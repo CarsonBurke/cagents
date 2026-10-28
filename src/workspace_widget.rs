@@ -555,11 +555,32 @@ pub fn focus_after_loading<Message: Send + 'static>(
     placeholder: widget::Id,
     target: widget::Id,
 ) -> Task<Message> {
-    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    use cosmic::iced::advanced::widget::operation::{self, Outcome};
+    use cosmic::iced::core::id::IdEq;
     struct Restore {
         foreign_focus: bool,
         placeholder: widget::Id,
         target: widget::Id,
+    }
+    struct FocusLoaded(widget::Id);
+    impl<Message: Send + 'static> Operation<Message> for FocusLoaded {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if id.is_some_and(|id| IdEq::eq(&id.0, &self.0.0)) {
+                state.focus();
+            } else if state.is_focused() {
+                // Unfocusing a fresh, already unfocused editor can publish
+                // ClearSelection. A loading handoff must retain its cursor.
+                state.unfocus();
+            }
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            operate(self);
+        }
     }
     impl<Message: Send + 'static> Operation<Message> for Restore {
         fn focusable(
@@ -568,7 +589,8 @@ pub fn focus_after_loading<Message: Send + 'static>(
             _bounds: Rectangle,
             state: &mut dyn operation::Focusable,
         ) {
-            self.foreign_focus |= state.is_focused() && id != Some(&self.placeholder);
+            self.foreign_focus |=
+                state.is_focused() && !id.is_some_and(|id| IdEq::eq(&id.0, &self.placeholder.0));
         }
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
             operate(self);
@@ -577,7 +599,7 @@ pub fn focus_after_loading<Message: Send + 'static>(
             if self.foreign_focus {
                 Outcome::None
             } else {
-                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+                Outcome::Chain(Box::new(FocusLoaded(self.target.clone())))
             }
         }
     }
@@ -1460,6 +1482,9 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             let previous_band = mem::take(&mut state.mounted);
             for (id, mut child) in previous_band.iter().copied().zip(children.drain(..)) {
                 reclaim_named_states(&mut child);
+                if !self.cards.iter().any(|card| card.id == id) {
+                    crate::ui_memory::release_parked(&mut child);
+                }
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
@@ -2522,6 +2547,55 @@ mod tests {
     }
 
     #[test]
+    fn parked_presentation_reclaims_named_state_before_releasing_its_subtree() {
+        let ids = [CardId::new(), CardId::new()];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let make = |index: usize| -> Element<'_, ()> {
+            VirtualStrip {
+                total_width: 320.0,
+                retained: retained.clone(),
+                focused: Some(ids[index]),
+                cards: vec![VirtualCard {
+                    id: ids[index],
+                    x: 0.0,
+                    width: 320.0,
+                    content_width: 320.0,
+                    on_screen: true,
+                    content: cosmic::widget::id_container(
+                        crate::ui_memory::gate(widget::Space::new()),
+                        widget::Id::new(format!("disposable-presentation-{index}")),
+                    )
+                    .into(),
+                }],
+            }
+            .into()
+        };
+        let mut element = make(0);
+        let mut tree = Tree::new(&element);
+        let owner = Arc::new(());
+        let released = Arc::downgrade(&owner);
+        // Model a retained/shaped allocation owned by the presentation tree.
+        // The named ancestor moves this entire subtree into iced's pool.
+        tree.children[0].children[0].children[0].state = tree::State::new(owner);
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        assert!(released.upgrade().is_some());
+        element = make(1);
+        tree.diff(&mut element);
+        assert!(
+            released.upgrade().is_none(),
+            "named extraction must not leave a presentation owner behind"
+        );
+        let parked = &tree.state.downcast_ref::<VirtualStripState>().detached[&ids[0]];
+        assert!(parked.children[0].children.is_empty());
+        // A real remount reconstructs the emptied gate through normal diffing.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(0);
+        tree.diff(&mut element);
+        assert_eq!(tree.children[0].children[0].children.len(), 1);
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
     fn parked_editor_preserves_focus_across_named_state_extraction() {
         use cosmic::iced::advanced::{renderer::Headless, widget::operation};
         let renderer = tokio::runtime::Builder::new_current_thread()
@@ -2719,7 +2793,7 @@ mod tests {
         use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
         use cosmic::iced::futures::{StreamExt, executor::block_on};
 
-        struct Focus(bool);
+        struct Focus(bool, usize);
         impl Focusable for Focus {
             fn is_focused(&self) -> bool {
                 self.0
@@ -2729,15 +2803,21 @@ mod tests {
             }
             fn unfocus(&mut self) {
                 self.0 = false;
+                self.1 += 1;
             }
         }
 
-        for foreign_id in [None, Some(widget::Id::new("sidebar.search"))] {
+        for (foreign_id, foreign_focused, placeholder_focused) in [
+            (None, true, false),
+            (Some(widget::Id::new("sidebar.search")), true, false),
+            (None, false, false),
+            (None, false, true),
+        ] {
             let placeholder = widget::Id::new("loading-pane.header");
             let target = widget::Id::new("loaded-pane.editor");
-            let mut header = Focus(false);
-            let mut foreign = Focus(true);
-            let mut editor = Focus(false);
+            let mut header = Focus(placeholder_focused, 0);
+            let mut foreign = Focus(foreign_focused, 0);
+            let mut editor = Focus(false, 0);
             let mut stream = cosmic::iced::runtime::task::into_stream(focus_after_loading::<()>(
                 placeholder.clone(),
                 target.clone(),
@@ -2758,8 +2838,14 @@ mod tests {
                     }
                 }
             }
-            assert!(foreign.0, "loading must preserve the chosen control");
-            assert!(!editor.0, "the loaded editor must not take its keyboard");
+            assert_eq!(foreign.0, foreign_focused, "keep the chosen control");
+            assert_eq!(
+                editor.0, !foreign_focused,
+                "handoff only without foreign focus"
+            );
+            assert_eq!(header.1, usize::from(placeholder_focused));
+            assert_eq!(foreign.1, 0, "do not unfocus an already unfocused control");
+            assert_eq!(editor.1, 0, "do not clear the target's selection");
         }
     }
 

@@ -257,6 +257,8 @@ impl<'a> Iterator for Chunks<'a> {
 pub struct TextSnapshot {
     root: Option<Arc<Node>>,
     serialized: Arc<OnceLock<Arc<str>>>,
+    #[cfg(test)]
+    serializations: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl PartialEq for TextSnapshot {
     fn eq(&self, other: &Self) -> bool {
@@ -300,8 +302,21 @@ impl TextSnapshot {
         Self {
             root: build(&lines),
             serialized: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
+    /// Shares immutable lines while giving a consumer its own empty text
+    /// cache. Protocol history must not retain a full string cached by a diff.
+    pub fn without_cached_text(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            serialized: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            serializations: Arc::clone(&self.serializations),
+        }
+    }
+
     /// A functional replacement for protocol-compatible native lines. Only
     /// the boundary lines, inserted text and AVL ancestors are copied.
     pub fn replaced(&self, start: Position, end: Position, inserted: &str) -> Option<Self> {
@@ -358,9 +373,54 @@ impl TextSnapshot {
             (Some(left), Some(right)) if Arc::ptr_eq(left, right) => return true,
             _ => {}
         }
-        Chunks::new(self.root.as_deref())
-            .flat_map(str::bytes)
-            .eq(Chunks::new(other.root.as_deref()).flat_map(str::bytes))
+        let mut left: Vec<_> = self.root.as_deref().into_iter().collect();
+        let mut right: Vec<_> = other.root.as_deref().into_iter().collect();
+        fn expand<'a>(stack: &mut Vec<&'a Node>, node: &'a Node) -> bool {
+            if let Node::Branch { left, right, .. } = node {
+                stack.pop();
+                stack.push(right);
+                stack.push(left);
+                true
+            } else {
+                false
+            }
+        }
+        while let (Some(&a), Some(&b)) = (left.last(), right.last()) {
+            if std::ptr::eq(a, b) {
+                left.pop();
+                right.pop();
+                continue;
+            }
+            if a.bytes() == b.bytes() {
+                if let (Node::Line(a), Node::Line(b)) = (a, b) {
+                    if !a
+                        .text
+                        .bytes()
+                        .chain(a.terminator.bytes())
+                        .eq(b.text.bytes().chain(b.terminator.bytes()))
+                    {
+                        return false;
+                    }
+                    left.pop();
+                    right.pop();
+                    continue;
+                }
+                let expanded_left = expand(&mut left, a);
+                let expanded_right = expand(&mut right, b);
+                debug_assert!(expanded_left || expanded_right);
+            } else if a.bytes() > b.bytes() && expand(&mut left, a) {
+                continue;
+            } else if b.bytes() > a.bytes() && expand(&mut right, b) {
+                continue;
+            } else {
+                // Equal bytes can have different native line topology. Keep
+                // exact semantics in that rare case without materialization.
+                return Chunks::new(self.root.as_deref())
+                    .flat_map(str::bytes)
+                    .eq(Chunks::new(other.root.as_deref()).flat_map(str::bytes));
+            }
+        }
+        left.iter().all(|node| node.bytes() == 0) && right.iter().all(|node| node.bytes() == 0)
     }
     pub fn protocol_compatible_lines(&self) -> bool {
         self.root.as_ref().is_none_or(|root| root.compatible())
@@ -379,14 +439,28 @@ impl TextSnapshot {
     pub fn is_materialized(&self) -> bool {
         self.serialized.get().is_some()
     }
+    /// Serialize a transient payload without retaining a second full copy
+    /// in every historical native snapshot (for example LSP wire messages).
+    pub fn to_string_uncached(&self) -> String {
+        #[cfg(test)]
+        self.serializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut text = String::with_capacity(self.len());
+        if let Some(root) = &self.root {
+            root.write(&mut text);
+        }
+        text
+    }
+    #[cfg(test)]
+    pub fn serialization_count(&self) -> usize {
+        self.serializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn text(&self) -> Arc<str> {
-        Arc::clone(self.serialized.get_or_init(|| {
-            let mut text = String::with_capacity(self.len());
-            if let Some(root) = &self.root {
-                root.write(&mut text);
-            }
-            Arc::from(text)
-        }))
+        Arc::clone(
+            self.serialized
+                .get_or_init(|| Arc::from(self.to_string_uncached())),
+        )
     }
     pub(super) fn replace_lines<'a>(
         &mut self,
@@ -403,6 +477,10 @@ impl TextSnapshot {
         let (_, right) = split(rest, old_end - first);
         self.root = join(join(left, replacement.root), right);
         self.serialized = Arc::new(OnceLock::new());
+        #[cfg(test)]
+        {
+            self.serializations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        }
     }
 }
 
@@ -427,6 +505,32 @@ mod tests {
             assert_balanced(right);
         }
     }
+    #[test]
+    fn detached_consumer_cache_shares_lines_without_retaining_full_text() {
+        let source = TextSnapshot::from_lines([
+            ("first", LineEnding::Lf, "\n"),
+            ("second", LineEnding::None, ""),
+        ]);
+        let text = source.text();
+        let weak = Arc::downgrade(&text);
+        let protocol = source.without_cached_text();
+        assert!(Arc::ptr_eq(
+            source.root.as_ref().unwrap(),
+            protocol.root.as_ref().unwrap()
+        ));
+        assert!(source.same_text(&protocol));
+        assert!(source.is_materialized());
+        assert!(!protocol.is_materialized());
+        drop(text);
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "protocol history must not own the diff's full serialization"
+        );
+        assert_eq!(protocol.line(1).unwrap().text, "second");
+        assert_eq!(protocol.text().as_ref(), "first\nsecond");
+    }
+
     #[test]
     fn functional_replacements_preserve_native_lines_without_serializing() {
         let original = TextSnapshot::from_lines([

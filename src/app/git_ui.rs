@@ -35,9 +35,25 @@ struct Entry {
     last_full_scan: Instant,
 }
 
+/// The window's watcher and the channel its wakes arrive on.
+struct Watch {
+    monitor: git_watch::Monitor,
+    receiver: async_channel::Receiver<()>,
+}
+
+impl Watch {
+    fn start() -> std::io::Result<Self> {
+        let (wake, receiver) = async_channel::bounded(1);
+        let monitor = git_watch::Monitor::start(move || {
+            let _ = wake.try_send(());
+        })?;
+        Ok(Self { monitor, receiver })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
-    monitor: Option<git_watch::Monitor>,
+    watch: Option<Watch>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
     activity: Vec<ProjectId>,
@@ -80,8 +96,8 @@ impl State {
     }
 
     fn configure(&self) {
-        if let Some(monitor) = &self.monitor {
-            monitor.configure(
+        if let Some(watch) = &self.watch {
+            watch.monitor.configure(
                 self.entries
                     .values()
                     .filter_map(|entry| entry.plan.clone())
@@ -100,7 +116,11 @@ impl State {
         if let Some(error) = &change.error {
             entry.fallback = Some(error.clone());
         }
-        if change.worktrees.is_empty() && !change.topology && !change.membership {
+        if change.worktrees.is_empty()
+            && !change.references
+            && !change.topology
+            && !change.membership
+        {
             return;
         }
         entry.pending.merge(change);
@@ -217,10 +237,10 @@ impl Cagents {
                 ));
             }
         }
-        let failure = if state.monitor.is_none() {
-            match git_watch::Monitor::start() {
-                Ok(monitor) => {
-                    state.monitor = Some(monitor);
+        let failure = if state.watch.is_none() {
+            match Watch::start() {
+                Ok(watch) => {
+                    state.watch = Some(watch);
                     None
                 }
                 Err(error) => Some(error.to_string()),
@@ -263,7 +283,7 @@ impl Cagents {
         let events =
             self.refresh_ui
                 .git
-                .monitor
+                .watch
                 .as_ref()
                 .map_or_else(Subscription::none, |monitor| {
                     Subscription::run_with(Source(monitor.receiver.clone()), stream)
@@ -276,11 +296,11 @@ impl Cagents {
     }
 
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
-        if self.refresh_ui.git.monitor.is_none()
+        if self.refresh_ui.git.watch.is_none()
             && !self.refresh_ui.git.entries.is_empty()
-            && let Ok(monitor) = git_watch::Monitor::start()
+            && let Ok(watch) = Watch::start()
         {
-            self.refresh_ui.git.monitor = Some(monitor);
+            self.refresh_ui.git.watch = Some(watch);
             self.refresh_ui.git.configure();
         }
         let open = self
@@ -415,9 +435,9 @@ impl Cagents {
                 let changes = self
                     .refresh_ui
                     .git
-                    .monitor
+                    .watch
                     .as_ref()
-                    .map(git_watch::Monitor::drain)
+                    .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
                 let mut reload = None;
                 for (project, change) in changes {
@@ -596,8 +616,8 @@ impl Cagents {
                 priority.push(project_id);
             }
         }
-        if let Some(monitor) = &state.monitor {
-            monitor.prioritize(priority, selected);
+        if let Some(watch) = &state.watch {
+            watch.monitor.prioritize(priority, selected);
         }
     }
 
@@ -641,7 +661,11 @@ impl Cagents {
                 entry.pending.merge(deferred);
                 state.queue.push_back(project);
             }
-            if !change.topology && !change.membership && change.worktrees.is_empty() {
+            if !change.topology
+                && !change.membership
+                && !change.references
+                && change.worktrees.is_empty()
+            {
                 continue;
             }
             entry.read_full_scan = change.topology;
@@ -701,7 +725,10 @@ fn read_local_with_plan(
     }
     let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
-        if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
+        // Shared refs move every worktree's upstream comparison.
+        if record.bare
+            || (!change.topology && !change.references && !change.worktrees.contains(&record.id))
+        {
             continue;
         }
         // A membership edge replaces the cached full count in this same
@@ -779,16 +806,17 @@ fn read_local_with_plan(
             Some((record.id, upstream.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let records = snapshot
+        .worktrees
+        .iter()
+        .map(|(record, _)| record.clone())
+        .collect::<Vec<_>>();
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
-            git_watch::Project::read_changed(
+            git_watch::Project::read_changed_with_upstreams(
                 project,
                 snapshot.repository.common_dir.clone(),
-                &snapshot
-                    .worktrees
-                    .iter()
-                    .map(|(record, _)| record.clone())
-                    .collect::<Vec<_>>(),
+                &records,
                 &cancellation,
                 previous_plan,
                 &change.worktrees,
@@ -796,7 +824,7 @@ fn read_local_with_plan(
             )
         })
         .transpose()?
-        .or_else(|| previous_plan.and_then(|plan| plan.refresh_upstreams(&upstreams)));
+        .or_else(|| previous_plan.and_then(|plan| plan.refresh_associations(&records, &upstreams)));
     Ok((snapshot, plan))
 }
 
@@ -1255,6 +1283,117 @@ mod tests {
             "passed",
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn packed_refs_only_event_reaches_the_local_read_worker() {
+        use cosmic::iced::futures::StreamExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        fixture(&root);
+        git(&root, &["branch", "upstream"]);
+        git(&root, &["config", "branch.main.remote", "."]);
+        git(
+            &root,
+            &["config", "branch.main.merge", "refs/heads/upstream"],
+        );
+        fs::write(root.join("tracked.txt"), "second revision\n").unwrap();
+        git(&root, &["commit", "-am", "advance local branch"]);
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let repository = service.discover(&root, &cancellation).unwrap();
+        let record = service
+            .list_worktrees(&repository.common_dir, &cancellation)
+            .unwrap()
+            .remove(0);
+        let status = service
+            .status_with_untracked(&root, false, &cancellation)
+            .unwrap();
+        assert!(matches!(
+            status.tracking,
+            crate::repository::TrackingState::Compared {
+                ahead: 1,
+                behind: 0,
+                ..
+            }
+        ));
+        let snapshot = Snapshot {
+            repository,
+            worktrees: vec![(record, Some(status))],
+            heads: HashMap::new(),
+        };
+        git(&root, &["branch", "-f", "upstream", "main"]);
+        git(&root, &["pack-refs", "--all", "--prune"]);
+        assert!(snapshot.repository.common_dir.join("packed-refs").is_file());
+        assert!(
+            !snapshot
+                .repository
+                .common_dir
+                .join("refs/heads/upstream")
+                .exists()
+        );
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.refresh_ui.git.entries.insert(
+            project,
+            Entry {
+                snapshot,
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                pending: Default::default(),
+                fallback: None,
+                read_failure: None,
+                read_full_scan: false,
+                last_full_scan: Instant::now(),
+            },
+        );
+        // This is the packed-refs event shape: shared references and metadata,
+        // without a named worktree or a membership/topology rescan.
+        app.refresh_ui.git.changed(
+            project,
+            git_watch::Change {
+                references: true,
+                metadata: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(app.refresh_ui.git.queue.front(), Some(&project));
+        let task = app.start_git_reads();
+        assert!(app.refresh_ui.git.entries[&project].cancellation.is_some());
+        let mut effects = cosmic::iced::runtime::task::into_stream(task)
+            .expect("packed references schedule a local worker");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(effect) = effects.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(Message::GitUi(
+                    Action::Read {
+                        project: actual,
+                        result,
+                        ..
+                    },
+                ))) = effect
+                {
+                    assert_eq!(actual, project);
+                    let (updated, _) = result.expect("local Git read succeeds");
+                    assert!(matches!(
+                        updated.worktrees[0].1.as_ref().unwrap().tracking,
+                        crate::repository::TrackingState::Compared {
+                            ahead: 0,
+                            behind: 0,
+                            ..
+                        }
+                    ));
+                    return;
+                }
+            }
+            panic!("packed references lost their local read completion");
+        })
+        .await
+        .expect("local Git worker completes");
     }
 
     #[test]

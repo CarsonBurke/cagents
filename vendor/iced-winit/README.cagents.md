@@ -22,3 +22,15 @@ native event arrives. This change is confined to `debug::on_hotpatch`; ordinary
 proxy traffic retains the pinned implementation. The callback is inactive when
 Iced's hot feature is disabled. Remove this backport when the pinned dependency
 provides the equivalent wake-up.
+
+The pinned window_clipboard revision returns no raw MIME data on X11. The
+clipboard bridge therefore uses its existing public X11 Context for bounded
+selection reads on actual Xlib/Xcb windows. It negotiates TARGETS in requested
+MIME order and supports direct/ICCCM INCR transfers, with a fresh requestor per
+read, a 16 KiB TARGETS cap, 32 MiB payload cap, and one three-second selection
+owner deadline. Property lengths are checked before fetching bytes; malformed,
+changed-owner and stalled transfers are refused. Existing text and Wayland raw
+reads keep their original paths. Raw-transfer errors remain logs/None under the
+generic clipboard API. Remove this fallback when the pinned backend provides
+equivalently bounded raw X11 reads. The ignored raw_selection_fixture test pairs
+with a real private X11 owner for direct, INCR and malformed-transfer coverage.

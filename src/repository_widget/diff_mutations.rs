@@ -521,6 +521,10 @@ mod tests {
         let mut stream = iced::runtime::task::into_stream(task).expect("save task");
         while let Some(action) = stream.next().await {
             if let iced::runtime::Action::Output(action) = action {
+                assert!(matches!(
+                    &action,
+                    RepositoryAction::RetainedSaveFinished { .. }
+                ));
                 drop(runtime.update(action));
             }
         }
@@ -533,6 +537,12 @@ mod tests {
     ) -> (RepositoryRuntime, AsyncIdentity) {
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "new.sh", text);
         runtime.descriptor.worktree = root.to_owned();
+        set_added_diff(&mut runtime, text);
+        let identity = runtime.current_identity(card, "new.sh".into());
+        (runtime, identity)
+    }
+
+    fn set_added_diff(runtime: &mut RepositoryRuntime, text: &str) {
         runtime.source_surface = SourceSurface::Diff;
         let mut model = crate::diff_view::build_diff("", text);
         model.present = [false, true];
@@ -549,7 +559,29 @@ mod tests {
         runtime.working_diff.desired = runtime.wanted_working_diff();
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
-        let identity = runtime.current_identity(card, "new.sh".into());
+    }
+
+    fn retained_added_file_runtime(
+        card: CardId,
+        root: &Path,
+        text: &str,
+    ) -> (RepositoryRuntime, AsyncIdentity) {
+        let (mut runtime, identity) = added_file_runtime(card, root, text);
+        let read = crate::editor::read_file_at(
+            root,
+            Path::new("new.sh"),
+            crate::editor::PdfTone::Original,
+            None,
+        )
+        .unwrap();
+        drop(runtime.update(RepositoryAction::FileLoadedAt {
+            identity: identity.clone(),
+            result: Ok(read),
+        }));
+        assert!(runtime.original_read_attested);
+        assert_eq!(runtime.editor_text().as_deref(), Some(text));
+        assert!(runtime.configure_save_recovery(Default::default(), vec![root.to_owned()]));
+        set_added_diff(&mut runtime, text);
         (runtime, identity)
     }
 
@@ -646,19 +678,25 @@ mod tests {
 
     #[tokio::test]
     async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
+        if super::super::retained_save_tests::isolated_test(
+            "repository_widget::diff_mutations::tests::partial_change_multiple_presence_undos_restore_their_own_access_metadata",
+        ) {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
         for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)]
         {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = super::super::retained_save_tests::Checkout::new();
             let root = directory.path().canonicalize().unwrap();
             initialize_presence_fixture(&root);
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
             let card = CardId::new();
-            let (mut runtime, _) = added_file_runtime(card, &root, "synthetic alpha\n");
+            let (mut runtime, _) = retained_added_file_runtime(card, &root, "synthetic alpha\n");
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             finish_lineage_save(&mut runtime, task).await;
             assert!(!root.join("new.sh").exists());
             let DocumentState::Editable(document) = &mut runtime.document else {
@@ -667,12 +705,12 @@ mod tests {
             document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
                 Arc::new("synthetic beta\n".into()),
             )));
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             finish_lineage_save(&mut runtime, task).await;
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644))
                 .unwrap();
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             if late_completion {
                 // The captured deletion belongs to B even after Undo has
                 // moved the current history back to A's absence identity.
@@ -688,7 +726,7 @@ mod tests {
             } else {
                 finish_lineage_save(&mut runtime, task).await;
                 drop(runtime.update(RepositoryAction::Undo { card }));
-                let task = runtime.request_save_inner(card, false, false);
+                let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
                 finish_lineage_save(&mut runtime, task).await;
                 assert_eq!(
                     std::fs::read_to_string(root.join("new.sh")).unwrap(),
@@ -706,13 +744,13 @@ mod tests {
             }
             assert!(!runtime.desired_file_present());
             if save_between_undos {
-                let task = runtime.request_save_inner(card, false, false);
+                let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
                 finish_lineage_save(&mut runtime, task).await;
                 assert!(!root.join("new.sh").exists());
             }
             drop(runtime.update(RepositoryAction::Undo { card }));
             assert_eq!(runtime.editor_text().unwrap(), "synthetic alpha\n");
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             finish_lineage_save(&mut runtime, task).await;
             assert_eq!(
                 std::fs::read_to_string(root.join("new.sh")).unwrap(),
@@ -734,19 +772,25 @@ mod tests {
 
     #[tokio::test]
     async fn partial_change_presence_capacity_refuses_before_disk_effects_and_preserves_undo() {
+        if super::super::retained_save_tests::isolated_test(
+            "repository_widget::diff_mutations::tests::partial_change_presence_capacity_refuses_before_disk_effects_and_preserves_undo",
+        ) {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::retained_save_tests::Checkout::new();
         let root = directory.path().canonicalize().unwrap();
         initialize_presence_fixture(&root);
         std::fs::write(root.join("new.sh"), "synthetic initial\n").unwrap();
         std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
             .unwrap();
         let card = CardId::new();
-        let (mut runtime, _) = added_file_runtime(card, &root, "synthetic initial\n");
+        let (mut runtime, _) = retained_added_file_runtime(card, &root, "synthetic initial\n");
         let mut latest = String::new();
         for index in 1..=64 {
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             finish_lineage_save(&mut runtime, task).await;
             assert!(!root.join("new.sh").exists());
             latest = format!("synthetic cycle {index}\n");
@@ -756,7 +800,7 @@ mod tests {
             document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
                 Arc::new(latest.clone()),
             )));
-            let task = runtime.request_save_inner(card, false, false);
+            let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
             finish_lineage_save(&mut runtime, task).await;
             assert_eq!(
                 std::fs::read_to_string(root.join("new.sh")).unwrap(),
@@ -764,7 +808,7 @@ mod tests {
             );
         }
         revert_complete_added_buffer(&mut runtime, card, 0o100644);
-        let refused = runtime.request_save_inner(card, false, false);
+        let refused = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
         assert!(iced::runtime::task::into_stream(refused).is_none());
         assert!(
             runtime
@@ -808,15 +852,21 @@ mod tests {
     #[tokio::test]
     async fn partial_change_full_added_file_revert_saves_absence_and_single_undo_restores_bytes_and_mode()
      {
+        if super::super::retained_save_tests::isolated_test(
+            "repository_widget::diff_mutations::tests::partial_change_full_added_file_revert_saves_absence_and_single_undo_restores_bytes_and_mode",
+        ) {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::retained_save_tests::Checkout::new();
         let root = directory.path().canonicalize().unwrap();
         let text = "#!/bin/sh\r\necho native\r\nno final newline";
         std::fs::write(root.join("new.sh"), text).unwrap();
         std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o751))
             .unwrap();
         let card = CardId::new();
-        let (mut runtime, identity) = added_file_runtime(card, &root, text);
+        let (mut runtime, identity) = retained_added_file_runtime(card, &root, text);
         let model = runtime.current_diff_model_snapshot().unwrap();
         let request = runtime
             .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
@@ -838,7 +888,7 @@ mod tests {
             .unwrap();
         assert!(!runtime.desired_file_present());
         assert!(runtime.is_dirty());
-        let task = runtime.request_save_inner(card, false, false);
+        let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
         finish_presence_save(&mut runtime, task).await;
         assert!(!root.join("new.sh").exists());
         assert!(!runtime.saved_file_present());
@@ -856,7 +906,7 @@ mod tests {
         assert_eq!(runtime.editor_text().unwrap(), text);
         assert!(runtime.desired_file_present());
         assert!(runtime.is_dirty());
-        let task = runtime.request_save_inner(card, false, false);
+        let task = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
         finish_presence_save(&mut runtime, task).await;
         assert_eq!(std::fs::read(root.join("new.sh")).unwrap(), text.as_bytes());
         assert_eq!(
@@ -878,14 +928,20 @@ mod tests {
 
     #[tokio::test]
     async fn partial_change_late_absent_save_keeps_newer_typing_dirty_and_recreates_it_safely() {
+        if super::super::retained_save_tests::isolated_test(
+            "repository_widget::diff_mutations::tests::partial_change_late_absent_save_keeps_newer_typing_dirty_and_recreates_it_safely",
+        ) {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::retained_save_tests::Checkout::new();
         let root = directory.path().canonicalize().unwrap();
         std::fs::write(root.join("new.sh"), "original\n").unwrap();
         std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         let card = CardId::new();
-        let (mut runtime, identity) = added_file_runtime(card, &root, "original\n");
+        let (mut runtime, identity) = retained_added_file_runtime(card, &root, "original\n");
         let model = runtime.current_diff_model_snapshot().unwrap();
         let request = runtime
             .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
@@ -904,7 +960,7 @@ mod tests {
                 patch.working_mode,
             )
             .unwrap();
-        let deletion = runtime.request_save_inner(card, false, false);
+        let deletion = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
         let DocumentState::Editable(document) = &mut runtime.document else {
             unreachable!();
         };
@@ -918,7 +974,7 @@ mod tests {
         assert!(runtime.desired_file_present());
         assert!(!runtime.saved_file_present());
         assert_eq!(runtime.editor_text().unwrap(), "newer typing\n");
-        let recreation = runtime.request_save_inner(card, false, false);
+        let recreation = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
         finish_presence_save(&mut runtime, recreation).await;
         assert_eq!(
             std::fs::read_to_string(root.join("new.sh")).unwrap(),

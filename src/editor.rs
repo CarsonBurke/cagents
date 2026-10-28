@@ -12,7 +12,10 @@ use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
 pub use presence::FileRestoration;
-pub(crate) use presence::{PresenceSave, save_document_file};
+#[cfg(test)]
+pub(crate) use presence::save_document_file;
+pub(crate) use presence::{PresenceSave, save_document_file_at};
+pub mod retained_save;
 
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
@@ -266,8 +269,101 @@ pub fn load_file(
     relative_path: &Path,
     tone: PdfTone,
 ) -> Result<LoadedFile, FileIoError> {
+    let root = open_read_root(worktree)?;
+    load_file_at(&root, relative_path, tone)
+}
+
+/// Capture the original physical root in the read worker, before reading any
+/// mutable document. Later reads and saves retain this same descriptor.
+pub(crate) fn open_read_root(worktree: &Path) -> Result<Root, FileIoError> {
+    worktree_root(worktree)
+}
+
+pub(crate) fn validate_read_root_named(root: &Root) -> Result<(), FileIoError> {
+    validate_read_root_for_worktree(root, root.path())
+}
+fn validate_read_root_for_worktree(root: &Root, worktree: &Path) -> Result<(), FileIoError> {
+    let named = worktree_root(worktree)?;
+    #[cfg(target_os = "linux")]
+    let same = fs_safety::recovery_directory_stamp(root).map_err(io_error)?
+        == fs_safety::recovery_directory_stamp(&named).map_err(io_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        let held = root.metadata().map_err(io_error)?;
+        let current = named.metadata().map_err(io_error)?;
+        held.dev() == current.dev() && held.ino() == current.ino()
+    };
+    if !same {
+        return Err(FileIoError::Io(
+            "The original worktree was replaced; reopen the pane before reading or saving".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A completed read from one original physical scope. Only the worker can
+/// construct this association; a pure root setter alone cannot admit Save.
+#[derive(Debug, Clone)]
+pub struct FileRead {
+    pub(crate) watch_revision: Option<u64>,
+    worktree: PathBuf,
+    root: std::sync::Arc<Root>,
+    result: Result<LoadedFile, FileIoError>,
+}
+impl FileRead {
+    pub(crate) fn source(&self) -> Option<&Path> {
+        self.result
+            .as_ref()
+            .ok()
+            .map(|loaded| loaded.source.as_path())
+    }
+    pub fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+    pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
+        (self.root, self.result)
+    }
+}
+pub(crate) fn read_file_at(
+    worktree: &Path,
+    relative: &Path,
+    tone: PdfTone,
+    original: Option<std::sync::Arc<Root>>,
+) -> Result<FileRead, FileIoError> {
+    let root = match original {
+        Some(root) => root,
+        None => std::sync::Arc::new(open_read_root(worktree)?),
+    };
+    let result = validate_read_root_for_worktree(&root, worktree)
+        .and_then(|()| load_file_at_original(&root, relative, tone))
+        .and_then(|loaded| {
+            validate_read_root_for_worktree(&root, worktree)?;
+            Ok(loaded)
+        });
+    Ok(FileRead {
+        watch_revision: None,
+        worktree: worktree.to_owned(),
+        root,
+        result,
+    })
+}
+
+pub(crate) fn load_file_at(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
+    validate_read_root_named(root)?;
+    load_file_at_original(root, relative_path, tone)
+}
+
+fn load_file_at_original(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
-    let root = worktree_root(worktree)?;
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a
     // target that turns out to name nothing usable is reported against the
@@ -328,7 +424,7 @@ pub fn load_file(
         reached_through = Some((source, target));
         source = resolved;
     };
-    let content = load_regular_file(&root, worktree, &source, metadata, tone)?;
+    let content = load_regular_file(root, root.path(), &source, metadata, tone)?;
     Ok(LoadedFile { source, content })
 }
 
@@ -472,20 +568,60 @@ fn load_regular_file(
         return Ok(decode_svg(&bytes)
             .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
     }
-    let format = image::guess_format(&bytes)
-        .ok()
-        .or_else(|| image::ImageFormat::from_path(relative_path).ok());
-    if let Some(format) = format {
-        return Ok(decode_raster(&bytes, format)
-            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
+    // A file named as an image that decodes is an image. The content picks
+    // the decoder, because a misnamed image is still an image.
+    let mut failure = None;
+    if let Ok(named) = image::ImageFormat::from_path(relative_path) {
+        let format = image::guess_format(&bytes).unwrap_or(named);
+        match decode_raster(&bytes, format) {
+            Ok(image) => return Ok(image),
+            Err(reason) => failure = Some(reason),
+        }
     }
-    if bytes.contains(&0) {
-        return Ok(FileContent::ReadOnly(ReadOnlyReason::Binary));
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return Ok(FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)),
+    // Otherwise a file that reads as text is text, whatever its name or its
+    // first bytes claim: a Git LFS pointer named `logo.png`, an error page
+    // saved as `.jpg`, or prose that begins with one of the printable
+    // signatures ("BM", "P1" to "P7", "DDS ", "qoif", "GIF89a").
+    let (bytes, reason) = if bytes.contains(&0) {
+        (bytes, ReadOnlyReason::Binary)
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(text) => return Ok(editable_text(relative_path, text)),
+            Err(error) => (error.into_bytes(), ReadOnlyReason::InvalidUtf8),
+        }
     };
+    // Bytes that are not text but that a name or a signature says are an
+    // image get the decoder's reason, which says more than "binary data"
+    // about a truncated or oversized picture. A named file was decoded
+    // above and is not decoded again.
+    if let Some(reason) = failure {
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason)));
+    }
+    if let Ok(format) = image::guess_format(&bytes) {
+        match decode_raster(&bytes, format) {
+            Ok(image) => return Ok(image),
+            // A weak signature is no evidence on its own, so a file it fails
+            // to decode is classified by its bytes.
+            Err(_) if weak_signature(format) => {}
+            Err(reason) => return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason))),
+        }
+    }
+    Ok(FileContent::ReadOnly(reason))
+}
+
+/// Whether `format`'s signature, as `image::guess_format` matches it, is too
+/// weak to call a file an image without a name that says so: two bytes
+/// ("BM", "P1" to "P7") or printable ASCII ("DDS ", "qoif", "farbfeld",
+/// "#?RADIANCE") that text in another encoding, or another binary format,
+/// can begin with. The rest pin binary bytes (PNG, JPEG, TIFF, ICO, OpenEXR,
+/// the AVIF and WebP containers) or are distinctive enough (GIF).
+fn weak_signature(format: image::ImageFormat) -> bool {
+    use image::ImageFormat::{Bmp, Dds, Farbfeld, Hdr, Pnm, Qoi};
+    matches!(format, Bmp | Pnm | Dds | Qoi | Farbfeld | Hdr)
+}
+
+/// The editable buffer for `text`, read from `relative_path`.
+fn editable_text(relative_path: &Path, text: String) -> FileContent {
     let markdown = relative_path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("README"))
@@ -495,11 +631,11 @@ fn load_regular_file(
             .is_some_and(|extension| {
                 matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
             });
-    Ok(FileContent::Editable {
+    FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
         markdown,
-    })
+    }
 }
 
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -1166,9 +1302,169 @@ mod tests {
             content(root.path(), "huge.png"),
             FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
         ));
+        // A name alone does not make text an image; see
+        // `a_file_that_claims_to_be_an_image_but_does_not_decode`.
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
-        assert!(matches!(
+        assert_eq!(
             content(root.path(), "broken.png"),
+            editable("not a valid image", false)
+        );
+    }
+
+    /// Several signatures `image::guess_format` knows are printable ASCII,
+    /// two of them only two bytes long, so they also begin ordinary prose.
+    /// Content alone is not evidence of an image when it reads as text and
+    /// the name does not say image.
+    #[test]
+    fn text_that_begins_like_an_image_signature_opens_as_text() {
+        let root = tempdir().unwrap();
+        for (name, text, markdown) in [
+            ("ranking.md", "BM25 ranking beats TF-IDF here.\n", true),
+            ("notes.txt", "P1: ship the fix\nP2: write tests\n", false),
+            ("plan", "P3 is blocked on review\n", false),
+            ("todo.txt", "P7 first, then P4\n", false),
+            ("textures.txt", "DDS files hold GPU textures.\n", false),
+            ("formats.txt", "qoif is the QOI magic.\n", false),
+            ("farbfeld.txt", "farbfeld is a lossless format.\n", false),
+            ("radiance.txt", "#?RADIANCE starts an HDR file.\n", false),
+            ("history.txt", "GIF89a added animation.\n", false),
+            // A plain-text bitmap is still text to a reader who did not name
+            // it as an image, whether or not this build can decode it.
+            ("sample.txt", "P1\n2 2\n0 1\n1 0\n", false),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                editable(text, markdown),
+                "{name} must open as editable text"
+            );
+        }
+    }
+
+    /// Text-first classification must not cost a real image that carries one
+    /// of those printable signatures: its bytes are not text, so the content
+    /// decides whatever the name says.
+    #[test]
+    fn a_real_image_with_a_printable_signature_still_renders() {
+        let root = tempdir().unwrap();
+        let image = image::RgbImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgb([200, 10, 30])
+            } else {
+                image::Rgb([5, 90, 250])
+            }
+        });
+        let mut bmp = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(bmp.starts_with(b"BM"));
+        for name in ["pixels.bmp", "pixels.dat", "pixels"] {
+            fs::write(root.path().join(name), &bmp).unwrap();
+            let FileContent::Image {
+                width,
+                height,
+                rgba,
+            } = content(root.path(), name)
+            else {
+                panic!("{name} must render as an image");
+            };
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(&*rgba, &[200, 10, 30, 255, 5, 90, 250, 255]);
+        }
+    }
+
+    /// A file whose name or signature says image but that does not decode
+    /// opens as text when it is text, and otherwise says why it is not a
+    /// usable image rather than calling it binary data.
+    #[test]
+    fn a_file_that_claims_to_be_an_image_but_does_not_decode() {
+        let root = tempdir().unwrap();
+        // Text named as an image: a Git LFS pointer, a saved error page, and
+        // a printable signature under its own extension.
+        for (name, text) in [
+            (
+                "logo.png",
+                "version https://git-lfs.github.com/spec/v1\n\
+                 oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                 size 12345\n",
+            ),
+            ("photo.jpg", "<!DOCTYPE html><title>404 Not Found</title>\n"),
+            ("weak.bmp", "BM25 ranking\n"),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                editable(text, false),
+                "{name} must open as editable text"
+            );
+        }
+
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 4]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let truncated = &png[..png.len() / 2];
+        let mut invalid = b"\x89PNG\r\n\x1a\n".to_vec();
+        invalid.extend_from_slice(b"\xff\xfe no NUL here");
+        let mut wide = Vec::new();
+        image::RgbaImage::new(MAX_IMAGE_DIMENSION + 1, 1)
+            .write_to(&mut Cursor::new(&mut wide), image::ImageFormat::Png)
+            .unwrap();
+        // Bytes that are not text, under any name, with a strong signature:
+        // the signature is the evidence, so the decoder's reason is the
+        // answer.
+        for (name, bytes) in [
+            ("screenshot", truncated),
+            ("screenshot.png", truncated),
+            ("screenshot.bin", truncated),
+            ("payload", invalid.as_slice()),
+            ("wide", wide.as_slice()),
+        ] {
+            fs::write(root.path().join(name), bytes).unwrap();
+            let content = content(root.path(), name);
+            assert!(
+                matches!(content, FileContent::ReadOnly(ReadOnlyReason::Image(_))),
+                "{name} must be refused as an image, not as {content:?}"
+            );
+        }
+    }
+
+    /// A weak signature counts only beside a name that says image, so a file
+    /// in another encoding that happens to begin like one is refused for
+    /// what its bytes are.
+    #[test]
+    fn a_weak_signature_without_an_image_name_is_not_evidence() {
+        let root = tempdir().unwrap();
+        for (name, bytes, reason) in [
+            (
+                "notes.txt",
+                &b"BM25 r\xe9sum\xe9\n"[..],
+                ReadOnlyReason::InvalidUtf8,
+            ),
+            (
+                "plan",
+                b"P3 caf\xe9 opens at nine\n",
+                ReadOnlyReason::InvalidUtf8,
+            ),
+            (
+                "blob",
+                b"BM\0\0\x01\x02 not a bitmap",
+                ReadOnlyReason::Binary,
+            ),
+            ("frames", b"P6\0\x01 not a pixmap", ReadOnlyReason::Binary),
+        ] {
+            fs::write(root.path().join(name), bytes).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                FileContent::ReadOnly(reason),
+                "{name}"
+            );
+        }
+        // Named as an image, the same bytes get the decoder's reason.
+        fs::write(root.path().join("notes.bmp"), b"BM25 r\xe9sum\xe9\n").unwrap();
+        assert!(matches!(
+            content(root.path(), "notes.bmp"),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
     }

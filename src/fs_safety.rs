@@ -137,6 +137,12 @@ impl Root {
         })
     }
 
+    /// Duplicate the retained directory for a command that must resolve the
+    /// same object through an inherited descriptor, independent of its name.
+    pub(crate) fn retained_directory(&self) -> io::Result<File> {
+        self.directory.try_clone().map(File::from)
+    }
+
     /// This root's own metadata, for a caller that needs the directory's
     /// identity — its device and inode — rather than the name it was reached
     /// by. `fstat` answers through an `O_PATH` descriptor, so this needs no
@@ -156,9 +162,46 @@ impl Root {
         std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
 
-    fn descriptor(&self) -> RawFd {
+    /// Address this retained directory from a synchronous child without
+    /// inheriting a descriptor. The caller must keep this root alive until
+    /// that child exits; `/proc/self` would name the child's different FD table.
+    pub(crate) fn process_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.descriptor()
+        ))
+    }
+
+    pub(crate) fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }
+}
+
+/// Internal worker-side ancestor observation through a retained directory.
+/// This intentional literal parent lookup is separate from confined public
+/// component resolution: `open_at` MUST continue rejecting user-supplied `..`.
+/// The returned descriptor alone does not grant placement/effect consent.
+#[cfg(target_os = "linux")]
+pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: the directory is retained, the ONLY lookup is this static NUL-
+    // terminated parent literal, and openat returns a fresh owned descriptor.
+    let descriptor = unsafe { libc::openat(root.descriptor(), c"..".as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Root {
+        directory: unsafe { OwnedFd::from_raw_fd(descriptor) },
+        path: root.path().join(".."),
+    })
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn retained_parent_directory(_root: &Root) -> io::Result<Root> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Retained parent observation is unavailable on this platform.",
+    ))
 }
 
 /// Why a path could not be resolved beneath a root.
@@ -176,6 +219,8 @@ pub enum ResolveError {
         /// reload, a save target that was deleted — needs to tell the two
         /// apart, and the message text is not a contract.
         not_found: bool,
+        /// Whether an exclusive create or rename refused an existing entry.
+        already_exists: bool,
         /// Whether the kernel refused write access specifically. A caller that
         /// presents an unwritable file read-only rather than failing to open it
         /// needs to tell that apart from an unsearchable parent directory,
@@ -185,6 +230,15 @@ pub enum ResolveError {
 }
 
 impl ResolveError {
+    pub fn is_already_exists(&self) -> bool {
+        matches!(
+            self,
+            Self::Io {
+                already_exists: true,
+                ..
+            }
+        )
+    }
     /// The path the failure is about.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -234,6 +288,7 @@ impl ResolveError {
         Self::Io {
             path: path.to_path_buf(),
             message: error.to_string(),
+            already_exists: error.kind() == io::ErrorKind::AlreadyExists,
             not_found: error.kind() == io::ErrorKind::NotFound,
             write_refused,
         }
@@ -243,6 +298,7 @@ impl ResolveError {
         Self::Io {
             path: path.to_path_buf(),
             message: message.to_owned(),
+            already_exists: false,
             not_found: false,
             write_refused: false,
         }
@@ -411,30 +467,20 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
     resolve_directory(root, relative)
 }
 
-/// Creates one directory while retaining whether this call created it. A
-/// recovery caller can preserve newer directories' permissions unchanged.
-pub fn create_directory_beneath(
-    root: &Root,
-    relative: &Path,
-    mode: u32,
-) -> Result<(Root, bool), ResolveError> {
-    let (parent, name) = open_parent_beneath(root, relative)?;
-    let leaf = c_component(&name, &parent.path)?;
-    // SAFETY: the held parent and C leaf remain live through mkdirat.
-    let result = unsafe { libc::mkdirat(parent.descriptor(), leaf.as_ptr(), mode) };
-    let created = result == 0;
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(ResolveError::io(&parent.path.join(&name), &error));
-        }
-    }
-    Ok((resolve_directory(&parent, Path::new(&name))?, created))
-}
+#[path = "fs_safety/directory_creation.rs"]
+mod directory_creation;
+#[cfg(test)]
+pub(crate) use directory_creation::fixture_directory_preparation_failure;
+pub use directory_creation::{
+    DirectoryCreateError, DirectoryCreation, DirectoryNamespace, DirectoryPreparation,
+    DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
+    create_directory_in_namespace, stage_directory_in_namespace,
+};
+pub(crate) use directory_creation::{
+    OwnedPrivateSibling, PrivateSiblingCreateError, SaveSiblingDurability, StickyParent,
+};
 
-/// Changes a held directory's permissions. An O_PATH fd cannot be passed to
-/// fchmod; Linux's descriptor link pins the same inode without re-resolving
-/// its mutable worktree name.
+/// Changes permissions through the exact retained directory descriptor.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
@@ -478,6 +524,182 @@ pub fn symlink_within(directory: &Root, target: &Path, name: &OsStr) -> Result<(
             &io::Error::last_os_error(),
         ))
     }
+}
+
+/// Removes only an empty direct child through its retained parent.
+pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError> {
+    let raw = c_component(name, &directory.path)?;
+    // SAFETY: the held directory and C string outlive unlinkat; AT_REMOVEDIR
+    // removes only an empty directory entry and never follows a symbolic link.
+    let status =
+        unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
+    if status < 0 {
+        return Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[path = "fs_safety/recovery_placement.rs"]
+mod recovery_placement;
+pub(crate) use recovery_placement::{
+    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp, validate_recovery_parent,
+};
+
+#[path = "fs_safety/recovery_cache.rs"]
+mod recovery_cache;
+#[cfg(test)]
+pub(crate) use recovery_cache::fixture_fail_next_save_preparation_sync;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
+pub(crate) use recovery_cache::{
+    RecoveryDirectoryError, RecoveryParentCandidates, SavePreparationDurability,
+    prepare_recovery_directory_with_owner, prepare_save_recovery_directory_with_owner,
+    verify_recovery_directory_private,
+};
+
+/// Creates missing directory components without following symbolic links.
+/// Existing components must be real directories beneath the retained root.
+pub fn create_directories_beneath(
+    root: &Root,
+    relative: &Path,
+    mode: u32,
+) -> Result<Root, ResolveError> {
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| ResolveError::io(root.path(), &error))?;
+    if relative.as_os_str().is_empty() {
+        return Ok(directory);
+    }
+    let parts = components(relative).ok_or_else(|| ResolveError::escaped(relative))?;
+    for component in parts {
+        let name = c_component(component, directory.path())?;
+        // SAFETY: the component and retained parent descriptor outlive mkdirat.
+        let result = unsafe { libc::mkdirat(directory.descriptor(), name.as_ptr(), mode) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(ResolveError::io(&directory.path.join(component), &error));
+            }
+        }
+        directory = resolve_directory(&directory, Path::new(component))?;
+    }
+    Ok(directory)
+}
+
+/// Lists direct child names through a retained directory descriptor.
+/// The limit bounds memory even when an untrusted repository has huge directories.
+pub fn directory_entries_beneath(
+    root: &Root,
+    relative: &Path,
+    limit: usize,
+) -> Result<Vec<OsString>, ResolveError> {
+    let directory = if relative.as_os_str().is_empty() {
+        root.try_clone()
+            .map_err(|error| ResolveError::io(root.path(), &error))?
+    } else {
+        resolve_directory(root, relative)?
+    };
+    // /proc resolves the already-open directory, never the repository pathname.
+    // read_dir owns its new descriptor for the entire enumeration.
+    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", directory.descriptor()))
+        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        if names.len() == limit {
+            return Err(ResolveError::message(
+                directory.path(),
+                "directory entry limit exceeded",
+            ));
+        }
+        names.push(
+            entry
+                .map_err(|error| ResolveError::io(directory.path(), &error))?
+                .file_name(),
+        );
+    }
+    Ok(names)
+}
+
+/// Creates an unnamed regular file on this retained directory's filesystem.
+///
+/// No directory entry can be substituted or require cleanup. Unsupported
+/// filesystems are an explicit refusal; there is no named temporary fallback.
+pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: the Root owns its descriptor, the literal is NUL-terminated,
+    // and a successful openat returns a fresh owned descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.descriptor(),
+            c".".as_ptr(),
+            libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+            libc::mode_t::from(mode),
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return Err(ResolveError::message(
+            directory.path(),
+            &format!(
+                "Cannot create an anonymous copy file; this filesystem must support O_TMPFILE: {error}"
+            ),
+        ));
+    }
+    // SAFETY: this is the fresh descriptor returned by openat above.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    if !metadata.is_file() || metadata.nlink() != 0 {
+        return Err(ResolveError::message(
+            directory.path(),
+            "The copy file is not an unnamed regular inode",
+        ));
+    }
+    Ok(file)
+}
+
+/// Publishes the exact unnamed file without replacing a destination entry.
+///
+/// `/proc/self/fd` denotes the retained descriptor, never a mutable worktree
+/// name. AT_SYMLINK_FOLLOW follows only that kernel-owned descriptor link.
+/// The caller keeps the File alive across linkat. Failure leaves the output
+/// unnamed and never unlinks or overwrites anything in the destination.
+pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(), ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    let destination = c_component(to, directory.path())?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ResolveError::io(directory.path(), &error))?;
+    if !metadata.is_file() || metadata.nlink() != 0 {
+        return Err(ResolveError::message(
+            directory.path(),
+            "Only an unnamed regular copy file may be published",
+        ));
+    }
+    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .expect("a decimal descriptor contains no NUL");
+    // SAFETY: both strings and the owning File/Root remain alive across
+    // linkat. linkat does not replace an existing destination, including links.
+    let status = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            directory.descriptor(),
+            destination.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if status < 0 {
+        return Err(ResolveError::io(
+            &directory.path.join(to),
+            &io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 /// Creates a file inside `directory` with `mode`, for the atomic
@@ -610,22 +832,6 @@ pub fn unlink_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError>
     // SAFETY: `raw` outlives the call and the descriptor is owned by
     // `directory`.
     let status = unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), 0) };
-    if status < 0 {
-        return Err(ResolveError::io(
-            &directory.path.join(name),
-            &io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
-}
-
-/// Removes an empty child directory through its held parent, without following links.
-pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError> {
-    let raw = c_component(name, &directory.path)?;
-    // SAFETY: the held directory and C string outlive unlinkat; AT_REMOVEDIR
-    // removes only an empty directory entry and never follows a symbolic link.
-    let status =
-        unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
     if status < 0 {
         return Err(ResolveError::io(
             &directory.path.join(name),
@@ -774,19 +980,35 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
     lost
 }
 
-/// Reads the content/access attributes of one held file for a coherent
-/// metadata comparison. A caller must compare descriptor metadata before and
-/// after capture; a disappearing listed attribute is a concurrent change.
+/// Captures the content metadata used to fence a retained editor Save.
+/// Unlike best-effort copying, an incomplete snapshot refuses publication.
+/// Bound both allocation and syscall work even when a file carries many
+/// attributes. Other filesystem callers retain their existing copy policy.
 pub fn content_attributes(
     file: &File,
 ) -> io::Result<std::collections::BTreeMap<OsString, Vec<u8>>> {
+    const LIST_BYTES: usize = 64 * 1024;
+    const MAX_ATTRIBUTES: usize = 1024;
+    const SNAPSHOT_BYTES: usize = 1024 * 1024;
+    let names = attribute_names_with_limit(file, LIST_BYTES)?;
+    if names.len() > MAX_ATTRIBUTES {
+        return Err(io::Error::other(
+            "file attribute count exceeds the Save metadata budget",
+        ));
+    }
+    let mut remaining = SNAPSHOT_BYTES;
     let mut attributes = std::collections::BTreeMap::new();
-    for name in attribute_names(file)? {
+    for name in names {
         if !is_content_attribute(&name) {
             continue;
         }
-        let value = read_attribute(file, &name)?
+        let value = read_attribute_with_limit(file, &name, remaining.min(LIST_BYTES))?
             .ok_or_else(|| io::Error::other("file attributes changed while they were read"))?;
+        // Discard spare capacity from a concurrent shrink, so the retained
+        // snapshot obeys the aggregate allocation budget as well as its
+        // logical byte budget. At most one bounded value is transient.
+        let value = value.into_boxed_slice().into_vec();
+        remaining -= value.len();
         attributes.insert(OsString::from_vec(name.to_bytes().to_vec()), value);
     }
     Ok(attributes)
@@ -822,29 +1044,76 @@ pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Preserves the source's POSIX access ACL on a new file after its mode is set.
+/// Preserve the source group on a new copy without changing its owning user.
+/// A setgid destination can otherwise assign existing group permissions to a
+/// different group. Failure prevents publication rather than broadening access.
+pub fn copy_group(source: &File, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    preserve_group(source.metadata()?.gid(), destination)
+}
+
+/// Apply a group captured with the source's other permission metadata.
+pub fn preserve_group(group: libc::gid_t, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if destination.metadata()?.gid() == group {
+        return Ok(());
+    }
+    // SAFETY: destination remains owned for this call; the all-ones uid keeps
+    // its current owner and the group comes from the retained source descriptor.
+    if unsafe { libc::fchown(destination.as_raw_fd(), libc::uid_t::MAX, group) } < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot preserve source file group: {error}"),
+        ));
+    }
+    if destination.metadata()?.gid() != group {
+        return Err(io::Error::other(
+            "the filesystem did not preserve the source file group",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserves the source's POSIX access ACL on a new file.
 /// Unlike optional content attributes, losing an ACL can grant unintended
 /// access, so every failure prevents publication. An absent source ACL removes
 /// any access ACL inherited by the destination from its parent.
 pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
-    let name = c"system.posix_acl_access";
-    let value = match read_attribute(source, name) {
-        Ok(value) => value,
-        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(value) = value {
-        return write_attribute(destination, name, &value);
+    AccessAcl::capture(source)?.apply(destination)
+}
+
+/// A captured access ACL, including the absence of one. Copy callers can keep
+/// mode, group and ACL from one verified source snapshot instead of mixing
+/// metadata observed before and after a concurrent permission change.
+pub struct AccessAcl(Option<Vec<u8>>);
+
+impl AccessAcl {
+    pub fn capture(source: &File) -> io::Result<Self> {
+        let name = c"system.posix_acl_access";
+        let value = match read_attribute(source, name) {
+            Ok(value) => value,
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self(value))
     }
-    // SAFETY: the descriptor is live and the attribute name is static.
-    let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
-    if status < 0 {
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
-            return Err(error);
+
+    pub fn apply(&self, destination: &File) -> io::Result<()> {
+        let name = c"system.posix_acl_access";
+        if let Some(value) = &self.0 {
+            return write_attribute(destination, name, value);
         }
+        // SAFETY: the descriptor is live and the attribute name is static.
+        let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's
@@ -857,6 +1126,10 @@ fn is_content_attribute(name: &CStr) -> bool {
 
 /// Every extended-attribute name an open file carries.
 fn attribute_names(file: &File) -> io::Result<Vec<CString>> {
+    attribute_names_with_limit(file, usize::MAX)
+}
+
+fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CString>> {
     let mut buffer = Vec::new();
     for _ in 0..ATTRIBUTE_SIZE_ATTEMPTS {
         // SAFETY: a null buffer with a zero length asks `flistxattr` only for
@@ -874,6 +1147,11 @@ fn attribute_names(file: &File) -> io::Result<Vec<CString>> {
         }
         if size == 0 {
             return Ok(Vec::new());
+        }
+        if size as usize > limit {
+            return Err(io::Error::other(
+                "file attribute list exceeds the Save metadata budget",
+            ));
         }
         buffer.resize(size as usize, 0);
         // SAFETY: the write is bounded by the buffer's own length.
@@ -908,6 +1186,14 @@ fn attribute_name_list(buffer: &[u8]) -> Vec<CString> {
 
 /// One attribute's value, or `None` when it was removed after being listed.
 fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+    read_attribute_with_limit(file, name, usize::MAX)
+}
+
+fn read_attribute_with_limit(
+    file: &File,
+    name: &CStr,
+    limit: usize,
+) -> io::Result<Option<Vec<u8>>> {
     let mut value = Vec::new();
     for _ in 0..ATTRIBUTE_SIZE_ATTEMPTS {
         // SAFETY: `name` outlives the call, and a null buffer with a zero
@@ -919,6 +1205,11 @@ fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
                 return Ok(None);
             }
             return Err(error);
+        }
+        if size as usize > limit {
+            return Err(io::Error::other(
+                "file attributes exceed the Save metadata budget",
+            ));
         }
         value.resize(size as usize, 0);
         // SAFETY: `name` outlives the call and the write is bounded by the
@@ -933,6 +1224,9 @@ fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
             )
         };
         if read >= 0 {
+            if read as usize > value.len() {
+                continue;
+            }
             value.truncate(read as usize);
             return Ok(Some(value));
         }
@@ -1621,6 +1915,29 @@ pub(crate) mod tests {
                 "{name:?} belongs to the kernel or the filesystem",
             );
         }
+    }
+
+    #[test]
+    fn retained_save_attribute_snapshot_reads_values_and_enforces_budget() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, b"one\n").expect("write");
+        if !tag(&path) {
+            return;
+        }
+        let file = File::open(&path).expect("open");
+        let attributes = content_attributes(&file).expect("snapshot");
+        assert_eq!(
+            attributes.get(OsStr::new("user.note")),
+            Some(&b"keepme".to_vec())
+        );
+        assert!(read_attribute_with_limit(&file, c"user.note", 5).is_err());
+        assert!(attribute_names_with_limit(&file, 1).is_err());
+        write_attribute(&file, c"user.note", b"new").expect("change attribute");
+        assert_ne!(
+            content_attributes(&file).expect("changed snapshot"),
+            attributes
+        );
     }
 
     #[test]

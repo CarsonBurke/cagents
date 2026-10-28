@@ -1,8 +1,11 @@
-//! Bounded filesystem invalidation for sidebar Git state. The watcher never
-//! runs Git or GitHub; its coalesced edges ask the UI's cancellable reader to do so.
+//! Bounded filesystem invalidation for Git state. The watcher never runs Git or
+//! GitHub; its coalesced edges ask the owner's cancellable reader to do so. The
+//! window's sidebar and the daemon's Work board each own one.
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    os::unix::fs::MetadataExt,
+    ffi::OsStr,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
@@ -17,13 +20,104 @@ use crate::{
 
 const MAX_DIRECTORIES: usize = 8192;
 
-fn watch_budget() -> usize {
-    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        // Leave half the kernel allowance for editors and other windows.
-        .map(|limit| (limit / 2).clamp(1, 262_144))
-        .unwrap_or(MAX_DIRECTORIES)
+/// Paths relative to a worktree root, sorted and kept in one allocation. A
+/// large checkout tracks tens of thousands of paths, and each watcher owner
+/// holds them for every worktree.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct PathSet {
+    text: Box<[u8]>,
+    /// Where each path ends in `text`.
+    ends: Box<[u32]>,
+}
+
+impl PathSet {
+    fn new<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Result<Self, String> {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths.dedup();
+        let mut text = Vec::with_capacity(paths.iter().map(|path| path.len()).sum());
+        let mut ends = Vec::with_capacity(paths.len());
+        for path in paths {
+            text.extend_from_slice(path);
+            ends.push(
+                u32::try_from(text.len())
+                    .map_err(|_| "the worktree tracks too many paths to watch".to_owned())?,
+            );
+        }
+        Ok(Self {
+            text: text.into(),
+            ends: ends.into(),
+        })
+    }
+
+    fn get(&self, index: usize) -> &[u8] {
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        &self.text[start..self.ends[index] as usize]
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        let path = path.as_os_str().as_bytes();
+        let (mut low, mut high) = (0, self.ends.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.get(middle).cmp(path) {
+                Ordering::Less => low = middle + 1,
+                Ordering::Equal => return true,
+                Ordering::Greater => high = middle,
+            }
+        }
+        false
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Path> {
+        (0..self.ends.len()).map(|index| Path::new(OsStr::from_bytes(self.get(index))))
+    }
+}
+
+impl std::fmt::Debug for PathSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PathSet({} paths)", self.ends.len())
+    }
+}
+
+/// What a worktree's index tracks. Branches rarely add or remove files, so
+/// most worktrees of a repository track the same paths and share one census,
+/// which a re-plan that finds them unchanged keeps as well.
+#[derive(Debug, PartialEq, Eq)]
+struct Census {
+    files: PathSet,
+    /// Every directory on the way to a file; the root is the empty path.
+    directories: PathSet,
+    submodules: bool,
+}
+
+impl Census {
+    fn new<'a>(
+        files: impl IntoIterator<Item = &'a [u8]>,
+        submodules: bool,
+    ) -> Result<Self, String> {
+        let files = PathSet::new(files)?;
+        let directories = PathSet::new(
+            files
+                .iter()
+                .flat_map(|file| file.ancestors().skip(1))
+                .chain([Path::new("")])
+                .map(|directory| directory.as_os_str().as_bytes()),
+        )?;
+        Ok(Self {
+            files,
+            directories,
+            submodules,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tracked {
+    File,
+    Directory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,29 +125,91 @@ pub struct Worktree {
     pub id: WorktreeId,
     pub root: PathBuf,
     pub git_dir: PathBuf,
+    census: Arc<Census>,
+    /// Complete nonignored directory membership, or a bounded prefix with polling.
+    /// Kept per checkout: unlike its index, empty/untracked folders need not match siblings.
+    directories: Arc<PathSet>,
     branch: Option<String>,
     upstream: Option<String>,
-    directories: BTreeSet<PathBuf>,
     polling: Option<String>,
 }
 
-/// Directory-only census includes empty nonignored folders without following
-/// symlinks or descending into ignored build trees or nested repositories.
+impl Worktree {
+    /// Whether `path` is a tracked file or a directory on the way to one.
+    fn tracks(&self, path: &Path) -> Option<Tracked> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        if self.census.directories.contains(relative) {
+            Some(Tracked::Directory)
+        } else {
+            self.census
+                .files
+                .contains(relative)
+                .then_some(Tracked::File)
+        }
+    }
+
+    fn watches_directory(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root).is_ok_and(|relative| {
+            self.census.directories.contains(relative) || self.directories.contains(relative)
+        })
+    }
+
+    fn untracked_content(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root).is_ok_and(|relative| {
+            self.directories.contains(relative)
+                || relative
+                    .parent()
+                    .is_some_and(|parent| self.directories.contains(parent))
+        })
+    }
+
+    /// Merge sorted compact paths without rebuilding the shared index census.
+    fn directories(&self) -> impl Iterator<Item = &Path> {
+        let mut tracked = self.census.directories.iter().peekable();
+        let mut content = self.directories.iter().peekable();
+        std::iter::from_fn(move || match (tracked.peek(), content.peek()) {
+            (Some(a), Some(b)) => match a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()) {
+                Ordering::Less => tracked.next(),
+                Ordering::Greater => content.next(),
+                Ordering::Equal => {
+                    content.next();
+                    tracked.next()
+                }
+            },
+            (Some(_), None) => tracked.next(),
+            (None, Some(_)) => content.next(),
+            (None, None) => None,
+        })
+    }
+
+    /// `relative` beneath the root; `join("")` would append a separator.
+    fn absolute(&self, relative: &Path) -> PathBuf {
+        if relative.as_os_str().is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(relative)
+        }
+    }
+}
+
+/// A bounded directory-only walk after complete Git ignore classification.
+/// Both entries examined and queued directories are capped, including flat trees.
 fn content_directories(
     root: &Path,
     ignored: &[crate::repository::RepoPath],
     cancellation: &CancellationToken,
-) -> Result<(BTreeSet<PathBuf>, bool), String> {
+) -> Result<(PathSet, bool), String> {
     use std::os::fd::AsRawFd;
     let handle = crate::fs_safety::Root::open(root).map_err(|error| error.to_string())?;
     let ignored = ignored
         .iter()
         .map(|path| path.as_path())
         .collect::<BTreeSet<_>>();
-    let limit = watch_budget();
     let mut pending = vec![PathBuf::new()];
     let mut directories = BTreeSet::new();
-    while let Some(relative) = pending.pop() {
+    let mut entries_left = MAX_DIRECTORIES;
+    let mut incomplete = false;
+    'walk: while let Some(relative) = pending.pop() {
         if cancellation.is_cancelled() {
             return Err("watch planning cancelled".into());
         }
@@ -69,31 +225,42 @@ fn content_directories(
             std::fs::read_dir(format!("/proc/self/fd/{}", reader.as_raw_fd()))
                 .map_err(|error| error.to_string())?
         };
-        directories.insert(root.join(&relative));
-        if directories.len() >= limit {
-            return Ok((directories, true));
-        }
+        directories.insert(relative.clone());
         for entry in entries {
+            if entries_left == 0 {
+                incomplete = true;
+                break 'walk;
+            }
+            entries_left -= 1;
             let entry = entry.map_err(|error| error.to_string())?;
-            if entry.file_name() == ".git" || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if entry.file_name() == ".git"
+                || !entry.file_type().map_err(|e| e.to_string())?.is_dir()
+            {
                 continue;
             }
             let child = relative.join(entry.file_name());
             if child.ancestors().any(|ancestor| ignored.contains(ancestor)) {
                 continue;
             }
-            // Nested checkouts and submodules have their own Git state. Their
-            // already-known directory is covered, but never traverse its tree.
+            // Nested checkouts/submodules keep their independent Git authority.
             if crate::fs_safety::metadata_beneath(&handle, &child.join(".git")).is_ok() {
                 continue;
             }
-            if pending.len() + directories.len() >= limit {
-                return Ok((directories, true));
+            if pending.len() + directories.len() >= MAX_DIRECTORIES {
+                incomplete = true;
+                break 'walk;
             }
             pending.push(child);
         }
     }
-    Ok((directories, false))
+    let paths = PathSet::new(directories.iter().map(|p| p.as_os_str().as_bytes()))?;
+    Ok((paths, incomplete))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryMode {
+    Tracked,
+    Nonignored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,11 +268,33 @@ pub struct Project {
     pub id: ProjectId,
     pub common_dir: PathBuf,
     pub worktrees: Vec<Worktree>,
+    mode: DirectoryMode,
     polling: Option<String>,
 }
 
 impl Project {
     pub fn read_changed(
+        id: ProjectId,
+        common_dir: PathBuf,
+        records: &[WorktreeRecord],
+        cancellation: &CancellationToken,
+        previous: Option<&Self>,
+        changed: &BTreeSet<WorktreeId>,
+    ) -> Result<Self, String> {
+        Self::read_changed_inner(
+            id,
+            common_dir,
+            records,
+            cancellation,
+            previous,
+            changed,
+            &BTreeMap::new(),
+            MAX_DIRECTORIES,
+            DirectoryMode::Tracked,
+        )
+    }
+
+    pub fn read_changed_with_upstreams(
         id: ProjectId,
         common_dir: PathBuf,
         records: &[WorktreeRecord],
@@ -122,7 +311,7 @@ impl Project {
             previous,
             changed,
             upstreams,
-            watch_budget().min(100_000),
+            MAX_DIRECTORIES,
         )
     }
 
@@ -136,28 +325,57 @@ impl Project {
         upstreams: &BTreeMap<WorktreeId, String>,
         inventory_limit: usize,
     ) -> Result<Self, String> {
+        Self::read_changed_inner(
+            id,
+            common_dir,
+            records,
+            cancellation,
+            previous,
+            changed,
+            upstreams,
+            inventory_limit,
+            DirectoryMode::Nonignored,
+        )
+    }
+
+    fn read_changed_inner(
+        id: ProjectId,
+        common_dir: PathBuf,
+        records: &[WorktreeRecord],
+        cancellation: &CancellationToken,
+        previous: Option<&Self>,
+        changed: &BTreeSet<WorktreeId>,
+        upstreams: &BTreeMap<WorktreeId, String>,
+        inventory_limit: usize,
+        mode: DirectoryMode,
+    ) -> Result<Self, String> {
         let git = RepositoryService::system("git");
-        let mut worktrees = Vec::new();
+        let mut worktrees: Vec<Worktree> = Vec::new();
         let mut planning_failure = None;
         let polling = network_filesystem(&common_dir)
             .map_err(|error| error.to_string())?
             .then(|| "network or FUSE filesystem may omit native change events".to_owned());
         for record in records.iter().filter(|record| !record.bare) {
-            if !changed.contains(&record.id)
-                && let Some(old) = previous.and_then(|previous| {
-                    previous
-                        .worktrees
-                        .iter()
-                        .find(|old| old.id == record.id && old.root == record.path)
-                })
+            let old = previous.and_then(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|old| old.id == record.id && old.root == record.path)
+            });
+            if previous.is_some_and(|previous| previous.mode == mode)
+                && !changed.contains(&record.id)
+                && let Some(old) = old
             {
-                worktrees.push(old.clone());
+                let mut next = old.clone();
+                next.branch = record.branch.clone();
+                next.upstream = upstreams.get(&record.id).cloned();
+                worktrees.push(next);
                 continue;
             }
             let planned = (|| -> Result<Worktree, String> {
                 let actual_common = git
                     .common_dir(&record.path, cancellation)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|e| e.to_string())?;
                 if actual_common != common_dir {
                     return Err(format!(
                         "{} now belongs to another repository",
@@ -166,84 +384,80 @@ impl Project {
                 }
                 let git_dir = git
                     .git_dir(&record.path, cancellation)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|e| e.to_string())?;
                 let mut worktree_polling = network_filesystem(&record.path)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|e| e.to_string())?
                     .then(|| "network or FUSE filesystem may omit native change events".to_owned());
-                let files =
-                    match git.watch_files_projection(&record.path, inventory_limit, cancellation) {
-                        Ok(files) => {
-                            if files.listing_truncated {
-                                // The independent census below still covers every
-                                // nonignored directory within the watch budget.
-                                // Force-tracked children beyond this prefix need
-                                // the explicit, quiet periodic fallback.
-                                worktree_polling
-                                    .get_or_insert_with(|| "directory watch limit reached".into());
-                            }
-                            files
+                let index = match git.index_paths(&record.path, cancellation) {
+                    Ok(index) => Some(index),
+                    Err(error) => {
+                        if mode == DirectoryMode::Tracked {
+                            return Err(error.to_string());
                         }
-                        Err(error) => {
-                            if cancellation.is_cancelled() {
-                                return Err("watch planning cancelled".into());
-                            }
-                            worktree_polling = Some(error.to_string());
-                            crate::repository::WorkingFiles::default()
-                        }
-                    };
-                // ls-files lists files, not empty directories. An agent can
-                // create a folder long before its first file, so discover those
-                // too. Git collapses ignored build trees before the filesystem
-                // walk; force-tracked ancestors remain in the file-derived set.
-                let ignored = git.ignored_files_with_limit(
-                    &record.path,
-                    &files.paths,
-                    Some(inventory_limit),
-                    cancellation,
-                );
-
-                let mut directories = BTreeSet::from([record.path.clone()]);
-                for file in files.paths {
-                    let path = record.path.join(file.as_path());
-                    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-                        worktree_polling.get_or_insert_with(|| {
-                            "submodule contents require a periodic local Git check".into()
-                        });
+                        worktree_polling = Some(error.to_string());
+                        None
                     }
-
-                    let mut parent = path.parent();
-                    while let Some(directory) = parent.filter(|path| path.starts_with(&record.path))
-                    {
-                        directories.insert(directory.to_owned());
-                        parent = directory.parent();
-                    }
+                };
+                if cancellation.is_cancelled() {
+                    return Err("watch planning cancelled".into());
                 }
-                match ignored {
-                    Ok(ignored) if !ignored.listing_truncated => {
-                        match content_directories(
+                let census = if let Some(index) = &index {
+                    let census = Census::new(
+                        index.paths.iter().map(|p| p.as_os_str().as_bytes()),
+                        index.gitlinks,
+                    )?;
+                    worktrees
+                        .iter()
+                        .chain(previous.iter().flat_map(|project| &project.worktrees))
+                        .map(|worktree| &worktree.census)
+                        .find(|known| ***known == census)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(census))
+                } else if let Some(old) = old {
+                    old.census.clone()
+                } else {
+                    Arc::new(Census::new([], false)?)
+                };
+                if census.submodules {
+                    worktree_polling.get_or_insert_with(|| {
+                        "submodule contents require a periodic local Git check".into()
+                    });
+                }
+                let mut directories = PathSet::new([b"".as_slice()])?;
+                if mode == DirectoryMode::Nonignored
+                    && let Some(index) = &index
+                {
+                    match git.ignored_files_with_limit(
+                        &record.path,
+                        &index.paths,
+                        Some(inventory_limit),
+                        cancellation,
+                    ) {
+                        Ok(ignored) if !ignored.listing_truncated => match content_directories(
                             &record.path,
                             &ignored.ignored_directories,
                             cancellation,
                         ) {
                             Ok((content, incomplete)) => {
-                                directories.extend(content);
+                                directories = content;
                                 if incomplete {
                                     worktree_polling.get_or_insert_with(|| {
                                         "directory watch limit reached".into()
                                     });
                                 }
                             }
-                            Err(error) => worktree_polling = Some(error),
+                            Err(error) => {
+                                worktree_polling = Some(error);
+                            }
+                        },
+                        Ok(_) => {
+                            worktree_polling
+                                .get_or_insert_with(|| "directory watch limit reached".into());
+                        }
+                        Err(error) => {
+                            worktree_polling = Some(error.to_string());
                         }
                     }
-                    Ok(_) => {
-                        // Without complete ignore classification, descending
-                        // could walk an ignored build tree. Keep the verified
-                        // inventory/root/admin coverage and poll the rest.
-                        worktree_polling
-                            .get_or_insert_with(|| "directory watch limit reached".into());
-                    }
-                    Err(error) => worktree_polling = Some(error.to_string()),
                 }
                 if cancellation.is_cancelled() {
                     return Err("watch planning cancelled".into());
@@ -252,46 +466,92 @@ impl Project {
                     id: record.id,
                     root: record.path.clone(),
                     git_dir,
+                    census,
+                    directories: if mode == DirectoryMode::Tracked {
+                        Arc::default()
+                    } else {
+                        old.filter(|old| index.is_none() || *old.directories == directories)
+                            .map(|old| old.directories.clone())
+                            .unwrap_or_else(|| Arc::new(directories))
+                    },
                     branch: record.branch.clone(),
                     upstream: upstreams.get(&record.id).cloned(),
-                    directories,
                     polling: worktree_polling,
                 })
             })();
             match planned {
                 Ok(worktree) => worktrees.push(worktree),
                 Err(error) => {
+                    if mode == DirectoryMode::Tracked || cancellation.is_cancelled() {
+                        return Err(error);
+                    }
                     planning_failure = Some(error.clone());
                     tracing::warn!(worktree = %record.path.display(), %error, "cannot update worktree watches; retaining sibling coverage");
-                    if let Some(old) = previous.and_then(|project| {
-                        project
-                            .worktrees
-                            .iter()
-                            .find(|worktree| worktree.id == record.id)
-                    }) {
+                    if let Some(old) = old {
                         worktrees.push(old.clone());
+                    } else {
+                        worktrees.push(Worktree {
+                            id: record.id,
+                            root: record.path.clone(),
+                            git_dir: common_dir.clone(),
+                            census: Arc::new(Census::new([], false)?),
+                            directories: Arc::new(PathSet::new([b"".as_slice()])?),
+                            branch: record.branch.clone(),
+                            upstream: upstreams.get(&record.id).cloned(),
+                            polling: Some(error),
+                        });
                     }
                 }
             }
         }
-        let polling = polling.or(planning_failure).or_else(|| {
-            worktrees
-                .iter()
-                .find_map(|worktree| worktree.polling.clone())
-        });
+        let polling = polling
+            .or(planning_failure)
+            .or_else(|| worktrees.iter().find_map(|w| w.polling.clone()));
         Ok(Self {
             id,
             common_dir,
             worktrees,
+            mode,
             polling,
         })
+    }
+
+    pub fn refresh_associations(
+        &self,
+        records: &[WorktreeRecord],
+        upstreams: &BTreeMap<WorktreeId, String>,
+    ) -> Option<Self> {
+        let records = records
+            .iter()
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
+        let branch = |worktree: &Worktree| {
+            records
+                .get(&worktree.id)
+                .filter(|record| record.path == worktree.root)
+                .map(|record| &record.branch)
+        };
+        if self.worktrees.iter().all(|worktree| {
+            branch(worktree).is_none_or(|branch| branch == &worktree.branch)
+                && worktree.upstream.as_ref() == upstreams.get(&worktree.id)
+        }) {
+            return None;
+        }
+        let mut next = self.clone();
+        for worktree in &mut next.worktrees {
+            if let Some(branch) = branch(worktree) {
+                worktree.branch.clone_from(branch);
+            }
+            worktree.upstream = upstreams.get(&worktree.id).cloned();
+        }
+        Some(next)
     }
 
     pub fn refresh_upstreams(&self, upstreams: &BTreeMap<WorktreeId, String>) -> Option<Self> {
         if self
             .worktrees
             .iter()
-            .all(|worktree| worktree.upstream.as_ref() == upstreams.get(&worktree.id))
+            .all(|w| w.upstream.as_ref() == upstreams.get(&w.id))
         {
             return None;
         }
@@ -304,13 +564,11 @@ impl Project {
 
     pub fn matches(&self, common_dir: &Path, records: &[WorktreeRecord]) -> bool {
         self.common_dir == common_dir
-            && self.worktrees.len() == records.iter().filter(|record| !record.bare).count()
-            && self.worktrees.iter().all(|previous| {
-                records.iter().any(|record| {
-                    previous.id == record.id
-                        && previous.root == record.path
-                        && previous.branch == record.branch
-                })
+            && self.worktrees.len() == records.iter().filter(|r| !r.bare).count()
+            && self.worktrees.iter().all(|w| {
+                records
+                    .iter()
+                    .any(|r| w.id == r.id && w.root == r.path && w.branch == r.branch)
             })
     }
 
@@ -322,8 +580,11 @@ impl Project {
         if let Some(parent) = self.common_dir.parent() {
             paths.insert(parent.to_owned(), RecursiveMode::NonRecursive);
         }
-        paths.insert(self.common_dir.join("info"), RecursiveMode::NonRecursive);
-        for name in ["refs", "worktrees", "logs/refs"] {
+        if self.mode == DirectoryMode::Nonignored {
+            paths.insert(self.common_dir.join("info"), RecursiveMode::NonRecursive);
+            paths.insert(self.common_dir.join("logs/refs"), RecursiveMode::Recursive);
+        }
+        for name in ["refs", "worktrees"] {
             paths.insert(self.common_dir.join(name), RecursiveMode::Recursive);
         }
         for worktree in &self.worktrees {
@@ -336,78 +597,62 @@ impl Project {
         paths
     }
 
-    /// Every directory on the way to a tracked file: one watch each, and by
-    /// far the larger share of a checkout's registrations.
-    fn content_paths(&self) -> impl Iterator<Item = &Path> {
-        self.worktrees.iter().flat_map(|worktree| {
-            worktree
-                .directories
-                .iter()
-                .filter(|directory| {
-                    !directory
-                        .ancestors()
-                        .take_while(|path| path.starts_with(&worktree.root))
-                        .any(|path| {
-                            std::fs::symlink_metadata(path)
-                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                        })
-                })
-                .map(PathBuf::as_path)
-        })
-    }
-
     fn change(&self, event: &Event) -> Option<Change> {
         if matches!(event.kind, EventKind::Access(_)) {
             return None;
         }
         let mut change = Change::default();
         for path in &event.paths {
-            // Git writes temporary locks before publishing the actual file.
-            // Reading those creates duplicate work and can race the mutation.
-            if path.starts_with(&self.common_dir)
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "lock")
-            {
-                continue;
-            }
             if path == &self.common_dir {
                 change.topology = true;
                 change.membership = true;
             }
             let common = path.strip_prefix(&self.common_dir).ok();
-            if common.is_some_and(|relative| {
-                relative == Path::new("config")
-                    || relative == Path::new("packed-refs")
-                    || relative == Path::new("info/exclude")
-            }) {
-                change
-                    .worktrees
-                    .extend(self.worktrees.iter().map(|worktree| worktree.id));
-                change.metadata = true;
-                change.membership |= common != Some(Path::new("packed-refs"));
-                continue;
-            }
-            if common.is_some_and(|relative| {
-                relative == Path::new("refs/stash") || relative == Path::new("logs/refs/stash")
-            }) {
+            if self.mode == DirectoryMode::Nonignored
+                && (common == Some(Path::new("logs/refs/stash"))
+                    || common == Some(Path::new("refs/stash")))
+            {
                 change.metadata = true;
                 change.shared_snapshot = true;
                 continue;
             }
-            if let Some(relative) = common.filter(|relative| relative.starts_with("refs")) {
+            if common.is_some_and(common_metadata_noise) {
+                continue;
+            }
+            if common.is_some_and(|relative| {
+                relative == Path::new("config")
+                    || relative == Path::new("packed-refs")
+                    || self.mode == DirectoryMode::Nonignored
+                        && relative == Path::new("info/exclude")
+                    || relative.starts_with("refs")
+            }) {
+                change.references = true;
                 change.metadata = true;
-                for worktree in &self.worktrees {
-                    if worktree
-                        .branch
-                        .as_deref()
-                        .is_some_and(|branch| relative == Path::new(branch))
-                        || worktree.upstream.as_ref().is_some_and(|upstream| {
-                            relative == Path::new(&format!("refs/remotes/{upstream}"))
-                                || relative == Path::new(&format!("refs/heads/{upstream}"))
-                        })
-                    {
-                        change.worktrees.insert(worktree.id);
+                change.membership |= common == Some(Path::new("refs"))
+                    || self.mode == DirectoryMode::Nonignored
+                        && matches!(common, Some(path) if path == Path::new("config") || path == Path::new("info/exclude"));
+                if self.mode == DirectoryMode::Nonignored
+                    && let Some(relative) = common
+                {
+                    if relative == Path::new("config") || relative == Path::new("info/exclude") {
+                        // Shared ignore rules can change every checkout's
+                        // directory census, even without a content event.
+                        change
+                            .worktrees
+                            .extend(self.worktrees.iter().map(|worktree| worktree.id));
+                    }
+                    for worktree in &self.worktrees {
+                        if worktree
+                            .branch
+                            .as_deref()
+                            .is_some_and(|branch| relative == Path::new(branch))
+                            || worktree.upstream.as_ref().is_some_and(|upstream| {
+                                relative == Path::new(&format!("refs/remotes/{upstream}"))
+                                    || relative == Path::new(&format!("refs/heads/{upstream}"))
+                            })
+                        {
+                            change.worktrees.insert(worktree.id);
+                        }
                     }
                 }
                 continue;
@@ -435,27 +680,28 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                 }
                 if metadata_owner == Some(worktree.id) {
+                    let relative = path.strip_prefix(&worktree.git_dir).unwrap();
+                    if metadata_noise(relative) {
+                        continue;
+                    }
                     change.worktrees.insert(worktree.id);
-                    let name = path.file_name();
                     change.metadata = true;
-                    // Index publication can turn tracked paths into untracked
-                    // paths without a content event (git rm --cached). Ref and
-                    // operation metadata alone retain the complete cached count.
-                    change.untracked |= name.is_some_and(|name| name == "index");
-                    change.membership |=
-                        name.is_some_and(|name| name == "HEAD" || name == "config.worktree");
-                    change.topology |= path
-                        .file_name()
-                        .is_some_and(|name| name == "locked" || name == "gitdir");
+                    change.untracked |= relative == Path::new("index")
+                        || relative.as_os_str().as_bytes().starts_with(b"sharedindex.");
+                    let topology = relative.as_os_str().is_empty()
+                        || matches!(relative.to_str(), Some("locked" | "gitdir" | "commondir"));
+                    change.topology |= topology;
+                    // HEAD and operation-state updates invalidate status, but
+                    // only index changes can change the tracked-path census.
+                    change.membership |= topology
+                        || relative == Path::new("index")
+                        || relative == Path::new("refs")
+                        || relative.as_os_str().as_bytes().starts_with(b"sharedindex.");
                 } else if !path.starts_with(&worktree.git_dir)
-                    && (worktree.directories.contains(path)
-                        || path
-                            .parent()
-                            .is_some_and(|parent| worktree.directories.contains(parent)))
+                    && (worktree.tracks(path).is_some() || worktree.untracked_content(path))
                 {
+                    let directory = worktree.watches_directory(path);
                     change.worktrees.insert(worktree.id);
-                    // Creation, removal and rename can change the untracked
-                    // count. Ordinary file writes retain the last complete count.
                     change.untracked |= matches!(
                         event.kind,
                         EventKind::Create(_)
@@ -464,32 +710,72 @@ impl Project {
                     );
                     // A removed/recreated ancestor needs new directory watches;
                     // simple file edits keep the existing tracked-path census.
-                    change.membership |= worktree.directories.contains(path)
-                        || path.file_name().is_some_and(|name| name == ".gitignore")
+                    change.membership |= self.mode == DirectoryMode::Nonignored
+                        && path.file_name().is_some_and(|name| name == ".gitignore")
                         || matches!(
                             event.kind,
                             EventKind::Create(notify::event::CreateKind::Folder)
                                 | EventKind::Remove(notify::event::RemoveKind::Folder)
-                        );
+                        )
+                        || directory
+                            && matches!(
+                                event.kind,
+                                EventKind::Any
+                                    | EventKind::Other
+                                    | EventKind::Create(_)
+                                    | EventKind::Remove(_)
+                                    | EventKind::Modify(notify::event::ModifyKind::Any)
+                                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            );
                     change.topology |= path == &worktree.root;
                 }
             }
         }
-        (change.topology || change.metadata || !change.worktrees.is_empty()).then_some(change)
+        (change.topology || change.references || change.metadata || !change.worktrees.is_empty())
+            .then_some(change)
     }
+}
+
+/// Git writes temporary locks and bookkeeping during status/refresh too.
+/// Classify paths individually: a rename may contain both index.lock and index.
+fn metadata_noise(relative: &Path) -> bool {
+    relative.starts_with("objects")
+        || relative.starts_with("logs")
+        || relative
+            .file_name()
+            .is_some_and(|name| name.as_bytes().ends_with(b".lock"))
+}
+
+fn common_metadata_noise(relative: &Path) -> bool {
+    // Linked worktree administrative directories share this shape even before
+    // the next topology read discovers their owner. Strip the directory name,
+    // not a suffix: a legitimate worktree can itself be named `checkout.lock`.
+    if let Ok(relative) = relative.strip_prefix("worktrees") {
+        let mut components = relative.components();
+        components.next();
+        metadata_noise(components.as_path())
+    } else {
+        metadata_noise(relative)
+    }
+}
+
+fn access_only(event: &Event) -> bool {
+    matches!(event.kind, EventKind::Access(_)) && !event.need_rescan()
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Change {
+    /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
+    /// Shared refs or configuration changed: a commit, fetch or branch
+    /// update. Any worktree's comparison may have moved, but its status only
+    /// where its own `HEAD` did, which a consumer can tell from the refs.
+    pub references: bool,
+    pub untracked: bool,
+    pub metadata: bool,
+    pub shared_snapshot: bool,
     pub topology: bool,
     pub membership: bool,
-    /// A content entry appeared/disappeared; replace the cached untracked count.
-    pub untracked: bool,
-    /// Index, HEAD, refs or config changed, invalidating cached panel metadata.
-    pub metadata: bool,
-    /// Shared stash data changes the one bound panel, without rereading every checkout.
-    pub shared_snapshot: bool,
     pub error: Option<String>,
     pub coverage: Option<bool>,
 }
@@ -497,11 +783,12 @@ pub(crate) struct Change {
 impl Change {
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
-        self.topology |= other.topology;
-        self.membership |= other.membership;
+        self.references |= other.references;
         self.untracked |= other.untracked;
         self.metadata |= other.metadata;
         self.shared_snapshot |= other.shared_snapshot;
+        self.topology |= other.topology;
+        self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
             self.coverage = Some(coverage);
             if coverage {
@@ -531,7 +818,10 @@ struct Configuration {
 }
 
 impl Pending {
-    fn event(&mut self, event: notify::Result<Event>) {
+    fn event(&mut self, event: notify::Result<Event>) -> bool {
+        if event.as_ref().is_ok_and(access_only) {
+            return false;
+        }
         self.faulted |= event.is_err();
         let affected = match &event {
             Ok(event) if !event.need_rescan() => event
@@ -544,6 +834,7 @@ impl Pending {
                 .collect::<BTreeSet<_>>(),
             _ => self.projects.keys().copied().collect(),
         };
+        let mut changed = false;
         for id in affected {
             let Some(project) = self.projects.get(&id) else {
                 continue;
@@ -567,8 +858,10 @@ impl Pending {
             };
             if let Some(change) = change {
                 self.changes.entry(id).or_default().merge(change);
+                changed = true;
             }
         }
+        changed
     }
 }
 
@@ -582,12 +875,20 @@ struct Registrations {
 }
 
 impl Registrations {
-    /// Keep background admin coverage when it fits alongside selected content.
-    /// Under tighter pressure the hot workspaces win and omitted coverage uses
-    /// the quiet polling fallback.
-    #[cfg(test)]
+    /// Metadata gets first claim on the watch and filesystem-work budgets.
+    /// Content traversal also has a candidate budget: missing or symlinked
+    /// directories cannot make a large census an unbounded planning job.
+    /// Projects left short of coverage retain the existing polling fallback.
     fn within(projects: &BTreeMap<ProjectId, Arc<Project>>, limit: usize) -> Self {
-        Self::prioritized(projects, &[], &[], limit)
+        Self::within_with(projects, limit, |path| std::fs::symlink_metadata(path))
+    }
+
+    fn within_with(
+        projects: &BTreeMap<ProjectId, Arc<Project>>,
+        limit: usize,
+        inspect: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Self {
+        Self::prioritized_with(projects, &[], &[], limit, inspect)
     }
 
     fn prioritized(
@@ -596,158 +897,259 @@ impl Registrations {
         selected: &[WorktreeId],
         limit: usize,
     ) -> Self {
+        Self::prioritized_with(projects, priority, selected, limit, |path| {
+            std::fs::symlink_metadata(path)
+        })
+    }
+
+    fn prioritized_with(
+        projects: &BTreeMap<ProjectId, Arc<Project>>,
+        priority: &[ProjectId],
+        selected: &[WorktreeId],
+        limit: usize,
+        mut inspect: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Self {
         let mut registrations = Self::default();
-        let mut metadata_order = projects.iter().collect::<Vec<_>>();
-        metadata_order.sort_by_key(|(id, _)| {
-            priority
-                .iter()
-                .position(|candidate| candidate == *id)
-                .unwrap_or(usize::MAX)
-        });
-        let hot_projects = projects
-            .iter()
-            .filter(|(_, project)| {
-                project
-                    .worktrees
-                    .iter()
-                    .any(|worktree| selected.contains(&worktree.id))
-            })
-            .map(|(id, _)| *id)
-            .collect::<BTreeSet<_>>();
-        let mut reserved = projects
-            .values()
-            .flat_map(|project| project.metadata_paths().into_keys())
-            .filter(|path| path.is_dir())
-            .collect::<BTreeSet<_>>();
-        for project in projects.values() {
-            for worktree in project
-                .worktrees
-                .iter()
-                .filter(|worktree| selected.contains(&worktree.id))
-            {
-                reserved.extend(
-                    project
-                        .content_paths()
-                        .filter(|path| path.starts_with(&worktree.root))
-                        .map(Path::to_owned),
-                );
-            }
-        }
-        // Reserve hot content even when all admin paths fit but leave too
-        // little room for the selected workspaces. When both fit, keep every
-        // project's admin edges before allocating any background content.
-        let oversubscribed = reserved.len() > limit;
-        for (&id, project) in metadata_order.iter().copied() {
+        let mut checks = limit;
+        for (&id, project) in projects {
             if let Some(reason) = &project.polling {
                 registrations.failures.insert(id, reason.clone());
             }
-            if !oversubscribed || hot_projects.contains(&id) {
-                for (path, mode) in project.metadata_paths() {
-                    registrations.claim(id, path, mode, limit);
-                }
+            for (path, mode) in project.metadata_paths() {
+                let _ = registrations.claim(id, path, mode, limit, &mut checks, &mut inspect);
             }
         }
-        let mut ordered = projects.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|(id, _)| {
-            priority
-                .iter()
-                .position(|candidate| candidate == *id)
-                .unwrap_or(usize::MAX)
+        let mut candidates = limit;
+        let mut roots: BTreeMap<&Path, Vec<(ProjectId, &Worktree)>> = BTreeMap::new();
+        for (&id, project) in projects {
+            for worktree in &project.worktrees {
+                roots
+                    .entry(&worktree.root)
+                    .or_default()
+                    .push((id, worktree));
+            }
+        }
+        // All metadata has already claimed its bounded share. Only remaining
+        // content slots can favor selected worktrees and the active project.
+        let mut priority_order = BTreeMap::new();
+        for (rank, id) in priority.iter().copied().enumerate() {
+            priority_order.entry(id).or_insert(rank);
+        }
+        let selected = selected.iter().copied().collect::<BTreeSet<_>>();
+        let mut ordered = projects.values().collect::<Vec<_>>();
+        ordered.sort_by_key(|project| {
+            (
+                priority_order
+                    .get(&project.id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                project.id,
+            )
         });
-        // Share the available content budget between the active binding and
-        // independently selected worktrees before filling in background ones.
-        // Round-robin prevents a large active tree starving a selected project.
-        let mut preferred = selected
+        let mut preferred = ordered
             .iter()
-            .filter_map(|selected| {
-                projects.iter().find_map(|(&id, project)| {
-                    let worktree = project
-                        .worktrees
-                        .iter()
-                        .find(|worktree| worktree.id == *selected)?;
-                    let paths = project
-                        .content_paths()
-                        .filter(|path| path.starts_with(&worktree.root))
-                        .collect::<Vec<_>>();
-                    Some((id, paths.into_iter()))
-                })
+            .flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .map(move |worktree| (project.id, worktree))
             })
+            .filter(|(_, worktree)| selected.contains(&worktree.id))
+            .map(|(id, worktree)| (id, worktree, worktree.directories(), BTreeSet::new()))
             .collect::<Vec<_>>();
         loop {
             let mut progressed = false;
-            for (id, paths) in &mut preferred {
-                if let Some(path) = paths.next() {
-                    registrations.claim(*id, path.to_owned(), RecursiveMode::NonRecursive, limit);
+            for (id, worktree, paths, blocked) in &mut preferred {
+                if let Some(relative) = paths.next() {
                     progressed = true;
+                    registrations.content_path(
+                        *id,
+                        worktree,
+                        relative,
+                        blocked,
+                        limit,
+                        &mut candidates,
+                        &mut checks,
+                        &mut inspect,
+                    );
                 }
             }
-            if !progressed {
+            if !progressed || candidates == 0 {
+                if progressed && candidates == 0 {
+                    for (id, _, paths, _) in &mut preferred {
+                        if paths.next().is_some() {
+                            registrations.exhausted(*id);
+                        }
+                    }
+                }
                 break;
             }
         }
-        if oversubscribed {
-            for (&id, project) in metadata_order {
-                if !hot_projects.contains(&id) {
-                    for (path, mode) in project.metadata_paths() {
-                        registrations.claim(id, path, mode, limit);
-                    }
-                }
-            }
+        drop(preferred);
+        for project in ordered {
+            registrations.content(
+                project,
+                &selected,
+                limit,
+                &mut candidates,
+                &mut checks,
+                &mut inspect,
+            );
         }
-        for (&id, project) in ordered {
-            for path in project.content_paths() {
-                registrations.claim(id, path.to_owned(), RecursiveMode::NonRecursive, limit);
+        // A project may share already-registered content after the traversal
+        // budget is spent. Route the bounded desired paths through their root
+        // ancestors, without scanning every project's entire census or every
+        // unrelated worktree for each watch.
+        for path in registrations.desired.keys() {
+            for &(id, worktree) in path
+                .ancestors()
+                .filter_map(|ancestor| roots.get(ancestor))
+                .flatten()
+            {
+                if worktree.watches_directory(path) {
+                    registrations
+                        .owners
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(id);
+                }
             }
         }
         registrations
     }
 
-    fn claim(&mut self, id: ProjectId, path: PathBuf, mode: RecursiveMode, limit: usize) {
-        self.owners.entry(path.clone()).or_default().insert(id);
-        // Never follow a tracked symlink into another checkout. Missing
-        // ancestors remain covered by their existing parent; a creation event
-        // rebuilds this registration.
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => {
-                self.failures.insert(id, error.to_string());
-                return;
+    fn exhausted(&mut self, id: ProjectId) {
+        self.failures
+            .insert(id, "directory watch limit reached".to_owned());
+    }
+
+    fn content(
+        &mut self,
+        project: &Project,
+        selected: &BTreeSet<WorktreeId>,
+        limit: usize,
+        candidates: &mut usize,
+        checks: &mut usize,
+        inspect: &mut impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) {
+        for worktree in project
+            .worktrees
+            .iter()
+            .filter(|worktree| !selected.contains(&worktree.id))
+        {
+            let mut blocked = BTreeSet::new();
+            for relative in worktree.directories() {
+                if !self.content_path(
+                    project.id,
+                    worktree,
+                    relative,
+                    &mut blocked,
+                    limit,
+                    candidates,
+                    checks,
+                    inspect,
+                ) {
+                    return;
+                }
             }
         }
-        if self.desired.len() >= limit && !self.desired.contains_key(&path) {
-            self.failures
-                .insert(id, "directory watch limit reached".to_owned());
-            return;
+    }
+
+    fn content_path(
+        &mut self,
+        id: ProjectId,
+        worktree: &Worktree,
+        relative: &Path,
+        blocked: &mut BTreeSet<PathBuf>,
+        limit: usize,
+        candidates: &mut usize,
+        checks: &mut usize,
+        inspect: &mut impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> bool {
+        if *candidates == 0 {
+            self.exhausted(id);
+            return false;
         }
-        self.desired
-            .entry(path)
-            .and_modify(|old| {
-                if mode == RecursiveMode::Recursive {
-                    *old = mode;
-                }
-            })
-            .or_insert(mode);
+        *candidates -= 1;
+        if relative
+            .ancestors()
+            .any(|ancestor| blocked.contains(ancestor))
+        {
+            return true;
+        }
+        match self.claim(
+            id,
+            worktree.absolute(relative),
+            RecursiveMode::NonRecursive,
+            limit,
+            checks,
+            inspect,
+        ) {
+            Some(true) => true,
+            Some(false) => {
+                blocked.insert(relative.to_owned());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// None means exhausted; false means absent, non-directory, or unreadable.
+    fn claim(
+        &mut self,
+        id: ProjectId,
+        path: PathBuf,
+        mode: RecursiveMode,
+        limit: usize,
+        checks: &mut usize,
+        inspect: &mut impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Option<bool> {
+        if let Some(registered) = self.desired.get_mut(&path) {
+            if mode == RecursiveMode::Recursive {
+                *registered = mode;
+            }
+            self.owners.entry(path).or_default().insert(id);
+            return Some(true);
+        }
+        if self.desired.len() >= limit || *checks == 0 {
+            self.exhausted(id);
+            return None;
+        }
+        *checks -= 1;
+        match inspect(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Some(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(error) => {
+                self.failures.insert(id, error.to_string());
+                return Some(false);
+            }
+        }
+        self.owners.entry(path.clone()).or_default().insert(id);
+        self.desired.insert(path, mode);
+        Some(true)
     }
 }
 
-/// One native watcher for the window, with at most one pending wake regardless
-/// of event rate. Registration happens on its coordinator, never the UI thread.
+/// One native watcher for its owner, with at most one pending change set
+/// regardless of event rate. Registration happens on its coordinator, never on
+/// the owner's thread.
 pub(crate) struct Monitor {
     commands: mpsc::SyncSender<()>,
     configuration: Arc<Mutex<Configuration>>,
     pending: Arc<Mutex<Pending>>,
-    pub receiver: async_channel::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Monitor {
-    pub fn start() -> std::io::Result<Self> {
+    /// `wake` runs on the watcher's threads whenever changes are pending to
+    /// [`drain`](Self::drain). It may run for every event, so it must only
+    /// signal (a bounded `try_send`, a condvar notify) and never block.
+    pub fn start(wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
         let (commands, requests) = mpsc::sync_channel(1);
         let configuration = Arc::new(Mutex::new(Configuration::default()));
         let desired_configuration = configuration.clone();
-        let (wake, receiver) = async_channel::bounded(1);
+        let wake = Arc::new(wake);
         let pending = Arc::new(Mutex::new(Pending::default()));
         let state = pending.clone();
         let thread = thread::Builder::new()
@@ -756,11 +1158,15 @@ impl Monitor {
                 let create_watcher = || {
                     let events = state.clone();
                     let signal = wake.clone();
-                    notify::recommended_watcher(move |event| {
+                    notify::recommended_watcher(move |event: notify::Result<Event>| {
+                        // Git status itself produces Access traffic. A requested
+                        // rescan still reaches the normal recovery path.
+                        if event.as_ref().is_ok_and(access_only) {
+                            return;
+                        }
                         let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
-                        pending.event(event);
-                        if !pending.changes.is_empty() {
-                            let _ = signal.try_send(());
+                        if pending.event(event) {
+                            signal();
                         }
                     })
                 };
@@ -811,7 +1217,12 @@ impl Monitor {
                         mut desired,
                         owners,
                         mut failures,
-                    } = Registrations::prioritized(&projects, &priority, &selected, watch_budget());
+                    } = Registrations::prioritized(
+                        &projects,
+                        &priority,
+                        &selected,
+                        MAX_DIRECTORIES,
+                    );
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
@@ -819,11 +1230,12 @@ impl Monitor {
                         .iter()
                         .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
                         .map(|(path, _)| path.clone())
-                        .collect::<Vec<_>>();
+                        .collect::<BTreeSet<_>>();
                     desired.retain(|path, _| {
-                        !recursive
-                            .iter()
-                            .any(|root| path != root && path.starts_with(root))
+                        !path
+                            .ancestors()
+                            .skip(1)
+                            .any(|ancestor| recursive.contains(ancestor))
                     });
                     let rearmed = match &mut watcher {
                         Ok(watcher) => {
@@ -875,7 +1287,7 @@ impl Monitor {
                         });
                     }
                     if !pending.changes.is_empty() {
-                        let _ = wake.try_send(());
+                        wake();
                     }
                 }
             })?;
@@ -883,7 +1295,6 @@ impl Monitor {
             commands,
             configuration,
             pending,
-            receiver,
             thread: Some(thread),
         })
     }
@@ -896,10 +1307,10 @@ impl Monitor {
         let _ = self.commands.try_send(());
     }
 
-    pub fn prioritize(&self, projects: Vec<ProjectId>, selected: Vec<WorktreeId>) {
+    pub fn prioritize(&self, priority: Vec<ProjectId>, selected: Vec<WorktreeId>) {
         let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
-        if configuration.priority != projects || configuration.selected != selected {
-            configuration.priority = projects;
+        if configuration.priority != priority || configuration.selected != selected {
+            configuration.priority = priority;
             configuration.selected = selected;
             let _ = self.commands.try_send(());
         }
@@ -974,7 +1385,6 @@ impl Drop for Monitor {
 /// Inotify cannot see changes performed by another machine/server. FUSE can
 /// have the same limitation, so keep local polling alongside available edges.
 fn network_filesystem(path: &Path) -> std::io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -996,64 +1406,179 @@ mod tests {
     use notify::event::{DataChange, ModifyKind};
     use std::time::{Duration, Instant};
 
+    fn census(files: &[&str]) -> Arc<Census> {
+        Arc::new(Census::new(files.iter().map(|file| file.as_bytes()), false).unwrap())
+    }
+
     fn project(root: &Path) -> Project {
         let first = root.join("first");
         let linked = root.join("linked");
         let common = first.join(".git");
+        let census = census(&["src/main.rs"]);
         Project {
             id: ProjectId::new(),
             common_dir: common.clone(),
+            mode: DirectoryMode::Tracked,
             polling: None,
             worktrees: vec![
                 Worktree {
                     id: WorktreeId::new(),
-                    root: first.clone(),
+                    root: first,
                     git_dir: common.clone(),
-                    branch: Some("refs/heads/main".into()),
-                    upstream: Some("origin/main".into()),
-                    directories: BTreeSet::from([first.clone(), first.join("src")]),
+                    census: census.clone(),
+                    directories: Arc::default(),
+                    branch: None,
+                    upstream: None,
                     polling: None,
                 },
                 Worktree {
                     id: WorktreeId::new(),
-                    root: linked.clone(),
+                    root: linked,
                     git_dir: common.join("worktrees/linked"),
-                    branch: Some("refs/heads/linked".into()),
-                    upstream: Some("origin/linked".into()),
-                    directories: BTreeSet::from([linked.clone(), linked.join("src")]),
+                    census,
+                    directories: Arc::default(),
+                    branch: None,
+                    upstream: None,
                     polling: None,
                 },
             ],
         }
     }
 
-    fn modified(path: PathBuf) -> Event {
-        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path)
+    #[test]
+    fn path_sets_hold_sorted_unique_relative_paths() {
+        let census = census(&["src/b.rs", "README.md", "src/a/mod.rs", "src/b.rs"]);
+        assert_eq!(
+            census.files.iter().collect::<Vec<_>>(),
+            ["README.md", "src/a/mod.rs", "src/b.rs"].map(Path::new)
+        );
+        assert_eq!(
+            census.directories.iter().collect::<Vec<_>>(),
+            ["", "src", "src/a"].map(Path::new)
+        );
+        assert!(census.files.contains(Path::new("src/a/mod.rs")));
+        assert!(!census.files.contains(Path::new("src/a")));
+        assert!(!census.files.contains(Path::new("src/c.rs")));
+        assert!(census.directories.contains(Path::new("")));
+        let empty = Census::new([], false).unwrap();
+        assert!(!empty.files.contains(Path::new("")));
+        assert_eq!(
+            empty.directories.iter().collect::<Vec<_>>(),
+            [Path::new("")]
+        );
+    }
+
+    fn git(root: &Path, arguments: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 
     #[test]
-    fn content_membership_events_refresh_full_counts_without_admin_fanout() {
-        let project = project(Path::new("/repo"));
-        let worktree = &project.worktrees[0];
-        for kind in [
-            EventKind::Create(notify::event::CreateKind::File),
-            EventKind::Remove(notify::event::RemoveKind::File),
-            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
-        ] {
-            let change = project
-                .change(&Event::new(kind).add_path(worktree.root.join("src/new.txt")))
-                .unwrap();
-            assert!(change.untracked);
-            assert_eq!(change.worktrees, BTreeSet::from([worktree.id]));
-            assert!(!change.metadata);
-            assert!(!change.topology);
-        }
-        assert!(
-            !project
-                .change(&modified(worktree.root.join("src/main.rs")))
+    fn plans_share_censuses_and_read_submodules_from_the_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let first = directory.join("first");
+        std::fs::create_dir_all(first.join("src")).unwrap();
+        std::fs::write(first.join("src/main.rs"), "").unwrap();
+        git(&first, &["init", "-q"]);
+        git(&first, &["add", "."]);
+        git(&first, &["commit", "-qm", "init"]);
+        git(&first, &["worktree", "add", "-q", "../linked"]);
+        git(&first, &["worktree", "add", "-q", "../other"]);
+        let (linked, other) = (directory.join("linked"), directory.join("other"));
+        std::fs::write(other.join("README.md"), "").unwrap();
+        git(&other, &["add", "README.md"]);
+
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let common = service.common_dir(&first, &cancellation).unwrap();
+        let records = service.list_worktrees(&first, &cancellation).unwrap();
+        let read = |previous: Option<&Project>, changed: &[WorktreeId]| {
+            Project::read_changed(
+                ProjectId::new(),
+                common.clone(),
+                &records,
+                &cancellation,
+                previous,
+                &changed.iter().copied().collect(),
+            )
+            .unwrap()
+        };
+        let worktree = |plan: &Project, root: &Path| {
+            plan.worktrees
+                .iter()
+                .find(|worktree| worktree.root == root)
                 .unwrap()
-                .untracked
+                .clone()
+        };
+        let plan = read(None, &[]);
+        let main = worktree(&plan, &first);
+        assert!(
+            Arc::ptr_eq(&main.census, &worktree(&plan, &linked).census),
+            "identical indexes share one census"
         );
+        assert!(!Arc::ptr_eq(&main.census, &worktree(&plan, &other).census));
+        assert_eq!(
+            worktree(&plan, &other).tracks(&other.join("README.md")),
+            Some(Tracked::File)
+        );
+        assert_eq!(main.tracks(&first.join("src/main.rs")), Some(Tracked::File));
+        assert_eq!(main.tracks(&first.join("src")), Some(Tracked::Directory));
+        assert_eq!(main.tracks(&first), Some(Tracked::Directory));
+        assert_eq!(main.tracks(&first.join("target/debug")), None);
+        // Roots match by component: a sibling sharing their prefix is not
+        // beneath them, and a trailing separator names the same directory.
+        assert_eq!(main.tracks(&directory.join("first2/src")), None);
+        assert_eq!(
+            main.tracks(Path::new(&format!("{}/src/", first.display()))),
+            Some(Tracked::Directory)
+        );
+        assert_eq!(main.tracks(&linked.join("src/main.rs")), None);
+        assert!(plan.polling.is_none());
+
+        // Re-reading a worktree whose paths did not change keeps its census.
+        let again = read(Some(&plan), &[main.id]);
+        assert!(Arc::ptr_eq(&worktree(&again, &first).census, &main.census));
+
+        // A gitlink is a submodule, whose contents only a periodic check sees.
+        let head = git(&first, &["rev-parse", "HEAD"]);
+        let gitlink = format!("160000,{},vendor/library", head.trim());
+        git(&first, &["update-index", "--add", "--cacheinfo", &gitlink]);
+        let submodule = read(Some(&again), &[main.id]);
+        let main = worktree(&submodule, &first);
+        assert_eq!(
+            main.polling.as_deref(),
+            Some("submodule contents require a periodic local Git check")
+        );
+        assert_eq!(main.tracks(&first.join("vendor")), Some(Tracked::Directory));
+        assert!(submodule.polling.is_some());
+        assert!(worktree(&submodule, &linked).polling.is_none());
+    }
+
+    fn modified(path: PathBuf) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path)
     }
 
     #[test]
@@ -1067,67 +1592,37 @@ mod tests {
         assert_eq!(change.worktrees, BTreeSet::from([first.id]));
         assert!(!change.membership);
         assert!(!change.topology);
-        assert_eq!(
+        assert!(
             project
                 .change(&modified(first.root.join("src/untracked.log")))
-                .unwrap()
-                .worktrees,
-            BTreeSet::from([first.id])
+                .is_none()
         );
         let change = project
             .change(&modified(linked.git_dir.join("index")))
             .unwrap();
         assert_eq!(change.worktrees, BTreeSet::from([linked.id]));
-        assert!(!change.membership);
-        assert!(change.metadata);
-        assert!(change.untracked);
+        assert!(change.membership);
         assert!(!change.topology);
-        let config = project
-            .change(&modified(linked.git_dir.join("config.worktree")))
-            .unwrap();
-        assert!(config.membership);
-        assert_eq!(config.worktrees, BTreeSet::from([linked.id]));
         let change = project
             .change(&modified(project.common_dir.join("refs/heads/main")))
             .unwrap();
-        assert_eq!(change.worktrees, BTreeSet::from([first.id]));
-        assert!(change.metadata);
-        assert!(!change.untracked);
-        assert!(!change.membership);
-        assert!(!change.topology);
-        assert_eq!(
-            project
-                .change(&modified(
-                    project.common_dir.join("refs/remotes/origin/linked")
-                ))
-                .unwrap()
-                .worktrees,
-            BTreeSet::from([linked.id])
+        assert!(change.references);
+        assert!(
+            change.worktrees.is_empty(),
+            "no worktree's own files changed"
         );
-        for stash in ["refs/stash", "logs/refs/stash"] {
-            let change = project
-                .change(&modified(project.common_dir.join(stash)))
-                .unwrap();
-            assert!(change.shared_snapshot);
-            assert!(change.worktrees.is_empty());
-        }
-        let ignored = project
-            .change(&modified(first.root.join(".gitignore")))
-            .unwrap();
-        assert!(ignored.membership);
-        assert_eq!(ignored.worktrees, BTreeSet::from([first.id]));
-        for shared in ["packed-refs", "config", "info/exclude"] {
-            assert_eq!(
-                project
-                    .change(&modified(project.common_dir.join(shared)))
-                    .unwrap()
-                    .worktrees,
-                BTreeSet::from([first.id, linked.id])
-            );
-        }
+        assert!(!change.topology);
         assert!(
             project
                 .change(&modified(project.common_dir.join("worktrees/new/gitdir")))
+                .unwrap()
+                .topology
+        );
+        assert!(
+            project
+                .change(&modified(
+                    project.common_dir.join("worktrees/checkout.lock")
+                ))
                 .unwrap()
                 .topology
         );
@@ -1167,16 +1662,21 @@ mod tests {
         let projects = [("large", 64), ("small", 0)]
             .map(|(name, modules)| {
                 let mut project = project(&directory.path().join(name));
+                let files = (0..modules)
+                    .map(|module| format!("src/{module}/mod.rs"))
+                    .chain(["src/main.rs".to_owned()])
+                    .collect::<Vec<_>>();
+                let shared = census(&files.iter().map(String::as_str).collect::<Vec<_>>());
                 for worktree in &mut project.worktrees {
-                    worktree.directories.extend(
-                        (0..modules).map(|module| worktree.root.join(format!("src/{module}"))),
-                    );
-                    for directory in &worktree.directories {
-                        std::fs::create_dir_all(directory).unwrap();
+                    worktree.census = shared.clone();
+                    for directory in worktree.census.directories.iter() {
+                        std::fs::create_dir_all(worktree.absolute(directory)).unwrap();
                     }
                     std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
                 }
                 std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
+                std::fs::create_dir_all(project.common_dir.join("info")).unwrap();
+                std::fs::create_dir_all(project.common_dir.join("logs/refs")).unwrap();
                 (project.id, Arc::new(project))
             })
             .into_iter()
@@ -1184,7 +1684,6 @@ mod tests {
         let metadata = projects
             .values()
             .flat_map(|project| project.metadata_paths().into_keys())
-            .filter(|path| path.is_dir())
             .collect::<BTreeSet<_>>();
         // Room for all metadata and a single content directory.
         let registrations = Registrations::within(&projects, metadata.len() + 1);
@@ -1218,18 +1717,345 @@ mod tests {
     }
 
     #[test]
+    fn metadata_bursts_ignore_locks_but_keep_real_rename_destinations_and_rescans() {
+        use notify::event::{AccessKind, Flag, RenameMode};
+
+        let project = project(Path::new("/repo"));
+        let linked = &project.worktrees[1];
+        let mut pending = Pending::default();
+        pending
+            .projects
+            .insert(project.id, Arc::new(project.clone()));
+        pending
+            .roots
+            .insert(project.common_dir.clone(), BTreeSet::from([project.id]));
+        assert!(pending.event(Ok(modified(linked.git_dir.join("HEAD")))));
+        assert_eq!(
+            pending.changes[&project.id].worktrees,
+            BTreeSet::from([linked.id])
+        );
+        assert!(!pending.changes[&project.id].membership);
+        for _ in 0..10_000 {
+            for path in ["index.lock", "logs/HEAD", "objects/pack/tmp_pack"] {
+                assert!(!pending.event(Ok(modified(linked.git_dir.join(path)))));
+            }
+            assert!(
+                !pending.event(Ok(Event::new(EventKind::Access(AccessKind::Any))
+                    .add_path(linked.git_dir.join("index"))))
+            );
+        }
+        assert!(
+            !pending.changes[&project.id].membership,
+            "old queued work must not make noise signal new work"
+        );
+        let renamed = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(linked.git_dir.join("index.lock"))
+            .add_path(linked.git_dir.join("index"));
+        assert!(pending.event(Ok(renamed)));
+        assert!(pending.changes[&project.id].membership);
+        assert_eq!(
+            pending.changes[&project.id].worktrees,
+            BTreeSet::from([linked.id])
+        );
+
+        let refs = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(project.common_dir.join("refs/heads/main.lock"))
+            .add_path(project.common_dir.join("refs/heads/main"));
+        let change = project.change(&refs).unwrap();
+        assert!(change.references);
+        assert!(!change.membership);
+        assert!(change.worktrees.is_empty());
+        pending.changes.clear();
+        let rescan = Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan);
+        assert!(pending.event(Ok(rescan)));
+        assert!(pending.changes[&project.id].topology);
+        assert!(pending.changes[&project.id].membership);
+        assert_eq!(pending.changes[&project.id].worktrees.len(), 2);
+    }
+
+    #[test]
+    fn metadata_status_and_topology_keep_their_original_worktree_scope() {
+        use notify::event::{CreateKind, RemoveKind};
+
+        let project = project(Path::new("/repo"));
+        let linked = &project.worktrees[1];
+        for path in ["HEAD", "MERGE_HEAD", "config.worktree", "rebase-merge/done"] {
+            let change = project
+                .change(&modified(linked.git_dir.join(path)))
+                .unwrap();
+            assert_eq!(change.worktrees, BTreeSet::from([linked.id]), "{path}");
+            assert!(!change.membership, "{path}");
+            assert!(!change.topology, "{path}");
+        }
+        for path in ["gitdir", "commondir", "locked"] {
+            let change = project
+                .change(&modified(linked.git_dir.join(path)))
+                .unwrap();
+            assert_eq!(change.worktrees, BTreeSet::from([linked.id]));
+            assert!(change.membership && change.topology, "{path}");
+        }
+        for path in ["config", "packed-refs", "refs/heads/main"] {
+            let change = project
+                .change(&modified(project.common_dir.join(path)))
+                .unwrap();
+            assert!(change.references, "{path}");
+            assert!(!change.membership, "{path}");
+        }
+        let source = linked.root.join("src");
+        assert!(
+            !project
+                .change(&modified(source.clone()))
+                .unwrap()
+                .membership
+        );
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Remove(RemoveKind::Folder),
+        ] {
+            let change = project
+                .change(&Event::new(kind).add_path(source.clone()))
+                .unwrap();
+            assert!(change.membership);
+            assert_eq!(change.worktrees, BTreeSet::from([linked.id]));
+        }
+        assert!(
+            project
+                .change(&modified(linked.root.join(".git")))
+                .unwrap()
+                .topology
+        );
+        assert!(
+            project
+                .change(&modified(project.common_dir.join("worktrees/new/gitdir")))
+                .unwrap()
+                .topology
+        );
+    }
+
+    #[test]
+    fn oversized_sparse_censuses_bound_filesystem_work_and_owner_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        let files = (0..MAX_DIRECTORIES * 4)
+            .map(|index| format!("module{index:06}/file.rs"))
+            .collect::<Vec<_>>();
+        project.worktrees[0].census =
+            Arc::new(Census::new(files.iter().map(|s| s.as_bytes()), false).unwrap());
+        let root = project.worktrees[0].root.clone();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(root.join(".git/worktrees")).unwrap();
+        let id = project.id;
+        let projects = BTreeMap::from([(id, Arc::new(project))]);
+        let mut inspected = BTreeSet::new();
+        let mut checks = 0;
+        let registrations = Registrations::within_with(&projects, MAX_DIRECTORIES, |path| {
+            checks += 1;
+            inspected.insert(path.to_owned());
+            std::fs::symlink_metadata(path)
+        });
+        assert!(
+            checks <= MAX_DIRECTORIES,
+            "the budget bounds actual metadata calls, not only successful watches"
+        );
+        assert!(!inspected.contains(&root.join("module032767")));
+        assert!(registrations.desired.len() <= MAX_DIRECTORIES);
+        assert_eq!(
+            registrations.owners.len(),
+            registrations.desired.len(),
+            "rejected paths must not grow the owner map"
+        );
+        assert_eq!(registrations.failures[&id], "directory watch limit reached");
+        assert_eq!(
+            registrations.desired[&root.join(".git/worktrees")],
+            RecursiveMode::Recursive
+        );
+    }
+
+    #[test]
+    fn shared_registered_paths_keep_all_owners_when_content_work_is_exhausted() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut first = project(directory.path());
+        first.worktrees.truncate(1);
+        first.worktrees[0].census = census(&["src/a/file.rs", "src/b/file.rs"]);
+        let worktree = &first.worktrees[0];
+        for path in [
+            ".git/refs",
+            ".git/worktrees",
+            ".git/info",
+            ".git/logs/refs",
+            "src/a",
+            "src/b",
+        ] {
+            std::fs::create_dir_all(worktree.root.join(path)).unwrap();
+        }
+        let mut second = first.clone();
+        second.id = ProjectId::new();
+        let ids = BTreeSet::from([first.id, second.id]);
+        let metadata = first.metadata_paths().len();
+        let projects = BTreeMap::from([(first.id, Arc::new(first)), (second.id, Arc::new(second))]);
+        let registrations = Registrations::within(&projects, metadata + 2);
+        assert_eq!(registrations.failures.len(), 2);
+        for (path, owners) in &registrations.owners {
+            assert_eq!(
+                owners, &ids,
+                "shared native watch failures/rearms must reach both owners: {path:?}"
+            );
+        }
+        assert_eq!(registrations.desired.len(), metadata + 2);
+    }
+
+    #[test]
+    fn symlink_and_missing_ancestors_are_not_followed_and_can_be_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        project.worktrees[0].census = census(&[
+            "a/nested/file.rs",
+            "a-other/file.rs",
+            "missing/nested/file.rs",
+            "missing-other/file.rs",
+        ]);
+        let root = project.worktrees[0].root.clone();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(root.join(".git/worktrees")).unwrap();
+        std::fs::create_dir_all(root.join("a-other")).unwrap();
+        std::fs::create_dir_all(root.join("missing-other")).unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        let id = project.id;
+        let projects = BTreeMap::from([(id, Arc::new(project))]);
+        let registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(registrations.desired.contains_key(&root));
+        assert!(registrations.desired.contains_key(&root.join("a-other")));
+        for path in ["a", "a/nested", "missing", "missing/nested"] {
+            assert!(
+                !registrations.desired.contains_key(&root.join(path)),
+                "{path}"
+            );
+        }
+        std::fs::remove_file(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("a/nested")).unwrap();
+        std::fs::create_dir_all(root.join("missing/nested")).unwrap();
+        let registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+        for path in ["a", "a/nested", "missing", "missing/nested"] {
+            assert!(
+                registrations.desired.contains_key(&root.join(path)),
+                "{path}"
+            );
+        }
+        assert!(registrations.failures.is_empty());
+    }
+
+    fn wait_for(
+        (monitor, woken): &(Monitor, mpsc::Receiver<()>),
+        project: ProjectId,
+        predicate: impl Fn(&Change) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if woken.try_recv().is_ok() && monitor.drain().get(&project).is_some_and(&predicate) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "watch event did not arrive");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn native_watcher_observes_atomic_replacement_and_recreated_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = project(directory.path());
+        project.worktrees.truncate(1);
+        let worktree = &project.worktrees[0];
+        let source = worktree.root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree.git_dir).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "first").unwrap();
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        wait_for(&monitor, project.id, |change| change.error.is_none());
+        let replacement = source.join(".save");
+        std::fs::write(&replacement, "second").unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        wait_for(&monitor, project.id, |change| {
+            change.worktrees.contains(&worktree.id)
+        });
+        std::fs::remove_dir_all(&source).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(&file, "third").unwrap();
+        wait_for(&monitor, project.id, |change| change.membership);
+        // The path set is unchanged, but the directory inode changed. Rearm
+        // it instead of trusting a stale native registration for that path.
+        monitor.0.configure(vec![Arc::new(project.clone())]);
+        // Configure completion must be acknowledged even when paths compare
+        // equal, so edits cannot race the re-registration barrier.
+        wait_for(&monitor, project.id, |change| {
+            change.worktrees.contains(&worktree.id)
+        });
+        std::fs::write(&file, "fourth").unwrap();
+        wait_for(&monitor, project.id, |change| {
+            change.worktrees.contains(&worktree.id)
+        });
+    }
+    fn content_project(root: &Path) -> Project {
+        let mut project = project(root);
+        project.mode = DirectoryMode::Nonignored;
+        project
+    }
+
+    #[test]
+    fn content_membership_events_refresh_full_counts_without_admin_fanout() {
+        let mut project = project(Path::new("/repo"));
+        project.mode = DirectoryMode::Nonignored;
+        project.worktrees[0].directories =
+            Arc::new(PathSet::new([b"".as_slice(), b"src".as_slice()]).unwrap());
+        let worktree = &project.worktrees[0];
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+        ] {
+            let change = project
+                .change(&Event::new(kind).add_path(worktree.root.join("src/new.txt")))
+                .unwrap();
+            assert!(change.untracked);
+            assert_eq!(change.worktrees, BTreeSet::from([worktree.id]));
+            assert!(!change.metadata);
+            assert!(!change.topology);
+        }
+        assert!(
+            !project
+                .change(&modified(worktree.root.join("src/main.rs")))
+                .unwrap()
+                .untracked
+        );
+    }
+    #[test]
     fn watch_budget_prioritizes_active_project_and_selected_worktree() {
         let directory = tempfile::tempdir().unwrap();
-        let active = Arc::new(project(&directory.path().join("active")));
-        let other = Arc::new(project(&directory.path().join("other")));
+        let active = Arc::new(content_project(&directory.path().join("active")));
+        let other = Arc::new(content_project(&directory.path().join("other")));
         for project in [&active, &other] {
             for worktree in &project.worktrees {
-                for path in &worktree.directories {
+                for relative in worktree.directories() {
+                    let path = worktree.absolute(relative);
                     std::fs::create_dir_all(path).unwrap();
                 }
                 std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
             }
             std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
+            std::fs::create_dir_all(project.common_dir.join("info")).unwrap();
+            std::fs::create_dir_all(project.common_dir.join("logs/refs")).unwrap();
         }
         let metadata = [&active, &other]
             .into_iter()
@@ -1252,20 +2078,22 @@ mod tests {
                 .contains_key(&other.worktrees[0].root.join("src"))
         );
     }
-
     #[test]
     fn independently_selected_projects_share_content_budget() {
         let directory = tempfile::tempdir().unwrap();
-        let active = Arc::new(project(&directory.path().join("active")));
-        let selected = Arc::new(project(&directory.path().join("selected")));
+        let active = Arc::new(content_project(&directory.path().join("active")));
+        let selected = Arc::new(content_project(&directory.path().join("selected")));
         for project in [&active, &selected] {
             for worktree in &project.worktrees {
-                for path in &worktree.directories {
+                for relative in worktree.directories() {
+                    let path = worktree.absolute(relative);
                     std::fs::create_dir_all(path).unwrap();
                 }
                 std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
             }
             std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
+            std::fs::create_dir_all(project.common_dir.join("info")).unwrap();
+            std::fs::create_dir_all(project.common_dir.join("logs/refs")).unwrap();
         }
         let metadata = [&active, &selected]
             .into_iter()
@@ -1295,82 +2123,6 @@ mod tests {
                 .contains_key(&active.worktrees[1].root.join("src"))
         );
     }
-
-    #[test]
-    fn active_content_survives_oversubscribed_background_metadata() {
-        let directory = tempfile::tempdir().unwrap();
-        let active = Arc::new(project(&directory.path().join("active")));
-        let mut projects = BTreeMap::from([(active.id, active.clone())]);
-        for index in 0..12 {
-            let background = Arc::new(project(
-                &directory.path().join(format!("background{index}")),
-            ));
-            projects.insert(background.id, background);
-        }
-        for project in projects.values() {
-            for worktree in &project.worktrees {
-                for path in &worktree.directories {
-                    std::fs::create_dir_all(path).unwrap();
-                }
-                std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
-            }
-            std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
-        }
-        let hot_metadata = active
-            .metadata_paths()
-            .into_keys()
-            .filter(|path| path.is_dir())
-            .count();
-        let limit = hot_metadata + 2;
-        let registrations =
-            Registrations::prioritized(&projects, &[active.id], &[active.worktrees[1].id], limit);
-        assert!(
-            registrations
-                .desired
-                .contains_key(&active.worktrees[1].root.join("src"))
-        );
-        assert!(registrations.failures.keys().any(|id| *id != active.id));
-        assert!(registrations.desired.len() <= limit);
-    }
-
-    #[test]
-    fn hot_content_is_reserved_when_background_admin_leaves_zero_or_one_slot() {
-        let directory = tempfile::tempdir().unwrap();
-        let active = Arc::new(project(&directory.path().join("active")));
-        let other = Arc::new(project(&directory.path().join("other")));
-        for project in [&active, &other] {
-            for worktree in &project.worktrees {
-                for path in &worktree.directories {
-                    std::fs::create_dir_all(path).unwrap();
-                }
-                std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
-            }
-            std::fs::create_dir_all(project.common_dir.join("worktrees")).unwrap();
-        }
-        let projects = BTreeMap::from([(active.id, active.clone()), (other.id, other.clone())]);
-        let all_metadata = projects
-            .values()
-            .flat_map(|project| project.metadata_paths().into_keys())
-            .filter(|path| path.is_dir())
-            .collect::<BTreeSet<_>>()
-            .len();
-        for spare in [0, 1] {
-            let registrations = Registrations::prioritized(
-                &projects,
-                &[active.id],
-                &[active.worktrees[1].id],
-                all_metadata + spare,
-            );
-            assert!(
-                registrations
-                    .desired
-                    .contains_key(&active.worktrees[1].root.join("src")),
-                "spare={spare}"
-            );
-            assert!(registrations.desired.len() <= all_metadata + spare);
-        }
-    }
-
     #[test]
     fn capped_inventory_keeps_native_directory_and_admin_coverage() {
         let directory = tempfile::tempdir().unwrap();
@@ -1418,33 +2170,32 @@ mod tests {
         assert!(
             plan.worktrees[0]
                 .directories
-                .contains(&root.join("z/nested"))
+                .contains(Path::new("z/nested"))
         );
-        assert!(!plan.worktrees[0].directories.contains(&root.join("target")));
+        assert!(!plan.worktrees[0].directories.contains(Path::new("target")));
         assert!(plan.metadata_paths().contains_key(&common));
-        assert_eq!(
-            plan.polling.as_deref(),
-            Some("directory watch limit reached")
-        );
+        // Main's complete tracked index census is independent of the old
+        // bounded working-file prefix; complete ignore + directory census
+        // can cover this small tree without declaring lost coverage.
+        assert!(plan.polling.is_none());
         let registrations = Registrations::within(
             &BTreeMap::from([(id, Arc::new(plan.clone()))]),
-            watch_budget(),
+            MAX_DIRECTORIES,
         );
         assert!(registrations.desired.contains_key(&root.join("z/nested")));
         assert!(registrations.desired.contains_key(&common));
-        let monitor = Monitor::start().unwrap();
+        let monitor = Monitor::start(|| {}).unwrap();
         monitor.configure(vec![Arc::new(plan)]);
-        wait_for(&monitor, id, |change| change.coverage.is_some());
+        wait_for_content(&monitor, id, |change| change.coverage.is_some());
         std::fs::write(&outside, "changed outside prefix\n").unwrap();
-        wait_for(&monitor, id, |change| {
+        wait_for_content(&monitor, id, |change| {
             change.worktrees.contains(&records[0].id)
         });
         std::fs::write(common.join("index"), "metadata event only\n").unwrap();
-        wait_for(&monitor, id, |change| {
+        wait_for_content(&monitor, id, |change| {
             change.metadata && change.worktrees.contains(&records[0].id)
         });
     }
-
     #[test]
     fn incomplete_ignored_inventory_does_not_descend_build_trees() {
         let directory = tempfile::tempdir().unwrap();
@@ -1479,15 +2230,14 @@ mod tests {
         .unwrap();
         assert_eq!(plan.worktrees.len(), 1);
         assert_eq!(
-            plan.worktrees[0].directories,
-            BTreeSet::from([root.to_owned()])
+            plan.worktrees[0].directories.iter().collect::<Vec<_>>(),
+            vec![Path::new("")]
         );
         assert_eq!(
             plan.polling.as_deref(),
             Some("directory watch limit reached")
         );
     }
-
     #[test]
     fn unreadable_index_keeps_initial_root_and_admin_watches() {
         let directory = tempfile::tempdir().unwrap();
@@ -1506,7 +2256,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let records = git.list_worktrees(root, &cancellation).unwrap();
         let common = git.common_dir(root, &cancellation).unwrap();
-        let plan = Project::read_changed(
+        let plan = Project::read_changed_with_upstreams(
             ProjectId::new(),
             common.clone(),
             &records,
@@ -1517,11 +2267,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.worktrees.len(), 1);
-        assert!(plan.worktrees[0].directories.contains(root));
+        assert!(plan.worktrees[0].directories.contains(Path::new("")));
         assert!(plan.metadata_paths().contains_key(&common));
         assert!(plan.polling.is_some());
     }
-
     #[test]
     fn native_watcher_observes_first_file_in_initial_and_later_empty_directories() {
         let directory = tempfile::tempdir().unwrap();
@@ -1540,7 +2289,7 @@ mod tests {
         let records = git.list_worktrees(root, &cancellation).unwrap();
         let id = ProjectId::new();
         let common = git.common_dir(root, &cancellation).unwrap();
-        let plan = Project::read_changed(
+        let plan = Project::read_changed_with_upstreams(
             id,
             common.clone(),
             &records,
@@ -1553,19 +2302,19 @@ mod tests {
         assert!(
             plan.worktrees[0]
                 .directories
-                .contains(&root.join("empty/nested"))
+                .contains(Path::new("empty/nested"))
         );
-        assert!(!plan.worktrees[0].directories.contains(&root.join("target")));
-        let monitor = Monitor::start().unwrap();
+        assert!(!plan.worktrees[0].directories.contains(Path::new("target")));
+        let monitor = Monitor::start(|| {}).unwrap();
         monitor.configure(vec![Arc::new(plan.clone())]);
-        wait_for(&monitor, id, |change| change.error.is_none());
+        wait_for_content(&monitor, id, |change| change.error.is_none());
         std::fs::write(root.join("empty/nested/first.txt"), "first\n").unwrap();
-        wait_for(&monitor, id, |change| {
+        wait_for_content(&monitor, id, |change| {
             change.worktrees.contains(&records[0].id)
         });
         std::fs::create_dir(root.join("later")).unwrap();
-        wait_for(&monitor, id, |change| change.membership);
-        let next = Project::read_changed(
+        wait_for_content(&monitor, id, |change| change.membership);
+        let next = Project::read_changed_with_upstreams(
             id,
             common,
             &records,
@@ -1575,65 +2324,401 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert!(next.worktrees[0].directories.contains(&root.join("later")));
+        assert!(next.worktrees[0].directories.contains(Path::new("later")));
         monitor.configure(vec![Arc::new(next)]);
-        wait_for(&monitor, id, |change| {
+        wait_for_content(&monitor, id, |change| {
             change.worktrees.contains(&records[0].id)
         });
         std::fs::write(root.join("later/first.txt"), "second\n").unwrap();
-        wait_for(&monitor, id, |change| {
+        wait_for_content(&monitor, id, |change| {
             change.worktrees.contains(&records[0].id)
         });
     }
-
-    fn wait_for(monitor: &Monitor, project: ProjectId, predicate: impl Fn(&Change) -> bool) {
+    fn wait_for_content(
+        monitor: &Monitor,
+        project: ProjectId,
+        predicate: impl Fn(&Change) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if monitor.receiver.try_recv().is_ok()
-                && monitor.drain().get(&project).is_some_and(&predicate)
-            {
+            if monitor.drain().get(&project).is_some_and(&predicate) {
                 return;
             }
             assert!(Instant::now() < deadline, "watch event did not arrive");
             thread::sleep(Duration::from_millis(10));
         }
     }
+    #[test]
+    fn metadata_keeps_priority_when_active_content_oversubscribes_budget() {
+        // Supersedes the old active_content_survives_oversubscribed_background_metadata
+        // promise: Main's fixed metadata/check budget is canonical. Priority
+        // only orders CONTENT after the metadata pass, with polling for gaps.
+        let directory = tempfile::tempdir().unwrap();
+        let active = Arc::new(content_project(&directory.path().join("active")));
+        let background = Arc::new(content_project(&directory.path().join("background")));
+        for project in [&active, &background] {
+            for worktree in &project.worktrees {
+                for relative in worktree.directories() {
+                    std::fs::create_dir_all(worktree.absolute(relative)).unwrap();
+                }
+            }
+            for path in project.metadata_paths().into_keys() {
+                std::fs::create_dir_all(path).unwrap();
+            }
+        }
+        let metadata = [&active, &background]
+            .into_iter()
+            .flat_map(|project| project.metadata_paths().into_keys())
+            .collect::<BTreeSet<_>>();
+        let limit = active.metadata_paths().len();
+        assert!(metadata.len() > limit);
+        let projects = BTreeMap::from([
+            (active.id, active.clone()),
+            (background.id, background.clone()),
+        ]);
+        let mut checks = 0;
+        let registrations = Registrations::prioritized_with(
+            &projects,
+            &[active.id],
+            &[active.worktrees[1].id],
+            limit,
+            |path| {
+                checks += 1;
+                std::fs::symlink_metadata(path)
+            },
+        );
+        assert!(checks <= limit && registrations.desired.len() <= limit);
+        assert!(
+            registrations
+                .desired
+                .keys()
+                .all(|path| metadata.contains(path))
+        );
+        assert!(!registrations.failures.is_empty());
+    }
 
     #[test]
-    fn native_watcher_observes_atomic_replacement_and_recreated_directory() {
+    fn selected_content_uses_only_capacity_left_after_all_metadata() {
+        // Supersedes hot_content_is_reserved_when_background_admin_leaves_zero_or_one_slot.
+        // All existing admin paths are retained before the selected checkout.
         let directory = tempfile::tempdir().unwrap();
-        let mut project = project(directory.path());
-        project.worktrees.truncate(1);
-        let worktree = &project.worktrees[0];
-        let source = worktree.root.join("src");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::create_dir_all(&worktree.git_dir).unwrap();
-        let file = source.join("main.rs");
-        std::fs::write(&file, "first").unwrap();
-        let monitor = Monitor::start().unwrap();
-        monitor.configure(vec![Arc::new(project.clone())]);
-        wait_for(&monitor, project.id, |change| change.error.is_none());
-        let replacement = source.join(".save");
-        std::fs::write(&replacement, "second").unwrap();
-        std::fs::rename(&replacement, &file).unwrap();
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
-        std::fs::remove_dir_all(&source).unwrap();
-        std::fs::create_dir(&source).unwrap();
-        std::fs::write(&file, "third").unwrap();
-        wait_for(&monitor, project.id, |change| change.membership);
-        // The path set is unchanged, but the directory inode changed. Rearm
-        // it instead of trusting a stale native registration for that path.
-        monitor.configure(vec![Arc::new(project.clone())]);
-        // Configure completion must be acknowledged even when paths compare
-        // equal, so edits cannot race the re-registration barrier.
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
-        std::fs::write(&file, "fourth").unwrap();
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
+        let active = Arc::new(content_project(&directory.path().join("active")));
+        let background = Arc::new(content_project(&directory.path().join("background")));
+        for project in [&active, &background] {
+            for worktree in &project.worktrees {
+                for relative in worktree.directories() {
+                    std::fs::create_dir_all(worktree.absolute(relative)).unwrap();
+                }
+            }
+            for path in project.metadata_paths().into_keys() {
+                std::fs::create_dir_all(path).unwrap();
+            }
+        }
+        let metadata = [&active, &background]
+            .into_iter()
+            .flat_map(|project| project.metadata_paths().into_keys())
+            .collect::<BTreeSet<_>>();
+        let selected = &active.worktrees[1];
+        let projects = BTreeMap::from([
+            (active.id, active.clone()),
+            (background.id, background.clone()),
+        ]);
+        for spare in [0, 1] {
+            let registrations = Registrations::prioritized(
+                &projects,
+                &[active.id],
+                &[selected.id],
+                metadata.len() + spare,
+            );
+            assert!(
+                metadata
+                    .iter()
+                    .all(|path| registrations.desired.contains_key(path))
+            );
+            assert_eq!(registrations.desired.len(), metadata.len() + spare);
+            assert_eq!(
+                registrations.desired.contains_key(&selected.root),
+                spare == 1
+            );
+            assert!(
+                !registrations
+                    .desired
+                    .contains_key(&selected.root.join("src"))
+            );
+            assert!(!registrations.failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn branch_associations_refresh_without_replacing_shared_censuses() {
+        let mut project = project(Path::new("/repo"));
+        project.mode = DirectoryMode::Nonignored;
+        let records = project
+            .worktrees
+            .iter()
+            .enumerate()
+            .map(|(index, worktree)| WorktreeRecord {
+                id: worktree.id,
+                path: worktree.root.clone(),
+                created_at_unix_ms: None,
+                head_oid: None,
+                branch: Some(format!("refs/heads/topic{index}")),
+                detached: false,
+                bare: false,
+                lock: Default::default(),
+                prunable_reason: None,
+            })
+            .collect::<Vec<_>>();
+        let upstreams = BTreeMap::from([(records[0].id, "origin/topic0".into())]);
+        let current = project.refresh_associations(&records, &upstreams).unwrap();
+        for (before, after) in project.worktrees.iter().zip(&current.worktrees) {
+            assert!(Arc::ptr_eq(&before.census, &after.census));
+            assert!(Arc::ptr_eq(&before.directories, &after.directories));
+        }
+        assert!(current.refresh_associations(&records, &upstreams).is_none());
+        for relative in ["refs/heads/topic0", "refs/remotes/origin/topic0"] {
+            let change = current
+                .change(&modified(current.common_dir.join(relative)))
+                .unwrap();
+            assert!(change.references && change.metadata && !change.membership);
+            assert_eq!(change.worktrees, BTreeSet::from([records[0].id]));
+        }
+        let unrelated = current
+            .change(&modified(current.common_dir.join("refs/heads/unrelated")))
+            .unwrap();
+        assert!(unrelated.references && unrelated.worktrees.is_empty());
+        for relative in ["refs/stash", "logs/refs/stash"] {
+            let change = current
+                .change(&modified(current.common_dir.join(relative)))
+                .unwrap();
+            assert!(change.metadata && change.shared_snapshot);
+            assert!(!change.references && change.worktrees.is_empty());
+        }
+    }
+
+    #[test]
+    fn directory_census_bounds_flat_entries_and_does_not_follow_ignored_or_linked_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("checkout");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("ignored/deep")).unwrap();
+        std::fs::create_dir_all(root.join("nested/.git")).unwrap();
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let ignored = [crate::repository::RepoPath::parse("ignored").unwrap()];
+        let (paths, incomplete) =
+            content_directories(&root, &ignored, &CancellationToken::default()).unwrap();
+        assert!(!incomplete);
+        assert!(paths.contains(Path::new("")) && paths.contains(Path::new("empty")));
+        for path in [
+            "ignored",
+            "ignored/deep",
+            "nested",
+            "nested/.git",
+            "linked",
+            "linked/deep",
+        ] {
+            assert!(!paths.contains(Path::new(path)), "{path}");
+        }
+        for index in 0..=MAX_DIRECTORIES {
+            std::fs::write(root.join(format!("flat{index}")), "").unwrap();
+        }
+        let (paths, incomplete) =
+            content_directories(&root, &ignored, &CancellationToken::default()).unwrap();
+        assert!(incomplete, "flat files must consume discovery budget too");
+        assert!(paths.ends.len() <= MAX_DIRECTORIES);
+    }
+    #[test]
+    fn shared_ignore_changes_replan_ui_directories_without_widening_host_events() {
+        let host = project(Path::new("/repo"));
+        let mut ui = host.clone();
+        ui.mode = DirectoryMode::Nonignored;
+        let all = ui
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.id)
+            .collect::<BTreeSet<_>>();
+        for relative in ["config", "info/exclude"] {
+            let event = modified(ui.common_dir.join(relative));
+            let change = ui.change(&event).unwrap();
+            assert!(change.membership && change.metadata);
+            assert_eq!(change.worktrees, all);
+            let host_change = host.change(&event).unwrap();
+            assert!(!host_change.membership && !host_change.topology);
+            if relative == "config" {
+                assert!(host_change.references && host_change.worktrees.is_empty());
+            } else {
+                // Main classifies this as metadata owned by the primary
+                // checkout, without adding an ignore-census replan.
+                assert!(host_change.metadata);
+                assert_eq!(
+                    host_change.worktrees,
+                    BTreeSet::from([host.worktrees[0].id])
+                );
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::create_dir_all(root.join("hidden/nested")).unwrap();
+        std::fs::write(root.join("hidden/nested/existing.txt"), "existing\n").unwrap();
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = service.list_worktrees(root, &cancellation).unwrap();
+        let common = service.common_dir(root, &cancellation).unwrap();
+        let exclude = common.join("info/exclude");
+        std::fs::write(&exclude, "hidden/\n").unwrap();
+        let id = ProjectId::new();
+        let before = Project::read_changed_with_upstreams(
+            id,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            !before.worktrees[0]
+                .directories
+                .contains(Path::new("hidden"))
+        );
+        assert!(
+            !before.worktrees[0]
+                .directories
+                .contains(Path::new("hidden/nested"))
+        );
+        std::fs::write(&exclude, "").unwrap();
+        let change = before.change(&modified(exclude)).unwrap();
+        assert!(change.membership);
+        assert_eq!(
+            change.worktrees,
+            records.iter().map(|record| record.id).collect()
+        );
+        let after = Project::read_changed_with_upstreams(
+            id,
+            common,
+            &records,
+            &cancellation,
+            Some(&before),
+            &change.worktrees,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(after.worktrees[0].directories.contains(Path::new("hidden")));
+        assert!(
+            after.worktrees[0]
+                .directories
+                .contains(Path::new("hidden/nested"))
+        );
+        assert!(after.polling.is_none());
+        let registrations =
+            Registrations::within(&BTreeMap::from([(id, Arc::new(after))]), MAX_DIRECTORIES);
+        assert!(
+            registrations
+                .desired
+                .contains_key(&root.join("hidden/nested"))
+        );
+    }
+
+    #[test]
+    fn host_tracked_mode_and_ui_nonignored_mode_keep_distinct_planning_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::create_dir(root.join("empty")).unwrap();
+        let git = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = git.list_worktrees(root, &cancellation).unwrap();
+        let common = git.common_dir(root, &cancellation).unwrap();
+        let changed = records.iter().map(|record| record.id).collect();
+        let id = ProjectId::new();
+        let host =
+            Project::read_changed(id, common.clone(), &records, &cancellation, None, &changed)
+                .unwrap();
+        let ui = Project::read_changed_with_upstreams(
+            id,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &changed,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(host.mode, DirectoryMode::Tracked);
+        assert!(
+            host.worktrees[0].directories.ends.is_empty(),
+            "host has no extra root/untracked classification"
+        );
+        assert_eq!(ui.mode, DirectoryMode::Nonignored);
+        assert!(ui.worktrees[0].directories.contains(Path::new("empty")));
+        let event = Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(root.join("new.txt"));
+        assert!(host.change(&event).is_none());
+        assert!(ui.change(&event).unwrap().untracked);
+        let host_paths = Registrations::within(
+            &BTreeMap::from([(id, Arc::new(host.clone()))]),
+            MAX_DIRECTORIES,
+        );
+        let ui_paths = Registrations::within(
+            &BTreeMap::from([(id, Arc::new(ui.clone()))]),
+            MAX_DIRECTORIES,
+        );
+        assert!(!host_paths.desired.contains_key(&root.join("empty")));
+        assert!(ui_paths.desired.contains_key(&root.join("empty")));
+        assert!(!host.metadata_paths().contains_key(&common.join("info")));
+        assert!(ui.metadata_paths().contains_key(&common.join("info")));
+        let ref_event = modified(common.join("refs/heads/main"));
+        let host_ref = host.change(&ref_event).unwrap();
+        assert!(host_ref.references && host_ref.worktrees.is_empty());
+        // Even an accidentally reused UI plan cannot widen the six-argument
+        // host contract; changing modes invalidates the reuse shortcut.
+        let host_again = Project::read_changed(
+            id,
+            common.clone(),
+            &records,
+            &cancellation,
+            Some(&ui),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(host_again.worktrees[0].directories.ends.is_empty());
+        // Main's fail-fast index boundary is unchanged for host. UI retains
+        // prior bounded coverage with explicit periodic fallback instead.
+        std::fs::write(common.join("index"), "not an index\n").unwrap();
+        assert!(
+            Project::read_changed(
+                id,
+                common.clone(),
+                &records,
+                &cancellation,
+                Some(&host),
+                &changed
+            )
+            .is_err()
+        );
+        let fallback = Project::read_changed_with_upstreams(
+            id,
+            common,
+            &records,
+            &cancellation,
+            Some(&ui),
+            &changed,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(fallback.polling.is_some());
+        assert!(Arc::ptr_eq(
+            &fallback.worktrees[0].directories,
+            &ui.worktrees[0].directories
+        ));
     }
 }

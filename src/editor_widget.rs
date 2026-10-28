@@ -58,6 +58,10 @@ use std::{
 #[path = "editor_widget/snapshot.rs"]
 mod snapshot;
 pub use snapshot::TextSnapshot;
+#[path = "editor_widget/match_index.rs"]
+mod match_index;
+pub(crate) use match_index::MatchBuilder;
+pub use match_index::{MatchIndex, Matches};
 
 #[cfg(test)]
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -75,26 +79,26 @@ pub struct Diagnostic {
     pub severity: crate::lsp::LspSeverity,
 }
 
-/// Immutable native lines, addressable without a renderer or font-system lock.
-/// The ranges exclude terminators, while `text` preserves exactly the bytes
-/// [`Content::text`] would save, including mixed and bare-CR line endings.
+/// Immutable native lines captured in constant time, without taking a renderer
+/// or font-system lock. Search walks these lines on its background worker;
+/// only an explicit replacement needs the complete source string.
 #[derive(Debug)]
 pub(crate) struct SearchSnapshot {
-    text: String,
-    lines: Vec<std::ops::Range<usize>>,
+    source: TextSnapshot,
 }
 
 impl SearchSnapshot {
+    fn lines(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        (0..self.source.line_count())
+            .filter_map(|index| self.source.line(index).map(|line| line.text))
+    }
+
     pub(crate) fn find_matches(
         &self,
         query: &str,
         cancelled: impl Fn() -> bool,
-    ) -> Option<Vec<(Position, Position)>> {
-        find_in_lines(
-            self.lines.iter().map(|range| &self.text[range.clone()]),
-            query,
-            cancelled,
-        )
+    ) -> Option<MatchIndex> {
+        find_in_lines(self.lines(), query, cancelled)
     }
 
     pub(crate) fn find_matches_with(
@@ -102,79 +106,212 @@ impl SearchSnapshot {
         query: &str,
         options: crate::editor_search::FindOptions,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Option<Vec<(Position, Position)>>, String> {
-        crate::editor_search::find_in_lines(
-            self.lines.iter().map(|range| &self.text[range.clone()]),
+    ) -> Result<Option<MatchIndex>, String> {
+        crate::editor_search::find_in_lines(self.lines(), query, options, cancelled)
+    }
+
+    /// Validates sparse replacements against one immutable revision before
+    /// any native mutation. Higher ranges can then be applied first.
+    pub(crate) fn replacement_edits(
+        &self,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+    ) -> Result<Vec<(Position, Position, String)>, String> {
+        self.replacement_edits_bounded(
+            matches,
             query,
+            replacement,
             options,
-            cancelled,
+            preserve,
+            crate::editor_search::replacement_budget(self.source.len()),
         )
+    }
+
+    fn replacement_edits_bounded(
+        &self,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+        limit: usize,
+    ) -> Result<Vec<(Position, Position, String)>, String> {
+        let replacement =
+            crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
+        let matches = matches.into_iter();
+        let mut edits = Vec::with_capacity(matches.size_hint().0);
+        let mut copied = 0;
+        let mut output_bytes = 0;
+        for item in matches {
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
+            if start.line != end.line {
+                return Err("A search match crosses a line boundary.".into());
+            }
+            let line = self
+                .source
+                .line(start.line)
+                .ok_or("The selected match is outside the document.")?;
+            let from = self
+                .source
+                .byte_offset(start)
+                .ok_or("Invalid search position.")?;
+            let to = self
+                .source
+                .byte_offset(end)
+                .ok_or("Invalid search position.")?;
+            if to < from || from < copied {
+                return Err("Search matches overlap.".into());
+            }
+            output_bytes =
+                crate::editor_search::checked_output_size(output_bytes, from - copied, limit)?;
+            let inserted = replacement.expand_bounded(
+                &line.text,
+                start.column,
+                end.column,
+                limit - output_bytes,
+            )?;
+            output_bytes =
+                crate::editor_search::checked_output_size(output_bytes, inserted.len(), limit)?;
+            if line.text.get(start.column..end.column) != Some(inserted.as_str()) {
+                edits.push((start, end, inserted));
+            }
+            copied = to;
+        }
+        crate::editor_search::checked_output_size(output_bytes, self.source.len() - copied, limit)?;
+        Ok(edits)
     }
 
     pub(crate) fn replace_matches_with(
         &self,
-        matches: &[(Position, Position)],
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
         query: &str,
         replacement: &str,
         options: crate::editor_search::FindOptions,
         preserve: bool,
     ) -> Result<String, String> {
+        self.replace_matches_with_cancellation(
+            matches,
+            query,
+            replacement,
+            options,
+            preserve,
+            || false,
+        )
+    }
+
+    pub(crate) fn replace_matches_with_cancellation(
+        &self,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        self.replace_matches_bounded(
+            matches,
+            query,
+            replacement,
+            options,
+            preserve,
+            cancelled,
+            crate::editor_search::replacement_budget(self.source.len()),
+        )
+    }
+
+    fn replace_matches_bounded(
+        &self,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+        cancelled: impl Fn() -> bool,
+        limit: usize,
+    ) -> Result<String, String> {
+        if cancelled() {
+            return Err("Replacement cancelled.".into());
+        }
         let replacement =
             crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
-        let mut result = String::with_capacity(self.text.len());
+        let text = self.source.text();
+        let mut result = String::new();
         let mut copied = 0;
-        for &(start, end) in matches {
+        let mut cached_line: Option<(usize, Line<'_>, usize)> = None;
+        for (index, item) in matches.into_iter().enumerate() {
+            if index % 256 == 0 && cancelled() {
+                return Err("Replacement cancelled.".into());
+            }
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
             if start.line != end.line {
                 return Err("A search match crosses a line boundary.".into());
             }
-            let line = self
-                .lines
-                .get(start.line)
-                .ok_or("The selected match is outside the document.")?;
-            let text = &self.text[line.clone()];
-            let inserted = replacement.expand(text, start.column, end.column)?;
-            let start = line.start + start.column;
-            let end = line.start + end.column;
-            if end < start || start < copied {
+            if cached_line
+                .as_ref()
+                .is_none_or(|(number, _, _)| *number != start.line)
+            {
+                let line = self
+                    .source
+                    .line(start.line)
+                    .ok_or("The selected match is outside the document.")?;
+                let offset = self
+                    .source
+                    .byte_offset(Position {
+                        line: start.line,
+                        column: 0,
+                    })
+                    .ok_or("Invalid search position.")?;
+                cached_line = Some((start.line, line, offset));
+            }
+            let (_, line, offset) = cached_line.as_ref().unwrap();
+            line.text
+                .get(start.column..end.column)
+                .ok_or("Invalid search position.")?;
+            let from = offset + start.column;
+            let to = offset + end.column;
+            if to < from || from < copied {
                 return Err("Search matches overlap.".into());
             }
-            result.push_str(
-                self.text
-                    .get(copied..start)
-                    .ok_or("Invalid search position.")?,
-            );
-            result.push_str(&inserted);
-            copied = end;
+            crate::editor_search::append_output(
+                &mut result,
+                text.get(copied..from).ok_or("Invalid search position.")?,
+                limit,
+            )?;
+            replacement.append_bounded(&line.text, start.column, end.column, &mut result, limit)?;
+            copied = to;
         }
-        result.push_str(self.text.get(copied..).ok_or("Invalid search position.")?);
+        crate::editor_search::append_output(
+            &mut result,
+            text.get(copied..).ok_or("Invalid search position.")?,
+            limit,
+        )?;
         Ok(result)
     }
 
-    /// Build a replacement in source order: each match and source byte is
-    /// visited once, irrespective of the number of lines or length changes.
+    /// Build a replacement in source order: each source byte is copied once.
     pub(crate) fn replace_matches(
         &self,
-        matches: &[(Position, Position)],
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
         replacement: &str,
     ) -> Option<String> {
-        let mut result = String::with_capacity(self.text.len());
+        let text = self.source.text();
+        let mut result = String::with_capacity(text.len());
         let mut copied = 0;
-        for &(start, end) in matches {
-            let start_line = self.lines.get(start.line)?;
-            let end_line = self.lines.get(end.line)?;
-            if start.column > start_line.len() || end.column > end_line.len() {
+        for item in matches {
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
+            let start = self.source.byte_offset(start)?;
+            let end = self.source.byte_offset(end)?;
+            if end < start || start < copied {
                 return None;
             }
-            let start = start_line.start + start.column;
-            let end = end_line.start + end.column;
-            if end < start || start < copied || !self.text.is_char_boundary(end) {
-                return None;
-            }
-            result.push_str(self.text.get(copied..start)?);
+            result.push_str(text.get(copied..start)?);
             result.push_str(replacement);
             copied = end;
         }
-        result.push_str(self.text.get(copied..)?);
+        result.push_str(text.get(copied..)?);
         Some(result)
     }
 }
@@ -183,20 +320,38 @@ pub(crate) fn find_in_lines<T: AsRef<str>>(
     lines: impl Iterator<Item = T>,
     query: &str,
     cancelled: impl Fn() -> bool,
-) -> Option<Vec<(Position, Position)>> {
+) -> Option<MatchIndex> {
+    let mut matches = MatchBuilder::default();
+    visit_matches(lines, query, cancelled, |line, _, start, end| {
+        matches.push(
+            Position {
+                line,
+                column: start,
+            },
+            Position { line, column: end },
+        )
+    })
+    .then(|| matches.finish())
+}
+
+pub(crate) fn visit_matches<T: AsRef<str>>(
+    lines: impl Iterator<Item = T>,
+    query: &str,
+    cancelled: impl Fn() -> bool,
+    mut emit: impl FnMut(usize, &str, usize, usize),
+) -> bool {
     use unicode_casefold::UnicodeCaseFold;
     if query.is_empty() {
-        return Some(Vec::new());
+        return true;
     }
     let query: String = query.case_fold().collect();
-    let mut matches = Vec::new();
     // Reuse scratch space rather than allocating two buffers per source line.
     let mut folded = String::new();
     let mut boundaries = Vec::new();
     for (line, text) in lines.enumerate() {
         let text = text.as_ref();
         if cancelled() {
-            return None;
+            return false;
         }
         folded.clear();
         boundaries.clear();
@@ -207,36 +362,29 @@ pub(crate) fn find_in_lines<T: AsRef<str>>(
             folded.make_ascii_lowercase();
             for (index, (offset, _)) in folded.match_indices(&query).enumerate() {
                 if index % 1024 == 0 && cancelled() {
-                    return None;
+                    return false;
                 }
-                matches.push((
-                    Position {
-                        line,
-                        column: offset,
-                    },
-                    Position {
-                        line,
-                        column: offset + query.len(),
-                    },
-                ));
+                emit(line, text, offset, offset + query.len());
             }
             continue;
         }
         for (index, (offset, character)) in text.char_indices().enumerate() {
             if index % 1024 == 0 && cancelled() {
-                return None;
+                return false;
             }
             let start = folded.len();
             folded.extend(std::iter::once(character).case_fold());
             boundaries.resize(folded.len(), None);
-            boundaries[start] = Some(offset);
+            // NonZero's niche keeps each optional source boundary one
+            // machine word, rather than a separate usize plus discriminant.
+            boundaries[start] = std::num::NonZeroUsize::new(offset + 1);
         }
-        boundaries.push(Some(text.len()));
+        boundaries.push(std::num::NonZeroUsize::new(text.len() + 1));
         let mut cursor = 0;
         let mut candidates = 0;
         while cursor + query.len() <= folded.len() {
             if candidates % 1024 == 0 && cancelled() {
-                return None;
+                return false;
             }
             candidates += 1;
             // Reject impossible source boundaries before building a substring
@@ -251,16 +399,7 @@ pub(crate) fn find_in_lines<T: AsRef<str>>(
             let offset = cursor + found;
             let end = offset + query.len();
             if let (Some(start), Some(end_column)) = (boundaries[offset], boundaries[end]) {
-                matches.push((
-                    Position {
-                        line,
-                        column: start,
-                    },
-                    Position {
-                        line,
-                        column: end_column,
-                    },
-                ));
+                emit(line, text, start.get() - 1, end_column.get() - 1);
                 cursor = end;
             } else {
                 // Rejected partial case-fold expansions must not consume a
@@ -269,7 +408,7 @@ pub(crate) fn find_in_lines<T: AsRef<str>>(
             }
         }
     }
-    Some(matches)
+    true
 }
 type NativeEditor = <cosmic::Renderer as text::Renderer>::Editor;
 
@@ -338,7 +477,7 @@ where
     popup_at: Option<Position>,
     on_hover: Option<Box<dyn Fn(Option<Position>) -> Message + 'a>>,
     on_definition: Option<Box<dyn Fn(Position) -> Message + 'a>>,
-    find_matches: &'a [(Position, Position)],
+    find_matches: Option<&'a MatchIndex>,
     current_match: usize,
     placeholder: Option<text::Fragment<'a>>,
     font: Option<Renderer::Font>,
@@ -376,7 +515,7 @@ where
             popup_at: None,
             on_hover: None,
             on_definition: None,
-            find_matches: &[],
+            find_matches: None,
             current_match: 0,
             placeholder: None,
             font: None,
@@ -466,7 +605,7 @@ where
         self
     }
 
-    pub fn find_matches(mut self, matches: &'a [(Position, Position)], current: usize) -> Self {
+    pub fn find_matches(mut self, matches: Option<&'a MatchIndex>, current: usize) -> Self {
         self.find_matches = matches;
         self.current_match = current;
         self
@@ -1391,7 +1530,7 @@ where
     }
 
     /// Search Unicode text a line at a time, retaining source byte positions.
-    pub fn find_matches(&self, query: &str) -> Vec<(Position, Position)> {
+    pub fn find_matches(&self, query: &str) -> MatchIndex {
         let internal = self.0.borrow();
         // NativeEditor borrows these lines in place; no whole-buffer snapshot
         // is needed for the synchronous, bounded small-file search.
@@ -1404,7 +1543,7 @@ where
         &self,
         query: &str,
         options: crate::editor_search::FindOptions,
-    ) -> Result<Vec<(Position, Position)>, String> {
+    ) -> Result<MatchIndex, String> {
         let internal = self.0.borrow();
         let lines =
             (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
@@ -1413,20 +1552,9 @@ where
     }
 
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
-        let internal = self.0.borrow();
-        let count = internal.editor.line_count();
-        let mut text = String::new();
-        let mut lines = Vec::with_capacity(count);
-        for index in 0..count {
-            let Some(line) = internal.editor.line(index) else {
-                break;
-            };
-            let start = text.len();
-            text.push_str(&line.text);
-            lines.push(start..text.len());
-            text.push_str(terminator(line.ending, index + 1 == count));
+        SearchSnapshot {
+            source: self.text_snapshot(),
         }
-        SearchSnapshot { text, lines }
     }
 
     /// Byte length of the text [`Content::text`] would produce, without
@@ -1902,11 +2030,17 @@ impl Focus {
 }
 
 impl<Highlighter: text::Highlighter> State<Highlighter> {
-    /// Clears focus, selection, and all interaction state.
-    pub fn clear_focus(&mut self) {
+    /// Leaves native focus without turning an outside pointer press into an
+    /// editor action. External result controls still own the selected buffer.
+    fn blur(&mut self) {
         self.focus = None;
         self.drag_click = None;
         self.context_menu_position = None;
+    }
+
+    /// Clears focus, selection, and all interaction state.
+    pub fn clear_focus(&mut self) {
+        self.blur();
         self.pending_edit = Some(Action::ClearSelection);
     }
 }
@@ -2140,6 +2274,14 @@ where
             state.horizontal_grab = None;
         }
         let pointer = cursor.position().filter(|point| _viewport.contains(*point));
+        // Layout can extend behind an adjacent pane or a clipped parent. New
+        // pointer interactions belong only to the visible editor; keep the
+        // original cursor for an already-owned drag below.
+        let visible_cursor = if pointer.is_some() {
+            cursor
+        } else {
+            mouse::Cursor::Unavailable
+        };
         if self.popup.is_none() {
             state.popup_bounds = None;
         }
@@ -2309,14 +2451,14 @@ where
                 event,
                 Event::Mouse(mouse::Event::ButtonPressed(_))
                     | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
-            ) && cursor.position_over(text_bounds).is_none()
+            ) && visible_cursor.position_over(text_bounds).is_none()
             {
-                state.clear_focus();
+                state.blur();
             }
 
             match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                    if let Some(pos) = cursor.position_over(text_bounds) {
+                    if let Some(pos) = visible_cursor.position_over(text_bounds) {
                         if state.focus.is_none() {
                             state.focus = Some(Focus::now());
                         }
@@ -2385,12 +2527,21 @@ where
             _ => {}
         }
 
+        let input_cursor = if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            && state.drag_click.is_some()
+        {
+            // A drag admitted in the viewport keeps its existing movement
+            // and release contract after crossing the clip boundary.
+            cursor
+        } else {
+            visible_cursor
+        };
         if let Some(update) = Update::from_event(
             event,
             state,
             layout.bounds(),
             self.text_padding(),
-            cursor,
+            input_cursor,
             self.key_binding.as_deref(),
         ) {
             match update {
@@ -2675,30 +2826,9 @@ where
         }
 
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
-        for run in internal.editor.buffer().layout_runs() {
-            let first = self
-                .find_matches
-                .partition_point(|(_, end)| end.line < run.line_i);
-            for (index, (start, end)) in self
-                .find_matches
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take_while(|(_, (start, _))| start.line <= run.line_i)
-            {
-                if run.line_i < start.line || run.line_i > end.line {
-                    continue;
-                }
-                let mut color = style.selection;
-                color.a *= if index == self.current_match {
-                    0.55
-                } else {
-                    0.18
-                };
-                for glyph in run.glyphs.iter().filter(|glyph| {
-                    (run.line_i != start.line || glyph.end > start.column)
-                        && (run.line_i != end.line || glyph.start < end.column)
-                }) {
+        if let Some(matches) = self.find_matches.filter(|matches| !matches.is_empty()) {
+            for run in internal.editor.buffer().layout_runs() {
+                for glyph in run.glyphs {
                     let rect = Rectangle::new(
                         Point::new(
                             text_bounds.x + horizontal.x + glyph.x,
@@ -2706,15 +2836,27 @@ where
                         ),
                         Size::new(glyph.w, run.line_height),
                     );
-                    if let Some(bounds) = text_bounds.intersection(&rect) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds,
-                                ..Default::default()
-                            },
-                            color,
-                        );
+                    let Some(bounds) = text_bounds.intersection(&rect) else {
+                        continue;
+                    };
+                    // Seek by the actual glyph's source bytes, including bidi
+                    // and ligatures. Match density outside this glyph cannot
+                    // multiply its paint work or create one quad per hit.
+                    let (first, overlapping) = matches.visible(run.line_i, glyph.start, glyph.end);
+                    if overlapping.len() == 0 {
+                        continue;
                     }
+                    let current = self.current_match >= first
+                        && self.current_match - first < overlapping.len();
+                    let mut color = style.selection;
+                    color.a *= if current { 0.55 } else { 0.18 };
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds,
+                            ..Default::default()
+                        },
+                        color,
+                    );
                 }
             }
         }
@@ -4029,6 +4171,218 @@ mod tests {
     }
 
     #[test]
+    fn replacement_output_budget_counts_prefix_tail_and_sparse_aggregate() {
+        let original = "λa🦀aZ";
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original, LineEnding::None, "")]),
+        };
+        let matches = snapshot.find_matches("a", || false).unwrap();
+        let expected = "λββ🦀ββZ";
+        assert_eq!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    || false,
+                    expected.len()
+                )
+                .unwrap(),
+            expected
+        );
+        assert!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    || false,
+                    expected.len() - 1
+                )
+                .is_err()
+        );
+        let edits = snapshot
+            .replacement_edits_bounded(
+                &matches,
+                "a",
+                "ββ",
+                Default::default(),
+                false,
+                expected.len(),
+            )
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(
+            snapshot
+                .replacement_edits_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    expected.len() - 1
+                )
+                .is_err()
+        );
+        assert_eq!(snapshot.source.text().as_ref(), original);
+
+        // Growth at an early match followed by shrinkage is valid; don't use
+        // source-size-plus-intermediate-deltas as the allocation budget.
+        let original = "a long";
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original, LineEnding::None, "")]),
+        };
+        let options = crate::editor_search::FindOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let matches = snapshot
+            .find_matches_with("(a)|long", options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "(a)|long",
+                    "$1$1$1",
+                    options,
+                    false,
+                    || false,
+                    original.len()
+                )
+                .unwrap(),
+            "aaa "
+        );
+        assert_eq!(
+            snapshot
+                .replacement_edits_bounded(
+                    &matches,
+                    "(a)|long",
+                    "$1$1$1",
+                    options,
+                    false,
+                    original.len()
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+        for text in ["${0}${0}${0}", "λ$0🦀"] {
+            let expected = regex::Regex::new("(a)|long")
+                .unwrap()
+                .replace_all(original, text)
+                .into_owned();
+            assert_eq!(
+                snapshot
+                    .replace_matches_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        || false,
+                        expected.len()
+                    )
+                    .unwrap(),
+                expected
+            );
+            assert!(
+                snapshot
+                    .replace_matches_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        || false,
+                        expected.len() - 1
+                    )
+                    .is_err()
+            );
+            assert!(
+                snapshot
+                    .replacement_edits_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        expected.len() - 1
+                    )
+                    .is_err()
+            );
+            assert_eq!(snapshot.source.text().as_ref(), original);
+        }
+    }
+
+    #[test]
+    fn oversized_existing_buffer_replacements_allow_only_shrink_or_nongrowth() {
+        let original = format!(
+            "λ{}",
+            "x".repeat(crate::editor::MAX_EDITABLE_FILE_BYTES as usize)
+        );
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original.as_str(), LineEnding::None, "")]),
+        };
+        let matches = [(
+            Position { line: 0, column: 0 },
+            Position { line: 0, column: 2 },
+        )];
+        for replacement in ["a", "zz"] {
+            let output = snapshot
+                .replace_matches_with(&matches, "λ", replacement, Default::default(), false)
+                .unwrap();
+            assert_eq!(output.len(), original.len() - 2 + replacement.len());
+            assert!(
+                snapshot
+                    .replacement_edits(&matches, "λ", replacement, Default::default(), false)
+                    .is_ok()
+            );
+        }
+        assert!(
+            snapshot
+                .replace_matches_with(&matches, "λ", "zzz", Default::default(), false)
+                .unwrap_err()
+                .contains("result size limit")
+        );
+        assert!(
+            snapshot
+                .replacement_edits(&matches, "λ", "zzz", Default::default(), false)
+                .is_err()
+        );
+        assert_eq!(snapshot.source.text().as_ref(), original);
+    }
+
+    #[test]
+    fn dense_replacement_cancellation_discards_partial_output_and_keeps_source() {
+        let text = "λa".repeat(2048);
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(text.as_str(), LineEnding::None, "")]),
+        };
+        let matches = snapshot.find_matches("a", || false).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let result = snapshot.replace_matches_with_cancellation(
+            &matches,
+            "a",
+            "β",
+            Default::default(),
+            false,
+            || {
+                let calls = checks.get() + 1;
+                checks.set(calls);
+                calls >= 3
+            },
+        );
+        assert_eq!(result.unwrap_err(), "Replacement cancelled.");
+        assert_eq!(snapshot.source.text().as_ref(), text);
+    }
+
+    #[test]
     #[ignore = "explicit constructor benchmark retains the old full-file glyph caches"]
     fn native_constructor_large_file_microbenchmark() {
         let source = "let token = 123; // native fixture\n".repeat(100_000);
@@ -4086,11 +4440,186 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_keeps_unicode_regex_scope_and_zero_width_replacements_complete() {
+        let text = "é1 λ22\nσ333";
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([
+                ("é1 λ22", LineEnding::Lf, "\n"),
+                ("σ333", LineEnding::None, ""),
+            ]),
+        };
+        let options = crate::editor_search::FindOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let query = r"(\p{L})(\d+)";
+        let matches = snapshot
+            .find_matches_with(query, options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(
+            snapshot
+                .replace_matches_with(&matches, query, "$2:$1", options, false)
+                .unwrap(),
+            "1:é 22:λ\n333:σ"
+        );
+        let scoped = matches.scoped(Some((
+            Position { line: 0, column: 4 },
+            Position { line: 1, column: 5 },
+        )));
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped.allocation_id(), matches.allocation_id());
+        assert_eq!(
+            snapshot
+                .replace_matches_with(&scoped, query, "$2:$1", options, false)
+                .unwrap(),
+            "é1 22:λ\n333:σ"
+        );
+        assert_eq!(snapshot.source.text().as_ref(), text);
+        let single = SearchSnapshot {
+            source: TextSnapshot::from_lines([("aλ b", LineEnding::None, "")]),
+        };
+        let empty = single
+            .find_matches_with(r"\b", options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.len(), 4);
+        assert_eq!(
+            single
+                .replace_matches_with(&empty, r"\b", "|", options, false)
+                .unwrap(),
+            "|aλ| |b|"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit dense8MiB match allocation/paint-query/replacement benchmark"]
+    fn benchmark_dense_eight_mib_complete_matches_and_visible_queries() {
+        use crate::editor_search::{FindOptions, find_in_lines};
+        const BYTES: usize = 8 * 1024 * 1024;
+        for irregular in [false, true] {
+            let text = if irregular {
+                format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3))
+            } else {
+                "a".repeat(BYTES)
+            };
+            assert_eq!(text.len(), BYTES);
+            let options = FindOptions {
+                regex: irregular,
+                ..Default::default()
+            };
+            let query = if irregular { "." } else { "a" };
+            let expected = if irregular {
+                2 * (BYTES / 3) + BYTES % 3
+            } else {
+                BYTES
+            };
+            let started = Instant::now();
+            let matches = find_in_lines(std::iter::once(text.as_str()), query, options, || false)
+                .unwrap()
+                .unwrap();
+            let search_time = started.elapsed();
+            assert_eq!(matches.len(), expected);
+            let retained = matches.retained_bytes();
+            assert!(retained < if irregular { 6 * BYTES } else { 1024 });
+            MatchIndex::take_query_runs();
+            let paint_started = Instant::now();
+            for column in BYTES / 2..BYTES / 2 + 80 {
+                let (_first, hits) = matches.visible(0, column, column + 1);
+                assert!(hits.len() <= 2);
+            }
+            let query_time = paint_started.elapsed();
+            let decoded = MatchIndex::take_query_runs();
+            assert!(
+                decoded < 400_000,
+                "eighty visible glyph queries must not walk millions of matches"
+            );
+            let snapshot = SearchSnapshot {
+                source: TextSnapshot::from_lines([(text.as_str(), LineEnding::None, "")]),
+            };
+            let replace_started = Instant::now();
+            let replaced = snapshot
+                .replace_matches_with(&matches, query, "b", options, false)
+                .unwrap();
+            let replace_time = replace_started.elapsed();
+            assert_eq!(replaced.len(), expected);
+            assert!(replaced.bytes().all(|byte| byte == b'b'));
+            eprintln!(
+                "find8MiB irregular={irregular} matches={expected} retained_index_bytes={retained} prior_pair_payload_bytes={} query_decoded_runs={decoded} search={search_time:?} visible80={query_time:?} replace_all={replace_time:?}; native glyph-layout traversal and processRSS are separate",
+                expected * std::mem::size_of::<(Position, Position)>()
+            );
+        }
+    }
+
+    #[test]
+    fn capturing_and_searching_large_snapshot_never_materializes_whole_text() {
+        let source = "let target = 1;\n".repeat(50_000);
+        let content: Content = Content::with_text(&source);
+        take_text_call_count();
+        let snapshot = content.search_snapshot();
+        assert!(!snapshot.source.is_materialized());
+        assert_eq!(
+            snapshot.find_matches("target", || false).unwrap().len(),
+            50_000
+        );
+        assert_eq!(
+            snapshot
+                .find_matches_with(
+                    "tar(get)",
+                    crate::editor_search::FindOptions {
+                        regex: true,
+                        ..Default::default()
+                    },
+                    || false
+                )
+                .unwrap()
+                .unwrap()
+                .len(),
+            50_000
+        );
+        let edits = snapshot
+            .replacement_edits(
+                &[
+                    (
+                        Position { line: 0, column: 4 },
+                        Position {
+                            line: 0,
+                            column: 10,
+                        },
+                    ),
+                    (
+                        Position {
+                            line: 49_999,
+                            column: 4,
+                        },
+                        Position {
+                            line: 49_999,
+                            column: 10,
+                        },
+                    ),
+                ],
+                "tar(get)",
+                "new$1",
+                crate::editor_search::FindOptions {
+                    regex: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|(_, _, text)| text == "newget"));
+        assert!(!snapshot.source.is_materialized());
+        assert_eq!(take_text_call_count(), 0);
+    }
+
+    #[test]
     fn search_snapshot_preserves_native_positions_unicode_and_mixed_endings() {
         let source = "Straße\rSTRASSE\r\ncafé CAFÉ\n\rtail";
         let content: Content = Content::with_text(source);
         let snapshot = content.search_snapshot();
-        assert_eq!(snapshot.text, content.text());
+        assert_eq!(snapshot.source.text().as_ref(), content.text());
         for query in ["strasse", "café", " ", "tail", "s", ""] {
             assert_eq!(
                 snapshot.find_matches(query, || false).unwrap(),
@@ -4166,7 +4695,7 @@ mod tests {
         assert_eq!(content.find_matches("ss"), expected);
         assert_eq!(
             content.search_snapshot().find_matches("ss", || false),
-            Some(expected)
+            Some(expected.into_iter().collect::<MatchIndex>())
         );
         assert_eq!(content.find_matches("ffi"), vec![(at(2, 1), at(2, 4))]);
         let partial: Content = Content::with_text("ß");
@@ -4640,6 +5169,236 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    fn pointer_event(
+        editor: &mut TextEditor<'_, highlighter::PlainText, Action>,
+        tree: &mut widget::Tree,
+        node: &layout::Node,
+        renderer: &cosmic::Renderer,
+        input: (mouse::Event, Point),
+        viewport: &Rectangle,
+        published: &mut Vec<Action>,
+    ) -> bool {
+        let mut shell = Shell::new(published);
+        editor.update(
+            tree,
+            &Event::Mouse(input.0),
+            Layout::new(node),
+            mouse::Cursor::Available(input.1),
+            renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut shell,
+            viewport,
+        );
+        shell.is_event_captured()
+    }
+
+    #[test]
+    fn clipped_and_external_presses_blur_without_publishing_editor_actions() {
+        let renderer = headless_renderer();
+        let size = Size::new(600.0, 200.0);
+        let viewport = Rectangle::with_size(Size::new(250.0, 200.0));
+        for point in [Point::new(400.0, 60.0), Point::new(650.0, 60.0)] {
+            for button in [
+                mouse::Button::Left,
+                mouse::Button::Middle,
+                mouse::Button::Right,
+            ] {
+                let mut content = Content::with_text("selected text\n");
+                content.set_cursor(Cursor {
+                    position: Position { line: 0, column: 8 },
+                    selection: Some(Position { line: 0, column: 0 }),
+                });
+                let mut editor = wheel_editor(&content, Wrapping::None);
+                let mut tree = widget::Tree::new(
+                    &editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>,
+                );
+                let node =
+                    editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+                tree.state
+                    .downcast_mut::<State<highlighter::PlainText>>()
+                    .focus = Some(Focus::now());
+                let before = (content.text(), content.cursor(), content.selection());
+                let mut actions = Vec::new();
+                let captured = pointer_event(
+                    &mut editor,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    (mouse::Event::ButtonPressed(button), point),
+                    &viewport,
+                    &mut actions,
+                );
+                assert!(actions.is_empty(), "outside {button:?} emitted {actions:?}");
+                assert!(!captured, "an external control owns the press");
+                let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+                assert!(state.focus.is_none());
+                assert!(state.drag_click.is_none());
+                assert!(state.context_menu_position.is_none());
+                assert_eq!(
+                    (content.text(), content.cursor(), content.selection()),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_pointer_presses_keep_editor_and_context_menu_behavior() {
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(600.0, 200.0));
+        for button in [
+            mouse::Button::Left,
+            mouse::Button::Middle,
+            mouse::Button::Right,
+        ] {
+            let content = Content::with_text("visible text\n");
+            let mut editor = wheel_editor(&content, Wrapping::None);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+            let node = editor.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut actions = Vec::new();
+            assert!(pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonPressed(button), Point::new(60.0, 30.0)),
+                &viewport,
+                &mut actions,
+            ));
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            assert!(state.focus.is_some());
+            if button == mouse::Button::Right {
+                assert!(actions.is_empty());
+                assert!(state.context_menu_position.is_some());
+            } else {
+                assert!(matches!(actions.as_slice(), [Action::Click(_)]));
+                assert!(state.context_menu_position.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_focus_operation_still_requests_selection_clearing() {
+        let renderer = headless_renderer();
+        let content = Content::with_text("selection\n");
+        let mut editor = wheel_editor(&content, Wrapping::None);
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let viewport = Rectangle::with_size(Size::new(600.0, 200.0));
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        operation::Focusable::unfocus(tree.state.downcast_mut::<State<highlighter::PlainText>>());
+        let mut actions = Vec::new();
+        pointer_event(
+            &mut editor,
+            &mut tree,
+            &node,
+            &renderer,
+            (
+                mouse::Event::CursorMoved {
+                    position: Point::new(30.0, 30.0),
+                },
+                Point::new(30.0, 30.0),
+            ),
+            &viewport,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::ClearSelection]));
+    }
+
+    #[test]
+    fn admitted_drag_and_scrollbar_grabs_settle_outside_the_viewport() {
+        let renderer = headless_renderer();
+        let size = Size::new(600.0, 200.0);
+        for kind in 0..3 {
+            let source = format!("{}\n", "wide text ".repeat(150)).repeat(100);
+            let content = Content::with_text(&source);
+            let mut editor = wheel_editor(&content, Wrapping::None);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+            let node = editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+            let geometry = editor.scroll_geometry(node.bounds());
+            let (start, outside, viewport) = match kind {
+                0 => (
+                    Point::new(30.0, 30.0),
+                    Point::new(400.0, 60.0),
+                    Rectangle::with_size(Size::new(250.0, 200.0)),
+                ),
+                1 => (
+                    geometry.thumb.center(),
+                    Point::new(geometry.track.center_x(), 180.0),
+                    Rectangle::with_size(Size::new(600.0, 100.0)),
+                ),
+                _ => {
+                    let horizontal = geometry.horizontal.expect("wide content has a thumb");
+                    (
+                        horizontal.thumb.center(),
+                        Point::new(500.0, horizontal.track.center_y()),
+                        Rectangle::with_size(Size::new(250.0, 200.0)),
+                    )
+                }
+            };
+            assert!(viewport.contains(start));
+            assert!(!viewport.contains(outside));
+            let mut actions = Vec::new();
+            assert!(pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonPressed(mouse::Button::Left), start),
+                &viewport,
+                &mut actions,
+            ));
+            actions.clear();
+            let before_horizontal = content.0.borrow().horizontal;
+            pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::CursorMoved { position: outside }, outside),
+                &viewport,
+                &mut actions,
+            );
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            match kind {
+                0 => assert!(matches!(actions.as_slice(), [Action::Drag(_)])),
+                1 => {
+                    assert!(state.scrollbar_grab.is_some());
+                    assert!(
+                        matches!(state.scrollbar_target, Some(ScrollTarget::Fraction { fraction, .. }) if fraction > 0.0)
+                    );
+                }
+                _ => {
+                    assert!(state.horizontal_grab.is_some());
+                    assert!(content.0.borrow().horizontal > before_horizontal);
+                }
+            }
+            pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonReleased(mouse::Button::Left), outside),
+                &viewport,
+                &mut actions,
+            );
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            assert!(state.drag_click.is_none());
+            assert!(state.scrollbar_grab.is_none());
+            assert!(state.horizontal_grab.is_none());
+        }
     }
 
     #[test]

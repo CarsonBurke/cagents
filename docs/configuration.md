@@ -81,11 +81,11 @@ terminal_font_family = ""
 sidebar_width = 260.0
 inspector_width = 380.0
 default_column_fraction = 0.5
-terminal_scrollback_lines = 10000
+terminal_scrollback_mib = 16
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
 pull_request_open_target = "review"
-managed_worktree_directory = "worktrees/"
+managed_worktree_directory = ".worktrees/"
 worktree_sort = "newest"
 editor_auto_save = true
 editor_wrap_lines = false
@@ -95,6 +95,7 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
+work_stale_after_days = 7
 shortcut_defaults_revision = 7
 
 [keyboard_shortcuts]
@@ -159,15 +160,16 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `sidebar_width` | float | `260.0` | `220.0` through `420.0` |
 | `inspector_width` | float | `380.0` | `320.0` through `480.0` |
 | `default_column_fraction` | float | `0.5` | `0.25` through `1.0`. The share of the workspace a new pane takes |
-| `terminal_scrollback_lines` | integer | `10000` | `0` through `1000000` lines. Applies to terminals started after the change |
+| `terminal_scrollback_mib` | integer | `16` | `0` through `1024` MiB, allocated lazily. Applies to terminals started after the change. Legacy line preferences migrate at 1 KiB per requested line, rounded up to MiB; an explicit MiB value wins |
 | `link_open_destination` | string | `"integrated_browser"` | Where an ordinary link click opens: `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | The gesture that always opens the system browser: `"control_click"` or `"control_shift_click"`. The other gesture always opens the in-app browser |
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
-| `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
+| `managed_worktree_directory` | string | `".worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root; an in-checkout destination is excluded clone-locally on creation |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `git_status_limit` | integer | `10000` | Maximum changed paths shown in each source-control snapshot; normalized to `1`–`100000`. Oversized listings show a notice. Safety checks and bulk group actions read complete status independently. |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
+| `editor_find_options` | table | all options `false` | Persisted Find matching options; see the three fields below |
 | `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
 | `editor_find_options.regex` | boolean | `false` | Interpret Find queries as bounded regular expressions |
 | `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |
@@ -178,7 +180,10 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `chat_enter_sends` | boolean | `true` | When on, Enter sends a chat message and Shift+Enter starts a new line. When off, Enter starts a new line and Ctrl+Enter sends |
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
+| `work_stale_after_days` | integer | `7` | Days without a commit, file change or agent activity after which a [Work board](user-guide.md#work-board) card moves to **Stale**. Between 1 and 365; set it under **Settings → General → Work board**. The daemon reads it from this file too |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
+| `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
+| `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `7` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
@@ -269,6 +274,17 @@ ansi = [
 
 ## Language servers
 
+Language servers are shared by workspace root. Rust selects the outermost Cargo
+workspace (or nearest Cargo package); JavaScript and TypeScript recognize npm
+workspaces, `pnpm-workspace.yaml`, and TypeScript project references. Discovery
+runs off the UI thread. The inspector lists live servers and their cached process
+RSS, refreshed in the background; RSS describes the server process, excluding its
+children. Closing the last document arms the idle timeout. Worktree removal
+retires its servers immediately; removals outside the app are detected within
+five seconds. When all slots have active documents, opening a new server reports
+the limit instead of evicting a server in use. Set the two scalar options before
+any TOML table headers.
+
 `language_servers` lists external Language Server Protocol (LSP) servers for
 the native editor. If the key is missing, cagents uses this built-in list. If
 the key is present, its list replaces the built-in one entirely; the two are
@@ -296,10 +312,16 @@ A server entry has these fields:
   matter.
 - `root_markers` (optional): relative paths that mark a project root, such as
   `Cargo.toml`. They cannot contain empty, `.`, or `..` path components. To
-  find a file's project root, cagents checks the file's folder and then each
-  parent folder, and stops at the worktree root. The first folder that contains
-  a marker is the project root. If no folder has a marker, the worktree root is
-  used.
+  find a file's project root, cagents checks its ancestors up to the worktree
+  root on a background worker. Rust files prefer the topmost Cargo workspace;
+  JavaScript and TypeScript files prefer an npm/pnpm workspace or TypeScript
+  project-reference root. Otherwise the nearest marker wins. With no marker,
+  the worktree root is used. Documents can also join an existing ancestor
+  server in the same worktree.
+- `initialization_options` (optional): server-specific JSON-compatible TOML data,
+  sent in the first `initialize` request before workspace loading. It is limited
+  to 1 MiB of encoded JSON. For example, `initialization_options = { checkOnSave = false }`
+  configures rust-analyzer startup; supported keys depend on the server.
 
 An extension can belong to only one server.
 

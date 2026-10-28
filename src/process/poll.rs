@@ -200,9 +200,9 @@ fn cancellation_descriptor() -> io::Result<Arc<OwnedFd>> {
     }
 }
 
-fn timeout_milliseconds(deadline: Option<Instant>) -> i32 {
+fn timeout_milliseconds(deadline: Option<Instant>, now: Instant) -> i32 {
     deadline.map_or(-1, |deadline| {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(now);
         let millis = remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
         millis.min(i32::MAX as u128) as i32
     })
@@ -359,7 +359,7 @@ pub(super) fn execute(
             libc::poll(
                 watched.as_mut_ptr(),
                 watched.len() as libc::nfds_t,
-                timeout_milliseconds(next_deadline),
+                timeout_milliseconds(next_deadline, Instant::now()),
             )
         };
         if ready < 0 {
@@ -432,20 +432,13 @@ pub(super) fn execute(
             },
             _ => unreachable!(),
         };
-        let captured = |bytes| {
-            if kind == ProcessFailureKind::OutputLimit {
-                failure_excerpt(bytes)
-            } else {
-                bytes
-            }
-        };
         return Err(ProcessFailure {
             kind,
             program: spec.program.clone(),
             exit_code: status.as_ref().and_then(ExitStatus::code),
             signal: status.as_ref().and_then(exit_signal),
-            stdout: captured(stdout_read.output),
-            stderr: captured(stderr_read.output),
+            stdout: failure_excerpt(stdout_read.output),
+            stderr: failure_excerpt(stderr_read.output),
             message,
             started: true,
         });
@@ -464,8 +457,8 @@ pub(super) fn execute(
             program: spec.program.clone(),
             exit_code: status.code(),
             signal: exit_signal(&status),
-            stdout: stdout_read.output,
-            stderr: stderr_read.output,
+            stdout: failure_excerpt(stdout_read.output),
+            stderr: failure_excerpt(stderr_read.output),
             message,
             started: true,
         });
@@ -479,6 +472,104 @@ pub(super) fn execute(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn readiness_wait_uses_the_deadline_instead_of_a_polling_interval() {
+        let now = Instant::now();
+        assert_eq!(timeout_milliseconds(None, now), -1);
+        for milliseconds in [15, 5_000, 120_000] {
+            let deadline = now + Duration::from_millis(milliseconds);
+            assert_eq!(
+                timeout_milliseconds(Some(deadline), now),
+                milliseconds as i32
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_wait_rounds_remaining_time_up_and_expires_at_zero() {
+        let now = Instant::now();
+        for (nanoseconds, expected) in [
+            (0, 0),
+            (1, 1),
+            (999_999, 1),
+            (1_000_000, 1),
+            (1_000_001, 2),
+            (999_999_999, 1_000),
+            (1_000_000_000, 1_000),
+            (1_000_000_001, 1_001),
+        ] {
+            let deadline = now + Duration::from_nanos(nanoseconds);
+            assert_eq!(timeout_milliseconds(Some(deadline), now), expected);
+        }
+        assert_eq!(
+            timeout_milliseconds(Some(now), now + Duration::from_nanos(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn readiness_wait_saturates_without_turning_into_an_unbounded_wait() {
+        let now = Instant::now();
+        let maximum = Duration::from_millis(i32::MAX as u64);
+        for remaining in [
+            maximum,
+            maximum + Duration::from_nanos(1),
+            maximum + Duration::from_millis(1),
+        ] {
+            assert_eq!(timeout_milliseconds(Some(now + remaining), now), i32::MAX);
+        }
+    }
+
+    #[test]
+    fn polled_io_uses_the_retained_directory_after_its_path_is_replaced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("payload"), b"original directory\n").unwrap();
+        let root = crate::fs_safety::Root::open(&selected).unwrap();
+        let retained = Arc::new(root.retained_directory().unwrap());
+        let descriptor = retained.as_raw_fd();
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "cat \"$1\"; printf 'retained stderr\\n' >&2; cat",
+                "fixture",
+            ])
+            .arg(format!("/proc/self/fd/{descriptor}/payload"))
+            .inherit_file(retained.clone())
+            .unwrap()
+            .stdin(input.clone())
+            .output_limits(3 * 1024 * 1024, 1024)
+            .timeout(Duration::from_secs(5));
+        drop(retained);
+        drop(root);
+        let original = temporary.path().join("original");
+        fs::rename(&selected, &original).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("payload"), b"replacement must survive\n").unwrap();
+
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stderr, b"retained stderr\n");
+        assert_eq!(
+            output.stdout.len(),
+            b"original directory\n".len() + input.len()
+        );
+        assert!(output.stdout.starts_with(b"original directory\n"));
+        assert_eq!(&output.stdout[b"original directory\n".len()..], input);
+        assert_eq!(
+            fs::read(original.join("payload")).unwrap(),
+            b"original directory\n"
+        );
+        assert_eq!(
+            fs::read(selected.join("payload")).unwrap(),
+            b"replacement must survive\n"
+        );
+    }
 
     #[test]
     fn git_calls_do_not_create_helper_threads() {
@@ -624,5 +715,81 @@ mod tests {
         assert_eq!(unsafe { libc::poll(&mut watched, 1, 0) }, 1);
         drop(registration);
         assert!(lock_wakers(&cancellation.0).is_empty());
+    }
+
+    #[test]
+    fn cancellation_and_timeout_keep_both_failure_excerpts_bounded() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("output-written");
+            let cancellation = CancellationToken::new();
+            let canceller = cancellation.clone();
+            let written = ready.clone();
+            let worker = cancel.then(|| {
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !written.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "both output streams never completed"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    canceller.cancel();
+                })
+            });
+            let command = CommandSpec::new("/bin/sh")
+                .args([
+                    "-c",
+                    "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2; \
+                     printf ready > \"$READY\"; exec sleep 300",
+                ])
+                .env("READY", ready.as_os_str())
+                .output_limits(512 * 1024, 512 * 1024)
+                .timeout(Duration::from_secs(if cancel { 10 } else { 2 }));
+            let outcome = SystemProcessExecutor.execute(&command, &cancellation);
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            let failure = outcome.unwrap_err();
+            assert!(
+                ready.exists(),
+                "the actual child filled both capture streams"
+            );
+            assert_eq!(
+                failure.kind,
+                if cancel {
+                    ProcessFailureKind::Cancelled
+                } else {
+                    ProcessFailureKind::TimedOut
+                }
+            );
+            assert_eq!(failure.stdout.len(), FAILURE_EXCERPT_LIMIT);
+            assert_eq!(failure.stderr.len(), FAILURE_EXCERPT_LIMIT);
+            assert!(failure.stdout.iter().all(|byte| *byte == 0));
+            assert!(failure.stderr.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn closed_stdin_keeps_both_io_failure_excerpts_bounded() {
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 0<&-; head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2",
+            ])
+            .stdin(vec![b'x'; 2 * 1024 * 1024])
+            .output_limits(512 * 1024, 512 * 1024)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Io);
+        assert_eq!(failure.exit_code, Some(0));
+        assert!(failure.message.starts_with("stdin:"));
+        assert_eq!(failure.stdout.len(), FAILURE_EXCERPT_LIMIT);
+        assert_eq!(failure.stderr.len(), FAILURE_EXCERPT_LIMIT);
+        assert!(failure.stdout.iter().all(|byte| *byte == 0));
+        assert!(failure.stderr.iter().all(|byte| *byte == 0));
     }
 }

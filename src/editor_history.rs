@@ -103,6 +103,8 @@ pub trait EditBuffer {
 
 #[derive(Debug, Clone)]
 struct Transaction {
+    before_revision: u64,
+    after_revision: u64,
     changes: Vec<TextChange>,
     /// File existence changes independently of text (an empty file is not absent).
     presence: Option<((bool, u64), (bool, u64))>,
@@ -138,6 +140,8 @@ pub enum Replay {
 /// One document's undo and redo stacks.
 #[derive(Debug)]
 pub struct History {
+    revision: u64,
+    next_revision: u64,
     undo: VecDeque<Transaction>,
     redo: Vec<Transaction>,
     /// Whether the newest undo step may still absorb the next keystroke.
@@ -157,6 +161,8 @@ impl Default for History {
 impl History {
     fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
+            revision: 0,
+            next_revision: 1,
             undo: VecDeque::new(),
             redo: Vec::new(),
             open: false,
@@ -164,6 +170,45 @@ impl History {
             max_transactions: max_transactions.max(1),
             max_bytes,
         }
+    }
+
+    /// Identifies this exact point in the undo graph, independent of stack
+    /// length, pruning and coalescing. Explicit Save seals the active
+    /// transaction; background autosave preserves the current typing group.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Reserves an identity for an external disk baseline without claiming
+    /// that the current buffer or any existing undo state contains its bytes.
+    /// The caller may adopt it only after verifying the corresponding text.
+    pub fn reserve_revision(&mut self) -> u64 {
+        let reserved = self.next_revision;
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        reserved
+    }
+
+    fn advance_revision(&mut self) -> (u64, u64) {
+        let before = self.revision;
+        self.revision = self.reserve_revision();
+        (before, self.revision)
+    }
+
+    /// The caller verified that the current bytes equal a known prior state
+    /// (for example Discard edits restored the saved contents).
+    pub fn adopt_revision(&mut self, known: u64) {
+        if let Some(transaction) = self.undo.back_mut()
+            && transaction.after_revision == self.revision
+        {
+            transaction.after_revision = known;
+        }
+        if let Some(transaction) = self.redo.last_mut()
+            && transaction.before_revision == self.revision
+        {
+            transaction.before_revision = known;
+        }
+        self.revision = known;
+        self.seal();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -185,6 +230,7 @@ impl History {
 
     /// Forgets everything.
     pub fn clear(&mut self) {
+        self.advance_revision();
         self.undo.clear();
         self.redo.clear();
         self.open = false;
@@ -206,12 +252,14 @@ impl History {
         now: Instant,
     ) {
         self.drop_redo();
+        let (before_revision, after_revision) = self.advance_revision();
         if self.open
             && let Some(last) = self.undo.back_mut()
         {
             let previous_bytes = last.bytes();
             if coalesce(last, &change, kind, now) {
                 self.bytes = self.bytes - previous_bytes + last.bytes();
+                last.after_revision = after_revision;
                 last.after = after;
                 last.last_edit = now;
                 self.enforce_limits();
@@ -220,6 +268,8 @@ impl History {
         }
         self.push(
             Transaction {
+                before_revision,
+                after_revision,
                 before,
                 changes: vec![change],
                 presence: None,
@@ -281,8 +331,11 @@ impl History {
             return;
         }
         self.drop_redo();
+        let (before_revision, after_revision) = self.advance_revision();
         self.push(
             Transaction {
+                before_revision,
+                after_revision,
                 changes,
                 presence,
                 before,
@@ -354,6 +407,7 @@ impl History {
             }
         }
         buffer.set_cursor(transaction.before);
+        self.revision = transaction.before_revision;
         self.redo.push(transaction);
         Replay::Applied
     }
@@ -376,6 +430,7 @@ impl History {
             }
         }
         buffer.set_cursor(transaction.after);
+        self.revision = transaction.after_revision;
         self.undo.push_back(transaction);
         Replay::Applied
     }
@@ -919,6 +974,152 @@ mod tests {
         assert_eq!(history.replay_presence(true), Some((true, false)));
         assert_eq!(history.redo(&mut model), Replay::Applied);
         assert!(model.text.is_empty());
+    }
+
+    #[test]
+    fn presence_only_revision_replays_and_branches_without_aliasing_saved_state() {
+        let mut history = History::default();
+        let mut model = Model::new("");
+        let saved = history.revision();
+        let now = Instant::now();
+        history.record_group_with_presence_identities(
+            vec![],
+            model.cursor,
+            model.cursor,
+            now,
+            Some(((true, 7), (false, 8))),
+        );
+        let removed = history.revision();
+        assert_ne!(
+            removed, saved,
+            "equal empty text does not erase a presence edit"
+        );
+        assert_eq!(
+            history.replay_presence_identity(false),
+            Some(((false, 8), (true, 7)))
+        );
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(
+            history.replay_presence_identity(true),
+            Some(((true, 7), (false, 8)))
+        );
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), removed);
+        assert!(model.text.is_empty());
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        history.record_group_with_presence_identities(
+            vec![],
+            model.cursor,
+            model.cursor,
+            now,
+            Some(((true, 7), (false, 9))),
+        );
+        assert_ne!(history.revision(), saved);
+        assert_ne!(
+            history.revision(),
+            removed,
+            "a new removal has its own revision"
+        );
+        assert!(!history.can_redo());
+        assert_eq!(
+            history
+                .retained_presence_ids()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([7, 9]),
+        );
+    }
+
+    #[test]
+    fn revisions_restore_saved_checkpoint_and_distinguish_branched_history() {
+        let mut history = History::default();
+        let mut model = Model::new("");
+        let now = Instant::now();
+        let initial = history.revision();
+        model.type_text(&mut history, "hello", now);
+        let saved = history.revision();
+        history.seal();
+        model.type_text(&mut history, "!", now);
+        let later = history.revision();
+        assert_ne!(saved, later);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(model.text, "hello");
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), later);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        model.type_text(&mut history, "?", now);
+        assert_ne!(
+            history.revision(),
+            later,
+            "a branch cannot reuse a redo state identity"
+        );
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), initial);
+    }
+
+    #[test]
+    fn external_baseline_identity_does_not_alias_undo_or_future_edits() {
+        let mut history = History::default();
+        let mut model = Model::new("A");
+        let initial = history.revision();
+        let now = Instant::now();
+        model.edit(&mut history, 0, 1, "B", EditKind::Other, now);
+        let mine = history.revision();
+        let external = history.reserve_revision();
+        assert_eq!(
+            history.revision(),
+            mine,
+            "Keep mine must retain the buffer's identity"
+        );
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "A");
+        assert_eq!(history.revision(), initial);
+        assert_ne!(
+            history.revision(),
+            external,
+            "Undo to A is dirty against external disk C"
+        );
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_eq!(history.revision(), mine);
+        assert_ne!(history.revision(), external);
+        model.edit(&mut history, 0, 1, "C", EditKind::Other, now);
+        assert_ne!(
+            history.revision(),
+            external,
+            "future edits cannot consume the reserved identity"
+        );
+        // A byte comparison now proves that this state equals disk C.
+        history.adopt_revision(external);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_ne!(history.revision(), external);
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "C");
+        assert_eq!(history.revision(), external);
+    }
+
+    #[test]
+    fn adopting_verified_saved_bytes_keeps_discard_and_undo_states_coherent() {
+        let mut history = History::default();
+        let mut model = Model::new("saved");
+        let saved = history.revision();
+        let now = Instant::now();
+        model.type_text(&mut history, "x", now);
+        let dirty = history.revision();
+        model.edit(&mut history, 0, 1, "", EditKind::Other, now);
+        assert_eq!(model.text, "saved");
+        history.adopt_revision(saved);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), dirty);
+        assert_eq!(model.text, "xsaved");
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(history.revision(), saved);
+        assert_eq!(model.text, "saved");
     }
 
     #[test]
