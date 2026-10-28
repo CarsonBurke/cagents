@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::ChannelId;
 
+pub(super) mod selection;
+
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
 pub(super) fn worktree_root<'a>(
@@ -193,6 +195,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
+        conversation_channels: Arc::default(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -368,12 +371,19 @@ impl Cagents {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
-        let channel = self
+        self.worktree_selection.cancel();
+        self.commit_channel_selection(id, path)
+    }
+
+    fn commit_channel_selection(&mut self, id: ChannelId, path: PathBuf) -> Task<Message> {
+        let Some(channel) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-            .expect("the channel directory resolved this same channel");
+        else {
+            return Task::none();
+        };
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
@@ -409,7 +419,8 @@ impl Cagents {
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
-    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+    pub(super) fn collect_worktree_roots(&mut self) {
+        let previous_count = self.known_worktree_roots.len();
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
@@ -436,6 +447,15 @@ impl Cagents {
                         _ => None,
                     }),
             );
+        if self.known_worktree_roots.len() != previous_count {
+            self.navigation_owners_changed();
+        }
+    }
+
+    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+        #[cfg(test)]
+        self.worktree_selection.record_owner_read();
+        self.collect_worktree_roots();
         let roots = self
             .known_worktree_roots
             .iter()
@@ -484,7 +504,9 @@ impl Cagents {
                 Some((card.id, owner.clone()))
             })
             .collect();
-        selected.map(resolve)
+        let selected = selected.map(resolve);
+        self.worktree_selection.owners_refreshed();
+        selected
     }
 
     /// Refresh which worktree rows hold an open pane after state changes,
@@ -512,7 +534,14 @@ impl Cagents {
         }) {
             #[cfg(test)]
             terminal_output_tests::record_folder_root_refresh();
-            self.refresh_worktree_owners(None);
+            if self.uses_navigation_scheduler() {
+                // The bounded preparation's model fence will see this new
+                // boundary. Do not canonicalize a newly loaded Folder in the
+                // UI tail while that same filesystem worker may be stalled.
+                self.collect_worktree_roots();
+            } else {
+                self.refresh_worktree_owners(None);
+            }
         }
         let roots = self.indexed_worktree_roots();
         let channeled = self
@@ -702,6 +731,15 @@ impl Cagents {
             )));
             return (false, Task::none());
         }
+        self.worktree_selection.cancel();
+        self.commit_worktree_selection(path, create_if_empty)
+    }
+
+    fn commit_worktree_selection(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         let roots = self
             .known_worktree_roots
             .iter()

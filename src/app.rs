@@ -32,6 +32,8 @@ mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+#[cfg(test)]
+mod resume_navigation_tests;
 mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
@@ -2884,7 +2886,8 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::PullRequestCheckoutReady { .. }
+        Message::WorktreeNavigationPrepared { .. }
+            | Message::PullRequestCheckoutReady { .. }
             | Message::RepositoryLoaded {
                 open_cards: true,
                 result: Ok(_),
@@ -4168,8 +4171,32 @@ fn grouped_digits(value: usize) -> String {
     grouped
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalLaunchDefaults {
+    program: Option<String>,
+    environment: std::collections::BTreeMap<String, String>,
+    unset_environment: std::collections::BTreeSet<String>,
+}
+
+impl TerminalLaunchDefaults {
+    fn apply(self, mut launch: LaunchRecipe) -> LaunchRecipe {
+        if let Some(program) = self.program {
+            launch.program = program;
+        }
+        launch.environment.extend(self.environment);
+        launch.unset_environment.extend(self.unset_environment);
+        launch
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
+    WorktreeNavigationPrepared {
+        generation: u64,
+        receipt: worktree_ui::selection::Receipt,
+    },
+    WorktreeNavigationRetired(u64),
+    WorktreeSelectionCacheInvalidated,
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -5195,6 +5222,7 @@ pub struct Cagents {
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
     worktree_protections: crate::worktree_cleanup::WindowProtections,
+    worktree_selection: worktree_ui::selection::State,
     channel_ui: channel_ui::State,
     sidebar_selection_ui: sidebar_selection_ui::State,
     chat_ui: chat_ui::State,
@@ -6104,7 +6132,7 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
+        let launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -6113,23 +6141,30 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if let Some(shell) = crate::device::shell() {
-            launch.program = shell.to_owned();
-        }
+        let defaults = self.terminal_launch_defaults(&working_directory);
+        self.add_terminal_recipe(defaults.apply(launch))
+    }
+
+    fn terminal_launch_defaults(&self, working_directory: &Path) -> TerminalLaunchDefaults {
+        let mut defaults = TerminalLaunchDefaults {
+            program: crate::device::shell().map(str::to_owned),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
         // A shell can start either provider's CLI. Give it the same default
         // homes as native conversations, and persist those choices in its
         // launch recipe so a restored terminal never silently changes login.
         for provider in Account::PROVIDERS {
-            let account = self.default_account_for_directory(provider, &working_directory);
+            let account = self.default_account_for_directory(provider, working_directory);
             if crate::device::is_remote() {
-                launch
+                defaults
                     .environment
                     .extend(crate::device::environment(provider, true));
                 if matches!(account.home, account::AccountHome::System) {
                     continue;
                 }
             }
-            launch.unset_environment.extend(
+            defaults.unset_environment.extend(
                 account
                     .credential_overrides()
                     .iter()
@@ -6138,12 +6173,29 @@ impl Cagents {
             if let (Some(variable), Some(home)) =
                 (account::home_variable(provider), account.resolved_home())
             {
-                launch
+                defaults
                     .environment
                     .insert(variable.to_owned(), home.display().to_string());
             }
         }
-        self.add_terminal_recipe(launch)
+        defaults
+    }
+
+    fn default_terminal_is_deferred(&self, directory: &Path) -> bool {
+        self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            && self.worktree_view_scope(directory).is_some()
+    }
+
+    fn add_prepared_default_terminal(&mut self, launch: LaunchRecipe) -> Task<Message> {
+        if self.default_terminal_is_deferred(&launch.working_directory) {
+            self.shared_views.deferred_default = Some(launch.working_directory);
+            return Task::none();
+        }
+        self.shared_views.creating_default =
+            self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
+        let task = self.add_terminal_recipe(launch);
+        self.shared_views.creating_default = false;
+        task
     }
 
     fn add_terminal_recipe(&mut self, launch: LaunchRecipe) -> Task<Message> {
@@ -12123,10 +12175,14 @@ impl Cagents {
     /// The worktree and pull request dialogs: forms, whose focused field
     /// captures the keys the dialog itself answers.
     fn form_dialog_is_open(&self) -> bool {
+        self.form_dialog_is_open_including_resume(true)
+    }
+
+    fn form_dialog_is_open_including_resume(&self, include_resume: bool) -> bool {
         self.device_ui.open
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
-            || self.resume_ui.open
+            || (include_resume && self.resume_ui.open)
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
@@ -12623,12 +12679,63 @@ impl Cagents {
         )
     }
 
+    fn navigation_completion_is_blocked(&self, message: &Message) -> bool {
+        use worktree_ui::selection::ResumeCompletion;
+
+        let resume = match message {
+            Message::WorktreeNavigationPrepared {
+                generation,
+                receipt,
+            } => receipt.resume_completion(self, *generation),
+            _ => None,
+        };
+        match resume {
+            // These receipts can only retire their original capabilities;
+            // they must not wait behind the picker which superseded them.
+            Some(ResumeCompletion::Stale | ResumeCompletion::SupersededPredecessor) => false,
+            Some(ResumeCompletion::CurrentPicker) => self.resume_picker_navigation_is_blocked(),
+            Some(ResumeCompletion::CurrentWithoutPicker) | None => {
+                self.focused_repository_is_saving() || self.modal_is_open()
+            }
+        }
+    }
+
+    fn resume_picker_navigation_is_blocked(&self) -> bool {
+        self.focused_repository_is_saving()
+            || self.update_ui.confirmation.is_some()
+            || self.form_dialog_is_open_including_resume(false)
+            || self.modal_over_form_dialogs()
+    }
+
     fn release_deferred_navigation_if_unblocked(&mut self) -> Task<Message> {
         let repository_blocks = self.workspace.focused().is_some_and(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         });
         if self.modal_is_open() || repository_blocks {
-            return Task::none();
+            // A current resume can have arrived behind another dialog/save.
+            // Once that blocker clears, its own picker must not strand it.
+            // Move metadata only; App::update rechecks the original receipt.
+            if repository_blocks
+                || !self.resume_ui.open
+                || self.resume_picker_navigation_is_blocked()
+                || self.deferred_navigation.is_empty()
+            {
+                return Task::none();
+            }
+            let mut ready = Vec::new();
+            let queued = std::mem::take(&mut self.deferred_navigation);
+            for message in queued {
+                let current_picker = matches!(&message,
+                    Message::WorktreeNavigationPrepared { generation, receipt }
+                        if receipt.resume_completion(self, *generation)
+                            == Some(worktree_ui::selection::ResumeCompletion::CurrentPicker));
+                if current_picker && !self.navigation_completion_is_blocked(&message) {
+                    ready.push(cosmic::task::message(message));
+                } else {
+                    self.deferred_navigation.push_back(message);
+                }
+            }
+            return Task::batch(ready);
         }
         Task::batch(
             self.deferred_navigation
@@ -13038,6 +13145,7 @@ impl Cagents {
     /// away from their work to wherever it was last opened.
     fn open_utility_card(&mut self, kind: CardKind) -> Task<Message> {
         debug_assert!(kind.is_utility());
+        self.worktree_selection.cancel();
         let Some(id) = self.utility_card(&kind) else {
             return self.add_utility_card(kind);
         };
@@ -13949,6 +14057,7 @@ impl Application for Cagents {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
+            worktree_selection: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
@@ -14267,8 +14376,7 @@ impl Application for Cagents {
         {
             return Task::none();
         }
-        if (self.focused_repository_is_saving() || self.modal_is_open())
-            && completion_navigates(&message)
+        if completion_navigates(&message) && self.navigation_completion_is_blocked(&message)
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
@@ -14312,7 +14420,16 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let mut terminal_metadata_unchanged = false;
+        let navigation_completion = matches!(&message,
+            Message::WorktreeNavigationPrepared { .. } | Message::WorktreeNavigationRetired(_));
         let task = match message {
+            Message::WorktreeNavigationPrepared { generation, receipt } => {
+                self.worktree_navigation_prepared(generation, receipt)
+            }
+            Message::WorktreeNavigationRetired(generation) => {
+                self.worktree_navigation_retired(generation)
+            }
+            Message::WorktreeSelectionCacheInvalidated => self.selection_cache_invalidated(),
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
@@ -14822,7 +14939,9 @@ impl Application for Cagents {
                             // into distinct worktrees after session restoration.
                             // Only the project holding the scope can move it,
                             // and re-selecting resolves every card's owner.
-                            task = if let Some(channel) = self.durable.active_channel {
+                            task = if self.uses_navigation_scheduler() {
+                                self.refresh_automatic_worktree_owners()
+                            } else if let Some(channel) = self.durable.active_channel {
                                 self.select_channel(channel)
                             } else {
                                 self.select_worktree(active, false)
@@ -15369,9 +15488,11 @@ impl Application for Cagents {
                         repository,
                     } => {
                         let directory = self.project_entry_directory(project_id, &repository);
-                        self.select_worktree(directory, true)
+                        self.navigate_worktree(directory, true, Some(worktree_ui::selection::Origin::Project(project_id, repository)))
                     }
-                    SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
+                    SidebarAction::OpenWorktree { project_id, worktree_id, path } => {
+                        self.navigate_worktree(path.clone(), true, Some(worktree_ui::selection::Origin::Worktree(project_id, worktree_id, path)))
+                    },
                     SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
                     SidebarAction::OpenPullRequest {
                         project_id,
@@ -17661,9 +17782,17 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        if !terminal_metadata_unchanged {
-            self.sync_worktree_protections();
-        }
+        let task = if self.uses_navigation_scheduler() {
+            if !terminal_metadata_unchanged || self.worktree_selection.needs_reconciliation() || navigation_completion {
+                // Collect newly arrived Folder/repository boundaries before
+                // deciding whether the one filesystem worker is needed.
+                self.collect_worktree_roots();
+                Task::batch([task, self.reconcile_navigation_protections()])
+            } else { task }
+        } else {
+            if !terminal_metadata_unchanged { self.sync_worktree_protections(); }
+            task
+        };
         self.sync_popup_keyboard_nav();
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
@@ -28622,6 +28751,7 @@ mod tests {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
+            worktree_selection: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::default(),

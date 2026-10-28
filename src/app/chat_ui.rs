@@ -2052,6 +2052,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    prepared_permission: Option<PreparedPermission>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
@@ -2942,8 +2943,27 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        Self::new_with_permission(
+            target,
+            session,
+            connection,
+            visible,
+            syntax_theme,
+            PermissionPreview::Read,
+        )
+    }
+
+    fn new_with_permission(
+        target: Target,
+        session: chat::Session,
+        connection: Connection,
+        visible: bool,
+        syntax_theme: crate::settings::EditorSyntaxTheme,
+        permission: PermissionPreview,
+    ) -> Self {
+        let (permission_mode, prepared) = permission.resolve(&session);
+        let prepared_permission =
+            prepared.then(|| PreparedPermission::capture(&session, permission_mode.clone()));
         let mut runtime = Self {
             preparation: preparation::State::default(),
             target,
@@ -2952,6 +2972,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            prepared_permission,
             provider_queue: std::cell::RefCell::default(),
             source_clock: None,
             finished_stamp: None,
@@ -3136,10 +3157,46 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let mut runtime = Self::new(target, session, Connection::Draft, visible, syntax_theme);
+        Self::draft_with_permission(target, session, snapshot, visible, syntax_theme, false)
+    }
+
+    fn draft_with_permission(
+        target: Target,
+        session: chat::Session,
+        snapshot: Snapshot,
+        visible: bool,
+        syntax_theme: crate::settings::EditorSyntaxTheme,
+        prepared: bool,
+    ) -> Self {
+        // snapshot already contains the one computed preview. In particular,
+        // a prepared None must not trigger another filesystem/config read.
+        let permission = if prepared {
+            PermissionPreview::Prepared(snapshot.permission_mode.clone())
+        } else {
+            PermissionPreview::Resolved(snapshot.permission_mode.clone())
+        };
+        let mut runtime = Self::new_with_permission(
+            target,
+            session,
+            Connection::Draft,
+            visible,
+            syntax_theme,
+            permission,
+        );
         runtime.snapshot = Arc::new(snapshot);
         runtime
     }
+    /// A deliberate existing synchronous picker/recovery resolved this exact
+    /// replacement launch. Keep provenance bound to it, without adding reads.
+    fn record_explicit_permission_preview(&mut self) {
+        if self.prepared_permission.is_some() {
+            self.prepared_permission = Some(PreparedPermission::capture(
+                &self.session,
+                self.snapshot.permission_mode.clone(),
+            ));
+        }
+    }
+
     /// The live connection, once the conversation has started.
     fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
@@ -3881,6 +3938,19 @@ impl Runtime {
         mut snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
+        if snapshot.permission_mode.is_none()
+            && snapshot.session_id.is_none()
+            && let Some(prepared) = &self.prepared_permission
+        {
+            Arc::make_mut(&mut snapshot).permission_mode = if prepared.current(&self.session) {
+                self.snapshot
+                    .permission_mode
+                    .clone()
+                    .or_else(|| prepared.mode.clone())
+            } else {
+                None
+            };
+        }
         if !self.visible.load(Ordering::Relaxed) {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
@@ -3953,10 +4023,20 @@ impl Runtime {
                 .any(|message| &message.id == id)
         });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
+            Arc::make_mut(&mut snapshot).permission_mode = match &self.prepared_permission {
+                Some(prepared) if prepared.current(&self.session) => self
+                    .snapshot
+                    .permission_mode
+                    .clone()
+                    .or_else(|| prepared.mode.clone()),
+                // An explicit prepared None stays authoritative. A different
+                // launch/device needs a new preparation or its explicit existing
+                // synchronous constructor; never read config as a wake fallback.
+                Some(_) => None,
+                None => self.snapshot.permission_mode.clone().or_else(|| {
                     draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
-                });
+                }),
+            };
         }
         if !self.parent_scroll().at_bottom()
             && !snapshot.has_later
@@ -4883,6 +4963,404 @@ fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> 
 /// starts the CLI on the same home, never on whatever the default has become
 /// since. Even the system home is recorded explicitly, because the daemon
 /// may have inherited a different environment from the interface.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::app) struct DefaultChatContext {
+    provider: Provider,
+    account: Account,
+    automatic: bool,
+    directory: PathBuf,
+    environment: std::collections::BTreeMap<String, String>,
+    home: Option<PathBuf>,
+    system_claude: Option<PathBuf>,
+    ambient_home: Option<PathBuf>,
+}
+
+impl DefaultChatContext {
+    pub(in crate::app) fn config_paths(&self) -> Vec<PathBuf> {
+        let absolute = |path: PathBuf| {
+            if path.is_absolute() {
+                path
+            } else {
+                self.directory.join(path)
+            }
+        };
+        let home = self.ambient_home.clone().map(absolute);
+        let mut paths = Vec::new();
+        match self.provider {
+            Provider::Codex => {
+                if let Some(root) = self.home.clone().map(absolute) {
+                    paths.push(root.join("config.toml"));
+                }
+                for directory in self.directory.ancestors() {
+                    if home.as_deref() == Some(directory) {
+                        break;
+                    }
+                    paths.push(directory.join(".codex/config.toml"));
+                }
+            }
+            Provider::Claude => {
+                for root in self.home.iter().chain(&self.system_claude) {
+                    paths.push(absolute(root.clone()).join("settings.json"));
+                }
+                for directory in self.directory.ancestors() {
+                    for name in ["settings.json", "settings.local.json"] {
+                        paths.push(directory.join(".claude").join(name));
+                    }
+                    if home.as_deref() == Some(directory) {
+                        break;
+                    }
+                }
+            }
+            Provider::Omp => {}
+        }
+        paths
+    }
+
+    fn environment_current(&self) -> bool {
+        self.environment
+            == crate::model::agent_recovery::fresh_native_environment(self.provider, true)
+            && self.home == self.account.resolved_home()
+            && self.system_claude == Account::system(Provider::Claude).resolved_home()
+            && self.ambient_home == std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+pub(in crate::app) struct PreparedDefaultChat {
+    context: DefaultChatContext,
+    session: chat::Session,
+    permission: Option<String>,
+}
+
+impl PreparedDefaultChat {
+    pub(in crate::app) fn current(&self, context: &DefaultChatContext) -> bool {
+        self.context == *context
+    }
+}
+
+pub(in crate::app) fn prepare_default_chat(
+    context: DefaultChatContext,
+) -> Result<PreparedDefaultChat, String> {
+    if !context.environment_current() {
+        return Err("Conversation launch context changed while preparing".into());
+    }
+    let session = fresh_chat_session(
+        context.provider,
+        TerminalId::new(),
+        context.directory.clone(),
+        &context.account,
+        context.automatic,
+    )?;
+    let permission = draft_permission_mode(&session.launch.recipe, session.launch.provider);
+    if !context.environment_current() {
+        return Err("Conversation launch context changed while preparing".into());
+    }
+    Ok(PreparedDefaultChat {
+        context,
+        session,
+        permission,
+    })
+}
+
+#[cfg(test)]
+mod prepared_navigation_tests {
+    use super::*;
+
+    fn worker_prepared(profile: &Path, project: &Path, contents: &str) -> PreparedDefaultChat {
+        std::fs::write(profile.join("config.toml"), contents).unwrap();
+        let app = crate::app::tests::context_inspector_test_app(false);
+        let mut context = app.navigation_default_chat_context(project, Provider::Codex);
+        context.account =
+            Account::managed(Provider::Codex, uuid::Uuid::new_v4(), profile.to_owned());
+        context.home = Some(profile.to_owned());
+        std::thread::spawn(move || prepare_default_chat(context).unwrap())
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn prepared_some_and_none_skip_both_open_draft_and_runtime_constructor_reads() {
+        for (contents, expected) in [
+            ("profile = 'not-previewable'\n", None),
+            (
+                "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+                Some("yolo"),
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let profile = base.join("profile");
+            let project = base.join("project");
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::create_dir(&project).unwrap();
+            let prepared = worker_prepared(&profile, &project, contents);
+            let exact_launch = prepared.session.launch.clone();
+            assert_eq!(prepared.permission.as_deref(), expected);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let before = permission_preview_reads();
+            // Dropping the returned skills task is deliberate: this owning
+            // test exercises card/Runtime initialization, never provider start.
+            drop(app.insert_prepared_default_chat(prepared));
+            assert_eq!(permission_preview_reads(), before);
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get(&card).unwrap() else {
+                panic!("prepared draft")
+            };
+            assert_eq!(runtime.session.launch, exact_launch);
+            assert_eq!(runtime.snapshot.permission_mode.as_deref(), expected);
+            assert!(runtime.prepared_permission.is_some());
+            assert!(app.chat_ui.default_chats.contains(&card));
+        }
+    }
+
+    #[test]
+    fn prepared_none_survives_empty_snapshots_hide_show_and_later_provider_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let profile = base.join("profile");
+        let project = base.join("project");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let prepared = worker_prepared(&profile, &project, "profile = 'unknown'\n");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.insert_prepared_default_chat(prepared));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("prepared draft")
+        };
+        let before = permission_preview_reads();
+        for generation in 1..=4 {
+            runtime.set_visible(generation % 2 == 0).unwrap();
+            runtime.install_snapshot(
+                Arc::new(Snapshot {
+                    generation,
+                    ..Snapshot::default()
+                }),
+                None,
+            );
+            assert!(runtime.snapshot.permission_mode.is_none());
+            assert!(runtime.prepared_permission.is_some());
+        }
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 5,
+                permission_mode: Some("workspaceWrite".into()),
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            runtime.snapshot.permission_mode.as_deref(),
+            Some("workspaceWrite")
+        );
+        runtime.set_visible(false).unwrap();
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 6,
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        runtime.set_visible(true).unwrap();
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 7,
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            runtime.snapshot.permission_mode.as_deref(),
+            Some("workspaceWrite")
+        );
+        assert_eq!(permission_preview_reads(), before);
+    }
+
+    #[test]
+    fn changed_launch_cannot_reuse_prepared_policy_or_trigger_an_implicit_config_read() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let profile = base.join("profile");
+        let project = base.join("project");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let prepared = worker_prepared(
+            &profile,
+            &project,
+            "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+        );
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.insert_prepared_default_chat(prepared));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("prepared draft")
+        };
+        let before = permission_preview_reads();
+        runtime
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), project.display().to_string());
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 1,
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        assert!(
+            runtime.snapshot.permission_mode.is_none(),
+            "old home's yolo policy must not survive a launch replacement"
+        );
+        assert!(
+            runtime.prepared_permission.is_some(),
+            "replacement never silently downgrades to wake-time resolver"
+        );
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 2,
+                permission_mode: Some("readOnly".into()),
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            runtime.snapshot.permission_mode.as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(permission_preview_reads(), before);
+        // Existing deliberate synchronous picker results can bind replacement
+        // provenance explicitly; this recording itself performs no read.
+        runtime.record_explicit_permission_preview();
+        runtime.install_snapshot(
+            Arc::new(Snapshot {
+                generation: 3,
+                ..Snapshot::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            runtime.snapshot.permission_mode.as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(permission_preview_reads(), before);
+    }
+
+    #[test]
+    fn navigation_default_provider_matches_post_discard_scope_instead_of_old_placeholder() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let old = base.join("old");
+        let next = base.join("next");
+        let other = base.join("other");
+        for path in [&old, &next, &other] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots
+            .extend([old.clone(), next.clone(), other.clone()]);
+        let fixture_session = |provider: Provider, directory: &Path| {
+            let account =
+                Account::managed(Provider::Codex, uuid::Uuid::new_v4(), base.join("profile"));
+            let mut session = chat::fresh_session(
+                Provider::Codex,
+                TerminalId::new(),
+                directory.to_owned(),
+                &account,
+            )
+            .unwrap();
+            // Synthetic unstarted pane descriptors: no provider/configuration
+            // resolver is involved in this scope/provider-ordering fixture.
+            session.launch.provider = provider;
+            session.launch.recipe.program = provider.executable().into();
+            session.launch.recipe.arguments.clear();
+            session
+        };
+        drop(app.select_worktree(other.clone(), false));
+        drop(app.insert_chat_card_with_preview(
+            fixture_session(Provider::Codex, &other),
+            None,
+            false,
+            None,
+            PermissionPreview::Prepared(None),
+        ));
+        drop(app.select_worktree(old.clone(), false));
+        drop(app.insert_chat_card_with_preview(
+            fixture_session(Provider::Claude, &old),
+            None,
+            true,
+            None,
+            PermissionPreview::Prepared(None),
+        ));
+        assert_eq!(app.preferred_chat_provider(), Provider::Claude);
+        let placeholder = app.workspace.focused().unwrap();
+        assert!(app.chat_is_unused_default(placeholder));
+        let owners = app
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::Chat(session) => {
+                    Some((card.id, session.launch.recipe.working_directory.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let predicted = app.navigation_default_provider(&next, &owners);
+        drop(app.select_worktree(next, false));
+        assert!(!app.durable.cards.iter().any(|card| card.id == placeholder));
+        assert_eq!(predicted, Provider::Codex);
+        assert_eq!(app.preferred_chat_provider(), predicted);
+    }
+}
+
+struct PreparedPermission {
+    launch: chat::Launch,
+    device: Option<(String, String, String)>,
+    mode: Option<String>,
+}
+
+impl PreparedPermission {
+    fn device() -> Option<(String, String, String)> {
+        crate::device::selected().map(|device| {
+            (
+                device.name.clone(),
+                device.host.clone(),
+                device.executable.clone(),
+            )
+        })
+    }
+    fn capture(session: &chat::Session, mode: Option<String>) -> Self {
+        Self {
+            launch: session.launch.clone(),
+            device: Self::device(),
+            mode,
+        }
+    }
+    fn current(&self, session: &chat::Session) -> bool {
+        self.launch == session.launch && self.device == Self::device()
+    }
+}
+
+enum PermissionPreview {
+    Read,
+    Resolved(Option<String>),
+    Prepared(Option<String>),
+}
+
+impl PermissionPreview {
+    fn resolve(self, session: &chat::Session) -> (Option<String>, bool) {
+        match self {
+            Self::Read => (
+                draft_permission_mode(&session.launch.recipe, session.launch.provider),
+                false,
+            ),
+            Self::Resolved(value) => (value, false),
+            Self::Prepared(value) => (value, true),
+        }
+    }
+}
+
 fn fresh_chat_session(
     provider: Provider,
     id: TerminalId,
@@ -4944,7 +5422,17 @@ fn draft_snapshot(
     }
 }
 
+#[cfg(test)]
+thread_local! { static PREVIEW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(in crate::app) fn permission_preview_reads() -> usize {
+    PREVIEW_READS.with(std::cell::Cell::get)
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    #[cfg(test)]
+    PREVIEW_READS.with(|reads| reads.set(reads.get() + 1));
     let arguments = &recipe.arguments;
     match provider {
         Provider::Claude => {
@@ -5483,6 +5971,7 @@ impl Cagents {
             runtime.session = session.clone();
             runtime.error = None;
         }
+        runtime.record_explicit_permission_preview();
         self.remember_chat_model(provider, model, reasoning);
         let skills = if let Some(session) = moved {
             self.replace_chat_conversation(target.card, session);
@@ -5586,6 +6075,7 @@ impl Cagents {
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
             draft_permission_mode(&session.launch.recipe, account.provider);
+        runtime.record_explicit_permission_preview();
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -6291,7 +6781,11 @@ impl Cagents {
         let scope = if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
-            self.select_worktree(working_directory, false)
+            let (selected, scope) = self.select_worktree_checked(working_directory, false);
+            if !selected {
+                return scope;
+            }
+            scope
         } else {
             Task::none()
         };
@@ -6314,12 +6808,60 @@ impl Cagents {
         self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
     }
 
+    pub(in crate::app) fn navigation_default_chat_context(
+        &self,
+        directory: &Path,
+        provider: Provider,
+    ) -> DefaultChatContext {
+        let account = self.default_account_for_directory(provider, directory);
+        DefaultChatContext {
+            provider,
+            home: account.resolved_home(),
+            account,
+            automatic: self.automatic_accounts_for_directory(provider, directory),
+            directory: directory.to_owned(),
+            environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
+            system_claude: Account::system(Provider::Claude).resolved_home(),
+            ambient_home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+
+    pub(in crate::app) fn insert_prepared_default_chat(
+        &mut self,
+        prepared: PreparedDefaultChat,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_preview(
+            prepared.session,
+            None,
+            true,
+            None,
+            PermissionPreview::Prepared(prepared.permission),
+        )
+    }
+
     fn insert_chat_card_with_lifetime(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
         ephemeral: bool,
         draft_from: Option<CardId>,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_preview(
+            session,
+            beside,
+            ephemeral,
+            draft_from,
+            PermissionPreview::Read,
+        )
+    }
+
+    fn insert_chat_card_with_preview(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+        preview: PermissionPreview,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -6396,7 +6938,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         let skills = if session.is_unstarted() {
-            self.open_chat_draft(card_id, session)
+            self.open_chat_draft_with_preview(card_id, session, preview)
         } else {
             let intent = if session.native_continuity.retains_provider() {
                 chat::Intent::Restore
@@ -6463,19 +7005,29 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
+        self.open_chat_draft_with_preview(card, session, PermissionPreview::Read)
+    }
+
+    fn open_chat_draft_with_preview(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+        preview: PermissionPreview,
+    ) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let (permission_mode, prepared) = preview.resolve(&session);
+        snapshot.permission_mode = permission_mode;
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
             && self.workspace_surfaces_visible();
-        let mut runtime = Runtime::draft(
+        let mut runtime = Runtime::draft_with_permission(
             target,
             session,
             snapshot,
             visible,
             self.settings.editor_syntax_theme,
+            prepared,
         );
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
@@ -7807,6 +8359,7 @@ impl Cagents {
         };
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
+        runtime.record_explicit_permission_preview();
         runtime.forget_transcript();
         runtime.pending = None;
         runtime.disconnected = false;
@@ -11145,6 +11698,7 @@ impl Cagents {
                     let provider = runtime.session.launch.provider;
                     set_draft_permission_mode(&mut runtime.session.launch.recipe, provider, &mode);
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
+                    runtime.record_explicit_permission_preview();
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
                     return Task::none();
@@ -14748,6 +15302,129 @@ mod tests {
     const FIXTURE_DIRECTORY: &str = "/workspace/chat-fixture";
     /// Providers name conversations by UUID; resume refuses anything else.
     const KNOWN_THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    #[test]
+    fn native_chat_creation_waits_for_successful_worktree_selection() {
+        for in_channel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let current = directory.path().join("current");
+            let next = directory.path().join("next");
+            std::fs::create_dir(&current).unwrap();
+            std::fs::create_dir(&next).unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(runtime.path().into());
+            // The real constructor creates an unstarted local draft. Drop its
+            // Tasks: no provider, daemon, selection worker or indexer is run.
+            let source = draft_in(&mut app, &current);
+            let target = chat_runtime(&app, source).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("Keep this unsent draft"));
+            let channel = in_channel.then(crate::model::ChannelId::new);
+            if let Some(channel) = channel {
+                let state = Arc::make_mut(&mut app.durable);
+                state.channels.push(crate::model::ProjectChannel {
+                    title_source: Default::default(),
+                    id: channel,
+                    project_id: crate::model::ProjectId::new(),
+                    title: "Existing channel".into(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![source],
+                    focused: Some(source),
+                });
+                state.active_channel = Some(channel);
+            }
+            let before = app.durable.clone();
+            let order = app.workspace.order().collect::<Vec<_>>();
+            let runtimes = app.cards.len();
+            let drafts = app.chat_ui.drafts.clone();
+            let defaults = app.chat_ui.default_chats.clone();
+            assert_eq!(app.active_workspace.as_ref(), Some(&current));
+            assert_eq!(app.workspace.focused(), Some(source));
+            assert!(
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &current, true)
+                    .is_err()
+            );
+            // This is the actual cleanup lock refused by protect_next, not an
+            // injected boolean, missing directory or a local deletion marker.
+            let exclusive =
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &next, true).unwrap();
+            drop(app.new_native_chat(Provider::Codex, Some(next.clone())));
+            if !in_channel {
+                assert!(
+                    Arc::ptr_eq(&app.durable, &before),
+                    "refusal cannot save a new card or scope"
+                );
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                assert_eq!(app.workspace.focused(), Some(source));
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+                assert_eq!(app.cards.len(), runtimes);
+                assert_eq!(app.chat_ui.drafts, drafts);
+                assert_eq!(app.chat_ui.default_chats, defaults);
+                assert!(
+                    app.status
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("Cannot open this worktree yet")
+                );
+                assert!(
+                    app.durable
+                        .cards
+                        .iter()
+                        .all(|card| !app.chat_start_pending(card.id))
+                );
+                assert_eq!(
+                    chat_runtime(&app, source).composer.text(),
+                    "Keep this unsent draft"
+                );
+                drop(exclusive);
+                // A fresh attempt after actual protection becomes available
+                // selects that destination and inserts exactly one draft.
+                drop(app.new_native_chat(Provider::Codex, Some(next.clone())));
+            } else {
+                // A launch in another directory deliberately keeps the active
+                // channel's filing. The original conditional must still skip
+                // worktree selection, even when that other scope is busy.
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                assert_eq!(app.durable.active_channel, channel);
+                drop(exclusive);
+            }
+            assert_eq!(app.durable.cards.len(), before.cards.len() + 1);
+            assert_eq!(app.cards.len(), runtimes + 1);
+            let added = app.workspace.focused().unwrap();
+            assert_ne!(added, source);
+            let draft = chat_runtime(&app, added);
+            assert!(draft.is_draft() && draft.session.is_unstarted());
+            assert_eq!(draft.session.launch.provider, Provider::Codex);
+            assert_eq!(draft.session.launch.recipe.working_directory, next);
+            assert!(!app.chat_start_pending(added));
+            assert_eq!(
+                chat_runtime(&app, source).composer.text(),
+                "Keep this unsent draft"
+            );
+            if let Some(channel) = channel {
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                let channel = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|item| item.id == channel)
+                    .unwrap();
+                assert!(channel.cards.contains(&added) && channel.cards.contains(&source));
+            } else {
+                assert_eq!(app.active_workspace.as_ref(), Some(&next));
+                assert!(app.durable.active_channel.is_none());
+                assert!(
+                    crate::worktree_cleanup::fixture_protection(runtime.path(), &next, true)
+                        .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn new_panes_keep_the_selected_channel_when_launch_directory_changes() {
@@ -21385,6 +22062,9 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = tempfile::tempdir().unwrap();
         let card = draft_in(&mut app, project.path());
+        // Exercise the actual command/picker metadata without starting its
+        // unrelated catalog thread or reading the user's conversation roots.
+        app.disable_resume_catalog_for_command_test();
         write(&mut app, card, "/resume flaky tests");
         submit(&mut app, card);
         assert!(app.resume_ui.open);
@@ -21402,7 +22082,10 @@ mod tests {
         assert!(runtime.is_draft() && !app.chat_start_pending(card));
         assert_eq!(app.resume_ui.replace, Some(card));
 
-        let _ = app.resume_saved_conversation(earlier(&app, card));
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(earlier(&app, card));
+        app.finish_local_resume_for_test(task);
         let resumed = app.workspace.focused().unwrap();
         assert_ne!(resumed, card);
         assert_eq!(app.card_state(resumed).unwrap().title, "Earlier");
@@ -21422,12 +22105,16 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = tempfile::tempdir().unwrap();
         let card = draft_in(&mut app, project.path());
+        app.disable_resume_catalog_for_command_test();
         write(&mut app, card, "/resume");
         submit(&mut app, card);
         assert_eq!(app.resume_ui.replace, Some(card));
         let _ = app.update_resume(super::resume_ui::Action::Close);
         assert_eq!(app.resume_ui.replace, None);
-        let _ = app.resume_saved_conversation(earlier(&app, card));
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(earlier(&app, card));
+        app.finish_local_resume_for_test(task);
         assert!(app.workspace.pending_close().is_none());
         assert!(app.workspace.order().any(|id| id == card));
     }
@@ -21443,7 +22130,10 @@ mod tests {
         saved.session.launch.recipe.arguments.clear();
         saved.session.launch.recipe.working_directory = project.path().join("removed");
         let provider_id = saved.session.launch.session_id.clone();
-        let _ = app.resume_saved_conversation(saved);
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(saved);
+        app.finish_local_resume_for_test(task);
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, card);
         let CardKind::Chat(session) = &app.card_state(reopened).unwrap().kind else {

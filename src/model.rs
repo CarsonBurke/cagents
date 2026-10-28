@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     str::FromStr,
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1228,6 +1229,12 @@ pub struct WorkspaceState {
     pub chat_drafts: HashMap<CardId, String>,
     #[serde(default)]
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    /// Remembered conversation filing after its card closes, independent of
+    /// the immutable launch directory. Keys are opaque history identities;
+    /// this navigation metadata grants no provider or channel authority.
+    /// Shared across snapshots so editing a draft does not copy the history.
+    #[serde(default)]
+    pub conversation_channels: Arc<BTreeMap<String, ChannelId>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1275,6 +1282,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            conversation_channels: Arc::default(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -1319,6 +1327,30 @@ impl WorkspaceState {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn editing_a_cloned_workspace_shares_conversation_filing_until_it_changes() {
+        let mut original = WorkspaceState::default();
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut original.conversation_channels)
+            .insert("opaque recorded history identity".into(), channel);
+        let mut edited = original.clone();
+        edited
+            .chat_drafts
+            .insert(CardId::new(), "another letter".into());
+        assert!(Arc::ptr_eq(
+            &original.conversation_channels,
+            &edited.conversation_channels
+        ));
+        let changed = ChannelId::new();
+        Arc::make_mut(&mut edited.conversation_channels)
+            .insert("opaque recorded history identity".into(), changed);
+        assert_eq!(
+            original.conversation_channels.values().next(),
+            Some(&channel)
+        );
+        assert_eq!(edited.conversation_channels.values().next(), Some(&changed));
+    }
 
     #[test]
     fn legacy_repository_descriptor_remains_a_browser() {

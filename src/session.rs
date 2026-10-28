@@ -3090,6 +3090,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            conversation_channels: Arc::default(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

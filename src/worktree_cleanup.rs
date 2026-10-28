@@ -641,17 +641,20 @@ pub(crate) fn fixture_protection(
 
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct WindowProtections {
-    directories: BTreeMap<PathBuf, Protection>,
+    directories: BTreeMap<PathBuf, std::sync::Arc<Protection>>,
     resolved: BTreeMap<PathBuf, PathBuf>,
     requested: std::collections::BTreeSet<PathBuf>,
-    ready: Option<crate::instance::OwnedLock>,
+    ready: Option<std::sync::Arc<crate::instance::OwnedLock>>,
+    preparing: bool,
     retry_after: Option<std::time::Instant>,
     last_failure: Option<String>,
     missing: std::collections::BTreeSet<PathBuf>,
     #[cfg(test)]
     fixture_runtime: Option<PathBuf>,
+    #[cfg(test)]
+    io_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl WindowProtections {
@@ -668,6 +671,19 @@ impl WindowProtections {
         self.fixture_runtime = Some(runtime);
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_navigation_io(
+        &mut self,
+        observer: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.io_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_navigation_retry(&mut self) {
+        self.retry_after = Some(std::time::Instant::now());
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
         #[cfg(test)]
         let protection = match &self.fixture_runtime {
@@ -679,11 +695,163 @@ impl WindowProtections {
         if let Some(protection) = protection {
             self.resolved
                 .insert(directory.to_owned(), protection.directory.clone());
-            self.directories
-                .insert(protection.directory.clone(), protection);
+            self.directories.insert(
+                protection.directory.clone(),
+                std::sync::Arc::new(protection),
+            );
         }
         Ok(())
     }
+    /// Snapshot shares directory leases, never the readiness advertisement.
+    /// The live window keeps its old guards until a current result is accepted.
+    pub(crate) fn navigation_sync_needed(&self, paths: &[PathBuf]) -> bool {
+        let requested = paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        requested != self.requested
+            || self
+                .retry_after
+                .is_some_and(|at| std::time::Instant::now() >= at)
+            || (self.ready.is_none() && self.retry_after.is_none())
+    }
+
+    /// Revoke the already-open per-window readiness lock without path lookup.
+    /// Runtime directories follow the local-filesystem XDG contract; this is
+    /// not a general claim about arbitrary filesystem unlock latency.
+    /// Keep its owning description for off-thread close/retirement. A changed
+    /// scope must never advertise readiness while its preparation is pending.
+    pub(crate) fn defer_navigation_sync(
+        &mut self,
+        paths: &[PathBuf],
+        owners_changed: bool,
+    ) -> io::Result<Option<std::sync::Arc<crate::instance::OwnedLock>>> {
+        let requested = paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if requested == self.requested && !owners_changed {
+            return Ok(None);
+        }
+        if let Some(ready) = self.ready.take() {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(ready.as_raw_fd(), libc::LOCK_UN | libc::LOCK_NB) } != 0 {
+                let error = io::Error::last_os_error();
+                self.ready = Some(ready);
+                return Err(error);
+            }
+            return Ok(Some(ready));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn navigation_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.ready = None;
+        snapshot.preparing = true;
+        snapshot.requested.clear();
+        snapshot.retry_after = None;
+        snapshot.last_failure = None;
+        snapshot
+    }
+
+    /// Worker-only: freshly acquire every present path, preserving the existing
+    /// old-inode lease policy for missing paths. No readiness is published here.
+    pub(crate) fn prepare_navigation(mut self, paths: Vec<PathBuf>) -> io::Result<Self> {
+        #[cfg(test)]
+        let runtime = self.fixture_runtime.clone();
+        self.sync_with(
+            paths,
+            std::time::Instant::now(),
+            |path| path.canonicalize(),
+            |path| {
+                #[cfg(test)]
+                if let Some(runtime) = &runtime {
+                    return acquire(runtime, path, false);
+                }
+                protect(path)?.ok_or_else(|| io::Error::other("window protection unavailable"))
+            },
+            || Err(io::Error::other("preparation cannot advertise readiness")),
+        )?;
+        if let Some(error) = &self.last_failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        Ok(self)
+    }
+
+    /// Worker-side named-root proof: equal canonical strings are insufficient
+    /// when a directory was replaced at that same name after acquisition.
+    pub(crate) fn validate_navigation(&self) -> io::Result<()> {
+        for (lexical, physical) in &self.resolved {
+            if self.missing.contains(lexical) {
+                continue;
+            }
+            let root = crate::fs_safety::Root::open(physical)?;
+            let guard = self
+                .directories
+                .get(physical)
+                .ok_or_else(|| io::Error::other("prepared worktree guard missing"))?;
+            if !guard.protects_root(&root)? {
+                return Err(io::Error::other("prepared worktree directory was replaced"));
+            }
+        }
+        Ok(())
+    }
+
+    /// All path resolution happened on the worker. This only narrows a
+    /// conservative prepared set and locks an already-open readiness file.
+    pub(crate) fn accept_navigation(
+        &mut self,
+        live: &Self,
+        desired: impl IntoIterator<Item = PathBuf>,
+        ready: &mut Option<crate::instance::PreparedLock>,
+    ) -> io::Result<Vec<std::sync::Arc<Protection>>> {
+        let desired = desired
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !desired.is_subset(&self.requested) {
+            return Err(io::Error::other("worktree protection inputs changed"));
+        }
+        let accepted_ready = match self.ready.as_ref().or(live.ready.as_ref()) {
+            Some(guard) => Some(guard.clone()),
+            None => match ready.take() {
+                Some(file) => match file.try_lock(libc::LOCK_EX | libc::LOCK_NB) {
+                    Ok(guard) => Some(std::sync::Arc::new(guard)),
+                    Err((error, file)) => {
+                        *ready = Some(file);
+                        return Err(error);
+                    }
+                },
+                None => None,
+            },
+        };
+        self.resolved.retain(|path, _| desired.contains(path));
+        self.missing.retain(|path| desired.contains(path));
+        let needed = self
+            .resolved
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let obsolete = self
+            .directories
+            .keys()
+            .filter(|path| !needed.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        // Return last-owner candidates for off-UI retirement; retain() here
+        // could otherwise unlock/close the final guard in the update callback.
+        let retired = obsolete
+            .into_iter()
+            .filter_map(|path| self.directories.remove(&path))
+            .collect();
+        self.requested = desired;
+        self.preparing = false;
+        self.ready = accepted_ready;
+        self.retry_after = (!self.missing.is_empty())
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+        Ok(retired)
+    }
+
     pub(crate) fn sync(
         &mut self,
         directories: impl IntoIterator<Item = PathBuf>,
@@ -737,6 +905,10 @@ impl WindowProtections {
         // Continue after individual failures so every resolvable scope keeps
         // its lease. Preserve earlier guards until the replacement set is safe.
         for path in &self.requested {
+            #[cfg(test)]
+            if let Some(observer) = &self.io_observer {
+                observer();
+            }
             let directory = match canonicalize(path) {
                 Ok(directory) => directory,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -754,10 +926,11 @@ impl WindowProtections {
                     continue;
                 }
             };
-            if !self.directories.contains_key(&directory) {
+            if self.preparing || !self.directories.contains_key(&directory) {
                 match protect(&directory) {
                     Ok(guard) => {
-                        self.directories.insert(directory.clone(), guard);
+                        self.directories
+                            .insert(directory.clone(), std::sync::Arc::new(guard));
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         missing.insert(path.clone());
@@ -785,9 +958,9 @@ impl WindowProtections {
         }
         self.missing = missing;
         if errors.is_empty() {
-            if self.ready.is_none() {
+            if self.ready.is_none() && !self.preparing {
                 match ready() {
-                    Ok(guard) => self.ready = Some(guard),
+                    Ok(guard) => self.ready = Some(std::sync::Arc::new(guard)),
                     Err(error) => errors.push(error.to_string()),
                 }
             }
@@ -1445,11 +1618,11 @@ mod tests {
         let path = guard.directory.clone();
         let marker = runtime.path().join("ready");
         let mut window = WindowProtections {
-            directories: [(path.clone(), guard)].into(),
+            directories: [(path.clone(), std::sync::Arc::new(guard))].into(),
             requested: [path].into(),
-            ready: Some(
+            ready: Some(std::sync::Arc::new(
                 crate::instance::owned_lock(&marker, libc::LOCK_EX | libc::LOCK_NB).unwrap(),
-            ),
+            )),
             ..Default::default()
         };
         window.suspend_readiness();

@@ -158,7 +158,30 @@ impl Drop for OwnedLock {
     }
 }
 
-pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+/// A validated file which does not advertise readiness until its owner commits.
+pub(crate) struct PreparedLock(File);
+
+impl PreparedLock {
+    pub(crate) fn try_lock(self, operation: i32) -> Result<OwnedLock, (io::Error, Self)> {
+        // Keep the descriptor owned by the caller on refusal. Navigation must
+        // retire it off the UI thread, including a failed readiness commit.
+        if unsafe { libc::flock(self.0.as_raw_fd(), operation) } != 0 {
+            return Err((io::Error::last_os_error(), self));
+        }
+        Ok(OwnedLock(self.0))
+    }
+
+    pub(crate) fn lock(self, operation: i32) -> io::Result<OwnedLock> {
+        self.try_lock(operation).map_err(|(error, _)| error)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_prepared_lock(path: &Path) -> io::Result<PreparedLock> {
+    prepare_owned_lock(path)
+}
+
+fn prepare_owned_lock(path: &Path) -> io::Result<PreparedLock> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -175,7 +198,11 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    owned_file_lock(lock, operation)
+    Ok(PreparedLock(lock))
+}
+
+pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+    prepare_owned_lock(path)?.lock(operation)
 }
 
 /// Acquire the existing drop-safe advisory lock on a file a confined storage
@@ -186,6 +213,65 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
         return Err(io::Error::last_os_error());
     }
     Ok(OwnedLock(lock))
+}
+
+#[cfg(test)]
+mod prepared_readiness_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn prepared_ready_file_does_not_advertise_until_original_descriptor_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("ready");
+        let prepared = prepare_owned_lock(&path).unwrap();
+        let identity = prepared.0.metadata().unwrap();
+        let other = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(other);
+        let committed = prepared
+            .try_lock(libc::LOCK_EX | libc::LOCK_NB)
+            .unwrap_or_else(|_| panic!("ready commit"));
+        let held = committed.metadata().unwrap();
+        assert_eq!((identity.dev(), identity.ino()), (held.dev(), held.ino()));
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(committed);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn refused_commit_returns_the_same_owned_descriptor_without_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("ready");
+        let prepared = prepare_owned_lock(&path).unwrap();
+        let original_fd = prepared.0.as_raw_fd();
+        let original = prepared.0.metadata().unwrap();
+        let other = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let (error, retained) = match prepared.try_lock(libc::LOCK_EX | libc::LOCK_NB) {
+            Err(refused) => refused,
+            Ok(_) => panic!("busy readiness must refuse"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(retained.0.as_raw_fd(), original_fd);
+        let still_held = retained.0.metadata().unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (still_held.dev(), still_held.ino())
+        );
+        drop(other);
+        assert!(retained.try_lock(libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn readiness_preparation_preserves_existing_nofollow_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let target = base.join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        let link = base.join("ready");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_owned_lock(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
 }
 
 /// Expected contention with the installation coordinator, distinct from a
@@ -724,6 +810,12 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
 
 pub(crate) fn window_is_initialized() -> bool {
     WINDOW_SLOT.get().is_some()
+}
+
+pub(crate) fn prepare_window_protection_ready() -> io::Result<PreparedLock> {
+    prepare_owned_lock(
+        &runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))),
+    )
 }
 
 pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {

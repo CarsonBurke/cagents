@@ -309,9 +309,7 @@ impl Cagents {
         }).map(|owner| owner.state.id).collect()
     }
 
-    pub(super) fn sync_worktree_protections(&mut self) {
-        #[cfg(test)]
-        super::terminal_output_tests::record_protection();
+    pub(super) fn desired_worktree_protections(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
@@ -324,13 +322,23 @@ impl Cagents {
         {
             // Drafts and parked sessions must not be discarded by an optional
             // cleanup, even before they acquire a daemon-hosted actor.
-            if matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                && let Some(scope) = self
+            let launch_directory = match &card.kind {
+                CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
+                CardKind::Terminal(session) => Some(&session.launch.working_directory),
+                _ => None,
+            };
+            if let Some(directory) = launch_directory {
+                // Filing may change without rewriting an issued recipe. Keep
+                // its physical launch source protected independently, including
+                // unstarted drafts and parked sessions with no daemon actor.
+                paths.push(directory.clone());
+                if let Some(scope) = self
                     .worktree_owners
                     .get(&card.id)
                     .or_else(|| self.durable.card_scopes.get(&card.id))
-            {
-                paths.push(scope.clone());
+                {
+                    paths.push(scope.clone());
+                }
             }
             if let CardKind::Repository(view) = &card.kind {
                 if view.selected_file.is_some() {
@@ -348,6 +356,13 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        paths
+    }
+
+    pub(super) fn sync_worktree_protections(&mut self) {
+        #[cfg(test)]
+        super::terminal_output_tests::record_protection();
+        let paths = self.desired_worktree_protections();
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
