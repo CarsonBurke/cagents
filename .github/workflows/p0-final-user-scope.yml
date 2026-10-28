@@ -19,12 +19,12 @@ env:
   RUSTUP_TOOLCHAIN: 1.93.0
   P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
   P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
-  P0_PRODUCT_HEAD: 091f030dadb17bec2008786acdb7decaadd90e7c
-  P0_PRODUCT_TREE: 197e4abaeee303c694cc2f04bfc50545cbba95eb
+  P0_PRODUCT_HEAD: 349073a38736253b17906726b18789965cac6c52
+  P0_PRODUCT_TREE: bf979afd2757af73f8c6e77ee6db55578fe7cfa8
 
 jobs:
-  host-final091f:
-    name: Final091f exact HOST parents in natural User scope
+  host-final349073a3:
+    name: Final349073a3 exact HOST parents in natural User scope
     if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
     runs-on: ubuntu-22.04
     timeout-minutes: 160
@@ -311,8 +311,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  ui-final091f:
-    name: Exact091f UI23 and cold13 parents in natural hosted User scope
+  ui-final349073a3:
+    name: Exact349073a3 UI23 and cold13 parents in natural hosted User scope
     if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
     runs-on: ubuntu-22.04
     timeout-minutes: 210
@@ -323,8 +323,8 @@ jobs:
       P0_EVIDENCE_DIR: /tmp/p0-final-user-scope-ui-${{ github.run_id }}-${{ github.run_attempt }}
       P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
       P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
-      P0_PRODUCT_HEAD: 091f030dadb17bec2008786acdb7decaadd90e7c
-      P0_PRODUCT_TREE: 197e4abaeee303c694cc2f04bfc50545cbba95eb
+      P0_PRODUCT_HEAD: 349073a38736253b17906726b18789965cac6c52
+      P0_PRODUCT_TREE: bf979afd2757af73f8c6e77ee6db55578fe7cfa8
     defaults:
       run:
         shell: bash
@@ -368,8 +368,8 @@ jobs:
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
           control_base = '4d18d788d03588621907b423a2df0e129f6e689c'
-          product = '091f030dadb17bec2008786acdb7decaadd90e7c'
-          tree = '197e4abaeee303c694cc2f04bfc50545cbba95eb'
+          product = '349073a38736253b17906726b18789965cac6c52'
+          tree = 'bf979afd2757af73f8c6e77ee6db55578fe7cfa8'
           assert control_base == os.environ['P0_CONTROL_BASE']
           assert product == os.environ['P0_PRODUCT_HEAD'] and tree == os.environ['P0_PRODUCT_TREE']
           workflow = '.github/workflows/p0-final-user-scope.yml'
@@ -391,6 +391,7 @@ jobs:
           assert git('rev-parse', product + ':' + setup) == setup_blob
           paths = [
               'Cargo.toml', 'Cargo.lock', 'build.rs', setup,
+              'scripts/check-format', 'scripts/check-format-cache.py', 'tests/check_format.py',
               'src/agent_execution.rs', 'src/app.rs', 'src/app/shared_views.rs',
               'src/app/shared_views/tests/startup_admission.rs',
               'src/app/shared_views/tests/history_start.rs',
@@ -421,11 +422,11 @@ jobs:
               'workflow_sha256': hashlib.sha256(workflow_bytes).hexdigest(),
               'setup_blob': setup_blob,
               'setup_sha256': hashlib.sha256(setup_bytes).hexdigest(),
-              'authoritative_product_source_packet_sha256': '59a6965c0a0457bef6c69853509f96daf386d7e0e88cd7a7459c5d0d8def11a6',
+              'authoritative_product_source_packet_sha256': 'a91fe34962c678464cbc7cb4b22f45d1015b6dfce7666fc486276493ea5b6b72',
               'cold13_leaf_sha256': 'af09ce5bdee439ca31ee2bbd6c28233972e35a8b3cc2ff366d4d109b70fbf72c',
               'selector_names_reference_48c_bundle_sha256': 'c6b9e1d9ca37bb134b1b72e57ab3337a5bc2abe6a9706dae50b00caad8f1a83d',
               'source_sha256': product_hashes,
-              'scope': 'Exact091f UI36 parents only; not native, HOST, full CI or recovery acceptance',
+              'scope': 'Exact349073a3 UI36 parents only; not native, HOST, full CI or recovery acceptance',
           }, indent=2) + '\n')
           (evidence / 'selectors.json').write_text(json.dumps(['app::chat_ui::tests::retained_history_enqueue_refusal_keeps_content_and_allows_fresh_writer_retry', 'app::chat_ui::tests::cold_retained_copy_opens_history_after_atomic_ack_then_requires_explicit_resume', 'app::chat_ui::tests::retained_history_lost_ack_needs_fresh_explicit_retry_and_keeps_latest_content', 'app::chat_ui::tests::retained_history_coalesced_aba_does_not_rearm_cancelled_snapshot_provenance', 'app::chat_ui::tests::retained_history_stale_context_and_changed_ack_connection_remain_inert', 'app::chat_ui::tests::strict_retained_history_wire_refuses_actor_mismatch_and_unsettled_results', 'app::chat_ui::tests::retained_history_atomic_refusal_preserves_both_copies_and_latest_retry', 'app::chat_ui::tests::retained_history_close_while_ack_pending_persists_only_closed_reader', 'app::chat_ui::tests::cold_image_only_retained_copy_can_open_history_without_a_text_draft', 'app::chat_ui::tests::generic_cached_pending_pane_cannot_spend_a_retained_copy_admission', 'app::chat_ui::tests::admitted_retained_history_detaches_later_actor_frames_and_restores_with_strict_policy', 'app::chat_ui::tests::explicit_same_allocation_resume_spends_only_reader_policy_with_content_ack', 'app::chat_ui::tests::retained_history_full_checkpoint_projects_prior_rebinding_and_unrelated_copy', 'app::shared_views::tests::startup_admission::retired_cached_shared_chat_executes_no_provider_start', 'app::shared_views::tests::startup_admission::authoritative_offscreen_chat_executes_exact_descriptor_once', 'app::shared_views::tests::startup_admission::local_only_cached_chat_still_restores_and_preserves_its_draft', 'app::shared_views::tests::startup_admission::retired_cached_draft_stays_readable_and_cannot_start_provider', 'app::shared_views::tests::startup_admission::replacement_admission_keeps_old_draft_beside_exact_canonical_chat', 'app::shared_views::tests::startup_admission::history_picker_does_not_focus_retained_unadmitted_cache', 'app::shared_views::tests::startup_admission::startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment', 'app::shared_views::tests::startup_admission::exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver', 'app::shared_views::tests::startup_admission::canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt', 'app::shared_views::tests::startup_admission::refused_canonical_upgrade_preserves_source_draft_without_provider_activation', 'app::shared_views::tests::startup_admission::canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment', 'app::shared_views::tests::startup_admission::an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission', 'app::shared_views::tests::startup_admission::refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider', 'app::shared_views::tests::startup_admission::failed_seed_retry_rejects_stale_owner_source_registry_and_attempt', 'app::shared_views::tests::startup_admission::failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor', 'app::shared_views::tests::startup_admission::failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts', 'app::shared_views::tests::startup_admission::retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots', 'app::shared_views::tests::startup_admission::closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat', 'app::shared_views::tests::startup_admission::retry_view::saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_all_widths', 'app::shared_views::tests::startup_admission::retry_view::closed_publisher_exposes_this_window_instruction_without_retry_or_keyboard_action', 'app::shared_views::tests::startup_admission::retry_view::native_retry_keyboard_dispatches_exact_attempt_and_queued_old_action_cannot_retry_its_successor', 'app::shared_views::tests::startup_admission::retry_view::retained_retry_press_cannot_cross_attempts_and_unchanged_attempt_keeps_its_native_press', 'app::shared_views::tests::startup_admission::retry_view::disabled_retry_keeps_failure_visible_and_reenabled_retry_requires_a_fresh_press'], indent=2) + '\n')
           PY
@@ -434,7 +435,7 @@ jobs:
         timeout-minutes: 20
         uses: ./.github/actions/setup-linux-build
 
-      - name: Detach the disposable checkout to exact091f before any Cargo
+      - name: Detach the disposable checkout to exact349073a3 before any Cargo
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -470,12 +471,12 @@ jobs:
           }, indent=2) + '\n')
           PY
 
-      - name: Check only the exact091f browserless UI executable boundary
+      - name: Check only the exact349073a3 browserless UI executable boundary
         timeout-minutes: 35
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 091f030dadb17bec2008786acdb7decaadd90e7c
-          test "$(git rev-parse 'HEAD^{tree}')" = 197e4abaeee303c694cc2f04bfc50545cbba95eb
+          test "$(git rev-parse HEAD)" = 349073a38736253b17906726b18789965cac6c52
+          test "$(git rev-parse 'HEAD^{tree}')" = bf979afd2757af73f8c6e77ee6db55578fe7cfa8
           test -z "$(git status --porcelain)"
           python3 - <<'PY'
           import os
@@ -498,8 +499,8 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 091f030dadb17bec2008786acdb7decaadd90e7c
-          test "$(git rev-parse 'HEAD^{tree}')" = 197e4abaeee303c694cc2f04bfc50545cbba95eb
+          test "$(git rev-parse HEAD)" = 349073a38736253b17906726b18789965cac6c52
+          test "$(git rev-parse 'HEAD^{tree}')" = bf979afd2757af73f8c6e77ee6db55578fe7cfa8
           test -z "$(git status --porcelain)"
           python3 - <<'PY'
           import os
