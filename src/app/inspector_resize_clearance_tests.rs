@@ -6,6 +6,7 @@ use iced::advanced::{
 };
 use iced::runtime::user_interface::{Cache, UserInterface};
 use iced::{Event, Point, Rectangle, Size, Vector, mouse};
+use uuid::Uuid;
 
 const SIZE: Size = Size::new(1440.0, 900.0);
 

@@ -6,6 +6,7 @@ use iced::advanced::{
 };
 use iced::runtime::user_interface::{Cache, UserInterface};
 use iced::{Event, Point, Rectangle, Size, Vector, mouse};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
