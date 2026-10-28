@@ -1466,7 +1466,11 @@ impl State {
                     match &result {
                         Ok(_) => {}
                         Err(message)
-                            if crate::github::polling::ready(&target.repository.host, false) =>
+                            if !cancellation.is_cancelled()
+                                && crate::github::polling::ready(
+                                    &target.repository.host,
+                                    false,
+                                ) =>
                         {
                             crate::github::polling::failed(
                                 &target.repository.host,
@@ -3643,6 +3647,52 @@ pub(crate) mod tests {
         state.cache_dirty = false;
         state.adopt(&refreshed);
         assert!(!state.cache_dirty);
+    }
+
+    #[tokio::test]
+    async fn closing_a_pending_review_load_does_not_pause_host_polling() {
+        use cosmic::iced::futures::StreamExt;
+
+        struct NeverExecute;
+        impl crate::repository::ProcessExecutor for NeverExecute {
+            fn execute(
+                &self,
+                _: &crate::repository::CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure>
+            {
+                panic!("closed review must cancel before launching its read");
+            }
+        }
+        let host = "review-cancelled-load-test.invalid";
+        let api = Arc::new(crate::github::GitHubService::new(
+            "gh",
+            Arc::new(NeverExecute),
+        ));
+        let mut state = State::new(api, RepositoryService::system("git"));
+        let mut target = target(1);
+        target.repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+        assert!(crate::github::polling::ready(host, false));
+        let task = state.open(target);
+        let generation = state.generation;
+        drop(state.close());
+        assert_ne!(state.generation, generation);
+
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let mut completions = 0;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                assert!(matches!(&action, Action::Loaded { result: Err(_), .. }));
+                drop(state.update_inner(action));
+                completions += 1;
+            }
+        }
+        assert_eq!(completions, 1);
+        assert_eq!(state.load, LoadState::Idle);
+        assert!(state.target.is_none());
+        assert!(crate::github::polling::ready(host, false));
+        assert!(crate::github::polling::ready(host, true));
+        assert!(crate::github::polling::rate_limit(host).is_none());
     }
 
     #[tokio::test]

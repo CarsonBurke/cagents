@@ -93,10 +93,18 @@ pub fn rate_limit(host: &str) -> Option<RateLimit> {
 }
 
 pub fn failed(host: &str, error: &GitHubError) {
+    let rate_limit = error.rate_limit();
+    // Closing or switching a review cancels reads without a host outage. Any
+    // server pacing already observed still applies, including partial output.
+    if rate_limit.is_none()
+        && matches!(error, GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Cancelled)
+    {
+        return;
+    }
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
     let budget = budgets.entry(host.to_ascii_lowercase()).or_default();
     budget.failures = budget.failures.saturating_add(1);
-    if let Some(limit) = error.rate_limit() {
+    if let Some(limit) = rate_limit {
         budget.due = budget.due.max(limit.retry_at);
         budget.rate_limited = true;
     } else if !budget.rate_limited || budget.due <= now() {
@@ -180,6 +188,83 @@ mod tests {
         assert!(!ready(host, true));
         succeeded(host);
         assert!(!ready(host, false));
+        BUDGETS.lock().unwrap().remove(host);
+    }
+
+    #[test]
+    fn cancelled_process_leaves_new_and_existing_host_budgets_unchanged() {
+        let host = "polling-cancelled-process-test.invalid";
+        let mut failure = ProcessFailure {
+            kind: ProcessFailureKind::Cancelled,
+            program: "gh".into(),
+            exit_code: None,
+            signal: None,
+            stdout: vec![],
+            stderr: vec![],
+            message: "operation cancelled".into(),
+            started: false,
+        };
+        for started in [false, true] {
+            failure.started = started;
+            failed(host, &GitHubError::Process(failure.clone()));
+            assert!(ready(host, false));
+            assert!(!BUDGETS.lock().unwrap().contains_key(host));
+        }
+        // A timeout remains a transient failure even with the same message.
+        let cancelled = GitHubError::Process(failure.clone());
+        failure.kind = ProcessFailureKind::TimedOut;
+        failed(host, &GitHubError::Process(failure));
+        assert!(!ready(host, false));
+        assert!(ready(host, true));
+        let snapshot = || {
+            let budgets = BUDGETS.lock().unwrap();
+            let budget = budgets.get(host).unwrap();
+            (budget.failures, budget.due, budget.rate_limited)
+        };
+        let transient = snapshot();
+        failed(host, &cancelled);
+        assert_eq!(snapshot(), transient);
+
+        let limit = RateLimit {
+            retry_at: now() + 120,
+        };
+        failed(
+            host,
+            &GitHubError::RateLimited {
+                limit: limit.clone(),
+            },
+        );
+        let rate_limited = snapshot();
+        failed(host, &cancelled);
+        assert_eq!(snapshot(), rate_limited);
+        assert_eq!(rate_limit(host), Some(limit));
+        assert!(!ready(host, true));
+        BUDGETS.lock().unwrap().remove(host);
+    }
+
+    #[test]
+    fn cancelled_process_preserves_server_pacing_from_partial_output() {
+        let host = "polling-cancelled-rate-limit-test.invalid";
+        let retry_at = now() + 120;
+        failed(
+            host,
+            &GitHubError::Process(ProcessFailure {
+                kind: ProcessFailureKind::Cancelled,
+                program: "gh".into(),
+                exit_code: None,
+                signal: None,
+                stdout: format!(
+                    "HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {retry_at}\r\n\r\n"
+                )
+                .into_bytes(),
+                stderr: vec![],
+                message: "operation cancelled".into(),
+                started: true,
+            }),
+        );
+        assert_eq!(rate_limit(host), Some(RateLimit { retry_at }));
+        assert!(!ready(host, false));
+        assert!(!ready(host, true));
         BUDGETS.lock().unwrap().remove(host);
     }
 }
