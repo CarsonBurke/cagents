@@ -2600,7 +2600,10 @@ fn execute_with_model_context(
             source,
         } => launch_ui(new_window, window.as_deref(), source.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
-        TopCommand::Terminal { command } => execute_terminal(command),
+        TopCommand::Terminal { command } => match project_channel_context {
+            Some(context) => execute_terminal_as(command, &context),
+            None => execute_terminal(command),
+        },
         TopCommand::Project { command } => match project_channel_context {
             Some(context) => execute_project_as(command, &context),
             None => execute_project(command),
@@ -3384,22 +3387,28 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    // Inside a hosted session the daemon lets these commands change only the
-    // terminals that session controls. Reads stay open to every caller.
-    let authority = Authority::from_environment();
-    if authority.token().is_some()
-        && matches!(
-            command,
-            TerminalCommand::Spawn { .. }
-                | TerminalCommand::Write { .. }
-                | TerminalCommand::Close { .. }
-        )
-    {
-        client.authenticate(authority).map_err(protocol_error)?;
+    if terminal_command_mutates(&command) {
+        return execute_terminal_as(command, &ProjectChannelContext::capture());
     }
+    // Keep the four global read verbs on their existing unauthenticated route.
+    let socket = control_daemon_socket()?;
+    let client = ControlClient::connect(&socket)
+        .map_err(|error| AppError::new("daemon_connection", error))?;
+    terminal_output(command, client)
+}
+
+fn execute_terminal_as(
+    command: TerminalCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    let client = context.connect(true)?;
+    terminal_output(command, client)
+}
+
+fn terminal_output(
+    command: TerminalCommand,
+    mut client: ControlClient,
+) -> Result<CommandOutput, AppError> {
     match command {
         TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
@@ -3569,7 +3578,7 @@ impl ServiceRequestContext {
     }
 }
 
-/// Caller scope for the legacy shared-model CLI verbs. ChannelWork carries
+/// Caller scope for legacy terminal and shared-model CLI mutations. ChannelWork carries
 /// its own explicit authority and never enters this connection path.
 struct ProjectChannelContext {
     authority: Authority,
@@ -3607,7 +3616,7 @@ impl ProjectChannelContext {
         if self.authority.token().is_some() && self.remote {
             return Err(AppError::new(
                 "permission_denied",
-                "Project and channel commands from an agent session require your own terminal on the remote device",
+                "Project, channel and terminal commands from an agent session require your own terminal on the remote device",
             ));
         }
         Ok(())
@@ -3642,6 +3651,7 @@ impl ProjectChannelContext {
 
 fn legacy_model_command_mutates(command: &TopCommand) -> bool {
     match command {
+        TopCommand::Terminal { command } => terminal_command_mutates(command),
         TopCommand::Project { command } => project_command_mutates(command),
         TopCommand::Channel { command } => channel_command_mutates(command) == Some(true),
         _ => false,
@@ -3655,6 +3665,18 @@ fn routes_to_staged_owner_as(
     routes_to_staged_owner(command)
         && !(legacy_model_command_mutates(command)
             && context.is_some_and(|context| context.authority.token().is_some()))
+}
+
+fn terminal_command_mutates(command: &TerminalCommand) -> bool {
+    match command {
+        TerminalCommand::Spawn { .. }
+        | TerminalCommand::Write { .. }
+        | TerminalCommand::Close { .. } => true,
+        TerminalCommand::List { .. }
+        | TerminalCommand::Show { .. }
+        | TerminalCommand::Snapshot { .. }
+        | TerminalCommand::Wait { .. } => false,
+    }
 }
 
 fn project_command_mutates(command: &ProjectCommand) -> bool {
