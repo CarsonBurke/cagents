@@ -76,6 +76,26 @@ pub enum Progress {
     Error(String),
 }
 
+/// Preserve gitignore's basename/anchored scope when extending a directory
+/// glob to the files below it. The dependency strips one escape before a final
+/// slash and treats a leading `!` as override negation.
+fn directory_glob_descendants(pattern: &str) -> Option<String> {
+    if !pattern.ends_with('/') || pattern.starts_with('#') {
+        return None;
+    }
+    let (negation, path) = pattern
+        .strip_prefix('!')
+        .map_or(("", pattern), |path| ("!", path));
+    let anchored = path.starts_with('/');
+    let path = path.strip_suffix('/')?;
+    let path = path.strip_suffix('\\').unwrap_or(path);
+    if anchored || path.contains('/') {
+        Some(format!("{negation}{path}/**"))
+    } else {
+        Some(format!("{negation}**/{path}/**"))
+    }
+}
+
 /// Search one local root. Returning false from `publish` cancels delivery.
 /// Symlinks are never followed, binary and oversized files are skipped, and
 /// each line is bounded independently to avoid an unbounded allocation.
@@ -143,9 +163,15 @@ fn search_with_limits(
             } else {
                 glob.to_owned()
             };
-            if let Err(error) = overrides.add(&pattern) {
-                publish(Progress::Error(format!("Invalid file glob: {error}")));
-                return;
+            // Override matching does not inherit a directory match when a
+            // file is tested. Keep the directory pattern for pruning and add
+            // the same scope's descendants for include/exclude file matching.
+            let descendants = directory_glob_descendants(&pattern);
+            for pattern in std::iter::once(pattern.as_str()).chain(descendants.as_deref()) {
+                if let Err(error) = overrides.add(pattern) {
+                    publish(Progress::Error(format!("Invalid file glob: {error}")));
+                    return;
+                }
             }
         }
     }
@@ -240,6 +266,11 @@ fn search_with_limits(
             Err(stop) => stop!(stop),
         };
         let traversal::Entry { path, kind } = entry;
+        // Excluding a directory also excludes its descendants. Include
+        // misses must not prune directories that can contain matching files.
+        if kind.is_dir() && overrides.matched(&path, true).is_ignore() {
+            continue;
+        }
         if !policy
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -635,6 +666,65 @@ mod tests {
         assert_eq!(result[0].length, 6);
         assert_eq!(result[0].path, Path::new("main.rs"));
     }
+    #[test]
+    fn directory_globs_filter_descendants_without_losing_their_scope() {
+        let fixture = tempfile::tempdir().unwrap();
+        for path in [
+            "src/main.rs",
+            "nested/src/lib.rs",
+            "generated/root.rs",
+            "nested/generated/nested.rs",
+            "docs/readme.txt",
+            "src/ignored/hidden.rs",
+        ] {
+            let path = fixture.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle").unwrap();
+        }
+        std::fs::write(fixture.path().join(".ignore"), "src/ignored/\n").unwrap();
+        let paths = |include: &str, exclude: &str, include_ignored| {
+            let mut opts = options("needle");
+            opts.include = include.into();
+            opts.exclude = exclude.into();
+            opts.include_ignored = include_ignored;
+            let mut found = matches(run(fixture.path(), opts))
+                .into_iter()
+                .map(|matched| matched.path)
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        };
+        assert_eq!(
+            paths("src/", "", false),
+            [
+                PathBuf::from("nested/src/lib.rs"),
+                PathBuf::from("src/main.rs")
+            ]
+        );
+        assert_eq!(paths("/src/", "", false), [PathBuf::from("src/main.rs")]);
+        assert_eq!(
+            paths("nested/src/", "", false),
+            [PathBuf::from("nested/src/lib.rs")]
+        );
+        assert_eq!(
+            paths("*.rs", "generated/", false),
+            [
+                PathBuf::from("nested/src/lib.rs"),
+                PathBuf::from("src/main.rs")
+            ]
+        );
+        assert_eq!(
+            paths("*.rs", "generated", false),
+            paths("*.rs", "generated/", false)
+        );
+        assert_eq!(
+            paths("src/", "/src/", false),
+            [PathBuf::from("nested/src/lib.rs")]
+        );
+        assert_eq!(paths("src/", "", true).len(), 3);
+        assert_eq!(paths("src/**", "", false), [PathBuf::from("src/main.rs")]);
+    }
+
     #[test]
     fn special_ignore_files_end_the_worker_without_blocking_or_leaking_queries() {
         use std::os::unix::ffi::OsStrExt;
