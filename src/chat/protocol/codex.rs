@@ -427,6 +427,7 @@ fn create_inner(
             retained_identity,
             thread: launch.session_id.clone(),
             goal: None,
+            goal_settings: None,
             goal_resume_admission: GoalResumeAdmission::Unavailable,
             goal_resume_pending: false,
             start,
@@ -487,14 +488,7 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
-    GoalSettings {
-        request: chat::goal::Request,
-        explicit: bool,
-        revision: u64,
-        model: Option<String>,
-        reasoning: Option<String>,
-        invalidated: bool,
-    },
+    GoalSettings,
     Goal {
         request: chat::goal::Request,
         explicit: bool,
@@ -550,6 +544,17 @@ enum Pending {
     Fork,
 }
 
+struct GoalSettings {
+    request: chat::goal::Request,
+    explicit: bool,
+    revision: u64,
+    model: Option<String>,
+    reasoning: Option<String>,
+    acknowledged: bool,
+    observed: Option<Option<String>>,
+    invalidated: bool,
+}
+
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
     match (approval.as_str(), sandbox["type"].as_str()) {
         (Some("never"), Some("dangerFullAccess")) => Some("yolo"),
@@ -587,6 +592,7 @@ struct Codex {
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
     goal: Option<chat::goal::State>,
+    goal_settings: Option<GoalSettings>,
     goal_resume_admission: GoalResumeAdmission,
     /// Keep metadata/stop controls usable while legacy restore lacks authority.
     goal_resume_pending: bool,
@@ -736,23 +742,94 @@ impl Codex {
             // has no turn/start from this client, so apply that explicit choice
             // to this exact provider thread before allowing the Goal mutation.
             let revision = self.goal_state()?.snapshot().revision;
+            self.goal_settings = Some(GoalSettings {
+                request,
+                explicit,
+                revision,
+                model: self.selected.clone(),
+                reasoning: self.reasoning.clone(),
+                acknowledged: false,
+                observed: None,
+                invalidated: false,
+            });
+            let mut settings = json!({"threadId":thread,"model":self.selected});
+            if let Some(reasoning) = &self.reasoning {
+                settings["effort"] = json!(reasoning);
+            }
             self.call(
                 step,
                 "thread/settings/update",
-                json!({"threadId":thread,"model":self.selected,"effort":self.reasoning}),
-                Pending::GoalSettings {
-                    request,
-                    explicit,
-                    revision,
-                    model: self.selected.clone(),
-                    reasoning: self.reasoning.clone(),
-                    invalidated: false,
-                },
+                settings,
+                Pending::GoalSettings,
             )?;
         } else {
             self.call(step, method, params, Pending::Goal { request, explicit })?;
         }
         self.publish_goal(step);
+        Ok(())
+    }
+
+    fn finish_goal_settings(&mut self, step: &mut Step) -> Result<(), String> {
+        let Some(settings) = self.goal_settings.take() else {
+            return Ok(());
+        };
+        // The RPC acknowledgement only means Core received a queued settings
+        // operation. The applied settings notification is the work barrier.
+        if !settings.acknowledged {
+            self.goal_settings = Some(settings);
+            return Ok(());
+        }
+        let current = self.ready
+            && self.direct_input
+            && self.thread.as_deref() == Some(settings.request.thread_id())
+            && self.selected == settings.model
+            && self.reasoning == settings.reasoning
+            && self.goal.as_ref().is_some_and(|state| {
+                state.pending() == Some(&settings.request)
+                    && state.snapshot().revision == settings.revision
+            });
+        if current && !settings.invalidated {
+            let Some(reasoning) = &settings.observed else {
+                self.goal_settings = Some(settings);
+                return Ok(());
+            };
+            let (method, params) =
+                goal::request(settings.request.thread_id(), settings.request.operation())?;
+            if self
+                .call(
+                    step,
+                    method,
+                    params,
+                    Pending::Goal {
+                        request: settings.request.clone(),
+                        explicit: settings.explicit,
+                    },
+                )
+                .is_ok()
+            {
+                self.effective_model = settings.model;
+                // None is an unspecified public override, not a request to
+                // clear the effort. Show the actual retained provider choice
+                // before work instead of claiming that null reset it.
+                self.reasoning = reasoning.clone();
+                self.model_events(step);
+                return Ok(());
+            }
+        }
+        let current = if let Some(state) = &mut self.goal {
+            state
+                .complete(&settings.request, Err(chat::goal::Failure::Unavailable))
+                .map_err(|error| error.to_string())?
+        } else {
+            false
+        };
+        self.publish_goal(step);
+        if current && settings.explicit {
+            step.events.push(Event::Error {
+                message: "The selected model and reasoning could not be confirmed for native Goal work. The goal was not sent; check its current state and submit again.".into(),
+                fatal: false,
+            });
+        }
         Ok(())
     }
 
@@ -1887,6 +1964,7 @@ impl Adapter for Codex {
             state.rebind(thread).map_err(|error| error.to_string())?;
             self.publish_goal(&mut step);
         }
+        self.finish_goal_settings(&mut step)?;
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
@@ -2093,60 +2171,14 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
-            if let Pending::GoalSettings {
-                request,
-                explicit,
-                revision,
-                model,
-                reasoning,
-                invalidated,
-            } = pending
-            {
-                let current = !invalidated
-                    && self.ready
-                    && self.direct_input
-                    && self.thread.as_deref() == Some(request.thread_id())
-                    && self.selected == model
-                    && self.reasoning == reasoning
-                    && self.goal.as_ref().is_some_and(|state| {
-                        state.pending() == Some(&request) && state.snapshot().revision == revision
-                    });
+            if matches!(pending, Pending::GoalSettings) {
                 let confirmed = frame.get("error").is_none()
                     && frame.get("result").is_some_and(Value::is_object);
-                if current && confirmed {
-                    let (method, params) = goal::request(request.thread_id(), request.operation())?;
-                    if self
-                        .call(
-                            &mut step,
-                            method,
-                            params,
-                            Pending::Goal {
-                                request: request.clone(),
-                                explicit,
-                            },
-                        )
-                        .is_ok()
-                    {
-                        self.effective_model = model;
-                        return Ok(step);
-                    }
+                if let Some(settings) = &mut self.goal_settings {
+                    settings.acknowledged = true;
+                    settings.invalidated |= !confirmed;
                 }
-                // A refused, lost or superseded settings application never
-                // starts Goal work, retries it, or clears the original input.
-                let current = if let Some(state) = &mut self.goal {
-                    state
-                        .complete(&request, Err(chat::goal::Failure::Unavailable))
-                        .map_err(|error| error.to_string())?
-                } else {
-                    false
-                };
-                self.publish_goal(&mut step);
-                if current && explicit {
-                    step.events.push(Event::Error {
-                        message: "The selected model and reasoning could not be confirmed for native Goal work. The goal was not sent; check its current state and submit again.".into(),
-                        fatal: false,
-                    });
-                }
+                self.finish_goal_settings(&mut step)?;
                 return Ok(step);
             }
             if let Pending::Goal { request, explicit } = pending {
@@ -2334,7 +2366,7 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
-                Pending::Goal { .. } | Pending::GoalSettings { .. } => {
+                Pending::Goal { .. } | Pending::GoalSettings => {
                     unreachable!("goal responses are handled above")
                 }
                 Pending::LoginRecovery {
@@ -3059,6 +3091,7 @@ impl Adapter for Codex {
                     });
                 }
             }
+            self.finish_goal_settings(&mut step)?;
             return Ok(step);
         }
         let notification_frame_turn = params["turnId"]
@@ -3114,18 +3147,17 @@ impl Adapter for Codex {
             }),
             "thread/settings/updated" => {
                 let settings = &params["threadSettings"];
-                for pending in self.pending.values_mut() {
-                    if let Pending::GoalSettings {
-                        model,
-                        reasoning,
-                        invalidated,
-                        ..
-                    } = pending
-                    {
-                        *invalidated |= (settings.get("model").is_some()
-                            && settings["model"].as_str() != model.as_deref())
-                            || (settings.get("effort").is_some()
-                                && settings["effort"].as_str() != reasoning.as_deref());
+                if let Some(pending) = &mut self.goal_settings {
+                    let model = settings["model"].as_str();
+                    let reasoning = settings["effort"].as_str().map(str::to_owned);
+                    let valid_reasoning = settings.get("effort").is_none_or(|effort| {
+                        effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
+                    });
+                    pending.invalidated |= !valid_reasoning
+                        || (model.is_some() && model != pending.model.as_deref())
+                        || (pending.reasoning.is_some() && reasoning != pending.reasoning);
+                    if model.is_some() && model == pending.model.as_deref() && valid_reasoning {
+                        pending.observed = Some(reasoning);
                     }
                 }
                 if settings.get("model").is_some() {
@@ -3152,6 +3184,7 @@ impl Adapter for Codex {
                         .map(str::to_owned);
                     self.model_events(&mut step);
                 }
+                self.finish_goal_settings(&mut step)?;
             }
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
@@ -3513,6 +3546,12 @@ impl Adapter for Codex {
                 });
             }
             "error" => {
+                if thread.is_some() && thread == self.thread.as_deref() {
+                    if let Some(settings) = &mut self.goal_settings {
+                        settings.invalidated = true;
+                    }
+                    self.finish_goal_settings(&mut step)?;
+                }
                 let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
@@ -6163,6 +6202,7 @@ mod tests {
             retained_identity: None,
             thread: Some("thread-exact".into()),
             goal: None,
+            goal_settings: None,
             goal_resume_admission: GoalResumeAdmission::OriginalScope,
             goal_resume_pending: false,
             start: json!({}),

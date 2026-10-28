@@ -124,6 +124,104 @@ fn autonomous_goal_work_applies_explicit_model_and_effort_before_the_goal_rpc() 
 }
 
 #[test]
+fn settings_ack_waits_for_actual_application_and_unspecified_effort_preserves_provider_truth() {
+    for unspecified in [false, true] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        if unspecified {
+            adapter
+                .command(Command::SetModel {
+                    model: "explicit-goal-model".into(),
+                    reasoning: None,
+                })
+                .unwrap();
+        }
+        let settings = command(&mut adapter, Operation::Resume);
+        if unspecified {
+            assert!(
+                settings.writes[0]["params"].get("effort").is_none(),
+                "an unspecified effort is not a provider reset request"
+            );
+        } else {
+            assert_eq!(settings.writes[0]["params"]["effort"], "low");
+        }
+        let acknowledged = adapter
+            .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            acknowledged.writes.is_empty(),
+            "an enqueue acknowledgement is not Core application"
+        );
+        assert!(snapshot(&mut adapter).pending);
+        assert!(command_busy(&mut adapter));
+        let foreign = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"different-thread","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap();
+        assert!(foreign.writes.is_empty());
+        assert!(snapshot(&mut adapter).pending);
+        let applied = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap();
+        assert_eq!(applied.writes.len(), 1);
+        assert_eq!(applied.writes[0]["method"], "thread/goal/set");
+        assert_eq!(
+            applied.writes[0]["params"],
+            json!({"threadId":"thread-exact","status":"active"})
+        );
+        assert_eq!(adapter.reasoning.as_deref(), Some("low"));
+        assert!(applied.events.iter().any(|event| matches!(event, Event::Models { reasoning: Some(reasoning), .. } if reasoning == "low")),
+            "the actual retained effort is published before native work");
+    }
+}
+
+#[test]
+fn core_settings_error_retires_unsent_goal_without_replay_in_either_ack_order() {
+    for error_first in [false, true] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        let settings = command(
+            &mut adapter,
+            Operation::SetObjective("Keep the draft".into()),
+        );
+        let ack = json!({"id":settings.writes[0]["id"],"result":{}});
+        if !error_first {
+            assert!(adapter.receive(ack.clone()).unwrap().writes.is_empty());
+        }
+        let failed = adapter.receive(json!({"method":"error","params":{
+            "threadId":"thread-exact","error":{"message":"Core rejected settings"},"willRetry":false
+        }})).unwrap();
+        assert!(failed.writes.is_empty());
+        if error_first {
+            assert!(
+                snapshot(&mut adapter).pending,
+                "the original physical settings RPC still owns its reply"
+            );
+            assert!(adapter.receive(ack).unwrap().writes.is_empty());
+        }
+        let current = snapshot(&mut adapter);
+        assert!(
+            !current.pending,
+            "a Core refusal cannot leave an unsent Goal spinner stuck"
+        );
+        assert_eq!(
+            current.last_result.unwrap().outcome,
+            chat::goal::Outcome::Uncertain
+        );
+        let late = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap();
+        assert!(
+            late.writes.is_empty(),
+            "late settings cannot replay a retired Goal intent"
+        );
+        assert_eq!(
+            command(&mut adapter, Operation::Get).writes[0]["method"],
+            "thread/goal/get"
+        );
+    }
+}
+
+#[test]
 fn failed_or_superseded_goal_settings_never_send_or_retry_a_goal_mutation() {
     for case in 0..6 {
         let mut adapter = adapter();

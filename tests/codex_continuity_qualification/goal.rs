@@ -528,6 +528,30 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     let resume_baseline_requests = fixture.model.requests().len();
     let resume_baseline_items: BTreeSet<_> =
         settled.items.iter().map(|item| item.id.clone()).collect();
+    // Public effort:null preserves the provider's current effort. Stage an
+    // unspecified choice and require the applied notification to restore its
+    // actual value before autonomous Resume, rather than pretending it cleared.
+    assert!(matches!(
+        window.request(ClientRequest::ChatCommand {
+            chat_id: chat.id,
+            command: ChatCommand::SetModel {
+                model: goal_model.clone(),
+                reasoning: None
+            },
+        }),
+        ServerResponse::Accepted
+    ));
+    until(
+        Duration::from_secs(30),
+        "the unspecified reasoning choice to be staged",
+        || {
+            let snapshot = window.read(chat.id);
+            (snapshot.selected_model.as_deref() == Some(goal_model.as_str())
+                && snapshot.reasoning.is_none())
+            .then_some(())
+        },
+    );
+    assert_eq!(fixture.model.requests().len(), resume_baseline_requests);
     let resume_started = Instant::now();
     let resume_revision = control(&mut window, &chat, Operation::Resume, "Resume");
     let resumed = observed(
@@ -540,6 +564,11 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     .unwrap();
     assert_eq!(resumed.objective, active.objective);
     assert_eq!(resumed.token_budget, active.token_budget);
+    assert_eq!(
+        window.read(chat.id).reasoning.as_deref(),
+        Some(goal_reasoning),
+        "Resume must publish the actual retained provider effort"
+    );
     pacing.permit_through(resume_baseline_requests + 1);
     // Use what remains of the existing Resume observation allowance, not a
     // second 30-second work budget. Provider-confirmed Active is necessary,
