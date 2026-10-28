@@ -431,14 +431,19 @@ impl Pending {
         }
         if let Err(error) = &event {
             if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) {
+                // notify's inotify backend stops the whole pending expansion
+                // batch at the first quota error. Other recursive roots may
+                // have skipped descendants without appearing in error.paths.
+                // Recheck those roots too, preserving nonrecursive watches.
+                if self.quota_rearm.is_empty() {
+                    self.quota_rearm.extend(self.recursive.keys().cloned());
+                }
                 let mut unknown = error.paths.is_empty();
                 for path in &error.paths {
-                    if let Some(root) = path
+                    if !path
                         .ancestors()
-                        .find(|root| self.recursive.contains_key(*root))
+                        .any(|root| self.recursive.contains_key(root))
                     {
-                        self.quota_rearm.insert(root.to_owned());
-                    } else {
                         unknown = true;
                     }
                 }
@@ -1590,11 +1595,13 @@ mod tests {
         });
     }
 
-    /// An injected backend for the real registration transition. Each root
-    /// consumes one slot here; recursive native mark counts are not simulated.
+    /// An injected backend for the real registration transition. By default
+    /// each requested root consumes one slot; walk_recursive also counts the
+    /// descendant directory marks needed by recursive batch recovery.
     #[derive(Default)]
     struct LimitedWatcher {
         capacity: usize,
+        walk_recursive: bool,
         active: BTreeMap<PathBuf, RecursiveMode>,
         attempts: Vec<PathBuf>,
         removals: Vec<PathBuf>,
@@ -1623,6 +1630,14 @@ mod tests {
                 );
             }
             self.active.insert(path.to_owned(), mode);
+            if self.walk_recursive && mode == RecursiveMode::Recursive {
+                for child in std::fs::read_dir(path).map_err(notify::Error::io)? {
+                    let child = child.map_err(notify::Error::io)?;
+                    if child.file_type().map_err(notify::Error::io)?.is_dir() {
+                        self.watch(&child.path(), mode)?;
+                    }
+                }
+            }
             if self.remove_after_watch.as_deref() == Some(path) {
                 std::fs::remove_dir(path).unwrap();
             }
@@ -1642,6 +1657,24 @@ mod tests {
 
         fn kind() -> notify::WatcherKind {
             notify::WatcherKind::NullWatcher
+        }
+    }
+
+    impl LimitedWatcher {
+        // Like notify's inotify event batch, stop adding descendant watches
+        // after the first quota error, without reporting skipped directories.
+        fn expand_batch(&mut self, directories: &[PathBuf]) -> notify::Result<()> {
+            for directory in directories {
+                self.watch(directory, RecursiveMode::Recursive)?;
+            }
+            Ok(())
+        }
+
+        fn file_event(&self, path: &Path) -> Option<Event> {
+            self.active.contains_key(path.parent()?).then(|| {
+                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                    .add_path(path.to_owned())
+            })
         }
     }
 
@@ -1936,6 +1969,100 @@ mod tests {
             "removed topology retires its fault and watch"
         );
         assert!(registered.contains_key(&common) && registered.contains_key(&content));
+    }
+
+    #[test]
+    fn quota_aborted_batch_repairs_other_recursive_roots_before_clearing_polling() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = Arc::new(project(&directory.path().join("a")));
+        let b = Arc::new(project(&directory.path().join("b")));
+        let a_refs = a.common_dir.join("refs");
+        let b_refs = b.common_dir.join("refs");
+        let mut desired = BTreeMap::new();
+        let mut owners = BTreeMap::new();
+        for (project, refs) in [(&a, &a_refs), (&b, &b_refs)] {
+            std::fs::create_dir_all(refs).unwrap();
+            for (path, mode) in [
+                (&project.common_dir, RecursiveMode::NonRecursive),
+                (refs, RecursiveMode::Recursive),
+            ] {
+                desired.insert(path.clone(), mode);
+                owners.insert(path.clone(), BTreeSet::from([project.id]));
+            }
+        }
+        let metadata = desired.keys().cloned().collect();
+        let mut pending = Pending::default();
+        pending.projects.insert(a.id, a.clone());
+        pending.projects.insert(b.id, b.clone());
+        let mut watcher = LimitedWatcher {
+            capacity: 4,
+            walk_recursive: true,
+            ..Default::default()
+        };
+        let mut registered = BTreeMap::new();
+        assert!(
+            registered_transition(
+                &mut pending,
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &metadata,
+                &owners,
+            )
+            .is_empty()
+        );
+
+        let a_new = a_refs.join("new-a");
+        let b_new = b_refs.join("new-b");
+        for path in [&a_new, &b_new] {
+            std::fs::create_dir(path).unwrap();
+        }
+        watcher.attempts.clear();
+        let error = watcher
+            .expand_batch(&[a_new.clone(), b_new.clone()])
+            .unwrap_err();
+        assert!(matches!(error.kind, notify::ErrorKind::MaxFilesWatch));
+        assert_eq!(error.paths, [a_new]);
+        assert_eq!(watcher.attempts.len(), 1, "B's expansion was skipped");
+        let later_ref = b_new.join("later-branch");
+        assert!(watcher.file_event(&later_ref).is_none());
+        pending.event(Err(error));
+
+        watcher.removals.clear();
+        let failures = registered_transition(
+            &mut pending,
+            &mut watcher,
+            &mut registered,
+            &desired,
+            &metadata,
+            &owners,
+        );
+        assert!(
+            failures.contains_key(&b.id),
+            "B must retain polling while its skipped descendant cannot be installed"
+        );
+        assert!(!registered.contains_key(&b_refs));
+        for project in [&a, &b] {
+            assert!(registered.contains_key(&project.common_dir));
+            assert!(!watcher.removals.contains(&project.common_dir));
+        }
+
+        watcher.capacity = 6;
+        assert!(
+            registered_transition(
+                &mut pending,
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &metadata,
+                &owners,
+            )
+            .is_empty(),
+            "coverage can recover once both recursive subtrees are installed"
+        );
+        std::fs::write(&later_ref, "fixture-ref").unwrap();
+        let event = watcher.file_event(&later_ref).unwrap();
+        assert!(b.change(&event).unwrap().references);
     }
 
     #[test]
