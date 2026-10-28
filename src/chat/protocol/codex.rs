@@ -487,6 +487,14 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    GoalSettings {
+        request: chat::goal::Request,
+        explicit: bool,
+        revision: u64,
+        model: Option<String>,
+        reasoning: Option<String>,
+        invalidated: bool,
+    },
     Goal {
         request: chat::goal::Request,
         explicit: bool,
@@ -718,7 +726,32 @@ impl Codex {
             .goal_state()?
             .begin_for(thread, revision, operation)
             .map_err(|error| error.to_string())?;
-        self.call(step, method, params, Pending::Goal { request, explicit })?;
+        if self.selection_dirty
+            && matches!(
+                request.operation(),
+                chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume
+            )
+        {
+            // SetModel stages a choice for turn/start. Autonomous Goal work
+            // has no turn/start from this client, so apply that explicit choice
+            // to this exact provider thread before allowing the Goal mutation.
+            let revision = self.goal_state()?.snapshot().revision;
+            self.call(
+                step,
+                "thread/settings/update",
+                json!({"threadId":thread,"model":self.selected,"effort":self.reasoning}),
+                Pending::GoalSettings {
+                    request,
+                    explicit,
+                    revision,
+                    model: self.selected.clone(),
+                    reasoning: self.reasoning.clone(),
+                    invalidated: false,
+                },
+            )?;
+        } else {
+            self.call(step, method, params, Pending::Goal { request, explicit })?;
+        }
         self.publish_goal(step);
         Ok(())
     }
@@ -2060,6 +2093,62 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
+            if let Pending::GoalSettings {
+                request,
+                explicit,
+                revision,
+                model,
+                reasoning,
+                invalidated,
+            } = pending
+            {
+                let current = !invalidated
+                    && self.ready
+                    && self.direct_input
+                    && self.thread.as_deref() == Some(request.thread_id())
+                    && self.selected == model
+                    && self.reasoning == reasoning
+                    && self.goal.as_ref().is_some_and(|state| {
+                        state.pending() == Some(&request) && state.snapshot().revision == revision
+                    });
+                let confirmed = frame.get("error").is_none()
+                    && frame.get("result").is_some_and(Value::is_object);
+                if current && confirmed {
+                    let (method, params) = goal::request(request.thread_id(), request.operation())?;
+                    if self
+                        .call(
+                            &mut step,
+                            method,
+                            params,
+                            Pending::Goal {
+                                request: request.clone(),
+                                explicit,
+                            },
+                        )
+                        .is_ok()
+                    {
+                        self.effective_model = model;
+                        return Ok(step);
+                    }
+                }
+                // A refused, lost or superseded settings application never
+                // starts Goal work, retries it, or clears the original input.
+                let current = if let Some(state) = &mut self.goal {
+                    state
+                        .complete(&request, Err(chat::goal::Failure::Unavailable))
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
+                self.publish_goal(&mut step);
+                if current && explicit {
+                    step.events.push(Event::Error {
+                        message: "The selected model and reasoning could not be confirmed for native Goal work. The goal was not sent; check its current state and submit again.".into(),
+                        fatal: false,
+                    });
+                }
+                return Ok(step);
+            }
             if let Pending::Goal { request, explicit } = pending {
                 // The exact RPC resolved (including an invalid response). Only
                 // this request can release its slot; notification epochs decide
@@ -2245,7 +2334,9 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
-                Pending::Goal { .. } => unreachable!("goal responses are handled above"),
+                Pending::Goal { .. } | Pending::GoalSettings { .. } => {
+                    unreachable!("goal responses are handled above")
+                }
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -3023,6 +3114,20 @@ impl Adapter for Codex {
             }),
             "thread/settings/updated" => {
                 let settings = &params["threadSettings"];
+                for pending in self.pending.values_mut() {
+                    if let Pending::GoalSettings {
+                        model,
+                        reasoning,
+                        invalidated,
+                        ..
+                    } = pending
+                    {
+                        *invalidated |= (settings.get("model").is_some()
+                            && settings["model"].as_str() != model.as_deref())
+                            || (settings.get("effort").is_some()
+                                && settings["effort"].as_str() != reasoning.as_deref());
+                    }
+                }
                 if settings.get("model").is_some() {
                     self.effective_model = settings["model"].as_str().map(str::to_owned);
                 }

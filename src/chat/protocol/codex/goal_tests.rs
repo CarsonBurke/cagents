@@ -47,6 +47,174 @@ fn command(adapter: &mut Codex, operation: Operation) -> Step {
         .unwrap()
 }
 
+fn select_goal_model(adapter: &mut Codex) {
+    adapter.models = vec![Model {
+        id: "explicit-goal-model".into(),
+        label: "Explicit Goal model".into(),
+        reasoning: vec!["low".into()],
+    }];
+    let selected = adapter
+        .command(Command::SetModel {
+            model: "explicit-goal-model".into(),
+            reasoning: Some("low".into()),
+        })
+        .unwrap();
+    assert!(
+        selected.writes.is_empty(),
+        "SetModel only stages turn input"
+    );
+}
+
+#[test]
+fn autonomous_goal_work_applies_explicit_model_and_effort_before_the_goal_rpc() {
+    for operation in [
+        Operation::SetObjective("Use my selected model".into()),
+        Operation::Resume,
+    ] {
+        let mut adapter = adapter();
+        adapter.selected = Some("provider-default".into());
+        select_goal_model(&mut adapter);
+        let settings = command(&mut adapter, operation.clone());
+        assert_eq!(settings.writes.len(), 1);
+        assert_eq!(settings.writes[0]["method"], "thread/settings/update");
+        assert_eq!(
+            settings.writes[0]["params"],
+            json!({
+                "threadId":"thread-exact", "model":"explicit-goal-model", "effort":"low"
+            })
+        );
+        assert!(published(&settings).pending);
+        assert!(command_busy(&mut adapter));
+        let matching_notification = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap();
+        assert!(
+            matching_notification.writes.is_empty(),
+            "notification alone cannot start Goal work"
+        );
+        let applied = adapter
+            .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert_eq!(applied.writes.len(), 1);
+        assert_eq!(applied.writes[0]["method"], "thread/goal/set");
+        let expected = match operation {
+            Operation::SetObjective(objective) => {
+                json!({"threadId":"thread-exact","objective":objective})
+            }
+            Operation::Resume => json!({"threadId":"thread-exact","status":"active"}),
+            _ => unreachable!(),
+        };
+        assert_eq!(applied.writes[0]["params"], expected);
+        assert!(
+            snapshot(&mut adapter).pending,
+            "the same physical Goal slot spans both RPCs"
+        );
+        let confirmed = adapter
+            .receive(json!({"id":applied.writes[0]["id"],"result":{
+                "goal":raw_goal("thread-exact","Use my selected model","active")
+            }}))
+            .unwrap();
+        assert!(!published(&confirmed).pending);
+        assert_eq!(
+            published(&confirmed).last_result.unwrap().outcome,
+            chat::goal::Outcome::Confirmed
+        );
+        assert!(confirmed.writes.is_empty());
+    }
+}
+
+#[test]
+fn failed_or_superseded_goal_settings_never_send_or_retry_a_goal_mutation() {
+    for case in 0..6 {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        let settings = command(
+            &mut adapter,
+            Operation::SetObjective("Keep this unsent".into()),
+        );
+        match case {
+            2 => {
+                adapter.receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":{"model":"different-model","effort":"low"}
+                }})).unwrap();
+            }
+            3 => {
+                adapter.receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"high"}
+                }})).unwrap();
+            }
+            4 => {
+                adapter.receive(json!({"method":"thread/goal/updated","params":{
+                    "threadId":"thread-exact","goal":raw_goal("thread-exact","New external goal","paused")
+                }})).unwrap();
+            }
+            5 => {
+                drop(adapter.initialize().unwrap());
+            }
+            _ => {}
+        }
+        let response = match case {
+            0 => {
+                json!({"id":settings.writes[0]["id"],"error":{"code":-32601,"message":"settings unavailable"}})
+            }
+            1 => json!({"id":settings.writes[0]["id"],"result":null}),
+            _ => json!({"id":settings.writes[0]["id"],"result":{}}),
+        };
+        let refused = adapter.receive(response).unwrap();
+        assert!(
+            refused.writes.is_empty(),
+            "case {case} must not start or retry Goal work"
+        );
+        let observed = published(&refused);
+        assert!(!observed.pending);
+        assert_ne!(
+            observed.support,
+            Support::Unsupported,
+            "settings support is not Goal support"
+        );
+        if case == 4 {
+            assert!(
+                matches!(&observed.read, ReadState::Known(Some(goal)) if goal.objective == "New external goal")
+            );
+        }
+        if case == 5 {
+            assert!(
+                observed.last_result.is_none(),
+                "reconnect cannot complete the old owner intent"
+            );
+            assert!(
+                !refused
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. })),
+                "the old settings callback cannot report an error into the new binding"
+            );
+        } else {
+            assert_eq!(
+                observed.last_result.unwrap().outcome,
+                chat::goal::Outcome::Uncertain
+            );
+        }
+    }
+}
+
+#[test]
+fn goal_read_pause_and_clear_do_not_apply_staged_execution_settings() {
+    for (operation, method) in [
+        (Operation::Get, "thread/goal/get"),
+        (Operation::Pause, "thread/goal/set"),
+        (Operation::Clear, "thread/goal/clear"),
+    ] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        let issued = command(&mut adapter, operation);
+        assert_eq!(issued.writes.len(), 1);
+        assert_eq!(issued.writes[0]["method"], method);
+        assert!(issued.writes[0]["params"].get("model").is_none());
+        assert!(issued.writes[0]["params"].get("effort").is_none());
+    }
+}
+
 fn attach(adapter: &mut Codex) -> Step {
     let initialize = adapter.initialize().unwrap();
     let initialized = adapter

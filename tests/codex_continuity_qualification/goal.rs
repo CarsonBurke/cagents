@@ -372,6 +372,41 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
         },
     );
     let baseline_items: BTreeSet<_> = baseline.items.iter().map(|item| item.id.clone()).collect();
+    let selected = baseline
+        .models
+        .iter()
+        .find(|model| {
+            Some(&model.id) != baseline.selected_model.as_ref()
+                && model.reasoning.iter().any(|effort| effort == "low")
+        })
+        .expect("the real SDK fixture must advertise an alternate model with low reasoning");
+    let goal_model = selected.id.clone();
+    let goal_reasoning = "low";
+    assert!(matches!(
+        window.request(ClientRequest::ChatCommand {
+            chat_id: chat.id,
+            command: ChatCommand::SetModel {
+                model: goal_model.clone(),
+                reasoning: Some(goal_reasoning.into())
+            },
+        }),
+        ServerResponse::Accepted
+    ));
+    until(
+        Duration::from_secs(30),
+        "the explicit Goal model selection to be staged",
+        || {
+            let snapshot = window.read(chat.id);
+            (snapshot.selected_model.as_deref() == Some(goal_model.as_str())
+                && snapshot.reasoning.as_deref() == Some(goal_reasoning))
+            .then_some(())
+        },
+    );
+    assert_eq!(
+        fixture.model.requests().len(),
+        baseline_requests,
+        "selecting a model must not manufacture an ordinary turn"
+    );
     let set_revision = control(
         &mut window,
         &chat,
@@ -386,8 +421,8 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // this second real request receives the next no-tool response allowance.
     assert_eq!(baseline_requests, 1);
     pacing.permit_through(baseline_requests + 1);
-    // Between the baseline and this observation the only effectful request is
-    // that one Goal Set: no Prompt, turn/start or mutation retry can make a
+    // After staging the explicit model choice, that one Goal Set applies it
+    // before requesting work: no Prompt, turn/start or mutation retry can make a
     // metadata-only implementation pass. The model counter alone also cannot
     // pass (e.g. a prediction request is not a new original-thread response).
     // Do not require a sampled idle gap while the goal may continue again.
@@ -424,6 +459,14 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
                 && new_final_response)
                 .then_some((snapshot.turn_generation, requests))
         },
+    );
+    let requests = fixture.model.requests();
+    assert!(
+        requests[baseline_requests..].iter().all(|request| {
+            request.model.as_deref() == Some(goal_model.as_str())
+                && request.reasoning.as_deref() == Some(goal_reasoning)
+        }),
+        "actual autonomous model requests must use the explicit model and reasoning effort"
     );
     // Share the original 30-second work-observation budget with settlement;
     // the existing Pause retains its own unchanged RPC observation bound.
@@ -529,6 +572,15 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
                 && new_final_response)
                 .then_some(snapshot.turn_generation)
         },
+    );
+    assert!(
+        fixture.model.requests()[resume_baseline_requests..]
+            .iter()
+            .all(|request| {
+                request.model.as_deref() == Some(goal_model.as_str())
+                    && request.reasoning.as_deref() == Some(goal_reasoning)
+            }),
+        "actual autonomous Resume requests must retain the selected model and effort"
     );
     // Native continuation can produce model requests. This asserts a finite
     // no-tool script, not that a real active goal is continuously idle.

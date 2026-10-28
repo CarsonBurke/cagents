@@ -856,6 +856,150 @@ mod tests {
     }
 
     #[test]
+    fn busy_goal_input_has_a_real_send_button_and_composer_chord() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation as WidgetOperation, operation},
+        };
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        struct Bounds(Vec<(widget::Id, iced::Rectangle)>);
+        impl WidgetOperation for Bounds {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.push((id.clone(), bounds));
+                }
+            }
+        }
+
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for width in [320.0, 800.0] {
+            for input in [
+                "/goal",
+                "/goal set Keep this scoped",
+                "/goal pause",
+                "/goal resume",
+                "/goal clear",
+            ] {
+                for keyboard in [false, true] {
+                    let (mut app, card, target) = live();
+                    drop(app.update(Message::Viewport {
+                        generation: app.workspace_view_generation,
+                        event: WorkspaceViewportEvent::Resized(width),
+                    }));
+                    let mut busy = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    busy.busy = true;
+                    busy.capabilities.steer = true;
+                    busy.capabilities.queue = true;
+                    publish(&mut app, card, busy);
+                    write(&mut app, target, input);
+                    let mut ui = UserInterface::build(
+                        app.chat_view(card),
+                        iced::Size::new(width, 750.0),
+                        Cache::new(),
+                        &mut renderer,
+                    );
+                    let mut controls = Bounds(Vec::new());
+                    ui.operate(&renderer, &mut controls);
+                    let button = controls
+                        .0
+                        .iter()
+                        .find(|(id, _)| id == &card_control_id(card, "chat-submit-send"))
+                        .expect("busy Goal input must expose the actual Send control")
+                        .1;
+                    for role in ["chat-submit-steer", "chat-submit-queue"] {
+                        assert!(
+                            !controls
+                                .0
+                                .iter()
+                                .any(|(id, _)| id == &card_control_id(card, role))
+                        );
+                    }
+                    let mut messages = Vec::new();
+                    let (events, cursor) = if keyboard {
+                        ui.operate(
+                            &renderer,
+                            &mut operation::focusable::focus(card_control_id(
+                                card,
+                                "chat-composer",
+                            )),
+                        );
+                        let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+                        (
+                            vec![iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                                key: key.clone(),
+                                modified_key: key,
+                                physical_key: keyboard::key::Physical::Code(
+                                    keyboard::key::Code::Enter,
+                                ),
+                                location: keyboard::Location::Standard,
+                                modifiers: keyboard::Modifiers::CTRL,
+                                text: None,
+                                repeat: false,
+                            })],
+                            iced::mouse::Cursor::Unavailable,
+                        )
+                    } else {
+                        let pointer = iced::Point::new(button.center_x(), button.center_y());
+                        (
+                            vec![
+                                iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                                    position: pointer,
+                                }),
+                                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                                    iced::mouse::Button::Left,
+                                )),
+                                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                    iced::mouse::Button::Left,
+                                )),
+                            ],
+                            iced::mouse::Cursor::Available(pointer),
+                        )
+                    };
+                    ui.update(
+                        &events,
+                        cursor,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                    drop(ui);
+                    let submissions = messages
+                        .into_iter()
+                        .filter(|message| matches!(message, Message::ChatUi(Action::Submit(..))))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        submissions.len(),
+                        1,
+                        "one actual input event dispatches once"
+                    );
+                    assert!(
+                        matches!(&submissions[0], Message::ChatUi(Action::Submit(bound, PromptMode::Send)) if *bound == target)
+                    );
+                    for message in submissions {
+                        drop(app.update(message));
+                    }
+                    assert!(matches!(
+                        runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { .. }
+                    ));
+                    assert_eq!(runtime(&app, card).composer.text().trim(), input);
+                    assert!(runtime(&app, card).queued.is_none());
+                    assert!(runtime(&app, card).followups.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn an_old_panel_close_preserves_a_newer_waiting_goal_and_all_composer_state() {
         let (mut app, card, target) = live();
         let mut probing = (*runtime(&app, card).handle().unwrap().snapshot()).clone();

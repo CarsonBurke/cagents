@@ -90,6 +90,9 @@ const APPROVAL_MARKER: &str = "approved-command-ran";
 /// One request the provider made to the model endpoint.
 #[derive(Clone, Debug)]
 struct ModelRequest {
+    /// Actual provider request settings, rather than the UI's staged choice.
+    model: Option<String>,
+    reasoning: Option<String>,
     /// Every user prompt in the request's input, in order.
     prompts: Vec<String>,
     /// The tool output the request ends with, when it reports one.
@@ -529,6 +532,8 @@ fn serve_with_goal_gate(
             return;
         }
         seen.push(ModelRequest {
+            model: body["model"].as_str().map(str::to_owned),
+            reasoning: body["reasoning"]["effort"].as_str().map(str::to_owned),
             prompts: prompts.clone(),
             output: output.clone(),
             conversation: conversation
@@ -785,6 +790,16 @@ impl Fixture {
     }
 
     fn with_model_mode(mode: ModelMode) -> Self {
+        assert!(
+            [
+                "CAGENTS_AGENT_AUTHORITY",
+                "CAGENTS_AGENT_TOKEN",
+                "CAGENTS_SESSION_TOKEN"
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none()),
+            "Private daemon bootstrap requires a genuine User terminal or CI context; hosted authority must not be stripped"
+        );
         let codex = std::env::var_os(CODEX).unwrap_or_else(|| {
             panic!("set {CODEX} to the native Codex executable this run qualifies")
         });

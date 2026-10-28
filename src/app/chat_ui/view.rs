@@ -2584,7 +2584,12 @@ impl Runtime {
         let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        let modes: &[PromptMode] = if snapshot.busy {
+        let modes: &[PromptMode] = if chat::goal::parse(&self.composer.text()).is_some() {
+            // Native Goal controls are independent of turn input. Even while
+            // a turn is active they need Send, including the path that explains
+            // unsupported providers or invalid reserved Goal syntax.
+            &[PromptMode::Send]
+        } else if snapshot.busy {
             match snapshot.capabilities.steer {
                 // A message taken back from the queue goes back the way it
                 // was queued unless the other chord says otherwise.
@@ -2862,6 +2867,14 @@ impl Runtime {
             let (name, tooltip) = submit_control(*mode, slot, enter_sends);
             submissions.push(
                 crate::ui_controls::icon_button(name, tooltip)
+                    .id(card_control_id(
+                        target.card,
+                        match mode {
+                            PromptMode::Send => "chat-submit-send",
+                            PromptMode::Steer => "chat-submit-steer",
+                            PromptMode::Queue => "chat-submit-queue",
+                        },
+                    ))
                     .selected(slot == 0)
                     .tone(crate::design::Tone::Themed(if slot == 0 {
                         design::accent_color
