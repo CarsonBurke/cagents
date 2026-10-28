@@ -195,7 +195,11 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 140 adds resident execution status to directory entries, including
+/// optional owner diagnostics. These positional fields require matched clients
+/// and hosts even when their values are absent. Separate private layouts using
+/// versions 128 through 139 are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 140;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
