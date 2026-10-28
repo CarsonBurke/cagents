@@ -207,19 +207,7 @@ impl ExitDiagnostic {
         if !self.provider_exited {
             return None;
         }
-        // A bounded byte tail may start inside a credential-bearing line,
-        // after the label used to identify it has already been discarded.
-        // Keep the raw snapshot intact, but do not display a leading fragment
-        // whose original context is unknown.
-        let display = if self.observed_bytes > self.stderr.len() as u64 {
-            self.stderr
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(&[][..], |end| &self.stderr[end + 1..])
-        } else {
-            &self.stderr
-        };
-        let loss = String::from_utf8_lossy(display);
+        let loss = String::from_utf8_lossy(&self.stderr);
         let mut plain = String::new();
         let mut escape = 0;
         for ch in loss.chars() {
