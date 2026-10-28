@@ -337,9 +337,11 @@ fn run_host() -> (
         let result = run(admission).map_err(|e| e.to_string());
         // The same thread publishes Ready before run can return. Its later
         // diagnostic cannot overtake readiness or consume the completion result.
-        let _ = ready.send(Err(format!(
-            "actual host::run returned before readiness: {result:?}"
-        )));
+        let diagnostic = match &result {
+            Err(error) => format!("actual host::run failed before readiness: {error}"),
+            Ok(()) => "actual host::run returned before readiness without an error".into(),
+        };
+        let _ = ready.send(Err(diagnostic));
         let _ = complete.send(result);
     });
     let host = observed
