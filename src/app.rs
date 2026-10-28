@@ -23,6 +23,8 @@ mod browser_host;
 mod file_ui;
 mod git_ui;
 mod history_ui;
+#[cfg(test)]
+mod inspector_resize_clearance_tests;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
@@ -9564,7 +9566,7 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn card_resize_clearance(&self) -> f32 {
+    fn content_resize_clearance(&self) -> f32 {
         // Winit's border scales with the display, while content additionally
         // scales with COSMIC's interface factor. A smaller interface needs
         // more layout space to clear the same native resize band.
@@ -9578,7 +9580,7 @@ impl Cagents {
             .presentation_geometry()
             .card(id)
             .map_or(self.workspace.viewport_width(), |card| card.width())
-            - 2.0 * self.card_resize_clearance())
+            - 2.0 * self.content_resize_clearance())
         .max(0.0)
     }
 
@@ -10155,7 +10157,7 @@ impl Cagents {
             widget::container(widget::column::with_children(rows).height(Length::Fill))
                 // Resize targets keep the outer edge; content, including a
                 // scrollbar, must finish before their hit regions begin.
-                .padding([0.0, self.card_resize_clearance()])
+                .padding([0.0, self.content_resize_clearance()])
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
                         background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
@@ -18627,9 +18629,24 @@ impl Application for Cagents {
         // The bar comes and goes, but the tree around the workspace must not:
         // iced matches widget state by position, so wrapping the surface only
         // while the bar shows would reset every scroll offset and focus in it.
-        let bar = self
-            .status_bar()
-            .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
+        let bar = self.status_bar();
+        let bottom_clearance = if bar.is_some() {
+            0.0
+        } else {
+            self.content_resize_clearance()
+        };
+        // Without the status bar, every body can reach the native South
+        // resize band. Reserve it once for cards, sidebar and inspector.
+        // This wrapper stays mounted when the status bar is toggled.
+        let surface = widget::container(surface)
+            .padding(Padding {
+                bottom: bottom_clearance,
+                ..Padding::ZERO
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let bar = bar.unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
         let surface: Element<'_, Message> = widget::column::with_children(vec![
             surface,
             self.operation_recovery

@@ -3344,6 +3344,8 @@ impl Cagents {
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
+        let clearance = self.content_resize_clearance();
+        let content_width = (width - 2.0 * clearance).max(0.0);
         if !self.channel_work_is_main() && self.channel_work.view.is_open() {
             let end = widget::row::with_children(vec![
                 self.attention_and_notice_controls(),
@@ -3355,16 +3357,20 @@ impl Cagents {
             let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
             return widget::column::with_children(vec![
                 heading,
-                crate::interaction::focused_escape(
+                widget::container(crate::interaction::focused_escape(
                     self.channel_work
                         .view
                         .view(
-                            width,
+                            content_width,
                             (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
                         )
                         .map(Message::ChannelWork),
                     || Message::ChannelWorkEscape,
-                ),
+                ))
+                .padding([0.0, clearance])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
             ])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -3521,18 +3527,18 @@ impl Cagents {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
                 &self.sidebar_state,
-                width,
+                content_width,
                 self.modal_is_open(),
             )
             .map(Message::Sidebar),
             ContextTab::Changes => sidebar::git_panel(
                 &self.sidebar_model,
                 &self.sidebar_state,
-                width,
+                content_width,
                 self.modal_is_open(),
             )
             .map(Message::Sidebar),
-            ContextTab::PullRequest => self.pull_request_panel(width),
+            ContextTab::PullRequest => self.pull_request_panel(content_width),
             ContextTab::Details => model.map_or_else(
                 || {
                     widget::container(
@@ -3553,7 +3559,7 @@ impl Cagents {
                 |model| {
                     let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
                     let icon = self.card_icon(model.card_id);
-                    inspector::view(model, icon, width, diagnostics_open)
+                    inspector::view(model, icon, content_width, diagnostics_open)
                         .map(Message::ContextInspector)
                 },
             ),
@@ -3564,7 +3570,11 @@ impl Cagents {
                 crate::design::horizontal_rule().into(),
                 tabs.into(),
                 crate::design::horizontal_rule().into(),
-                body,
+                widget::container(body)
+                    .padding([0.0, clearance])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
             ])
             .width(Length::Fill)
             .height(Length::Fill),
