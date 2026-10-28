@@ -5889,6 +5889,8 @@ signal.signal(signal.SIGTERM, terminating)
 for line in sys.stdin:
     sys.stdout.write(line)
     sys.stdout.flush()
+while True:
+    signal.pause()
 "#
                 .into(),
                 marker.to_string_lossy().into_owned(),
@@ -5924,7 +5926,9 @@ for line in sys.stdin:
                 if settled {
                     fixture.server.actor.command(Command::Compact)?;
                 }
+                fixture.server.actor.check_update_readiness()?;
                 let before = state(&mut fixture.server, 0)?.ok_or("initial state absent")?;
+                let quiet = state(&mut fixture.server, before.changed)?;
                 let provider = fixture
                     .server
                     .actor
@@ -5948,13 +5952,15 @@ for line in sys.stdin:
                     Err(Rejection::Refused(_))
                 );
                 Ok((
-                    before, during, activity, execution, completed, current, refused, provider,
+                    before, quiet, during, activity, execution, completed, current, refused,
+                    provider,
                 ))
             })();
             let closed = fixture.server.actor.close();
             closed.unwrap();
-            let (before, during, activity, execution, completed, current, refused, provider) =
+            let (before, quiet, during, activity, execution, completed, current, refused, provider) =
                 observed.unwrap();
+            assert!(quiet.is_none(), "unchanged retained state must start quiet");
             assert_eq!(before.activity, crate::agent::ActivityState::Working);
             assert_eq!(
                 before.execution_status.unwrap().active_run,
