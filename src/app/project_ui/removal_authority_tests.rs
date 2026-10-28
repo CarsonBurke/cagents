@@ -777,9 +777,10 @@ fn standalone_retained_removal(role: &str) {
             assert!(app.project_ui.removal_attempts.is_empty());
             assert!(app.project_ui.removing.is_empty());
             assert!(
-                app.status
-                    .as_ref()
-                    .is_some_and(|notice| notice.message.contains(REFUSAL))
+                app.notices
+                    .entries
+                    .iter()
+                    .any(|entry| entry.notice.message.contains(REFUSAL))
             );
         }
         peer.finished(usize::from(accepted && role == "user"));
