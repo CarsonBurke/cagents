@@ -86,6 +86,26 @@ pub struct NavigationOrder {
     pub items: Vec<NavigationItem>,
 }
 
+/// Complete a saved mixed order using the same placement as the sidebar:
+/// newly discovered channels precede saved destinations; new worktrees follow.
+/// Existing destinations retain their relative order before an explicit move.
+pub fn merge_navigation_fallback(items: &mut Vec<NavigationItem>, fallback: &[NavigationItem]) {
+    let mut known = std::collections::HashSet::new();
+    items.retain(|item| known.insert(item.clone()));
+    let mut channels = Vec::new();
+    let mut worktrees = Vec::new();
+    for item in fallback {
+        if known.insert(item.clone()) {
+            match item {
+                NavigationItem::Channel(_) => channels.push(item.clone()),
+                NavigationItem::Worktree(_) => worktrees.push(item.clone()),
+            }
+        }
+    }
+    items.splice(0..0, channels);
+    items.extend(worktrees);
+}
+
 pub fn reorder_navigation(
     items: &mut Vec<NavigationItem>,
     source: &NavigationItem,
@@ -253,11 +273,7 @@ impl WorkspaceModel {
                         self.navigation_orders.len() - 1
                     });
                 let items = &mut self.navigation_orders[index].items;
-                for item in fallback {
-                    if !items.contains(item) {
-                        items.push(item.clone());
-                    }
-                }
+                merge_navigation_fallback(items, fallback);
                 reorder_navigation(items, source, before.as_ref());
             }
             ModelEdit::RetitleChannel { id, title } => {

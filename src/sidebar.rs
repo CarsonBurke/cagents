@@ -11401,6 +11401,13 @@ mod row_interaction {
     #[derive(Clone, Default)]
     pub(super) struct StickyViewport(Rc<Cell<f32>>);
 
+    /// Widget-operation context is scoped to members of this actual group.
+    /// Header targets themselves do not inherit their own sticky obstruction.
+    pub(super) enum RevealInset {
+        Enter(f32),
+        Exit,
+    }
+
     fn sticky_header_bounds(group: Rectangle, height: f32, top: f32) -> Rectangle {
         Rectangle {
             y: top
@@ -11849,19 +11856,36 @@ mod row_interaction {
             }
             operation.container(None, layout.bounds());
             operation.traverse(&mut |operation| {
-                for ((child, tree), layout) in
-                    self.children
-                        .iter_mut()
-                        .zip(&mut tree.children)
-                        .zip(child_layouts(
-                            &self.kind,
-                            tree.state.downcast_ref::<State>(),
-                            layout,
-                        ))
+                let header_height = matches!(self.kind, Kind::Group { .. }).then(|| {
+                    tree.state
+                        .downcast_ref::<State>()
+                        .header_node
+                        .as_ref()
+                        .expect("group has been laid out")
+                        .size()
+                        .height
+                });
+                for (index, ((child, tree), layout)) in self
+                    .children
+                    .iter_mut()
+                    .zip(&mut tree.children)
+                    .zip(child_layouts(
+                        &self.kind,
+                        tree.state.downcast_ref::<State>(),
+                        layout,
+                    ))
+                    .enumerate()
                 {
+                    let inset = header_height.filter(|_| index == 1);
+                    if let Some(height) = inset {
+                        operation.custom(None, layout.bounds(), &mut RevealInset::Enter(height));
+                    }
                     child
                         .as_widget_mut()
                         .operate(tree, layout, renderer, operation);
+                    if inset.is_some() {
+                        operation.custom(None, layout.bounds(), &mut RevealInset::Exit);
+                    }
                 }
             });
             self.focus(tree, layout, renderer);
@@ -16343,13 +16367,29 @@ pub(crate) mod tests {
         // Project headers themselves need no member inset and keep their
         // displayed sticky position when explicitly focused.
         let header_target = selection_row_focus_id(SelectionRow::Project(owner));
-        ui.operate(
-            &renderer,
-            &mut operation::focusable::focus::<()>(header_target.clone()),
-        );
+        let mut header_before = Probe::default();
+        ui.operate(&renderer, &mut header_before);
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(focus_and_reveal::<()>(header_target.clone()))
+                .unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(Action::Widget(mut operation)) = stream.next().await {
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        });
         let mut focused = Probe::default();
         ui.operate(&renderer, &mut focused);
         assert_eq!(focused.focused, Some(header_target));
+        assert_eq!(
+            focused.offset, header_before.offset,
+            "an already visible sticky header must not scroll by a member inset"
+        );
     }
 
     #[test]
@@ -21431,10 +21471,26 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
         id: Id,
         bounds: Option<cosmic::iced::Rectangle>,
         focus: bool,
+        insets: Vec<f32>,
+        top_inset: f32,
     }
     impl<T: 'static> Operation<T> for FocusRow {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
             visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&Id>,
+            _: cosmic::iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            match state.downcast_ref::<row_interaction::RevealInset>() {
+                Some(row_interaction::RevealInset::Enter(height)) => self.insets.push(*height),
+                Some(row_interaction::RevealInset::Exit) => {
+                    self.insets.pop();
+                }
+                None => {}
+            }
         }
         fn focusable(
             &mut self,
@@ -21447,18 +21503,23 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
                     state.focus();
                 }
                 self.bounds = Some(bounds);
+                self.top_inset = self.insets.last().copied().unwrap_or_default();
             } else if self.focus {
                 state.unfocus();
             }
         }
         fn finish(&self) -> operation::Outcome<T> {
             self.bounds.map_or(operation::Outcome::None, |bounds| {
-                operation::Outcome::Chain(Box::new(RevealRow { bounds }))
+                operation::Outcome::Chain(Box::new(RevealRow {
+                    bounds,
+                    top_inset: self.top_inset,
+                }))
             })
         }
     }
     struct RevealRow {
         bounds: cosmic::iced::Rectangle,
+        top_inset: f32,
     }
     impl<T> Operation<T> for RevealRow {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
@@ -21476,8 +21537,9 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
                 return;
             }
             let row = self.bounds - translation;
-            let delta = if row.y < bounds.y {
-                row.y - bounds.y
+            let top = bounds.y + self.top_inset.min((bounds.height - row.height).max(0.0));
+            let delta = if row.y < top {
+                row.y - top
             } else if row.y + row.height > bounds.y + bounds.height {
                 row.y + row.height - bounds.y - bounds.height
             } else {
@@ -21496,5 +21558,7 @@ fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced
         id,
         bounds: None,
         focus,
+        insets: Vec::new(),
+        top_inset: 0.0,
     })
 }
