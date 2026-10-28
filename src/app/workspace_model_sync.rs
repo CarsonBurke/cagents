@@ -2640,9 +2640,15 @@ mod tests {
             if !matching {
                 model.identity = uuid::Uuid::new_v4();
             }
+            let connected_registry = model.identity;
             drop(app.update(Message::WorkspaceModelObserved(
                 ModelUpdate::connected_fixture(model),
             )));
+            assert_eq!(app.workspace_model.identity, connected_registry);
+            assert_eq!(
+                app.durable.workspace_model_identity,
+                Some(connected_registry)
+            );
             assert_eq!(app.project_ui.is_reopening(&repository), !matching);
             assert_eq!(
                 app.workspace_model_reopens.can_retry(&repository),
@@ -2654,14 +2660,48 @@ mod tests {
                     .any(|edit| matches!(edit, ModelEdit::ReopenProject { .. })),
                 "Connected never replays the old explicit intent"
             );
+            let retry_message = "Project reopening could not be confirmed on the current workspace connection. Open the project again to retry.";
+            assert!(
+                app.status.is_none(),
+                "the App reducer drains its staging notice into the visible journal"
+            );
             if !matching {
-                assert!(
-                    app.status
-                        .as_ref()
-                        .is_some_and(|notice| notice.message.contains("again"))
+                let recorded = app
+                    .notices
+                    .recent()
+                    .next()
+                    .expect("the current failed attempt leaves an actionable visible notice");
+                assert_eq!(
+                    recorded.notice,
+                    TransientNotice::warning(retry_message),
+                    "visible journal: {:?}",
+                    app.notices.entries
                 );
+                assert_eq!(
+                    recorded.expires_at, None,
+                    "retry instructions remain until dismissal"
+                );
+                assert_eq!(app.notices.severity(), Some(NoticeSeverity::Warning));
+                assert_eq!(
+                    app.workspace_model_reopens.active.get(&project),
+                    Some(&origin)
+                );
+                assert!(app.workspace_model_reopens.retryable.contains(&project));
+                assert!(!app.workspace_model_reopens.deferred.contains_key(&project));
+                assert!(!app.project_ui.closed.contains(&repository));
                 let replacement = queue_reopen_fixture(&mut app, project, &repository);
-                assert_ne!(replacement.reopen.unwrap().nonce, origin.nonce);
+                let replacement = replacement.reopen.unwrap();
+                assert_ne!(replacement.nonce, origin.nonce);
+                assert_eq!(replacement.registry, connected_registry);
+                assert_eq!(replacement.host, app.workspace_model_source);
+            } else {
+                assert!(!app.workspace_model_reopens.active.contains_key(&project));
+                assert!(!app.workspace_model_reopens.deferred.contains_key(&project));
+                assert!(
+                    !app.notices
+                        .recent()
+                        .any(|entry| entry.notice.message == retry_message)
+                );
             }
         }
     }
@@ -2753,10 +2793,24 @@ mod tests {
         assert!(app.project_ui.is_reopening(&repository));
         assert!(app.workspace_model_reopens.can_retry(&repository));
         assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message.contains("again"))
+            app.status.is_none(),
+            "the real App update records its notice"
         );
+        let recorded = app
+            .notices
+            .recent()
+            .next()
+            .expect("the refused physical destination exposes a visible retry notice");
+        assert_eq!(
+            recorded.notice,
+            TransientNotice::error(format!(
+                "Could not reopen project: {error}. Open the project again to retry."
+            )),
+            "visible journal: {:?}",
+            app.notices.entries
+        );
+        assert_eq!(recorded.expires_at, None);
+        assert_eq!(app.notices.severity(), Some(NoticeSeverity::Error));
         assert_eq!(app.workspace_model.identity, NO_REGISTRY);
     }
 
