@@ -186,6 +186,7 @@ impl Details {
 struct Probe {
     operation: uuid::Uuid,
     session: TerminalSession,
+    saved_context: Option<(uuid::Uuid, PathBuf)>,
     available: bool,
     pending: bool,
     retry_at: Instant,
@@ -241,11 +242,16 @@ impl Action {
 }
 fn fresh_transcript(
     session: &TerminalSession,
+    saved_socket: Option<&Path>,
 ) -> Result<transcript_location::ValidatedTranscript, transcript_location::Unavailable> {
     use transcript_location::Unavailable;
     // Connecting to the existing control socket never starts or repairs a host.
-    let socket =
-        crate::terminal::ipc::daemon_socket_path().map_err(|_| Unavailable::MetadataMissing)?;
+    let socket = match saved_socket {
+        Some(socket) => socket.to_path_buf(),
+        None => {
+            crate::terminal::ipc::daemon_socket_path().map_err(|_| Unavailable::MetadataMissing)?
+        }
+    };
     let mut client = ControlClient::connect(&socket).map_err(|_| Unavailable::MetadataMissing)?;
     let descriptors = client.list().map_err(|_| Unavailable::MetadataMissing)?;
     let metadata: TranscriptMetadata = descriptors
@@ -316,7 +322,21 @@ impl Cagents {
         Failure::Terminal(Box::new(details))
     }
     fn probe_current(&self, card: CardId, operation: uuid::Uuid) -> bool {
-        !crate::device::is_remote() && self.terminal_failure.probes.get(&card).is_some_and(|probe| probe.operation == operation && self.card_state(card).is_some_and(|state| state.existence.is_open() && matches!(&state.kind, CardKind::Terminal(session) if session.id == probe.session.id && session.launch == probe.session.launch)))
+        !crate::device::is_remote()
+            && self.terminal_failure.probes.get(&card).is_some_and(|probe| {
+                probe.operation == operation
+                    && (self.saved_terminal_current(card).is_none() || probe.saved_context.is_some())
+                    && probe.saved_context == self.saved_terminal_transcript_context(card)
+                    && self.card_state(card).is_some_and(|state| {
+                        state.existence.is_open()
+                            && matches!(&state.kind, CardKind::Terminal(session)
+                                if if probe.saved_context.is_some() {
+                                    session == &probe.session
+                                } else {
+                                    session.id == probe.session.id && session.launch == probe.session.launch
+                                })
+                    })
+            })
     }
     pub(super) fn terminal_transcript_probes(&mut self) -> Task<Message> {
         let sessions: HashMap<_, _> = self
@@ -329,6 +349,7 @@ impl Cagents {
                     self.cards.get(&state.id),
                     Some(CardRuntime::Failed(Failure::Terminal(_)) | CardRuntime::Completed)
                 ) || ended_terminal(Some(state)).is_some()
+                    || self.saved_terminal_diagnostics_allowed(state.id)
             })
             .filter_map(|state| {
                 if let CardKind::Terminal(session) = &state.kind {
@@ -345,6 +366,18 @@ impl Cagents {
         });
         let mut tasks = Vec::new();
         for (card, session) in sessions {
+            let saved_context = self.saved_terminal_transcript_context(card);
+            if self
+                .terminal_failure
+                .probes
+                .get(&card)
+                .is_some_and(|probe| {
+                    probe.saved_context != saved_context
+                        || (saved_context.is_some() && &probe.session != session)
+                })
+            {
+                self.terminal_failure.probes.remove(&card);
+            }
             if self.workspace.visibility(card) != Some(VisibilityClass::Visible) {
                 continue;
             }
@@ -365,6 +398,7 @@ impl Cagents {
                 Probe {
                     operation,
                     session: session.clone(),
+                    saved_context: saved_context.clone(),
                     available: false,
                     pending: !crate::device::is_remote(),
                     retry_at: Instant::now() + Duration::from_secs(10),
@@ -374,10 +408,15 @@ impl Cagents {
                 continue;
             }
             tasks.push(cosmic::task::future(async move {
-                let available =
-                    tokio::task::spawn_blocking(move || fresh_transcript(&session).is_ok())
-                        .await
-                        .unwrap_or(false);
+                let available = tokio::task::spawn_blocking(move || {
+                    fresh_transcript(
+                        &session,
+                        saved_context.as_ref().map(|(_, socket)| socket.as_path()),
+                    )
+                    .is_ok()
+                })
+                .await
+                .unwrap_or(false);
                 Message::TerminalFailure(Action::Probed {
                     card,
                     operation,
@@ -405,6 +444,25 @@ impl Cagents {
             .into()
     }
     pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'static, Message> {
+        widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Copy details")
+                .id(card_control_id(card, "failure.copy"))
+                .on_press(Message::TerminalFailure(Action::Copy(card)))
+                .into(),
+            self.terminal_transcript_control(
+                card,
+                Some(Message::TerminalFailure(Action::Reveal(card))),
+            ),
+        ])
+        .spacing(space::S)
+        .wrap()
+        .into()
+    }
+    pub(super) fn terminal_transcript_control(
+        &self,
+        card: CardId,
+        action: Option<Message>,
+    ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
         let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
@@ -418,22 +476,14 @@ impl Cagents {
             },
         )
         .id(card_control_id(card, "failure.folder"));
-        let folder = if available {
-            folder.on_press(Message::TerminalFailure(Action::Reveal(card)))
+        let folder = if let Some(action) = action.filter(|_| available) {
+            folder.on_press(action)
         } else {
             folder
         };
-        widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Copy details")
-                .id(card_control_id(card, "failure.copy"))
-                .on_press(Message::TerminalFailure(Action::Copy(card)))
-                .into(),
-            folder.into(),
-        ])
-        .spacing(space::S)
-        .wrap()
-        .into()
+        folder.into()
     }
+
     pub(super) fn terminal_runtime_claims(&self, terminal: TerminalId) -> bool {
         self.durable.cards.iter().filter(|state| state.existence.is_open()).any(|state| match &state.kind {
             CardKind::Terminal(session) if session.id == terminal => {
@@ -524,6 +574,14 @@ impl Cagents {
                 Task::none()
             }
             Action::Reveal(card) => {
+                if self
+                    .terminal_failure
+                    .probes
+                    .get(&card)
+                    .is_none_or(|probe| !self.probe_current(card, probe.operation))
+                {
+                    return Task::none();
+                }
                 let Some(probe) = self
                     .terminal_failure
                     .probes
@@ -539,10 +597,14 @@ impl Cagents {
                 probe.operation = uuid::Uuid::new_v4();
                 let operation = probe.operation;
                 let session = probe.session.clone();
+                let saved_context = probe.saved_context.clone();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        fresh_transcript(&session)
-                            .map(|transcript| Permit(Arc::new(Mutex::new(Some(transcript)))))
+                        fresh_transcript(
+                            &session,
+                            saved_context.as_ref().map(|(_, socket)| socket.as_path()),
+                        )
+                        .map(|transcript| Permit(Arc::new(Mutex::new(Some(transcript)))))
                     })
                     .await
                     .unwrap_or(Err(transcript_location::Unavailable::MetadataMissing));
@@ -952,6 +1014,7 @@ mod tests {
             Probe {
                 operation: old,
                 session,
+                saved_context: None,
                 available: true,
                 pending: false,
                 retry_at: Instant::now(),
@@ -978,6 +1041,7 @@ mod tests {
             Probe {
                 operation,
                 session,
+                saved_context: None,
                 available: false,
                 pending: true,
                 retry_at: Instant::now(),

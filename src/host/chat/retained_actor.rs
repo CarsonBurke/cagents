@@ -14,6 +14,9 @@ pub(in crate::host) struct Startup {
     pub(super) source: Session,
     pub(super) requested: Session,
     pub(super) context: Arc<chat::protocol::ExecutionContext>,
+    /// An initial named resume failed after installation. Only this exact
+    /// attachment may finish its normal semantic close before a retry starts.
+    pub(super) failed_close: Option<super::CloseTarget>,
 }
 
 /// Unit-only HostState fixtures intentionally exercise local transports without
@@ -556,6 +559,9 @@ pub(super) fn forget_startup(
 }
 
 pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
+    if prepare_failed_start(host, source)?.is_some() {
+        return Ok(true);
+    }
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
@@ -580,6 +586,34 @@ pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<b
                 .into(),
         ),
     }
+}
+
+/// Explicit retry may discover the still-owned failed attachment in ChatList.
+/// Preparation finishes that exact normal Close and returns only its original
+/// requested launch. An unrelated or successful retained actor never gains a
+/// restart grant through this path.
+pub(super) fn prepare_failed_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, String> {
+    let failed = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .native_actor_startups
+            .get(&source.id)
+            .and_then(|pending| {
+                pending.failed_close.as_ref().and_then(|target| {
+                    (source == &pending.requested || source == &target.source)
+                        .then(|| (pending.clone(), target.clone()))
+                })
+            })
+    };
+    if let Some((pending, target)) = failed {
+        super::close_captured(host, target).map_err(|error| error.message)?;
+        forget_startup(host, &pending.source, &pending.context);
+        return Ok(Some(pending.requested));
+    }
+    Ok(None)
 }
 
 /// Persist cleanup authority while the inspected source and captured scope are
@@ -707,7 +741,85 @@ pub(super) fn restore(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
-    restore_actor(host, client, requested, proof, owner, true)
+    restore_actor(host, client, requested, proof, owner, true, None)
+}
+
+/// A failed cleanup attachment is not a user request to return to a terminal.
+/// Restore its still-running owner through normal installation, retaining the
+/// old cleanup record until the helper and durable registry acknowledge it.
+pub(super) fn recover_cleanup_attachment(
+    host: &SharedHost,
+    requested: &Session,
+) -> Result<(), String> {
+    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
+    let (target, identity, proof, _reservation) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&requested.id)
+            .ok_or("Cleanup owner disappeared")?;
+        if !record.handle.is_close_only()
+            || record.session.launch.provider != Provider::Claude
+            || record.handle.is_completed()
+            || state.shutting_down
+            || state.chat_handoffs.contains_key(&requested.id)
+            || state.native_closing.contains_key(&requested.id)
+        {
+            return Err("This conversation is not a running recoverable cleanup attachment".into());
+        }
+        let target = super::CloseTarget::from_record(record);
+        let identity = record
+            .handle
+            .actor_identity()
+            .ok_or("Cleanup lost its exact helper")?;
+        let proof = state.proof().clone();
+        let reservation = capacity::Reservation::closing(host, &mut state, requested)
+            .map_err(|error| error.message)?;
+        (target, identity, proof, reservation)
+    };
+    restore_actor(
+        host,
+        0,
+        requested,
+        &proof,
+        identity.record,
+        true,
+        Some(&target),
+    )?;
+    Ok(())
+}
+
+pub(in crate::host) fn recover_cleanup_attachments(host: &SharedHost) -> Vec<String> {
+    let sources = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .values()
+        .filter(|record| record.handle.is_close_only())
+        .map(|record| record.session.clone())
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut failures = Vec::new();
+    for source in sources {
+        if Instant::now() >= deadline {
+            failures.push("Conversation recovery reached its preview deadline; existing ownership was preserved.".into());
+            break;
+        }
+        if recover_cleanup_attachment(host, &source).is_err() && failures.len() < 40 {
+            failures.push(format!("Conversation {} could not reconnect after an unfinished close; its provider and recovery evidence were preserved.", source.id));
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+pub(super) fn restore_cleanup_for_test(
+    host: &SharedHost,
+    requested: &Session,
+    proof: &HostSessionProof,
+    owner: crate::daemon::holder_registry::Record,
+) -> Result<ServerResponse, String> {
+    restore_actor(host, 0, requested, proof, owner, false, None)
 }
 
 fn restore_actor(
@@ -717,6 +829,7 @@ fn restore_actor(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
     publish_snapshot: bool,
+    replacing: Option<&super::CloseTarget>,
 ) -> Result<ServerResponse, String> {
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
@@ -724,6 +837,20 @@ fn restore_actor(
         || inspection.source.launch.provider != Provider::Claude
     {
         return Err("The retained Claude actor identity changed during inspection".into());
+    }
+    if let Some(target) = replacing {
+        target
+            .require_current(host)
+            .map_err(|error| error.message)?;
+        if target.handle.actor_identity().as_ref() != Some(&inspection.identity)
+            || !inspection.state.installed
+            || inspection.state.completed
+            || !inspection.state.owns_work
+            || inspection.state.close.closing
+            || inspection.state.close.exited
+        {
+            return Err("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into());
+        }
     }
     if !publish_snapshot {
         verify_close_ownership(
@@ -825,12 +952,13 @@ fn restore_actor(
             Publication::Close
         },
     )?;
+    let after_generation = handle.observe_next_update();
     let observation = Observation {
-        after_generation: handle.observe_next_update(),
+        after_generation,
         ..Observation::default()
     };
     let previous_sources = super::native_recovery::retained_upgrade_sources(sources, &session);
-    let record = Record {
+    let mut record = Record {
         execution_instance: identity.instance,
         console_recipe: inspection.execution_console,
         paired_terminal: paired.clone(),
@@ -870,7 +998,13 @@ fn restore_actor(
     if state.shutting_down
         || state.proof() != proof
         || !pair_unchanged
-        || state.chats.contains_key(&id)
+        || match replacing {
+            Some(target) => state
+                .chats
+                .get(&id)
+                .is_none_or(|current| !target.matches(current)),
+            None => state.chats.contains_key(&id),
+        }
         || state
             .chat_spawning
             .get(&id)
@@ -878,12 +1012,40 @@ fn restore_actor(
     {
         return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
     }
+    if replacing.is_some() {
+        // Failed legacy attachments may already have observers in another
+        // window. Preserve those authorized subscriptions, rebasing their
+        // notification fence onto the actual new attachment's generation.
+        let previous = state.chats.get(&id).expect("replacement was validated");
+        record.subscribers.extend(previous.subscribers.clone());
+        record.observations = record
+            .subscribers
+            .keys()
+            .map(|&client| {
+                (
+                    client,
+                    Observation {
+                        epoch: previous
+                            .observations
+                            .get(&client)
+                            .map_or(0, |observation| observation.epoch),
+                        after_generation,
+                        notified: false,
+                    },
+                )
+            })
+            .collect();
+    }
+    let visible = record.subscribers.values().any(|visible| *visible);
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
+    if visible {
+        handle.set_visible(true);
+    }
     handle.wake_retained_outcomes();
     super::super::state::retire_unattached_upgrade_chat(host, id);
     Ok(response)
@@ -1012,7 +1174,7 @@ fn close_with_target(
                     .into(),
             );
         }
-        restore_actor(host, 0, requested, &proof, owner.clone(), false)?;
+        restore_actor(host, 0, requested, &proof, owner.clone(), false, None)?;
     }
     let (handle, source, paired, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1208,6 +1370,22 @@ fn close_with_target(
             state.retire_terminal(terminal.id);
         }
         let removed = state.chats.remove(&source.id);
+        // Ordinary Close may finish a previously failed initialization too.
+        // Clear only the startup captured by this fully retired attachment;
+        // a replacement owner or an unproved teardown retains its reservation.
+        if removed.as_ref().is_some_and(|record| {
+            state
+                .native_actor_startups
+                .get(&source.id)
+                .is_some_and(|pending| {
+                    pending
+                        .failed_close
+                        .as_ref()
+                        .is_some_and(|failed| failed.matches(record))
+                })
+        }) {
+            state.native_actor_startups.remove(&source.id);
+        }
         state.native_adoption_failures.clear(source.id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(source.id);
@@ -1501,6 +1679,130 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
     Ok(())
 }
 
+/// A completed task from a previous kernel boot is saved history, not ownership
+/// of a current cleanup-only helper using the same saved allocation. Archive
+/// only an already removed presentation, before orphan adoption consults it.
+pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (proof, registry) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(registry) = state.execution_registry.clone() else {
+            // A damaged model still permits exact orphan-terminal recovery.
+            // Preserve native history until its registry can be opened; do not
+            // prevent the recovery-only listener from exposing checked Close.
+            return Ok(());
+        };
+        (state.proof().clone(), registry)
+    };
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(());
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "Historical execution inspection reached its startup budget; remaining records were preserved"
+                );
+                return Ok(());
+            }
+            if !ownership.is_pending() || ownership.owner().boot != proof.boot_id {
+                continue;
+            }
+            if !registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_previous_boot_execution(ownership.source().id, &proof.boot_id)?
+            {
+                continue;
+            }
+            let inspection = match Handle::inspect_remote_until(
+                ownership.owner(),
+                proof.clone(),
+                deadline,
+            ) {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical execution cleanup could not authenticate its helper; original records preserved");
+                    continue;
+                }
+            };
+            if inspection.identity.instance != ownership.actor()
+                || &inspection.identity.record != ownership.owner()
+                || (ownership.source() != &inspection.source
+                    && !inspection.previous_sources.contains(ownership.source()))
+                || ownership.scope()
+                    != inspection
+                        .launch_account_scope
+                        .as_ref()
+                        .map_err(String::as_str)
+                || !inspection.state.close.completed
+                || !inspection.state.close.exited
+                || !inspection.state.installed
+                || inspection.state.owns_work
+                || inspection.state.outbox_ack != inspection.state.outbox_latest
+                || inspection.state.continuity_loss.is_some()
+            {
+                continue;
+            }
+            // Reattach only for cleanup. This republishes the already closed
+            // snapshot under our authenticated epoch, without provider input.
+            let handle = match Handle::adopt_remote_for_close(
+                ownership.owner(),
+                inspection.source.clone(),
+                proof.clone(),
+                |_| {},
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical helper cleanup remains retryable");
+                    continue;
+                }
+            };
+            if handle.actor_identity().as_ref() != Some(&inspection.identity)
+                || handle.launch_account_scope() != ownership.scope()
+                || !handle.retained_close_proved(&inspection.source, &proof)?
+            {
+                continue;
+            }
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                !state.shutting_down
+                    && state.proof() == &proof
+                    && !state.chats.contains_key(&ownership.source().id)
+            };
+            if !current {
+                continue;
+            }
+            let mut issued = inspection.previous_sources;
+            issued.push(inspection.source.clone());
+            let archived = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_previous_boot_execution(
+                    &ownership,
+                    &proof.boot_id,
+                    &issued,
+                    &inspection.source,
+                )?;
+            if archived {
+                // Retire performs the existing final semantic ACK/real exit
+                // checks. Archival supplied no alias or execution authority.
+                if let Err(error) = publish_retirement(host, &handle, &inspection.source) {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical task was archived; authenticated helper journal remains for cleanup retry");
+                } else {
+                    super::super::agent_execution::retired(host, &inspection.source)?;
+                }
+            }
+        }
+    }
+}
+
 /// Finish a durable retirement whose helper completed before the prior daemon
 /// could commit its registry receipt. No attachment or provider is created.
 /// A missing receipt remains unknown; a roster row alone never proves closure.
@@ -1529,12 +1831,15 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
             if ownership.owner().boot != proof.boot_id {
                 continue;
             }
-            if registry
+            let retired = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .native_actor_retirement(ownership.actor())?
-                .is_some()
-            {
+                .native_actor_retirement(ownership.actor())?;
+            if let Some(retired) = retired {
+                // A crash can follow receipt commit but precede capability
+                // retirement. The existing process-identity CAS preserves any
+                // newer authority; this grants no execution from an archive.
+                super::super::agent_execution::retired(host, retired.source())?;
                 continue;
             }
             let retirement = Handle::inspect_retained_retirement(ownership.owner(), &proof)?;
