@@ -7673,6 +7673,8 @@ impl RepositoryRuntime {
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
+            self.language
+                .retire_completions(&mut self.completion_intent);
             document.navigate_to(text_editor::Cursor {
                 position: caret,
                 selection,
@@ -12785,6 +12787,36 @@ mod tests {
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("abcd\n"));
         assert!(!runtime.is_dirty());
+    }
+
+    #[test]
+    fn cached_file_and_search_jumps_retire_the_previous_completion_intent() {
+        let (_directory, matched) = scanned_location("foo\nhit\n");
+        for search in [false, true] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "foo\nhit\n");
+            runtime.set_lsp_document(Some(LspDocumentId(1)));
+            runtime.set_editor_completions(vec![completion_item(
+                completion_edit(
+                    LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 3)),
+                    "old",
+                ),
+                vec![],
+            )]);
+            let held = runtime.editor_completion_targets(card).remove(0);
+            let intent = runtime.editor_completion_intent();
+            if search {
+                drop(runtime.open_search_result(card, &matched));
+            } else {
+                drop(runtime.open_file_location(card, matched.path.clone(), 1, 0, 3));
+            }
+            assert_ne!(runtime.editor_completion_intent(), intent);
+            assert!(runtime.language.completions.is_empty());
+            assert_eq!(runtime.selected_text().as_deref(), Some("hit"));
+            assert!(!runtime.apply_completion_target(card, &held));
+            assert_eq!(runtime.editor_text().as_deref(), Some("foo\nhit\n"));
+            assert!(!runtime.is_dirty());
+        }
     }
 
     #[test]
