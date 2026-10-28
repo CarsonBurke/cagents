@@ -2103,6 +2103,201 @@ fn failed_seed_retry_rejects_stale_owner_source_registry_and_attempt() {
     );
     assert!(daemon.requests().is_empty());
     assert!(app.chat_awaiting_admission(pane.id));
+
+    crate::chat::attachment_assets::with_test_image(|image| {
+        let (mut app, active, hidden, pane, registry_a) = cached_chat();
+        let scope = Scope::Channel(hidden);
+        let CardKind::Chat(source) = &pane.kind else {
+            unreachable!()
+        };
+        let source = source.clone();
+        let draft = "Unsent across a warm registry replacement  ";
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::from([(pane.id, draft.into())]),
+            HashMap::from([(pane.id, vec![image.clone()])]),
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.initialize_runtimes());
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let canonical_a = model(registry_a, active, hidden, view);
+        let connected =
+            app.apply_workspace_model_update(ModelUpdate::Connected(canonical_a.clone()));
+        settle(&mut app, connected);
+        let refused_a = framed_seed(queued_seed(&rx, &scope), canonical_a.clone(), true);
+        apply_seed_updates(&mut app, refused_a.clone());
+        let retry_a = app
+            .shared_chat_admission_failure(pane.id)
+            .unwrap()
+            .retry()
+            .unwrap();
+        drop(app.retry_shared_chat_admission(retry_a.clone()));
+        let accepted_a = framed_seed(queued_seed(&rx, &scope), canonical_a.clone(), false);
+        apply_seed_updates(&mut app, vec![accepted_a[0].clone()]);
+        assert_eq!(
+            app.workspace_model.identity, registry_a,
+            "use a warm installed A"
+        );
+        assert_eq!(app.durable.workspace_model_identity, Some(registry_a));
+        let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+            unreachable!()
+        };
+        let allocation = &**runtime as *const chat_ui::Runtime as usize;
+        let original_target = runtime.target;
+
+        let registry_b = uuid::Uuid::new_v4();
+        let mut missing_b = canonical_a.clone();
+        missing_b.identity = registry_b;
+        missing_b.channels.retain(|channel| channel.id != hidden);
+        missing_b.views.retain(|view| view.scope != scope);
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(missing_b.clone()));
+        settle(&mut app, connected);
+        assert_eq!(app.workspace_model, missing_b);
+        assert_eq!(app.durable.workspace_model_identity, Some(registry_b));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == hidden && channel.cards.contains(&pane.id)),
+            "a replacement registry has not deleted the old channel"
+        );
+        assert!(
+            app.shared_views
+                .seed_admissions
+                .values()
+                .all(|seed| seed.registry == registry_b)
+        );
+        let queued = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            queued
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == hidden))
+        );
+        let mut seeds = queued.into_iter().filter(
+            |edit| matches!(edit, ModelEdit::SeedView { scope: queued, .. } if queued == &scope),
+        );
+        let seed_b = seeds
+            .next()
+            .expect("the installed B snapshot publishes its seed");
+        assert!(
+            seeds.next().is_none(),
+            "join must not queue an A seed before B"
+        );
+        assert!(app.shared_views.seed_admissions[&scope].attempt.is_none());
+        apply_seed_updates(&mut app, vec![refused_a[1].clone(), accepted_a[1].clone()]);
+        drop(app.retry_shared_chat_admission(retry_a.clone()));
+        assert!(app.shared_views.seed_admissions[&scope].attempt.is_none());
+        assert!(!app.shared_views.seed_admissions[&scope].failed);
+        assert!(rx.is_empty());
+
+        let refused_b = framed_seed(seed_b, missing_b.clone(), true);
+        apply_seed_updates(&mut app, vec![refused_b[0].clone()]);
+        let ModelUpdate::ViewSeedStarted {
+            attempt: attempt_b, ..
+        } = &refused_b[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.shared_views.seed_admissions[&scope].attempt,
+            Some(*attempt_b)
+        );
+        apply_seed_updates(&mut app, vec![refused_a[1].clone(), accepted_a[1].clone()]);
+        assert_eq!(
+            app.shared_views.seed_admissions[&scope].attempt,
+            Some(*attempt_b)
+        );
+        apply_seed_updates(&mut app, vec![refused_b[1].clone()]);
+        let failure_b = app.shared_chat_admission_failure(pane.id).unwrap();
+        let retry_b = failure_b.retry().unwrap();
+        apply_seed_updates(&mut app, vec![refused_a[1].clone(), accepted_a[1].clone()]);
+        drop(app.retry_shared_chat_admission(retry_a.clone()));
+        assert_eq!(
+            app.shared_chat_admission_failure(pane.id).unwrap().retry(),
+            Some(retry_b.clone())
+        );
+        assert_eq!(
+            app.shared_views.seed_admissions[&scope].attempt,
+            Some(*attempt_b)
+        );
+        assert!(app.startup_pane_check().is_err());
+        let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (
+                &**runtime as *const chat_ui::Runtime as usize,
+                runtime.target
+            ),
+            (allocation, original_target)
+        );
+        assert!(runtime.awaiting_admission());
+        assert_eq!(runtime.session, source);
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&pane.id),
+            Some(&source)
+        );
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&pane.id], draft);
+        assert_eq!(saved.chat_draft_attachments[&pane.id], [image.clone()]);
+        assert!(daemon.requests().is_empty());
+
+        drop(app.retry_shared_chat_admission(retry_b));
+        let seed_b = queued_seed(&rx, &scope);
+        let mut admitted_b = canonical_a;
+        admitted_b.identity = registry_b;
+        admitted_b.sequence = missing_b.sequence + 1;
+        let accepted_b = framed_seed(seed_b, admitted_b.clone(), false);
+        apply_seed_updates(&mut app, vec![accepted_b[0].clone()]);
+        let ModelUpdate::ViewSeedStarted {
+            attempt: retry_attempt_b,
+            ..
+        } = &accepted_b[0]
+        else {
+            unreachable!()
+        };
+        apply_seed_updates(&mut app, vec![refused_a[1].clone(), accepted_a[1].clone()]);
+        drop(app.retry_shared_chat_admission(retry_a));
+        assert_eq!(
+            app.shared_views.seed_admissions[&scope].registry,
+            registry_b
+        );
+        assert_eq!(
+            app.shared_views.seed_admissions[&scope].attempt,
+            Some(*retry_attempt_b)
+        );
+        assert!(!app.shared_views.seed_admissions[&scope].failed);
+        assert!(rx.is_empty());
+        drop(app.apply_workspace_model_update(accepted_b[1].clone()));
+        assert_eq!(app.workspace_model, admitted_b);
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert!(!app.shared_views.seeding.contains(&scope));
+        assert!(!app.shared_views.seed_admissions.contains_key(&scope));
+        assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
+        assert!(app.chat_start_pending(pane.id));
+        let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+            unreachable!()
+        };
+        let admitted_target = runtime.target;
+        drop(app.apply_workspace_model_update(accepted_b[1].clone()));
+        let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+            unreachable!()
+        };
+        assert_eq!(
+            runtime.target, admitted_target,
+            "B admits this source only once"
+        );
+        assert_eq!(app.local_view_cards(&scope), [pane.id]);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&pane.id], draft);
+        assert_eq!(saved.chat_draft_attachments[&pane.id], [image.clone()]);
+        assert!(rx.is_empty());
+        assert!(
+            daemon.requests().is_empty(),
+            "registry recovery only authorizes the exact attachment task"
+        );
+    });
 }
 
 #[test]

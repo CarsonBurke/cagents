@@ -1314,8 +1314,13 @@ impl Cagents {
     }
 
     pub(super) fn publish_view_changes(&mut self) {
+        // A join checkpoints its new registry before installing that snapshot.
         if self.shared_views.applying
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            || self
+                .durable
+                .workspace_model_identity
+                .is_some_and(|identity| identity != self.workspace_model.identity)
         {
             return;
         }
