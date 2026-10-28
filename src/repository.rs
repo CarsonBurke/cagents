@@ -5133,6 +5133,55 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             })
     }
 
+    /// Looks up an exact ref path without Git's revision-name fallbacks.
+    fn resolve_exact_ref_oid(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Oid, RepositoryError> {
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--hash", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run_checked(&command, cancellation)?;
+        Oid::parse_object(parse_utf8_line(&output.stdout, "reference_oid")?).map_err(|error| {
+            RepositoryError::InvalidOutput {
+                field: "reference_oid",
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Resolves an exact ref to a commit, distinguishing absence from a Git
+    /// failure. Peeling the captured object cannot select a similarly named tag
+    /// if the ref disappears between these reads.
+    fn resolve_optional_ref(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--quiet", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run(&command, cancellation)?;
+        if !output.success {
+            return if output.exit_code == Some(1) {
+                Ok(None)
+            } else {
+                Err(git_failure(&command, output).into())
+            };
+        }
+        let oid = self.resolve_exact_ref_oid(worktree, reference, cancellation)?;
+        self.resolve_optional_revision(worktree, oid.as_str(), cancellation)
+    }
+
     /// The `git log` page for one history request.
     pub fn history_command(
         &self,
@@ -5222,7 +5271,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     reason: "an unborn branch has nothing to compare".into(),
                 })?;
         let base = self
-            .resolve_optional_revision(worktree, base_ref.as_str(), cancellation)?
+            .resolve_optional_ref(worktree, base_ref.as_str(), cancellation)?
             .ok_or_else(|| RepositoryError::InvalidOutput {
                 field: "base_ref",
                 reason: format!("{base_ref} does not resolve to a commit"),
@@ -9468,6 +9517,17 @@ mod tests {
                     command: &CommandSpec,
                     cancellation: &CancellationToken,
                 ) -> Result<ProcessOutput, ProcessFailure> {
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "show-ref")
+                    {
+                        assert_eq!(
+                            command.environment.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+                            Some(&OsString::from("1")),
+                            "selected-base reads must not fetch missing promisor objects"
+                        );
+                    }
                     let output = IsolatedExecutor.execute(command, cancellation)?;
                     if command
                         .arguments
@@ -9572,6 +9632,89 @@ mod tests {
             };
             assert_eq!(old.text(), Some("rename contents\n"));
             assert_eq!(new.text(), Some("rename contents\n"));
+
+            // A base offered by the loaded snapshot can disappear before the
+            // selected comparison runs. Its full spelling must not select a tag.
+            let mut unexpected_comparisons = Vec::new();
+            for reference in ["refs/heads/selected", "refs/remotes/origin/selected"] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                git(root, &["init", "-b", "main"]);
+                if reference.starts_with("refs/remotes/") {
+                    git(root, &["remote", "add", "origin", root.to_str().unwrap()]);
+                }
+                fs::write(root.join("tracked.txt"), b"selected base\n").unwrap();
+                git(root, &["add", "tracked.txt"]);
+                git(root, &["commit", "-m", "selected base"]);
+                let comparison_service = service();
+                let base = comparison_service
+                    .resolve_head(root, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                git(root, &["update-ref", reference, base.as_str()]);
+                fs::write(root.join("tracked.txt"), b"head change\n").unwrap();
+                git(root, &["add", "tracked.txt"]);
+                git(root, &["commit", "-m", "head change"]);
+                let head = comparison_service
+                    .resolve_head(root, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(head, base);
+                let snapshot = comparison_service.snapshot(root, &cancellation).unwrap();
+                let selected = snapshot
+                    .local_refs
+                    .iter()
+                    .map(|record| &record.name)
+                    .chain(snapshot.remote_refs.iter().map(|record| &record.name))
+                    .find(|name| name.as_str() == reference)
+                    .cloned()
+                    .expect("the real snapshot offers this branch comparison base");
+                let original = comparison_service
+                    .branch_comparison(root, &selected, &cancellation)
+                    .unwrap();
+                assert_eq!(original.base_oid, base);
+                assert_eq!(original.merge_base, base);
+                assert!(!original.entries.is_empty());
+
+                // The decoy is HEAD, so falling back to it would silently erase
+                // the branch's changes from the comparison instead of failing.
+                let decoy = format!("refs/tags/{reference}");
+                git(root, &["update-ref", &decoy, head.as_str()]);
+                git(root, &["update-ref", "-d", reference]);
+                let result = comparison_service.branch_comparison(root, &selected, &cancellation);
+                if !matches!(
+                    &result,
+                    Err(RepositoryError::InvalidOutput {
+                        field: "base_ref",
+                        ..
+                    })
+                ) {
+                    unexpected_comparisons.push((reference, result));
+                }
+                assert_eq!(
+                    String::from_utf8(git_output(
+                        root,
+                        &["show-ref", "--verify", "--hash", "--", &decoy]
+                    ))
+                    .unwrap()
+                    .trim(),
+                    head.as_str()
+                );
+                assert_eq!(
+                    comparison_service
+                        .resolve_head(root, &cancellation)
+                        .unwrap(),
+                    Some(head)
+                );
+                assert_eq!(
+                    fs::read(root.join("tracked.txt")).unwrap(),
+                    b"head change\n"
+                );
+            }
+            assert!(
+                unexpected_comparisons.is_empty(),
+                "an absent selected ref must not produce a tag-based comparison: {unexpected_comparisons:?}"
+            );
         }
 
         #[test]
