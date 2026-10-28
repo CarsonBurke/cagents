@@ -17840,14 +17840,6 @@ mod tests {
                 ticket.active(),
                 "same-drop prose must preserve actual staging admission"
             );
-            assert_eq!(chat_runtime(&app, card).pastes_pending, 1);
-            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
-            drop(app.handle_chat_ui(Action::Reconnect(target)));
-            assert!(
-                app.chat_ui.attempt(card).is_none(),
-                "resume/reconnect cannot cancel an admitted attachment worker"
-            );
-            assert!(ticket.active());
             drop(app.handle_chat_ui(Action::AttachmentsPrepared(
                 target,
                 ticket,
@@ -19468,6 +19460,14 @@ mod tests {
                     .attachment_chooser_pending
                     .is_none()
             );
+            assert_eq!(chat_runtime(&app, card).pastes_pending, 1);
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "resume/reconnect cannot cancel an admitted attachment worker"
+            );
+            assert!(ticket.active());
             drop(app.handle_chat_ui(Action::AttachmentsPrepared(
                 target,
                 ticket,
