@@ -518,19 +518,23 @@ impl State {
                 && incident.sources.iter().any(|source| {
                     matches!(source, Source::Note(index) if runtime.failures[*index].0.as_deref() == Some(anchor))
                 })
-                && let Some(carrier) = attachment_draft::message_key(provider, anchor)
-                && user_carriers.contains_key(carrier)
             {
-                // The original note keeps its captured anchor. Only its
-                // display destination follows a visible part of the SAME
-                // proven User message after paging removes the first part.
-                // A visual Turn key is a destination, never incident identity.
+                // A note's message identity can differ from its containing
+                // visual Turn, including opaque legacy IDs. Prefer its exact
+                // visible User item; after paging, only a proven same-message
+                // carrier may supply the display destination.
+                let carrier = attachment_draft::message_key(provider, anchor)
+                    .filter(|carrier| user_carriers.contains_key(carrier));
                 if let Some(turn) = runtime.turns.iter().find(|turn| {
                     turn.prompt.iter().any(|index| {
                         runtime.snapshot.items.get(*index).is_some_and(|item| {
                             item.role == chat::Role::User
                                 && !matches!(item.content, ItemContent::Delivery { .. })
-                                && attachment_draft::message_key(provider, &item.id) == Some(carrier)
+                                && (item.id == anchor
+                                    || carrier.is_some_and(|carrier| {
+                                        attachment_draft::message_key(provider, &item.id)
+                                            == Some(carrier)
+                                    }))
                         })
                     })
                 }) {

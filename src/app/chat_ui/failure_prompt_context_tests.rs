@@ -426,6 +426,69 @@ fn adjacent_distinct_message_carriers_do_not_borrow_the_shared_visual_turn_key()
 }
 
 #[test]
+fn refresh_keeps_adjacent_opaque_notes_visible_without_aliasing_their_scopes() {
+    let raw = "Opaque provider failure\ncomplete original diagnostic";
+    for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text("legacy-first", chat::Role::User, "First submission"),
+                text("legacy-second", chat::Role::User, "Second submission"),
+            ],
+        );
+        assert_eq!(runtime.turns.len(), 1);
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failures[0].0.as_deref(), Some("legacy-second"));
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("legacy-first")
+        );
+
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.error = None;
+        next.items.push(Arc::new(text(
+            "legacy-third",
+            chat::Role::User,
+            "Third submission",
+        )));
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failures[1].0.as_deref(), Some("legacy-third"));
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        assert_ne!(
+            runtime.failure_ui.incidents[0].key,
+            runtime.failure_ui.incidents[1].key
+        );
+        for incident in &runtime.failure_ui.incidents {
+            assert_eq!(incident.anchor.as_deref(), Some("legacy-first"));
+            assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
+        }
+
+        // An absent opaque item has no same-message proof. Do not move its
+        // historical note to a different prompt merely sharing the old Turn.
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.error = None;
+        next.items.retain(|item| item.id != "legacy-second");
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+        assert_eq!(runtime.failures[0].0.as_deref(), Some("legacy-second"));
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("legacy-second")
+        );
+        assert_eq!(
+            runtime.failure_ui.incidents[1].anchor.as_deref(),
+            Some("legacy-first")
+        );
+    }
+}
+
+#[test]
 fn refresh_attributes_adjacent_message_error_to_the_incoming_prompt() {
     let raw = "Opaque provider failure\nexact original diagnostic";
     for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
