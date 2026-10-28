@@ -763,11 +763,18 @@ where
         }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let hovered_guard = self.hovered_option.lock().unwrap();
-                if cursor.is_over(layout.bounds()) {
-                    if let Some(index) =
-                        (*hovered_guard).filter(|index| *index < self.options.len())
-                    {
+                if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
+                    let text_size = self
+                        .text_size
+                        .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
+                    let option_height =
+                        f32::from(self.text_line_height.to_absolute(Pixels(text_size)))
+                            + self.padding.y();
+                    // Keyboard navigation and scrolling can change the row
+                    // beneath a stationary pointer without a CursorMoved event.
+                    let index = (cursor_position.y / option_height) as usize;
+                    if index < self.options.len() {
+                        *self.hovered_option.lock().unwrap() = Some(index);
                         if let Some(keyboard) = &self.keyboard {
                             if self.close_on_selected.is_some() {
                                 keyboard.retired.store(true, Ordering::SeqCst);

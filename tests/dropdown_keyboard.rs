@@ -914,3 +914,84 @@ fn dropdown_rebuild_refreshes_unselected_option_metrics_after_typography_changes
         }
     }
 }
+
+#[test]
+fn dropdown_stationary_pointer_press_selects_pressed_row_after_keyboard_navigation() {
+    use keyboard::key::Named;
+    let mut fixture = Fixture::new(choices(3), Some(0));
+    fixture.tab(false);
+    fixture.tab(false);
+    fixture.key(Named::Enter);
+    let (bounds, _, offset) = fixture.scroll();
+    assert_eq!(offset, 0.0);
+    // The menu uses its own default line height and an 8px outer inset.
+    let row_height =
+        f32::from(cosmic::iced::widget::text::LineHeight::default().to_absolute(Pixels(14.0)))
+            + 16.0;
+    let point = cosmic::iced::Point::new(bounds.x + 24.0, bounds.y + 8.0 + 0.5 * row_height);
+    let cursor = mouse::Cursor::Available(point);
+    fixture.event(
+        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+        cursor,
+    );
+    fixture.event(named(Named::End), cursor);
+    assert_eq!(fixture.scroll().2, 0.0, "all three rows remain visible");
+    // No intervening CursorMoved: the pointer is still over the first row.
+    assert_eq!(
+        fixture
+            .event(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                cursor,
+            )
+            .0,
+        [Message::Selected(0)]
+    );
+    assert!(!fixture.open());
+}
+
+#[test]
+fn dropdown_stationary_pointer_press_selects_row_currently_beneath_it_after_wheel_scroll() {
+    use keyboard::key::Named;
+    let mut fixture = Fixture::new(choices(100), Some(0));
+    fixture.tab(false);
+    fixture.tab(false);
+    fixture.key(Named::Enter);
+    let (bounds, _, initial_offset) = fixture.scroll();
+    assert_eq!(initial_offset, 0.0);
+    let row_height =
+        f32::from(cosmic::iced::widget::text::LineHeight::default().to_absolute(Pixels(14.0)))
+            + 16.0;
+    let point = cosmic::iced::Point::new(bounds.x + 24.0, bounds.y + 8.0 + 0.5 * row_height);
+    let cursor = mouse::Cursor::Available(point);
+    fixture.event(
+        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+        cursor,
+    );
+    fixture.event(
+        Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: -4.0 },
+        }),
+        cursor,
+    );
+    let (scrolled_bounds, _, offset) = fixture.scroll();
+    assert_eq!(scrolled_bounds, bounds);
+    assert!(
+        offset > row_height,
+        "wheel browsing moves another row under the pointer"
+    );
+    // Scrollable adds its actual content translation to the cursor before
+    // dispatching to the List, whose origin follows the 8px inner padding.
+    let expected = ((point.y - scrolled_bounds.y - 8.0 + offset) / row_height).floor() as usize;
+    assert!(expected > 0 && expected < 100);
+    // No CursorMoved after scrolling; the old hover still names row zero.
+    assert_eq!(
+        fixture
+            .event(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                cursor,
+            )
+            .0,
+        [Message::Selected(expected)]
+    );
+    assert!(!fixture.open());
+}
