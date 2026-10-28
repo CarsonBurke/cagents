@@ -2262,9 +2262,15 @@ fn account_recovery_retained_discovery(
     members: &[TerminalId],
     retired: &BTreeMap<TerminalId, crate::daemon::holder_registry::Record>,
     proof: &HostSessionProof,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<(), ProtocolError> {
     use crate::daemon::holder_registry::{self as holders, Kind};
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let check = || {
+        retained_resume::account_recovery_census_check(deadline, cancelled)
+            .map_err(account_switch_unavailable)
+    };
+    check()?;
     let related = |id: TerminalId| members.contains(&id) || id == replacement.id;
     let conflicts = |candidate: &Session, confirmed: Option<&str>| {
         related(candidate.id)
@@ -2274,15 +2280,12 @@ fn account_recovery_retained_discovery(
                     || confirmed == source.launch.session_id.as_deref())
     };
     for kind in [Kind::Native, Kind::Terminal] {
+        check()?;
         let directory = holders::directory(kind).map_err(account_switch_unavailable)?;
         for owner in holders::recovery_census(&directory, &proof.boot_id, kind)
             .map_err(account_switch_unavailable)?
         {
-            if Instant::now() >= deadline {
-                return Err(account_switch_unavailable(
-                    "Retained ownership census timed out; retry after exact recovery",
-                ));
-            }
+            check()?;
             if kind == Kind::Native && retired.get(&owner.terminal) == Some(&owner) {
                 continue;
             }
@@ -2333,13 +2336,10 @@ fn account_recovery_retained_discovery(
                     ));
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(account_switch_unavailable(
-                    "Retained ownership census exceeded its inspection deadline",
-                ));
-            }
+            check()?;
         }
     }
+    check()?;
     Ok(())
 }
 
@@ -2350,6 +2350,15 @@ fn recover_saved_account(
     replacement: Session,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
+    // One budget covers source options, lineage, durable and orphan ownership,
+    // then the final admission. Later census phases cannot renew this deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let cancelled = || crate::daemon::termination_requested();
+    let check = || {
+        retained_resume::account_recovery_census_check(deadline, &cancelled)
+            .map_err(account_switch_unavailable)
+    };
+    check()?;
     if replacement
         .launch
         .recipe
@@ -2372,11 +2381,13 @@ fn recover_saved_account(
         .terminal
         .as_ref()
         .and_then(|terminal| terminal.recovery_origin);
+    check()?;
     let members = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .recovery_lineage_members(source.id, root)
         .map_err(account_switch_unavailable)?;
+    check()?;
     let completed = saved_account_admission(
         &host.lock().unwrap_or_else(|p| p.into_inner()),
         &source,
@@ -2404,8 +2415,10 @@ fn recover_saved_account(
     } else {
         None
     };
-    let retired = retained_resume::account_recovery_census(host, &source, &members)
-        .map_err(account_switch_unavailable)?;
+    check()?;
+    let retired =
+        retained_resume::account_recovery_census(host, &source, &members, deadline, &cancelled)
+            .map_err(account_switch_unavailable)?;
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2422,7 +2435,17 @@ fn recover_saved_account(
             "The saved source has no authenticated completed owner or close receipt; restore and close its original before retrying",
         ));
     }
-    account_recovery_retained_discovery(&source, &replacement, &members, &retired, &proof)?;
+    check()?;
+    account_recovery_retained_discovery(
+        &source,
+        &replacement,
+        &members,
+        &retired,
+        &proof,
+        deadline,
+        &cancelled,
+    )?;
+    check()?;
     let context = Arc::new(
         chat::protocol::ExecutionContext::capture(&replacement.launch.recipe.working_directory)
             .map_err(account_switch_unavailable)?,
@@ -2430,6 +2453,7 @@ fn recover_saved_account(
     let reservation = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         saved_account_admission(&state, &source, &replacement, &members)?;
+        check()?;
         state.chat_spawning.insert(source.id, source.clone());
         AccountSwitchReservation {
             host: host.clone(),
@@ -2439,14 +2463,15 @@ fn recover_saved_account(
     // Saved recovery deliberately reads only the selected account's existing
     // history. A removed source home supplies neither a transcript nor authority.
     // start_with_execution performs current target/directory/duplicate admission.
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    check()?;
     registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
         // The exclusive control gate plus the completed admission census
         // above excludes live family members. No HostState lock or IO runs
         // under this registry transaction; a saved recovery never forks.
         .succeed(replacement.id, source.id, root, |_| false)
         .map_err(account_switch_unavailable)?;
+    drop(registry);
     drop(reservation);
     start_confirmed_account_recovery(
         host,

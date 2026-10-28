@@ -182,6 +182,21 @@ pub(super) fn inspect_resume_retirement(
     }
 }
 
+pub(super) fn account_recovery_census_check(
+    deadline: std::time::Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), String> {
+    if cancelled() {
+        return Err(
+            "Saved recovery ownership census was cancelled; no replacement was prepared".into(),
+        );
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("Saved recovery ownership census timed out; retry after exact recovery".into());
+    }
+    Ok(())
+}
+
 /// A saved account recovery changes the selected home, not the old actor's
 /// retirement evidence. Check the whole relevant durable roster without
 /// reopening the original home, which may have been explicitly removed.
@@ -191,7 +206,10 @@ pub(super) fn account_recovery_census(
     host: &SharedHost,
     source: &Session,
     members: &[crate::model::TerminalId],
+    deadline: std::time::Instant,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<std::collections::BTreeMap<crate::model::TerminalId, Record>, String> {
+    account_recovery_census_check(deadline, cancelled)?;
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -202,14 +220,17 @@ pub(super) fn account_recovery_census(
     let mut matched_source = false;
     let mut after = None;
     loop {
+        account_recovery_census_check(deadline, cancelled)?;
         let page = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .native_actor_ownerships(after, 128)?;
+        account_recovery_census_check(deadline, cancelled)?;
         if page.is_empty() {
             break;
         }
         for ownership in page {
+            account_recovery_census_check(deadline, cancelled)?;
             after = Some(ownership.actor());
             let issued = ownership.source();
             if !members.contains(&issued.id)
@@ -242,6 +263,7 @@ pub(super) fn account_recovery_census(
                 if retirement.is_pending() {
                     return Err("A relevant native actor retirement remains pending".into());
                 }
+                account_recovery_census_check(deadline, cancelled)?;
                 let verified = match Handle::inspect_retained_retirement(ownership.owner(), &proof)?
                 {
                     crate::chat::runtime::RetirementInspection::Verified(receipt) => receipt,
@@ -251,6 +273,7 @@ pub(super) fn account_recovery_census(
                         );
                     }
                 };
+                account_recovery_census_check(deadline, cancelled)?;
                 let receipt = verified.receipt();
                 let evidence = Evidence {
                     actor: receipt.identity.instance,
@@ -297,9 +320,11 @@ pub(super) fn account_recovery_census(
             if issued.id == source.id && std::mem::replace(&mut matched_source, true) {
                 return Err("The saved source has ambiguous retired native actors".into());
             }
+            account_recovery_census_check(deadline, cancelled)?;
             stopped.insert(issued.id, ownership.owner().clone());
         }
     }
+    account_recovery_census_check(deadline, cancelled)?;
     Ok(stopped)
 }
 
@@ -499,6 +524,60 @@ mod tests {
         model::{HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn saved_recovery_census_refuses_expired_or_cancelled_before_registry_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("census-budget-fixture"),
+            host_incarnation: HostIncarnation::new("current"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        };
+        // No execution registry is installed: reaching any roster work would
+        // report its absence instead of the deadline/cancellation refusal.
+        let host = std::sync::Arc::new(super::super::super::HostLock::new(
+            super::super::super::HostState::new(proof.clone()),
+        ));
+        let source = Session {
+            id: TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: directory.path().into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+            proof: Some(proof),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let expired = account_recovery_census(
+            &host,
+            &source,
+            &[source.id],
+            std::time::Instant::now(),
+            &|| false,
+        )
+        .unwrap_err();
+        assert!(expired.contains("timed out"), "{expired}");
+        let cancelled = account_recovery_census(
+            &host,
+            &source,
+            &[source.id],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        let state = host.lock().unwrap();
+        assert!(state.chats.is_empty());
+        assert!(state.chat_spawning.is_empty());
+    }
 
     #[test]
     fn disk_resume_joins_exact_store_retirement_to_private_issued_aliases() {
