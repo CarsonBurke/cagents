@@ -683,9 +683,6 @@ impl State {
                         generation,
                         self.operation.as_ref().map(|op| op.phase),
                         current,
-                        // Disclosure moves the consent controls. Retire any
-                        // held native input before mounting their new geometry.
-                        self.details_open,
                     ),
                     content,
                 ))
@@ -704,7 +701,7 @@ impl State {
         current: bool,
     ) -> Element<'a, Action> {
         let generation = self.generation;
-        let mut content = widget::column::with_children(vec![
+        let mut header = widget::column::with_children(vec![
             design::heading(format!(
                 "Remove worktree · {}",
                 bounded(&operation.subject.label)
@@ -713,7 +710,7 @@ impl State {
             design::caption(bounded(&crate::app::display_path(&operation.subject.path))).into(),
         ])
         .spacing(space::XS);
-        content = content.push(
+        header = header.push(
             button::quiet(if self.details_open {
                 "Hide full details"
             } else {
@@ -724,17 +721,18 @@ impl State {
                 open: !self.details_open,
             }),
         );
+        let mut details = widget::column::with_capacity(8).spacing(space::XS);
         if self.details_open {
-            content = content
+            details = details
                 .push(design::heading("Target path"))
                 .push(selectable_detail(operation.subject.path.to_string_lossy()));
             if let Some(branch) = &operation.subject.branch {
-                content = content
+                details = details
                     .push(design::heading("Branch"))
                     .push(selectable_detail(branch.as_str()));
             }
             if let Some(message) = &operation.message {
-                content = content
+                details = details
                     .push(design::heading("Message"))
                     .push(selectable_detail(message.as_str()));
             }
@@ -744,11 +742,15 @@ impl State {
                 .and_then(|submitted| submitted.diagnostic.as_deref())
                 .filter(|original| Some(*original) != operation.message.as_deref())
             {
-                content = content
+                details = details
                     .push(design::heading("Original removal diagnostic"))
                     .push(selectable_detail(original));
             }
         }
+        // Keep the disclosure's native state and focus stable when its panel
+        // opens. The following controls have separate geometry ownership.
+        header = header.push(details);
+        let mut content = widget::column::with_capacity(8).spacing(space::XS);
         if self.viewing_unresolved.is_some() {
             content = content.push(design::body("Read-only original. Inspection cannot confirm or settle the original removal. Its full unresolved record remains kept for the current application lifetime."));
         }
@@ -913,7 +915,17 @@ impl State {
                 .push(button::quiet("Close review").on_press(Action::Dismiss { generation }));
         }
         content = content.push(actions);
-        content.into()
+        widget::column::with_children(vec![
+            header.into(),
+            // Disclosure moves these consent controls. Retire held native
+            // input before mounting their new geometry, retaining the header.
+            crate::ui_controls::owned(
+                (generation, operation.phase, current, self.details_open),
+                content,
+            ),
+        ])
+        .spacing(space::XS)
+        .into()
     }
 }
 
@@ -1851,7 +1863,9 @@ mod tests {
         let mut state = State::default();
         let prefix = format!("/work/{}", "common-segment/".repeat(15));
         let first = subject(&format!("{prefix}first"));
-        let second = subject(&format!("{prefix}second"));
+        let mut second = subject(&format!("{prefix}second"));
+        let branch = format!("feature/{}distinct-branch", "long-segment/".repeat(15));
+        second.branch = Some(branch.clone());
         assert_eq!(
             bounded(first.path.to_str().unwrap()),
             bounded(second.path.to_str().unwrap()),
@@ -1914,6 +1928,7 @@ mod tests {
                 .iter()
                 .any(|text| text == first.path.to_str().unwrap())
         );
+        assert!(texts.iter().any(|text| text == &branch));
         let Some(Effect::Remove {
             generation,
             request,
@@ -1941,6 +1956,14 @@ mod tests {
             },
             true,
         );
+        state.update(
+            Action::Details {
+                generation: state.generation(),
+                open: true,
+            },
+            true,
+        );
+        assert!(outline(&state).iter().any(|text| text == &diagnostic));
         let id = keep_unresolved(&mut state);
         return_unresolved(&mut state, id);
         state.update(

@@ -3697,9 +3697,18 @@ mod tests {
         cache: iced::runtime::user_interface::Cache,
         renderer: &mut cosmic::Renderer,
     ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+        full_removal_ui_at_width(state, 1600.0, cache, renderer)
+    }
+
+    fn full_removal_ui_at_width<'a>(
+        state: &'a State,
+        width: f32,
+        cache: iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
         let mut ui = iced::runtime::UserInterface::build(
-            state.layout_view(1600.0),
-            iced::Size::new(1600.0, 900.0),
+            state.layout_view(width),
+            iced::Size::new(width, 900.0),
             cache,
             renderer,
         );
@@ -3984,6 +3993,229 @@ mod tests {
             assert_eq!(state.removal.subject(), Some(&other_subject));
             assert!(
                 matches!(state.update(RemovalAction::Confirm { generation: state.removal.generation() }.into()), Some(Effect::Removal(RemovalEffect::Remove { subject, .. })) if subject == other_subject)
+            );
+        }
+    }
+
+    #[test]
+    fn removal_disclosure_retires_cached_confirmation_presses() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        for width in [760.0, 1600.0] {
+            // The unchanged case proves this cache and hit target can retain
+            // a held press; opening and closing must retire that same input.
+            for (initial_open, next_open) in [(false, false), (false, true), (true, false)] {
+                let path = format!("/work/{}target", "common-segment/".repeat(18));
+                let original = removable(&path);
+                let mut state = State::default();
+                connected(&mut state, 1, board(vec![original.clone()]));
+                let subject = removal_review(&mut state, &original);
+                let generation = state.removal.generation();
+                if initial_open {
+                    assert!(
+                        state
+                            .update(
+                                RemovalAction::Details {
+                                    generation,
+                                    open: true
+                                }
+                                .into()
+                            )
+                            .is_none()
+                    );
+                }
+                let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+                let mut ui = full_removal_ui_at_width(&state, width, Cache::new(), &mut renderer);
+                let point = unresolved_control_point(&mut ui, &mut renderer, "Remove worktree");
+                assert!(
+                    retained_work_events(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonPressed(Button::Left)],
+                    )
+                    .is_empty()
+                );
+                let cache = ui.into_cache();
+                assert!(
+                    state
+                        .update(
+                            RemovalAction::Details {
+                                generation,
+                                open: next_open
+                            }
+                            .into()
+                        )
+                        .is_none(),
+                    "disclosure cannot dispatch work"
+                );
+                assert_eq!(state.removal.generation(), generation);
+                assert_eq!(state.removal.subject(), Some(&subject));
+                let mut ui = full_removal_ui_at_width(&state, width, cache, &mut renderer);
+                // Release over the replacement's actual visible location. A
+                // release at the old location could pass only because it misses.
+                let point = unresolved_control_point(&mut ui, &mut renderer, "Remove worktree");
+                let release = retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)],
+                );
+                let accepted = if initial_open != next_open {
+                    assert!(
+                        release.is_empty(),
+                        "held confirmation crossed {initial_open} -> {next_open} at {width}: {release:?}"
+                    );
+                    click_work(&mut ui, &mut renderer, point)
+                } else {
+                    release
+                };
+                drop(ui);
+                assert!(
+                    matches!(accepted.as_slice(), [Action::Removal(action)] if matches!(action.as_ref(), RemovalAction::Confirm { generation: g } if *g == generation)),
+                    "fresh confirmation after {initial_open} -> {next_open} at {width}: {accepted:?}"
+                );
+                let Some(Effect::Removal(RemovalEffect::Remove {
+                    subject: removed,
+                    backend,
+                    request,
+                    ..
+                })) = state.update(accepted.into_iter().next().unwrap())
+                else {
+                    panic!("capture the removal effect without executing it")
+                };
+                assert_eq!(removed, subject);
+                assert_eq!(backend, prepared_removal(&subject).backend);
+                assert_eq!(
+                    request,
+                    crate::work::Removal {
+                        scope: crate::work::Scope::Project(subject.card.project.clone()),
+                        item: path,
+                        token: "reviewed".into(),
+                        keep: crate::work::Keep::Nothing,
+                        delete_branch: false,
+                    },
+                    "disclosure preserves the exact reviewed consent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn removal_disclosure_keeps_keyboard_focus_across_cached_expansion_and_collapse() {
+        use iced::advanced::widget::{Operation, operation};
+        use iced::keyboard::{self, key};
+        use iced::runtime::user_interface::Cache;
+
+        fn disclosure_focus(
+            ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+            renderer: &cosmic::Renderer,
+            label: &str,
+            set_focus: bool,
+        ) -> bool {
+            struct Focus {
+                bounds: iced::Rectangle,
+                set_focus: bool,
+                matched: usize,
+                focused: bool,
+            }
+            impl Operation for Focus {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if bounds == self.bounds {
+                        self.matched += 1;
+                        if self.set_focus {
+                            state.focus();
+                        }
+                        self.focused = state.is_focused();
+                    } else if self.set_focus {
+                        state.unfocus();
+                    }
+                }
+            }
+            let mut focus = Focus {
+                bounds: popup_button_bounds(ui, renderer, label),
+                set_focus,
+                matched: 0,
+                focused: false,
+            };
+            ui.operate(renderer, &mut focus);
+            assert_eq!(focus.matched, 1, "one actual disclosure button");
+            focus.focused
+        }
+
+        for width in [760.0, 1600.0] {
+            let original = removable(&format!("/work/{}target", "common-segment/".repeat(18)));
+            let mut state = State::default();
+            connected(&mut state, 1, board(vec![original.clone()]));
+            let subject = removal_review(&mut state, &original);
+            let generation = state.removal.generation();
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = full_removal_ui_at_width(&state, width, Cache::new(), &mut renderer);
+            assert!(disclosure_focus(
+                &mut ui,
+                &renderer,
+                "Show full details",
+                true
+            ));
+            let mut cache = ui.into_cache();
+            for open in [true, false] {
+                let mut ui = full_removal_ui_at_width(&state, width, cache, &mut renderer);
+                let label = if open {
+                    "Show full details"
+                } else {
+                    "Hide full details"
+                };
+                assert!(
+                    disclosure_focus(&mut ui, &renderer, label, false),
+                    "disclosure must retain keyboard focus before Enter at {width}"
+                );
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(key::Named::Enter),
+                            modified_key: keyboard::Key::Named(key::Named::Enter),
+                            physical_key: key::Physical::Code(key::Code::Enter),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::default(),
+                            text: None,
+                            repeat: false,
+                        }),
+                        iced::Event::Keyboard(keyboard::Event::KeyReleased {
+                            key: keyboard::Key::Named(key::Named::Enter),
+                            modified_key: keyboard::Key::Named(key::Named::Enter),
+                            physical_key: key::Physical::Code(key::Code::Enter),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::default(),
+                        }),
+                    ],
+                    iced::mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut messages,
+                );
+                cache = ui.into_cache();
+                assert!(
+                    matches!(messages.as_slice(), [Action::Removal(action)] if matches!(action.as_ref(), RemovalAction::Details { generation: g, open: value } if *g == generation && *value == open)),
+                    "Enter must only toggle disclosure at {width}: {messages:?}"
+                );
+                assert!(state.update(messages.into_iter().next().unwrap()).is_none());
+                assert_eq!(state.removal.generation(), generation);
+                assert_eq!(state.removal.subject(), Some(&subject));
+            }
+            let mut ui = full_removal_ui_at_width(&state, width, cache, &mut renderer);
+            assert!(
+                disclosure_focus(&mut ui, &renderer, "Show full details", false),
+                "collapse must also retain disclosure keyboard focus at {width}"
             );
         }
     }
