@@ -176,6 +176,13 @@ fn search_with_limits(
     };
     // Like OverrideBuilder, positive globs include and negated globs exclude.
     let has_includes = overrides.num_ignores() > 0;
+    if overrides.matched(root, true).invert().is_ignore() {
+        publish(Progress::Finished {
+            capped: false,
+            skipped: 0,
+        });
+        return;
+    }
     let guarded_root = match crate::fs_safety::Root::open(root) {
         Ok(root) => root,
         Err(error) if traversal::descriptor_exhausted(&error) => {
@@ -748,6 +755,8 @@ mod tests {
             [PathBuf::from("src/child/deep.rs")]
         );
         assert_eq!(paths("**/", "generated/", false).len(), 4);
+        assert_eq!(paths("/", "", false).len(), 6);
+        assert!(paths("*.rs", "/", false).is_empty());
         assert_eq!(paths("src/,src/child", "", false), paths("src/", "", false));
         for path in [
             "looks_like.rs/notes.txt",
