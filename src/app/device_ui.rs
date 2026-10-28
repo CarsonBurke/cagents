@@ -2152,6 +2152,100 @@ mod tests {
     }
 
     #[test]
+    fn completed_image_preview_cannot_take_keys_from_the_pending_window_close() {
+        use iced::futures::{FutureExt, StreamExt};
+
+        for dispatch in ["escape", "captured escape", "cancel dialog"] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            drop(app.update_device(Action::OpenFile {
+                path: "/fixture/image.png".into(),
+                fragment: None,
+            }));
+            assert!(app.device_ui.busy && app.device_ui.image.is_some());
+            // Keep a lower recovery too: generic cancellation must follow
+            // the same visible owner as the raw keyboard subscription.
+            app.daemon_health_ui.confirmation = true;
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            drop(app.update(Message::WindowCloseRequested(window)));
+            assert_eq!(app.transient_work_close, Some(window));
+
+            // Deliver the real image-read reducer without polling file I/O.
+            // The close prompt stays mounted while the completed preview
+            // replaces Device files with a lower image viewer.
+            let generation = app.device_ui.generation;
+            drop(app.update_device(Action::ImageLoaded {
+                generation,
+                result: Ok(iced::widget::image::Handle::from_rgba(
+                    1,
+                    1,
+                    vec![0, 0, 0, 255],
+                )),
+            }));
+            assert!(!app.device_ui.open && !app.device_ui.busy);
+            assert!(app.chat_ui.image_viewer.is_some());
+            assert_eq!(app.transient_work_close, Some(window));
+
+            let task = if dispatch == "cancel dialog" {
+                app.update(Message::CancelDialog)
+            } else {
+                device_key(
+                    &mut app,
+                    keyboard::key::Named::Escape,
+                    dispatch == "captured escape",
+                )
+            };
+            assert!(
+                app.chat_ui.image_viewer.is_some() && app.daemon_health_ui.confirmation,
+                "{dispatch} must leave both covered dialogs intact"
+            );
+            let mut effects = iced::runtime::task::into_stream(task)
+                .expect("the visible close prompt receives cancellation");
+            let Some(Some(iced::runtime::Action::Output(cosmic::Action::App(message)))) =
+                effects.next().now_or_never()
+            else {
+                panic!("{dispatch} must immediately cancel the visible prompt");
+            };
+            assert!(matches!(message, Message::CancelTransientWorkClose));
+            assert!(matches!(effects.next().now_or_never(), Some(None)));
+            drop(app.update(message));
+            assert!(app.transient_work_close.is_none());
+            assert!(app.chat_ui.image_viewer.is_some() && app.daemon_health_ui.confirmation);
+        }
+    }
+
+    #[test]
+    fn draft_confirmation_keeps_its_keyboard_owner_above_a_retained_preview_and_recovery() {
+        for cancel_dialog in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.automation_ui.update(crate::automation_ui::Action::New);
+            app.automation_ui
+                .update(crate::automation_ui::Action::Field(
+                    crate::automation_ui::Field::Name,
+                    "Keep the edited automation".into(),
+                ));
+            drop(app.update(Message::AutomationUi(
+                crate::automation_ui::Action::CancelEdit,
+            )));
+            assert!(app.automation_ui.draft_dialog_open());
+            app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                "/fixture/retained.png".into(),
+                None,
+                iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            ));
+            app.daemon_health_ui.confirmation = true;
+            drop(if cancel_dialog {
+                app.update(Message::CancelDialog)
+            } else {
+                device_key(&mut app, keyboard::key::Named::Escape, false)
+            });
+            assert!(!app.automation_ui.draft_dialog_open());
+            assert!(app.automation_ui.draft_dirty());
+            assert!(app.chat_ui.image_viewer.is_some() && app.daemon_health_ui.confirmation);
+        }
+    }
+
+    #[test]
     fn device_files_close_restores_workspace_focus_only_when_exposed() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;

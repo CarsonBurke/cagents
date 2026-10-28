@@ -12107,6 +12107,12 @@ impl Cagents {
         if self.automation_approval_open() {
             return self.cancel_automation_approval();
         }
+        if self.transient_work_close.is_some() {
+            return cosmic::task::message(Message::CancelTransientWorkClose);
+        }
+        if let Some(action) = self.automation_ui.keep_draft_action() {
+            return self.update_automation_ui(action);
+        }
         if self.device_dialog_on_top() {
             return self.update_device(device_ui::Action::Close);
         }
@@ -12115,12 +12121,6 @@ impl Cagents {
         }
         if self.daemon_health_ui.confirmation {
             return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
-        }
-        if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
-        }
-        if let Some(action) = self.automation_ui.keep_draft_action() {
-            return self.update_automation_ui(action);
         }
         if self.device_ui.open {
             return self.update_device(device_ui::Action::Close);
@@ -16915,13 +16915,30 @@ impl Application for Cagents {
                 {
                     chat_ui::invalidate_copy_intent();
                 }
+                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                    self.keyboard_modifiers = *modifiers;
+                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
+                // A completion can expose an image or recovery below the
+                // pending-work prompt. Route every key to the mounted owner
+                // before any of those retained surfaces can answer it.
+                if self.transient_work_close.is_some() {
+                    return if is_escape_press(&event) {
+                        cosmic::task::message(Message::CancelTransientWorkClose)
+                    } else {
+                        Task::none()
+                    };
+                }
+                if self.automation_ui.draft_dialog_open() {
+                    return if is_escape_press(&event) {
+                        self.cancel_form_dialog()
+                    } else {
+                        Task::none()
+                    };
+                }
                 if self.device_dialog_on_top() {
-                    if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                        self.keyboard_modifiers = *modifiers;
-                    }
                     // Native device fields have already received the key. Do
                     // not let a retained recovery or Resume dialog answer it.
                     return if is_escape_press(&event) {
@@ -16939,9 +16956,6 @@ impl Application for Cagents {
                 }
                 if let Some(task) = self.daemon_health_key_event(&event, captured) {
                     return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
                 }
                 if self.chat_ui.image_viewer.is_some() {
                     if let keyboard::Event::KeyPressed { key, .. } = &event {
@@ -17079,12 +17093,6 @@ impl Application for Cagents {
                     }
                 }
                 if is_escape_press(&event) && !captured {
-                    if self.transient_work_close.is_some() {
-                        return cosmic::task::message(Message::CancelTransientWorkClose);
-                    }
-                    if let Some(action) = self.automation_ui.keep_draft_action() {
-                        return self.update_automation_ui(action);
-                    }
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
                             .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
