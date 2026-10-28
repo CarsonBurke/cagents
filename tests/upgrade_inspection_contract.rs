@@ -272,6 +272,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
                         code: ProtocolErrorCode::PermissionDenied,
                         ref message,
                         retryable: false,
+                        ..
                     }) if message == "This agent session authority is no longer registered"
                 ),
                 "unrelated private daemon must precisely refuse inherited delegation"
