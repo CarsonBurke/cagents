@@ -45,7 +45,10 @@ impl Context {
         Self {
             authority: Authority::from_environment(),
             remote: crate::device::is_remote(),
-            no_start: crate::control::daemon_autostart_disabled(),
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
         }
     }
 
