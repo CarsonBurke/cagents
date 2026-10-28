@@ -236,15 +236,27 @@ fn frozen_127_inventory_refuses_changed_identity_errors_and_unknown_layouts() {
     let mut truncated = original.clone();
     truncated.pop();
     let cases = [
-        version,
-        request_id(original.clone(), 3),
-        replace(original.clone(), b"actor", b"other"),
-        trailing(original),
-        truncated,
-        request_id(frozen!("error-permission-denied.bin").to_vec(), 2),
-        frozen!("event-chat-changed.bin").to_vec(),
+        (version, "Source inspection ownership or protocol changed"),
+        (
+            request_id(original.clone(), 3),
+            "Source inspection request or event identity changed",
+        ),
+        (
+            replace(original.clone(), b"actor", b"other"),
+            "Source inspection ownership or protocol changed",
+        ),
+        (trailing(original), "Source response has an unknown layout"),
+        (truncated, "Truncated source response"),
+        (
+            request_id(frozen!("error-permission-denied.bin").to_vec(), 2),
+            "Unsupported source response",
+        ),
+        (
+            frozen!("event-chat-changed.bin").to_vec(),
+            "Unsupported source response",
+        ),
     ];
-    for response in cases {
+    for (response, expected) in cases {
         let (stream, mut peer) = pair();
         let worker = std::thread::spawn(move || {
             expect_request(&mut peer, frozen!("request-02-chat-list.bin"));
@@ -252,6 +264,7 @@ fn frozen_127_inventory_refuses_changed_identity_errors_and_unknown_layouts() {
         });
         let mut client = client(stream, 2);
         let error = client.list().unwrap_err();
+        assert_eq!(error, expected, "a later I/O failure is not this refusal");
         assert!(
             !error.contains("legacy source refused"),
             "source details stay redacted"
@@ -270,14 +283,29 @@ fn frozen_127_history_refuses_changed_owner_event_error_and_trailing_payload() {
     truncated.pop();
     let mut foreign_chat = frozen!("event-chat-changed.bin").to_vec();
     *foreign_chat.last_mut().unwrap() ^= 1;
-    for response in [
-        version,
-        request_id(original.clone(), 6),
-        replace(original.clone(), b"actor", b"other"),
-        trailing(original),
-        truncated,
-        frozen!("error-permission-denied.bin").to_vec(),
-        foreign_chat,
+    for (response, expected) in [
+        (version, "Source inspection ownership or protocol changed"),
+        (
+            request_id(original.clone(), 6),
+            "Source inspection request or event identity changed",
+        ),
+        (
+            replace(original.clone(), b"actor", b"other"),
+            "Source inspection ownership or protocol changed",
+        ),
+        (
+            trailing(original),
+            "Source retained-owner response has an unknown layout",
+        ),
+        (truncated, "Truncated source response"),
+        (
+            frozen!("error-permission-denied.bin").to_vec(),
+            "Unsupported legacy retained-owner response",
+        ),
+        (
+            foreign_chat,
+            "Source inspection request or event identity changed",
+        ),
     ] {
         let (stream, mut peer) = pair();
         let worker = std::thread::spawn(move || {
@@ -287,6 +315,7 @@ fn frozen_127_history_refuses_changed_owner_event_error_and_trailing_payload() {
         let mut client = client(stream, 5);
         let original = saved();
         let error = client.inspect_saved_history(&original).unwrap_err();
+        assert_eq!(error, expected, "a later I/O failure is not this refusal");
         assert!(
             !error.contains("legacy source refused"),
             "source details stay redacted"
