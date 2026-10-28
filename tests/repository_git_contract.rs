@@ -4478,4 +4478,109 @@ fn successful_push_refuses_a_changed_source_oid_and_preserves_first_publish() {
             after.as_str()
         );
     }
+
+    // A successful push can also be followed by external deletion. A tag at
+    // the same OID is not evidence that the captured source branch survived.
+    struct RemoveSourceAfterPush {
+        worktree: PathBuf,
+        source: Oid,
+    }
+    impl ProcessExecutor for RemoveSourceAfterPush {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if command.arguments.iter().any(|argument| argument == "push") {
+                assert!(output.success, "the real first-publish push succeeds");
+                for arguments in [
+                    vec![
+                        "update-ref",
+                        "refs/tags/refs/heads/main",
+                        self.source.as_str(),
+                    ],
+                    vec!["update-ref", "-d", "refs/heads/main", self.source.as_str()],
+                ] {
+                    let update = CommandSpec::new(&command.program)
+                        .cwd(&self.worktree)
+                        .args(arguments);
+                    let changed = SystemProcessExecutor.execute(&isolate(update), cancellation)?;
+                    assert!(changed.success);
+                }
+            }
+            Ok(output)
+        }
+    }
+    let fixture = Fixture::new().expect("Git remains available after the source-race controls");
+    let first = publish_main(&fixture);
+    fixture.write("a.txt", b"source committed before first publish\n");
+    fixture.git_in_work(&["add", "a.txt"]);
+    let source = fixture.commit("source later removed externally");
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(RemoveSourceAfterPush {
+            worktree: fixture.work(),
+            source: source.clone(),
+        }),
+    );
+    let outcome = service
+        .push(
+            &PushRequest {
+                worktree: fixture.work(),
+                branch: ValidatedBranchName::parse("main").unwrap(),
+                target: PushTarget::SetUpstream {
+                    remote: "origin".into(),
+                    remote_branch: ValidatedBranchName::parse("published-after-removal").unwrap(),
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            PushOutcome::OutcomeUnknown {
+                failure: MutationFailure::Reconciliation { .. }
+            }
+        ),
+        "a same-OID tag cannot confirm a deleted branch: {outcome:?}"
+    );
+    assert_eq!(
+        bare_refs(&fixture),
+        ["refs/heads/main", "refs/heads/published-after-removal"]
+    );
+    assert_eq!(remote_oid(&fixture, "refs/heads/main"), first);
+    assert_eq!(
+        remote_oid(&fixture, "refs/heads/published-after-removal"),
+        source
+    );
+    assert_eq!(fixture.text(&["config", "branch.main.remote"]), "origin");
+    assert_eq!(
+        fixture.text(&["config", "branch.main.merge"]),
+        "refs/heads/published-after-removal"
+    );
+    assert_eq!(
+        fixture
+            .run_failing_status(
+                &fixture.work(),
+                &["show-ref", "--verify", "--quiet", "--", "refs/heads/main"]
+            )
+            .0,
+        Some(1)
+    );
+    assert_eq!(
+        fixture.text(&[
+            "show-ref",
+            "--verify",
+            "--hash",
+            "--",
+            "refs/tags/refs/heads/main"
+        ]),
+        source.as_str()
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("a.txt")).unwrap(),
+        b"source committed before first publish\n"
+    );
 }
