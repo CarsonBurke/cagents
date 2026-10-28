@@ -2358,15 +2358,18 @@ where
         return ExitCode::FAILURE;
     }
     // Preserve the original caller before operational recovery or delegation
-    // to a staged CLI whose Automation/Work transport may predate this policy.
-    let service_context = matches!(
+    // to a staged CLI whose caller-scoped service transport may predate this policy.
+    let service_context = (matches!(
         &cli.command,
         TopCommand::Automation { .. }
             | TopCommand::Work { .. }
             | TopCommand::Channel {
                 command: ChannelCommand::Work { .. }
             }
-    )
+    ) || matches!(
+        &cli.command,
+        TopCommand::Agent { command } if !matches!(command, AgentCommand::Console { .. })
+    ))
     .then(ServiceRequestContext::capture);
     if let Some(context) = &service_context
         && let Err(error) = context.admit_remote()
@@ -2538,7 +2541,10 @@ fn execute_with_model_context(
             Some(context) => work::execute_with_context(command, &context),
             None => work::execute(command),
         },
-        TopCommand::Agent { command } => agents::execute(command),
+        TopCommand::Agent { command } => match service_context {
+            Some(context) => agents::execute_with_context(command, &context),
+            None => agents::execute(command),
+        },
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
@@ -3541,8 +3547,9 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
-/// Automation, Workboard and channel work share endpoint selection, while
+/// Agents, Automation, Workboard and channel work share endpoint selection, while
 /// retaining their business-envelope and connection-authentication contracts.
+#[derive(Clone)]
 struct ServiceRequestContext {
     authority: Authority,
     remote: bool,
@@ -3564,7 +3571,7 @@ impl ServiceRequestContext {
         if self.scoped() && self.remote {
             return Err(AppError::new(
                 "permission_denied",
-                "Automation and work commands from an agent session require your own terminal on the remote device",
+                "Agent, automation and work commands from an agent session require your own terminal on the remote device",
             ));
         }
         Ok(())
