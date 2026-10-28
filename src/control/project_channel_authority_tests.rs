@@ -1,6 +1,8 @@
 //! Actual public parsing and legacy dispatch over a private framed Unix peer.
 //! No Host policy, staged executable, provider or remote transport is simulated
 //! as a successful production integration; these tests pin the caller boundary.
+mod remote_entry;
+
 use super::*;
 use crate::{
     model::{BootId, CardId, CardKind, HostIncarnation, HostSessionId, ProjectKind},
