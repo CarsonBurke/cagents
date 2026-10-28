@@ -31,8 +31,12 @@ session = argument("--session-id") or argument("--resume") or str(uuid.uuid4())
 for line in sys.stdin:
     frame = json.loads(line)
     if frame.get("type") == "control_request":
-        send({"type": "control_response", "response": {
-            "subtype": "success", "request_id": frame["request_id"], "response": {}}})
+        response = {"request_id": frame["request_id"]}
+        if frame.get("request", {}).get("subtype") == "initialize":
+            response.update(subtype="success", response={})
+        else:
+            response.update(subtype="error", error="Offline fixture supports initialization only")
+        send({"type": "control_response", "response": response})
     elif frame.get("type") == "user":
         if "noise-limit" in json.dumps(frame.get("message", {})):
             for index in range(8):
