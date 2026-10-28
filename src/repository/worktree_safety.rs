@@ -4,25 +4,7 @@ use std::collections::HashSet;
 
 const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
 
-fn require_complete_inventory(output: &ProcessOutput) -> Result<(), RepositoryError> {
-    if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let line = stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("Git inventory warning");
-        let detail: String = line.chars().take(FAILURE_DETAIL_LIMIT).collect();
-        return Err(RepositoryError::InvalidOutput {
-            field: "worktree_safety",
-            reason: format!(
-                "Git could not inspect every file; worktree was kept: {}",
-                detail
-            ),
-        });
-    }
-    Ok(())
-}
+use super::complete_inventory::require_complete_inventory;
 
 pub fn default_disposable_ignored_directories() -> Vec<String> {
     [
@@ -82,18 +64,6 @@ impl WorktreeSafetySnapshot {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    /// Safety decisions require a complete census, even when Git returns
-    /// success while warning that a directory could not be read.
-    pub(crate) fn status_for_removal(
-        &self,
-        worktree: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<StatusSnapshot, RepositoryError> {
-        let output = self.run_checked(&self.status_command(worktree), cancellation)?;
-        require_complete_inventory(&output)?;
-        invalid_output(parse_status(&output.stdout), output)
-    }
-
     pub fn disposable_ignored_directories(
         &self,
         worktree: &Path,

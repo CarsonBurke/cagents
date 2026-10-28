@@ -175,7 +175,7 @@ fn paint(weight: Weight, status: Status, theme: &cosmic::Theme) -> Paint {
         return Paint {
             fill: (weight != Weight::Quiet).then(|| lift(0.05)),
             edge: None,
-            ink: design::mix(surface, on, 0.42),
+            ink: design::disabled_color(theme),
         };
     }
     let filled = |component: &cosmic::cosmic_theme::Component| Paint {

@@ -157,8 +157,8 @@ where
     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
 
     let instance = Box::pin(run_instance::<P>(
-        program,
         runtime,
+        program,
         proxy.clone(),
         boot_receiver,
         event_receiver,
@@ -791,9 +791,11 @@ enum Control {
     StartDnd,
 }
 
+// Parameters drop in reverse order. Drop the program and its cancellation
+// guards before the runtime waits for their blocking tasks.
 async fn run_instance<P>(
-    mut program: program::Instance<P>,
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
+    mut program: program::Instance<P>,
     mut proxy: Proxy<P::Message>,
     boot: oneshot::Receiver<()>,
     mut event_receiver: mpsc::UnboundedReceiver<Event<P::Message>>,

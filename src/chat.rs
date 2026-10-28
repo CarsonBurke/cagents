@@ -5,6 +5,8 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod failure;
+pub mod notification;
 pub mod presentation;
 pub mod pricing;
 
@@ -12,7 +14,9 @@ pub mod pricing;
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod claude_metadata;
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 pub mod client;
 #[cfg(feature = "host")]
 pub(crate) mod native_holder;
@@ -22,6 +26,12 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+
+/// Whether answering a request with `action` turns its work down rather than
+/// authorizing it.
+pub(crate) fn declines(action: &str) -> bool {
+    matches!(action, "deny" | "decline" | "reject" | "cancel" | "abort")
+}
 
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
@@ -315,6 +325,9 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon has no free resident chat slots. Retrying preserves this
+    /// conversation; capacity must become available before it can start.
+    Capacity,
     /// The saved conversation cannot be reached by any retry. Only a new
     /// conversation in the same place is left, and the reader has to ask for
     /// it rather than find one started on their behalf.
@@ -361,10 +374,79 @@ impl From<&str> for StartFailure {
     }
 }
 
+/// A cagents-owned immutable image identity. The UUID receipt is authority;
+/// the device-wide number is only its stable, human-readable label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageReference {
+    pub id: uuid::Uuid,
+    pub number: u64,
+    pub device: uuid::Uuid,
+    pub name: String,
+    pub sha256: String,
+    pub extension: String,
+}
+
+impl ImageReference {
+    pub fn label(&self) -> String {
+        format!("Image {}", self.number)
+    }
+
+    pub fn token(&self) -> String {
+        format!("[{}]", self.label())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_nil() || self.device.is_nil() || self.number == 0 {
+            return Err("The image reference has no valid identity.".into());
+        }
+        if !matches!(self.extension.as_str(), "png" | "jpg" | "gif" | "webp")
+            || self.name.len() > 256
+            || self.name.chars().any(char::is_control)
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("The image reference metadata is invalid.".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
+    /// Absent on legacy provider files and non-image attachments. Legacy text
+    /// that happens to say `[Image N]` never manufactures an image reference.
+    #[serde(default)]
+    pub reference: Option<ImageReference>,
 }
+
+impl Attachment {
+    pub fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            reference: None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.reference
+            .as_ref()
+            .map(ImageReference::label)
+            .unwrap_or_else(|| {
+                self.path
+                    .file_name()
+                    .unwrap_or(self.path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+    }
+}
+
+pub mod attachment_assets;
 
 /// The file extensions every provider's image input recognises.
 pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -479,6 +561,20 @@ pub enum NativeContinuity {
     Durable {
         provider_version: String,
     },
+    /// The exact Claude reducer, Store and pipes remain in an authenticated
+    /// helper, including before the provider reports a conversation ID.
+    RetainedClaudeActor {
+        protocol: u32,
+    },
+}
+
+impl NativeContinuity {
+    pub fn retains_provider(&self) -> bool {
+        matches!(
+            self,
+            Self::Durable { .. } | Self::RetainedClaudeActor { .. }
+        )
+    }
 }
 
 /// Account recovery changes only account selection. It never changes the
@@ -534,26 +630,35 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
         return false;
     };
+    let unnamed_retained = source.has_unnamed_retained_claude_actor()
+        && replacement.has_unnamed_retained_claude_actor();
     if !old.is_complete()
         || !new.is_complete()
         || old == new
         || source.id != replacement.id
         || source.launch.provider != replacement.launch.provider
+        || source.launch.session_id != replacement.launch.session_id
+        || (matches!(
+            source.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ) && old.boot_id != new.boot_id)
         || !upgrade_recipe_matches(source, replacement)
         || source.owned_codex_listener != replacement.owned_codex_listener
         || (source.native_continuity != replacement.native_continuity
             && !matches!(source.native_continuity, NativeContinuity::ReconnectOnly))
         || !replacement.has_valid_native_continuity()
-        || !source
-            .launch
-            .session_id
-            .as_ref()
-            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
-        || !replacement
-            .launch
-            .session_id
-            .as_ref()
-            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+        || (!unnamed_retained
+            && !source
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty() && id.len() <= 1024))
+        || (!unnamed_retained
+            && !replacement
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty() && id.len() <= 1024))
     {
         return false;
     }
@@ -566,6 +671,46 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         }
         _ => false,
     }
+}
+
+/// A formerly hosted pane may never have observed its first provider identity.
+/// This narrow transition is usable only after authenticated upgrade resolution,
+/// exact attachment and snapshot confirmation, followed by a writer receipt.
+/// It does not authorize an ordinary snapshot to change saved ownership.
+pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> bool {
+    if source.launch.session_id.is_some()
+        || (matches!(
+            replacement.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ) && !source.has_unnamed_retained_claude_actor())
+        || source.launch.recipe != replacement.launch.recipe
+        || !source.has_valid_native_continuity()
+        || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
+        || !source
+            .proof
+            .as_ref()
+            .zip(replacement.proof.as_ref())
+            .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+        || source.terminal.as_ref().is_some_and(|terminal| {
+            terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
+        })
+        || replacement.terminal.as_ref().is_some_and(|terminal| {
+            terminal.continuity.live_proof().as_ref() != replacement.proof.as_ref()
+        })
+    {
+        return false;
+    }
+    let Some(identity) = replacement
+        .launch
+        .session_id
+        .as_ref()
+        .filter(|id| !id.is_empty() && id.len() <= 1024)
+    else {
+        return false;
+    };
+    let mut confirmed = source.clone();
+    confirmed.launch.session_id = Some(identity.clone());
+    is_upgrade_recovery(&confirmed, replacement)
 }
 
 /// A retained Codex holder may have issued the same confirmed thread with an
@@ -664,9 +809,38 @@ impl Session {
                 .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
     }
 
+    /// A typed descriptor shape, never proof of an authenticated live helper.
+    /// Adoption and persistence callers must also resolve its exact actor owner.
+    pub(crate) fn has_unnamed_retained_claude_actor(&self) -> bool {
+        self.launch.session_id.is_none()
+            && matches!(
+                self.native_continuity,
+                NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            && self.has_valid_native_continuity()
+            && std::path::Path::new(&self.launch.recipe.program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(Provider::Claude.executable())
+    }
+
     pub fn has_valid_native_continuity(&self) -> bool {
         match &self.native_continuity {
             NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::RetainedClaudeActor { protocol } => {
+                *protocol == 2
+                    && self.launch.provider == Provider::Claude
+                    && self.owned_codex_listener.is_none()
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self
+                        .launch
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
             NativeContinuity::Durable { provider_version } => {
                 self.owns_codex_listener()
                     && self
@@ -693,8 +867,9 @@ impl Session {
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
-        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+        previous.native_continuity.retains_provider()
             && self.native_continuity == previous.native_continuity
+            && previous.has_valid_native_continuity()
             && self.has_valid_native_continuity()
             && previous
                 .proof
@@ -859,6 +1034,10 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Resident live-turn excerpt; never transcript serialization or wire state.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub notification_preview: std::sync::Arc<notification::Preview>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.
@@ -877,6 +1056,8 @@ pub struct Snapshot {
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
+    #[serde(default)]
+    pub text_copy_sources: TextCopySources,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
     pub models: Vec<Model>,
@@ -1010,12 +1191,12 @@ impl PermissionDenial {
 
 impl QueuedMessage {
     pub const LIMIT: usize = 128;
+    pub const PREVIEW_BYTES: usize = 16 * 1024;
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
-        const PREVIEW_BYTES: usize = 16 * 1024;
-        let whole = text.len() <= PREVIEW_BYTES;
+        let whole = text.len() <= Self::PREVIEW_BYTES;
         if !whole {
-            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.truncate(text.floor_char_boundary(Self::PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
@@ -1105,6 +1286,29 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Drop renderable history while retaining provider continuity, controls,
+    /// activity and pending interactions. Only the UI client's disposable copy
+    /// uses this: the daemon still owns paging and the authoritative transcript.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+
+    /// Logical body bytes referenced by this owner, not unique heap bytes:
+    /// immutable items can be Arc-shared with other snapshots and caches.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
@@ -1137,6 +1341,51 @@ pub enum PromptMode {
     Steer,
     Queue,
 }
+/// A logical text source, independent of loaded transcript part IDs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TextCopyScope {
+    Conversation,
+    Subagent { id: String },
+}
+
+/// Owned-source authority for the exact committed prefix shown by a publication.
+/// Appends preserve the revision; authoritative replacement invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopySource {
+    pub cache: uuid::Uuid,
+    pub scope: TextCopyScope,
+    pub token: u64,
+    pub revision: u64,
+    pub bytes: u64,
+}
+
+/// Keep each reply at the existing transcript chunk size, far below the IPC
+/// frame ceiling. A single clipboard operation may collect one 30 MiB Claude
+/// envelope, with headroom; longer accumulated streams fail explicitly.
+pub const TEXT_COPY_PAGE_BYTES: usize = 128 * 1024;
+pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopyPage {
+    pub source: TextCopySource,
+    pub offset: u64,
+    pub text: String,
+    pub done: bool,
+}
+
+/// Body-free authority aligned with the items of the same snapshot. Keeping
+/// source identity outside Item avoids changing provider-owned item IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopySources {
+    /// Changes only when canonical parent text is rewritten, removed, or reset.
+    /// Paging and verified append preserve pending clipboard authority. An
+    /// unrelated destructive edit conservatively cancels a pending copy too.
+    #[serde(default)]
+    pub conversation_revision: u64,
+    pub conversation: Vec<Option<TextCopySource>>,
+    pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Verify login on the same live actor without replaying any failed prompt.
@@ -1210,6 +1459,11 @@ pub enum Command {
         key: FileChangeKey,
         cursor: Option<FilePatchCursor>,
         revision: u64,
+    },
+    /// Read only the exact Store-owned source prefix; never invokes a provider.
+    ReadTextCopy {
+        source: TextCopySource,
+        offset: u64,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1481,6 +1735,8 @@ pub enum ItemContent {
     Image {
         path: String,
         description: String,
+        #[serde(default)]
+        reference: Option<ImageReference>,
     },
     /// Something another agent, or the harness on its behalf, delivered to
     /// this conversation: a subagent's report, a teammate's or another
@@ -1598,7 +1854,18 @@ impl ItemContent {
                 .len()
                 .saturating_add(input.len())
                 .saturating_add(output.len()),
-            Self::Image { path, description } => path.len().saturating_add(description.len()),
+            Self::Image {
+                path,
+                description,
+                reference,
+            } => path.len().saturating_add(description.len()).saturating_add(
+                reference.as_ref().map_or(0, |r| {
+                    r.name
+                        .len()
+                        .saturating_add(r.sha256.len())
+                        .saturating_add(96)
+                }),
+            ),
             Self::Delivery {
                 from,
                 sender,
@@ -1898,6 +2165,7 @@ pub enum Event {
     },
     Session {
         id: String,
+        /// Absent means no new name. A different session or Reset clears an old name.
         title: Option<String>,
     },
     Capabilities(Capabilities),
@@ -2052,6 +2320,187 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+}
+
+#[cfg(test)]
+mod retained_native_pair_tests {
+    use super::*;
+    use crate::model::{
+        BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalContinuity, TerminalId,
+        TerminalSession,
+    };
+
+    fn live(proof: &HostSessionProof) -> TerminalContinuity {
+        TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    fn pair(confirmed: bool) -> (Session, Session) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("paired-host"),
+            boot_id: BootId::new("paired-boot"),
+            host_incarnation: HostIncarnation::new("old-daemon"),
+        };
+        let id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/paired-project".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let previous = Session {
+            id,
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: recipe.clone(),
+                session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(proof.clone()),
+            terminal: Some(TerminalSession {
+                id,
+                launch: recipe,
+                continuity: live(&proof),
+                resume_hint: None,
+                transcript_path: None,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+            }),
+            owned_codex_listener: None,
+            native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        let mut successor = previous.clone();
+        successor.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("new-daemon");
+        successor.terminal.as_mut().unwrap().continuity = live(successor.proof.as_ref().unwrap());
+        (previous, successor)
+    }
+
+    #[test]
+    fn retained_pre_id_upgrade_learns_only_exact_confirmed_identity() {
+        let (source, mut replacement) = pair(false);
+        assert!(is_upgrade_recovery(&source, &replacement));
+        replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(is_upgrade_identity_learning(&source, &replacement));
+        for mutation in 0..9 {
+            let mut old = source.clone();
+            let mut new = replacement.clone();
+            match mutation {
+                0 => old.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => old.native_continuity = NativeContinuity::ReconnectOnly,
+                2 => {
+                    new.launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                3 => new.launch.recipe.arguments.push("--other-model".into()),
+                4 => new.proof = old.proof.clone(),
+                5 => new.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                6 => new.id = TerminalId::new(),
+                7 => new.launch.session_id = Some("invalid-provider-identity".into()),
+                _ => new.terminal.as_mut().unwrap().continuity = live(old.proof.as_ref().unwrap()),
+            }
+            assert!(
+                !is_upgrade_identity_learning(&old, &new),
+                "mutation {mutation}"
+            );
+        }
+        let mut known = source;
+        known.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(
+            !is_upgrade_recovery(&known, &replacement),
+            "two known IDs never prove a reset lineage"
+        );
+    }
+
+    #[test]
+    fn retained_claude_pair_accepts_only_exact_terminal_and_proof_rotation() {
+        for confirmed in [false, true] {
+            let (previous, successor) = pair(confirmed);
+            assert_ne!(previous.terminal, successor.terminal);
+            assert!(successor.retains_native_pair_from(&previous));
+            // Persistence independently checks the enclosing pane/provider/
+            // launch descriptor before consulting this terminal-only gate.
+            assert_eq!(previous.id, successor.id);
+            assert_eq!(previous.launch, successor.launch);
+            for mutation in 0..8 {
+                let mut changed = successor.clone();
+                match mutation {
+                    0 => changed.terminal = None,
+                    1 => changed.terminal.as_mut().unwrap().id = TerminalId::new(),
+                    2 => changed
+                        .terminal
+                        .as_mut()
+                        .unwrap()
+                        .launch
+                        .arguments
+                        .push("--different".into()),
+                    3 => {
+                        changed.terminal.as_mut().unwrap().launch.working_directory =
+                            "/other-project".into()
+                    }
+                    4 => {
+                        changed.terminal.as_mut().unwrap().owned_codex_listener =
+                            Some(OwnedCodexListener {
+                                socket: "/other/control.sock".into(),
+                                allocator: previous.proof.clone().unwrap(),
+                            })
+                    }
+                    5 => {
+                        changed.terminal.as_mut().unwrap().continuity =
+                            live(previous.proof.as_ref().unwrap())
+                    }
+                    6 => {
+                        changed.proof.as_mut().unwrap().boot_id = BootId::new("other-boot");
+                        changed.terminal.as_mut().unwrap().continuity =
+                            live(changed.proof.as_ref().unwrap());
+                    }
+                    _ => changed.native_continuity = NativeContinuity::ReconnectOnly,
+                }
+                assert!(
+                    !changed.retains_native_pair_from(&previous),
+                    "terminal mutation {mutation}, confirmed={confirmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_claude_pair_requires_valid_previous_and_current_actor_continuity() {
+        let (previous, successor) = pair(false);
+        for mutation in 0..6 {
+            let mut old = previous.clone();
+            let mut new = successor.clone();
+            match mutation {
+                0 => old.terminal = None,
+                1 => {
+                    old.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("");
+                    old.terminal.as_mut().unwrap().continuity = live(old.proof.as_ref().unwrap());
+                }
+                2 => old.terminal.as_mut().unwrap().continuity = live(new.proof.as_ref().unwrap()),
+                3 => {
+                    old.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 1 };
+                    new.native_continuity = old.native_continuity.clone();
+                }
+                4 => {
+                    new.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("");
+                    new.terminal.as_mut().unwrap().continuity = live(new.proof.as_ref().unwrap());
+                }
+                _ => {
+                    old.launch.provider = Provider::Codex;
+                    new.launch.provider = Provider::Codex;
+                }
+            }
+            assert!(
+                !new.retains_native_pair_from(&old),
+                "continuity mutation {mutation}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

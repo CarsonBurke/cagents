@@ -202,38 +202,36 @@ impl Tree {
                     })
                 {
                     std::mem::swap(&mut self.state, &mut state);
-                    let widget_children = borrowed.children();
-                    if !tag_match {
-                        self.children = widget_children;
-                    } else {
-                        for (old_i, mut old) in children {
-                            let Some(my_state) = self.children.get_mut(old_i)
-                            else {
-                                continue;
-                            };
-                            if my_state.tag != old.tag || {
-                                !match (&old.id, &my_state.id) {
-                                    (
-                                        Some(Id(Internal::Custom(_, old_name))),
-                                        Some(Id(Internal::Custom(_, my_name))),
-                                    ) => old_name == my_name,
-                                    (
-                                        Some(Id(Internal::Set(a))),
-                                        Some(Id(Internal::Set(b))),
-                                    ) => a.len() == b.len(),
-                                    (
-                                        Some(Id(Internal::Unique(_))),
-                                        Some(Id(Internal::Unique(_))),
-                                    ) => true,
-                                    (None, None) => true,
-                                    _ => false,
-                                }
-                            } {
-                                continue;
+                    // The tag already matches. Restore existing children;
+                    // Widget::diff below reconciles them without constructing
+                    // and discarding a fresh subtree.
+                    for (old_i, mut old) in children {
+                        let Some(my_state) = self.children.get_mut(old_i)
+                        else {
+                            continue;
+                        };
+                        if my_state.tag != old.tag || {
+                            !match (&old.id, &my_state.id) {
+                                (
+                                    Some(Id(Internal::Custom(_, old_name))),
+                                    Some(Id(Internal::Custom(_, my_name))),
+                                ) => old_name == my_name,
+                                (
+                                    Some(Id(Internal::Set(a))),
+                                    Some(Id(Internal::Set(b))),
+                                ) => a.len() == b.len(),
+                                (
+                                    Some(Id(Internal::Unique(_))),
+                                    Some(Id(Internal::Unique(_))),
+                                ) => true,
+                                (None, None) => true,
+                                _ => false,
                             }
-
-                            mem::swap(my_state, &mut old);
+                        } {
+                            continue;
                         }
+
+                        mem::swap(my_state, &mut old);
                     }
                 } else {
                     tag_match = false;
