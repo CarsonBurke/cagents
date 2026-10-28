@@ -683,18 +683,18 @@ impl Cagents {
                     .card_state(card)
                     .map(|state| state.exposure)
                     .unwrap_or(Exposure::Offscreen);
-                self.lifecycle.register(
-                    card,
-                    exposure,
-                    if exposure == Exposure::Offscreen {
-                        Residency::Hibernated
-                    } else {
-                        Residency::Hydrating {
-                            epoch: unix_millis().max(1) as u64,
-                        }
-                    },
-                    Instant::now(),
-                );
+                let residency = if exposure == Exposure::Offscreen {
+                    Residency::Hibernated
+                } else {
+                    Residency::Hydrating {
+                        epoch: unix_millis().max(1) as u64,
+                    }
+                };
+                self.lifecycle
+                    .register(card, exposure, residency.clone(), Instant::now());
+                if let Some(state) = self.card_state_mut(card) {
+                    state.residency = residency;
+                }
                 self.terminal_started(card, source.id, Ok(started))
             }
             result => {

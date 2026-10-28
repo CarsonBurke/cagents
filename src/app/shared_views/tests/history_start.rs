@@ -285,6 +285,7 @@ impl Daemon {
                                 if lose_first_reply && count == 1 {
                                     // Admission succeeded; only its reply is lost.
                                     // Retrying must discover this owner, not start twice.
+                                    stream.shutdown(std::net::Shutdown::Both).unwrap();
                                     break;
                                 }
                                 ServerResponse::ChatAttached {

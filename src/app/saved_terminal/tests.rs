@@ -127,6 +127,13 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
             matches!(app.lifecycle.state(card), Some((_, Residency::Hibernated))),
             current == Exposure::Offscreen
         );
+        assert_eq!(
+            matches!(
+                app.card_state(card).unwrap().residency,
+                Residency::Hibernated
+            ),
+            current == Exposure::Offscreen
+        );
         assert!(!surface.is_unsized_spawn());
         surface.stop_for_test();
     }

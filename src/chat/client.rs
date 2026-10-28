@@ -3747,6 +3747,7 @@ mod tests {
             &live,
             omp_card(Some(CONVERSATION), Some(live.clone())),
             &mut None,
+            false,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));
