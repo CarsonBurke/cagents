@@ -2,10 +2,6 @@
 use super::*;
 use chat::failure::{Failure, FailureKind};
 
-#[cfg(test)]
-#[path = "failure_prompt_context_tests.rs"]
-mod prompt_context_tests;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
     Item(String),
@@ -906,5 +902,398 @@ impl Runtime {
             .spacing(space::S)
             .width(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(id: &str, role: chat::Role, body: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        }
+    }
+
+    fn image(id: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role: chat::Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Image {
+                path: String::new(),
+                description: "Synthetic image".into(),
+                reference: None,
+            },
+        }
+    }
+
+    fn provider_error(provider: Provider, id: &str, body: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::System, body);
+        assert!(chat::failure::mark_provider_error(provider, &mut item));
+        item
+    }
+
+    /// The content-part ID a provider's decoder assigns to one message.
+    fn part(provider: Provider, message: &str, index: usize) -> String {
+        match provider {
+            Provider::Codex => format!("{message}/input/{index}"),
+            Provider::Claude | Provider::Omp => format!("{message}:{index}"),
+        }
+    }
+
+    fn live_fixture(provider: Provider, items: Vec<chat::Item>) -> (Runtime, Arc<ClientHandle>) {
+        let session = fresh_chat_session(
+            provider,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(provider),
+            false,
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            ready: true,
+            items: items.into_iter().map(Arc::new).collect(),
+            ..Snapshot::default()
+        };
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), snapshot));
+        let runtime = Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 1,
+            },
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        (runtime, handle)
+    }
+
+    fn publish(runtime: &mut Runtime, handle: &ClientHandle, edit: impl FnOnce(&mut Snapshot)) {
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        edit(&mut next);
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+    }
+
+    fn publish_error(runtime: &mut Runtime, handle: &ClientHandle, error: &str) {
+        publish(runtime, handle, |next| next.error = Some(error.into()));
+    }
+
+    /// Whether the incident's notice is part of the visible transcript.
+    fn notice_visible(runtime: &mut Runtime, key: &str) -> bool {
+        runtime.failure_ui.expanded.insert(key.to_owned());
+        runtime.cache_failure_preview(key);
+        runtime
+            .selection_document()
+            .0
+            .text(diagnostic_preview_identity(key))
+            .is_some()
+    }
+
+    #[test]
+    fn multipart_prompt_failure_shows_one_notice() {
+        let raw = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let message = "11111111-1111-4111-8111-111111111111";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut items = vec![text(
+                &part(provider, message, 0),
+                chat::Role::User,
+                "Inspect these images",
+            )];
+            items.extend((1..=8).map(|index| image(&part(provider, message, index))));
+            let (mut runtime, handle) = live_fixture(provider, items);
+            publish_error(&mut runtime, &handle, raw);
+
+            // The retained note (first part) and the current error (scoped by
+            // the last image part) must resolve to the same message.
+            assert_eq!(runtime.failures.len(), 1);
+            assert_eq!(
+                runtime.failure_ui.incidents.len(),
+                1,
+                "one notice per message, not per content part: {provider:?}"
+            );
+            let key = runtime.failure_ui.incidents[0].key.clone();
+            assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+
+            let revision = runtime.failure_ui.revision;
+            runtime.refresh();
+            assert_eq!(runtime.failure_ui.revision, revision);
+        }
+    }
+
+    #[test]
+    fn paged_out_first_part_keeps_the_notice_beside_the_remaining_part() {
+        let provider = Provider::Claude;
+        let message = "22222222-2222-4222-8222-222222222222";
+        let first = part(provider, message, 0);
+        let last = part(provider, message, 8);
+        let raw = "Opaque provider failure\nexact original details";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![text(&first, chat::Role::User, "Prompt"), image(&last)],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        let key = runtime.failure_ui.incidents[0].key.clone();
+
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.retain(|item| item.id == last);
+        });
+        assert_eq!(runtime.failures[0].0.as_deref(), Some(first.as_str()));
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failure_ui.incidents[0].key, key);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some(last.as_str())
+        );
+        assert!(notice_visible(&mut runtime, &key));
+
+        // An unrelated prompt must not adopt the notice of an absent message.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items = vec![Arc::new(text(
+                "another-message:0",
+                chat::Role::User,
+                "Unrelated",
+            ))];
+        });
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        assert!(!notice_visible(&mut runtime, &key));
+    }
+
+    #[test]
+    fn distinct_messages_and_children_keep_identical_errors_separate() {
+        let provider = Provider::Claude;
+        let raw = "Opaque provider failure\nidentical complete details";
+        let a = "33333333-3333-4333-8333-333333333333";
+        let b = "44444444-4444-4444-8444-444444444444";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, a, 0), chat::Role::User, "First"),
+                image(&part(provider, a, 1)),
+                provider_error(provider, "error-a:0", raw),
+                text(&part(provider, b, 0), chat::Role::User, "Second"),
+                image(&part(provider, b, 1)),
+                provider_error(provider, "error-b:0", raw),
+            ],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+
+        // Child failures reporting the same body after the multipart prompt
+        // stay scoped to each child rather than merging into the parent.
+        publish(&mut runtime, &handle, |next| {
+            for id in ["child-a", "child-b"] {
+                let mut call = text(id, chat::Role::Assistant, "");
+                call.content = ItemContent::Tool {
+                    name: "Agent".into(),
+                    input: "Synthetic reviewer".into(),
+                    output: String::new(),
+                    status: chat::ToolStatus::Failed,
+                };
+                next.items.push(Arc::new(call));
+            }
+            next.subagents = ["child-a", "child-b"]
+                .map(|id| chat::Subagent {
+                    id: id.into(),
+                    kind: "reviewer".into(),
+                    description: "Synthetic child failure".into(),
+                    model: None,
+                    status: chat::ToolStatus::Failed,
+                    waiting: false,
+                    detail: raw.into(),
+                    background: true,
+                    items: vec![Arc::new(provider_error(provider, "child-error:0", raw))],
+                })
+                .into();
+        });
+        let incidents = &runtime.failure_ui.incidents;
+        assert_eq!(incidents.len(), 4);
+        assert_eq!(
+            incidents
+                .iter()
+                .map(|incident| &incident.key)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        for id in ["child-a", "child-b"] {
+            let scoped: Vec<_> = incidents
+                .iter()
+                .filter(|incident| incident.child_scope.as_deref() == Some(id))
+                .collect();
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(
+                scoped[0].sources,
+                vec![
+                    Source::ChildItem(id.into(), "child-error:0".into()),
+                    Source::ChildDetail(id.into()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_item_id_does_not_alias_a_message_with_the_same_spelling() {
+        let provider = Provider::Claude;
+        let raw = "Opaque provider failure";
+        let (runtime, _) = live_fixture(
+            provider,
+            vec![
+                text("m", chat::Role::User, "Legacy opaque item"),
+                provider_error(provider, "error-legacy:0", raw),
+                text("m:0", chat::Role::User, "Canonical message"),
+                provider_error(provider, "error-message:0", raw),
+            ],
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    }
+
+    #[test]
+    fn error_is_attributed_to_the_incoming_message_within_a_shared_turn() {
+        let raw = "Opaque provider failure\nexact original diagnostic";
+        let a = "77777777-7777-4777-8777-777777777777";
+        let b = "88888888-8888-4888-8888-888888888888";
+        let c = "99999999-9999-4999-8999-999999999999";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            // One publication carries both adjacent prompts and the failure.
+            let (mut runtime, handle) = live_fixture(provider, vec![]);
+            publish(&mut runtime, &handle, |next| {
+                next.items = vec![
+                    Arc::new(text(&part(provider, a, 0), chat::Role::User, "First")),
+                    Arc::new(image(&part(provider, a, 1))),
+                    Arc::new(text(&part(provider, b, 0), chat::Role::User, "Second")),
+                    Arc::new(image(&part(provider, b, 1))),
+                ];
+                next.error = Some(raw.into());
+            });
+            assert_eq!(runtime.turns.len(), 1, "adjacent prompts share a turn");
+            assert_eq!(
+                runtime.failures[0].0.as_deref(),
+                Some(part(provider, b, 0).as_str())
+            );
+            assert_eq!(runtime.failure_ui.incidents.len(), 1, "{provider:?}");
+            let incident = &runtime.failure_ui.incidents[0];
+            assert!(incident.sources.contains(&Source::Note(0)));
+            assert!(incident.sources.contains(&Source::Snapshot));
+            assert_eq!(
+                incident.anchor.as_deref(),
+                Some(runtime.turns[0].key.as_str())
+            );
+
+            // A later message reporting the same diagnostic is a new incident.
+            publish(&mut runtime, &handle, |next| {
+                next.error = None;
+                next.items.push(Arc::new(text(
+                    &part(provider, c, 0),
+                    chat::Role::User,
+                    "Third",
+                )));
+                next.items.push(Arc::new(image(&part(provider, c, 1))));
+            });
+            publish_error(&mut runtime, &handle, raw);
+            assert_eq!(runtime.failures.len(), 2);
+            assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        }
+    }
+
+    #[test]
+    fn opaque_note_follows_its_visible_item_and_never_borrows_another() {
+        let raw = "Opaque provider failure\ncomplete original diagnostic";
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let (mut runtime, handle) = live_fixture(
+                provider,
+                vec![
+                    text("legacy-first", chat::Role::User, "First"),
+                    text("legacy-second", chat::Role::User, "Second"),
+                ],
+            );
+            publish_error(&mut runtime, &handle, raw);
+            // The note belongs to the later item but displays on the turn
+            // that contains it, keyed by the first item.
+            assert_eq!(runtime.failures[0].0.as_deref(), Some("legacy-second"));
+            assert_eq!(
+                runtime.failure_ui.incidents[0].anchor.as_deref(),
+                Some("legacy-first")
+            );
+            let key = runtime.failure_ui.incidents[0].key.clone();
+            assert!(notice_visible(&mut runtime, &key));
+
+            publish(&mut runtime, &handle, |next| next.error = None);
+            assert!(
+                notice_visible(&mut runtime, &key),
+                "clearing the error keeps the retained note"
+            );
+
+            // Without its item there is no proof of where the note belongs.
+            publish(&mut runtime, &handle, |next| {
+                next.items.retain(|item| item.id != "legacy-second");
+            });
+            assert!(!notice_visible(&mut runtime, &key), "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn auth_recovery_after_paging_clears_only_the_current_message_warning() {
+        let provider = Provider::Codex;
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let raw = "Authentication required. Please sign in again.";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, a, 0), chat::Role::User, "First"),
+                image(&part(provider, a, 1)),
+            ],
+        );
+        publish_error(&mut runtime, &handle, raw);
+        let first_note = runtime.failures[0].clone();
+
+        // A changed error after B joins the same visual turn must not replace A.
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(text(
+                &part(provider, b, 0),
+                chat::Role::User,
+                "Second",
+            )));
+            next.items.push(Arc::new(image(&part(provider, b, 1))));
+            next.error = Some(chat::sign_in_verification_failure(
+                raw,
+                "Synthetic verification failure",
+            ));
+        });
+        assert_eq!(runtime.turns.len(), 1);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failures[0], first_note);
+        assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &runtime.failures[0].1));
+        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
+
+        // Paging B's first part away keeps B's scope for dedup and recovery.
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.retain(|item| item.id == part(provider, b, 1));
+        });
+        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
+        runtime.note(runtime.failures[1].1.clone());
+        assert_eq!(runtime.failures.len(), 2);
+
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.busy = false;
+        });
+        assert_eq!(runtime.failures, vec![first_note]);
     }
 }
