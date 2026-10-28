@@ -3920,10 +3920,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         reference: &str,
         cancellation: &CancellationToken,
     ) -> Result<Oid, RepositoryError> {
-        let command = self.git_read(
-            worktree,
-            ["show-ref", "--verify", "--hash", "--", reference],
-        );
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--hash", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let output = self.run_checked(&command, cancellation)?;
         Oid::parse_object(parse_utf8_line(&output.stdout, "reference_oid")?).map_err(|error| {
             RepositoryError::InvalidOutput {
@@ -3942,10 +3944,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         reference: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
-        let command = self.git_read(
-            worktree,
-            ["show-ref", "--verify", "--quiet", "--", reference],
-        );
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--quiet", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let output = self.run(&command, cancellation)?;
         if !output.success {
             return if output.exit_code == Some(1) {
@@ -6021,15 +6025,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     base.into(),
                 ],
             ),
-            check_branch_absent: self.git_read(
-                &request.repository,
-                [
-                    OsString::from("show-ref"),
-                    OsString::from("--verify"),
-                    OsString::from("--quiet"),
-                    request.branch.full_ref().into(),
-                ],
-            ),
+            check_branch_absent: self
+                .git_read(
+                    &request.repository,
+                    [
+                        OsString::from("show-ref"),
+                        OsString::from("--verify"),
+                        OsString::from("--quiet"),
+                        request.branch.full_ref().into(),
+                    ],
+                )
+                .env("GIT_NO_LAZY_FETCH", "1"),
         })
     }
 
@@ -6087,15 +6093,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<WorktreeResidualState, RepositoryError> {
         let worktrees = self.list_worktrees(&request.repository, cancellation)?;
-        let command = self.git_read(
-            &request.repository,
-            [
-                OsString::from("show-ref"),
-                OsString::from("--verify"),
-                OsString::from("--quiet"),
-                request.branch.full_ref().into(),
-            ],
-        );
+        let command = self
+            .git_read(
+                &request.repository,
+                [
+                    OsString::from("show-ref"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    request.branch.full_ref().into(),
+                ],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let branch_output = self.run(&command, cancellation)?;
         let branch_exists = match branch_output.exit_code {
             _ if branch_output.success => true,
@@ -11859,10 +11867,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )?;
             } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
                 // A tag with a remote ref's spelling is not a cached branch.
-                let cache_check = self.git_read(
-                    &journal.request.repository,
-                    ["show-ref", "--verify", "--quiet", "--", reference.as_str()],
-                );
+                let cache_check = self
+                    .git_read(
+                        &journal.request.repository,
+                        ["show-ref", "--verify", "--quiet", "--", reference.as_str()],
+                    )
+                    .env("GIT_NO_LAZY_FETCH", "1");
                 let cache_output = self.run(&cache_check, cancellation)?;
                 let cached = if cache_output.success {
                     true
