@@ -73,10 +73,13 @@ jobs:
           set -euo pipefail
           retained_actor_helper=$(python3 scripts/build-ceditor-product cagentsd \
             --locked --no-default-features --features host --bin cagentsd)
-          # The retained 100-chat stress workload has separate qualification.
+          # Run the retained 100-chat workload serially after the ordinary suite.
           CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
             cargo test --locked --no-default-features --features host --all-targets -- --test-threads=2 \
               --skip user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt
+          CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
+            cargo test --locked --no-default-features --features host --test agent_console_contract \
+              user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt -- --exact --test-threads=1
       - name: Check the isolated browserless UI
         if: matrix.lane == 'UI'
         run: cargo check --locked --no-default-features --features ui --bin cagents-ui
