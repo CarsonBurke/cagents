@@ -630,9 +630,13 @@ mod tests {
 
         animate_activity(true);
         let (mut element, mut tree) = mounted();
-        let (visible, advanced) = redraw(&mut element, &mut tree, Point::new(8.0, 8.0), half_turn());
+        let (visible, advanced) =
+            redraw(&mut element, &mut tree, Point::new(8.0, 8.0), half_turn());
         // Stepped at the spinner's own cadence, not at display refresh.
-        assert_eq!(visible, window::RedrawRequest::At(half_turn() + SPINNER_FRAME));
+        assert_eq!(
+            visible,
+            window::RedrawRequest::At(half_turn() + SPINNER_FRAME)
+        );
         assert_ne!(advanced, Duration::ZERO, "the visible arc did not advance");
 
         let (mut element, mut tree) = mounted();
@@ -654,13 +658,19 @@ mod tests {
         animate_activity(true);
         let (mut turning, mut turning_tree) = mounted();
         let (request, _) = redraw(&mut turning, &mut turning_tree, origin, half_turn());
-        assert_eq!(request, window::RedrawRequest::At(half_turn() + SPINNER_FRAME));
+        assert_eq!(
+            request,
+            window::RedrawRequest::At(half_turn() + SPINNER_FRAME)
+        );
 
         animate_activity(false);
         // The frame the spinner had already asked for still arrives.
         let later = half_turn() + SPINNER_FRAME;
         let (mut fresh, mut fresh_tree) = mounted();
-        for (element, tree) in [(&mut turning, &mut turning_tree), (&mut fresh, &mut fresh_tree)] {
+        for (element, tree) in [
+            (&mut turning, &mut turning_tree),
+            (&mut fresh, &mut fresh_tree),
+        ] {
             let (request, slow) = redraw(element, tree, origin, later);
             assert_eq!(
                 request,
@@ -682,7 +692,10 @@ mod tests {
 
         animate_activity(true);
         let resumed = later + SPINNER_BACKGROUND_FRAME * 2;
-        for (element, tree) in [(&mut turning, &mut turning_tree), (&mut fresh, &mut fresh_tree)] {
+        for (element, tree) in [
+            (&mut turning, &mut turning_tree),
+            (&mut fresh, &mut fresh_tree),
+        ] {
             let (request, elapsed) = redraw(element, tree, origin, resumed);
             assert_eq!(request, window::RedrawRequest::At(resumed + SPINNER_FRAME));
             assert_eq!(
