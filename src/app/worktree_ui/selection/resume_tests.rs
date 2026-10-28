@@ -93,6 +93,50 @@ impl Cagents {
     ) {
         self.configure_local_resume_for_test(runtime);
         self.worktree_selection.followup_effects = None;
+        self.worktree_selection.idle_cache_wake_effects = Some(Vec::new());
+    }
+
+    /// Retain the idle observer through the caller's protocol/source assertions.
+    /// This never captures daemon, lifecycle, focus or worker-retirement effects.
+    pub(in crate::app) fn take_idle_resume_cache_wake_for_test(&mut self) -> Vec<Task<Message>> {
+        let state = &mut self.worktree_selection;
+        assert!(
+            state.followup_effects.is_none(),
+            "real followup effects must run"
+        );
+        assert!(state.active.is_none(), "original navigation must retire");
+        assert!(state.pending.is_none(), "no navigation request may remain");
+        assert!(state.resume.is_none(), "resume intent must be consumed");
+        assert!(
+            !self.resume_ui.loading,
+            "resume completion must be delivered"
+        );
+        assert!(state.cache_wake_armed, "actual idle observer must be armed");
+        let cache = state.cache.as_ref().expect("actual navigation cache owner");
+        assert!(cache.alive(), "cache custody must remain live");
+        assert!(
+            cache.events().is_empty(),
+            "ready invalidation must not be hidden"
+        );
+        let effects = state
+            .idle_cache_wake_effects
+            .as_mut()
+            .expect("idle-only fixture capture");
+        assert_eq!(effects.len(), 1, "retain exactly the armed idle observer");
+        for (_, receiver) in effects.iter() {
+            assert!(
+                !receiver.is_closed(),
+                "closed observer must run its invalidation"
+            );
+            assert!(
+                receiver.is_empty(),
+                "captured ready invalidation must not be hidden"
+            );
+        }
+        std::mem::take(effects)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect()
     }
 
     /// Completes only the real local-selection protocol, including its actual

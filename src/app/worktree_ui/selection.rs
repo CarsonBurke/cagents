@@ -55,6 +55,8 @@ pub(in crate::app) struct State {
     watch_retired: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     followup_effects: Option<Vec<Task<Message>>>,
+    #[cfg(test)]
+    idle_cache_wake_effects: Option<Vec<(Task<Message>, async_channel::Receiver<()>)>>,
 }
 
 impl State {
@@ -1186,10 +1188,26 @@ impl Cagents {
             .watch_attempt
             .as_ref()
             .map_or(age, |cached| age.saturating_sub(cached.checked.elapsed()));
+        #[cfg(test)]
+        let idle_receiver = (self.worktree_selection.idle_cache_wake_effects.is_some()
+            && events.is_empty()
+            && !events.is_closed()
+            && !remaining.is_zero())
+        .then(|| events.clone());
         let task = cosmic::task::future(async move {
             let _ = tokio::time::timeout(remaining, events.recv()).await;
             Message::WorktreeSelectionCacheInvalidated
         });
+        #[cfg(test)]
+        {
+            // Retain only an idle cache wake, never queued, closed or expired work.
+            if let Some(receiver) = idle_receiver
+                && let Some(effects) = &mut self.worktree_selection.idle_cache_wake_effects
+            {
+                effects.push((task, receiver));
+                return Task::none();
+            }
+        }
         #[cfg(test)]
         if let Some(effects) = &mut self.worktree_selection.followup_effects {
             effects.push(task);

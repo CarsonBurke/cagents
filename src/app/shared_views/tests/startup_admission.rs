@@ -860,16 +860,20 @@ fn history_picker_does_not_focus_retained_unadmitted_cache() {
     app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
     app.chat_ui =
         chat_ui::State::with_drafts(HashMap::from([(pane.id, "Retained source draft".into())]));
+    eprintln!("history fixture: initialize/settle begin");
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
+    eprintln!("history fixture: initialize/settle complete");
     let mut view = View::empty(hidden);
     view.retired.push(pane.id);
+    eprintln!("history fixture: admit begin");
     admit(
         &mut app,
         active,
         hidden,
         model(identity, active, hidden, view),
     );
+    eprintln!("history fixture: admit complete");
     let disk = tempfile::tempdir().unwrap();
     let store = crate::persistence::StateStore::open(
         disk.path().join("history.sqlite"),
@@ -900,8 +904,11 @@ fn history_picker_does_not_focus_retained_unadmitted_cache() {
     app.configure_local_resume_without_effect_capture_for_test(
         navigation_runtime.path().to_owned(),
     );
+    eprintln!("history fixture: resume/settle begin");
     let task = app.resume_saved_conversation(entry);
     settle(&mut app, task);
+    eprintln!("history fixture: resume/settle complete");
+    let _idle_cache_observers = app.take_idle_resume_cache_wake_for_test();
     let requests = daemon.requests();
     assert_eq!(
         requests.len(),
