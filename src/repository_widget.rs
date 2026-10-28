@@ -1095,6 +1095,13 @@ impl EditorDocument {
         }
     }
 
+    /// A programmatic location change is an edit-group boundary, including
+    /// a jump back to the same caret position.
+    fn navigate_to(&mut self, cursor: text_editor::Cursor) {
+        self.history.seal();
+        self.content.set_cursor(cursor);
+    }
+
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
@@ -3656,9 +3663,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             unreachable!("the validated editor remains mounted");
         };
-        // Typing after a jump is a new undo step, like typing after a click.
-        document.history.seal();
-        document.content.set_cursor(text_editor::Cursor {
+        document.navigate_to(text_editor::Cursor {
             position,
             selection: None,
         });
@@ -7668,7 +7673,7 @@ impl RepositoryRuntime {
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
-            document.content.set_cursor(text_editor::Cursor {
+            document.navigate_to(text_editor::Cursor {
                 position: caret,
                 selection,
             });
@@ -12752,6 +12757,34 @@ mod tests {
         let navigation = runtime.navigation().unwrap().editor.unwrap();
         assert_eq!(navigation.caret.column, 0);
         assert_eq!(navigation.selection.unwrap().column, 8);
+    }
+
+    #[test]
+    fn file_location_jumps_separate_same_position_deletions_in_undo() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "abcd\n");
+        let path = runtime.selected_path().unwrap().to_path_buf();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.history_time = Some(Instant::now());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Delete),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("bcd\n"));
+        drop(runtime.open_file_location(card, path, 0, 0, 0));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Delete),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("cd\n"));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("bcd\n"));
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("abcd\n"));
+        assert!(!runtime.is_dirty());
     }
 
     #[test]
