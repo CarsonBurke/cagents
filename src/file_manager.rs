@@ -111,7 +111,12 @@ async fn open_macos_url_with_opener(
         open_system_url_with_opener(url, opener),
     )
     .await
-    .map_err(|_| format!("System opener did not respond while opening {}", SanitizedLocation::from(url)))?
+    .map_err(|_| {
+        format!(
+            "System opener did not respond while opening {}",
+            SanitizedLocation::from(url)
+        )
+    })?
 }
 
 pub(crate) async fn open_system_url_with_opener(
@@ -234,8 +239,14 @@ mod tests {
     #[tokio::test]
     async fn native_opener_keeps_uri_and_reveal_arguments_out_of_diagnostics() {
         for (reveal, raw) in [
-            (false, "https://alice:password@example.test/private%20path?oauth=secret#access-token"),
-            (true, "file:///workspace/private%20linked%20folder/file%20%231.txt"),
+            (
+                false,
+                "https://alice:password@example.test/private%20path?oauth=secret#access-token",
+            ),
+            (
+                true,
+                "file:///workspace/private%20linked%20folder/file%20%231.txt",
+            ),
         ] {
             let url = Url::parse(raw).unwrap();
             let mut opener = tokio::process::Command::new("/bin/sh");
@@ -251,8 +262,21 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(error.contains("system opener exited"), "{error}");
-            assert!(error.contains("42"), "the exact argument fixture must run: {error}");
-            for sensitive in ["alice", "password", "oauth", "secret", "access-token", "linked", "file%20", "?", "#"] {
+            assert!(
+                error.contains("42"),
+                "the exact argument fixture must run: {error}"
+            );
+            for sensitive in [
+                "alice",
+                "password",
+                "oauth",
+                "secret",
+                "access-token",
+                "linked",
+                "file%20",
+                "?",
+                "#",
+            ] {
                 assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
             }
         }
