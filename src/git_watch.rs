@@ -1404,14 +1404,24 @@ mod tests {
     fn wait_for(
         (monitor, woken): &(Monitor, mpsc::Receiver<()>),
         project: ProjectId,
+        phase: &str,
         predicate: impl Fn(&Change) -> bool,
     ) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
         loop {
-            if woken.try_recv().is_ok() && monitor.drain().get(&project).is_some_and(&predicate) {
-                return;
+            if woken.try_recv().is_ok()
+                && let Some(change) = monitor.drain().remove(&project)
+            {
+                if predicate(&change) {
+                    return;
+                }
+                last = Some(change);
             }
-            assert!(Instant::now() < deadline, "watch event did not arrive");
+            assert!(
+                Instant::now() < deadline,
+                "watch event did not arrive during {phase}; last change: {last:?}"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1436,28 +1446,41 @@ mod tests {
             woken,
         );
         monitor.0.configure(vec![Arc::new(project.clone())]);
-        wait_for(&monitor, project.id, |change| change.error.is_none());
+        wait_for(&monitor, project.id, "initial registration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
         let replacement = source.join(".save");
         std::fs::write(&replacement, "second").unwrap();
         std::fs::rename(&replacement, &file).unwrap();
-        wait_for(&monitor, project.id, |change| {
+        wait_for(&monitor, project.id, "atomic file replacement", |change| {
             change.worktrees.contains(&worktree.id)
         });
         std::fs::remove_dir_all(&source).unwrap();
         std::fs::create_dir(&source).unwrap();
         std::fs::write(&file, "third").unwrap();
-        wait_for(&monitor, project.id, |change| change.membership);
+        wait_for(
+            &monitor,
+            project.id,
+            "directory removal/recreation",
+            |change| change.membership,
+        );
         // The path set is unchanged, but the directory inode changed. Rearm
         // it instead of trusting a stale native registration for that path.
         monitor.0.configure(vec![Arc::new(project.clone())]);
         // Configure completion must be acknowledged even when paths compare
         // equal, so edits cannot race the re-registration barrier.
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
+        wait_for(
+            &monitor,
+            project.id,
+            "re-registration acknowledgement",
+            |change| change.coverage == Some(true) && change.worktrees.contains(&worktree.id),
+        );
         std::fs::write(&file, "fourth").unwrap();
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
+        wait_for(
+            &monitor,
+            project.id,
+            "edit after re-registration",
+            |change| change.worktrees.contains(&worktree.id),
+        );
     }
 }
