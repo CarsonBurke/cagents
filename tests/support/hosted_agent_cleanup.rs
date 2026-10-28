@@ -65,13 +65,26 @@ impl Agents {
             thread::scope(|scope| {
                 let workers: Vec<_> = batch
                     .iter()
-                    .map(|id| scope.spawn(move || cli(root, &["agent", "close", id], deadline)))
+                    .map(|id| {
+                        thread::Builder::new().spawn_scoped(scope, move || {
+                            cli(root, &["agent", "close", id], deadline)
+                        })
+                    })
                     .collect();
                 for (id, worker) in batch.iter().zip(workers) {
-                    match worker.join() {
+                    // Cleanup also runs while unwinding a failed assertion.
+                    // A full task budget must not turn a failed worker spawn
+                    // into a second panic that skips the daemon's teardown.
+                    let result = match worker {
+                        Ok(worker) => worker.join(),
+                        Err(_) => std::panic::catch_unwind(|| {
+                            cli(root, &["agent", "close", id], deadline)
+                        }),
+                    };
+                    match result {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => failures.push(format!("agent {id}: {error}")),
-                        Err(_) => failures.push(format!("agent {id}: cleanup worker panicked")),
+                        Err(_) => failures.push(format!("agent {id}: cleanup panicked")),
                     }
                 }
             });
