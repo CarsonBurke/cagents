@@ -630,7 +630,7 @@ impl State {
             )));
             content = content.push(design::caption("Kept for the current application lifetime. Original results are still unconfirmed; no removal is resent. The same card or path stays protected."));
             if self.unresolved.len() == MAX_UNRESOLVED {
-                content = content.push(design::body("All 16 unresolved slots are occupied. New removals are disabled; browsing and inspecting retained originals remain available. No records are discarded automatically."));
+                content = content.push(design::body("All 16 unresolved slots are occupied. Opening another removal review is disabled; browsing and inspecting retained originals remain available. No records are discarded automatically."));
             }
             for saved in &self.unresolved {
                 let id = saved.id;
@@ -838,11 +838,13 @@ impl State {
                 ));
             } else {
                 actions = actions.push(
-                    button::secondary("Keep unresolved; review other work").on_press(
-                        Action::KeepUnresolved {
-                            generation,
-                            owner: self.retained_owner,
-                        },
+                    button::secondary("Keep unresolved; review other work").on_press_maybe(
+                        (self.unresolved.len() < MAX_UNRESOLVED).then_some(
+                            Action::KeepUnresolved {
+                                generation,
+                                owner: self.retained_owner,
+                            },
+                        ),
                     ),
                 );
             }
@@ -2081,6 +2083,12 @@ mod tests {
         );
         let operation = state.operation.as_ref().unwrap();
         assert_eq!(operation.phase, Phase::Uncertain);
+        assert!(keep_unresolved_button_disabled(&state));
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| { text.contains("Opening another removal review is disabled") })
+        );
         assert_eq!(operation.submitted.as_ref().unwrap().request, request);
         assert_eq!(
             operation.submitted.as_ref().unwrap().diagnostic.as_deref(),
@@ -2374,6 +2382,37 @@ mod tests {
             self.0.push(text.into());
         }
     }
+    fn keep_unresolved_button_disabled(state: &State) -> bool {
+        use cosmic::iced::{
+            Size,
+            advanced::{Layout, layout, widget::Tree},
+            mouse,
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.view(true, Default::default()).expect("review shown");
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(760.0, 700.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let buttons: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some("Keep unresolved; review other work")
+            })
+            .collect();
+        assert_eq!(buttons.len(), 1, "one actual keep-unresolved control");
+        buttons[0].node().is_disabled()
+    }
+
     fn outline(state: &State) -> Vec<String> {
         use cosmic::iced::{
             Size,
