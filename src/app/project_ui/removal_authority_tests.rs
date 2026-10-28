@@ -974,6 +974,53 @@ fn retained_project_successor(role: &str) {
         command: ProjectCommand::Remove,
     }));
     assert!(app.project_ui.remove_dialog.is_some());
+    let retry = app.handle_project_action(Action::ConfirmRemove);
+    let origin = app.project_ui.removal_attempts[&removal.repository]
+        .origin
+        .clone();
+    let tombstone = app.workspace_model.clone();
+    let passive = app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(tombstone.clone()),
+    );
+    // Close admission marks these synchronously before its lazy worker can
+    // connect. A passive snapshot must not produce a second close census.
+    assert!(!app.project_ui.close_in_flight.contains(&removal.project));
+    assert!(
+        !app.project_ui
+            .close_cancellations
+            .contains_key(&removal.project)
+    );
+    assert_eq!(
+        app.project_ui.removal_attempts[&removal.repository].origin,
+        origin
+    );
+    assert!(
+        app.selected_project_removal_blocker(removal.project)
+            .is_some()
+    );
+    drop(passive);
+    drop(retry); // The owning retry is admitted, but its provider task stays unrun.
+    drop(app.update(Message::ProjectUi(Action::RemovedProject {
+        origin,
+        result: Err(REFUSAL.into()),
+    })));
+    assert!(app.project_ui.close_failed.contains(&removal.project));
+    assert!(app.project_ui.removal_attempts.is_empty());
+    let passive = app.apply_workspace_model_update(
+        super::super::workspace_model_sync::ModelUpdate::Read(tombstone),
+    );
+    assert!(!app.project_ui.close_in_flight.contains(&removal.project));
+    assert!(
+        !app.project_ui
+            .close_cancellations
+            .contains_key(&removal.project)
+    );
+    assert_eq!(app.selected_project_removal_blocker(removal.project), None);
+    drop(passive);
+    assert!(app.sidebar_model.project(removal.project).is_some());
+    assert_eq!(app.card_state(card), Some(&saved));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
 }
 
 #[test]
