@@ -169,6 +169,7 @@ fn named_claude_resume_failure_retires_before_exact_retry() {
     named_resume_case(
         "named_claude_resume_failure_retires_before_exact_retry",
         false,
+        false,
     );
 }
 
@@ -177,10 +178,20 @@ fn named_claude_resume_retry_finishes_failed_retirement_write() {
     named_resume_case(
         "named_claude_resume_retry_finishes_failed_retirement_write",
         true,
+        false,
     );
 }
 
-fn named_resume_case(name: &str, fail_retirement: bool) {
+#[test]
+fn named_claude_resume_normal_close_finishes_failed_retirement_write() {
+    named_resume_case(
+        "named_claude_resume_normal_close_finishes_failed_retirement_write",
+        true,
+        true,
+    );
+}
+
+fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool) {
     let Some(root) = isolated(name) else { return };
     let provider = root.join("bin/claude");
     fs::write(
@@ -325,6 +336,26 @@ fn named_resume_case(name: &str, fail_retirement: bool) {
     }
     assert!(host.lock().unwrap().chat_spawning.is_empty());
     assert_eq!(fs::read(&history).unwrap(), history_before);
+    if finish_with_close {
+        process(
+            &host,
+            0,
+            ClientRequest::ChatClose {
+                chat_id: requested.id,
+            },
+        )
+        .unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&requested.id));
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(requested.id)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // The exact original request is retried only after the real failed owner
     // finishes normal Close, including a previously failed retirement write.

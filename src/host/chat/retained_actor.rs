@@ -1370,6 +1370,22 @@ fn close_with_target(
             state.retire_terminal(terminal.id);
         }
         let removed = state.chats.remove(&source.id);
+        // Ordinary Close may finish a previously failed initialization too.
+        // Clear only the startup captured by this fully retired attachment;
+        // a replacement owner or an unproved teardown retains its reservation.
+        if removed.as_ref().is_some_and(|record| {
+            state
+                .native_actor_startups
+                .get(&source.id)
+                .is_some_and(|pending| {
+                    pending
+                        .failed_close
+                        .as_ref()
+                        .is_some_and(|failed| failed.matches(record))
+                })
+        }) {
+            state.native_actor_startups.remove(&source.id);
+        }
         state.native_adoption_failures.clear(source.id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(source.id);
