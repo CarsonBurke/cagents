@@ -1612,7 +1612,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         if matches!(self.kind, Kind::UnclaimedKey)
             && !shell.is_event_captured()
             && let Event::Keyboard(event) = event
-            && let Some(message) = self.on_focused_key.as_ref().and_then(|on_key| on_key(event))
+            && let Some(message) = self
+                .on_focused_key
+                .as_ref()
+                .and_then(|on_key| on_key(event))
         {
             shell.publish(message);
             shell.capture_event();

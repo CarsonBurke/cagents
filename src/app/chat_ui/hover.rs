@@ -141,11 +141,10 @@ where
             limits: &layout::Limits,
         ) -> layout::Node {
             let Placement::Beside(spacing) = self.placement else {
-                let base = self.base.as_widget_mut().layout(
-                    &mut tree.children[0],
-                    renderer,
-                    limits,
-                );
+                let base =
+                    self.base
+                        .as_widget_mut()
+                        .layout(&mut tree.children[0], renderer, limits);
                 let top = self.top.as_widget_mut().layout(
                     &mut tree.children[1],
                     renderer,
