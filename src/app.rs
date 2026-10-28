@@ -4976,8 +4976,13 @@ struct PendingLspJump {
 struct LspInspectorState {
     context: inspector::LspInspectorContext,
     /// The document, once opened. `None` while no file is open, or when no
-    /// configured server claims this file's extension.
+    /// configured server claims this file's extension, or another independent
+    /// buffer already owns its language-server attachment.
     document: Option<LspDocumentId>,
+    /// Independent editor buffers cannot share one language-server URI.
+    /// Keep the refused buffer editable and let Restart retry after its owner
+    /// closes, without registering its text over the other pane's snapshot.
+    blocked_by_other_buffer: bool,
     /// Absolute path of the card's open buffer, recorded even when no server
     /// claims it. A jump target arrives absolute while the card's file list is
     /// worktree-relative, so this is the only side both can be compared on.
@@ -11115,6 +11120,17 @@ impl Cagents {
             self.lsp_pending_jumps.remove(&card);
             return Task::none();
         };
+        if self.lsp_contexts.iter().any(|(other, state)| {
+            *other != card && state.document.is_some() && state.path.as_deref() == Some(path)
+        }) {
+            let state = self.lsp_contexts.entry(card).or_default();
+            state.blocked_by_other_buffer = true;
+            state.context.status = Some(LspStatus::Unavailable {
+                reason: "This file is already open for language tools in another pane. Close that file there, then restart the language server here.".into(),
+            });
+            self.lsp_pending_jumps.remove(&card);
+            return Task::none();
+        }
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = match text {
@@ -11171,6 +11187,7 @@ impl Cagents {
             state.context = inspector::LspInspectorContext::default();
             state.diagnostics_version = None;
             state.path = None;
+            state.blocked_by_other_buffer = false;
         }
     }
 
@@ -11424,6 +11441,15 @@ impl Cagents {
             }
             InspectorAction::RestartLanguageServer(card) => {
                 let Some(doc) = self.lsp_document(card) else {
+                    if self
+                        .lsp_contexts
+                        .get(&card)
+                        .is_some_and(|state| state.blocked_by_other_buffer)
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    {
+                        runtime.resync_lsp();
+                        return self.drain_lsp_intents(card);
+                    }
                     return Task::none();
                 };
                 self.lsp.restart(doc);
@@ -26204,6 +26230,10 @@ mod tests {
             assert_eq!(runtime(&app, reopened).navigation(), None);
             assert_eq!(runtime(&app, source).navigation(), original_navigation);
         }
+    }
+
+    mod repository_clone_lsp_ownership {
+        include!("app/repository_clone_lsp_ownership_tests.rs");
     }
 
     #[test]
