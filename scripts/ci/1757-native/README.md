@@ -115,17 +115,25 @@ The baseline records whether its known loss reproduces on X11; if needed it uses
 an explicitly labeled extra click to continue the baseline. This cannot waive
 the after-arm no-click assertion. After confirmed transaction release, one
 explicit Enter must produce exactly one recovery acceptance with one image,
-late identity and completion. SELECT-only metadata records the original pane
-inventory before failure and after retry; SDK session IDs are not treated as
-app-candidate identity. The exact owning regression separately pins candidate
-reuse and stale receipt refusal.
+late identity and completion. SELECT-only metadata records all persisted chat
+rows in this isolated two-pane fixture, not an authoritative open inventory.
+The first completed actor must remain stable and the second source A must
+survive failure. The successful checkpoint legitimately changes A to candidate
+B; its native ID must match the SDK receipt and its pane/app-session/native-ID
+mapping must survive reopen. Failed private candidate B is not visible through
+the refused Store; its exact reuse and stale-receipt refusal remain the separate
+R3 owning regression's scope. SDK session IDs are not app-candidate identities.
 
 A six-second native video records pointer hover during the writer wait, with
 input timestamps. No frame-rate or responsiveness pass is inferred from command
 success. Independent UX review must inspect hover updates, focus, transitions,
 same-draft/image conservation and native screenshots. The UI is closed normally,
 zero X11 windows are required, and the same runner/source/slot reopens against
-the original daemon. The transcript must return without another SDK invocation.
+the original daemon. Its retained read-only pidfd, PID/start epoch and immutable
+phase bindings must prove continuity across close, zero windows and reopen.
+The transcript and post-retry persisted mapping must return without another
+SDK invocation. The complete start log is checked again after private daemon
+shutdown and owned-family settlement before the arm can pass.
 
 ## Custody, evidence and remaining gates
 

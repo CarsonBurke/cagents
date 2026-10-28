@@ -120,6 +120,8 @@ def main():
     writer = None
     window = None
     artifacts = None
+    daemon_pin = None
+    daemon_fd = None
 
     def event(kind, **fields):
         events.append({'monotonic': time.monotonic(), 'kind': kind, **fields})
@@ -229,8 +231,15 @@ def main():
         return path.is_file() and any(row.get('fixture_command') == name and row.get('state') == 'completed'
                                      for row in (json.loads(line) for line in path.read_text().splitlines()))
 
-    def bind():
-        nonlocal artifacts
+    def daemon_alive(label):
+        assert daemon_fd is not None and daemon_pin is not None
+        assert not select.select([daemon_fd], [], [], 0)[0], 'Original daemon exited'
+        fields = Path(f'/proc/{daemon_pin["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
+        assert int(fields[19]) == daemon_pin['start_ticks'] and fields[0] != 'Z'
+        event('original-daemon-live', label=label, identity=daemon_pin)
+
+    def bind(label):
+        nonlocal artifacts, daemon_pin, daemon_fd
         result = {}
         for name in ['cagents', 'cagentsd', 'cagents-ui']:
             p = target / 'dev-runtime' / name
@@ -247,18 +256,36 @@ def main():
             if not p.name.isdecimal():
                 continue
             try:
-                executable = Path(os.readlink(p / 'exe'))
+                executable = Path(os.readlink(p / 'exe').removesuffix(' (deleted)'))
                 for name in ['cagentsd', 'cagents-ui']:
                     if executable == Path(result[name]['path']):
-                        assert digest(p / 'exe') == result[name]['sha256']
-                        running.append({'pid': int(p.name), 'name': name, 'sha256': digest(p / 'exe')})
+                        before = (p / 'stat').read_text().rsplit(')', 1)[1].split()
+                        identity = (p / 'exe').stat()
+                        actual_hash = digest(p / 'exe')
+                        after = (p / 'stat').read_text().rsplit(')', 1)[1].split()
+                        assert before[19] == after[19] and after[0] != 'Z'
+                        assert actual_hash == result[name]['sha256']
+                        running.append({'pid': int(p.name), 'name': name, 'sha256': actual_hash,
+                                        'start_ticks': int(after[19]), 'device': identity.st_dev,
+                                        'inode': identity.st_ino})
             except (FileNotFoundError, PermissionError, ProcessLookupError):
                 continue
         assert sum(r['name'] == 'cagentsd' for r in running) == 1
         assert sum(r['name'] == 'cagents-ui' for r in running) == 1
+        current_daemon = next(r for r in running if r['name'] == 'cagentsd')
+        if daemon_pin is None:
+            daemon_pin = current_daemon
+            # Read-only liveness pin, never individual-signal authority.
+            daemon_fd = os.pidfd_open(daemon_pin['pid'])
+        else:
+            assert current_daemon == daemon_pin, 'A replacement daemon cannot qualify UI-only reopen'
+        daemon_alive(label)
         xpid = int(command(['xdotool', 'getwindowpid', str(window)]).strip())
         assert any(r['name'] == 'cagents-ui' and r['pid'] == xpid for r in running)
-        save(output / 'matched-trio.json', {'source': source(), 'artifacts': artifacts, 'running': running})
+        destination = output / ('matched-trio-' + label + '.json')
+        assert not destination.exists(), 'Bindings are immutable per phase'
+        save(destination, {'source': source(), 'artifacts': artifacts, 'running': running,
+                           'original_daemon': daemon_pin, 'original_daemon_pidfd_live': True})
 
     try:
         save(output / 'source-before.json', source())
@@ -322,7 +349,7 @@ def main():
         command(['xdotool', 'windowsize', '--sync', str(window), '1278', '800'])
         command(['xdotool', 'windowmove', '--sync', str(window), '0', '0'])
         command(['xdotool', 'windowactivate', '--sync', str(window)])
-        bind()
+        bind('initial')
         cli = target / 'dev-runtime/cagents'
         linked = json.loads(command([cli, '--no-start', '--device', 'local', '--json', 'account', 'link',
                                      'claude', root / 'account'], timeout=30))
@@ -386,8 +413,13 @@ def main():
         wait(database.is_file, 'actual generated named window Store')
         def settled_cards():
             value = identities('before-failure')
-            return value if len(value) == 2 else None
+            first_session = json.loads((root / 'accepted-first-send.json').read_text())['session']
+            return value if len(value) == 2 and sum(r['native_session_id'] == first_session for r in value) == 1 else None
         cards_before = wait(settled_cards, 'both ordinary panes persisted before writer reservation')
+        first_sdk_session = json.loads((root / 'accepted-first-send.json').read_text())['session']
+        original_actor = next(r for r in cards_before if r['native_session_id'] == first_sdk_session)
+        original_draft = next(r for r in cards_before if r['pane_id'] != original_actor['pane_id'])
+        assert original_draft['app_session_id'] and original_draft['native_session_id'] is None
         identity = database.stat()
         writer = spawn(['/usr/bin/python3', HERE / 'hold-store-lock.py', '--root', root, '--database', database,
                         '--device', str(identity.st_dev), '--inode', str(identity.st_ino), '--nonce', nonce], 'writer-lock', pipe=True)
@@ -415,6 +447,9 @@ def main():
         capture('first-save-error')
         before_typing = entry('error-before-typing')
         assert before_typing['text'] == draft_before and len(starts()) == 1
+        cards_failed = identities('after-real-writer-failure')
+        assert {r['pane_id']: (r['app_session_id'], r['native_session_id']) for r in cards_failed} == {
+            r['pane_id']: (r['app_session_id'], r['native_session_id']) for r in cards_before}
         focused = any('FOCUSED' in state for state in before_typing['states'])
         # Deliberately no click/focus operation between refusal and these keys.
         type_text('_FOCUS_RETURNED')
@@ -456,14 +491,26 @@ def main():
         time.sleep(0.4)
         capture('retry-completed-narrow', (900, 650))
         command(['xdotool', 'windowsize', '--sync', str(window), '1278', '800'])
-        cards_after = identities('after-retry')
+        def completed_cards():
+            value = identities('after-retry')
+            return value if any(r['pane_id'] == original_draft['pane_id'] and r['native_session_id'] == receipt['session']
+                                for r in value) else None
+        cards_after = wait(completed_cards, 'recovered native identity persisted in its original pane')
         assert {r['pane_id'] for r in cards_before} == {r['pane_id'] for r in cards_after}
-        bind()
+        retained_first = next(r for r in cards_after if r['pane_id'] == original_actor['pane_id'])
+        assert (retained_first['app_session_id'], retained_first['native_session_id']) == (
+            original_actor['app_session_id'], original_actor['native_session_id'])
+        recovered_actor = next(r for r in cards_after if r['pane_id'] == original_draft['pane_id'])
+        # The legitimate first-start checkpoint deliberately changes source A
+        # to candidate B; failed B is private memory and not claimed observed.
+        assert recovered_actor['app_session_id'] != original_draft['app_session_id']
+        bind('before-ui-close')
         # Normal UI close, zero-window observation, same-source normal runner.
         key('alt+F4')
         product.wait(timeout=20)
         assert product.returncode == 0
         assert not command(['xdotool', 'search', '--onlyvisible', '--class', 'cagents'], check=False).strip()
+        daemon_alive('zero-ui-windows')
         starts_before_reopen = starts()
         product = spawn([checkout / 'scripts/run-development', '--browserless', '--debug', '--log-file', logs / 'ui-reopen.log',
                          '--', '--window', slot], 'development-runner-reopen')
@@ -473,16 +520,22 @@ def main():
         window = int(windows[0])
         command(['xdotool', 'windowsize', '--sync', str(window), '1278', '800'])
         command(['xdotool', 'windowactivate', '--sync', str(window)])
-        bind()
+        bind('after-ui-reopen')
         wait(lambda: any('UNSENT_SAVE_RECOVERY_1757_FOCUS_RETURNED' in r.get('name', '') or
                          'UNSENT_SAVE_RECOVERY_1757_FOCUS_RETURNED' in r.get('text', '')
                          for r in at('ui-reopened')), 'original recovered transcript after UI-only reopen')
         assert starts() == starts_before_reopen
+        reopened_cards = identities('after-ui-reopen')
+        assert {r['pane_id']: (r['app_session_id'], r['native_session_id']) for r in reopened_cards} == {
+            r['pane_id']: (r['app_session_id'], r['native_session_id']) for r in cards_after}
         capture('ui-only-reopened')
         save(output / 'source-after.json', source())
         save(output / 'RESULT.json', {'status': 'FLOW_ASSERTIONS_PASS_PENDING_TEARDOWN', 'arm': args.arm, 'head': args.source, 'tree': args.tree,
              'sdk_starts': starts(), 'accepted_first': json.loads((root / 'accepted-first-send.json').read_text()),
              'accepted_recovery': receipt, 'failed_save_started_provider': False, 'retry_starts': 1,
+             'identity_scope': 'SELECT-only persisted cards, not open inventory or private failed candidate B',
+             'source_A': original_draft, 'successful_candidate_B': recovered_actor,
+             'private_failed_candidate_reuse': 'Source/owning R3 regression only, not directly native-observed',
              'hover': 'Raw native6second video and input timestamps; independent responsiveness review pending',
              'backend': 'X11 only; no Wayland popup claim', 'native_review': 'PENDING'})
     finally:
@@ -521,9 +574,14 @@ def main():
             for name in ['provider-starts.jsonl', 'protocol-states.jsonl', 'accepted-first-send.json', 'accepted-recovery.json']:
                 if (root / name).is_file():
                     shutil.copy2(root / name, output / name)
-            shutil.copytree(root / 'account', output / 'synthetic-provider-history')
         save(output / 'final-source.json', source())
+        if daemon_fd is not None:
+            os.close(daemon_fd)
     result = json.loads((output / 'RESULT.json').read_text())
+    final_starts = starts()
+    save(output / 'sdk-starts-after-teardown.json', final_starts)
+    assert final_starts == starts_before_reopen and len(final_starts) == 2, 'Late SDK invocation cannot qualify after teardown'
+    result['sdk_starts_after_teardown'] = final_starts
     result['status'] = 'PASS'
     save(output / 'RESULT.json', result)
 
