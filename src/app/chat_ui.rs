@@ -258,7 +258,7 @@ pub enum Action {
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(images::PreviewTarget),
-    LoadImage(Target, String),
+    LoadImage(images::LoadTarget),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
@@ -9498,9 +9498,9 @@ impl Cagents {
                     );
                 }
             }
-            Action::LoadImage(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    images::request(runtime, &id);
+            Action::LoadImage(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target.runtime()) {
+                    target.request(runtime);
                 }
             }
             Action::RetryThumbnails(target) => {
@@ -11227,7 +11227,11 @@ mod tests {
             images::bounded_handle(bytes.clone(), &budget),
         );
         preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
-        drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
+        let load = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            images::LoadTarget::capture(target, &requested, &runtime.cache[&requested.id]).unwrap()
+        };
+        drop(app.handle_chat_ui(Action::LoadImage(load)));
         let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,

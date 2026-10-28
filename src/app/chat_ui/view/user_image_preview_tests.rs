@@ -112,8 +112,8 @@ fn click_prompt(
             Message::ChatUi(Action::OpenImage(target)) => {
                 format!("OpenImage({:?}, {})", target.runtime(), target.item_id())
             }
-            Message::ChatUi(Action::LoadImage(target, id)) => {
-                format!("LoadImage({target:?}, {id})")
+            Message::ChatUi(Action::LoadImage(target)) => {
+                format!("LoadImage({:?}, {})", target.runtime(), target.item_id())
             }
             message => format!("{message:?}"),
         })

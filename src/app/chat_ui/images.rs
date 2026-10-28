@@ -818,6 +818,71 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+/// The prepared image source a Load preview interaction was rendered for.
+#[derive(Clone)]
+pub(in crate::app) struct LoadTarget {
+    runtime: Target,
+    item: Arc<chat::Item>,
+    revision: u64,
+}
+impl PartialEq for LoadTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.runtime == other.runtime
+            && Arc::ptr_eq(&self.item, &other.item)
+            && self.revision == other.revision
+    }
+}
+impl Eq for LoadTarget {}
+impl std::fmt::Debug for LoadTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadTarget")
+            .field("runtime", &self.runtime)
+            .field("item_id", &self.item.id)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+impl LoadTarget {
+    pub(super) fn capture(runtime: Target, item: &chat::Item, cached: &CachedItem) -> Option<Self> {
+        let source = cached.image_item.as_ref()?;
+        (source.id == item.id
+            && matches!(source.content, ItemContent::Image { .. })
+            && (std::ptr::eq(source.as_ref(), item) || source.content == item.content))
+            .then(|| Self {
+                runtime,
+                item: source.clone(),
+                revision: cached.revision,
+            })
+    }
+    pub(super) fn runtime(&self) -> Target {
+        self.runtime
+    }
+    #[cfg(test)]
+    pub(super) fn item_id(&self) -> &str {
+        &self.item.id
+    }
+    pub(super) fn request(&self, runtime: &mut Runtime) {
+        if runtime.target == self.runtime
+            && runtime
+                .presentation_cache()
+                .get(&self.item.id)
+                .is_some_and(|cached| {
+                    cached.revision == self.revision
+                        && cached
+                            .image_item
+                            .as_ref()
+                            .is_some_and(|item| Arc::ptr_eq(item, &self.item))
+                })
+            && items(runtime).iter().any(|item| {
+                item.id == self.item.id
+                    && (Arc::ptr_eq(item, &self.item) || item.content == self.item.content)
+            })
+        {
+            request(runtime, &self.item.id);
+        }
+    }
+}
+
 /// The exact decoded preview an interaction was rendered for. Retaining the
 /// existing immutable item keeps keys and queued actions cheap even for inline
 /// images; equality never compares their encoded payloads.
@@ -1175,12 +1240,14 @@ impl Runtime {
             {
                 design::caption(format!("{label} · Loading preview…")).into()
             } else {
-                widget::column::with_children(vec![
-                    design::caption(label).into(),
-                    crate::ui_controls::button::secondary("Load preview")
-                        .on_press(action(Action::LoadImage(self.target, item.id.clone())))
-                        .into(),
-                ])
+                widget::column::with_children(vec![design::caption(label).into(), {
+                    let target = LoadTarget::capture(self.target, item, cached);
+                    crate::ui_controls::owned(
+                        target.clone(),
+                        crate::ui_controls::button::secondary("Load preview")
+                            .on_press_maybe(target.map(|target| action(Action::LoadImage(target)))),
+                    )
+                }])
                 .spacing(step::GAP_XS)
                 .into()
             };
@@ -1955,6 +2022,135 @@ mod tests {
     }
 
     #[test]
+    fn load_preview_keeps_queued_and_held_requests_with_the_rendered_source() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let renderer = crate::app::tests::headless_renderer();
+        for changed in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some("/fixture/images".into())));
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                panic!("draft chat");
+            };
+            runtime.visible.store(true, Ordering::Relaxed);
+            let original = Arc::new(image_item("/fixture/original.png".into()));
+            let prepare = |runtime: &mut Runtime| {
+                Runtime::prepare_items(
+                    &mut runtime.cache,
+                    &runtime.snapshot.items,
+                    false,
+                    &HashSet::new(),
+                    runtime.syntax_theme,
+                    Provider::Codex,
+                );
+            };
+            Arc::make_mut(&mut runtime.snapshot).items = vec![original.clone()];
+            prepare(runtime);
+            retire(runtime.cache.get_mut(&original.id).unwrap(), true);
+            let view = |runtime: &Runtime| {
+                runtime.image_preview(&runtime.snapshot.items[0], &runtime.cache[&original.id])
+            };
+            let mut queued_tree = Tree::new(view(runtime).as_widget());
+            assert!(
+                button_pointer_step(
+                    view(runtime),
+                    &mut queued_tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            let queued = button_pointer_step(
+                view(runtime),
+                &mut queued_tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            assert_eq!(queued.len(), 1);
+            let mut held_tree = Tree::new(view(runtime).as_widget());
+            assert!(
+                button_pointer_step(
+                    view(runtime),
+                    &mut held_tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            let mut replacement = (*original).clone();
+            if changed {
+                let ItemContent::Image { path, .. } = &mut replacement.content else {
+                    unreachable!()
+                };
+                *path = "/fixture/replacement.png".into();
+            }
+            let replacement = Arc::new(replacement);
+            Arc::make_mut(&mut runtime.snapshot).items = vec![replacement.clone()];
+            prepare(runtime);
+            retire(runtime.cache.get_mut(&original.id).unwrap(), true);
+            let held = button_pointer_step(
+                view(runtime),
+                &mut held_tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            assert_eq!(
+                held.len(),
+                usize::from(!changed),
+                "held source ownership: changed={changed}"
+            );
+            let target = runtime.target;
+            let attempt = runtime.cache[&original.id].image_attempt;
+            let interest = runtime.preview_request.clone();
+            for message in queued.into_iter().chain(held) {
+                drop(app.update(message));
+            }
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            if changed {
+                assert_eq!(runtime.cache[&original.id].image_attempt, attempt);
+                assert_eq!(runtime.preview_request, interest);
+                assert!(runtime.cache[&original.id].image_source.is_none());
+            } else {
+                assert!(
+                    Arc::ptr_eq(
+                        runtime.cache[&original.id].image_source.as_ref().unwrap(),
+                        &original
+                    ),
+                    "equivalent snapshots keep a valid retry's source"
+                );
+            }
+            // A newly rendered request always remains usable for its own source.
+            retire(runtime.cache.get_mut(&original.id).unwrap(), true);
+            let mut fresh_tree = Tree::new(view(runtime).as_widget());
+            assert!(
+                button_pointer_step(
+                    view(runtime),
+                    &mut fresh_tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            let mut fresh = button_pointer_step(
+                view(runtime),
+                &mut fresh_tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            assert_eq!(fresh.len(), 1);
+            drop(app.update(fresh.pop().unwrap()));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let source = runtime.cache[&original.id].image_source.as_ref().unwrap();
+            assert_eq!(source.content, replacement.content);
+            assert!(Arc::ptr_eq(
+                source,
+                if changed { &replacement } else { &original }
+            ));
+        }
+    }
+
+    #[test]
     fn gallery_neighbors_require_pixels_from_their_current_immutable_source() {
         use iced::advanced::widget::Tree;
         use iced::mouse::{Button, Event};
@@ -2002,8 +2198,8 @@ mod tests {
                 Event::ButtonReleased(Button::Left),
             );
             assert!(
-                matches!(messages.as_slice(), [Message::ChatUi(Action::LoadImage(target, id))]
-                if *target == runtime.target && id == &item.id)
+                matches!(messages.as_slice(), [Message::ChatUi(Action::LoadImage(target))]
+                if target.runtime() == runtime.target && target.item_id() == item.id)
             );
             messages.pop().unwrap()
         };
