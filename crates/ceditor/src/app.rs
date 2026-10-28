@@ -71,6 +71,8 @@ struct Tab {
     id: CardId,
     title: String,
     runtime: RepositoryRuntime,
+    /// Last visibility applied to the runtime; only transitions schedule work.
+    diff_surface_visible: bool,
     sidebar: SidebarModel,
     navigation: SidebarState,
     pending_file: Option<PendingFile>,
@@ -366,6 +368,21 @@ impl Editor {
             }
         })
     }
+
+    fn reconcile_diff_visibility(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for tab in &mut self.tabs {
+            let visible = self.active == Some(tab.id);
+            if tab.diff_surface_visible != visible {
+                tab.diff_surface_visible = visible;
+                tasks.push(repository_task(
+                    tab.runtime.refresh_diff_visibility(tab.id, visible),
+                ));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     fn shortcut_pressed(&self, action: EditorShortcut, event: &keyboard::Event) -> bool {
         cagents::settings::parse_shortcut(self.shortcuts.value(action))
             .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
@@ -1412,6 +1429,8 @@ impl Editor {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
+        runtime.set_diff_surface_visible(false);
         runtime.set_find_preferences(
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
@@ -1481,6 +1500,7 @@ impl Editor {
             id,
             title,
             runtime,
+            diff_surface_visible: false,
             sidebar,
             navigation,
             pending_file,
@@ -3556,6 +3576,38 @@ impl Application for Editor {
                     if let RepositoryAction::StageSelected { stage, .. } = action {
                         return self.stage(id, stage);
                     }
+                    if let RepositoryAction::RevertFile { identity, request } = action {
+                        let Some(tab) = self.tab(id).filter(|_| self.active == Some(id)) else {
+                            return Task::none();
+                        };
+                        if !tab.runtime.accepts_revert(&identity, &request) {
+                            return Task::none();
+                        }
+                        let Some(key) = tab.navigation.active_worktree().cloned() else {
+                            return Task::none();
+                        };
+                        return self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                            key,
+                            request,
+                        }));
+                    }
+                    if let RepositoryAction::ToggleDiffWhitespace { .. } = action {
+                        if self.tab(id).is_none() {
+                            return Task::none();
+                        }
+                        self.settings.diff_ignore_whitespace =
+                            !self.settings.diff_ignore_whitespace;
+                        let enabled = self.settings.diff_ignore_whitespace;
+                        let mut tasks = Vec::new();
+                        for tab in &mut self.tabs {
+                            tab.runtime.set_diff_ignore_whitespace(enabled);
+                            tasks.push(repository_task(
+                                tab.runtime.refresh_diff_preferences(tab.id),
+                            ));
+                        }
+                        tasks.push(self.save_settings());
+                        return Task::batch(tasks);
+                    }
                     if let RepositoryAction::RefreshFiles { .. } = action {
                         return self.refresh(id);
                     }
@@ -4176,6 +4228,7 @@ impl Application for Editor {
                     self.settings = AppSettings::default();
                     self.shortcuts = crate::preferences::EditorShortcuts::default();
                     self.shortcut_draft = self.shortcuts.clone();
+                    let mut diff_tasks = Vec::new();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
@@ -4183,6 +4236,11 @@ impl Application for Editor {
                             .set_line_height(self.settings.terminal_line_height);
                         tab.runtime
                             .set_syntax_theme(self.settings.editor_syntax_theme);
+                        tab.runtime
+                            .set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
+                        diff_tasks.push(repository_task(
+                            tab.runtime.refresh_diff_preferences(tab.id),
+                        ));
                     }
                     let options = self.settings.editor_find_options;
                     let preserve = self.settings.editor_replace_preserve_case;
@@ -4204,6 +4262,7 @@ impl Application for Editor {
                         self.save_settings(),
                         preference_task(shortcuts),
                         Task::batch(find_tasks),
+                        Task::batch(diff_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -4649,6 +4708,7 @@ impl Application for Editor {
             } else {
                 Task::none()
             },
+            self.reconcile_diff_visibility(),
         ])
     }
 
@@ -6509,32 +6569,88 @@ mod tests {
     }
 
     #[test]
-    fn git_actions_discard_serializes_sibling_tabs_and_refreshes_their_buffers() {
+    fn diff_toolbar_revert_confirms_serializes_sibling_tabs_and_refreshes_buffers() {
         let directory = git_fixture();
         let root = directory.path();
+        std::fs::write(root.join("other.txt"), "other original\n").unwrap();
+        git(root, &["add", "other.txt"]);
+        git(root, &["commit", "-m", "Other file"]);
         std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other changed\n").unwrap();
         let mut app = editor();
         app.settings.editor_auto_save = false;
         let file = open_real_git(&mut app, root, Some("tracked.txt"));
         let folder = open_real_git(&mut app, root, None);
+        assert_ne!(file, folder);
+        drop(app.update(Message::Select(file)));
+        let held = app
+            .tab(file)
+            .unwrap()
+            .runtime
+            .selected_revert_action(file)
+            .expect("the changed file offers Revert");
+        let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card: file,
+            path: "other.txt".into(),
+        }));
+        run_tasks(&mut app, task);
+        assert_eq!(
+            app.tab(file).unwrap().runtime.selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        assert!(
+            app.tab(file)
+                .unwrap()
+                .runtime
+                .selected_revert_action(file)
+                .is_some()
+        );
+        let task = app.update(Message::Repository(held));
+        run_tasks(&mut app, task);
+        assert!(
+            app.pending_discard().is_none(),
+            "the old callback must not target the replacement file"
+        );
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.txt")).unwrap(),
+            "other changed\n"
+        );
+        std::fs::write(root.join("other.txt"), "other original\n").unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card: file,
+            path: "tracked.txt".into(),
+        }));
+        run_tasks(&mut app, task);
         let key = app
-            .tab(folder)
+            .tab(file)
             .unwrap()
             .navigation
             .active_worktree()
             .unwrap()
             .clone();
-        sidebar_action(
-            &mut app,
-            SidebarAction::RequestDiscard {
-                key: key.clone(),
-                request: cagents::repository::DiscardRequest {
-                    worktree: root.to_path_buf(),
-                    tracked: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
-                    untracked: Vec::new(),
-                    confirmed: false,
-                },
-            },
+        let revert = app
+            .tab(file)
+            .unwrap()
+            .runtime
+            .selected_revert_action(file)
+            .unwrap();
+        let task = app.update(Message::Repository(revert));
+        run_tasks(&mut app, task);
+        let pending = app
+            .pending_discard()
+            .expect("toolbar opens the existing confirmation");
+        assert_eq!(pending.key, key);
+        assert_eq!(
+            pending.request.tracked,
+            vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())]
+        );
+        assert!(!pending.request.confirmed);
+        assert!(app.dialog().is_some());
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "changed\n"
         );
         let confirm = app.pending_discard().unwrap().confirm_action();
         let task = app.update(Message::Sidebar(confirm));
@@ -8070,6 +8186,112 @@ mod tests {
     }
 
     #[test]
+    fn diff_whitespace_preferences_share_persist_initialize_and_reset() {
+        use cagents::repository::ChangeArea;
+
+        const BEFORE: &str = "    item = 1;\n";
+        const AFTER: &str = "\titem = 1;  \n";
+        fn show_staged(app: &mut Editor, id: CardId, path: &str) {
+            let task = app.update(Message::Select(id));
+            run_tasks(app, task);
+            let key = app
+                .tab(id)
+                .unwrap()
+                .navigation
+                .active_worktree()
+                .unwrap()
+                .clone();
+            sidebar_action(
+                app,
+                SidebarAction::OpenChange {
+                    key,
+                    path: RepoPath::parse(path).unwrap(),
+                    area: ChangeArea::Staged,
+                },
+            );
+        }
+        fn assert_counts(app: &Editor, id: CardId, counts: (u32, u32)) {
+            let model = app
+                .tab(id)
+                .unwrap()
+                .runtime
+                .current_diff_model_snapshot()
+                .expect("staged comparison finished");
+            assert_eq!((model.additions, model.deletions), counts);
+            assert_eq!(model.before.as_ref(), BEFORE);
+            assert_eq!(model.after.as_ref(), AFTER);
+        }
+
+        let directory = git_fixture();
+        let root = directory.path();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(root.join(name), BEFORE).unwrap();
+        }
+        git(root, &["add", "a.txt", "b.txt", "c.txt", "d.txt"]);
+        git(root, &["commit", "-m", "Whitespace baseline"]);
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(root.join(name), AFTER).unwrap();
+        }
+        git(root, &["add", "a.txt", "b.txt", "c.txt", "d.txt"]);
+        let preferences = tempfile::tempdir().unwrap();
+        let mut app = configured(&preferences);
+        app.settings_writable = true;
+        let first = open_real_git(&mut app, root, Some("a.txt"));
+        show_staged(&mut app, first, "a.txt");
+        let second = open_real_git(&mut app, root, Some("b.txt"));
+        show_staged(&mut app, second, "b.txt");
+        assert_counts(&app, first, (1, 1));
+        assert_counts(&app, second, (1, 1));
+
+        let task = app.update(Message::Repository(
+            RepositoryAction::ToggleDiffWhitespace { card: second },
+        ));
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(second));
+        assert_counts(&app, second, (0, 0));
+        assert!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .current_diff_model_snapshot()
+                .is_none(),
+            "a preference change invalidates the hidden tab's old comparison"
+        );
+        let task = app.update(Message::Select(first));
+        run_tasks(&mut app, task);
+        assert_counts(&app, first, (0, 0));
+
+        let persisted = settings::load(&app.settings_path).unwrap();
+        assert!(persisted.diff_ignore_whitespace);
+        let third = open_real_git(&mut app, root, Some("c.txt"));
+        show_staged(&mut app, third, "c.txt");
+        assert_counts(&app, third, (0, 0));
+        let mut reopened = configured(&preferences);
+        reopened.settings = persisted;
+        let fourth = open_real_git(&mut reopened, root, Some("d.txt"));
+        show_staged(&mut reopened, fourth, "d.txt");
+        assert_counts(&reopened, fourth, (0, 0));
+
+        app.settings_open = true;
+        drop(app.update(Message::ResetSettings));
+        let task = app.update(Message::ResetSettings);
+        run_tasks(&mut app, task);
+        assert_counts(&app, third, (1, 1));
+        assert!(
+            !settings::load(&app.settings_path)
+                .unwrap()
+                .diff_ignore_whitespace
+        );
+        let task = app.update(Message::Settings);
+        run_tasks(&mut app, task);
+        for id in [first, second] {
+            let task = app.update(Message::Select(id));
+            run_tasks(&mut app, task);
+            assert_counts(&app, id, (1, 1));
+        }
+    }
+
+    #[test]
     fn find_preferences_load_share_persist_and_reset_across_standalone_tabs() {
         use cagents::ui_controls::FindOption;
 
@@ -9390,6 +9612,150 @@ mod tests {
             .collect::<Vec<_>>();
         repeated.sort();
         repeated
+    }
+
+    #[test]
+    fn switching_diff_tabs_rejects_hidden_results_and_resumes_on_reveal_or_close() {
+        use cagents::repository::ChangeArea;
+        use cosmic::iced::futures::StreamExt;
+
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::remove_file(root.join("tracked.txt")).unwrap();
+        let mut app = editor();
+        let first = open_real_git(&mut app, root, None);
+        let key = app
+            .tab(first)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        let task = app.update(Message::Sidebar(SidebarAction::OpenChange {
+            key,
+            path: RepoPath::parse("tracked.txt").unwrap(),
+            area: ChangeArea::Unstaged,
+        }));
+        assert_eq!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading")
+        );
+        // Keep the real worker's callback queued while the reader changes tabs.
+        let deferred = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut pending = vec![task];
+                let mut deferred = None;
+                while let Some(task) = pending.pop() {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                                action
+                            {
+                                match message {
+                                    Message::Repository(
+                                        action @ RepositoryAction::DiffLoaded { .. },
+                                    ) => {
+                                        assert!(deferred.replace(action).is_none());
+                                    }
+                                    message => pending.push(app.update(message)),
+                                }
+                            }
+                        }
+                    }
+                }
+                deferred.expect("the actual comparison completed")
+            });
+        let RepositoryAction::DiffLoaded {
+            content: cagents::diff_view::RenderedDiff::Text { model, .. },
+            ..
+        } = &deferred
+        else {
+            panic!("deleted file must produce a text comparison");
+        };
+        assert_eq!(model.before.as_ref(), "original\n");
+        assert_eq!(model.after.as_ref(), "");
+        assert_eq!(model.deletions, 1);
+        let second = open_real_git(&mut app, root, None);
+        assert_ne!(first, second);
+        drop(app.update(Message::Repository(deferred.clone())));
+        let hidden = app.tab(first).unwrap().runtime.inspector_context();
+        assert!(hidden.diff_error.is_none());
+        assert_ne!(hidden.diff_state, Some("Loading"));
+        assert!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .current_diff_model_snapshot()
+                .is_none(),
+            "a hidden comparison must not accept the completed old request"
+        );
+
+        drop(app.update(Message::Select(first)));
+        assert_eq!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading")
+        );
+        drop(app.update(Message::Repository(deferred)));
+        assert_eq!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading"),
+            "revealing creates a new request, so the old completion remains fenced"
+        );
+
+        drop(app.update(Message::Select(second)));
+        open_change(&mut app, second, "tracked.txt", ChangeArea::Unstaged);
+        assert_eq!(
+            app.tab(second)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading")
+        );
+        drop(app.update(Message::Select(first)));
+        assert_ne!(
+            app.tab(second)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading")
+        );
+        let task = app.update(Message::CloseTab(first));
+        assert_eq!(app.active, Some(second));
+        assert_eq!(
+            app.tab(second)
+                .unwrap()
+                .runtime
+                .inspector_context()
+                .diff_state,
+            Some("Loading")
+        );
+        run_tasks(&mut app, task);
+        let model = app
+            .tab(second)
+            .unwrap()
+            .runtime
+            .current_diff_model_snapshot()
+            .expect("closing the active tab resumes its fallback comparison");
+        assert_eq!(model.before.as_ref(), "original\n");
+        assert_eq!(model.after.as_ref(), "");
+        assert_eq!(model.deletions, 1);
     }
 
     #[test]
