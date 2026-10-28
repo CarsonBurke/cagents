@@ -14156,6 +14156,30 @@ impl Application for Cagents {
                 .collect();
             app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
             app.context_inspector_open = false;
+            if app
+                .latency_fixture
+                .as_ref()
+                .is_some_and(|fixture| !fixture.automatic())
+            {
+                chat_ui::resident_fixture::install(&mut app);
+                app.window_width /= app.settings.ui_scale;
+                app.window_height /= app.settings.ui_scale;
+                let theme = app.settings.app_theme.resolve(app.core.system_theme());
+                let scale = app.settings.ui_scale;
+                let chrome = app.sync_chrome();
+                // Apply the real shell action: changing only AppSettings
+                // would leave the native viewport at Core's original scale.
+                return (
+                    app,
+                    Task::batch([
+                        chrome,
+                        cosmic::command::set_theme(theme),
+                        Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ScaleFactor(
+                            scale,
+                        ))),
+                    ]),
+                );
+            }
             let chrome = app.sync_chrome();
             return (app, chrome);
         }

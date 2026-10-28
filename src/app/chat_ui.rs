@@ -1,3 +1,5 @@
+#[cfg(feature = "latency-harness")]
+pub(super) mod resident_fixture;
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};

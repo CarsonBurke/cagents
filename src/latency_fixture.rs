@@ -14,6 +14,8 @@ pub const MEASURED_STEPS: usize = 256;
 pub const FIXTURE_VERSION: &str = "adjacent-card-focus-v1";
 const SEED: u64 = 0x4341_4745_4e54_5338;
 pub const INTERACTIVE_ENV: &str = "CAGENTS_NATIVE_UI_FIXTURE";
+pub const SCALE_ENV: &str = "CAGENTS_NATIVE_UI_FIXTURE_SCALE";
+pub const STATUS_BAR_ENV: &str = "CAGENTS_NATIVE_UI_FIXTURE_STATUS_BAR";
 
 /// Both diagnostic modes are in-process UI workloads, never service callers.
 /// Presence fails closed even when a malformed value is rejected at startup.
@@ -77,6 +79,25 @@ impl Fixture {
 
     pub fn automatic(&self) -> bool {
         self.output.is_some()
+    }
+
+    /// Appearance choices are intentionally finite and apply only to the
+    /// interactive fixture. They never load or save a user's settings file.
+    pub fn apply_interactive_appearance(&self, settings: &mut crate::settings::AppSettings) {
+        if self.automatic() {
+            return;
+        }
+        settings.ui_scale = match std::env::var(SCALE_ENV).as_deref() {
+            Ok("0.8") => 0.8,
+            Ok("1") | Err(std::env::VarError::NotPresent) => 1.0,
+            _ => panic!("native fixture scale must be 0.8 or 1"),
+        };
+        settings.show_status_bar = match std::env::var(STATUS_BAR_ENV).as_deref() {
+            Ok("off") => false,
+            Ok("on") | Err(std::env::VarError::NotPresent) => true,
+            _ => panic!("native fixture status bar must be off or on"),
+        };
+        settings.app_theme = crate::settings::AppTheme::Dark;
     }
 
     /// Caller starts at card zero and requests another step only after settlement.

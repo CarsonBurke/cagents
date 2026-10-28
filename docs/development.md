@@ -127,8 +127,18 @@ normal App and main native window with in-memory data. It does not prepare a
 device, recover a saved window, install account state, publish a workspace,
 observe or start a daemon, or connect to a provider. Backend actions are
 unavailable; resize, scroll, focus, local transcript find and selection remain
-local. The initial dataset is eight failed terminal cards, not a populated chat,
-repository, sidebar or inspector qualification workload.
+local. Interactive mode supplies two long resident chats, an empty chat, static
+attachment labels, a long synthetic project list and synthetic Files/Changes
+rows. These are not saved projects, provider history or repository results.
+PR and Channel Work behavior, external link launch, repository editor/diff
+surfaces and image loading remain unavailable. The automatic latency benchmark
+retains its separate eight-card workload.
+
+Interactive appearance is fixed dark theme, with `CAGENTS_NATIVE_UI_FIXTURE_SCALE`
+set to `0.8` or `1` (default `1`) and
+`CAGENTS_NATIVE_UI_FIXTURE_STATUS_BAR` set to `off` or `on` (default `on`). The
+initialization task applies the real COSMIC scale action to Core. These bounded
+selectors never load or save settings and do not affect the automatic benchmark.
 
 Use a coordinated private compositor and private XDG directories for captures.
 The runner preserves inherited `HOME`, agent authority, no-start and scope

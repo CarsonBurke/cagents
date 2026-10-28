@@ -420,6 +420,13 @@ impl Cagents {
         }
     }
     pub(super) fn fixture_bootstrap() -> Bootstrap {
+        if let Some(fixture) = crate::latency_fixture::Fixture::from_env()
+            && !fixture.automatic()
+        {
+            let mut bootstrap = chat_ui::resident_fixture::bootstrap();
+            fixture.apply_interactive_appearance(&mut bootstrap.settings);
+            return bootstrap;
+        }
         let mut state = WorkspaceState::default();
         for index in 0..crate::latency_fixture::CARD_COUNT {
             let launch = LaunchRecipe {
