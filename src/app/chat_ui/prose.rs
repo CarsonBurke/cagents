@@ -701,6 +701,7 @@ impl Renderer {
                         };
                         let number: Option<Element<'static, Message>> = start.map(|start| {
                             iced::widget::text(format!("{}.", index as u64 + start))
+                                .font(settings.style.font)
                                 .size(settings.text_size)
                                 .align_x(iced::alignment::Horizontal::Right)
                                 .width(
@@ -714,7 +715,10 @@ impl Renderer {
                                 .spacing(settings.spacing.0)
                                 .into(),
                             (Some(marker), None) | (None, Some(marker)) => marker,
-                            (None, None) => iced::widget::text("•").size(settings.text_size).into(),
+                            (None, None) => iced::widget::text("•")
+                                .font(settings.style.font)
+                                .size(settings.text_size)
+                                .into(),
                         };
                         let mut prefix = start.map_or_else(
                             || "-".to_owned(),
@@ -1326,6 +1330,80 @@ mod tests {
                         "numbering and ordinary list markers remain visible: {marker}"
                     );
                 }
+            }
+        }
+
+        // Native app defaults come from the desktop interface font; Markdown
+        // carries its own explicit font. Make that mismatch deliberate rather
+        // than letting the usual default SansSerif mask a missing marker font.
+        use iced::advanced::{renderer::Headless, text::Paragraph as _, widget::tree::Tag};
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn markers(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<TextState>() {
+                let state = tree.state.downcast_ref::<TextState>();
+                let content = state.paragraph.content();
+                if matches!(content, "8." | "9." | "1." | "2." | "•") {
+                    out.push((
+                        content.to_owned(),
+                        state.paragraph.raw().font(),
+                        state.paragraph.raw().size().0,
+                    ));
+                }
+            }
+            for child in &tree.children {
+                markers(child, out);
+            }
+        }
+        let default_font = iced::Font::MONOSPACE;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                default_font,
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("actual headless renderer with a distinct interface font");
+        let mut tree = None;
+        for font in [
+            iced::Font::DEFAULT,
+            iced::Font {
+                family: iced::font::Family::Serif,
+                ..iced::Font::DEFAULT
+            },
+        ] {
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            assert_ne!(font, default_font, "fixture must expose renderer fallback");
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1200.0)),
+            );
+            let mut actual = Vec::new();
+            markers(tree, &mut actual);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|marker| marker.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["8.", "9.", "1.", "2.", "•"]
+            );
+            for (marker, actual_font, size) in actual {
+                assert_eq!(
+                    actual_font, font,
+                    "native marker {marker} follows the prose family"
+                );
+                assert_eq!(
+                    size, settings.text_size.0,
+                    "existing marker size remains unchanged"
+                );
             }
         }
 
