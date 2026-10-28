@@ -1926,9 +1926,16 @@ impl Cagents {
         }
         for (index, pane) in panes.iter().enumerate() {
             if self.workspace.card(pane.id).is_none() {
+                // A held reported title is newer than the shared one.
+                let held = self
+                    .reported_title_save
+                    .cards
+                    .contains(&pane.id)
+                    .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
+                    .flatten();
                 if let Ok(card) = WorkspaceCard::new(
                     pane.id,
-                    pane.user_title.as_deref().unwrap_or_else(|| {
+                    pane.user_title.as_deref().or(held).unwrap_or_else(|| {
                         browser_host::presentation_title(&pane.kind, &pane.title)
                     }),
                     CardWidth::Fraction(pane.width_fraction),
@@ -4401,6 +4408,31 @@ mod tests {
         assert!(publishes_title(&app), "its save publishes it");
         assert!(app.reported_title_save.cards.is_empty());
         assert_eq!(app.card_state(card).unwrap().title, "build done");
+    }
+
+    /// Every save other than reconciliation's own publishes held titles, so
+    /// exiting, which saves, never leaves one unpublished.
+    #[test]
+    fn a_save_publishes_held_reported_titles() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let card = app.workspace.focused().unwrap();
+        let shared = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.panes.push(shared);
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        app.shared_views.pending.clear();
+
+        assert!(app.apply_reported_title(card, "build done".into()));
+        drop(app.save_reported_titles_soon(card));
+        app.persist();
+        assert!(app.reported_title_save.cards.is_empty());
+        assert!(app.shared_views.pending.iter().any(|(_, _, change)| {
+            matches!(change, Change::Update { pane, .. } if pane.id == card && pane.title == "build done")
+        }));
     }
 
     /// A name given in another window replaces a held reported title, which

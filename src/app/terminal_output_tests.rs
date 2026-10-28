@@ -488,6 +488,8 @@ fn repaint_ticks_skip_the_projection_tail() {
     let durable = Arc::clone(&app.durable);
     for _ in 0..8 {
         drop(app.update(Message::ChatUi(super::chat_ui::Action::Tick)));
+        #[cfg(feature = "integrated-browser")]
+        drop(app.update(Message::BrowserProgressTick));
     }
     assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
     assert!(Arc::ptr_eq(&durable, &app.durable));
