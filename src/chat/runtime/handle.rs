@@ -1,7 +1,9 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
 use super::retained_actor::journal::{InputIdentity, InputReceipt, OutboxEntry};
 use super::retained_actor::transport::{ActorIdentity, RemoteActor};
-use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
+use super::{
+    ActivityObservation, LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness,
+};
 use crate::chat::{
     self, Command, Snapshot,
     protocol::{Adapter, ProcessSpec, Step},
@@ -591,6 +593,24 @@ impl Handle {
             Owner::Remote(remote) => remote.state().activity,
         }
     }
+    pub(crate) fn attention_activity(&self) -> Option<ActivityObservation> {
+        match &self.0 {
+            Owner::Local(local) => local.attention_activity(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                let live = !state.completed && !state.close.exited && !state.close.closing;
+                Some(ActivityObservation::bounded(
+                    live && state.ready,
+                    if live {
+                        state.activity
+                    } else {
+                        crate::agent::ActivityState::Unknown
+                    },
+                    state.title.as_deref(),
+                ))
+            }
+        }
+    }
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         match &self.0 {
             Owner::Local(local) => local.update_activity(),
@@ -725,6 +745,24 @@ impl chat::protocol::LaunchCleanup for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attention_observes_retained_resident_without_helper_and_suppresses_completion() {
+        let remote = RemoteActor::fixture();
+        let handle = Handle(Owner::Remote(remote));
+        let observation = handle
+            .attention_activity()
+            .expect("resident proxy is available");
+        assert!(observation.ready);
+        assert_eq!(observation.activity, crate::agent::ActivityState::Idle);
+        assert_eq!(observation.title, None);
+
+        let completed = Handle(Owner::Remote(RemoteActor::completed_failure_fixture()));
+        assert!(completed.is_completed());
+        let observation = completed.attention_activity().unwrap();
+        assert!(!observation.ready);
+        assert_eq!(observation.activity, crate::agent::ActivityState::Unknown);
+    }
+
     #[test]
     fn attachment_identity_distinguishes_new_proxy_epochs_of_the_same_actor() {
         let remote = RemoteActor::fixture();
