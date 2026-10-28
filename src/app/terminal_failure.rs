@@ -223,6 +223,36 @@ struct Probe {
     available: bool,
     pending: bool,
     retry_at: Instant,
+    /// Consecutive probes that found the transcript unavailable.
+    failures: u32,
+}
+/// The wait before probing an unavailable transcript again. It doubles with
+/// each consecutive failure, up to [`PROBE_RETRY_MAX`].
+const PROBE_RETRY_BASE: Duration = Duration::from_secs(10);
+const PROBE_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+/// Consecutive failures that arm a timer of their own. Later retries wait for
+/// another full update, so an idle app with a lost transcript goes quiet.
+const PROBE_RETRY_TIMERS: u32 = 5;
+impl Probe {
+    /// Records that the transcript is unavailable and schedules the next
+    /// probe. Answers when to wake for it, if it warrants its own timer.
+    fn unavailable(&mut self, remote: bool, now: Instant) -> Option<Instant> {
+        self.available = false;
+        self.pending = false;
+        if remote {
+            // A remote device's transcript is never local, so probing again
+            // cannot succeed; only another full update re-checks it.
+            self.retry_at = now + PROBE_RETRY_BASE;
+            return None;
+        }
+        self.failures = self.failures.saturating_add(1);
+        let doublings = (self.failures - 1).min(16);
+        self.retry_at = now
+            + PROBE_RETRY_BASE
+                .saturating_mul(1 << doublings)
+                .min(PROBE_RETRY_MAX);
+        (self.failures <= PROBE_RETRY_TIMERS).then_some(self.retry_at)
+    }
 }
 #[derive(Debug, Clone)]
 struct Attempt {
@@ -269,11 +299,24 @@ pub(super) enum Action {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     },
+    /// An unavailable probe's retry time has come. Handling it runs the full
+    /// update tail, which probes again.
+    ProbeRetryDue,
 }
 impl Action {
     pub(super) fn is_user_action(&self) -> bool {
         matches!(self, Self::Copy(_) | Self::Reveal(_))
     }
+}
+/// Probes are retried by the update tail, which runs only for messages that
+/// may change what it reads; this message brings it at the retry time.
+fn probe_retry_timer(at: Instant) -> Task<Message> {
+    #[cfg(test)]
+    tests::ARMED.with(|armed| armed.borrow_mut().push(at));
+    cosmic::task::future(async move {
+        tokio::time::sleep_until(at.into()).await;
+        Message::TerminalFailure(Action::ProbeRetryDue)
+    })
 }
 fn fresh_transcript(
     session: &TerminalSession,
@@ -470,19 +513,28 @@ impl Cagents {
             }
             let session = session.clone();
             let operation = uuid::Uuid::new_v4();
-            self.terminal_failure.probes.insert(
-                card,
-                Probe {
-                    operation,
-                    session: session.clone(),
-                    saved_context: saved_context.clone(),
-                    activation: None,
-                    available: false,
-                    pending: !crate::device::is_remote(),
-                    retry_at: Instant::now() + Duration::from_secs(10),
-                },
-            );
-            if crate::device::is_remote() {
+            // A retry keeps counting the failures before it.
+            let failures = self
+                .terminal_failure
+                .probes
+                .get(&card)
+                .map_or(0, |probe| probe.failures);
+            let remote = crate::device::is_remote();
+            let mut probe = Probe {
+                operation,
+                session: session.clone(),
+                saved_context: saved_context.clone(),
+                activation: None,
+                available: false,
+                pending: true,
+                retry_at: Instant::now(),
+                failures,
+            };
+            if remote {
+                let _ = probe.unavailable(true, Instant::now());
+            }
+            self.terminal_failure.probes.insert(card, probe);
+            if remote {
                 continue;
             }
             tasks.push(cosmic::task::future(async move {
@@ -655,11 +707,17 @@ impl Cagents {
                 if self.probe_current(card, operation)
                     && let Some(probe) = self.terminal_failure.probes.get_mut(&card)
                 {
-                    probe.available = available;
-                    probe.pending = false;
+                    if available {
+                        probe.available = true;
+                        probe.pending = false;
+                        probe.failures = 0;
+                    } else if let Some(at) = probe.unavailable(false, Instant::now()) {
+                        return probe_retry_timer(at);
+                    }
                 }
                 Task::none()
             }
+            Action::ProbeRetryDue => Task::none(),
             Action::Reveal(intent) => {
                 let card = intent.diagnostic.card;
                 if self.terminal_transcript_intent(card).as_ref() != Some(&intent) {
@@ -754,14 +812,18 @@ impl Cagents {
                 owner,
                 result,
             } => {
+                let mut retry = Task::none();
                 if owner.card == card
                     && self.diagnostic_intent_is_current(&owner)
                     && self.probe_current(card, operation)
                 {
                     if let Some(probe) = self.terminal_failure.probes.get_mut(&card) {
-                        probe.pending = false;
                         if result.is_err() {
-                            probe.available = false;
+                            if let Some(at) = probe.unavailable(false, Instant::now()) {
+                                retry = probe_retry_timer(at);
+                            }
+                        } else {
+                            probe.pending = false;
                         }
                     }
                     if result.is_err() {
@@ -770,7 +832,7 @@ impl Cagents {
                         ));
                     }
                 }
-                Task::none()
+                retry
             }
             Action::RetryFinished {
                 card,
@@ -835,6 +897,7 @@ mod tests {
                 available: true,
                 pending: false,
                 retry_at: Instant::now(),
+                failures: 0,
             },
         );
     }
@@ -1424,6 +1487,7 @@ mod tests {
                 available: true,
                 pending: false,
                 retry_at: Instant::now(),
+                failures: 0,
             },
         );
         let owner = app.terminal_diagnostic_intent(card).unwrap();
@@ -1454,6 +1518,7 @@ mod tests {
                 available: false,
                 pending: true,
                 retry_at: Instant::now(),
+                failures: 0,
             },
         );
         drop(app.update_terminal_failure(Action::Probed {
@@ -1472,6 +1537,154 @@ mod tests {
             available: true,
         }));
         assert!(!app.terminal_failure.probes[&card].available);
+    }
+    thread_local! {
+        /// Deadlines of the probe retry timers armed on this test thread.
+        pub(super) static ARMED: std::cell::RefCell<Vec<Instant>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    fn armed() -> Vec<Instant> {
+        ARMED.with(|armed| std::mem::take(&mut *armed.borrow_mut()))
+    }
+    fn probing(app: &mut Cagents, card: CardId, session: &TerminalSession) -> uuid::Uuid {
+        let operation = uuid::Uuid::new_v4();
+        let failures = app
+            .terminal_failure
+            .probes
+            .get(&card)
+            .map_or(0, |probe| probe.failures);
+        app.terminal_failure.probes.insert(
+            card,
+            Probe {
+                operation,
+                session: session.clone(),
+                saved_context: None,
+                activation: None,
+                available: false,
+                pending: true,
+                retry_at: Instant::now(),
+                failures,
+            },
+        );
+        operation
+    }
+    /// The update tail retries an unavailable probe, but nothing else may run
+    /// that tail by then, so the reply arms its own retry at the probe's
+    /// retry time. A found transcript arms nothing and resets the backoff.
+    #[test]
+    fn an_unavailable_probe_arms_its_retry_and_an_available_one_does_not() {
+        let (mut app, card, session) = app_and_session();
+        armed();
+        let operation = probing(&mut app, card, &session);
+        let before = Instant::now();
+        assert_eq!(
+            app.update_terminal_failure(Action::Probed {
+                card,
+                operation,
+                available: false,
+            })
+            .units(),
+            1
+        );
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!(armed(), vec![probe.retry_at]);
+        assert!(probe.retry_at >= before + PROBE_RETRY_BASE);
+        assert!(!probe.pending && !probe.available);
+
+        let operation = probing(&mut app, card, &session);
+        drop(app.update_terminal_failure(Action::Probed {
+            card,
+            operation,
+            available: true,
+        }));
+        assert!(armed().is_empty());
+        assert_eq!(app.terminal_failure.probes[&card].failures, 0);
+    }
+    /// Delivering the timer reprobes a visible ended terminal whose retry time
+    /// has come, carrying its failure count forward.
+    #[test]
+    fn a_due_retry_probes_again() {
+        let (mut app, card, session) = app_and_session();
+        app.cards.insert(card, CardRuntime::Completed);
+        let _ = app.workspace.resize_viewport(1200.0);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let operation = probing(&mut app, card, &session);
+        drop(app.update_terminal_failure(Action::Probed {
+            card,
+            operation,
+            available: false,
+        }));
+        app.terminal_failure.probes.get_mut(&card).unwrap().retry_at = Instant::now();
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        assert_ne!(probe.operation, operation, "a new probe started");
+        assert!(probe.pending);
+        assert_eq!(probe.failures, 1);
+    }
+    /// Retries back off and stop arming timers, so an idle app with a lost
+    /// transcript goes quiet. A remote transcript is never armed for.
+    #[test]
+    fn retries_back_off_then_wait_for_other_updates_and_never_arm_remotely() {
+        let (_, _, session) = app_and_session();
+        let now = Instant::now();
+        let mut probe = Probe {
+            operation: uuid::Uuid::new_v4(),
+            session,
+            saved_context: None,
+            activation: None,
+            available: false,
+            pending: true,
+            retry_at: now,
+            failures: 0,
+        };
+        let delays = (0..8)
+            .map(|_| probe.unavailable(false, now).map(|at| at - now))
+            .collect::<Vec<_>>();
+        let secs = |s| Some(Duration::from_secs(s));
+        assert_eq!(
+            delays,
+            [
+                secs(10),
+                secs(20),
+                secs(40),
+                secs(80),
+                secs(160),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(probe.retry_at - now, PROBE_RETRY_MAX);
+
+        probe.failures = 0;
+        assert_eq!(probe.unavailable(true, now), None);
+        assert_eq!(probe.failures, 0);
+        assert_eq!(probe.retry_at - now, PROBE_RETRY_BASE);
+    }
+    /// A reveal that finds the transcript gone arms the same retry.
+    #[test]
+    fn a_failed_reveal_arms_a_retry() {
+        let (mut app, card, session) = app_and_session();
+        armed();
+        let operation = probing(&mut app, card, &session);
+        let owner = app.terminal_diagnostic_intent(card).unwrap();
+        assert_eq!(
+            app.update_terminal_failure(Action::Revealed {
+                card,
+                operation,
+                owner,
+                result: Err(transcript_location::Unavailable::Changed),
+            })
+            .units(),
+            1
+        );
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!(armed(), vec![probe.retry_at]);
+        assert!(!probe.available && !probe.pending);
     }
 }
 
