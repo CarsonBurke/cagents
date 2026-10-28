@@ -1355,7 +1355,7 @@ impl Cagents {
                 // this out of Deletion.failure: its RetryDelete action is an
                 // already-confirmed destructive operation.
                 self.status = Some(TransientNotice::warning(match result {
-                    Err(reason) => format!("Worktree kept: {reason}"),
+                    Err(reason) => reason,
                     Ok(_) => "Worktree kept: automatic checks keep files. Review it, then choose Delete worktree and confirm to discard its files.".into(),
                 }));
                 return Task::none();
