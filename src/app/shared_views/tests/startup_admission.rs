@@ -18,6 +18,16 @@ use std::{
 /// every application path in a separate process, away from the user's services
 /// and tests running concurrently in this binary.
 fn isolated(name: &str) -> bool {
+    for variable in [
+        crate::agent_execution::AUTHORITY_ENV,
+        "CAGENTS_AGENT_TOKEN",
+        "CAGENTS_SESSION_TOKEN",
+    ] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "startup admission qualification requires a genuine User/CI launch; inherited role variables must not be replaced"
+        );
+    }
     const CHILD: &str = "CAGENTS_STARTUP_ADMISSION_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return false;
@@ -32,7 +42,7 @@ fn isolated(name: &str) -> bool {
         .unwrap();
     }
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    // Preserve inherited delegation while keeping every fixture path private.
+    // Isolate this User-only fixture without rewriting the authority slot.
     for (name, _) in std::env::vars_os() {
         if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
             command.env_remove(name);
