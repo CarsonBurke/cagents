@@ -199,7 +199,7 @@ pub enum Action {
     AwaitSessions(Target),
     AutomaticallyDeleted {
         target: Target,
-        removed: Option<RemovedWorktree>,
+        result: Result<Option<RemovedWorktree>, String>,
     },
     Deleted {
         target: Target,
@@ -365,16 +365,19 @@ impl Cagents {
         self.sync_worktree_operation_rows();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
-            let removed = tokio::task::spawn_blocking(move || {
-                let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
-                let crate::device_service::Reply::MergedWorktreeRemoved(Some(removed)) = reply else { return None; };
+            let result = tokio::task::spawn_blocking(move || {
+                let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request })?;
+                let crate::device_service::Reply::MergedWorktreeRemoved(removed) = reply else {
+                    return Err("The daemon did not confirm merged worktree cleanup; the worktree has been kept.".to_owned());
+                };
+                let Some(removed) = removed else { return Ok(None); };
                 if let Some(store) = store
                     && let Err(errors) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
                     for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
                 }
-                Some(removed)
-            }).await.ok().flatten();
-            Message::ProjectUi(Action::AutomaticallyDeleted { target, removed })
+                Ok(Some(removed))
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            Message::ProjectUi(Action::AutomaticallyDeleted { target, result })
         })
     }
 
@@ -1306,11 +1309,12 @@ impl Cagents {
                 }
                 return self.start_worktree_deletion(target);
             }
-            Action::AutomaticallyDeleted { target, removed } => {
-                if removed
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.path == target.path)
-                {
+            Action::AutomaticallyDeleted { target, result } => {
+                if result.as_ref().is_ok_and(|removed| {
+                    removed
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.path == target.path)
+                }) {
                     return self.handle_project_action(Action::Deleted {
                         target,
                         result: Ok(()),
@@ -1319,6 +1323,13 @@ impl Cagents {
                 if let Some(id) = target.worktree {
                     self.project_ui.deletions.remove(&id);
                 }
+                // Automatic cleanup has no user confirmation to reuse. Keep
+                // this out of Deletion.failure: its RetryDelete action is an
+                // already-confirmed destructive operation.
+                self.status = Some(TransientNotice::warning(match result {
+                    Err(reason) => format!("Worktree kept: {reason}"),
+                    Ok(_) => "Worktree kept: the daemon did not confirm removal. Review it, then choose Delete worktree to confirm deletion.".into(),
+                }));
                 self.sync_worktree_operation_rows();
                 return self.lifecycle_sweep();
             }
@@ -2338,6 +2349,79 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn automatic_retention_keeps_the_row_catalog_and_confirmation_boundary() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        app.session
+            .as_ref()
+            .unwrap()
+            .save_worktrees([WorktreeState {
+                id: linked.id,
+                project_id: project,
+                generation: 0,
+                path: linked.path.clone(),
+                branch: Some("feature".into()),
+                existence: Existence::Open,
+            }]);
+        // The automatic task owns only this temporary pending state. It has
+        // never displayed or received the manual deletion confirmation.
+        app.project_ui.deletions.insert(
+            linked.id,
+            Deletion {
+                target: target.clone(),
+                started_at: Instant::now(),
+                failure: None,
+            },
+        );
+        app.sync_worktree_operation_rows();
+        let reason = "Kept: external writes cannot be excluded; choose Delete worktree and confirm";
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target,
+            result: Err(reason.into()),
+        }));
+        assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
+        assert_eq!(row(&app, linked.id).unwrap().deletion, None);
+        assert!(app.project_ui.deletions.is_empty());
+        assert!(app.status.as_ref().unwrap().message.contains(reason));
+        let session = app.session.as_ref().unwrap();
+        session.flush(Duration::from_secs(5)).unwrap();
+        let retained = session
+            .operation_store()
+            .load_worktree(linked.id)
+            .unwrap()
+            .unwrap();
+        assert!(retained.existence.is_open());
+        assert_eq!(retained.path, linked.path);
+        assert_eq!(retained.branch.as_deref(), Some("feature"));
+
+        // A stale RetryDelete message must not turn an automatic refusal into
+        // an unconfirmed force removal. The ordinary row action still opens
+        // its existing confirmation with no already-confirmed failure state.
+        drop(app.handle_project_action(Action::RetryDelete(linked.id)));
+        assert!(app.project_ui.deletions.is_empty());
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.blocker.is_none());
+        assert!(dialog.failure.is_none());
+        assert!(app.project_ui.deletions.is_empty());
     }
 
     #[test]

@@ -370,13 +370,21 @@ pub(super) fn process_request(
                             .unwrap_or_else(|p| p.into_inner())
                             .allow_automatic_worktree_cleanup(client_id, windows)
                     })
-                    .ok()
+                    .map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?
             }
-            Err(_) => None,
+            Err(message) => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    message,
+                    false,
+                ));
+            }
         };
         return Ok((
             ServerResponse::DeviceOperation {
-                reply: crate::device_service::Reply::MergedWorktreeRemoved(removed),
+                reply: crate::device_service::Reply::MergedWorktreeRemoved(Some(removed)),
             },
             Vec::new(),
             false,
@@ -2198,6 +2206,37 @@ mod tests {
             super::super::state::HostState::new(proof.clone()),
         ));
         (proof, host)
+    }
+
+    #[test]
+    fn automatic_worktree_cleanup_preserves_refusal_instead_of_silent_none() {
+        let (_, host) = panic_test_host("automatic-worktree-refusal");
+        let source =
+            crate::github_identity::GitHubRepoKey::new("github.com", None, "fixture", "repository")
+                .unwrap();
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::DeviceOperation {
+                operation: crate::device_service::Operation::RemoveMergedWorktree {
+                    request: crate::worktree_cleanup::RemovalRequest {
+                        repository: "relative-repository".into(),
+                        path: "relative-worktree".into(),
+                        branch: "feature".into(),
+                        head_oid: "a".repeat(40),
+                        source_repository: source.clone(),
+                        pull_request: crate::github_identity::PullRequestKey {
+                            repository: source,
+                            number: 1,
+                        },
+                    },
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        assert_eq!(error.message, "Worktree path is not absolute");
     }
 
     /// The host mutex panics when its holder locks it again, on the promise
