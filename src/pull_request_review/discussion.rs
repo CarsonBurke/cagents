@@ -703,6 +703,69 @@ mod tests {
     }
 
     #[test]
+    fn discard_refuses_changed_pending_scope_but_allows_an_unchanged_review_after_diff_moves() {
+        let mut expected = context();
+        expected.pending.as_mut().unwrap().comment_count = 1;
+        let repo = repository();
+        let key = PullRequestKey::new(repo.clone(), 1).unwrap();
+        let mutation = Mutation::Discard {
+            review_id: "REVIEW_1".into(),
+        };
+        for changed in [
+            "added comment",
+            "removed comment",
+            "commit",
+            "identity",
+            "absent",
+        ] {
+            let api = ScriptedApi::new();
+            let mut current = expected.clone();
+            match changed {
+                "added comment" => current.pending.as_mut().unwrap().comment_count = 2,
+                "removed comment" => current.pending.as_mut().unwrap().comment_count = 0,
+                "commit" => current.pending.as_mut().unwrap().commit_oid = Some("c".repeat(40)),
+                "identity" => current.pending.as_mut().unwrap().id = "REVIEW_other".into(),
+                "absent" => current.pending = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    execute_current(
+                        &api,
+                        &repo,
+                        &key,
+                        &current,
+                        &expected,
+                        &mutation,
+                        &CancellationToken::new(),
+                    ),
+                    Err(Outcome::Refused(_))
+                ),
+                "{changed} must require a new discard confirmation"
+            );
+            assert!(api.discarded.lock().unwrap().is_empty(), "{changed}");
+        }
+        let api = ScriptedApi::new();
+        let mut current = expected.clone();
+        current.head_oid = "c".repeat(40);
+        current.base_oid = "d".repeat(40);
+        assert_eq!(
+            execute_current(
+                &api,
+                &repo,
+                &key,
+                &current,
+                &expected,
+                &mutation,
+                &CancellationToken::new(),
+            ),
+            Ok(()),
+            "unchanged pending work can be discarded even after its diff moves"
+        );
+        assert_eq!(&*api.discarded.lock().unwrap(), &["REVIEW_1"]);
+    }
+
+    #[test]
     fn changed_head_base_viewer_or_pull_request_refuses_captured_authority() {
         let expected = context();
         assert_eq!(same_authority(&expected, &expected), Ok(()));

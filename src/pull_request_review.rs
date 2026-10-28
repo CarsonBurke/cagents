@@ -3997,6 +3997,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn refresh_started_before_a_viewed_ack_cannot_undo_that_outcome() {
+        for (initial, requested, outcome, expected, sync) in [
+            (
+                false,
+                true,
+                ViewedOutcome::Applied,
+                true,
+                ViewedSync::Settled,
+            ),
+            (
+                true,
+                false,
+                ViewedOutcome::Applied,
+                false,
+                ViewedSync::Settled,
+            ),
+            (
+                false,
+                true,
+                ViewedOutcome::NotApplied("refused".into()),
+                false,
+                ViewedSync::Settled,
+            ),
+            (
+                false,
+                true,
+                ViewedOutcome::Unknown("lost receipt".into()),
+                true,
+                ViewedSync::Unverified,
+            ),
+        ] {
+            let (mut state, _) = state();
+            let snapshot = loaded(
+                vec![entry("a.rs", ChangeKind::Modified)],
+                vec![remote_file("a.rs", initial)],
+            );
+            open_with(&mut state, snapshot.clone());
+            drop(state.update(Action::Refresh));
+            drop(state.update(Action::ToggleViewed(path("a.rs"))));
+            drop(state.update(Action::ViewedApplied {
+                generation: state.generation,
+                authority_revision: state.authority_revision,
+                results: vec![(path("a.rs"), requested, outcome)],
+            }));
+            finish_load(&mut state, snapshot.clone());
+            assert_eq!(
+                (state.files[0].viewed, state.files[0].sync),
+                (expected, sync),
+                "an older refresh cannot undo the newer mutation outcome"
+            );
+            // A genuinely subsequent read still accepts a change from another
+            // GitHub window, instead of pinning this local mark indefinitely.
+            drop(state.update(Action::Refresh));
+            finish_load(&mut state, snapshot);
+            assert_eq!(state.files[0].viewed, initial);
+            assert_eq!(state.files[0].sync, ViewedSync::Settled);
+        }
+    }
+
+    #[test]
     fn a_refresh_keeps_a_pending_mark_over_the_older_answer() {
         let (mut state, _) = state();
         open_with(
