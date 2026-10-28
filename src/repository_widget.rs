@@ -12027,8 +12027,6 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             &mut inner,
         );
         let mut rectangles = inner.into_rectangles();
-        // Keep the child's target stacking order when the outer collection is extracted.
-        rectangles.reverse();
         crate::workspace_widget::clip_drag_destinations(&mut rectangles, layout.bounds());
         destinations.append(&mut rectangles);
     }

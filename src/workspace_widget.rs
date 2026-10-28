@@ -2105,9 +2105,6 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             &mut inner,
         );
         let mut rectangles = inner.into_rectangles();
-        // Extraction reverses stacking order. Preserve insertion order here;
-        // the enclosing native collection performs the final reversal.
-        rectangles.reverse();
         clip_drag_destinations(&mut rectangles, layout.bounds());
         destinations.append(&mut rectangles);
     }

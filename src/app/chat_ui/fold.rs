@@ -398,10 +398,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
             renderer,
             &mut inner,
         );
-        // Extraction reverses stacking order; restore insertion order before
-        // appending to the enclosing collection, which performs its own reversal.
         let mut rectangles = inner.into_rectangles();
-        rectangles.reverse();
         crate::workspace_widget::clip_drag_destinations(
             &mut rectangles,
             Self::shown(state, layout),
