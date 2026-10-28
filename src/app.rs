@@ -28395,6 +28395,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_git_mutation_does_not_restore_consumed_marker_confirmation() {
+        for confirmed in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+            let source = app.sidebar_model.source_control.as_mut().unwrap();
+            let first = source
+                .group(crate::repository::ChangeArea::Unstaged)
+                .unwrap()
+                .rows()[0]
+                .selection();
+            let marker = source
+                .group(crate::repository::ChangeArea::Untracked)
+                .unwrap()
+                .rows()[0]
+                .selection();
+            source.pending_marker_stage = Some(vec![marker.clone()]);
+            source
+                .pending_marker_approval
+                .insert(marker.path.clone(), (1, 2, 3, 4, 5, 6, 7));
+            // Admission captures the earlier visible confirmation in rollback.
+            // Its later Cancel or Stage anyway decision belongs to the live UI.
+            drop(app.enqueue_git_mutation(key.clone(), super::QueuedGitMutation::Stage(vec![first])));
+            let operation = app.source_control_mutations[&key.canonical_path].id;
+            drop(
+                app.update(Message::Sidebar(SidebarAction::ConfirmStageMarkers {
+                    key: key.clone(),
+                    confirmed,
+                })),
+            );
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(source.pending_marker_stage.is_none());
+            assert!(source.pending_marker_approval.is_empty());
+            assert_eq!(
+                app.source_control_mutations[&key.canonical_path]
+                    .pending
+                    .len(),
+                usize::from(confirmed)
+            );
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation,
+                report: Some("The unrelated stage failed".into()),
+                committed: false,
+            }));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(
+                source.pending_marker_stage.is_none(),
+                "a later failure cannot revive the consumed confirmation: {confirmed}"
+            );
+            assert!(source.pending_marker_approval.is_empty());
+            if confirmed {
+                let mutation = &app.source_control_mutations[&key.canonical_path];
+                let Some(super::QueuedGitMutation::StageApproved {
+                    selection,
+                    approved,
+                }) = &mutation.request
+                else {
+                    panic!("the one approved request retains its captured paths and marker versions")
+                };
+                assert_eq!(selection, &vec![marker.clone()]);
+                assert_eq!(approved.get(&marker.path), Some(&(1, 2, 3, 4, 5, 6, 7)));
+                let next = mutation.id;
+                drop(app.update(Message::SourceControlMutated {
+                    key: key.clone(),
+                    operation: next,
+                    report: Some("The approved stage also failed".into()),
+                    committed: false,
+                }));
+            }
+            assert!(app.source_control_mutations.is_empty());
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(source.pending_marker_stage.is_none());
+            assert!(source.pending_marker_approval.is_empty());
+            let mut refreshed = sidebar::tests::panel_model().source_control.unwrap();
+            refreshed.key = key.clone();
+            source.carry_mutation_into(&mut refreshed);
+            assert!(refreshed.pending_marker_stage.is_none());
+            assert!(refreshed.pending_marker_approval.is_empty());
+            // A delayed confirmation click after the decision was consumed
+            // cannot admit another mutation from an obsolete offer.
+            drop(
+                app.update(Message::Sidebar(SidebarAction::ConfirmStageMarkers {
+                    key,
+                    confirmed: true,
+                })),
+            );
+            assert!(app.source_control_mutations.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
         let mut app = context_inspector_test_app(false);
