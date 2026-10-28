@@ -1177,6 +1177,7 @@ impl Cagents {
     /// either the old strip or the replacement's ownership is projected.
     fn defer_fenced_repository_replacements(&mut self, views: &mut Vec<View>) -> HashSet<CardId> {
         let mut deferred = HashMap::new();
+        let mut original_orders = HashMap::new();
         for (destination, incoming) in views
             .iter()
             .flat_map(|view| view.panes.iter().map(move |pane| (&view.scope, pane)))
@@ -1215,8 +1216,9 @@ impl Cagents {
                 // The ordinary in-place replacement guard below owns this.
                 continue;
             }
-            let position = self
-                .local_view_cards(&scope)
+            let position = original_orders
+                .entry(scope.clone())
+                .or_insert_with(|| self.local_view_cards(&scope))
                 .iter()
                 .position(|id| *id == card.id)
                 .unwrap_or(0);
@@ -1239,11 +1241,16 @@ impl Cagents {
         for view in views.iter_mut() {
             view.panes.retain(|pane| !deferred.contains_key(&pane.id));
         }
-        // Restore in local order when several fenced editors share a strip.
+        // Preserve incident-report order while grouping placement restoration.
         let mut deferred = deferred.into_values().collect::<Vec<_>>();
         deferred.sort_by_key(|(_, position, _, _, _)| *position);
+        let mut by_scope = HashMap::<Scope, Vec<(usize, Pane)>>::new();
         for (scope, position, pane, incoming, reason) in deferred {
             self.report_retention_incident(pane.id, Some(incoming), reason);
+            by_scope.entry(scope).or_default().push((position, pane));
+        }
+        for (scope, mut retained) in by_scope {
+            let original = original_orders.remove(&scope).unwrap_or_default();
             let index = match views.iter().position(|view| view.scope == scope) {
                 Some(index) => index,
                 None => {
@@ -1252,7 +1259,55 @@ impl Cagents {
                 }
             };
             let view = &mut views[index];
-            view.panes.insert(position.min(view.panes.len()), pane);
+            let survivors = view
+                .panes
+                .iter()
+                .enumerate()
+                .map(|(index, pane)| (pane.id, index))
+                .collect::<HashMap<_, _>>();
+            let mut anchors = vec![(None, None); original.len()];
+            let mut preceding = None;
+            for (index, id) in original.iter().enumerate() {
+                anchors[index].0 = preceding;
+                if let Some(position) = survivors.get(id) {
+                    preceding = Some(*position);
+                }
+            }
+            let mut following = None;
+            for (index, id) in original.iter().enumerate().rev() {
+                anchors[index].1 = following;
+                if let Some(position) = survivors.get(id) {
+                    following = Some(*position);
+                }
+            }
+            // Keep canonical survivor order, placing retained editors before
+            // their nearest surviving original successor, otherwise after a
+            // predecessor, otherwise at the end. Peer reordering can make
+            // those anchors conflict: the earlier retained editor's anchor
+            // wins, so later retained editors never cross it.
+            retained.sort_by_key(|(position, _)| *position);
+            let survivor_count = view.panes.len();
+            let mut gap = 0;
+            let mut insertions = retained
+                .into_iter()
+                .map(|(position, pane)| {
+                    let desired = anchors
+                        .get(position)
+                        .and_then(|(before, after)| after.or_else(|| before.map(|index| index + 1)))
+                        .unwrap_or(survivor_count);
+                    gap = gap.max(desired);
+                    (gap, pane)
+                })
+                .peekable();
+            let mut projected = Vec::with_capacity(view.panes.len() + insertions.len());
+            for (index, pane) in std::mem::take(&mut view.panes).into_iter().enumerate() {
+                while insertions.peek().is_some_and(|(gap, _)| *gap == index) {
+                    projected.push(insertions.next().expect("checked insertion").1);
+                }
+                projected.push(pane);
+            }
+            projected.extend(insertions.map(|(_, pane)| pane));
+            view.panes = projected;
         }
         deferred_ids
     }
@@ -4826,6 +4881,149 @@ mod tests {
             retention_full_read(&mut app);
             assert_eq!(app.notices.entries[0].id, rearmed);
             assert_eq!(app.notices.entries[0].repeats, 1);
+        }
+    }
+
+    #[test]
+    fn moved_shared_repository_replacements_keep_relative_order_after_clean_neighbor_changes() {
+        for destination_first in [false, true] {
+            for reordered_survivors in [false, true] {
+                let (mut app, source, mut a, destination) =
+                    moved_repository_replacement_fixture("dirty", destination_first);
+                let CardKind::Repository(original) = a.kind.clone() else {
+                    unreachable!()
+                };
+                a.scope = Some(original.worktree.clone());
+                let clean = |label: &str| Pane {
+                    id: CardId::new(),
+                    title: label.into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.5,
+                    kind: CardKind::Browser(BrowserSession {
+                        id: BrowserId::new(),
+                        current_url: "https://example.com".parse().unwrap(),
+                        history: vec![],
+                        history_index: 0,
+                        scroll_x: 0.,
+                        scroll_y: 0.,
+                        fidelity: BrowserRestoreFidelity::UrlOnly,
+                    }),
+                    scope: Some(original.worktree.clone()),
+                };
+                let x = clean("removed predecessor");
+                let b = clean("surviving middle");
+                let d = clean("surviving tail");
+                let mut c = a.clone();
+                c.id = CardId::new();
+                c.title = "recovering editor".into();
+                c.scope = Some(original.worktree.clone());
+                let (mut recovery, mut receipt) =
+                    RepositoryRuntime::open_fixture(c.id, "notes.txt", "saved\n");
+                recovery.descriptor = original.clone();
+                let authority = crate::recovery_authority::RecoverySlot::reserve()
+                    .unwrap()
+                    .retain("pending editor cleanup".into(), || {
+                        Err("cleanup still pending".into())
+                    });
+                receipt.generation = receipt.generation.wrapping_add(1);
+                drop(recovery.update(RepositoryAction::RetainedSaveFinished {
+                    identity: receipt,
+                    ticket: u64::MAX,
+                    revision: 0,
+                    saved_text: "saved\n".into(),
+                    result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                        message: "pending editor cleanup".into(),
+                        authority,
+                    }),
+                }));
+                assert!(!recovery.is_dirty() && recovery.has_editor_recovery());
+                assert!(recovery.blocks_navigation());
+                let mut local = vec![x.clone(), a.clone(), b.clone(), c.clone()];
+                if reordered_survivors {
+                    local.push(d.clone());
+                }
+                let mut source_view = View::empty(source);
+                source_view.panes = local;
+                app.workspace_model.views = vec![source_view, View::empty(destination.clone())];
+                drop(app.reconcile_shared_views());
+                app.cards
+                    .insert(c.id, CardRuntime::Repository(Box::new(recovery)));
+                let identities = [a.id, c.id].map(|id| {
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                        unreachable!()
+                    };
+                    (
+                        &**runtime as *const RepositoryRuntime,
+                        runtime.editor_text(),
+                        app.worktree_owners.get(&id).cloned(),
+                    )
+                });
+
+                let Scope::Worktree { path, .. } = &destination else {
+                    unreachable!()
+                };
+                let mut target = View::empty(destination.clone());
+                for mut pane in [a.clone(), c.clone()] {
+                    let CardKind::Repository(replacement) = &mut pane.kind else {
+                        unreachable!()
+                    };
+                    replacement.worktree = path.clone();
+                    replacement.selected_file = Some("peer.txt".into());
+                    pane.scope = Some(path.clone());
+                    target.panes.push(pane);
+                }
+                let clean_survivors = if reordered_survivors {
+                    vec![d.clone(), b.clone()]
+                } else {
+                    vec![b.clone()]
+                };
+                let clean_order = clean_survivors
+                    .iter()
+                    .map(|pane| pane.id)
+                    .collect::<Vec<_>>();
+                let expected = if reordered_survivors {
+                    // Canonical clean order wins when old neighbor anchors
+                    // conflict; A's earlier anchor bounds C behind A.
+                    vec![d.id, a.id, c.id, b.id]
+                } else {
+                    // The removed x must not shift A past its surviving b.
+                    vec![a.id, b.id, c.id]
+                };
+                let mut source_view = View::empty(source);
+                source_view.panes = clean_survivors;
+                app.workspace_model.views = if destination_first {
+                    vec![target, source_view]
+                } else {
+                    vec![source_view, target]
+                };
+                let incoming = app.workspace_model.views.clone();
+                for _ in 0..2 {
+                    drop(app.reconcile_shared_views());
+                    assert_eq!(app.local_view_cards(&Scope::Channel(source)), expected);
+                    assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
+                    assert_eq!(
+                        app.workspace
+                            .order()
+                            .filter(|id| clean_order.contains(id))
+                            .collect::<Vec<_>>(),
+                        clean_order
+                    );
+                    assert!(!app.card_state(x.id).unwrap().existence.is_open());
+                    for (id, (identity, text, owner)) in [a.id, c.id].into_iter().zip(&identities) {
+                        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                            panic!("a fenced editor must remain in its original strip");
+                        };
+                        assert_eq!(&**runtime as *const RepositoryRuntime, *identity);
+                        assert_eq!(runtime.editor_text(), *text);
+                        assert!(runtime.blocks_navigation());
+                        assert_eq!(app.worktree_owners.get(&id), owner.as_ref());
+                        assert_eq!(app.durable.card_scopes.get(&id), Some(&original.worktree));
+                        assert!(!app.local_view_cards(&destination).contains(&id));
+                    }
+                    assert_eq!(app.workspace_model.views, incoming);
+                }
+            }
         }
     }
 
