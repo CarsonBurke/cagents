@@ -5663,6 +5663,12 @@ for line in sys.stdin:
                     "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => {
                         serde_json::json!({"data":[],"nextCursor":null})
                     }
+                    "thread/goal/get" => {
+                        // This synthetic upgrade peer is inactive. Keep its
+                        // original identity and strict refusal of Goal mutations.
+                        assert_eq!(frame["params"]["threadId"], expected);
+                        serde_json::json!({"goal":null})
+                    }
                     method => panic!("unexpected fixture method {method}"),
                 };
                 if socket
