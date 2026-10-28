@@ -35,6 +35,8 @@ mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
 mod terminal_list;
+#[cfg(test)]
+mod terminal_start_authority_tests;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
