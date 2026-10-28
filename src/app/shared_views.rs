@@ -1512,6 +1512,9 @@ impl Cagents {
                     self.sync_closed_chat_draft(id);
                 }
                 let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime)) if runtime.is_saving() => {
+                        "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
+                    }
                     Some(CardRuntime::Repository(runtime))
                         if runtime.is_dirty()
                             && (runtime.has_editor_recovery()
@@ -1520,11 +1523,7 @@ impl Cagents {
                         "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning, then save any remaining edits before closing it."
                     }
                     Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
-                        if runtime.is_saving() {
-                            "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
-                        } else {
-                            "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
-                        }
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
                     }
                     _ => {
                         "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
@@ -1643,14 +1642,14 @@ impl Cagents {
                         && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
                         && runtime.blocks_navigation()
                     {
-                        let message = if runtime.is_dirty()
+                        let message = if runtime.is_saving() {
+                            "Another client changed this pane. Wait for its save to finish before adopting that change."
+                        } else if runtime.is_dirty()
                             && (runtime.has_editor_recovery() || runtime.has_durability_warning())
                         {
                             "Another client changed this pane. Resolve this editor's file recovery or durability warning, then save any remaining edits before adopting that change."
                         } else if runtime.is_dirty() {
                             "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
-                        } else if runtime.is_saving() {
-                            "Another client changed this pane. Wait for its save to finish before adopting that change."
                         } else {
                             "Another client changed this pane. Resolve this editor's file recovery or durability warning before adopting that change."
                         };
@@ -4096,6 +4095,21 @@ mod tests {
         let runtime = match state {
             "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
             "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
+            "dirty-saving" => {
+                let (mut runtime, _) = RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                // Keep the real active SaveTicket while a real editor action
+                // makes the current buffer dirty. Do not fake either predicate.
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card: pane.id,
+                    action: cosmic::widget::text_editor::Action::Edit(
+                        cosmic::widget::text_editor::Edit::Paste(Arc::new("in-flight edit".into())),
+                    ),
+                }));
+                assert!(runtime.is_dirty() && runtime.is_saving());
+                assert!(!runtime.can_save());
+                assert!(!runtime.can_abandon_unsaved_changes());
+                runtime
+            }
             "dirty-warning" => {
                 let (mut runtime, completion) =
                     RepositoryRuntime::post_persist_failure_fixture(pane.id);
@@ -4148,9 +4162,12 @@ mod tests {
         };
         assert_eq!(
             runtime.is_dirty(),
-            matches!(state, "dirty" | "dirty-warning")
+            matches!(state, "dirty" | "dirty-warning" | "dirty-saving")
         );
-        assert_eq!(runtime.is_saving(), state == "saving");
+        assert_eq!(
+            runtime.is_saving(),
+            matches!(state, "saving" | "dirty-saving")
+        );
         assert_eq!(
             runtime.has_durability_warning(),
             matches!(state, "warning" | "dirty-warning")
@@ -4167,9 +4184,37 @@ mod tests {
         (app, channel, pane)
     }
 
+    fn finish_shared_repository_save_with_warning(app: &mut Cagents, id: CardId) {
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&id) else {
+            panic!("the saving editor must remain attached");
+        };
+        let mut completion = runtime.durable_active_save_completion();
+        let RepositoryAction::SaveFinished {
+            result: Ok(crate::editor::SaveOutcome::Saved { durability, .. }),
+            ..
+        } = &mut completion
+        else {
+            unreachable!()
+        };
+        *durability = crate::editor::SaveDurability::Unconfirmed {
+            error: "injected shared-save directory sync failure".into(),
+        };
+        drop(runtime.update(completion));
+        assert!(!runtime.is_saving());
+        assert!(runtime.is_dirty() && runtime.has_durability_warning());
+        assert!(runtime.blocks_navigation());
+    }
+
     #[test]
     fn shared_repository_removal_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
+        for state in [
+            "dirty",
+            "saving",
+            "warning",
+            "recovery",
+            "dirty-warning",
+            "dirty-saving",
+        ] {
             let (mut app, channel, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4204,7 +4249,11 @@ mod tests {
                         assert!(notice.contains("then save any remaining edits"));
                         assert!(!notice.contains("discard"));
                     }
-                    "saving" => assert!(notice.contains("wait for its save to finish")),
+                    "saving" | "dirty-saving" => {
+                        assert!(notice.contains("wait for its save to finish"));
+                        assert!(!notice.contains("save or discard"));
+                        assert!(!notice.contains("resolve its file recovery"));
+                    }
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
                         assert!(!notice.contains("unsaved edits"));
@@ -4217,12 +4266,33 @@ mod tests {
                     })
                 );
             }
+            if state == "dirty-saving" {
+                finish_shared_repository_save_with_warning(&mut app, pane.id);
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("completed save warning must retain the editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.editor_text(), text);
+                assert!(current.has_durability_warning() && current.blocks_navigation());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(notice.contains("resolve its file recovery or durability warning"));
+                assert!(!notice.contains("wait for its save"));
+                assert!(!notice.contains("discard"));
+            }
         }
     }
 
     #[test]
     fn shared_repository_replacement_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
+        for state in [
+            "dirty",
+            "saving",
+            "warning",
+            "recovery",
+            "dirty-warning",
+            "dirty-saving",
+        ] {
             let (mut app, _, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4265,13 +4335,34 @@ mod tests {
                         assert!(notice.contains("then save any remaining edits"));
                         assert!(!notice.contains("discard"));
                     }
-                    "saving" => assert!(notice.contains("Wait for its save to finish")),
+                    "saving" | "dirty-saving" => {
+                        assert!(notice.contains("Wait for its save to finish"));
+                        assert!(!notice.contains("Save or discard"));
+                        assert!(!notice.contains("Resolve this editor's file recovery"));
+                    }
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
                         assert!(!notice.contains("unsaved edits"));
                     }
                     _ => unreachable!(),
                 }
+            }
+            if state == "dirty-saving" {
+                finish_shared_repository_save_with_warning(&mut app, pane.id);
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("completed save warning must retain the editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.descriptor, descriptor);
+                assert_eq!(current.editor_text(), text);
+                assert!(current.has_durability_warning() && current.blocks_navigation());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(
+                    notice.contains("Resolve this editor's file recovery or durability warning")
+                );
+                assert!(!notice.contains("Wait for its save"));
+                assert!(!notice.contains("discard"));
             }
         }
     }
