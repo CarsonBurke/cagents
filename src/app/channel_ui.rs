@@ -1302,7 +1302,7 @@ impl Cagents {
         } else if let Some(blocker) = &blocker
             && dialog.failure.as_ref() != Some(blocker)
         {
-            rows.push(super::notice_body(blocker.as_str()));
+            rows.push(super::notice_body(blocker.clone()));
         }
         let confirm_enabled = self.channel_dialog_can_confirm(dialog);
         let cancel_id = dialog.control_id(false, true);
