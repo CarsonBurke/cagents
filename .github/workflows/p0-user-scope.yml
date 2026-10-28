@@ -375,7 +375,10 @@ jobs:
                                                  'scope': 'Observational only; missing capture is not a product test failure'},
                         'remaining_fixture_processes': remaining,
                         'outer_timeout_or_kill_status': status in (124, 137),
-                        'external_cleanup_performed': False,
+                        'external_cleanup_classification': (
+                            'Outer timeout/kill status; command-group termination may have assisted cleanup'
+                            if status in (124, 137)
+                            else 'No outer timeout/kill status; no additional external fixture cleanup'),
                         'cleanup_scope': 'Test-owned guards and original assertions; no assisted cleanup counted as normal retirement'}
               (phase / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
               results.append(result)
