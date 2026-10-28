@@ -67,6 +67,7 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    include!("chrome_ui/notice_actions_tests.rs");
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -1340,6 +1341,10 @@ impl State {
         self.popup.is_some() || self.rename.is_some()
     }
 
+    pub(super) fn notices_are_open(&self) -> bool {
+        self.popup == Some(Popup::Notices)
+    }
+
     pub(super) fn close(&mut self) {
         self.popup = None;
     }
@@ -1626,6 +1631,14 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
+fn notice_details_id(id: u64) -> String {
+    format!("chrome.notices.details.{id}")
+}
+
+fn notice_open_id(id: u64) -> String {
+    format!("chrome.notices.open.{id}")
+}
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
@@ -1731,11 +1744,15 @@ impl Cagents {
                     ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
                 }
                 ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
-                ring.extend(
-                    self.notices
-                        .recent()
-                        .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
-                );
+                for entry in self.notices.recent() {
+                    if self.notice_card_target(entry.id).is_some() {
+                        ring.push(Cow::Owned(notice_open_id(entry.id)));
+                    }
+                    if entry.notice.details.is_some() {
+                        ring.push(Cow::Owned(notice_details_id(entry.id)));
+                    }
+                    ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
+                }
                 // In the order the notices draw them: the lane's own notice,
                 // then the refused writes. Only one of them offers a retry.
                 let health = self.save_health.as_ref();
@@ -2444,8 +2461,49 @@ impl Cagents {
                 for entry in self.notices.recent() {
                     let severity = entry.notice.severity;
                     let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    let mut actions = Vec::new();
+                    if let Some(card) = self.notice_card_target(entry.id) {
+                        let name = self
+                            .notice_pane_name(card)
+                            .unwrap_or_else(|| "the related pane".into());
+                        actions.push(super::notice_surface_action(
+                            severity,
+                            "Open pane",
+                            format!("Open {name}"),
+                            widget::Id::new(notice_open_id(entry.id)),
+                            Message::OpenNoticePane(entry.id),
+                        ));
+                    }
+                    if entry.notice.details.is_some() {
+                        actions.push(super::notice_surface_action(
+                            severity,
+                            if entry.details_open {
+                                "Collapse details"
+                            } else {
+                                "Expand details"
+                            },
+                            if entry.details_open {
+                                "Collapse diagnostic details"
+                            } else {
+                                "Expand full diagnostic details"
+                            },
+                            widget::Id::new(notice_details_id(entry.id)),
+                            Message::ToggleNoticeDetails(entry.id),
+                        ));
+                    }
+                    if !actions.is_empty() {
+                        lines.push(
+                            widget::column::with_children(actions)
+                                .spacing(space::XS)
+                                .into(),
+                        );
+                    }
                     if let Some(details) = &entry.notice.details {
-                        lines.push(super::notice_surface_details(severity, details));
+                        lines.push(if entry.details_open {
+                            super::notice_surface_detail(severity, details)
+                        } else {
+                            super::notice_surface_details(severity, details)
+                        });
                     }
                     if entry.repeats > 1 {
                         lines.push(super::notice_surface_detail(
