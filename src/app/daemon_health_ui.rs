@@ -776,6 +776,107 @@ mod tests {
     }
 
     #[test]
+    fn actual_device_close_and_escape_restore_cancel_across_fresh_daemon_verification() {
+        for captured in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.daemon_health_ui.health = daemon_health::State::Unreachable {
+                since: std::time::SystemTime::UNIX_EPOCH,
+            };
+            drop(app.update_daemon_health_ui(Action::Open));
+            let original = app.daemon_health_ui.generation;
+            drop(app.update_daemon_health_ui(Action::Prepared {
+                generation: original,
+                target: Err("ownership changed".into()),
+            }));
+            app.device_ui.open = true;
+            let closed = app.update(Message::Device(device_ui::Action::Close));
+            assert!(!app.device_ui.open);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    closed,
+                ),
+                Some(widget::Id::new("daemon-health.cancel")),
+                "the actual Device close reducer must focus the exposed recovery",
+            );
+            let check = dialog_ui::tests::enter_control(
+                cosmic::Application::dialog(&app).unwrap(),
+                health_action_id(&app.daemon_health_ui),
+            );
+            drop(app.update(check));
+            let current = app.daemon_health_ui.generation;
+            assert_ne!(current, original);
+            let target = Arc::new(crate::daemon::RestartTarget::inert_for_ui_test());
+            drop(app.update_daemon_health_ui(Action::Prepared {
+                generation: original,
+                target: Err("obsolete ownership read".into()),
+            }));
+            assert!(app.daemon_health_ui.preparing);
+            drop(app.update_daemon_health_ui(Action::Prepared {
+                generation: current,
+                target: Ok(target.clone()),
+            }));
+            assert!(!app.daemon_health_ui.restarting);
+            drop(app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Tab),
+                captured: false,
+            }));
+            assert_eq!(app.daemon_health_ui.focus, 1);
+            app.device_ui.open = true;
+            let escaped = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Escape),
+                captured,
+            });
+            assert!(
+                !app.device_ui.open,
+                "Escape closes the mounted Device cover"
+            );
+            assert!(app.daemon_health_ui.confirmation);
+            assert!(!app.daemon_health_ui.restarting);
+            assert!(Arc::ptr_eq(
+                app.daemon_health_ui.target.as_ref().unwrap(),
+                &target
+            ));
+            assert_eq!(app.daemon_health_ui.focus, 0);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    escaped,
+                ),
+                Some(widget::Id::new("daemon-health.cancel")),
+            );
+            let selected = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Tab),
+                captured: false,
+            });
+            let stale_close = app.update(Message::Device(device_ui::Action::Close));
+            assert_eq!(
+                app.daemon_health_ui.focus, 1,
+                "stale close preserves a new choice"
+            );
+            assert_eq!(
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    selected.chain(stale_close),
+                ),
+                Some(health_action_id(&app.daemon_health_ui)),
+            );
+            let confirm = dialog_ui::tests::enter_control(
+                cosmic::Application::dialog(&app).unwrap(),
+                health_action_id(&app.daemon_health_ui),
+            );
+            assert!(
+                matches!(confirm, Message::DaemonHealthUi(Action::Confirm { generation }) if generation == current)
+            );
+            // The inert target grants no process authority. Do not poll the
+            // task: only the separate mounted confirmation is exercised here.
+            drop(app.update(confirm));
+            assert!(app.daemon_health_ui.restarting);
+            assert!(app.daemon_health_ui.target.is_none());
+        }
+    }
+
+    #[test]
     fn delayed_daemon_focus_tasks_leave_newly_mounted_keyboard_owner_focused() {
         for restore in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(false);
