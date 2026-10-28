@@ -1018,7 +1018,9 @@ impl Cagents {
                 if unpublished && self.shared_views.blocked.contains(&scope) {
                     continue;
                 }
-                if let Some(task) = self.adopt_execution_agent_display(agent, display) {
+                if let Some(task) =
+                    self.adopt_execution_agent_display_for_registry(model.identity, agent, display)
+                {
                     if unpublished {
                         new_managed_panes.push((scope, card));
                     }
@@ -1062,6 +1064,19 @@ impl Cagents {
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
     ) -> Option<Task<Message>> {
+        self.adopt_execution_agent_display_for_registry(
+            self.workspace_model.identity,
+            agent,
+            display,
+        )
+    }
+
+    fn adopt_execution_agent_display_for_registry(
+        &mut self,
+        registry: uuid::Uuid,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+    ) -> Option<Task<Message>> {
         let session = match display.pane.as_ref().map(|pane| &pane.kind) {
             Some(CardKind::Chat(session)) => {
                 crate::agent_execution::HostedSession::Chat(session.clone())
@@ -1075,7 +1090,7 @@ impl Cagents {
             }
             None => agent.session.clone()?,
         };
-        self.adopt_execution_agent_resolved_session(agent, display, session)
+        self.adopt_execution_agent_resolved_session(registry, agent, display, session)
     }
 
     pub(super) fn adopt_execution_agent_activation_display(
@@ -1108,11 +1123,17 @@ impl Cagents {
         if !owned || !saved_matches {
             return None;
         }
-        self.adopt_execution_agent_resolved_session(agent, display, session)
+        self.adopt_execution_agent_resolved_session(
+            self.workspace_model.identity,
+            agent,
+            display,
+            session,
+        )
     }
 
     fn adopt_execution_agent_resolved_session(
         &mut self,
+        registry: uuid::Uuid,
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
         session: crate::agent_execution::HostedSession,
@@ -1150,6 +1171,9 @@ impl Cagents {
             }
         };
         let card_id = CardId::from_uuid(agent.id.as_uuid());
+        if self.shared_chat_admission_scope_conflicts(registry, card_id, placement) {
+            return None;
+        }
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
         if let Some(existing) = self.durable.cards.iter().find(|card| card.id == card_id) {

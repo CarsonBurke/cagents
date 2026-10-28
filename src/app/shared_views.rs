@@ -270,6 +270,26 @@ impl Cagents {
     /// A different scope's earlier ACK cannot admit a refused source while its
     /// original seed is still unresolved. Keep this authority independently of
     /// error rows, runtimes and pending markers, which can be pruned or closed.
+    pub(super) fn shared_chat_admission_scope_conflicts(
+        &self,
+        registry: uuid::Uuid,
+        card: CardId,
+        scope: &Scope,
+    ) -> bool {
+        self.shared_views.seed_admissions.values().any(|seed| {
+            seed.registry == registry
+                && seed
+                    .failed_chats
+                    .iter()
+                    .chain(&seed.retry_sources)
+                    .any(|retry| {
+                        retry.0.registry == registry
+                            && retry.0.card == card
+                            && &retry.0.scope != scope
+                    })
+        })
+    }
+
     fn preserve_shared_chat_admission_scopes(
         &mut self,
         views: &mut [View],

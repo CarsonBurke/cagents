@@ -1640,6 +1640,36 @@ fn acknowledge_destination_seed(
     seed(source)
 }
 
+fn managed_chat(pane: &Pane, placement: Scope) -> crate::agent_execution::Agent {
+    use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+    let CardKind::Chat(session) = &pane.kind else {
+        unreachable!()
+    };
+    Agent {
+        name: None,
+        id: crate::model::AgentId::from_uuid(pane.id.as_uuid()),
+        origin: Origin::User,
+        spec: Spec {
+            provider: session.launch.provider,
+            account: None,
+            target: Target {
+                repository: "/fixture-project".into(),
+                directory: session.launch.recipe.working_directory.clone(),
+                placement: Some(placement.clone()),
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement,
+        session: Some(HostedSession::Chat(session.clone())),
+        console: None,
+        created_ms: 0,
+        closed: false,
+    }
+}
+
 #[test]
 fn refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider() {
     if isolated(
@@ -2190,6 +2220,8 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
         "canonical_retired",
         "canonical_moved",
         "canonical_moved_pruned",
+        "canonical_moved_managed",
+        "canonical_moved_managed_pruned",
         "local_closed",
         "local_removed",
         "title",
@@ -2232,7 +2264,13 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
         if changed != "legacy_unshared" {
             view.panes.push(sibling.clone());
         }
-        let canonical = model(identity, active, hidden, view);
+        let mut canonical = model(identity, active, hidden, view);
+        if matches!(
+            changed,
+            "canonical_moved_managed" | "canonical_moved_managed_pruned"
+        ) {
+            canonical.agents = vec![managed_chat(&sibling, Scope::Channel(hidden))];
+        }
         let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
         settle(&mut app, connected);
         let scope = Scope::Channel(hidden);
@@ -2283,6 +2321,8 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
                 | "canonical_retired"
                 | "canonical_moved"
                 | "canonical_moved_pruned"
+                | "canonical_moved_managed"
+                | "canonical_moved_managed_pruned"
                 | "legacy_unshared"
         ) {
             hidden_view.panes.retain(|entry| entry.id != sibling.id);
@@ -2311,7 +2351,13 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
                 _ => unreachable!(),
             }
         }
-        if matches!(changed, "canonical_moved" | "canonical_moved_pruned") {
+        if matches!(
+            changed,
+            "canonical_moved"
+                | "canonical_moved_pruned"
+                | "canonical_moved_managed"
+                | "canonical_moved_managed_pruned"
+        ) {
             newer
                 .views
                 .iter_mut()
@@ -2319,8 +2365,18 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
                 .unwrap()
                 .panes
                 .push(sibling.clone());
+            if !newer.agents.is_empty() {
+                newer.agents = vec![managed_chat(&sibling, Scope::Channel(active))];
+                assert!(
+                    crate::workspace_model::views::managed_display(&newer, &newer.agents[0])
+                        .is_some_and(|display| display.scope == Scope::Channel(active))
+                );
+            }
         }
-        if changed == "canonical_moved_pruned" {
+        if matches!(
+            changed,
+            "canonical_moved_pruned" | "canonical_moved_managed_pruned"
+        ) {
             // A normal publication between installing authority and projecting
             // it can prune the old row. The original refusal still owns B.
             assert!(app.install_workspace_model_snapshot(newer.clone()));
@@ -2329,7 +2385,13 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
         }
         let read = app.apply_workspace_model_update(ModelUpdate::Read(newer.clone()));
         settle(&mut app, read);
-        if matches!(changed, "canonical_moved" | "canonical_moved_pruned") {
+        if matches!(
+            changed,
+            "canonical_moved"
+                | "canonical_moved_pruned"
+                | "canonical_moved_managed"
+                | "canonical_moved_managed_pruned"
+        ) {
             assert_eq!(app.local_view_cards(&scope), source_members);
             assert_eq!(
                 app.local_view_cards(&Scope::Channel(active)),
@@ -2438,6 +2500,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                 "proof",
                 "recipe",
                 "canonical_moved",
+                "canonical_moved_managed",
                 "title",
                 "legacy_unshared",
             ] {
@@ -2511,6 +2574,10 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                         .unwrap()
                         .panes
                         .push(destination_pane.clone());
+                    if changed == "canonical_moved_managed" {
+                        canonical.agents =
+                            vec![managed_chat(&originals[changed_card], scope.clone())];
+                    }
                     drop(
                         app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone())),
                     );
@@ -2549,7 +2616,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                         .iter_mut()
                         .find(|view| view.scope == scope)
                         .unwrap();
-                    if changed == "canonical_moved" {
+                    if matches!(changed, "canonical_moved" | "canonical_moved_managed") {
                         view.panes
                             .retain(|pane| pane.id != originals[changed_card].id);
                         let destination_view = newer
@@ -2559,6 +2626,17 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                             .unwrap();
                         destination_view.panes[0].title = "Updated destination browser".into();
                         destination_view.panes.push(originals[changed_card].clone());
+                        if changed == "canonical_moved_managed" {
+                            newer.agents =
+                                vec![managed_chat(&originals[changed_card], destination.clone())];
+                            assert!(
+                                crate::workspace_model::views::managed_display(
+                                    &newer,
+                                    &newer.agents[0],
+                                )
+                                .is_some_and(|display| display.scope == destination)
+                            );
+                        }
                     } else if changed == "legacy_unshared" {
                         view.panes.push(originals[changed_card].clone());
                     } else {
@@ -2599,7 +2677,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                         let read =
                             app.apply_workspace_model_update(ModelUpdate::Read(newer.clone()));
                         settle(&mut app, read);
-                        if changed == "canonical_moved" {
+                        if matches!(changed, "canonical_moved" | "canonical_moved_managed") {
                             assert_eq!(app.local_view_cards(&scope), source_members, "{case}");
                             assert_eq!(
                                 app.local_view_cards(&destination),
@@ -2685,7 +2763,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                             destination_members,
                             "{case}"
                         );
-                        if changed == "canonical_moved" {
+                        if matches!(changed, "canonical_moved" | "canonical_moved_managed") {
                             assert_eq!(
                                 app.card_state(destination_pane.id).unwrap().title,
                                 "Updated destination browser",
