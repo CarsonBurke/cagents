@@ -575,8 +575,8 @@ and `--token` makes the removal refuse if anything changed since that plan.
 
 While a removal runs, no session can start inside the worktree. It is refused
 when a terminal, chat or agent works there, an automation run is in progress
-there, or any process of yours has its working directory or an open file
-inside it, the shell running `cagents work rm` included. Processes in
+there, or any process of yours has its working directory, an open file or a
+mapped file inside it, the shell running `cagents work rm` included. Processes in
 containers are not seen; stop them first. Sessions in other worktrees keep
 running, and the daemon refuses to upgrade or shut down until the removal
 finishes. Agents may read plans, but only you can remove a worktree.

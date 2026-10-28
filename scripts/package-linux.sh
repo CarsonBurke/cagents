@@ -83,13 +83,14 @@ case $VARIANT in
     *) fail "unknown package variant: $VARIANT" ;;
 esac
 
-for command in cargo date dpkg-deb gzip install mktemp sed sha256sum sort strip tar touch wc; do
+for command in awk cargo date dpkg-deb gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
+    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
     # Native build scripts run outside the repository and cannot rely on a mise
     # shim rediscovering mise.toml. Resolve the real executable up front.
@@ -114,27 +115,37 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     export CAGENTS_BUILD_METADATA
 
     build_target() {
-        cargo build \
+        product=$1
+        shift
+        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --release \
             --target-dir "$TARGET_DIR" \
+            --target "$RELEASE_TARGET" \
             "$@"
     }
 
     # Keep package feature sets disjoint. A single invocation would unify
     # package features and compile/link both host and UI implementation graphs.
+    # Override config build.target with the validated native release target and
+    # use Cargo's exact executable paths, including configured output layouts.
     if [ "$VARIANT" = browserless ]; then
-        build_target --no-default-features --bin cagents
-        build_target --no-default-features --features host --bin cagentsd
-        build_target --no-default-features --features ui --bin cagents-ui
+        CLI_BINARY=$(build_target cagents --no-default-features --bin cagents)
+        HOST_BINARY=$(build_target cagentsd --no-default-features --features host --bin cagentsd)
+        UI_BINARY=$(build_target cagents-ui --no-default-features --features ui --bin cagents-ui)
     else
-        build_target --bin cagents
-        build_target --features host --bin cagentsd
-        build_target --features integrated-browser --bin cagents-ui
+        CLI_BINARY=$(build_target cagents --bin cagents)
+        HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
+        UI_BINARY=$(build_target cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
+else
+    # Explicit prebuilt mode retains its native release layout.
+    CLI_BINARY=$TARGET_DIR/release/cagents
+    HOST_BINARY=$TARGET_DIR/release/cagentsd
+    UI_BINARY=$TARGET_DIR/release/cagents-ui
 fi
 
 # Report the package's whole resolved graph: the union of the lanes built above.
@@ -160,11 +171,11 @@ else
 fi
 RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 
-for binary in cagents cagents-ui cagentsd; do
-    [ -x "$TARGET_DIR/release/$binary" ] || fail "missing release binary: $TARGET_DIR/release/$binary"
+for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
+    [ -x "$binary" ] || fail "missing release binary: $binary"
 done
 
-PROTOCOL_VERSION=$("$TARGET_DIR/release/cagents" daemon protocol-version) \
+PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
     || fail 'cannot inspect packaged daemon protocol'
 case $PROTOCOL_VERSION in
     ''|*[!0-9]*) fail 'packaged CLI returned an invalid daemon protocol version' ;;
@@ -189,16 +200,61 @@ install -d -m 0755 \
     "$SHARE_DIR/icons/hicolor/128x128/apps" \
     "$SHARE_DIR/metainfo" \
     "$SHARE_DIR/doc/cagents"
-install -m 0755 "$TARGET_DIR/release/cagents" "$BIN_DIR/cagents"
-install -m 0755 "$TARGET_DIR/release/cagents-ui" "$BIN_DIR/cagents-ui"
-install -m 0755 "$TARGET_DIR/release/cagentsd" "$BIN_DIR/cagentsd"
+install -m 0755 "$CLI_BINARY" "$BIN_DIR/cagents"
+install -m 0755 "$UI_BINARY" "$BIN_DIR/cagents-ui"
+install -m 0755 "$HOST_BINARY" "$BIN_DIR/cagentsd"
 install -m 0644 /dev/null "$BIN_DIR/.cagents-ui-lease-v1"
 if [ "$VARIANT" = full ]; then
     install -m 0755 "$ROOT_DIR/packaging/cagents-uninstall" "$BIN_DIR/cagents-uninstall"
 else
     ln -s cagents "$BIN_DIR/cagents-browserless"
 fi
-strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+# Opt in when repacking already-qualified executable bytes. Skipping the build
+# alone must retain the normal release stripping behavior.
+if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
+    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+fi
+
+# A local/native package can be built on newer glibc than the official release
+# baseline. Declare the requirements of these exact packaged ELFs, not the
+# packager host version or unrelated exported version definitions.
+GLIBC_REQUIREMENTS=$WORK_DIR/glibc-requirements
+printf '%s\n' 2.35 > "$GLIBC_REQUIREMENTS"
+for binary in cagents cagents-ui cagentsd; do
+    VERSION_INFO=$WORK_DIR/$binary-version-info
+    VERSION_ERRORS=$WORK_DIR/$binary-version-errors
+    LC_ALL=C readelf --wide --version-info "$BIN_DIR/$binary" \
+        > "$VERSION_INFO" 2> "$VERSION_ERRORS" \
+        || fail "cannot inspect glibc requirements for $binary"
+    [ ! -s "$VERSION_ERRORS" ] || fail "readelf reported invalid version information for $binary"
+    # Keep inspection and parsing separate: POSIX sh has no pipefail, so a
+    # successful parser must never hide a failed readelf invocation.
+    LC_ALL=C awk '
+        /^Version needs section / { needs++; in_needs = 1; next }
+        /^Version .* section / { in_needs = 0; next }
+        in_needs && /Name:/ {
+            if (NF != 7 || $1 !~ /^0x[0-9a-fA-F]+:$/ || $2 != "Name:" ||
+                $4 != "Flags:" || $6 != "Version:" || $7 !~ /^[0-9]+$/) {
+                bad = 1; exit
+            }
+            if ($3 ~ /^GLIBC_/) {
+                if ($3 !~ /^GLIBC_(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+$/) {
+                    bad = 1; exit
+                }
+                print substr($3, 7)
+                glibc++
+            }
+        }
+        END { if (bad || needs != 1 || !glibc) exit 1 }
+    ' "$VERSION_INFO" >> "$GLIBC_REQUIREMENTS" \
+        || fail "missing or malformed required glibc versions for $binary"
+done
+LC_ALL=C sort -Vu "$GLIBC_REQUIREMENTS" > "$WORK_DIR/glibc-sorted" \
+    || fail 'cannot sort required glibc versions'
+GLIBC_MINIMUM=$(sed -n '$p' "$WORK_DIR/glibc-sorted") \
+    || fail 'cannot select required glibc version'
+[ -n "$GLIBC_MINIMUM" ] || fail 'no minimum glibc version was determined'
+
 sed \
     -e "s/^Name=cagents\$/Name=$PACKAGE_NAME/" \
     -e "s/^Exec=cagents ui\$/Exec=$COMMAND_NAME ui/" \
@@ -281,7 +337,7 @@ Package: $PACKAGE_NAME
 Version: $VERSION
 Architecture: $DEB_ARCH
 Maintainer: cagents contributors <maintainers@cagents.dev>
-Depends: ca-certificates, tzdata, curl, git (>= 2.36), libsecret-tools, libc6 (>= 2.35), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
+Depends: ca-certificates, tzdata, curl, git (>= 2.36), libsecret-tools, libc6 (>= $GLIBC_MINIMUM), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
 Recommends: gh
 Section: devel
 Priority: optional

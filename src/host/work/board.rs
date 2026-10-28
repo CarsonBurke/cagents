@@ -48,7 +48,12 @@ pub(super) fn assemble(projects: &[ProjectView<'_>], context: &Context<'_>) -> B
     let worktrees = projects
         .iter()
         .filter_map(|project| project.local)
-        .flat_map(|local| local.worktrees.iter().map(|worktree| worktree.path.as_path()))
+        .flat_map(|local| {
+            local
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+        })
         .collect::<Vec<_>>();
     let sessions = sessions_by_worktree(context.sessions, &worktrees);
     let mut items = projects
@@ -93,7 +98,10 @@ fn sessions_by_worktree<'a>(
             .filter(|worktree| session.directory.starts_with(worktree))
             .max_by_key(|worktree| worktree.components().count())
         {
-            placed.entry(worktree.to_path_buf()).or_default().push(session);
+            placed
+                .entry(worktree.to_path_buf())
+                .or_default()
+                .push(session);
         }
     }
     placed
@@ -318,15 +326,16 @@ fn convert(pull_request: &crate::github::PullRequest, contains_local_head: bool)
         }
         checks
     });
-    let review = pull_request
-        .review_decision
-        .as_ref()
-        .and_then(|decision| match decision.0.as_str() {
-            "APPROVED" => Some(Review::Approved),
-            "CHANGES_REQUESTED" => Some(Review::ChangesRequested),
-            "REVIEW_REQUIRED" => Some(Review::Required),
-            _ => None,
-        });
+    let review =
+        pull_request
+            .review_decision
+            .as_ref()
+            .and_then(|decision| match decision.0.as_str() {
+                "APPROVED" => Some(Review::Approved),
+                "CHANGES_REQUESTED" => Some(Review::ChangesRequested),
+                "REVIEW_REQUIRED" => Some(Review::Required),
+                _ => None,
+            });
     PullRequest {
         number: pull_request.number,
         title: pull_request.title.clone(),
@@ -434,7 +443,12 @@ mod tests {
         }
     }
 
-    fn pull_request(branch: &str, oid: &str, state: &str, draft: bool) -> crate::github::PullRequest {
+    fn pull_request(
+        branch: &str,
+        oid: &str,
+        state: &str,
+        draft: bool,
+    ) -> crate::github::PullRequest {
         serde_json::from_value(serde_json::json!({
             "number": 7,
             "title": "Seven",
@@ -543,9 +557,16 @@ mod tests {
                 }),
             },
         );
-        local.branch_names = ["main", "feature", "landed", "draft", "merged-plain", "unshared"]
-            .map(str::to_owned)
-            .into();
+        local.branch_names = [
+            "main",
+            "feature",
+            "landed",
+            "draft",
+            "merged-plain",
+            "unshared",
+        ]
+        .map(str::to_owned)
+        .into();
         let mut merged = pull_request("landed", "landed-oid", "MERGED", false);
         merged.number = 8;
         let mut merged_plain = pull_request("merged-plain", "merged-plain-oid", "MERGED", false);
@@ -583,8 +604,16 @@ mod tests {
         assert_eq!(column(&board, "draft"), Some(Column::InProgress));
         assert_eq!(column(&board, "remote-only"), Some(Column::Stale));
         assert_eq!(column(&board, "main"), None, "an idle primary checkout");
-        assert_eq!(column(&board, "merged-plain"), None, "a merged plain branch");
-        assert_eq!(column(&board, "unshared"), None, "no worktree and no pull request");
+        assert_eq!(
+            column(&board, "merged-plain"),
+            None,
+            "a merged plain branch"
+        );
+        assert_eq!(
+            column(&board, "unshared"),
+            None,
+            "no worktree and no pull request"
+        );
         assert_eq!(board.projects[0].name, "repo");
     }
 

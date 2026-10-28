@@ -23,6 +23,11 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(test)]
+mod device_request_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod explicit_authority_server_tests;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
     stream: &'a mut UnixStream,
@@ -519,13 +524,17 @@ pub(super) fn process_request(
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
-        operation: crate::device_service::Operation::RemoveMergedWorktree { request },
+        operation:
+            crate::device_service::Operation::RemoveMergedWorktree {
+                request: removal_request,
+            },
     } = &request
     {
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
-            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            crate::worktree_cleanup::PreparedRemoval::prepare(removal_request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
@@ -736,9 +745,14 @@ pub(super) fn process_request(
             authority,
             operation,
         } => {
-            let reply =
-                super::agent_execution::process(host, authority, operation).map_err(|message| {
-                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            let reply = super::agent_execution::process_request(host, authority, operation)
+                .map_err(|error| match error {
+                    crate::agent_execution::AcceptanceError::Invalid(message) => {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    }
+                    crate::agent_execution::AcceptanceError::MailboxFull(message) => {
+                        ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
+                    }
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
