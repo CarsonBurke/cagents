@@ -2404,19 +2404,19 @@ mod tests {
             .unwrap();
         f.app.sidebar_model.projects[index].id = ProjectId::new();
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "project identity must remain fenced"
         );
         f.app.sidebar_model.projects[index].id = project;
         f.app.sidebar_model.projects[index].kind = ProjectKind::Folder;
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "project kind must remain fenced"
         );
         f.app.sidebar_model.projects[index].kind = ProjectKind::Git;
         f.app.sidebar_model.projects[index].repository = f.old.join("replacement");
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "project path must remain fenced"
         );
         f.app.sidebar_model.projects[index].repository = f.old.clone();
@@ -2424,32 +2424,32 @@ mod tests {
         let original = f.app.sidebar_model.projects[index].worktrees[0].clone();
         f.app.sidebar_model.projects[index].worktrees[0].id = WorktreeId::new();
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "worktree identity must remain fenced"
         );
         f.app.sidebar_model.projects[index].worktrees[0] = original.clone();
         f.app.sidebar_model.projects[index].worktrees[0].path = f.old.join("replacement");
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "worktree path must remain fenced"
         );
         f.app.sidebar_model.projects[index].worktrees[0] = original.clone();
         f.app.sidebar_model.projects[index].worktrees.push(original);
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "duplicate membership cannot disappear"
         );
         f.app.sidebar_model.projects[index].worktrees.pop();
         let moved = f.app.sidebar_model.projects[index].worktrees.pop().unwrap();
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "removed membership must invalidate"
         );
         f.app.sidebar_model.projects[sibling_index]
             .worktrees
             .push(moved);
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "project association must remain fenced"
         );
         let moved = f.app.sidebar_model.projects[sibling_index]
@@ -2459,13 +2459,13 @@ mod tests {
         f.app.sidebar_model.projects[index].worktrees.push(moved);
         let removed = f.app.sidebar_model.projects.remove(sibling_index);
         assert!(
-            before != capture(&mut f.app),
+            before.sidebar != capture(&mut f.app).sidebar,
             "removed project must invalidate"
         );
         f.app.sidebar_model.projects.insert(sibling_index, removed);
         assert!(
-            before == capture(&mut f.app),
-            "restoring membership restores the key"
+            before.sidebar == capture(&mut f.app).sidebar,
+            "restoring membership restores its snapshot"
         );
 
         // A project's primary checkout can repeat its own repository root.
@@ -2518,7 +2518,7 @@ mod tests {
         );
         f.app.sidebar_model.projects.reverse();
         f.app.sidebar_model.projects[sibling_index] = sibling_row;
-        assert!(before == capture(&mut f.app));
+        assert!(before.sidebar == capture(&mut f.app).sidebar);
     }
 
     #[test]
