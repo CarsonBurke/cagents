@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 OUTPUT = Path(os.environ["RUNNER_TEMP"]) / "native1881-ui-results"
 TARGET = Path(os.environ["RUNNER_TEMP"]) / "native1881-ui-target"
-TOTAL_SECONDS = 3000  # Leaves setup/upload time inside the one 60-minute job.
+TOTAL_SECONDS = 3000  # Absolute budget includes checkout/setup from first step.
 CANCEL = []
 RESULTS = []
 
@@ -232,11 +232,20 @@ def main():
     contract = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(contract)
     OUTPUT.mkdir(exist_ok=False)
-    BEGIN = time.monotonic()
-    DEADLINE = BEGIN + TOTAL_SECONDS
+    BEGIN = float(os.environ["NATIVE1881_JOB_START"])
+    DEADLINE = float(os.environ["NATIVE1881_JOB_DEADLINE"])
+    now = time.monotonic()
+    assert math.isfinite(BEGIN) and 0 <= BEGIN <= now
+    assert math.isfinite(DEADLINE) and abs(DEADLINE - BEGIN - TOTAL_SECONDS) < 0.001
+    budget_record = json.loads((Path(os.environ["RUNNER_TEMP"]) / "native1881-job-budget.json").read_text())
+    assert abs(budget_record["earliest_step_monotonic"] - BEGIN) < 0.001
+    assert abs(budget_record["deadline_monotonic"] - DEADLINE) < 0.001
+    assert budget_record["total_budget_seconds"] == TOTAL_SECONDS
     put(OUTPUT / "RESEARCH-START.json", {"research_head": git("rev-parse", "HEAD"),
         "research_tree": git("rev-parse", "HEAD^{tree}"), "manifest_sha256": digest(HERE / "manifest.json"),
-        "total_execution_budget_seconds": TOTAL_SECONDS, "authority_present": "CAGENTS_AGENT_AUTHORITY" in os.environ,
+        "absolute_budget_seconds": TOTAL_SECONDS, "setup_and_preflight_elapsed_seconds": now - BEGIN,
+        "remaining_seconds_at_harness_start": max(0, DEADLINE - now),
+        "authority_present": "CAGENTS_AGENT_AUTHORITY" in os.environ,
         "authority": "inherited unchanged; value not inspected", "claims": "compiler and headless owning-test results only"})
     summary("Native1881 compiler/headless research. Native/provider/matched-artifact qualification remains pending.\n")
     passed = True

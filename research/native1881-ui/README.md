@@ -28,13 +28,18 @@ command, exit, leader reaping, empty membership uncertainty/remaining family,
 and closed sampler receipt checks. Metrics describe an observed subset, not
 whole-job totals. Unproved cleanup holds the hosted job without another phase.
 
-The job is capped at 60 minutes, with a 50 minute execution budget, residual phase
-timeouts and 15 second heartbeats. Cleanup remains mandatory beyond execution
-budget. The workflow has no local launch admission and is prepared privately
+The job is capped at 60 minutes. Its first step, before checkout/setup, records
+an absolute monotonic deadline 50 minutes later; the harness consumes that same
+residual budget across setup and every phase, with 15 second heartbeats. The
+nominal final 10 minutes are reserved for cleanup/upload. Cleanup remains
+mandatory beyond the execution budget. The workflow has no local launch
+admission and is prepared privately
 until independent exact source review and Root's publication decision. This is
 a new temporary CI research action; it does not retry the rejected fixture
 issue-create operation.
 
-Actual native interactions/screenshots, integrated-browser coverage, a normally
-built matched CLI/daemon/UI artifact set and independent native UX review remain
-separate gates. These logs cannot establish any of those claims.
+Actual native interactions/screenshots and a normally built matched
+CLI/daemon/browserless UI+latency-harness artifact set through the reviewed
+diagnostic runner remain separate gates, as does independent native UX review.
+Integrated-browser coverage is a separate affected-consumer/production delivery
+gate. These logs cannot establish any of those claims.

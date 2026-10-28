@@ -21,6 +21,21 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
+      - name: Record the absolute budget before checkout or setup
+        shell: bash
+        run: |
+          /usr/bin/python3 -I -B - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          start = time.monotonic()
+          deadline = start + 3000
+          record = {"earliest_step_monotonic": start, "deadline_monotonic": deadline,
+                    "total_budget_seconds": 3000, "nominal_job_reserve_seconds": 600}
+          (Path(os.environ["RUNNER_TEMP"]) / "native1881-job-budget.json").write_text(json.dumps(record) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as stream:
+              stream.write(f"NATIVE1881_JOB_START={start:.9f}\nNATIVE1881_JOB_DEADLINE={deadline:.9f}\n")
+          print("Native1881 absolute 50-minute budget recorded before checkout/setup; nominal 10-minute cleanup/upload reserve.")
+          PY
       - name: Check out the exact research and source history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -47,6 +62,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native1881-ui-research-${{ github.sha }}
-          path: ${{ runner.temp }}/native1881-ui-results
+          path: |
+            ${{ runner.temp }}/native1881-ui-results
+            ${{ runner.temp }}/native1881-job-budget.json
           if-no-files-found: warn
           retention-days: 14
