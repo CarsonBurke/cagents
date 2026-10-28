@@ -447,6 +447,12 @@ mod tests {
 
     #[test]
     fn namespace_read_rechecks_identity_before_same_or_other_runtime_classification() {
+        if crate::repository::isolated_git_test(concat!(
+            module_path!(),
+            "::namespace_read_rechecks_identity_before_same_or_other_runtime_classification"
+        )) {
+            return;
+        }
         for same_runtime in [true, false] {
             // A stable process is the control. The other arms change its
             // identity while the actual namespace read is held open.
