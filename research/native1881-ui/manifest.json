@@ -1,22 +1,22 @@
 {
   "schema": 1,
-  "prepared_state": "Reviewed-source successor after actual2819 UI lib compile failure; new matching compiler/tests/controls remain UNRUN until one authorized remote qualification.",
+  "prepared_state": "Corrective source successor after actual c1 resize assertion failure and latency-feature WorktreeId compiler failure. All four corrected inputs, nine ordinary UI parents and fixture/baseline/controls are UNRUN until one separately authorized hosted qualification.",
   "sources": {
     "after": {
-      "head": "b816e5419fe3610c7bb67f87f16533d10443e345",
-      "tree": "93e583ae8b04555a6654081ea3624a0c1d653258"
+      "head": "8f5c88573c9384e0470c32441491ab08e15aba42",
+      "tree": "96f9587e2721ad0a10fd3d1e074c5cc1825fda8c"
     },
     "before": {
-      "head": "87d17f5767c39c7304f87b6fbf20e2f51930fc53",
-      "tree": "500b8cc5c8bd34eba067d9302fdee3a0c40e32ec"
+      "head": "3bf1b9d9950359a6b128412fa5a6c780516e9d80",
+      "tree": "a0e371f088346d6f930c04e4cb6e0aea409bb97f"
     },
     "publisher": {
-      "head": "078dc43d86b128dfa19fee348f48cbbd1b00c708",
-      "tree": "acf22bccb0e2ea88e62458a07bda82bedd429b5d"
+      "head": "c739ac9b312709cf896dd530b5fde9b5a054ca0e",
+      "tree": "84b3c64513c5890751b9b1be6b9d2f35492208d5"
     },
     "visibility": {
-      "head": "7e697f3609d932a19ec3ec1b3467ece712cb63eb",
-      "tree": "c795d895f7786f97295e069bda72654f32e5fb78"
+      "head": "f8653c2781728c4fa2fe51c0a63b54c59a6ba670",
+      "tree": "eb3b1f3b4cf2d963f8e8e6d6f02e6ab57e8dee6e"
     }
   },
   "fixture_selector": "app::latency_ui::isolation_tests::actual_app_fixture_mounts_and_interacts_without_service_attempts",
@@ -28,7 +28,9 @@
     "app::chat_ui::scrollbar_press_tests::native_app_expanded_sidebar_thumb_and_outer_resize_handle_have_distinct_gestures",
     "app::inspector_resize_clearance_tests::docked_inspector_native_thumb_scrolls_clear_of_right_and_bottom_resize_bands",
     "app::inspector_resize_clearance_tests::docked_inspector_keeps_its_leading_resize_gesture_and_native_close_control",
-    "app::inspector_resize_clearance_tests::shared_body_bottom_clearance_covers_cards_sidebar_and_inspector_without_a_second_status_gap"
+    "app::inspector_resize_clearance_tests::shared_body_bottom_clearance_covers_cards_sidebar_and_inspector_without_a_second_status_gap",
+    "app::tests::pane_resize_updates_rendered_and_durable_width_for_every_kind",
+    "app::tests::pane_resize_ignores_missing_inactive_and_closed_cards_without_mutation"
   ],
   "control_refusals": {
     "publisher": [
@@ -61,7 +63,9 @@
     "after_original_whole_sha256": "f9284e29f46edb2f9881ea4903409717f69fe94f7d406235ec4f6467e984486b",
     "after_original_whole_head": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
     "after_two_import_refresh_sha256": "af06c87af72276584dfa028b445651d96b9b23c0443e9ddd01686efb10cc76e8",
-    "after_two_import_refresh_head": "b816e5419fe3610c7bb67f87f16533d10443e345"
+    "after_two_import_refresh_head": "b816e5419fe3610c7bb67f87f16533d10443e345",
+    "corrective_four_source_whole_sha256": "53fd5ab71474b5ea614c43db8b4fd539e0fcdf36b54af9256fd276c40af406cc",
+    "corrective_four_source_whole_after": "8f5c88573c9384e0470c32441491ab08e15aba42"
   },
   "limits": [
     "Compiler and headless owning-test evidence only, no actual native window/provider/auth/lease/P0 or screenshot qualification",
@@ -77,5 +81,15 @@
     "tested_after": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
     "result": "UIbincheck0, UIlibcompile101 on two missing Uuid imports; no selectors/latency/before/controls executed. Both owned families closed. Historical result only, not new-source qualification.",
     "artifact_sha256": "7dcf1357deae2d6fd7a0947a03b9a37bd103d97334d5b00ab210cde3c52ce357"
-  }
+  },
+  "latest_prior_actual_run": {
+    "research_head": "c1b84cb206acb93487fccd14f90a1d95deec8a59",
+    "research_tree": "82410e956b4a8b56ce7c9f88f281150209a8452a",
+    "run_id": 40785130853,
+    "tested_after": "b816e5419fe3610c7bb67f87f16533d10443e345",
+    "result": "UIbincheck0; UIlibcompile0; six of seven product parents pass, outer Chat pointer resize actual101 at scrollbar_press_tests.rs411; latencyUIbincheck101 missing WorktreeId292/293. All10 owned families closed. Fixturelib/owning/before/controls UNRUN. Historical results do not qualify corrected sources.",
+    "artifact_sha256": "e880a662a3e05c79e328b0a3b002434987054a2944bfa3aa61eb6209fa87d2ed",
+    "packet_sha256": "ba8ccba0dce14709fb3efa647298dfbacbd4ccb30fcb31bd85f10d0d9f1eb1fb"
+  },
+  "corrective_cause": "Actual pointer test exposed stale Terminal-or-utility App admission guard on content-independent pane resize. Corrected after requires an open durable card in the current workspace; existing pointer assertion is unchanged. Two new actual-App regressions cover every kind and stale-card refusal. All four resident leaves receive the same WorktreeId import; owning fixture test and causal control mutations remain unchanged. Source-causal diagnosis is separate from pending new-head execution."
 }
