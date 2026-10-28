@@ -22,6 +22,8 @@ use std::{
 };
 use uuid::Uuid;
 
+const ACCOUNT_DETAIL_SENTINEL: &str = "fixture-account-detail-must-stay-out-of-listings-4f58c12e";
+
 #[derive(Clone, Copy)]
 enum Listing {
     Accounts,
@@ -106,7 +108,7 @@ impl Listing {
                         "selected_by_caller": true, "default_for_new_chats": true, "archived": false,
                         "usage": null, "remaining": [], "credits": null,
                         "credits_remaining_fraction": null, "credits_remaining": null,
-                        "age_ms": null, "stale": true, "detail": null
+                        "age_ms": null, "stale": true, "detail": ACCOUNT_DETAIL_SENTINEL
                     })).unwrap()]
                 } else {
                     vec![]
@@ -424,6 +426,10 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
         let human = output(listing, true, false);
         assert!(human.starts_with(header), "{human}");
         assert!(human.contains(content), "{human}");
+        assert!(
+            !human.contains(ACCOUNT_DETAIL_SENTINEL),
+            "account detail leaked into public listing: {human}"
+        );
         for raw in ["Some(", "None", "{ ", "created_ms", "at_unix_ms"] {
             assert!(!human.contains(raw), "raw value {raw}: {human}");
         }
@@ -432,8 +438,12 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
 
 #[test]
 fn standalone_account_list_json_is_metadata_only_and_lowercase() {
-    let value: serde_json::Value =
-        serde_json::from_str(&output(Listing::Accounts, true, true)).unwrap();
+    let rendered = output(Listing::Accounts, true, true);
+    assert!(
+        !rendered.contains(ACCOUNT_DETAIL_SENTINEL),
+        "account detail leaked into public JSON: {rendered}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["command"], "account.list");
     let row = &value["data"]["accounts"][0];
     assert_eq!(row["provider"], "claude");

@@ -11,8 +11,9 @@
 
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
-is only a native build prerequisite of the full Servo dependency graph.
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
+is also required by the ceditor development/installation scripts, experimental
+hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -55,7 +56,16 @@ cargo check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
 cargo check --locked --features integrated-browser --bin cagents-ui
+
+# Standalone editor: separate package using the browserless UI graph.
+cargo check --locked --package ceditor --bin ceditor
 ```
+
+Changes to ceditor or shared UI, editor, or notification public contracts also
+require the standalone editor check above. The workspace's
+`default-members = ["."]` selects only cagents: root UI checks and root
+`--all-targets` tests do not compile the downstream ceditor binary. Run the
+ceditor check separately from the CLI, host, and UI checks.
 
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
@@ -345,13 +355,54 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches:
+its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
+below before running that lane:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --features host --all-targets
 cargo test --locked --no-default-features --features ui --all-targets
 ```
+
+HOST fixtures that exec retained actors require
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
+checkout and source state as the tests. Build it immediately before testing,
+keeping sources, Cargo environment, target, configuration and any explicit
+profile overrides fixed. Ordinary build and test profile defaults differ as
+expected.
+The existing artifact helper reads Cargo's exact executable path, including
+configured target directories/triples. A matching version alone does not prove
+that two dirty source trees match.
+
+Use a fresh private temporary directory with a short, physical absolute path
+outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
+directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
+meets those conditions before creating the root. The **final** nested Unix
+socket path must be shorter than 108 bytes, including fixture suffixes. For
+example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
+bytes, so that layout requires a temporary base of at most 28 bytes. Longer
+fixture layouts need more room; a short base alone is not proof.
+
+```sh
+(
+    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    export TMPDIR
+    printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    cargo test --locked --no-default-features --features host --all-targets
+)
+```
+
+A helper build failure prevents the test command. Use the same preparation for
+narrow HOST targets that need retained actors. Keep the temporary root and any
+separately retained fixture evidence until their original children have settled;
+this recipe deliberately installs no automatic deletion trap. Do not change
+socket limits, remove enclosing Git markers or silently select another runtime
+root to make a failed preparation pass.
 
 Prefer the narrow target that covers the changed contract, for example:
 
@@ -396,7 +447,18 @@ cargo test --locked --no-default-features --features host --test repository_scal
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
+Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Cargo roots and directly checks `src/modules.rs` and nested Rust-source
+`include!` fragments, which rustfmt does not discover through macro expansion.
+Both stages report their diagnostics and any failure makes the command fail;
+the check never rewrites source or formats vendored packages. When adding a
+Rust-source `include!`, update the explicit list in the script. Its lightweight
+regression is `python3 tests/check_format.py` (mocked command routing and bounded
+real-rustfmt fixtures, with no Cargo/application build). Set
+`CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
+fixture; this still runs only `cargo fmt`, with no application build.
+
+For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
@@ -448,8 +510,9 @@ source visible alongside an error. Rendering is debounced, uses at most two
 workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
 
 The development runner uses an isolated application and settings identity.
-The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
-built executable.
+The editor runner and installer require Python 3 to read executable paths from
+Cargo's build output. This honors configured targets and output directories,
+including `build.target` in Cargo configuration and `CARGO_BUILD_TARGET`.
 
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session

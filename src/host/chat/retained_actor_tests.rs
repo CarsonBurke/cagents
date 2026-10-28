@@ -378,7 +378,7 @@ fn retained_upgrade_tail(fail_final_save: bool) {
         "successor failed to hydrate retained transcript",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact slow turn");
     let transcript = snapshot
         .items
         .iter()
@@ -935,7 +935,7 @@ fn retained_turn_final_action(action: &str) {
         "retained transcript failed to hydrate",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact slow turn");
     let transcript = snapshot
         .items
         .iter()
@@ -1343,7 +1343,21 @@ fn running_commit_diagnostic(
     )
 }
 
-fn assert_retained_copy_sources(handle: &Handle, snapshot: &chat::Snapshot) {
+fn assert_retained_copy_sources(handle: &Handle, snapshot: &chat::Snapshot, prompt: &str) {
+    let users = snapshot
+        .items
+        .iter()
+        .filter(|item| item.role == chat::Role::User)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users.len(),
+        1,
+        "one prompt and its echo must remain one row"
+    );
+    assert!(
+        matches!(&users[0].content, chat::ItemContent::Text { text, .. } if text == prompt),
+        "retained attachment must preserve the original prompt exactly"
+    );
     assert_eq!(
         snapshot.items.len(),
         snapshot.text_copy_sources.conversation.len()
@@ -1443,7 +1457,7 @@ for line in sys.stdin:
     elif frame.get('type')=='user':
         with (root/'prompts').open('a') as log: log.write('prompt\n')
         received=frame['uuid']
-        send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':{'id':'native-'+received,'role':'user','content':[{'type':'text','text':'One exact slow turn'}]}})
+        send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':frame['message']})
         send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
         for index in range(40):
             send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
@@ -2369,7 +2383,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
         "transcript did not hydrate after host SIGKILL",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact killed-host turn");
     let text = snapshot
         .items
         .iter()
@@ -3168,6 +3182,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
             source: source.clone(),
             requested: source.clone(),
             context: original.clone(),
+            failed_close: None,
         },
     );
     for _ in 0..2 {
