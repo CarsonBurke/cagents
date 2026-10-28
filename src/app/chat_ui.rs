@@ -378,6 +378,7 @@ pub enum Action {
     CompletionScrolled(Target, f32),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
+    ScopedParkedCloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history.
@@ -440,6 +441,7 @@ impl Action {
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
+                | Self::ScopedParkedCloseFinished(..)
                 | Self::RetainedCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
@@ -4792,21 +4794,31 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
 fn retire_conversation(
     handle: Option<Arc<ClientHandle>>,
     session: Option<chat::Session>,
+    context: &super::channel_ui::SessionCloseContext,
 ) -> Result<(), String> {
+    context.admit_remote()?;
+    // A live surface's User connection cannot replace an inherited caller.
+    // Scoped closes take the authenticated inventory path below instead.
+    let handle = handle.filter(|_| !context.scoped());
     let refused = match handle.map(|handle| handle.close()) {
         Some(Ok(())) => return Ok(()),
         Some(Err(error)) => Some(error),
         None => None,
     };
     let Some(session) = session else {
+        if context.scoped() {
+            return Err(
+                "Cannot verify this conversation's close without its original session.".into(),
+            );
+        }
         return refused.map_or(Ok(()), Err);
     };
-    super::channel_ui::close_sessions(vec![CardKind::Chat(session)]).map_err(
-        |error| match refused {
+    super::channel_ui::close_sessions(vec![CardKind::Chat(session)], context).map_err(|error| {
+        match refused {
             Some(refused) => format!("{refused}; {error}"),
             None => error,
-        },
-    )
+        }
+    })
 }
 
 /// The CLI the daemon still runs for a Codex thread, if any.
@@ -6918,6 +6930,7 @@ impl Cagents {
             && let Some(handle) = runtime.handle().cloned()
         {
             let target = runtime.target;
+            let session = runtime.session.clone();
             if self.chat_ui.phases.contains_key(&card) {
                 return Task::none();
             }
@@ -6928,12 +6941,21 @@ impl Cagents {
                     restart: None,
                 },
             );
+            let context =
+                super::channel_ui::SessionCloseContext::capture(self.workspace_model.identity);
+            let scoped = context.scoped();
             return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || handle.close())
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                Message::ChatUi(Action::CloseFinished(target, result))
+                let result = tokio::task::spawn_blocking(move || {
+                    retire_conversation(Some(handle), Some(session), &context)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::ChatUi(if scoped {
+                    Action::ScopedParkedCloseFinished(target, result)
+                } else {
+                    Action::CloseFinished(target, result)
+                })
             });
         }
         if !self
@@ -6956,9 +6978,15 @@ impl Cagents {
                 .cloned(),
             _ => None,
         };
+        let context =
+            super::channel_ui::SessionCloseContext::capture(self.workspace_model.identity);
         if !pending
-            && session.proof.is_some()
-            && (session.owns_codex_listener() || session.native_continuity.retains_provider())
+            && ((session.proof.is_some()
+                && (session.owns_codex_listener() || session.native_continuity.retains_provider()))
+                || (context.scoped()
+                    && (handle.is_some()
+                        || session.proof.is_some()
+                        || session.launch.session_id.is_some())))
         {
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(
@@ -6970,11 +6998,12 @@ impl Cagents {
             );
             return cosmic::task::future(async move {
                 let saved = session.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || retire_conversation(handle, Some(saved)))
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result);
+                let result = tokio::task::spawn_blocking(move || {
+                    retire_conversation(handle, Some(saved), &context)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
                 Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
             });
         }
@@ -6998,11 +7027,14 @@ impl Cagents {
     ) -> Task<Message> {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
+        let context =
+            super::channel_ui::SessionCloseContext::capture(self.workspace_model.identity);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || retire_conversation(handle, session))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result =
+                tokio::task::spawn_blocking(move || retire_conversation(handle, session, &context))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
             Message::ChatUi(Action::Retired(target, result))
         })
     }
@@ -7053,16 +7085,21 @@ impl Cagents {
                 close_requested: false,
             },
         );
+        let context =
+            super::channel_ui::SessionCloseContext::capture(self.workspace_model.identity);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                context.admit_remote().map_err(ReturnRefused::Unconfirmed)?;
                 if shared
+                    && !context.scoped()
                     && live_codex_source(session.id)
                         .map_err(ReturnRefused::Unconfirmed)?
                         .is_some()
                 {
                     return Err(ReturnRefused::SourceLive);
                 }
-                retire_conversation(handle, Some(session)).map_err(ReturnRefused::Unconfirmed)
+                retire_conversation(handle, Some(session), &context)
+                    .map_err(ReturnRefused::Unconfirmed)
             })
             .await
             .map_err(|error| ReturnRefused::Unconfirmed(error.to_string()))
@@ -9427,6 +9464,7 @@ impl Cagents {
                     && let Some(handle) = runtime.handle().cloned()
                 {
                     let target = runtime.target;
+                    let retiring = runtime.session.clone();
                     self.chat_ui.phases.insert(
                         card,
                         Phase::Closing {
@@ -9434,11 +9472,16 @@ impl Cagents {
                             restart: Some(session),
                         },
                     );
+                    let context = super::channel_ui::SessionCloseContext::capture(
+                        self.workspace_model.identity,
+                    );
                     return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || handle.close())
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
+                        let result = tokio::task::spawn_blocking(move || {
+                            retire_conversation(Some(handle), Some(retiring), &context)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
                         Message::ChatUi(Action::CloseFinished(target, result))
                     });
                 }
@@ -11389,6 +11432,23 @@ impl Cagents {
                     .remove_chat_card(target.card, None)
                     .unwrap_or_else(Task::none);
             }
+            Action::ScopedParkedCloseFinished(target, result) => {
+                if let Err(error) = result {
+                    if self.chat_runtime_mut(target).is_none()
+                        || self
+                            .chat_ui
+                            .finish(target, |phase| {
+                                matches!(phase, Phase::Closing { restart: None, .. })
+                            })
+                            .is_none()
+                    {
+                        return Task::none();
+                    }
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
+                }
+                return self.handle_chat_ui(Action::CloseFinished(target, result));
+            }
             Action::CloseFinished(target, result) => {
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It
@@ -11650,7 +11710,7 @@ pub(super) fn show_chat_snapshot_for_test(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
@@ -18430,6 +18490,31 @@ mod tests {
         )));
     }
 
+    /// Admit a saved pane through insertion and Ready without a provider.
+    pub(in crate::app) fn restored_chat_with_draft_fixture(
+        app: &mut Cagents,
+        session: chat::Session,
+        draft: &str,
+    ) -> CardId {
+        drop(app.insert_chat_card(session.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        let target = chat_runtime_attempt(app, card);
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                session_id: session.launch.session_id.clone(),
+                native_continuity: session.native_continuity.clone(),
+                ..Snapshot::default()
+            },
+        ));
+        answer_start(app, target, Ok(handle));
+        write(app, card, draft);
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(app, card).composer.text().trim_end(), draft);
+        card
+    }
+
     /// Whether `task` asks for the keyboard to go to `control`.
     ///
     /// Focus is a widget operation, not a message. Each operation the task
@@ -19905,9 +19990,11 @@ mod tests {
                 assert!(app.can_move_pane_to_channel(card, destination));
             } else {
                 drop(app.move_pane_to_channel(card, destination));
-                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                assert!(
+                    matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
                     change: Change::Transfer { id, .. }, ..
-                } if id == card));
+                } if id == card)
+                );
                 drop(app.begin_chat_close(card));
                 assert!(!app.chat_close_owned(card));
                 assert!(app.card_state(card).unwrap().existence.is_open());
@@ -20891,7 +20978,7 @@ mod tests {
 
     /// A live conversation whose provider stopped without ever loading the
     /// conversation it was asked to resume, which offers a fresh start.
-    fn unresumable_chat(app: &mut Cagents) -> (CardId, Target) {
+    pub(in crate::app) fn unresumable_chat(app: &mut Cagents) -> (CardId, Target) {
         let card = live_chat(app, Some(KNOWN_THREAD));
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             unreachable!()
@@ -20902,6 +20989,26 @@ mod tests {
         snapshot.session_id = None;
         let target = runtime.target;
         assert!(app.chat_offers_fresh_conversation(card));
+        (card, target)
+    }
+
+    /// Actual local handoff projection; the returned terminal task stays unrun.
+    pub(in crate::app) fn parked_close_scope_fixture(app: &mut Cagents) -> (CardId, Target) {
+        let card = live_chat(app, Some(KNOWN_THREAD));
+        let target = chat_runtime(app, card).target;
+        app.chat_ui.phases.insert(
+            card,
+            Phase::Returning {
+                target,
+                local: None,
+                close_requested: false,
+            },
+        );
+        let CardKind::Terminal(terminal) = crate::app::tests::terminal_card_state().kind else {
+            unreachable!()
+        };
+        drop(app.handle_chat_ui(Action::HandoffFinished(target, Ok(terminal))));
+        assert!(app.chat_has_parked_runtime(card));
         (card, target)
     }
 
@@ -21622,7 +21729,7 @@ mod tests {
             assert!(!app.channel_ui.was_deleted(channel));
             assert!(app.channel_work.retire_candidates.contains(&home));
             let mut before_ack = Vec::new();
-            while let Ok(edit) = published.try_recv() {
+            while let Ok(edit) = published.try_recv().map(|queued| queued.edit) {
                 before_ack.push(edit);
             }
             assert!(
@@ -21648,7 +21755,7 @@ mod tests {
                 model: settled.clone(),
             }));
             let mut after_ack = Vec::new();
-            while let Ok(edit) = published.try_recv() {
+            while let Ok(edit) = published.try_recv().map(|queued| queued.edit) {
                 after_ack.push(edit);
             }
             let retire_requests = after_ack
