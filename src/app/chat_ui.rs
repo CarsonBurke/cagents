@@ -189,6 +189,9 @@ pub enum Action {
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
+    OpenSavedHistory(Target),
+    SavedHistoryOpened(Target, HistoryReady),
+    SavedHistoryCommitted(Target, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -422,6 +425,8 @@ impl Action {
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
+                | Self::SavedHistoryOpened(..)
+                | Self::SavedHistoryCommitted(..)
                 | Self::ResumePrepared(..)
                 | Self::ResumeCommitted(..)
                 | Self::Wake(..)
@@ -546,6 +551,25 @@ struct LocalReturn {
     resumes: bool,
 }
 
+/// Completion messages share a take-once result, so discarded/duplicate
+/// callbacks detach their handle without routing through provider retirement.
+#[derive(Clone)]
+pub struct HistoryReady(
+    Arc<Mutex<Option<Result<(Arc<ClientHandle>, chat::client::SavedHistoryAdmission), String>>>>,
+);
+
+impl std::fmt::Debug for HistoryReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HistoryReady")
+    }
+}
+
+struct HistoryPreparation {
+    context: ResumePreparation,
+    pending: bool,
+    reader: Option<(Arc<ClientHandle>, chat::client::SavedHistoryAdmission)>,
+}
+
 struct ResumePreparation {
     target: Target,
     runtime: Target,
@@ -580,6 +604,7 @@ impl Clone for ResumePreparation {
 enum Phase {
     Starting(Attempt),
     PreparingResume(ResumePreparation),
+    OpeningHistory(HistoryPreparation),
     Returning {
         target: Target,
         local: Option<LocalReturn>,
@@ -596,6 +621,7 @@ impl Phase {
         match self {
             Self::Starting(attempt) => attempt.target,
             Self::PreparingResume(resume) => resume.target,
+            Self::OpeningHistory(history) => history.context.target,
             Self::Returning { target, .. } | Self::Closing { target, .. } => *target,
         }
     }
@@ -612,6 +638,7 @@ pub(super) struct State {
     closing_resumes: HashMap<CardId, crate::session::ResumeSnapshotBinding>,
     // A retained product response is a candidate, never automatic start intent.
     prepared_resumes: HashMap<CardId, ResumePreparation>,
+    strict_history_readers: HashMap<CardId, chat::Session>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -662,6 +689,7 @@ impl Default for State {
             phases: HashMap::new(),
             closing_resumes: HashMap::new(),
             prepared_resumes: HashMap::new(),
+            strict_history_readers: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -2070,6 +2098,8 @@ pub(super) struct Runtime {
     connection: Connection,
     /// Set only by exact shared-view retirement, independently of transport failure.
     closed_elsewhere: bool,
+    retained_history_candidate: bool,
+    history_opening: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3053,6 +3083,8 @@ impl Runtime {
             pending: None,
             next_command: 0,
             disconnected: false,
+            retained_history_candidate: false,
+            history_opening: false,
             listed_models: 0,
             visible: AtomicBool::new(visible),
             error: None,
@@ -6689,6 +6721,11 @@ impl Cagents {
                     self.chat_ui.closing_resumes.insert(card, binding);
                 }
             }
+            Some(Phase::OpeningHistory(history)) => {
+                if let Some(binding) = history.context.snapshot_binding {
+                    self.chat_ui.closing_resumes.insert(card, binding);
+                }
+            }
             Some(Phase::Closing { target, .. }) => {
                 if let Some(session) = self.chat_return_session(card) {
                     self.chat_ui.abandoned.insert(target, session);
@@ -6728,8 +6765,12 @@ impl Cagents {
         }
         self.chat_ui.closing_resumes.remove(&card);
         if matches!(self.chat_ui.phases.get(&card), Some(Phase::PreparingResume(resume)) if &resume.source != replacement)
+            || matches!(self.chat_ui.phases.get(&card), Some(Phase::OpeningHistory(history)) if &history.context.source != replacement)
         {
             self.chat_ui.phases.remove(&card);
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+                runtime.history_opening = false;
+            }
         }
     }
 
@@ -6745,6 +6786,7 @@ impl Cagents {
             .values()
             .filter_map(|phase| match phase {
                 Phase::PreparingResume(resume) => resume.snapshot_binding.clone(),
+                Phase::OpeningHistory(history) => history.context.snapshot_binding.clone(),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -6897,6 +6939,7 @@ impl Cagents {
                 Phase::PreparingResume(_) => {
                     "Preparing the saved conversation. Wait for it to finish."
                 }
+                Phase::OpeningHistory(_) => "Opening saved history. Wait for it to finish.",
                 Phase::Starting(_) => {
                     "Connecting to native chat. Wait for the connection to finish."
                 }
@@ -7352,6 +7395,20 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        if intent == chat::Intent::Restore
+            && source.is_none()
+            && !terminate_source
+            && upgrade_admission.is_none()
+            && self.is_retained_history_reader(card, &session)
+        {
+            if !matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
+                self.await_retained_history_reader(card, session);
+            }
+            let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+                return Task::none();
+            };
+            return self.open_retained_chat_history(runtime.target);
+        }
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -8654,6 +8711,13 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::OpenSavedHistory(target) => return self.open_retained_chat_history(target),
+            Action::SavedHistoryOpened(target, ready) => {
+                return self.retained_chat_history_opened(target, ready);
+            }
+            Action::SavedHistoryCommitted(target, result) => {
+                return self.retained_chat_history_committed(target, result);
+            }
             Action::RetainedCopyCommitted(card, result) => {
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
@@ -9597,7 +9661,10 @@ impl Cagents {
                     );
                 }
                 let prepared = match result {
-                    Ok(prepared) if prepared == resume.source => {
+                    Ok(prepared)
+                        if prepared == resume.source
+                            && !self.is_retained_history_reader(target.card, &resume.source) =>
+                    {
                         self.chat_ui
                             .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
                         return self.start_chat(
@@ -9608,7 +9675,12 @@ impl Cagents {
                             false,
                         );
                     }
-                    Ok(prepared) if chat::is_prepared_history_resume(&resume.source, &prepared) => {
+                    Ok(prepared)
+                        if chat::is_prepared_history_resume(&resume.source, &prepared)
+                            || (prepared == resume.source
+                                && self
+                                    .is_retained_history_reader(target.card, &resume.source)) =>
+                    {
                         prepared
                     }
                     Ok(_) => {
@@ -9633,12 +9705,17 @@ impl Cagents {
                     return Task::none();
                 };
                 card.kind = CardKind::Chat(prepared.clone());
-                let receipt = self.session.as_ref().unwrap().save_chat_resume(
-                    snapshot,
-                    target.card,
-                    resume.source.clone(),
-                    prepared.clone(),
-                );
+                let writer = self.session.as_ref().unwrap();
+                let receipt = if prepared == resume.source {
+                    writer.save_retained_history_start(snapshot, target.card, resume.source.clone())
+                } else {
+                    writer.save_chat_resume(
+                        snapshot,
+                        target.card,
+                        resume.source.clone(),
+                        prepared.clone(),
+                    )
+                };
                 let receipt = receipt.map(|(receipt, binding, owner)| {
                     if let Some(Phase::PreparingResume(resume)) =
                         self.chat_ui.phases.get_mut(&target.card)
@@ -18855,7 +18932,9 @@ mod tests {
                             message @ Message::ChatUi(
                                 Action::AccountCommitted(..)
                                 | Action::UpgradeCommitted(..)
-                                | Action::ResumeCommitted(..),
+                                | Action::ResumeCommitted(..)
+                                | Action::RetainedCopyCommitted(..)
+                                | Action::SavedHistoryCommitted(..),
                             ),
                         )) = action
                         {
@@ -28163,4 +28242,5 @@ mod tests {
             "an old account wake must not drain the replacement connection's report queue"
         );
     }
+    include!("chat_ui/retained_history_admission_tests.rs");
 }

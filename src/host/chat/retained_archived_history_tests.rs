@@ -993,6 +993,15 @@ fn authenticated_retirement_reconciliation_preserves_a_newer_authority() {
 
 #[test]
 fn original_old_boot_visual_restores_named_account_history_then_starts_twice_over_real_wire() {
+    original_old_boot_visual_history_case(false);
+}
+
+#[test]
+fn strict_retained_draft_history_witness_opens_original_visual_then_starts_twice_over_real_wire() {
+    original_old_boot_visual_history_case(true);
+}
+
+fn original_old_boot_visual_history_case(strict_history: bool) {
     let Some(root) = isolated() else { return };
     install_provider(&root.join("bin/claude"));
     let home = root.join("named-account");
@@ -1092,7 +1101,20 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         let host = fixture.host.clone();
         let server = thread::spawn(move || crate::host::client::serve(server, 61, host));
-        let reader = chat::client::ClientHandle::fixture_restore(client, visual.clone()).unwrap();
+        let reader = if strict_history {
+            let (reader, witness) = chat::client::ClientHandle::connect_saved_history_on(
+                client,
+                visual.clone(),
+                |_| {},
+            )
+            .unwrap();
+            assert!(witness.validate());
+            assert_eq!(witness.source(), &visual);
+            assert_eq!(witness.reader(), &reader.session());
+            reader
+        } else {
+            chat::client::ClientHandle::fixture_restore(client, visual.clone()).unwrap()
+        };
         wait_for_read_only_history(
             &reader,
             "original old-boot visual did not load real read-only history",

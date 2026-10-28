@@ -461,6 +461,30 @@ impl RetainedChatCopy {
     }
 }
 
+/// Local read-only policy provenance, never provider authority. Only hashes
+/// are retained in addition to the original copy receipt and card payload.
+#[derive(Serialize, serde::Deserialize)]
+struct RetainedHistoryReceipt {
+    copy_receipt: String,
+    source: String,
+    reader: String,
+    #[serde(default)]
+    start_spent: bool,
+}
+
+fn retained_history_digest(
+    workspace: WorkspaceId,
+    card: CardId,
+    copy_receipt: &str,
+    session: &crate::chat::Session,
+) -> Result<String> {
+    use sha2::Digest;
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(to_json(&(workspace, card, copy_receipt, session))?.as_bytes())
+    ))
+}
+
 /// The storage generations a snapshot is written against.
 ///
 /// The persistence lane owns these, not the UI. A snapshot travels to the
@@ -1401,6 +1425,249 @@ impl StateStore {
             ));
         }
         self.rebind_chat_descriptor(card_id, source, replacement)
+    }
+
+    /// Cold eligibility is presentation only; the atomic writer below repeats
+    /// provenance, identity and generation checks under its reservation.
+    pub(crate) fn retained_history_candidates(
+        &self,
+        state: &WorkspaceState,
+    ) -> Result<HashSet<CardId>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let mut candidates = HashSet::new();
+        for (card, source) in &state.pending_chat_admissions {
+            if state.local_only_cards.contains(card)
+                && source.is_saved_claude_history()
+                && metadata(
+                    &inner.connection,
+                    &format!("workspace:{}:retained_chat_copy:{card}", state.id),
+                )?
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                candidates.insert(*card);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn retained_history_readers(
+        &self,
+        state: &WorkspaceState,
+    ) -> Result<HashMap<CardId, crate::chat::Session>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let mut readers = HashMap::new();
+        for card in &state.cards {
+            let CardKind::Chat(session) = &card.kind else {
+                continue;
+            };
+            if !card.existence.is_open()
+                || !state.local_only_cards.contains(&card.id)
+                || state.pending_chat_admissions.contains_key(&card.id)
+                || !session.is_saved_claude_history()
+            {
+                continue;
+            }
+            let Some(encoded) = metadata(
+                &inner.connection,
+                &format!(
+                    "workspace:{}:retained_history_admission:{}",
+                    state.id, card.id
+                ),
+            )?
+            else {
+                continue;
+            };
+            let receipt: RetainedHistoryReceipt = from_json("retained history receipt", &encoded)?;
+            if !receipt.start_spent
+                && metadata(
+                    &inner.connection,
+                    &format!("workspace:{}:retained_chat_copy:{}", state.id, card.id),
+                )?
+                .as_deref()
+                    == Some(receipt.copy_receipt.as_str())
+                && retained_history_digest(state.id, card.id, &receipt.copy_receipt, session)?
+                    == receipt.reader
+            {
+                readers.insert(card.id, session.clone());
+            }
+        }
+        Ok(readers)
+    }
+
+    /// Spend only this retained copy's pending admission, together with its
+    /// complete latest workspace/content snapshot. A History witness grants no
+    /// process authority and does not publish the local copy as canonical.
+    #[cfg(feature = "ui")]
+    pub(crate) fn save_retained_chat_history(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        witness: &crate::chat::client::SavedHistoryAdmission,
+    ) -> Result<WorkspaceCommit> {
+        if !witness.validate()
+            || !state.local_only_cards.contains(&card)
+            || state.pending_chat_admissions.contains_key(&card)
+            || !state.cards.iter().any(|saved| {
+                saved.id == card
+                    && saved.existence.is_open()
+                    && matches!(&saved.kind, CardKind::Chat(session) if session == witness.reader())
+            })
+        {
+            return Err(StoreError::InvalidState(
+                "Read-only history admission changed the retained pane".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let StoreInner {
+            connection,
+            refused_closures,
+            ..
+        } = &mut *inner;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_descriptor_write(&transaction)?;
+        let manifest =
+            load_workspace_manifest_connection(&transaction, state.id)?.ok_or_else(|| {
+                StoreError::InvalidState("Retained draft workspace disappeared".into())
+            })?;
+        let copy_key = format!("workspace:{}:retained_chat_copy:{card}", state.id);
+        let copy_receipt = metadata(&transaction, &copy_key)?;
+        if !copy_receipt.as_ref().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) || !manifest.existence.is_open()
+            || !manifest.local_only_cards.contains(&card)
+            || !manifest
+                .cards
+                .iter()
+                .any(|saved| saved.id == card && saved.existence.is_open())
+        {
+            return Err(StoreError::InvalidState(
+                "This pane has no current retained-copy receipt".into(),
+            ));
+        }
+        let copy_receipt = copy_receipt.unwrap();
+        let admission_key = format!("workspace:{}:retained_history_admission:{card}", state.id);
+        let previous = metadata(&transaction, &admission_key)?
+            .map(|encoded| {
+                from_json::<RetainedHistoryReceipt>("retained history receipt", &encoded)
+            })
+            .transpose()?;
+        let stored = load_card_connection(&transaction, card, &self.boot_id, None)?
+            .ok_or_else(|| StoreError::InvalidState("Retained draft disappeared".into()))?;
+        let CardKind::Chat(stored) = &stored.kind else {
+            return Err(StoreError::InvalidState(
+                "Retained draft is no longer a conversation".into(),
+            ));
+        };
+        let source_digest =
+            retained_history_digest(state.id, card, &copy_receipt, witness.source())?;
+        let stored_digest = retained_history_digest(state.id, card, &copy_receipt, stored)?;
+        let first = previous.is_none()
+            && manifest.pending_chat_admissions.get(&card) == Some(witness.source())
+            && stored == witness.source();
+        let retry = !manifest.pending_chat_admissions.contains_key(&card)
+            && previous.as_ref().is_some_and(|previous| {
+                !previous.start_spent
+                    && previous.copy_receipt == copy_receipt
+                    && previous.reader == stored_digest
+                    && (stored == witness.source()
+                        || (previous.source == source_digest
+                            && crate::chat::client::SavedHistoryAdmission::exact(
+                                witness.source(),
+                                stored,
+                            )))
+            });
+        if !first && !retry {
+            return Err(StoreError::InvalidState(
+                "The retained draft admission changed; reopen the saved pane before retrying"
+                    .into(),
+            ));
+        }
+        // A fresh authenticated read-only operation may refresh the exact
+        // already-admitted reader, including a lost ACK followed by daemon
+        // restart. Neither the receipt nor shape alone grants this transfer.
+        rebind_chat_descriptor_transaction(&transaction, card, stored, witness.reader())?;
+        let receipt = RetainedHistoryReceipt {
+            copy_receipt: copy_receipt.clone(),
+            source: source_digest,
+            reader: retained_history_digest(state.id, card, &copy_receipt, witness.reader())?,
+            start_spent: false,
+        };
+        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
+        set_metadata(&transaction, &admission_key, &to_json(&receipt)?)?;
+        transaction.commit()?;
+        Ok(commit)
+    }
+
+    /// An explicit same-allocation Resume spends only this exact reader policy
+    /// before Start. This is not permission for restoration to launch a provider.
+    #[cfg(feature = "ui")]
+    pub(crate) fn save_retained_history_start(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        source: &crate::chat::Session,
+    ) -> Result<WorkspaceCommit> {
+        if !source.is_saved_claude_history()
+            || !state.local_only_cards.contains(&card)
+            || state.pending_chat_admissions.contains_key(&card)
+            || !state.cards.iter().any(|saved| {
+                saved.id == card
+                    && saved.existence.is_open()
+                    && matches!(&saved.kind, CardKind::Chat(session) if session == source)
+            })
+        {
+            return Err(StoreError::InvalidState(
+                "Explicit history Resume changed the local pane".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let StoreInner {
+            connection,
+            refused_closures,
+            ..
+        } = &mut *inner;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_descriptor_write(&transaction)?;
+        let manifest = load_workspace_manifest_connection(&transaction, state.id)?
+            .ok_or_else(|| StoreError::InvalidState("History workspace disappeared".into()))?;
+        let key = format!("workspace:{}:retained_history_admission:{card}", state.id);
+        let encoded = metadata(&transaction, &key)?
+            .ok_or_else(|| StoreError::InvalidState("History reader receipt disappeared".into()))?;
+        let mut receipt: RetainedHistoryReceipt = from_json("retained history receipt", &encoded)?;
+        if !manifest.local_only_cards.contains(&card)
+            || manifest.pending_chat_admissions.contains_key(&card)
+            || metadata(
+                &transaction,
+                &format!("workspace:{}:retained_chat_copy:{card}", state.id),
+            )?
+            .as_deref()
+                != Some(receipt.copy_receipt.as_str())
+            || retained_history_digest(state.id, card, &receipt.copy_receipt, source)?
+                != receipt.reader
+            || load_card_connection(&transaction, card, &self.boot_id, None)?.is_none_or(|saved| {
+                !saved.existence.is_open()
+                    || !matches!(&saved.kind, CardKind::Chat(session) if session == source)
+            })
+        {
+            return Err(StoreError::InvalidState(
+                "The exact admitted history reader changed before Resume".into(),
+            ));
+        }
+        // A new explicit operation may retry a committed but unacknowledged
+        // spend, but must save its latest associated content and get a fresh ACK.
+        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
+        receipt.start_spent = true;
+        set_metadata(&transaction, &key, &to_json(&receipt)?)?;
+        transaction.commit()?;
+        Ok(commit)
     }
 
     /// Commit the prepared allocation and its associated unsent content in one

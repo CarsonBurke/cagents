@@ -370,6 +370,7 @@ pub(crate) struct ResumeSnapshotBinding {
     card: CardId,
     source: crate::chat::Session,
     replacement: crate::chat::Session,
+    retained_history: bool,
     committed: Arc<std::sync::atomic::AtomicBool>,
     active: Arc<std::sync::atomic::AtomicBool>,
     writer: std::sync::Weak<()>,
@@ -398,9 +399,29 @@ impl ResumeSnapshotBinding {
                 .find(|card| card.id == self.card)
                 .unwrap()
                 .kind = CardKind::Chat(self.replacement.clone());
+            if self.retained_history {
+                Arc::make_mut(snapshot)
+                    .pending_chat_admissions
+                    .remove(&self.card);
+            }
         }
     }
 }
+
+#[derive(Debug)]
+enum ChatCheckpointKind {
+    Resume,
+    #[cfg(feature = "ui")]
+    History(crate::chat::client::SavedHistoryAdmission),
+    #[cfg(feature = "ui")]
+    StartHistory,
+}
+
+type ChatCheckpointReceipt = (
+    std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    ResumeSnapshotBinding,
+    ResumeSnapshotOwner,
+);
 
 #[derive(Debug)]
 enum ConversionCheckpoint {
@@ -419,6 +440,7 @@ enum ConversionCheckpoint {
     ChatRecovery(ChatRecoveryWrite),
     ChatResume {
         bindings: Vec<ResumeSnapshotBinding>,
+        kind: ChatCheckpointKind,
         committed: Arc<std::sync::atomic::AtomicBool>,
         snapshot: Arc<WorkspaceState>,
         card: CardId,
@@ -546,6 +568,8 @@ pub struct SessionRuntime {
     /// surface these.
     restore_warnings: Vec<String>,
     operation_store: Arc<StateStore>,
+    retained_history_candidates: std::collections::HashSet<CardId>,
+    retained_history_readers: HashMap<CardId, crate::chat::Session>,
 }
 
 impl std::fmt::Debug for SessionRuntime {
@@ -599,6 +623,16 @@ impl SessionRuntime {
             Some(restored) => (Some(restored.state), restored.warnings),
             None => (None, Vec::new()),
         };
+        let retained_history_candidates = restored
+            .as_ref()
+            .map(|state| store.retained_history_candidates(state))
+            .transpose()?
+            .unwrap_or_default();
+        let retained_history_readers = restored
+            .as_ref()
+            .map(|state| store.retained_history_readers(state))
+            .transpose()?
+            .unwrap_or_default();
         let projects = store.list_projects()?;
         let worktrees = store.list_worktrees()?;
         let writes = PendingWrites::restored(
@@ -656,9 +690,23 @@ impl SessionRuntime {
                 restored_worktrees: worktrees,
                 restore_warnings,
                 operation_store,
+                retained_history_candidates,
+                retained_history_readers,
             },
             restored,
         ))
+    }
+
+    pub(crate) fn has_retained_history_candidate(&self, card: CardId) -> bool {
+        self.retained_history_candidates.contains(&card)
+    }
+
+    pub(crate) fn is_retained_history_reader(
+        &self,
+        card: CardId,
+        source: &crate::chat::Session,
+    ) -> bool {
+        self.retained_history_readers.get(&card) == Some(source)
     }
 
     /// Replaces any uncommitted snapshot. This keeps mutations non-blocking and
@@ -893,14 +941,56 @@ impl SessionRuntime {
         card: CardId,
         source: crate::chat::Session,
         replacement: crate::chat::Session,
-    ) -> std::result::Result<
-        (
-            std::sync::mpsc::Receiver<std::result::Result<(), String>>,
-            ResumeSnapshotBinding,
-            ResumeSnapshotOwner,
-        ),
-        String,
-    > {
+    ) -> std::result::Result<ChatCheckpointReceipt, String> {
+        self.queue_chat_checkpoint(
+            snapshot,
+            card,
+            source,
+            replacement,
+            ChatCheckpointKind::Resume,
+        )
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn save_retained_chat_history(
+        &self,
+        snapshot: Arc<WorkspaceState>,
+        card: CardId,
+        history: crate::chat::client::SavedHistoryAdmission,
+    ) -> std::result::Result<ChatCheckpointReceipt, String> {
+        self.queue_chat_checkpoint(
+            snapshot,
+            card,
+            history.source().clone(),
+            history.reader().clone(),
+            ChatCheckpointKind::History(history),
+        )
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn save_retained_history_start(
+        &self,
+        snapshot: Arc<WorkspaceState>,
+        card: CardId,
+        source: crate::chat::Session,
+    ) -> std::result::Result<ChatCheckpointReceipt, String> {
+        self.queue_chat_checkpoint(
+            snapshot,
+            card,
+            source.clone(),
+            source,
+            ChatCheckpointKind::StartHistory,
+        )
+    }
+
+    fn queue_chat_checkpoint(
+        &self,
+        snapshot: Arc<WorkspaceState>,
+        card: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+        kind: ChatCheckpointKind,
+    ) -> std::result::Result<ChatCheckpointReceipt, String> {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
@@ -916,10 +1006,15 @@ impl SessionRuntime {
         if let Some(previous) = queue.take_latest() {
             queue.conversions.push_back(previous);
         }
+        #[cfg(feature = "ui")]
+        let retained_history = matches!(&kind, ChatCheckpointKind::History(_));
+        #[cfg(not(feature = "ui"))]
+        let retained_history = false;
         let binding = ResumeSnapshotBinding {
             card,
             source: source.clone(),
             replacement: replacement.clone(),
+            retained_history,
             committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             writer: self.writer_token(),
@@ -930,6 +1025,7 @@ impl SessionRuntime {
             .conversions
             .push_back(ConversionCheckpoint::ChatResume {
                 bindings,
+                kind,
                 committed: Arc::clone(&binding.committed),
                 snapshot,
                 card,
@@ -1625,6 +1721,30 @@ trait SessionStore {
             "This store does not support account recovery".into(),
         ))
     }
+    #[cfg(feature = "ui")]
+    fn save_retained_chat_history(
+        &self,
+        _snapshot: &WorkspaceState,
+        _base: SnapshotBase<'_>,
+        _card: CardId,
+        _history: &crate::chat::client::SavedHistoryAdmission,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support retained history admission".into(),
+        ))
+    }
+    #[cfg(feature = "ui")]
+    fn save_retained_history_start(
+        &self,
+        _snapshot: &WorkspaceState,
+        _base: SnapshotBase<'_>,
+        _card: CardId,
+        _source: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support explicit history Resume".into(),
+        ))
+    }
     fn save_chat_resume(
         &self,
         _snapshot: &WorkspaceState,
@@ -1736,6 +1856,26 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
+    #[cfg(feature = "ui")]
+    fn save_retained_chat_history(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        history: &crate::chat::client::SavedHistoryAdmission,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_retained_chat_history(self, snapshot, base, card, history)
+    }
+    #[cfg(feature = "ui")]
+    fn save_retained_history_start(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        source: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_retained_history_start(self, snapshot, base, card, source)
     }
     fn save_chat_resume(
         &self,
@@ -1858,6 +1998,26 @@ impl SessionStore for Arc<StateStore> {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
+    #[cfg(feature = "ui")]
+    fn save_retained_chat_history(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        history: &crate::chat::client::SavedHistoryAdmission,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_retained_chat_history(self, snapshot, base, card, history)
+    }
+    #[cfg(feature = "ui")]
+    fn save_retained_history_start(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        source: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_retained_history_start(self, snapshot, base, card, source)
     }
     fn save_chat_resume(
         &self,
@@ -2150,10 +2310,14 @@ impl PendingWrites {
     fn project_retained_chat_copies(
         &self,
         snapshot: &mut Arc<WorkspaceState>,
+        spending: Option<CardId>,
     ) -> Result<(), StoreError> {
         if !self.retained_chat_copies.is_empty() {
             let state = Arc::make_mut(snapshot);
             for copy in self.retained_chat_copies.values() {
+                if spending == Some(copy.copy.id) {
+                    continue;
+                }
                 copy.project(state)?;
             }
         }
@@ -2168,11 +2332,20 @@ impl PendingWrites {
         snapshot: &mut Arc<WorkspaceState>,
         bindings: &[ResumeSnapshotBinding],
     ) -> Result<(), StoreError> {
+        self.project_snapshot_spending(snapshot, bindings, None)
+    }
+
+    fn project_snapshot_spending(
+        &self,
+        snapshot: &mut Arc<WorkspaceState>,
+        bindings: &[ResumeSnapshotBinding],
+        spending: Option<CardId>,
+    ) -> Result<(), StoreError> {
         for binding in bindings {
             binding.project(snapshot);
         }
         self.translate_chat_rebindings(snapshot);
-        self.project_retained_chat_copies(snapshot)
+        self.project_retained_chat_copies(snapshot, spending)
     }
 
     fn acknowledge_retained_copy_closures(&mut self, snapshot: &WorkspaceState) {
@@ -2310,6 +2483,7 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::ChatResume {
+                    kind,
                     bindings,
                     committed,
                     mut snapshot,
@@ -2318,26 +2492,43 @@ impl PendingWrites {
                     replacement,
                     reply,
                 } => {
-                    if let Err(error) = self.project_snapshot(&mut snapshot, &bindings) {
+                    let spending = match &kind {
+                        #[cfg(feature = "ui")]
+                        ChatCheckpointKind::History(_) => Some(card),
+                        _ => None,
+                    };
+                    if let Err(error) =
+                        self.project_snapshot_spending(&mut snapshot, &bindings, spending)
+                    {
                         let _ = reply.send(Err(error.to_string()));
                         continue;
                     }
-                    let result = store.save_chat_resume(
-                        &snapshot,
-                        SnapshotBase {
-                            workspace: self.workspace_generation,
-                            cards: &self.card_generations,
-                        },
-                        card,
-                        &source,
-                        &replacement,
-                    );
+                    let base = SnapshotBase {
+                        workspace: self.workspace_generation,
+                        cards: &self.card_generations,
+                    };
+                    let result = match &kind {
+                        ChatCheckpointKind::Resume => {
+                            store.save_chat_resume(&snapshot, base, card, &source, &replacement)
+                        }
+                        #[cfg(feature = "ui")]
+                        ChatCheckpointKind::History(history) => {
+                            store.save_retained_chat_history(&snapshot, base, card, history)
+                        }
+                        #[cfg(feature = "ui")]
+                        ChatCheckpointKind::StartHistory => {
+                            store.save_retained_history_start(&snapshot, base, card, &source)
+                        }
+                    };
                     match result {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
                             self.quarantine.snapshot_landed(&snapshot);
                             self.acknowledge_retained_copy_closures(&snapshot);
+                            if let Some(card) = spending {
+                                self.retained_chat_copies.remove(&card);
+                            }
                             committed.store(true, std::sync::atomic::Ordering::Release);
                             let _ = reply.send(Ok(()));
                         }
@@ -4936,6 +5127,7 @@ mod tests {
             .conversions
             .push_back(ConversionCheckpoint::ChatResume {
                 bindings: Vec::new(),
+                kind: ChatCheckpointKind::Resume,
                 committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 snapshot,
                 card,
@@ -5005,6 +5197,7 @@ mod tests {
                 card,
                 source: source.clone(),
                 replacement: replacement.clone(),
+                retained_history: false,
                 committed: Arc::clone(&committed),
                 active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 writer: std::sync::Weak::new(),
@@ -5019,6 +5212,7 @@ mod tests {
                 .conversions
                 .push_back(ConversionCheckpoint::ChatResume {
                     bindings: Vec::new(),
+                    kind: ChatCheckpointKind::Resume,
                     committed,
                     snapshot: Arc::new(prepared),
                     card,
