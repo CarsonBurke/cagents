@@ -3906,6 +3906,9 @@ fn observer_close_callbacks_lose_their_generation_across_registry_replacement_an
         let repository = directory.path().canonicalize().unwrap();
         let project = ProjectId::new();
         let mut app = crate::app::tests::context_inspector_test_app(true);
+        let runtime = directory.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        app.worktree_protections.use_fixture_runtime(runtime);
         app.sidebar_model.projects.push(
             SidebarProject::new(
                 project,
@@ -4022,6 +4025,9 @@ fn queued_observer_close_fixture() -> (
     let repository = directory.path().canonicalize().unwrap();
     let project = ProjectId::new();
     let mut app = crate::app::tests::context_inspector_test_app(false);
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    app.worktree_protections.use_fixture_runtime(runtime);
     app.sidebar_model.projects.push(
         SidebarProject::new(
             project,
