@@ -134,6 +134,38 @@ pub(super) fn same_prompt(provider: Provider, left: Option<&str>, right: Option<
     }
 }
 
+/// Where a retained note is drawn: the last group of its message's exchange,
+/// as when it was recorded. A note names its message for identity, while a
+/// reply can span several groups. After paging, a visible later part of the
+/// same message stands in for an absent first part. `None` when no visible
+/// prompt belongs to the note.
+fn note_destination<'a>(
+    runtime: &'a Runtime,
+    anchor: &str,
+    user_carriers: &HashMap<&str, String>,
+) -> Option<&'a str> {
+    let provider = runtime.session.launch.provider;
+    let carrier = attachment_draft::message_key(provider, anchor)
+        .filter(|carrier| user_carriers.contains_key(carrier));
+    let start = runtime.turns.iter().position(|turn| {
+        turn.prompt.iter().any(|index| {
+            runtime.snapshot.items.get(*index).is_some_and(|item| {
+                item.role == chat::Role::User
+                    && !matches!(item.content, ItemContent::Delivery { .. })
+                    && (item.id == anchor
+                        || carrier.is_some_and(|carrier| {
+                            attachment_draft::message_key(provider, &item.id) == Some(carrier)
+                        }))
+            })
+        })
+    })?;
+    let replies = runtime.turns[start + 1..]
+        .iter()
+        .take_while(|turn| turn.prompt.is_empty())
+        .count();
+    Some(runtime.turns[start + replies].key.as_str())
+}
+
 impl State {
     fn metadata(
         provider: Provider,
@@ -504,39 +536,17 @@ impl State {
                         .sources
                         .iter()
                         .find_map(|source| match source {
-                            Source::Note(index) => Some(runtime.failures[*index].0.clone()),
+                            Source::Note(index) => {
+                                Some(runtime.failures[*index].0.as_deref().map(|anchor| {
+                                    note_destination(runtime, anchor, &user_carriers)
+                                        .unwrap_or(anchor)
+                                        .to_owned()
+                                }))
+                            }
                             _ => None,
                         })
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
-            if let Some(anchor) = incident.anchor.as_deref()
-                && !runtime.turns.iter().any(|turn| turn.key == anchor)
-                && incident.sources.iter().any(|source| {
-                    matches!(source, Source::Note(index) if runtime.failures[*index].0.as_deref() == Some(anchor))
-                })
-            {
-                // A note's message identity can differ from its containing
-                // visual Turn, including opaque legacy IDs. Prefer its exact
-                // visible User item; after paging, only a proven same-message
-                // carrier may supply the display destination.
-                let carrier = attachment_draft::message_key(provider, anchor)
-                    .filter(|carrier| user_carriers.contains_key(carrier));
-                if let Some(turn) = runtime.turns.iter().find(|turn| {
-                    turn.prompt.iter().any(|index| {
-                        runtime.snapshot.items.get(*index).is_some_and(|item| {
-                            item.role == chat::Role::User
-                                && !matches!(item.content, ItemContent::Delivery { .. })
-                                && (item.id == anchor
-                                    || carrier.is_some_and(|carrier| {
-                                        attachment_draft::message_key(provider, &item.id)
-                                            == Some(carrier)
-                                    }))
-                        })
-                    })
-                }) {
-                    incident.anchor = Some(turn.key.clone());
-                }
-            }
         }
         state.expanded = runtime
             .failure_ui
@@ -1031,6 +1041,50 @@ mod tests {
             runtime.refresh();
             assert_eq!(runtime.failure_ui.revision, revision);
         }
+    }
+
+    #[test]
+    fn notice_stays_below_a_reply_that_spans_several_groups() {
+        let provider = Provider::Claude;
+        let message = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let mut tool = text("reply-tool", chat::Role::Assistant, "");
+        tool.content = ItemContent::Tool {
+            name: "Bash".into(),
+            input: "ls".into(),
+            output: String::new(),
+            status: chat::ToolStatus::Succeeded,
+        };
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, message, 0), chat::Role::User, "Inspect"),
+                image(&part(provider, message, 1)),
+                text("reply-prose", chat::Role::Assistant, "Checking the images."),
+                tool,
+            ],
+        );
+        assert_eq!(
+            runtime.turns.len(),
+            2,
+            "a tool after narration opens a group"
+        );
+        publish_error(&mut runtime, &handle, "Opaque provider failure");
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("reply-tool")
+        );
+
+        // A later exchange does not pull the retained notice into itself.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items
+                .push(Arc::new(text("next-message:0", chat::Role::User, "Next")));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("reply-tool")
+        );
     }
 
     #[test]
