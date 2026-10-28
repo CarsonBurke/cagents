@@ -1334,7 +1334,13 @@ fn run_isolated(test: &str, mode: &str) {
         .env(MODE, mode)
         .env(
             "CAGENTS_UPGRADE_GOAL_FIXTURE",
-            if mode == "fresh-goal" { "1" } else { "0" },
+            match mode {
+                "fresh-goal" => "mutable",
+                // These parents establish a confirmed idle synthetic chat
+                // before upgrade. Unsupported/unknown is not inactive.
+                "fixture" | "degraded-retained" | "degraded" => "inactive",
+                _ => panic!("unexpected native upgrade fixture mode {mode}"),
+            },
         )
         .env("CAGENTS_UPGRADE_ROOT", root)
         .env("CAGENTS_UPGRADE_EXE", std::env::current_exe().unwrap())
@@ -1424,6 +1430,14 @@ fn wait_durable(handle: &crate::chat::runtime::Handle) {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(handle.confirmed_session_id().as_deref(), Some(THREAD));
+    let goal = handle.snapshot(None).unwrap().goal.unwrap();
+    assert!(
+        goal.support == crate::chat::goal::Support::Supported
+            && !goal.pending
+            && !goal.uncertain
+            && matches!(goal.read, crate::chat::goal::ReadState::Known(None)),
+        "upgrade fixture must confirm inactivity, not infer it from unsupported/unknown: {goal:?}"
+    );
 }
 
 fn wait_until(mut condition: impl FnMut() -> bool, failure: &str) {
@@ -1466,7 +1480,11 @@ fn completed_local_adapter(root: &std::path::Path) -> crate::chat::runtime::Hand
 }
 
 fn provider() {
-    let goals = std::env::var("CAGENTS_UPGRADE_GOAL_FIXTURE").as_deref() == Ok("1");
+    let mutable_goals = match std::env::var("CAGENTS_UPGRADE_GOAL_FIXTURE").as_deref() {
+        Ok("mutable") => true,
+        Ok("inactive") => false,
+        other => panic!("unexpected native upgrade Goal fixture profile {other:?}"),
+    };
     let mut goal: Option<Value> = None;
     let socket = std::env::var_os("CAGENTS_UPGRADE_SOCKET").unwrap();
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
@@ -1509,7 +1527,9 @@ fn provider() {
             }
             let result = match frame["method"].as_str().unwrap() {
                 "initialize" => {
-                    json!({"userAgent": if goals { "cagents/0.162.0 (Linux)" } else { "cagents/0.157.1 (Linux)" }, "codexHome":std::env::var("CODEX_HOME").unwrap()})
+                    // Both synthetic profiles support reading Goals. Only
+                    // fresh-goal may mutate; this is no actual SDK evidence.
+                    json!({"userAgent":"cagents/0.162.0 (Linux)", "codexHome":std::env::var("CODEX_HOME").unwrap()})
                 }
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
@@ -1519,8 +1539,11 @@ fn provider() {
                     json!({"data":[],"nextCursor":null})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),
-                "thread/goal/get" if goals => json!({"goal":goal}),
-                "thread/goal/set" if goals => {
+                "thread/goal/get" => {
+                    assert_eq!(frame["params"]["threadId"], THREAD);
+                    json!({"goal":goal})
+                }
+                "thread/goal/set" if mutable_goals => {
                     assert_eq!(frame["params"]["threadId"], THREAD);
                     assert!(frame["params"].get("tokenBudget").is_none());
                     let objective = frame["params"]["objective"].as_str().unwrap();

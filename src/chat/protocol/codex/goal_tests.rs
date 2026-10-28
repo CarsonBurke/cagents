@@ -1543,6 +1543,63 @@ fn legacy_restore_reads_before_resume_and_requires_positive_inactive_native_trut
 }
 
 #[test]
+fn missing_goal_field_cannot_authorize_legacy_resume_or_erase_active_truth() {
+    for previously_active in [false, true] {
+        for missing in [json!({}), json!({"other":null})] {
+            let mut adapter = adapter();
+            let initialized = begin_legacy_restore(&mut adapter);
+            let mut get = initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/goal/get")
+                .unwrap()["id"]
+                .clone();
+            adapter.set_goal_resume_admission(GoalResumeAdmission::InactiveOnly);
+            if previously_active {
+                let active = adapter
+                    .receive(json!({"id":get,"result":{
+                        "goal":raw_goal("thread-exact", "Original active goal", "active")
+                    }}))
+                    .unwrap();
+                assert!(active.writes.is_empty());
+                get = command(&mut adapter, Operation::Get).writes[0]["id"].clone();
+            }
+            let before = snapshot(&mut adapter);
+            let unavailable = adapter.receive(json!({"id":get,"result":missing})).unwrap();
+            let actual = published(&unavailable);
+            assert_eq!(
+                actual.read, before.read,
+                "missing data cannot become observed absence"
+            );
+            assert!(!actual.pending && actual.uncertain);
+            assert_ne!(actual.support, Support::Unsupported);
+            assert!(adapter.goal_resume_pending && !adapter.ready);
+            assert!(
+                unavailable.writes.is_empty(),
+                "malformed data cannot authorize resume"
+            );
+            assert!(
+                unavailable
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, Event::Ready(true)))
+            );
+            // Only a new explicit Check with real null can establish absence.
+            let check = command(&mut adapter, Operation::Get);
+            let inactive = adapter
+                .receive(json!({"id":check.writes[0]["id"],"result":{"goal":null}}))
+                .unwrap();
+            assert_eq!(inactive.writes.len(), 1);
+            assert_eq!(inactive.writes[0]["method"], "thread/resume");
+            assert_eq!(inactive.writes[0]["params"]["threadId"], "thread-exact");
+            assert_eq!(published(&inactive).read, ReadState::Known(None));
+            assert!(!published(&inactive).uncertain);
+            assert!(!adapter.ready);
+        }
+    }
+}
+
+#[test]
 fn blocked_legacy_restore_keeps_native_pause_and_clear_without_claiming_ready() {
     for clear in [false, true] {
         let mut adapter = adapter();

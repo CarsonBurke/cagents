@@ -62,7 +62,9 @@ pub(super) fn response(
             .as_bool()
             .map(Reply::Cleared)
             .ok_or_else(|| "Codex did not confirm the goal clear result".into()),
-        Operation::Get if result.get("goal").is_none_or(Value::is_null) => Ok(Reply::Read(None)),
+        // The native response always includes goal, with explicit null for
+        // absence. A missing field proves nothing about autonomous work.
+        Operation::Get if result.get("goal").is_some_and(Value::is_null) => Ok(Reply::Read(None)),
         Operation::Get => {
             observed_goal(&result["goal"], thread).map(|goal| Reply::Read(Some(goal)))
         }
@@ -147,13 +149,15 @@ mod tests {
 
     #[test]
     fn read_absence_is_distinct_from_malformed_set_and_unconfirmed_clear() {
-        for result in [json!({}), json!({"goal":null})] {
-            assert_eq!(
-                response("thread", &Operation::Get, &result).unwrap(),
-                Reply::Read(None)
-            );
+        assert_eq!(
+            response("thread", &Operation::Get, &json!({"goal":null})).unwrap(),
+            Reply::Read(None)
+        );
+        for result in [json!({}), json!({"other":null}), json!({"goal":false})] {
+            assert!(response("thread", &Operation::Get, &result).is_err());
             assert!(response("thread", &Operation::Pause, &result).is_err());
         }
+        assert!(response("thread", &Operation::Pause, &json!({"goal":null})).is_err());
         for cleared in [false, true] {
             assert_eq!(
                 response("thread", &Operation::Clear, &json!({"cleared":cleared})).unwrap(),
