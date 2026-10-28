@@ -310,6 +310,8 @@ fn session_scopes(
 
 #[cfg(test)]
 mod tests {
+    mod source_scope;
+
     use super::*;
 
     #[test]
