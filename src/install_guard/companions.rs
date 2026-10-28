@@ -447,10 +447,48 @@ mod tests {
 
     #[test]
     fn namespace_read_rechecks_identity_before_same_or_other_runtime_classification() {
-        if crate::repository::isolated_git_test(concat!(
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+        const CHILD: &str = "CAGENTS_COMPANION_NAMESPACE_TEST";
+        let name = concat!(
             module_path!(),
             "::namespace_read_rechecks_identity_before_same_or_other_runtime_classification"
-        )) {
+        );
+        let name = name
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(name);
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            // The fixture's FIFO open can block if its writer is delayed.
+            // Bound the owning process using the executor shared by the CLI,
+            // while inheriting the caller's complete authority unchanged.
+            let command = CommandSpec::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
+                .env(CHILD, name)
+                .timeout(Duration::from_secs(15))
+                .output_limits(1024 * 1024, 1024 * 1024);
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap_or_else(|error| panic!("bounded namespace fixture failed: {error:?}"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.success, "{stdout}\n{stderr}");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {name} ... ok")),
+                "the exact namespace child did not pass: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "the namespace child must execute exactly one test: {stdout}\n{stderr}"
+            );
             return;
         }
         for same_runtime in [true, false] {
