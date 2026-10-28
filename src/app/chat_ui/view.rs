@@ -5017,6 +5017,21 @@ mod tests {
                 "Open artifact: Unicode source",
                 "src/résumé.rs:9:2",
             ),
+            (
+                "Compare tree-real-*.png and [Source revision](file:///producing/worktree/main.rs?revision=7:3#L12:3).",
+                "Open artifact: Source revision",
+                "file:///producing/worktree/main.rs?revision=7:3#L12:3",
+            ),
+            (
+                "Compare tree-real-*.png and [Filtered source](FILE:/producing/worktree/main.rs?filter=*?[one]{a,b}#section[one]).",
+                "Open artifact: Filtered source",
+                "FILE:/producing/worktree/main.rs?filter=*?[one]{a,b}#section[one]",
+            ),
+            (
+                "Compare tree-real-*.png and [Literal source](file:///producing/worktree/literal%2A%3F%5Bone%5D.rs?revision=7:3#L12:3).",
+                "Open artifact: Literal source",
+                "file:///producing/worktree/literal%2A%3F%5Bone%5D.rs?revision=7:3#L12:3",
+            ),
         ] {
             let request = chat::Request {
                 kind: chat::RequestKind::Question,

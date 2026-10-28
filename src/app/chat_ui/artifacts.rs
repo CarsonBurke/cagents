@@ -52,17 +52,24 @@ fn add(label: &str, uri: &str, output: &mut Vec<(String, String)>) {
     // `main.rs:42:7` otherwise looks like the unsupported `main.rs` scheme.
     // Keep the original URI below so the opener still receives its position.
     let (destination, _) = crate::document_link::file_position(uri);
-    let web = match Url::parse(destination) {
-        Ok(url) if matches!(url.scheme(), "https" | "http") => url.host_str().is_some(),
-        Ok(url) if url.scheme() == "file" && url.to_file_path().is_ok() => false,
+    let (web, pattern_target) = match Url::parse(destination) {
+        Ok(url) if matches!(url.scheme(), "https" | "http") => (url.host_str().is_some(), uri),
+        Ok(url) if url.scheme() == "file" && url.to_file_path().is_ok() => {
+            // Query and fragment bytes are URI data, not filename patterns.
+            // Keep the raw path spelling so encoded literal metacharacters
+            // remain distinct from unescaped shell shorthand.
+            (false, uri.split(['?', '#']).next().unwrap_or(uri))
+        }
         Ok(_) => return,
-        Err(_) => false,
+        Err(_) => (false, uri),
     };
     // A producer can encode a literal metacharacter in an explicit file URL.
     // Unescaped shell patterns do not become artifact buttons.
     if !web
-        && (uri.contains(['*', '?', '[', ']'])
-            || uri.contains('{') && uri.contains(',') && uri.contains('}'))
+        && (pattern_target.contains(['*', '?', '[', ']'])
+            || pattern_target.contains('{')
+                && pattern_target.contains(',')
+                && pattern_target.contains('}'))
     {
         return;
     }
@@ -195,6 +202,35 @@ mod tests {
                     path: "/repo/report.txt:12:3".into(),
                     fragment: None,
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn review_artifact_file_uri_queries_and_fragments_are_not_filename_patterns() {
+        for uri in [
+            "file:///repo/main.rs?revision=7:3#L12:3",
+            "FILE:/repo/main.rs?filter=*?[one]{a,b}#section[one]",
+            "file:///repo/main.rs#section[one]*{a,b}?",
+            "file:///repo/literal%2A%3F%5Bone%5D%7Ba,b%7D.rs?revision=7:3#L12:3",
+        ] {
+            assert_eq!(
+                links(&question(&format!("[source]({uri})"))),
+                [("source".to_owned(), uri.to_owned())],
+                "the original file URI retains its query and fragment: {uri}"
+            );
+        }
+        for uri in [
+            "file:///repo/main*.rs?revision=7:3#L12:3",
+            "FILE:/repo/main[ab].rs?revision=7:3#L12:3",
+            "file:///repo/main-{one,two}.rs?revision=7:3#L12:3",
+            "src/main?.rs:42",
+            "file://remote/repo/main.rs?revision=7:3#L12:3",
+            "javascript:payload.rs:42",
+        ] {
+            assert!(
+                links(&question(&format!("[source]({uri})"))).is_empty(),
+                "URI boundaries do not bypass path-pattern or scheme admission: {uri}"
             );
         }
     }
