@@ -481,7 +481,13 @@ fn index(
             &launch.recipe,
         );
         let untitled = entry.title == chat_ui::chat_card_title(launch.provider);
-        seen.insert(key, Some((entry.card, untitled))).is_none()
+        match seen.entry(key) {
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(Some((entry.card, untitled)));
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
     });
     let seeds: Arc<[chat::Session]> = seeds.into();
     if !send(Progress::Saved {
