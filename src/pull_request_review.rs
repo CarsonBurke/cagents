@@ -3096,6 +3096,8 @@ fn load_review<E: crate::repository::ProcessExecutor>(
             pull_request.body = metadata.body;
             pull_request.state = metadata.state;
             pull_request.is_draft = metadata.is_draft;
+            pull_request.base_ref_name = metadata.base_ref_name;
+            pull_request.head_ref_name = metadata.head_ref_name;
             pull_request.updated_at = metadata.updated_at;
             pull_request.review_decision = metadata.review_decision;
         }
@@ -3710,7 +3712,117 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn refreshed_metadata_replaces_stale_header_and_checks() {
+    fn unchanged_revision_refreshes_branch_names_and_preserves_loaded_checks() {
+        struct CompactRefresh {
+            calls: std::sync::atomic::AtomicUsize,
+            response: Vec<u8>,
+        }
+        impl crate::repository::ProcessExecutor for CompactRefresh {
+            fn execute(
+                &self,
+                command: &crate::repository::CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure>
+            {
+                assert_eq!(command.program, Path::new("gh"), "must not run Git");
+                assert_eq!(
+                    self.calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "unchanged review needs only its compact refresh"
+                );
+                let query = command
+                    .arguments
+                    .iter()
+                    .find_map(|arg| arg.to_str()?.strip_prefix("query="))
+                    .expect("compact GraphQL refresh");
+                assert!(query.contains("baseRefName"));
+                assert!(query.contains("headRefName"));
+                assert!(!query.contains("statusCheckRollup"));
+                Ok(crate::repository::ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: self.response.clone(),
+                    stderr: vec![],
+                })
+            }
+        }
+
+        let mut previous = loaded(
+            vec![entry("file.rs", ChangeKind::Modified)],
+            vec![remote_file("file.rs", true)],
+        );
+        previous.pull_request.status_check_rollup =
+            Some(vec![crate::github::PullRequestCheckRollup::StatusContext {
+                context: "CI".into(),
+                state: RemoteValue("PENDING".into()),
+                target_url: None,
+                created_at: None,
+            }]);
+        let mut target = target(1);
+        target.repository =
+            GitHubRepoKey::new("review-metadata-refresh-test.invalid", None, "o", "r").unwrap();
+        previous.pull_request.url =
+            Url::parse("https://review-metadata-refresh-test.invalid/o/r/pull/1").unwrap();
+        target.pull_request = Arc::new(previous.pull_request.clone());
+        let body = serde_json::json!({"data":{
+            "viewer":{"login":"me"},
+            "repository":{"pullRequest":{
+                "id":"PR_1",
+                "number":1,
+                "title":"Retargeted review",
+                "body":"Updated description",
+                "state":"OPEN",
+                "isDraft":false,
+                "headRefName":"renamed-feature",
+                "headRefOid":previous.context.head_oid,
+                "baseRefName":"release",
+                "baseRefOid":previous.context.base_oid,
+                "updatedAt":"2026-10-28T00:00:00Z",
+                "url":previous.pull_request.url,
+                "viewerDidAuthor":false,
+                "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+                "files":{"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}
+        }});
+        let executor = Arc::new(CompactRefresh {
+            calls: Default::default(),
+            response: format!("HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4000\r\n\r\n{body}")
+                .into_bytes(),
+        });
+        let api = crate::github::GitHubService::new("gh", executor.clone());
+        let refreshed = load_review(
+            &api,
+            &RepositoryService::new("git", executor.clone()),
+            &target,
+            Some(&previous),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(refreshed.context, previous.context);
+        assert_eq!(refreshed.range, previous.range);
+        assert_eq!(refreshed.entries, previous.entries);
+        assert_eq!(refreshed.pull_request.base_ref_name, "release");
+        assert_eq!(refreshed.pull_request.head_ref_name, "renamed-feature");
+        assert_eq!(refreshed.pull_request.title, "Retargeted review");
+        // The compact query does not fetch checks; keep the last loaded snapshot.
+        assert_eq!(
+            refreshed.pull_request.status_check_rollup,
+            previous.pull_request.status_check_rollup
+        );
+
+        let (mut state, _) = state();
+        state.target = Some(target);
+        state.adopt(&refreshed);
+        let summary = &state.target.as_ref().unwrap().pull_request;
+        assert_eq!(summary.base_ref_name, "release");
+        assert_eq!(summary.head_ref_name, "renamed-feature");
+    }
+
+    #[test]
+    fn adopted_metadata_replaces_stale_header() {
         let (mut state, _) = state();
         let mut fresh = loaded(vec![], vec![]);
         fresh.pull_request.title = "Renamed on GitHub".into();
