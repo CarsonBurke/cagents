@@ -4,7 +4,10 @@
 
 mod appearance;
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 pub use appearance::{Appearance, StyleSheet};
 
@@ -16,7 +19,7 @@ use iced_core::text::{self, Text};
 use iced_core::widget::Tree;
 use iced_core::{
     Border, Clipboard, Element, Length, Padding, Pixels, Point, Rectangle, Renderer, Shadow, Shell,
-    Size, Vector, Widget, alignment, mouse, overlay, renderer, svg, touch,
+    Size, Vector, Widget, alignment, keyboard, mouse, overlay, renderer, svg, touch,
 };
 use iced_widget::scrollable::Scrollable;
 
@@ -40,6 +43,7 @@ where
     text_size: Option<f32>,
     text_line_height: text::LineHeight,
     style: (),
+    keyboard: Option<Keyboard>,
 }
 
 impl<'a, S: AsRef<str>, Message: 'a + std::clone::Clone> Menu<'a, S, Message>
@@ -72,7 +76,26 @@ where
             text_line_height: text::LineHeight::default(),
             style: Default::default(),
             close_on_selected,
+            keyboard: None,
         }
+    }
+
+    pub(super) fn keyboard(
+        mut self,
+        open: Arc<AtomicBool>,
+        source: Arc<AtomicU64>,
+        epoch: u64,
+    ) -> Self {
+        self.keyboard = Some(Keyboard {
+            epoch,
+            source,
+            open,
+            reveal: self.state.reveal.clone(),
+            follow_highlight: self.state.follow_highlight.clone(),
+            viewport_size: self.state.viewport_size.clone(),
+            retired: self.state.retired.clone(),
+        });
+        self
     }
 
     /// Sets the width of the [`Menu`].
@@ -126,18 +149,58 @@ where
     }
 }
 
+pub(super) fn activation_key(key: &keyboard::Key) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
+        || matches!(key, keyboard::Key::Character(value) if value.as_str() == " ")
+}
+
+#[derive(Clone)]
+struct Keyboard {
+    source: Arc<AtomicU64>,
+    epoch: u64,
+    open: Arc<AtomicBool>,
+    reveal: Arc<AtomicBool>,
+    follow_highlight: Arc<AtomicBool>,
+    viewport_size: Arc<Mutex<Option<Size>>>,
+    retired: Arc<AtomicBool>,
+}
+
+impl Keyboard {
+    fn valid(&self) -> bool {
+        self.source.load(Ordering::SeqCst) == self.epoch && self.open.load(Ordering::SeqCst)
+    }
+}
+
 /// The local state of a [`Menu`].
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct State {
     pub(crate) tree: RcWrapper<Tree>,
+    reveal: Arc<AtomicBool>,
+    follow_highlight: Arc<AtomicBool>,
+    viewport_size: Arc<Mutex<Option<Size>>>,
+    retired: Arc<AtomicBool>,
 }
 
 impl State {
+    pub(super) fn begin_open(&mut self) {
+        self.reveal.store(true, Ordering::SeqCst);
+        self.follow_highlight.store(true, Ordering::SeqCst);
+        *self.viewport_size.lock().unwrap() = None;
+        // Native popup view providers retain their cloned opening state. A
+        // newer opening gets its own retirement receipt; rebuilding an old
+        // provider must not regain permission to close or select again.
+        self.retired = Arc::new(AtomicBool::new(false));
+    }
+
     /// Creates a new [`State`] for a [`Menu`].
     pub fn new() -> Self {
         Self {
             tree: RcWrapper::new(Tree::empty()),
+            reveal: Arc::new(AtomicBool::new(false)),
+            follow_highlight: Arc::new(AtomicBool::new(true)),
+            viewport_size: Arc::new(Mutex::new(None)),
+            retired: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -155,6 +218,10 @@ struct Overlay<'a, Message> {
     target_height: f32,
     style: (),
     position: Point,
+    keyboard: Option<Keyboard>,
+    hovered_option: Arc<Mutex<Option<usize>>>,
+    row_height: f32,
+    padding_top: f32,
 }
 
 impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
@@ -180,13 +247,15 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             text_line_height,
             style,
             close_on_selected,
+            keyboard,
         } = menu;
 
         let mut container = Container::new(Scrollable::new(
             Container::new(List {
                 options,
                 icons,
-                hovered_option,
+                hovered_option: hovered_option.clone(),
+                keyboard: keyboard.clone(),
                 selected_option,
                 on_selected,
                 close_on_selected,
@@ -210,7 +279,80 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             target_height,
             style,
             position,
+            keyboard,
+            hovered_option,
+            row_height: f32::from(text_line_height.to_absolute(Pixels(text_size.unwrap_or(14.0))))
+                + padding.y(),
+            padding_top: padding.top,
         }
+    }
+
+    fn reveal(&mut self, layout: Layout<'_>, renderer: &crate::Renderer) {
+        let Some(keyboard) = &self.keyboard else {
+            return;
+        };
+        if !keyboard.valid() {
+            return;
+        }
+        let Some(index) = *self.hovered_option.lock().unwrap() else {
+            return;
+        };
+        struct Reveal<'a> {
+            top: f32,
+            bottom: f32,
+            requested: bool,
+            follow_highlight: bool,
+            viewport_size: &'a Mutex<Option<Size>>,
+        }
+        impl iced_core::widget::Operation for Reveal<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced_core::widget::Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&iced_core::widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                state: &mut dyn iced_core::widget::operation::Scrollable,
+            ) {
+                // A shorter native viewport must keep keyboard navigation visible.
+                // Merely reconstructing a view, or browsing with the wheel,
+                // must not pull the user back to the highlighted row.
+                let geometry_changed = self.viewport_size.lock().unwrap().replace(bounds.size())
+                    != Some(bounds.size());
+                if !self.requested && !(self.follow_highlight && geometry_changed) {
+                    return;
+                }
+                let delta = if self.top < translation.y {
+                    self.top - translation.y
+                } else if self.bottom > translation.y + bounds.height {
+                    self.bottom - translation.y - bounds.height
+                } else {
+                    0.0
+                };
+                state.scroll_by(
+                    iced_core::widget::operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                    bounds,
+                    content,
+                );
+            }
+        }
+        let top = self.padding_top + index as f32 * self.row_height;
+        self.state.with_data_mut(|tree| {
+            self.container.operate(
+                tree,
+                layout,
+                renderer,
+                &mut Reveal {
+                    top,
+                    bottom: top + self.row_height,
+                    requested: keyboard.reveal.swap(false, Ordering::SeqCst),
+                    follow_highlight: keyboard.follow_highlight.load(Ordering::SeqCst),
+                    viewport_size: &keyboard.viewport_size,
+                },
+            )
+        });
     }
 
     fn _layout(&mut self, renderer: &crate::Renderer, bounds: Size) -> layout::Node {
@@ -235,11 +377,13 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             .with_data_mut(|tree| self.container.layout(tree, renderer, &limits));
 
         let node_size = node.size();
-        node.move_to(if space_below > space_above {
+        let node = node.move_to(if space_below > space_above {
             self.position + Vector::new(0.0, self.target_height)
         } else {
             self.position - Vector::new(0.0, node_size.height)
-        })
+        });
+        self.reveal(Layout::new(&node), renderer);
+        node
     }
 
     fn _update(
@@ -252,12 +396,31 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
         shell: &mut Shell<'_, Message>,
     ) {
         let bounds = layout.bounds();
+        if cursor.is_over(bounds)
+            && matches!(
+                event,
+                Event::Mouse(
+                    mouse::Event::WheelScrolled { .. }
+                        | mouse::Event::CursorMoved { .. }
+                        | mouse::Event::ButtonPressed(_)
+                ) | Event::Touch(
+                    touch::Event::FingerPressed { .. } | touch::Event::FingerMoved { .. }
+                )
+            )
+        {
+            if let Some(keyboard) = &self.keyboard {
+                if keyboard.valid() {
+                    keyboard.follow_highlight.store(false, Ordering::SeqCst);
+                }
+            }
+        }
 
         self.state.with_data_mut(|tree| {
             self.container.update(
                 tree, event, layout, cursor, renderer, clipboard, shell, &bounds,
             )
-        })
+        });
+        self.reveal(layout, renderer);
     }
 
     fn _mouse_interaction(
@@ -324,6 +487,16 @@ impl<'a, Message: Clone + 'a> iced_core::Overlay<Message, crate::Theme, crate::R
         self._update(event, layout, cursor, renderer, clipboard, shell)
     }
 
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        self.state
+            .with_data_mut(|tree| self.container.operate(tree, layout, renderer, operation));
+    }
+
     fn mouse_interaction(
         &self,
         layout: Layout<'_>,
@@ -360,8 +533,22 @@ impl<'a, Message: Clone + 'a> crate::widget::Widget<Message, crate::Theme, crate
     ) -> layout::Node {
         let limits = limits.width(self.width);
 
+        let node = self
+            .state
+            .with_data_mut(|tree| self.container.layout(tree, renderer, &limits));
+        self.reveal(Layout::new(&node), renderer);
+        node
+    }
+
+    fn operate(
+        &mut self,
+        _tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
         self.state
-            .with_data_mut(|tree| self.container.layout(tree, renderer, &limits))
+            .with_data_mut(|tree| self.container.operate(tree, layout, renderer, operation));
     }
 
     fn mouse_interaction(
@@ -414,6 +601,7 @@ where
     [S]: std::borrow::ToOwned,
 {
     options: Cow<'a, [S]>,
+    keyboard: Option<Keyboard>,
     icons: Cow<'a, [icon::Handle]>,
     hovered_option: Arc<Mutex<Option<usize>>>,
     selected_option: Option<usize>,
@@ -472,11 +660,119 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if let Some(keyboard) = &self.keyboard {
+            if !keyboard.valid() {
+                // An old popup can outlive a source replacement or a reopen.
+                // Retire only its own native surface; never select or close the new menu.
+                if !keyboard.retired.swap(true, Ordering::SeqCst) {
+                    if let Some(close) = &self.close_on_selected {
+                        shell.publish(close.clone());
+                    }
+                }
+                if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) if activation_key(key) || matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)))
+                    || matches!(
+                        event,
+                        Event::Mouse(mouse::Event::ButtonPressed(_))
+                            | Event::Touch(touch::Event::FingerPressed { .. })
+                    )
+                {
+                    shell.capture_event();
+                }
+                return;
+            }
+            if let Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) = event
+            {
+                use keyboard::key::Named;
+                if matches!(key, keyboard::Key::Named(Named::Tab))
+                    && (modifiers.is_empty() || *modifiers == keyboard::Modifiers::SHIFT)
+                {
+                    keyboard.open.store(false, Ordering::SeqCst);
+                    if self.close_on_selected.is_some() {
+                        keyboard.retired.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(close) = &self.close_on_selected {
+                        shell.publish(close.clone());
+                    }
+                    shell.request_redraw();
+                    // Leave Tab ignored so normal keyboard navigation runs once.
+                    return;
+                }
+                if modifiers.is_empty() {
+                    if matches!(key, keyboard::Key::Named(Named::Escape)) {
+                        keyboard.open.store(false, Ordering::SeqCst);
+                        if self.close_on_selected.is_some() {
+                            keyboard.retired.store(true, Ordering::SeqCst);
+                        }
+                        if let Some(close) = &self.close_on_selected {
+                            shell.publish(close.clone());
+                        }
+                        shell.request_redraw();
+                        shell.capture_event();
+                        return;
+                    }
+                    if activation_key(key) {
+                        if !repeat {
+                            let index = *self.hovered_option.lock().unwrap();
+                            if let Some(index) = index.filter(|index| *index < self.options.len()) {
+                                if self.close_on_selected.is_some() {
+                                    keyboard.retired.store(true, Ordering::SeqCst);
+                                }
+                                shell.publish((self.on_selected)(index));
+                                if let Some(close) = &self.close_on_selected {
+                                    shell.publish(close.clone());
+                                }
+                            }
+                        }
+                        shell.request_redraw();
+                        shell.capture_event();
+                        return;
+                    }
+                    let mut hovered = self.hovered_option.lock().unwrap();
+                    let last = self.options.len().checked_sub(1);
+                    let next = match (key, last) {
+                        (keyboard::Key::Named(Named::ArrowDown), Some(last)) => {
+                            Some(hovered.map_or(0, |i| i.saturating_add(1).min(last)))
+                        }
+                        (keyboard::Key::Named(Named::ArrowUp), Some(last)) => {
+                            Some(hovered.map_or(last, |i| i.saturating_sub(1).min(last)))
+                        }
+                        (keyboard::Key::Named(Named::Home), Some(_)) => Some(0),
+                        (keyboard::Key::Named(Named::End), Some(last)) => Some(last),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        *hovered = Some(next);
+                        keyboard.follow_highlight.store(true, Ordering::SeqCst);
+                        keyboard.reveal.store(true, Ordering::SeqCst);
+                        shell.request_redraw();
+                        shell.capture_event();
+                        return;
+                    }
+                }
+            }
+            if matches!(event, Event::Keyboard(keyboard::Event::KeyReleased { key, modifiers, .. }) if modifiers.is_empty() && activation_key(key))
+            {
+                shell.capture_event();
+                return;
+            }
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let hovered_guard = self.hovered_option.lock().unwrap();
                 if cursor.is_over(layout.bounds()) {
-                    if let Some(index) = *hovered_guard {
+                    if let Some(index) =
+                        (*hovered_guard).filter(|index| *index < self.options.len())
+                    {
+                        if let Some(keyboard) = &self.keyboard {
+                            if self.close_on_selected.is_some() {
+                                keyboard.retired.store(true, Ordering::SeqCst);
+                            }
+                        }
                         shell.publish((self.on_selected)(index));
                         if let Some(close_on_selected) = self.close_on_selected.as_ref() {
                             shell.publish(close_on_selected.clone());
@@ -538,7 +834,14 @@ where
 
                     *hovered_guard = Some((cursor_position.y / option_height) as usize);
 
-                    if let Some(index) = *hovered_guard {
+                    if let Some(index) =
+                        (*hovered_guard).filter(|index| *index < self.options.len())
+                    {
+                        if let Some(keyboard) = &self.keyboard {
+                            if self.close_on_selected.is_some() {
+                                keyboard.retired.store(true, Ordering::SeqCst);
+                            }
+                        }
                         shell.publish((self.on_selected)(index));
                         if let Some(close_on_selected) = self.close_on_selected.as_ref() {
                             shell.publish(close_on_selected.clone());

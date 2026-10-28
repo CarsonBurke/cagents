@@ -11,9 +11,7 @@ use crate::{
     },
 };
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -26,12 +24,11 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS pending_automation_proposals
             ON automation_proposals(repository,id) WHERE pending=1;
         CREATE INDEX IF NOT EXISTS owned_automation_proposals
-            ON automation_proposals(owner,id);
-        PRAGMA user_version=11;",
+            ON automation_proposals(owner,id);",
         )
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn encode(value: &impl serde::Serialize) -> Result<String, String> {
@@ -528,7 +525,16 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE automation_proposals; PRAGMA user_version=10;")
+            .execute_batch(
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
+                 DROP TABLE automation_proposals; PRAGMA user_version=10;",
+            )
             .unwrap();
         drop(registry);
         let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();

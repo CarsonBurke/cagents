@@ -505,7 +505,10 @@ impl Cagents {
         match action {
             Action::Copy(card) => self
                 .terminal_details(card)
-                .map(|details| iced::clipboard::write(details.copy_text()).map(cosmic::Action::App))
+                .map(|details| {
+                    chat_ui::invalidate_copy_intent();
+                    iced::clipboard::write(details.copy_text()).map(cosmic::Action::App)
+                })
                 .unwrap_or_else(Task::none),
             Action::Probed {
                 card,
@@ -1136,6 +1139,7 @@ mod ownership_tests {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
         };
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {

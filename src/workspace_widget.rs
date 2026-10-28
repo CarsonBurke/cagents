@@ -68,6 +68,7 @@ pub enum GlobalShortcut {
     FocusPane7,
     FocusPane8,
     FocusPane9,
+    /// Focus the last pane in the current strip, independent of MRU history.
     FocusLastPane,
     NewTerminal,
     NewChannel,
@@ -1484,6 +1485,9 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             let previous_band = mem::take(&mut state.mounted);
             for (id, mut child) in previous_band.iter().copied().zip(children.drain(..)) {
                 reclaim_named_states(&mut child);
+                if !self.cards.iter().any(|card| card.id == id) {
+                    crate::ui_memory::release_parked(&mut child);
+                }
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
@@ -2543,6 +2547,55 @@ mod tests {
         probe.elsewhere(&moved(RestProbe::INSIDE));
         probe.move_to(Point::new(151.0, 40.0));
         assert!(probe.rest().is_empty());
+    }
+
+    #[test]
+    fn parked_presentation_reclaims_named_state_before_releasing_its_subtree() {
+        let ids = [CardId::new(), CardId::new()];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let make = |index: usize| -> Element<'_, ()> {
+            VirtualStrip {
+                total_width: 320.0,
+                retained: retained.clone(),
+                focused: Some(ids[index]),
+                cards: vec![VirtualCard {
+                    id: ids[index],
+                    x: 0.0,
+                    width: 320.0,
+                    content_width: 320.0,
+                    on_screen: true,
+                    content: cosmic::widget::id_container(
+                        crate::ui_memory::gate(widget::Space::new()),
+                        widget::Id::new(format!("disposable-presentation-{index}")),
+                    )
+                    .into(),
+                }],
+            }
+            .into()
+        };
+        let mut element = make(0);
+        let mut tree = Tree::new(&element);
+        let owner = Arc::new(());
+        let released = Arc::downgrade(&owner);
+        // Model a retained/shaped allocation owned by the presentation tree.
+        // The named ancestor moves this entire subtree into iced's pool.
+        tree.children[0].children[0].children[0].state = tree::State::new(owner);
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        assert!(released.upgrade().is_some());
+        element = make(1);
+        tree.diff(&mut element);
+        assert!(
+            released.upgrade().is_none(),
+            "named extraction must not leave a presentation owner behind"
+        );
+        let parked = &tree.state.downcast_ref::<VirtualStripState>().detached[&ids[0]];
+        assert!(parked.children[0].children.is_empty());
+        // A real remount reconstructs the emptied gate through normal diffing.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(0);
+        tree.diff(&mut element);
+        assert_eq!(tree.children[0].children[0].children.len(), 1);
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
     }
 
     #[test]
@@ -4738,5 +4791,71 @@ mod tests {
         let mut moved = projection;
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
+    }
+    #[test]
+    fn focus_last_pane_uses_physical_zero_and_respects_rebinding_unbinding_and_repeat() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        for character in ["0", "à", "ы"] {
+            for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::Other] {
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, Code::Digit0, keyboard::Modifiers::ALT, false),
+                        &shortcuts,
+                        focused
+                    ),
+                    Some(GlobalShortcut::FocusLastPane)
+                );
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, Code::Digit0, keyboard::Modifiers::ALT, true),
+                        &shortcuts,
+                        focused
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            global_shortcut(
+                &key_press("0", Code::Digit0, keyboard::Modifiers::empty(), false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+        assert!(!is_global_shortcut_chord(
+            &keyboard::Key::Character("0".into()),
+            keyboard::key::Physical::Code(Code::Digit0),
+            keyboard::Modifiers::empty(),
+            &shortcuts,
+            FocusedPane::Terminal
+        ));
+        shortcuts.focus_last_pane = vec!["Alt+L".into()];
+        assert_eq!(
+            global_shortcut(
+                &key_press("0", Code::Digit0, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("l", Code::KeyL, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            Some(GlobalShortcut::FocusLastPane)
+        );
+        shortcuts.focus_last_pane.clear();
+        assert_eq!(
+            global_shortcut(
+                &key_press("l", Code::KeyL, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
     }
 }

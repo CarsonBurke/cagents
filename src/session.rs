@@ -369,6 +369,12 @@ enum ConversionCheckpoint {
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
+    RetainedChatCopy {
+        copy: crate::persistence::RetainedChatCopy,
+        // The first failure is reported once. Data-only retries retain their
+        // payload but cannot block on a second reply after the receiver leaves.
+        reply: Option<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
+    },
     TerminalOwnershipRecovery {
         snapshot: Arc<WorkspaceState>,
         recovery: crate::persistence::TerminalPaneAdoption,
@@ -380,6 +386,8 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    #[cfg(feature = "ui")]
+    AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
 }
 
 #[derive(Debug)]
@@ -765,6 +773,59 @@ impl SessionRuntime {
         self.rebind_chat(ChatRecoveryKind::Upgrade, card_id, source, replacement)
     }
 
+    /// Preserve inert saved text independently of a refused canonical-pane
+    /// snapshot. The receipt confirms only these local bytes, never an actor.
+    pub fn preserve_chat_copy(
+        &self,
+        copy: crate::persistence::RetainedChatCopy,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        queue.ordered_identities = true;
+        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(snapshot) = queue.latest.take() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::Snapshot(snapshot));
+        }
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::RetainedChatCopy {
+                copy,
+                reply: Some(reply),
+            });
+        changed.notify_one();
+        Ok(receiver)
+    }
+
+    /// Queue a grant-bound attachment and await the same one-shot durable
+    /// receipt as ordinary recovery. Descriptor arguments come only from it.
+    #[cfg(feature = "ui")]
+    pub(crate) fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: crate::chat::client::UpgradeRecovery,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let source = recovery.source().clone();
+        let replacement = recovery.replacement().clone();
+        self.rebind_chat(
+            ChatRecoveryKind::AuthenticatedUpgrade(recovery),
+            card_id,
+            source,
+            replacement,
+        )
+    }
+
     fn rebind_chat(
         &self,
         kind: ChatRecoveryKind,
@@ -1010,6 +1071,7 @@ struct PendingWrites {
     /// queued while the UI awaited acknowledgment. Other card fields, including
     /// tombstones, remain exactly as submitted.
     chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
+    retained_chat_copies: HashMap<CardId, crate::persistence::RetainedChatCopy>,
 }
 
 /// When storage first refused a subject, and why it refuses it now.
@@ -1338,6 +1400,25 @@ trait SessionStore {
             "This store does not support terminal ownership recovery".into(),
         ))
     }
+    fn preserve_chat_copy(
+        &self,
+        _copy: &crate::persistence::RetainedChatCopy,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support retained chat copies".into(),
+        ))
+    }
+
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        _card_id: CardId,
+        _recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support authenticated chat recovery".into(),
+        ))
+    }
     fn rebind_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1419,6 +1500,13 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn preserve_chat_copy(
+        &self,
+        copy: &crate::persistence::RetainedChatCopy,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::preserve_chat_copy(self, copy)
+    }
+
     fn recover_terminal_ownership(
         &self,
         state: &WorkspaceState,
@@ -1426,6 +1514,14 @@ impl SessionStore for StateStore {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_authenticated_chat_upgrade(self, card_id, recovery)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1516,6 +1612,13 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn preserve_chat_copy(
+        &self,
+        copy: &crate::persistence::RetainedChatCopy,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::preserve_chat_copy(self, copy)
+    }
+
     fn recover_terminal_ownership(
         &self,
         state: &WorkspaceState,
@@ -1523,6 +1626,14 @@ impl SessionStore for Arc<StateStore> {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_authenticated_chat_upgrade(self, card_id, recovery)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1632,6 +1743,7 @@ impl PendingWrites {
             worktree_generations,
             quarantine: Quarantine::default(),
             chat_rebindings: HashMap::new(),
+            retained_chat_copies: HashMap::new(),
         }
     }
 
@@ -1714,6 +1826,7 @@ impl PendingWrites {
                 | ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, .. } => {
                     Some(snapshot.id)
                 }
+                ConversionCheckpoint::RetainedChatCopy { copy, .. } => Some(copy.workspace),
                 ConversionCheckpoint::IdentityReplacement(_)
                 | ConversionCheckpoint::ChatRecovery(_) => None,
             })
@@ -1805,6 +1918,28 @@ impl PendingWrites {
         }
     }
 
+    fn project_retained_chat_copies(
+        &self,
+        snapshot: &mut Arc<WorkspaceState>,
+    ) -> Result<(), StoreError> {
+        if !self.retained_chat_copies.is_empty() {
+            let state = Arc::make_mut(snapshot);
+            for copy in self.retained_chat_copies.values() {
+                copy.project(state)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn acknowledge_retained_copy_closures(&mut self, snapshot: &WorkspaceState) {
+        self.retained_chat_copies.retain(|id, _| {
+            !snapshot
+                .cards
+                .iter()
+                .any(|card| card.id == *id && !card.existence.is_open())
+        });
+    }
+
     /// Writes the conversion checkpoints in order, then the coalesced
     /// autosave, stopping at the first write that failed for a reason that may
     /// clear. That write goes back where it came from, so neither a retry nor
@@ -1844,6 +1979,10 @@ impl PendingWrites {
                     reply,
                 } => {
                     self.translate_chat_rebindings(&mut snapshot);
+                    if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
+                        let _ = reply.send(Err(error.to_string()));
+                        continue;
+                    }
                     let refused = self.quarantine.workspace.as_ref().filter(|(state, card, _)| {
                         state.id == snapshot.id
                             && *card == Some(recovery.canonical)
@@ -1874,6 +2013,7 @@ impl PendingWrites {
                                     self.workspace = None;
                                 }
                                 self.quarantine.snapshot_landed(&snapshot);
+                                self.acknowledge_retained_copy_closures(&snapshot);
                                 Ok(())
                             }
                             Err(error) => Err(error.to_string()),
@@ -1890,6 +2030,32 @@ impl PendingWrites {
                     // an unreviewed later transfer after an I/O retry.
                     let _ = reply.send(result);
                 }
+                ConversionCheckpoint::RetainedChatCopy { copy, reply } => {
+                    match store.preserve_chat_copy(&copy) {
+                        Ok(commit) => {
+                            self.workspace_generation = commit.generation;
+                            self.card_generations = commit.card_generations;
+                            self.retained_chat_copies.insert(copy.copy.id, copy);
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(error.to_string()));
+                            }
+                            if !error.refuses_content() {
+                                // This operation owns inert bytes only. Its
+                                // stable identity permits the usual bounded
+                                // I/O retry and explicit Retry Saving safely.
+                                self.conversions.push_front(
+                                    ConversionCheckpoint::RetainedChatCopy { copy, reply: None },
+                                );
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
                         ChatRecoveryKind::Account => store.rebind_chat_account(
@@ -1902,6 +2068,18 @@ impl PendingWrites {
                             &recovery.source,
                             &recovery.replacement,
                         ),
+                        #[cfg(feature = "ui")]
+                        ChatRecoveryKind::AuthenticatedUpgrade(witness) => {
+                            if witness.source() != &recovery.source
+                                || witness.replacement() != &recovery.replacement
+                            {
+                                Err(StoreError::InvalidState(
+                                    "Authenticated recovery payload changed before commit".into(),
+                                ))
+                            } else {
+                                store.rebind_authenticated_chat_upgrade(recovery.card, &witness)
+                            }
+                        }
                     };
                     if result.is_ok() {
                         self.chat_rebindings
@@ -1930,6 +2108,10 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::Snapshot(mut snapshot) => {
                     self.translate_chat_rebindings(&mut snapshot);
+                    if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
+                        self.quarantine.refuse_workspace(snapshot, &error);
+                        continue;
+                    }
                     match store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {
@@ -1943,6 +2125,7 @@ impl PendingWrites {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
                             self.quarantine.snapshot_landed(&snapshot);
+                            self.acknowledge_retained_copy_closures(&snapshot);
                         }
                         Err(error) if error.refuses_content() => {
                             self.quarantine.refuse_workspace(snapshot, &error);
@@ -2758,6 +2941,17 @@ mod tests {
     }
 
     impl SessionStore for FakeStore {
+        fn preserve_chat_copy(
+            &self,
+            copy: &crate::persistence::RetainedChatCopy,
+        ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+            self.write()?;
+            Ok(crate::persistence::WorkspaceCommit {
+                generation: 1,
+                card_generations: BTreeMap::from([(copy.source_card, 1), (copy.copy.id, 1)]),
+            })
+        }
+
         fn rebind_chat_upgrade(
             &self,
             _card_id: CardId,
@@ -2885,11 +3079,13 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
             cards: vec![CardState {
                 id: CardId::new(),
@@ -4305,11 +4501,11 @@ mod tests {
             id: TerminalId::new(),
             proof: Some(proof("old")),
             terminal: None,
-            native_continuity: Default::default(),
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                session_id: None,
                 recipe: LaunchRecipe {
                     program: "claude".into(),
                     arguments: Vec::new(),
@@ -4321,7 +4517,7 @@ mod tests {
         };
         let mut replacement = source.clone();
         replacement.proof = Some(proof("new"));
-        replacement.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        // Upgrade recovery advances the same still-unnamed retained actor.
         let mut snapshot = workspace();
         let card = snapshot.cards[0].id;
         snapshot.cards[0].kind = CardKind::Chat(source.clone());
@@ -4329,11 +4525,46 @@ mod tests {
         writes.workspace = Some(Arc::new(snapshot.clone()));
         assert!(writes.flush(&store).is_empty());
 
-        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let (raw_reply, raw_receipt) = std::sync::mpsc::sync_channel(1);
         writes
             .conversions
             .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
                 kind: ChatRecoveryKind::Upgrade,
+                card,
+                source: source.clone(),
+                replacement: replacement.clone(),
+                reply: raw_reply,
+            }));
+        assert!(writes.flush(&store).is_empty());
+        assert!(
+            raw_receipt.recv().unwrap().is_err(),
+            "raw retained descriptors cannot authorize an upgrade or queued-snapshot translation"
+        );
+        assert!(writes.chat_rebindings.is_empty());
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+
+        let handle = crate::chat::client::ClientHandle::fixture_upgrade_handshake(
+            source.clone(),
+            replacement.clone(),
+            crate::chat::Snapshot {
+                session_id: replacement.launch.session_id.clone(),
+                ready: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let recovery = handle.authenticated_upgrade_recovery().unwrap().clone();
+        assert!(recovery.validate());
+        assert_eq!(recovery.source(), &source);
+        assert_eq!(recovery.replacement(), &replacement);
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
+                kind: ChatRecoveryKind::AuthenticatedUpgrade(recovery),
                 card,
                 source,
                 replacement: replacement.clone(),
@@ -4349,6 +4580,505 @@ mod tests {
         assert_eq!(saved.kind, CardKind::Chat(replacement));
         assert_eq!(saved.title, "Saved during recovery");
         assert!(writes.is_settled());
+    }
+
+    #[test]
+    fn retained_copy_keeps_its_typed_payload_for_io_retry_but_not_content_refusal() {
+        for transient in [false, true] {
+            let mut state = workspace();
+            let origin = state.cards[0].id;
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: None,
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: Some("saved-thread".into()),
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/project".into(),
+                        environment: BTreeMap::new(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            state.cards[0].id = CardId::new();
+            state.cards[0].kind = CardKind::Chat(source.clone());
+            let copy = crate::persistence::RetainedChatCopy {
+                workspace: state.id,
+                source_card: origin,
+                source,
+                copy: state.cards[0].clone(),
+                draft: "Keep exact retry bytes".into(),
+                attachments: Vec::new(),
+                scope: None,
+                channel: None,
+            };
+            let store = FakeStore::new([
+                if transient {
+                    FakeWrite::FailDiskFull
+                } else {
+                    FakeWrite::Refuse
+                },
+                FakeWrite::Succeed,
+            ]);
+            let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+            let mut writes = empty_writes();
+            writes
+                .conversions
+                .push_back(ConversionCheckpoint::RetainedChatCopy {
+                    copy: copy.clone(),
+                    reply: Some(reply),
+                });
+            let failed = writes.flush(&store);
+            assert_eq!(!failed.is_empty(), transient);
+            assert!(
+                receipt
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_err()
+            );
+            drop(receipt);
+            if transient {
+                assert!(
+                    matches!(writes.conversions.front(), Some(ConversionCheckpoint::RetainedChatCopy { copy: retained, reply: None }) if retained == &copy)
+                );
+                // The existing explicit retry path does not reconstruct the
+                // failed canonical snapshot or a different source descriptor.
+                writes.rearm_quarantine();
+                assert!(writes.flush(&store).is_empty());
+                assert_eq!(writes.retained_chat_copies[&copy.copy.id], copy);
+                assert_eq!(store.attempts.load(Ordering::Relaxed), 2);
+            } else {
+                assert!(writes.is_settled());
+                writes.rearm_quarantine();
+                assert!(writes.flush(&store).is_empty());
+                assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_copy_explicit_retry_commits_real_bytes_after_its_initial_error() {
+        struct FailFirstCopy {
+            store: Arc<StateStore>,
+            attempts: Arc<AtomicUsize>,
+        }
+        impl SessionStore for FailFirstCopy {
+            fn preserve_chat_copy(
+                &self,
+                copy: &crate::persistence::RetainedChatCopy,
+            ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(StoreError::Io(std::io::Error::from_raw_os_error(
+                        libc::ENOSPC,
+                    )));
+                }
+                self.store.preserve_chat_copy(copy)
+            }
+            fn replace_terminal_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                replacement: &TerminalSession,
+            ) -> Result<(), StoreError> {
+                self.store
+                    .replace_terminal_identity(card, expected, replacement)
+            }
+            fn replace_chat_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                replacement: &crate::chat::Session,
+            ) -> Result<(), StoreError> {
+                self.store
+                    .replace_chat_identity(card, expected, replacement)
+            }
+            fn save_workspace(
+                &self,
+                state: &WorkspaceState,
+                base: SnapshotBase<'_>,
+            ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+                self.store.save_workspace(state, base)
+            }
+            fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
+                self.store.save_project(project)
+            }
+            fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
+                self.store.save_worktree(worktree)
+            }
+            fn stored_generations(
+                &self,
+                workspace: WorkspaceId,
+            ) -> Result<StoredGenerations, StoreError> {
+                self.store.stored_generations(workspace)
+            }
+            fn stored_project_generation(
+                &self,
+                project: ProjectId,
+            ) -> Result<Option<u64>, StoreError> {
+                self.store.stored_project_generation(project)
+            }
+            fn stored_worktree_generation(
+                &self,
+                worktree: WorktreeId,
+            ) -> Result<Option<u64>, StoreError> {
+                self.store.stored_worktree_generation(worktree)
+            }
+            fn shutdown(&self) -> Result<(), StoreError> {
+                self.store.shutdown()
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("late-copy.db");
+        let scope = directory.path().join("project");
+        std::fs::create_dir(&scope).unwrap();
+        let store = Arc::new(StateStore::open(&path, BootId::new("boot")).unwrap());
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "old".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "old".into(),
+            }),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: scope.clone(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut original = workspace();
+        let origin = original.cards[0].id;
+        original.cards[0].kind = CardKind::Chat(source.clone());
+        original
+            .chat_drafts
+            .insert(origin, "Canonical draft stays here".into());
+        let committed = store
+            .save_workspace(
+                &original,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let canonical_before = store.load_card(origin, None).unwrap().unwrap();
+        let mut card = original.cards[0].clone();
+        card.id = CardId::new();
+        let copy = crate::persistence::RetainedChatCopy {
+            workspace: original.id,
+            source_card: origin,
+            source: source.clone(),
+            copy: card,
+            draft: "Retry exact bytes  \nUnicode 🦀".into(),
+            attachments: Vec::new(),
+            scope: Some(scope.clone()),
+            channel: None,
+        };
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([ConversionCheckpoint::RetainedChatCopy {
+                    copy: copy.clone(),
+                    reply: Some(reply),
+                }]),
+                ordered_identities: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let wrapped = FailFirstCopy {
+            store: Arc::clone(&store),
+            attempts: Arc::clone(&attempts),
+        };
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                wrapped,
+                PendingWrites::restored(
+                    committed.generation,
+                    committed.card_generations,
+                    HashMap::new(),
+                    HashMap::new(),
+                ),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(1),
+            )
+        });
+
+        let first_receipt = receipt.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            first_receipt.is_err(),
+            "the failed first attempt is never a successful receipt"
+        );
+        let failed = health_until(&health_rx, |event| {
+            matches!(
+                event.health,
+                SessionSaveHealth::RetryExhausted {
+                    category: SaveFailureCategory::DiskFull,
+                    attempts: 1,
+                    ..
+                }
+            )
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(store.load_card(copy.copy.id, None).unwrap().is_none());
+        assert_eq!(
+            store.load_card(origin, None).unwrap().unwrap(),
+            canonical_before
+        );
+
+        // This is the queue action used by Retry Saving. No second copy,
+        // different descriptor, replacement snapshot or actor action is sent.
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        let recovered = health_until(&health_rx, |event| {
+            matches!(event.health, SessionSaveHealth::Recovered { .. })
+        });
+        assert!(recovered.revision > failed.revision);
+        assert!(recovered.last_successful_flush_at_unix_ms.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "late recovery is a health event, not a changed first receipt"
+        );
+        let saved = store.load_workspace(copy.workspace, None).unwrap().unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == copy.copy.id)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+        assert!(saved.local_only_cards.contains(&copy.copy.id));
+        assert_eq!(saved.pending_chat_admissions[&copy.copy.id], source);
+        assert_eq!(saved.card_scopes[&copy.copy.id], scope);
+        assert_eq!(saved.chat_drafts[&origin], "Canonical draft stays here");
+        assert_eq!(
+            store.load_card(origin, None).unwrap().unwrap(),
+            canonical_before
+        );
+
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, BootId::new("boot")).unwrap();
+        let restored = reopened
+            .load_workspace(copy.workspace, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            restored
+                .cards
+                .iter()
+                .any(|card| card.id == copy.copy.id && card.existence.is_open())
+        );
+        assert_eq!(restored.chat_drafts[&copy.copy.id], copy.draft);
+        assert!(restored.local_only_cards.contains(&copy.copy.id));
+        assert_eq!(restored.pending_chat_admissions[&copy.copy.id], copy.source);
+        assert_eq!(restored.card_scopes[&copy.copy.id], scope);
+        assert_eq!(
+            reopened.load_card(origin, None).unwrap().unwrap().kind,
+            canonical_before.kind
+        );
+    }
+
+    #[test]
+    fn retained_copy_writer_survives_refused_canonical_snapshots_and_explicit_close() {
+        for after_upgrade in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("retained-copy.db");
+            let (mut runtime, _) = SessionRuntime::open(&path, BootId::new("boot")).unwrap();
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: "old".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "old".into(),
+                }),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/project".into(),
+                        environment: BTreeMap::new(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            let mut original = workspace();
+            let origin = original.cards[0].id;
+            original.cards[0].kind = CardKind::Chat(source.clone());
+            original
+                .chat_drafts
+                .insert(origin, "Canonical bytes".into());
+            runtime.snapshot(Arc::new(original.clone()));
+            runtime.flush(Duration::from_secs(5)).unwrap();
+            let mut canonical = source.clone();
+            if after_upgrade {
+                canonical.proof.as_mut().unwrap().host_incarnation = "new".into();
+                runtime
+                    .rebind_chat_upgrade(origin, source.clone(), canonical.clone())
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            }
+            let before = runtime
+                .operation_store
+                .load_card(origin, None)
+                .unwrap()
+                .unwrap();
+            let mut card = original.cards[0].clone();
+            card.id = CardId::new();
+            let copy = crate::persistence::RetainedChatCopy {
+                workspace: original.id,
+                source_card: origin,
+                source: source.clone(),
+                copy: card,
+                draft: "Saved draft  \nUnicode 🦀".into(),
+                attachments: Vec::new(),
+                scope: None,
+                channel: None,
+            };
+            // This newer shared actor is deliberately not an ordinary snapshot
+            // identity change. Its refusal must not prevent copying local text.
+            let mut refused = original.clone();
+            let mut other = canonical.clone();
+            other.id = TerminalId::new();
+            other.launch.recipe.arguments.push("--other-recipe".into());
+            refused.cards[0].kind = CardKind::Chat(other);
+            runtime.snapshot_conversion(Arc::new(refused.clone()));
+            runtime
+                .preserve_chat_copy(copy.clone())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .operation_store
+                    .load_card(origin, None)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                runtime
+                    .operation_store
+                    .load_workspace(original.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .chat_drafts[&copy.copy.id],
+                copy.draft
+            );
+            runtime.snapshot(Arc::new(refused));
+            assert!(runtime.flush(Duration::from_secs(5)).is_err());
+            assert!(
+                runtime
+                    .operation_store
+                    .load_card(copy.copy.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .existence
+                    .is_open()
+            );
+            // A later stale autosave omits the newly retained copy. The writer
+            // keeps the committed bytes, markers and navigation reachable.
+            runtime.snapshot(Arc::new(original));
+            runtime.flush(Duration::from_secs(5)).unwrap();
+            let mut saved = runtime
+                .operation_store
+                .load_workspace(copy.workspace, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+            assert_eq!(saved.pending_chat_admissions[&copy.copy.id], source);
+            assert!(saved.local_only_cards.contains(&copy.copy.id));
+            assert!(saved.card_scopes.contains_key(&copy.copy.id));
+            assert_eq!(
+                saved
+                    .cards
+                    .iter()
+                    .find(|card| card.id == origin)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(canonical.clone())
+            );
+            saved
+                .cards
+                .iter_mut()
+                .find(|card| card.id == copy.copy.id)
+                .unwrap()
+                .existence = Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("discarded retained text".into()),
+                },
+            };
+            saved.chat_drafts.remove(&copy.copy.id);
+            saved.pending_chat_admissions.remove(&copy.copy.id);
+            saved.local_only_cards.remove(&copy.copy.id);
+            saved.card_scopes.remove(&copy.copy.id);
+            runtime.snapshot(Arc::new(saved));
+            runtime.flush(Duration::from_secs(5)).unwrap();
+            assert!(
+                runtime
+                    .preserve_chat_copy(copy.clone())
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+            runtime.shutdown();
+            let reopened = StateStore::open(&path, BootId::new("boot")).unwrap();
+            let restored = reopened
+                .load_workspace(copy.workspace, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !restored
+                    .cards
+                    .iter()
+                    .find(|card| card.id == copy.copy.id)
+                    .unwrap()
+                    .existence
+                    .is_open()
+            );
+            assert!(!restored.chat_drafts.contains_key(&copy.copy.id));
+        }
     }
 
     #[test]

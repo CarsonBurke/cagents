@@ -160,10 +160,20 @@ impl Observer {
         // Only the account lock spans I/O, never HostState or the registry lock.
         // A slow account must not occupy every daemon worker with duplicate
         // waiters. Another terminal can retry its cached census next time.
-        let mut entry = entry.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => ObserveError::Busy,
-            std::sync::TryLockError::Poisoned(_) => ObserveError::Unavailable,
-        })?;
+        let mut entry = match entry.try_lock() {
+            Ok(entry) => entry,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(ObserveError::Busy),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let mut recovered = error.into_inner();
+                // The service contains observation panics and retries. Discard
+                // potentially partial presentation state before allowing this
+                // same account gate to serve a fresh census again.
+                recovered.census = None;
+                recovered.updated = None;
+                entry.clear_poison();
+                recovered
+            }
+        };
         if entry.updated.is_none_or(|updated| updated.elapsed() >= TTL) {
             entry.census = match provider {
                 Provider::Claude => claude::census(recipe).map(Inventory::Claude),
@@ -330,6 +340,182 @@ fn add(census: &mut Census, cwd: &str, state: ActivityState) -> ProbeResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(directory: &Path, program: PathBuf) -> crate::model::agent_recovery::AgentProcess {
+        let launch = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: program.to_str().unwrap().into(),
+            arguments: Vec::new(),
+            working_directory: directory.into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), directory.to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory.to_str().unwrap().into(),
+                ),
+            ]),
+        };
+        crate::model::agent_recovery::AgentProcess {
+            pid: 123,
+            start: 456,
+            provider: Provider::Claude,
+            recovery: launch.clone(),
+            launch,
+        }
+    }
+
+    fn cached_account(
+        observer: &Observer,
+        process: &crate::model::agent_recovery::AgentProcess,
+        state: ActivityState,
+        title: &str,
+    ) -> Arc<Mutex<Entry>> {
+        let entry = Arc::new(Mutex::new(Entry {
+            updated: Some(Instant::now()),
+            census: Some(Inventory::Claude(BTreeMap::from([(
+                process.pid,
+                (
+                    process.launch.working_directory.clone(),
+                    state,
+                    Some(title.into()),
+                    None,
+                ),
+            )]))),
+        }));
+        observer.accounts.lock().unwrap().insert(
+            key(process.provider, &process.launch).unwrap(),
+            entry.clone(),
+        );
+        entry
+    }
+
+    fn poison_fresh_census(entry: &Mutex<Entry>) {
+        {
+            let held = entry.lock().unwrap();
+            assert!(held.census.is_some());
+            assert!(held.updated.unwrap().elapsed() < TTL);
+        }
+        let failure = std::panic::catch_unwind(|| {
+            let _held = entry.lock().unwrap();
+            panic!("fixture panic while the account census is held");
+        });
+        assert!(failure.is_err());
+        assert!(entry.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_account_refreshes_fresh_cached_state_and_preserves_its_gate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("census-fixture");
+        let marker = directory.path().join("queries");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+test "$#" -eq 2
+test "$1" = agents
+test "$2" = --json
+printf 'query\n' >> "$CAGENTS_OBSERVER_MARKER"
+printf '%s\n' "$CAGENTS_OBSERVER_ROWS"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut process = process(directory.path(), script);
+        process.launch.environment.extend([
+            (
+                "CAGENTS_OBSERVER_MARKER".into(),
+                marker.to_str().unwrap().into(),
+            ),
+            (
+                "CAGENTS_OBSERVER_ROWS".into(),
+                serde_json::json!([{
+                    "kind": "interactive",
+                    "pid": process.pid,
+                    "cwd": directory.path(),
+                    "status": "waiting",
+                    "name": "Fresh title"
+                }])
+                .to_string(),
+            ),
+        ]);
+        let observer = Observer::new();
+        let entry = cached_account(&observer, &process, ActivityState::Working, "Stale title");
+        poison_fresh_census(&entry);
+
+        for _ in 0..2 {
+            let observed = observer
+                .try_observe(&process)
+                .unwrap_or_else(|_| panic!("fresh census failed"));
+            assert_eq!(observed.activity.unwrap().state, ActivityState::Waiting);
+            assert_eq!(observed.title.as_deref(), Some("Fresh title"));
+            assert!(
+                observed.attention.is_none(),
+                "first Waiting census is a baseline"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "query\n");
+        assert!(!entry.is_poisoned());
+        let accounts = observer.accounts.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            accounts
+                .get(&key(process.provider, &process.launch).unwrap())
+                .unwrap(),
+            &entry
+        ));
+        drop(accounts);
+        let _held = entry.lock().unwrap();
+        assert!(matches!(
+            observer.try_observe(&process),
+            Err(ObserveError::Busy)
+        ));
+    }
+
+    #[test]
+    fn poisoned_account_discards_stale_census_and_caches_failure_without_affecting_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-census-executable");
+        let process = process(directory.path(), missing.clone());
+        let other_directory = tempfile::tempdir().unwrap();
+        let peer = self::process(other_directory.path(), missing);
+        let observer = Observer::new();
+        let entry = cached_account(&observer, &process, ActivityState::Working, "Stale title");
+        cached_account(&observer, &peer, ActivityState::Idle, "Peer title");
+        poison_fresh_census(&entry);
+
+        assert!(matches!(
+            observer.try_observe(&process),
+            Err(ObserveError::Unavailable)
+        ));
+        assert!(!entry.is_poisoned());
+        let failed_at = {
+            let cached = entry.lock().unwrap();
+            assert!(
+                cached.census.is_none(),
+                "failed refresh must discard stale Working/title"
+            );
+            cached.updated.unwrap()
+        };
+        assert!(matches!(
+            observer.try_observe(&process),
+            Err(ObserveError::Unavailable)
+        ));
+        assert_eq!(
+            entry.lock().unwrap().updated,
+            Some(failed_at),
+            "failed census retains its normal TTL"
+        );
+
+        let observed = observer
+            .try_observe(&peer)
+            .unwrap_or_else(|_| panic!("peer cache failed"));
+        assert_eq!(observed.activity.unwrap().state, ActivityState::Idle);
+        assert_eq!(observed.title.as_deref(), Some("Peer title"));
+        assert!(observed.attention.is_none());
+        assert_eq!(observer.accounts.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn busy_account_defers_without_waiting_or_publishing_failure() {

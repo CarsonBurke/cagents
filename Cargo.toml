@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/ceditor", "crates/browser-import"]
+members = [".", "crates/ceditor", "crates/browser-import", "crates/iced-contracts"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
@@ -38,14 +38,16 @@ host = [
     "dep:imara-diff",
     "dep:ksni",
     "dep:libghostty-vt",
+    "dep:notify",
     "dep:portable-pty",
     "dep:rusqlite",
-    "dep:tempfile",
     "dep:tokio",
+    "tokio/net",
     "dep:tracing-subscriber",
     "dep:tungstenite",
 ]
 ui = [
+    "dep:accesskit_unix",
     "dep:base64",
     "dep:ashpd",
     "dep:async-channel",
@@ -66,11 +68,12 @@ ui = [
     "dep:libcosmic",
     "dep:lsp-types",
     "dep:mermaid-rs-renderer",
+    "dep:unicase",
     "dep:notify",
     "dep:resvg",
+    "dep:regex",
     "dep:roxmltree",
     "dep:rusqlite",
-    "dep:tempfile",
     "dep:tokio",
     "dep:tokio-util",
     "dep:tracing-subscriber",
@@ -78,7 +81,6 @@ ui = [
     "dep:unicode-linebreak",
     "dep:unicode-casefold",
     "dep:yaml-rust",
-    "dep:unicode-width",
     "dep:unicode-segmentation",
 ]
 integrated-browser = [
@@ -131,12 +133,71 @@ required-features = ["ui"]
 name = "enrich-shared-terminal-hint"
 required-features = ["ui"]
 
+[[example]]
+name = "terminal-workload"
+required-features = ["host"]
+
+# Skip empty harnesses outside their owning lane. Keep the source cfgs for
+# platform restrictions; integrated-browser also selects the UI tests.
+[[test]]
+name = "account_default_contract"
+required-features = ["host"]
+
+[[test]]
+name = "agent_console_contract"
+required-features = ["host"]
+
+[[test]]
+name = "automation_cli_contract"
+required-features = ["host"]
+
+[[test]]
+name = "automation_precheck_contract"
+required-features = ["host"]
+
+[[test]]
+name = "codex_continuity_qualification"
+required-features = ["host"]
+
+[[test]]
+name = "terminal_load_contract"
+required-features = ["host"]
+
+[[test]]
+name = "terminal_metadata_contract"
+required-features = ["host"]
+
+[[test]]
+name = "upgrade_inspection_contract"
+required-features = ["host"]
+
+[[test]]
+name = "browser_capability_contract"
+required-features = ["ui"]
+
+[[test]]
+name = "iced_tree_reconciliation"
+required-features = ["ui"]
+
+[[test]]
+name = "native_accessibility_button_routing"
+required-features = ["ui"]
+
+[[test]]
+name = "repository_git_contract"
+required-features = ["ui"]
+
+[[test]]
+name = "session_restore_contract"
+required-features = ["ui"]
+
 [dependencies]
 cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
-unicode-width = { version = "0.2.2", optional = true }
+unicode-width = "0.2.2"
+regex = { version = "1.13", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
@@ -148,11 +209,13 @@ base64 = { version = "0.22", optional = true }
 bitflags = { version = "2.9", features = ["serde"] }
 blake3 = { version = "1.8", optional = true }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "=4.5.61"
 crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.14", optional = true }
 futures-util = { version = "0.3", optional = true }
+glob = "0.3.4"
 # Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
 # an SVG, by rasterizing to RGBA off the UI thread, so a document in a
 # worktree opens in place instead of handing the reader to an external viewer.
@@ -183,7 +246,10 @@ portable-pty = { version = "0.9", features = ["serde_support"], optional = true 
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Shared bounded notification excerpts use the same CommonMark parser as the UI.
+pulldown-cmark = { version = "0.12.2", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
+unicase = { version = "2.9", optional = true }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
@@ -200,7 +266,8 @@ serde_path_to_error = "0.1"
 sha2 = "0.10"
 servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "js_jit"], optional = true }
 thiserror = "2.0"
-tempfile = { version = "3.21", optional = true }
+# Atomic settings writes are shared by CLI, daemon, and UI.
+tempfile = "3.21"
 tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = "0.1"
@@ -214,6 +281,9 @@ wayland-server = { version = "=0.31.14", optional = true }
 # Platform backends are explicit rather than inherited from iced/winit defaults.
 # Match the common package identities so Cargo unifies widget/runtime features.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The UI diagnostics regression exercises the same native accessibility adapter
+# used by iced, without requiring a display server or affecting CLI/host lanes.
+accesskit_unix = { version = "0.18.0", git = "https://github.com/wash2/accesskit", tag = "cosmic-0.14", default-features = false, features = ["tokio"], optional = true }
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"], optional = true }
 # Only Linux enables the portal's Wayland handle integration.
 ashpd = { version = "0.12.3", default-features = false, features = ["wayland"], optional = true }
@@ -222,7 +292,6 @@ wayland-client = { version = "=0.31.15", features = ["system"], optional = true 
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
 
 [dev-dependencies]
-tempfile = "3.21"
 tracing-log = "0.2"
 
 [profile.dev]
@@ -265,15 +334,25 @@ winit-wayland = { path = "vendor/winit-wayland" }
 [patch."https://github.com/pop-os/libcosmic.git"]
 libcosmic = { path = "vendor/libcosmic" }
 iced_core = { path = "vendor/iced-core" }
+iced_graphics = { path = "vendor/iced-graphics" }
 iced_accessibility = { path = "vendor/iced-accessibility" }
 iced_runtime = { path = "vendor/iced-runtime" }
+iced_futures = { path = "vendor/iced-futures" }
 iced_winit = { path = "vendor/iced-winit" }
 
 # Backport upstream long-line shaping fix until cosmic-text accepts its release.
 [patch.crates-io]
+# Keep rusqlite/Servo compatibility while backporting upstream SQLite 3.50.7.
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+# Display-only immutable full-context layout snapshots; see vendor/cosmic-text/LOCAL_CHANGES.md.
+cosmic-text = { path = "vendor/cosmic-text" }
 harfrust = { path = "vendor/harfrust" }
 
 # Editable fields require the Linux string-editing interface, absent in the pinned adapter.
 [patch."https://github.com/wash2/accesskit"]
 accesskit_unix = { path = "vendor/accesskit-unix" }
 accesskit_atspi_common = { path = "vendor/accesskit-atspi-common" }
+
+# Keep the clipboard worker alive when an input device is removed (#1464).
+[patch."https://github.com/pop-os/smithay-clipboard"]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }

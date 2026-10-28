@@ -41,6 +41,7 @@ pub mod conversion;
 pub mod platform_specific;
 
 mod error;
+mod input_source;
 mod proxy;
 mod window;
 
@@ -157,8 +158,8 @@ where
     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
 
     let instance = Box::pin(run_instance::<P>(
-        program,
         runtime,
+        program,
         proxy.clone(),
         boot_receiver,
         event_receiver,
@@ -791,9 +792,11 @@ enum Control {
     StartDnd,
 }
 
+// Parameters drop in reverse order. Drop the program and its cancellation
+// guards before the runtime waits for their blocking tasks.
 async fn run_instance<P>(
-    mut program: program::Instance<P>,
     mut runtime: Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
+    mut program: program::Instance<P>,
     mut proxy: Proxy<P::Message>,
     boot: oneshot::Receiver<()>,
     mut event_receiver: mpsc::UnboundedReceiver<Event<P::Message>>,
@@ -831,7 +834,7 @@ async fn run_instance<P>(
     let mut is_window_opening = !is_daemon;
 
     let mut compositor = None;
-    let mut events = Vec::new();
+    let mut events = input_source::NativeEvents::default();
     let mut messages = Vec::new();
     let mut actions = 0;
 
@@ -1304,6 +1307,7 @@ async fn run_instance<P>(
                     window: id,
                     event: redraw_event,
                     status: core::event::Status::Ignored,
+                    source: core::keyboard::input::Source::default(),
                 });
 
                 window.draw_preedit();
@@ -1444,28 +1448,24 @@ async fn run_instance<P>(
                         continue;
                     }
                     let interact_span = debug::interact(id);
-                    let mut window_events = vec![];
-
-                    events.retain(|(window_id, event)| {
-                        if *window_id == Some(id) {
-                            window_events.push(event.clone());
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    let (mut window_events, mut window_sources) =
+                        events.take_window(id);
                     #[cfg(wayland_platform)]
-                    window_events.push(core::Event::PlatformSpecific(
-                        core::event::PlatformSpecific::Wayland(
-                            core::event::wayland::Event::RequestResize,
-                        ),
-                    ));
+                    {
+                        window_events.push(core::Event::PlatformSpecific(
+                            core::event::PlatformSpecific::Wayland(
+                                core::event::wayland::Event::RequestResize,
+                            ),
+                        ));
+                        window_sources.push(core::keyboard::input::Source::default());
+                    }
 
                     let (ui_state, statuses) = user_interfaces
                         .get_mut(&id)
                         .expect("Get user interface")
-                        .update(
+                        .update_with_sources(
                             &window_events,
+                            &window_sources,
                             window.state.cursor(),
                             &mut window.renderer,
                             &mut clipboard,
@@ -1546,20 +1546,23 @@ async fn run_instance<P>(
                         }
                     }
 
-                    for (event, status) in
-                        window_events.into_iter().zip(statuses.into_iter())
+                    for ((event, source), status) in window_events
+                        .into_iter()
+                        .zip(window_sources)
+                        .zip(statuses.into_iter())
                     {
                         runtime.broadcast(subscription::Event::Interaction {
                             window: id,
                             event,
                             status,
+                            source,
                         });
                     }
 
                     interact_span.finish();
                 }
 
-                for (id, event) in events.drain(..) {
+                for (id, event, source) in events.drain(..) {
                     if id.is_none()
                         && matches!(
                             event,
@@ -1576,6 +1579,7 @@ async fn run_instance<P>(
                         window: id.unwrap_or(window::Id::NONE),
                         event,
                         status: core::event::Status::Ignored,
+                        source,
                     });
                 }
 
@@ -2137,7 +2141,7 @@ fn run_action<'a, P, C>(
     program: &'a program::Instance<P>,
     runtime: &mut Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
     compositor: &mut Option<C>,
-    events: &mut Vec<(Option<window::Id>, core::Event)>,
+    events: &mut input_source::NativeEvents,
     messages: &mut Vec<P::Message>,
     clipboard: &mut Clipboard,
     control_sender: &mut mpsc::UnboundedSender<Control>,

@@ -10,12 +10,12 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: title,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(design::TEXT_BODY),
-        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
-        font: cosmic::font::default(),
+        size: Pixels(design::interface_size()),
+        line_height: text::LineHeight::Absolute(Pixels(design::interface_size() + 5.0)),
+        font: design::interface_font(),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
+        shaping: text::Shaping::default(),
         wrapping: text::Wrapping::None,
         ellipsize: text::Ellipsize::None,
     });
@@ -46,6 +46,7 @@ pub(super) struct State {
     pub(super) workspace_switcher_rows: Vec<WorkspaceSwitcherRow>,
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
+    attention_page: usize,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
     /// two would each move focus on one key press, and whichever landed last
@@ -58,78 +59,17 @@ pub(super) struct State {
     /// the tab to the viewport edge - including a reveal triggered by merely
     /// hovering an already-visible tab under focus-follows-mouse.
     tabs_offset: f32,
+    /// The notices control kept on screen, at this severity, for the frame
+    /// after the last notice went: long enough to learn whether it held the
+    /// keyboard, which would otherwise go nowhere with it.
+    retiring_notice_control: Option<NoticeSeverity>,
 }
 
 #[cfg(test)]
 mod tests {
-
-    fn tab_fixture(count: usize, width: f32) -> Cagents {
-        let mut app = super::super::tests::context_inspector_test_app(false);
-        app.context_inspector_open = false;
-        let cards: Vec<_> = (0..count)
-            .map(|_| super::super::tests::terminal_card_state())
-            .collect();
-        let durable = Arc::make_mut(&mut app.durable);
-        durable.focused = cards.first().map(|card| card.id);
-        durable.cards = cards;
-        app.workspace = Cagents::rebuild_workspace(&app.durable);
-        app.workspace.resize_viewport(width);
-        drop(app.sync_chrome());
-        app
-    }
-
-    #[test]
-    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
-        let mut app = tab_fixture(30, 900.0);
-        let (available, width) = app.tab_strip_geometry();
-        assert!(
-            4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
-                <= available + 0.1
-        );
-        let id = app.durable.cards[0].id;
-        app.chrome_ui
-            .user_titles
-            .insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
-        app.workspace.resize_viewport(1600.0);
-        drop(app.sync_chrome());
-        let (_, width) = app.tab_strip_geometry();
-        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
-        use iced::advanced::{
-            Layout, layout,
-            widget::{Operation, Tree},
-        };
-        struct TitleBounds(Option<iced::Rectangle>);
-        impl Operation for TitleBounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
-                if text == "WWWWWWWWWWWWWWWWWWWW" {
-                    self.0 = Some(bounds);
-                }
-            }
-        }
-        let renderer = super::super::tests::headless_renderer();
-        let mut header = app.column_header(id, true, width);
-        let mut tree = Tree::new(header.as_widget());
-        let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
-        let node =
-            header
-                .as_widget_mut()
-                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
-        let mut title = TitleBounds(None);
-        header
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
-        assert!(
-            title.0.expect("actual mounted title text").width
-                >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
-            "the real title allocation must fit, after its icon, padding and controls"
-        );
-    }
-
     #[test]
     fn plus_and_pane_list_stay_visible_when_thirty_tabs_overflow() {
+        let _typography = design::typography_test_guard();
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree, operation::Focusable},
@@ -207,6 +147,514 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        drop(app.update_chrome(Action::ToggleAttention));
+        assert!(app.attention_is_open());
+        assert_eq!(app.popup_focus_ring(Popup::Attention), ["attention.close"]);
+        let target = crate::model::TerminalId::new();
+        for index in 0..21 {
+            app.notification_ui
+                .snapshot
+                .notices
+                .push(crate::notifications::Notice {
+                    id: uuid::Uuid::new_v4(),
+                    event: crate::notifications::Event::session(
+                        target,
+                        crate::agent::Provider::Codex,
+                        "/tmp/toy".into(),
+                        crate::notifications::Evidence {
+                            key: format!("incident-{index}"),
+                            kind: crate::notifications::Kind::Succeeded,
+                        },
+                    ),
+                    delivered: false,
+                    acknowledged: false,
+                    window: None,
+                });
+        }
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("attention-pages"),
+            boot_id: crate::model::BootId::new("attention-pages"),
+            host_incarnation: crate::model::HostIncarnation::new("attention-pages"),
+        };
+        drop(app.update_notifications(notification_ui::Action::HostBound(proof)));
+        let snapshot = app.notification_ui.snapshot.clone();
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        let duplicate = app.notification_ui.snapshot.notices[0].clone();
+        app.notification_ui.snapshot.notices.push(duplicate);
+        let first = app.popup_focus_ring(Popup::Attention);
+        assert_eq!(first.len(), 22, "close, twenty incident actions, more");
+        assert_eq!(
+            first
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            first.len()
+        );
+        assert_eq!(first.last().unwrap(), "attention.next");
+        drop(app.update_chrome(Action::AttentionPage(1)));
+        let last = app.popup_focus_ring(Popup::Attention);
+        assert_eq!(last.len(), 3, "close, last incident, previous");
+        assert_eq!(last.last().unwrap(), "attention.previous");
+        app.notification_ui.snapshot.notices.clear();
+        assert_eq!(app.popup_focus_ring(Popup::Attention), ["attention.close"]);
+        drop(app.update_chrome(Action::Close));
+        assert!(!app.attention_is_open());
+        app.settings_reset_confirm = true;
+        drop(app.update_chrome(Action::ToggleAttention));
+        assert!(
+            !app.attention_is_open(),
+            "a modal keeps its existing keyboard owner"
+        );
+    }
+
+    #[test]
+    fn narrow_header_mounts_four_complete_tabs() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced::{Rectangle, Size};
+        struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.1 = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        for width in [640.0, 900.0, 1600.0] {
+            let app = tab_fixture(30, width);
+            let mut element =
+                app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)),
+            );
+            let mut bounds = Bounds(HashMap::new(), None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width <= 900.0 {
+                let viewport = bounds.1.expect("native tab viewport");
+                let visible = app
+                    .workspace
+                    .order()
+                    .filter(|id| {
+                        let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                        tab.x >= viewport.x
+                            && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                    })
+                    .count();
+                assert!(
+                    visible >= 4,
+                    "only {visible} complete tabs fit in {viewport:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_keeps_new_pane_and_named_pane_counter_outside_the_scrolling_strip() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::{Rectangle, Size, Vector};
+        #[derive(Default)]
+        struct Bounds {
+            controls: HashMap<String, Rectangle>,
+            strip: Option<(Rectangle, Vector)>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.controls.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                offset: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.strip = Some((bounds, offset));
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        for size in [13.0, 24.0] {
+            for width in [640.0, 900.0, 1600.0] {
+                let mut app = tab_fixture(30, width);
+                app.settings.interface_font_size = size;
+                drop(app.sync_chrome());
+                let mut header =
+                    app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+                let mut tree = Tree::new(header.as_widget());
+                let extent = Size::new(width, 600.0);
+                let node = header.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(extent, extent),
+                );
+                let mut before = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let strip = before.strip.expect("actual horizontal tab viewport").0;
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    let control = before.controls[id];
+                    assert!(
+                        control.x >= strip.x + strip.width - 0.1,
+                        "{id} is pinned outside {strip:?}"
+                    );
+                    assert!(
+                        control.x >= -0.1 && control.x + control.width <= width + 0.1,
+                        "{id} clipped at width{width}/size{size}: {control:?}"
+                    );
+                }
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::scrollable::snap_to::<()>(
+                        widget::Id::new("workspace.tabs"),
+                        operation::scrollable::RelativeOffset {
+                            x: Some(1.0),
+                            y: None,
+                        },
+                    ),
+                );
+                let mut after = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert!(
+                    after.strip.unwrap().1.x.abs() > 1.0,
+                    "exercise actual overflowing scroll state"
+                );
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    assert_eq!(
+                        after.controls[id], before.controls[id],
+                        "scroll moved pinned {id}"
+                    );
+                }
+                let ax = header.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(ax.root().iter().chain(ax.children()).any(|node| {
+                    node.node().label() == Some("Show open panes · 1 of 30")
+                        && node
+                            .node()
+                            .supports_action(iced_accessibility::accesskit::Action::Click)
+                }));
+            }
+        }
+    }
+
+    fn tab_fixture(count: usize, width: f32) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let cards: Vec<_> = (0..count)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(width);
+        drop(app.sync_chrome());
+        app
+    }
+
+    #[test]
+    fn mounted_tab_width_tracks_interface_size_and_family_without_a_title_change() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        const TITLE: &str = "Native tab";
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == TITLE {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(id, TITLE.into());
+        app.settings.interface_font_family.clear();
+        app.settings.interface_font_size = 13.0;
+        drop(app.sync_chrome());
+        let initial_font = design::interface_font();
+        let initial_revision = app.card_chrome[&id].typography_revision;
+        let initial_width = app.card_chrome[&id].title_width;
+        let initial_tab_width = app.tab_strip_geometry().1;
+        // Lay out the actual body widget independently of the measurement
+        // helper, so a stale/default font in that helper cannot validate itself.
+        let body_size = |font| {
+            let mut body: Element<'_, Message> = design::body(TITLE)
+                .font(font)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into();
+            let mut tree = Tree::new(body.as_widget());
+            body.as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(
+                        iced::Size::ZERO,
+                        iced::Size::new(f32::INFINITY, f32::INFINITY),
+                    ),
+                )
+                .size()
+        };
+        let assert_mounted = |app: &Cagents| {
+            let width = app.tab_strip_geometry().1;
+            let mut header = app.column_header(id, true, width);
+            let mut tree = Tree::new(header.as_widget());
+            let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(size, size),
+            );
+            let mut title = TitleBounds(None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+            let bounds = title.0.expect("the actual mounted tab title");
+            let intrinsic = body_size(design::interface_font());
+            assert!(bounds.width + 0.1 >= intrinsic.width);
+            assert!(bounds.height + 0.1 >= intrinsic.height);
+            assert!((app.card_chrome[&id].title_width - intrinsic.width).abs() < 0.1);
+        };
+        assert_mounted(&app);
+
+        // sync_chrome must apply new settings before refreshing its cache;
+        // neither a label change nor an intervening view call is required.
+        app.settings.interface_font_size = 24.0;
+        drop(app.sync_chrome());
+        assert_eq!(design::interface_size(), 24.0);
+        assert!(app.card_chrome[&id].typography_revision > initial_revision);
+        assert!(app.card_chrome[&id].title_width > initial_width);
+        assert!(app.tab_strip_geometry().1 > initial_tab_width);
+        assert_mounted(&app);
+
+        let sized_revision = app.card_chrome[&id].typography_revision;
+        let sized_width = app.card_chrome[&id].title_width;
+        let family = design::installed_font_families(false)
+            .iter()
+            .find(|family| {
+                let font = iced::Font {
+                    family: iced::font::Family::Name(family.as_str()),
+                    ..initial_font
+                };
+                font.family != initial_font.family
+                    && (body_size(font).width - sized_width).abs() > 0.1
+            })
+            .expect("an installed family has different actual metrics for the fixture title");
+        app.settings.interface_font_family = family.clone();
+        drop(app.sync_chrome());
+        assert_eq!(
+            design::interface_font().family,
+            iced::font::Family::Name(family.as_str())
+        );
+        assert!(app.card_chrome[&id].typography_revision > sized_revision);
+        assert!((app.card_chrome[&id].title_width - sized_width).abs() > 0.1);
+        assert_mounted(&app);
+        let stable_revision = app.card_chrome[&id].typography_revision;
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&id].typography_revision, stable_revision);
+    }
+
+    #[test]
+    fn numbered_terminal_caption_fits_the_retained_header_at_maximum_interface_size() {
+        use iced::advanced::{
+            Layout, layout,
+            text::Paragraph as _,
+            widget::{Operation, Tree, tree::Tag},
+        };
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn caption_line(tree: &Tree, suffix: &str) -> Option<f32> {
+            if tree.tag == Tag::of::<TextState>() {
+                let text = &tree.state.downcast_ref::<TextState>().paragraph;
+                if text.content() == suffix {
+                    let paragraph = text.raw();
+                    return Some(paragraph.line_height().to_absolute(paragraph.size()).0);
+                }
+            }
+            tree.children
+                .iter()
+                .find_map(|child| caption_line(child, suffix))
+        }
+        struct CaptionBounds<'a>(&'a str, Option<iced::Rectangle>);
+        impl Operation for CaptionBounds<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == self.0 {
+                    self.1 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let card = app.durable.cards[0].id;
+        let mut tree = Tree::empty();
+        for size in [13.0, 24.0] {
+            app.settings.interface_font_size = size;
+            drop(app.sync_chrome());
+            let suffix = app.card_chrome[&card]
+                .terminal_ordinal_suffix
+                .as_deref()
+                .expect("natural terminal title keeps its number")
+                .trim();
+            let width = app.tab_strip_geometry().1;
+            assert!(
+                width >= design::TAB_MIN_WIDTH,
+                "exercise the actual separate ordinal caption"
+            );
+            let mut header = app.column_header(card, true, width);
+            tree.diff(header.as_widget_mut());
+            let bounds = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds, bounds),
+            );
+            let line = caption_line(&tree, suffix).expect("actual mounted ordinal text paragraph");
+            let mut caption = CaptionBounds(suffix, None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut caption);
+            let actual = caption.1.expect("actual ordinal layout bounds");
+            assert!(
+                line <= actual.height + 0.1,
+                "caption line {line} clipped by {actual:?} at {size}px"
+            );
+            assert!(actual.y >= -0.1 && actual.y + actual.height <= bounds.height + 0.1);
+            assert!(
+                line <= size + 5.0 && line > design::scaled_interface_size(design::TEXT_CAPTION)
+            );
+            if size == 13.0 {
+                assert_eq!(line, 17.0, "default caption geometry stays unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+        let mut app = tab_fixture(30, 900.0);
+        let (available, width) = app.tab_strip_geometry();
+        assert!(
+            4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
+                <= available + 0.1
+        );
+        let id = app.durable.cards[0].id;
+        app.chrome_ui
+            .user_titles
+            .insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
+        app.workspace.resize_viewport(1600.0);
+        drop(app.sync_chrome());
+        let (_, width) = app.tab_strip_geometry();
+        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == "WWWWWWWWWWWWWWWWWWWW" {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut header = app.column_header(id, true, width);
+        let mut tree = Tree::new(header.as_widget());
+        let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+        let node =
+            header
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut title = TitleBounds(None);
+        header
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+        assert!(
+            title.0.expect("actual mounted title text").width
+                >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
+            "the real title allocation must fit, after its icon, padding and controls"
+        );
     }
 
     #[test]
@@ -392,7 +840,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let before = rename_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(before.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
 
             let open = app.update_chrome(Action::Rename(card));
@@ -403,7 +851,7 @@ mod tests {
             assert!(
                 !during
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
             let close = match dismissal {
@@ -432,7 +880,7 @@ mod tests {
             );
             let after = rename_fixture_step(&app, &mut tree, &renderer, close, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
         }
     }
@@ -478,7 +926,7 @@ mod tests {
         assert_eq!(state.title_source, ChannelTitleSource::Manual);
         let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -502,7 +950,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
@@ -523,7 +971,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
@@ -594,6 +1042,403 @@ mod tests {
         let _ = app.update_chrome(Action::Reveal(card));
         assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
         assert!(app.context_inspector_overlay_active);
+    }
+
+    fn focus_main_window(app: &mut Cagents, focused: bool) {
+        app.core
+            .set_main_window_id(Some(cosmic::iced::window::Id::RESERVED));
+        let _ = app.update(Message::RefreshUi(
+            super::super::refresh_ui::Action::Focused(cosmic::iced::window::Id::RESERVED, focused),
+        ));
+        assert_eq!(app.refresh_ui.focused, focused);
+    }
+
+    /// The expiry timer runs only while a confirmation is waiting to retire
+    /// and someone could be reading it: the window in the foreground and the
+    /// notices closed. Time spent otherwise is added back to the deadline. It
+    /// fires as a message that retires what is due.
+    #[test]
+    fn confirmations_retire_only_while_someone_could_read_them() {
+        // A measurable pause, so a resume that shifted nothing cannot pass.
+        let pause = || std::thread::sleep(Duration::from_millis(5));
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
+        app.notices.record(TransientNotice::error("Still failing."));
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "an idle window arms no timer"
+        );
+        let recorded = Instant::now();
+        app.notices
+            .record_at(TransientNotice::success("Account added."), recorded);
+        let due = recorded + NOTICE_SUCCESS_LIFETIME;
+        assert_eq!(app.notices.next_expiry(), Some(due));
+
+        let _ = app.update(Message::ChromeUi(Action::ToggleNotices));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "nothing retires while read"
+        );
+        let paused = app.notices.paused_at.expect("reading pauses the countdown");
+        // A timer that fired just before the popup opened changes nothing.
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        pause();
+        let before = Instant::now();
+        let _ = app.update(Message::ChromeUi(Action::Close));
+        let after = Instant::now();
+        let resumed = app.notices.next_expiry().expect("the countdown resumes");
+        // Moved on by exactly the pause, which ended inside the update.
+        assert!(
+            due + (before - paused) <= resumed && resumed <= due + (after - paused),
+            "the time spent reading is not counted"
+        );
+
+        focus_main_window(&mut app, false);
+        assert_eq!(app.notices.next_expiry(), None, "nothing retires unseen");
+        let paused = app.notices.paused_at.expect("the background pauses it");
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        pause();
+        let before = Instant::now();
+        focus_main_window(&mut app, true);
+        let after = Instant::now();
+        let refocused = app.notices.next_expiry().expect("focus resumes it");
+        assert!(
+            resumed + (before - paused) <= refocused && refocused <= resumed + (after - paused),
+            "time in the background is not counted"
+        );
+
+        // Backdated, so the repeat is already due when the timer fires.
+        app.notices.record_at(
+            TransientNotice::success("Account added."),
+            recorded - NOTICE_SUCCESS_LIFETIME,
+        );
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices.severity(), Some(NoticeSeverity::Error));
+        assert_eq!(app.notices.next_expiry(), None);
+    }
+
+    /// The header's notices control beside the inspector toggle, as the
+    /// window header mounts them.
+    fn notice_header(app: &Cagents) -> Element<'_, Message> {
+        widget::row::with_children(vec![
+            app.sidebar_toggle(),
+            widget::row::with_children(app.notice_control()).into(),
+        ])
+        .into()
+    }
+
+    fn notice_focus_fixture(app: &Cagents) -> Element<'_, Message> {
+        widget::column::with_children(vec![
+            notice_header(app),
+            rename_fixture_view(app),
+            app.dialog()
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
+        ])
+        .into()
+    }
+
+    /// Mounts the header as `app` now draws it, then applies `task`'s widget
+    /// operations to it, as the runtime does once an update has been drawn.
+    /// Returns the messages the task produced and the ids holding focus after.
+    fn apply_to_header(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+    ) -> (Vec<Message>, Vec<String>) {
+        use iced::advanced::widget::operation::{Focusable, Outcome};
+        use iced::advanced::{Layout, layout, widget::Operation};
+        use iced::{Rectangle, Size, futures::StreamExt};
+
+        struct Focused(Vec<String>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id
+                    && state.is_focused()
+                {
+                    self.0.push(id.to_string());
+                }
+            }
+        }
+
+        let mut element = notice_focus_fixture(app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1600.0)),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = Vec::new();
+        runtime.block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                match action {
+                    iced::runtime::Action::Widget(operation) => {
+                        let mut next = Some(operation);
+                        while let Some(mut operation) = next.take() {
+                            element.as_widget_mut().operate(
+                                tree,
+                                Layout::new(&node),
+                                renderer,
+                                operation.as_mut(),
+                            );
+                            if let Outcome::Chain(chained) = operation.finish() {
+                                next = Some(chained);
+                            }
+                        }
+                    }
+                    iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        runtime.shutdown_background();
+        let mut focused = Focused(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut focused);
+        (messages, focused.0)
+    }
+
+    /// The notices control goes with the last notice, whatever removes it.
+    /// When it held the keyboard, the keyboard moves to the inspector toggle
+    /// beside it rather than to nowhere; otherwise it stays where it is.
+    #[test]
+    fn the_last_notice_going_moves_the_keyboard_off_its_control() {
+        let toggle = context_inspector_toggle_id().to_string();
+        let control = widget::Id::new(NOTICES_CONTROL_ID).to_string();
+        // A confirmation retiring on its timer, and a failure withdrawn by
+        // the reader giving up on what failed.
+        let removals: [(&str, fn(&mut Cagents) -> Task<Message>); 2] = [
+            ("timer", |app| {
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                app.update(Message::ExpireNotices)
+            }),
+            ("link cancel", |app| {
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkStart(crate::agent::Provider::Claude),
+                ));
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkReady {
+                        key: uuid::Uuid::new_v4(),
+                        result: Err("no credentials there".into()),
+                    },
+                ));
+                app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkCancel,
+                ))
+            }),
+        ];
+        for (path, remove) in removals {
+            for holds_keyboard in [true, false] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                focus_main_window(&mut app, true);
+                app.notices.record(TransientNotice::warning("Placeholder."));
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = iced::advanced::widget::Tree::new(notice_header(&app).as_widget());
+                let target = if holds_keyboard {
+                    widget::Id::new(NOTICES_CONTROL_ID)
+                } else {
+                    widget::Id::new("elsewhere")
+                };
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(target),
+                );
+                assert_eq!(focused == [control.clone()], holds_keyboard, "{path}");
+                app.notices.clear();
+
+                let query = remove(&mut app);
+                assert!(!app.has_chrome_notices(), "{path}");
+                let (mut messages, _) = apply_to_header(&app, &mut tree, &renderer, query);
+                assert!(
+                    matches!(messages.as_slice(), [Message::NoticeControlRetired]),
+                    "{path}: {messages:?}"
+                );
+                let moved = app.update(messages.pop().unwrap());
+                assert!(app.notice_control().is_none(), "{path}");
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, moved);
+                if holds_keyboard {
+                    assert_eq!(focused, [toggle.clone()], "{path}");
+                } else {
+                    assert!(focused.is_empty(), "{path}: {focused:?}");
+                }
+            }
+        }
+
+        // A tree without the control answers nothing; the control still goes.
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let query = app.update(Message::ExpireNotices);
+        assert!(app.notice_control().is_some(), "kept for the query");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = runtime.block_on(async {
+            use cosmic::iced::futures::StreamExt;
+            let mut messages = Vec::new();
+            let mut stream = cosmic::iced::runtime::task::into_stream(query).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    cosmic::iced::runtime::Action::Widget(operation) => drop(operation),
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+            messages
+        });
+        assert!(
+            matches!(messages.as_slice(), [Message::NoticeControlRetired]),
+            "{messages:?}"
+        );
+        let _ = app.update(messages.pop().unwrap());
+        assert!(app.notice_control().is_none());
+    }
+
+    #[test]
+    fn retiring_notices_never_take_focus_from_a_newer_keyboard_owner() {
+        use iced::advanced::widget::Tree;
+
+        // Interleave both before the widget operation and after its reply:
+        // neither a stale focus query nor its cleanup may override new UI.
+        for before_operation in [false, true] {
+            for owner in ["palette", "rename", "dialog", "editor"] {
+                let mut app = rename_test_app();
+                focus_main_window(&mut app, true);
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+                );
+                assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+                let mut retirement = Some(app.update(Message::ExpireNotices));
+                let mut replies = if before_operation {
+                    Vec::new()
+                } else {
+                    apply_to_header(&app, &mut tree, &renderer, retirement.take().unwrap()).0
+                };
+                let (open, destination) = match owner {
+                    "palette" => (
+                        app.update_palette(palette_ui::Action::Open),
+                        widget::Id::new("palette.query"),
+                    ),
+                    "rename" => (
+                        app.update_chrome(Action::Rename(app.workspace.focused().unwrap())),
+                        widget::Id::new("chrome.rename.input"),
+                    ),
+                    "dialog" => {
+                        // Mount the real confirmation without requesting any
+                        // daemon operation; Cancel is an actual dialog widget.
+                        app.daemon_health_ui.confirmation = true;
+                        let destination = widget::Id::new("daemon-health.cancel");
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                    _ => {
+                        let destination = crate::settings_widgets::search_id();
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                };
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, open);
+                assert_eq!(focused, [destination.to_string()], "{owner}");
+                if let Some(retirement) = retirement {
+                    replies = apply_to_header(&app, &mut tree, &renderer, retirement).0;
+                }
+                assert!(matches!(
+                    replies.as_slice(),
+                    [Message::NoticeControlRetired]
+                ));
+                let cleanup = app.update(replies.pop().unwrap());
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+                assert_eq!(
+                    focused,
+                    [destination.to_string()],
+                    "{owner}, before operation: {before_operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_notice_cancels_the_pending_focus_handoff() {
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+        let _ = apply_to_header(
+            &app,
+            &mut tree,
+            &renderer,
+            iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+        );
+        let retirement = app.update(Message::ExpireNotices);
+        app.notices
+            .record(TransientNotice::warning("A newer report."));
+        let (mut replies, focused) = apply_to_header(&app, &mut tree, &renderer, retirement);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert!(matches!(
+            replies.as_slice(),
+            [Message::NoticeControlRetired]
+        ));
+        let cleanup = app.update(replies.pop().unwrap());
+        let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert_eq!(app.notices.len(), 1);
     }
 
     #[test]
@@ -890,6 +1735,7 @@ impl State {
 enum Popup {
     NewTab,
     Notices,
+    Attention,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -944,6 +1790,8 @@ pub enum Action {
     ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
+    ToggleAttention,
+    AttentionPage(usize),
     ShowNoticesFor(CardId),
     Close,
     TabsScrolled(f32),
@@ -968,6 +1816,8 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    MoveTo(crate::model::ChannelId),
+    MoveToChannel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -991,6 +1841,12 @@ impl widget::menu::Action for PaneMenu {
             }
             PaneMenuCommand::ReviewChanges(target) => {
                 return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
+            PaneMenuCommand::MoveTo(channel) => {
+                return Message::MovePaneToChannel { card: id, channel };
+            }
+            PaneMenuCommand::MoveToChannel => {
+                return Message::Palette(palette_ui::Action::MovePane(id));
             }
         })
     }
@@ -1086,8 +1942,71 @@ mod tab_style_tests {
     }
 }
 
+const NOTICES_CONTROL_ID: &str = "chrome.notices";
+const RETIRING_NOTICES_ID: &str = "chrome.notices.retiring";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
+
+/// Check ownership and transfer focus in one runtime operation chain. An
+/// asynchronous boolean reply would become stale if another field, dialog or
+/// popup took focus before the application handled it.
+struct RetireNoticeFocus {
+    source: widget::Id,
+    marker: widget::Id,
+    target: widget::Id,
+    retiring: bool,
+    focused: bool,
+    target_present: bool,
+}
+
+impl iced::advanced::widget::Operation for RetireNoticeFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        visit(self);
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, _: iced::Rectangle) {
+        self.retiring |= id == Some(&self.marker);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if id == Some(&self.source) {
+            self.focused |= state.is_focused();
+        }
+        self.target_present |= id == Some(&self.target);
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        use iced::advanced::widget::operation::{Outcome, focusable};
+        if self.retiring && self.focused && self.target_present {
+            // Iced applies chained operations synchronously, without an
+            // intervening application message that could change the owner.
+            Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+        } else {
+            Outcome::None
+        }
+    }
+}
+
+/// The deadline a notice expiry timer is armed for. As the subscription's
+/// identity, an earlier deadline replaces the timer and an unchanged one
+/// keeps it.
+#[derive(Hash)]
+struct NoticeExpiry(Instant);
+
+fn notice_expiry_stream(
+    expiry: &NoticeExpiry,
+) -> impl cosmic::iced::futures::Stream<Item = Message> + use<> {
+    let deadline = tokio::time::Instant::from_std(expiry.0);
+    cosmic::iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline).await;
+        Message::ExpireNotices
+    })
+}
 
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
@@ -1166,6 +2085,32 @@ impl Cagents {
                 .iter()
                 .map(|(_, _, _, id)| Cow::Borrowed(*id))
                 .collect(),
+            Popup::Attention => {
+                let mut ring = vec![Cow::Borrowed("attention.close")];
+                let notices = if self.attention_backend_current() {
+                    self.attention_notices()
+                } else {
+                    Vec::new()
+                };
+                let page = self
+                    .chrome_ui
+                    .attention_page
+                    .min(notices.len().saturating_sub(1) / 20);
+                ring.extend(
+                    notices
+                        .iter()
+                        .skip(page * 20)
+                        .take(20)
+                        .map(|notice| Cow::Owned(format!("attention.open.{}", notice.id))),
+                );
+                if page > 0 {
+                    ring.push(Cow::Borrowed("attention.previous"));
+                }
+                if (page + 1) * 20 < notices.len() {
+                    ring.push(Cow::Borrowed("attention.next"));
+                }
+                ring
+            }
             Popup::Notices => {
                 let mut ring = Vec::new();
                 if !self.notices.is_empty() {
@@ -1254,6 +2199,11 @@ impl Cagents {
                     .chrome_ui
                     .popup
                     .is_some_and(|popup| popup != Popup::Notices))
+        {
+            return Task::none();
+        }
+        if matches!(action, Action::ToggleAttention | Action::AttentionPage(_))
+            && self.focused_repository_is_saving()
         {
             return Task::none();
         }
@@ -1376,6 +2326,7 @@ impl Cagents {
                     .map(Path::to_path_buf),
             }
             .map_or_else(Task::none, |path| {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(path.display().to_string())
             }),
             Action::Reveal(id) => {
@@ -1430,9 +2381,23 @@ impl Cagents {
                 self.persist();
                 self.sync_context_overlay_state()
             }
-            Action::ToggleNewTab | Action::ToggleNotices | Action::ShowNoticesFor(_) => {
+            Action::AttentionPage(page) => {
+                if !self.attention_is_open() || !self.attention_backend_current() {
+                    return Task::none();
+                }
+                self.chrome_ui.attention_page =
+                    page.min(self.attention_notices().len().saturating_sub(1) / 20);
+                self.chrome_ui.focus_index = 0;
+                self.focus_popup_control(self.popup_focus_ring(Popup::Attention))
+            }
+            Action::ToggleNewTab
+            | Action::ToggleNotices
+            | Action::ToggleAttention
+            | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
+                } else if matches!(action, Action::ToggleAttention) {
+                    Popup::Attention
                 } else {
                     Popup::Notices
                 };
@@ -1442,12 +2407,15 @@ impl Cagents {
                     }
                     return self.update_chrome(Action::Close);
                 }
+                if popup == Popup::Attention {
+                    self.chrome_ui.attention_page = 0;
+                }
                 self.chrome_ui.popup = Some(popup);
                 // The notices popup opens on its close control, which is not
                 // the first stop when "Dismiss all" precedes it.
                 let ring = self.popup_focus_ring(popup);
                 self.chrome_ui.focus_index = match popup {
-                    Popup::NewTab => 0,
+                    Popup::NewTab | Popup::Attention => 0,
                     Popup::Notices => ring
                         .iter()
                         .position(|id| id == NOTICES_CLOSE_ID)
@@ -1457,10 +2425,18 @@ impl Cagents {
             }
             Action::Close => {
                 let popup = self.chrome_ui.popup.take();
+                if popup == Some(Popup::Attention)
+                    && (self.modal_is_open() || self.focused_repository_is_saving())
+                {
+                    // A queued outside-close cannot unfocus a dialog/editor
+                    // that acquired the keyboard after this overlay was drawn.
+                    return Task::none();
+                }
                 popup.map_or_else(Task::none, |popup| {
                     iced::widget::operation::focus(widget::Id::new(match popup {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
-                        Popup::Notices => "chrome.notices",
+                        Popup::Notices => NOTICES_CONTROL_ID,
+                        Popup::Attention => "attention.control",
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -1561,6 +2537,74 @@ impl Cagents {
                 .is_some_and(SaveHealthState::is_visible)
     }
 
+    /// Wakes the shell when the earliest confirmation is due to retire, and
+    /// never otherwise: with nothing waiting to retire, or the countdown
+    /// paused, there is no timer.
+    pub(super) fn notice_expiry_subscription(&self) -> Subscription<Message> {
+        self.notices
+            .next_expiry()
+            .map_or_else(Subscription::none, |deadline| {
+                Subscription::run_with(NoticeExpiry(deadline), notice_expiry_stream)
+            })
+    }
+
+    /// Confirmations count down only while someone could be reading them as
+    /// they appear: with the main window in the foreground and the notices
+    /// closed. While the notices are open nothing retires, so an entry does
+    /// not vanish from under the pointer or the keyboard; and a confirmation
+    /// raised behind another window is still there when the user returns.
+    /// Either way the countdown carries on from where it stopped.
+    pub(super) fn sync_notice_countdown(&mut self) {
+        let now = Instant::now();
+        if self.refresh_ui.focused && self.chrome_ui.popup != Some(Popup::Notices) {
+            self.notices.resume(now);
+        } else {
+            self.notices.pause(now);
+        }
+    }
+
+    /// The notices control goes with the last notice, whatever removed it:
+    /// a confirmation retiring, a dismissal, a success resolving a failure,
+    /// a pane closing. Holding the keyboard, it would take the keyboard with
+    /// it. So it stays until the widget operation conditionally hands focus
+    /// to the inspector toggle beside it. The cleanup reply never moves focus.
+    /// `before` is the control's severity before this update, if it showed.
+    ///
+    /// With the notices open, `reconcile_notice_popup` closes them and moves
+    /// focus the same way.
+    pub(super) fn retire_notice_control(
+        &mut self,
+        before: Option<NoticeSeverity>,
+    ) -> Task<Message> {
+        let Some(severity) = before else {
+            return Task::none();
+        };
+        if self.has_chrome_notices()
+            || self.chrome_ui.popup == Some(Popup::Notices)
+            || self.chrome_ui.retiring_notice_control.is_some()
+        {
+            return Task::none();
+        }
+        self.chrome_ui.retiring_notice_control = Some(severity);
+        // Collect even an empty operation outcome so an absent control still
+        // retires. Focus is settled in the widget tree, never by this reply.
+        iced::runtime::task::widget(RetireNoticeFocus {
+            source: widget::Id::new(NOTICES_CONTROL_ID),
+            marker: widget::Id::new(RETIRING_NOTICES_ID),
+            target: context_inspector_toggle_id(),
+            retiring: false,
+            focused: false,
+            target_present: false,
+        })
+        .collect()
+        .map(|_| cosmic::Action::App(Message::NoticeControlRetired))
+    }
+
+    pub(super) fn notice_control_retired(&mut self) -> Task<Message> {
+        self.chrome_ui.retiring_notice_control = None;
+        Task::none()
+    }
+
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
@@ -1570,7 +2614,9 @@ impl Cagents {
         }
     }
 
-    fn notice_control(&self) -> Option<Element<'_, Message>> {
+    /// The severity the notices control shows, or `None` when there is no
+    /// control because there is nothing to show.
+    pub(super) fn notice_control_severity(&self) -> Option<NoticeSeverity> {
         if !self.has_chrome_notices() {
             return None;
         }
@@ -1589,7 +2635,179 @@ impl Cagents {
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
-        let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
+        Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
+    }
+
+    pub(super) fn attention_is_open(&self) -> bool {
+        self.chrome_ui.popup == Some(Popup::Attention)
+    }
+
+    /// The journal's own keyboard layer must not veto its explicit action.
+    /// Inspect the unchanged navigation predicate with only that popup absent;
+    /// restore it immediately, without focus operations or event processing.
+    pub(super) fn with_attention_dismissed(&mut self, allowed: impl FnOnce(&Self) -> bool) -> bool {
+        if !self.attention_is_open() {
+            return false;
+        }
+        let popup = self.chrome_ui.popup.take();
+        let admitted = allowed(self);
+        self.chrome_ui.popup = popup;
+        admitted
+    }
+
+    pub(super) fn close_attention(&mut self) {
+        if self.attention_is_open() {
+            self.chrome_ui.close();
+        }
+    }
+
+    fn attention_and_notice_controls(&self) -> Element<'_, Message> {
+        widget::row::with_children(
+            std::iter::once(self.attention_control()).chain(self.notice_control()),
+        )
+        .spacing(space::XXS)
+        .into()
+    }
+
+    fn attention_control(&self) -> Element<'_, Message> {
+        let control = crate::ui_controls::icon_button(Icon::NotificationSettings, "Attention")
+            .id(widget::Id::new("attention.control"))
+            .selected(self.attention_is_open())
+            .on_press_maybe(
+                (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleAttention)),
+            );
+        let content =
+            (self.attention_is_open() && !self.modal_is_open()).then(|| self.attention_journal());
+        crate::ui_controls::popover(
+            control,
+            content,
+            widget::popover::Position::Bottom,
+            Message::ChromeUi(Action::Close),
+        )
+    }
+
+    pub(super) fn attention_journal(&self) -> Element<'_, Message> {
+        let notices = if self.attention_backend_current() {
+            self.attention_notices()
+        } else {
+            Vec::new()
+        };
+        let page = self
+            .chrome_ui
+            .attention_page
+            .min(notices.len().saturating_sub(1) / 20);
+        let mut entries = Vec::new();
+        if !self.attention_backend_current() {
+            entries.push(design::caption("The notification backend is not connected. Retained entries cannot be opened until it reconnects.")
+                .width(Length::Fill).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into());
+        } else if notices.is_empty() {
+            entries.push(
+                design::caption("No attention entries.")
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+            );
+        }
+        for (index, notice) in notices.iter().skip(page * 20).take(20).enumerate() {
+            let message = crate::notifications::presentation::message(
+                &notice.event,
+                self.settings.notifications.message_previews,
+            );
+            let mut paragraphs = vec![
+                design::heading(message.title.clone())
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+            ];
+            if !message.body.is_empty() && message.body != message.title {
+                paragraphs.push(
+                    design::body(message.body)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into(),
+                );
+            }
+            paragraphs.push(
+                crate::ui_controls::button::quiet(message.action)
+                    .id(widget::Id::new(format!("attention.open.{}", notice.id)))
+                    .name(format!(
+                        "{} — {} — entry {}",
+                        message.action,
+                        message.title,
+                        page * 20 + index + 1
+                    ))
+                    .on_press(self.attention_notice_action(notice))
+                    .into(),
+            );
+            let body = widget::column::with_children(paragraphs)
+                .spacing(space::XS)
+                .width(Length::Fill);
+            entries.push(crate::ui_controls::owned(
+                self.attention_notice_owner(notice),
+                widget::container(body)
+                    .padding(space::S)
+                    .width(Length::Fill),
+            ));
+        }
+        let mut navigation = Vec::new();
+        if page > 0 {
+            navigation.push(
+                crate::ui_controls::button::quiet("Previous entries")
+                    .id(widget::Id::new("attention.previous"))
+                    .on_press(Message::ChromeUi(Action::AttentionPage(page - 1)))
+                    .into(),
+            );
+        }
+        if (page + 1) * 20 < notices.len() {
+            navigation.push(
+                crate::ui_controls::button::quiet("More entries")
+                    .id(widget::Id::new("attention.next"))
+                    .on_press(Message::ChromeUi(Action::AttentionPage(page + 1)))
+                    .into(),
+            );
+        }
+        let header = widget::row::with_children(vec![
+            design::heading("Attention").width(Length::Fill).into(),
+            command(
+                Icon::Close,
+                "Close Attention",
+                widget::Id::new("attention.close"),
+                Some(Message::ChromeUi(Action::Close)),
+            ),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::S);
+        widget::container(
+            widget::column::with_children(vec![
+                header.into(),
+                // Shrink children are measured in order. Reserve the page
+                // controls before the list can consume the remaining height.
+                widget::row::with_children(navigation)
+                    .spacing(space::S)
+                    .into(),
+                widget::scrollable(
+                    widget::column::with_children(entries)
+                        .spacing(space::XS)
+                        .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink)
+                .into(),
+            ])
+            .spacing(space::S),
+        )
+        .padding(space::S)
+        .width((self.window_width - 16.0).clamp(160.0, 420.0))
+        .max_height(408)
+        .into()
+    }
+
+    fn notice_control(&self) -> Option<Element<'_, Message>> {
+        let severity = self
+            .notice_control_severity()
+            .or(self.chrome_ui.retiring_notice_control)?;
         let control = crate::ui_controls::icon_button(
             severity.icon(),
             match severity {
@@ -1600,7 +2818,7 @@ impl Cagents {
         )
         .selected(self.chrome_ui.popup == Some(Popup::Notices))
         .on_press_maybe((!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)))
-        .id(widget::Id::new("chrome.notices"))
+        .id(widget::Id::new(NOTICES_CONTROL_ID))
         .tone(design::Tone::Themed(match severity {
             NoticeSeverity::Success => design::success_color,
             NoticeSeverity::Warning => design::warning_color,
@@ -1610,18 +2828,23 @@ impl Cagents {
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
                 for entry in self.notices.recent() {
-                    let body: Element<'_, Message> = if entry.repeats > 1 {
-                        widget::column::with_children(vec![
-                            super::notice_body(&entry.notice.message),
-                            super::notice_surface_detail(
-                                entry.notice.severity,
-                                format!("Repeated {} times", entry.repeats),
-                            ),
-                        ])
-                        .spacing(space::XS)
-                        .into()
+                    let severity = entry.notice.severity;
+                    let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    if let Some(details) = &entry.notice.details {
+                        lines.push(super::notice_surface_details(severity, details));
+                    }
+                    if entry.repeats > 1 {
+                        lines.push(super::notice_surface_detail(
+                            severity,
+                            format!("Repeated {} times", entry.repeats),
+                        ));
+                    }
+                    let body: Element<'_, Message> = if lines.len() > 1 {
+                        widget::column::with_children(lines)
+                            .spacing(space::XS)
+                            .into()
                     } else {
-                        super::notice_body(&entry.notice.message)
+                        lines.pop().expect("a notice has its message")
                     };
                     notices.push(super::notice_surface(
                         entry.notice.severity,
@@ -1697,7 +2920,22 @@ impl Cagents {
                 .into()
             });
         Some(crate::ui_controls::popover(
-            control,
+            // Keep the wrapper and button shape stable through retirement so
+            // their focus state survives. Only a still-retiring control with
+            // no newer keyboard layer advertises the handoff marker.
+            widget::container(control).id(widget::Id::new(
+                if self.chrome_ui.retiring_notice_control.is_some()
+                    && !self.has_chrome_notices()
+                    && !self.modal_is_open()
+                    && !self.palette.is_open()
+                    && self.chrome_ui.popup.is_none()
+                    && self.chrome_ui.rename.is_none()
+                {
+                    RETIRING_NOTICES_ID
+                } else {
+                    "chrome.notices.anchor"
+                },
+            )),
             content,
             widget::popover::Position::Bottom,
             Message::ChromeUi(Action::Close),
@@ -1764,18 +3002,39 @@ impl Cagents {
         .into()
     }
 
+    fn pane_counter_width(&self) -> f32 {
+        let total = self.workspace.cards().len();
+        let current = self
+            .workspace
+            .focused()
+            .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
+            .map_or(0, |index| index + 1);
+        thread_local! {
+            // One bounded UI-thread cache: ordinary redraws never reshape the
+            // counter while unrelated agents update or a spinner animates.
+            static WIDTH: std::cell::Cell<Option<(u64, usize, usize, f32)>> = const { std::cell::Cell::new(None) };
+        }
+        WIDTH.with(|cache| {
+            let revision = design::typography_revision();
+            if let Some((old_revision, old_current, old_total, width)) = cache.get()
+                && (old_revision, old_current, old_total) == (revision, current, total)
+            {
+                return width;
+            }
+            // The count is an actual caption at the active interface scale.
+            let width = (measure_tab_title(&format!("{current} / {total}"))
+                * (design::TEXT_CAPTION / design::TEXT_BODY)
+                + 16.0)
+                .max(design::PANE_NAVIGATOR_MIN_WIDTH);
+            cache.set(Some((revision, current, total, width)));
+            width
+        })
+    }
+
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
-            let total = self.workspace.cards().len();
-            let current = self
-                .workspace
-                .focused()
-                .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
-                .map_or(0, |index| index + 1);
-            2.0 * ICON_CONTROL_SIZE
-                + 2.0 * space::XXS
-                + (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                    .max(design::PANE_NAVIGATOR_MIN_WIDTH)
+            design::PANE_NAVIGATOR_RESERVED_WIDTH
+                + (self.pane_counter_width() - design::PANE_NAVIGATOR_MIN_WIDTH)
         } else {
             0.0
         };
@@ -1808,7 +3067,12 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + 16.0;
+        let attention = if !self.context_inspector_visible() {
+            design::PRIMARY_CONTROL_SIZE + 2.0
+        } else {
+            0.0
+        };
+        let width = navigator + controls + update + notice + attention + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -1870,6 +3134,7 @@ impl Cagents {
         if available <= 0.0 {
             return Task::none();
         }
+        // New-pane and pane-list controls stay outside the scrolling strip.
         let pitch = width + crate::tab_strip::SPACING;
         let content =
             self.workspace.order().count() as f32 * pitch + 2.0 * crate::tab_strip::EDGE_INSET;
@@ -1905,55 +3170,136 @@ impl Cagents {
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let (_, tab_width) = self.tab_strip_geometry();
-        let tabs = self
-            .workspace
-            .order()
-            .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-            .collect();
-        let generation = self.workspace_view_generation;
-        let tabs = crate::tab_strip::reorderable(
-            widget::Id::new("workspace.tabs"),
-            tabs,
-            design::PRIMARY_CONTROL_SIZE,
-            design::HEADER_HEIGHT,
-            Some(Box::new(|viewport| {
-                Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
-            })),
-            crate::tab_strip::Reordering {
-                order: self.workspace.order().collect(),
-                tab_width,
-                enabled: !self.workspace_inputs_blocked(),
-                select: Box::new(Message::FocusCard),
-                dropped: Box::new(move |card, before| Message::Viewport {
-                    generation,
-                    event: WorkspaceViewportEvent::Reordered { card, before },
-                }),
-            },
-        );
-        let actions = widget::row::with_children(self.workflow_header())
+        let header = if self.channel_work_is_main() {
+            let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
+            self.native_header(
+                iced::widget::Space::new().into(),
+                Some(actions.into()),
+                true,
+            )
+        } else {
+            let (_, tab_width) = self.tab_strip_geometry();
+            let tabs = self
+                .workspace
+                .order()
+                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
+                .collect();
+            let generation = self.workspace_view_generation;
+            let tabs = crate::tab_strip::reorderable(
+                widget::Id::new("workspace.tabs"),
+                tabs,
+                design::PRIMARY_CONTROL_SIZE,
+                design::HEADER_HEIGHT,
+                Some(Box::new(|viewport| {
+                    Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
+                })),
+                crate::tab_strip::Reordering {
+                    order: self.workspace.order().collect(),
+                    tab_width,
+                    enabled: !self.workspace_inputs_blocked(),
+                    select: Box::new(Message::FocusCard),
+                    dropped: Box::new(move |card, before| Message::Viewport {
+                        generation,
+                        event: WorkspaceViewportEvent::Reordered { card, before },
+                    }),
+                },
+            );
+            let actions = widget::row::with_children(self.workflow_header())
+                .spacing(space::XXS)
+                .align_y(Alignment::Center);
+            let tabs = widget::row::with_children(vec![
+                widget::container(tabs).width(Length::Fill).into(),
+                self.new_tab_control(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+            self.native_header(
+                tabs.into(),
+                Some(actions.into()),
+                !self.context_inspector_open,
+            )
+        };
+        let mut rows = vec![header];
+        if let Some(channel) = self.channel_home_bar() {
+            rows.push(channel);
+        }
+        rows.push(crate::design::horizontal_rule().into());
+        rows.push(content);
+        widget::column::with_children(rows)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
+        let (home, title) = self.channel_home()?;
+        let generation = self.channel_home_generation();
+        let workspace = self.workspace_view_generation;
+        let work = self.channel_work_is_main();
+        let compact = self.window_width < 800.0;
+        let mut navigation = Vec::new();
+        for (label, surface, selected) in [
+            ("Conversations", channel_work::Surface::Conversations, !work),
+            ("Work", channel_work::Surface::Work, work),
+        ] {
+            let action = Message::ChannelWorkNavigation(channel_work::Navigation {
+                home,
+                generation,
+                workspace,
+                surface,
+            });
+            navigation.push(crate::ui_controls::owned(
+                (home, generation, workspace, surface),
+                crate::ui_controls::view_tab(
+                    crate::ui_controls::ViewTab {
+                        label: label.into(),
+                        description: format!("{label} for channel {title}").into(),
+                        count: None,
+                        selected,
+                        id: None,
+                        on_press: (!self.modal_is_open()).then_some(action),
+                    },
+                    compact,
+                    None,
+                ),
+            ));
+        }
+        let navigation = widget::row::with_children(navigation)
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let tabs = widget::row::with_children(vec![
-            widget::container(tabs).width(Length::Fill).into(),
-            self.new_tab_control(),
+        let identity = widget::column::with_children(vec![
+            design::caption("CHANNEL").into(),
+            design::heading(if title.is_empty() {
+                "Untitled channel".to_owned()
+            } else {
+                title
+            })
+            .width(Length::Fill)
+            .into(),
         ])
         .spacing(space::XXS)
-        .align_y(Alignment::Center)
         .width(Length::Fill);
-        let header = self.native_header(
-            tabs.into(),
-            Some(actions.into()),
-            !self.context_inspector_open,
-        );
-        widget::column::with_children(vec![
-            header,
-            crate::design::horizontal_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        let content: Element<'_, Message> = if work {
+            // Work's fixed leaf header already displays the captured channel
+            // title. Do not repeat it or narrow it beside the navigation.
+            navigation.into()
+        } else if compact {
+            widget::column::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::XS)
+                .into()
+        } else {
+            widget::row::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        Some(
+            widget::container(content)
+                .padding([space::XS, space::S])
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
@@ -1961,7 +3307,11 @@ impl Cagents {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
-        let total = self.workspace.cards().len();
+        let total = if self.channel_work_is_main() {
+            0
+        } else {
+            self.workspace.cards().len()
+        };
         if should_show_card_navigator(total) {
             let current = self
                 .workspace
@@ -1983,14 +3333,15 @@ impl Cagents {
             ));
             actions.push(
                 widget::button::custom(crate::design::caption(format!("{current} / {total}")))
-                    .name("Show open panes")
+                    .name(format!("Show open panes · {current} of {total}"))
                     .id(widget::Id::new("workspace.pane-list"))
                     .class(cosmic::theme::Button::Text)
+                    .padding([0, 8])
                     .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::Palette(palette_ui::Action::OpenPanes))
-                    .width(
-                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
+                    .width(self.pane_counter_width())
+                    .on_press_maybe(
+                        (!self.workspace_inputs_blocked())
+                            .then_some(Message::Palette(palette_ui::Action::OpenPanes)),
                     )
                     .into(),
             );
@@ -2033,9 +3384,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls)
-                    .then(|| self.notice_control())
-                    .flatten(),
+                (!panel_owns_shared_controls).then(|| self.attention_and_notice_controls()),
             )
             .into(),
             widget::row::with_children(
@@ -2045,7 +3394,8 @@ impl Cagents {
             )
             .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
+                (!panel_owns_shared_controls && !self.channel_work_is_main())
+                    .then(|| self.sidebar_toggle()),
             )
             .into(),
         ]
@@ -2196,8 +3546,25 @@ impl Cagents {
             },
             |chrome| Cow::Borrowed(chrome.tooltip.as_str()),
         );
+        let attention = self.sidebar_state.card_attention(id);
+        let tip = if attention != sidebar::AttentionSummary::default() {
+            let mut tip = format!("{tip}\n{}", attention.description());
+            if attention.unread != 0 && self.settings.notifications.message_previews {
+                if let Some(preview) = card
+                    .and_then(super::notification_ui::card_session)
+                    .and_then(|session| self.notification_ui.previews.get(&session))
+                {
+                    tip.push('\n');
+                    tip.push_str(&preview.text);
+                }
+            }
+            Cow::Owned(tip)
+        } else {
+            tip
+        };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -2214,7 +3581,7 @@ impl Cagents {
             _ => None,
         };
         if let Some((label, busy)) = status
-            && (!compact || self.sidebar_state.card_attention(id).is_none())
+            && (!compact || attention.state().is_none())
         {
             let indicator: Element<'_, Message> = if busy {
                 crate::ui_controls::activity_spinner(
@@ -2230,13 +3597,7 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if let Some(indicator) = sidebar::outcome_indicator(
-            self.sidebar_state
-                .card_activity(id)
-                .map(|activity| activity.state),
-            self.sidebar_state.has_card_update(id),
-            self.sidebar_state.card_outcome(id),
-        ) {
+        if let Some(indicator) = sidebar::attention_indicator(attention, false) {
             children.push(indicator);
         }
         if focused && !compact && self.chat_switch_available(id) {
@@ -2287,11 +3648,11 @@ impl Cagents {
                     .width(Length::Fill),
             )
             .padding([0.0, space::XS])
+            .height(design::PRIMARY_CONTROL_SIZE)
             .id(chrome.map_or_else(
                 || card_control_id(id, "tab"),
                 |chrome| chrome.tab_id.clone(),
             ))
-            .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
                 column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
@@ -2360,6 +3721,25 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
                 ));
             }
+            let destinations = self.pane_move_destinations(id);
+            if !destinations.is_empty() {
+                entries.push(widget::menu::Item::Divider);
+            }
+            if destinations.len() <= 5 {
+                entries.extend(destinations.into_iter().map(|channel| {
+                    widget::menu::Item::Button(
+                        format!("Move to {}", self.pane_move_destination_label(channel)),
+                        None,
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                    )
+                }));
+            } else {
+                entries.push(widget::menu::Item::Button(
+                    "Move to channel…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
+                ));
+            }
             widget::menu::items(&HashMap::new(), entries)
         })
     }
@@ -2389,6 +3769,32 @@ impl Cagents {
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
+        if !self.channel_work_is_main() && self.channel_work.view.is_open() {
+            let end = widget::row::with_children(vec![
+                self.attention_and_notice_controls(),
+                widget::row::with_children(self.update_control()).into(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .into();
+            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            return widget::column::with_children(vec![
+                heading,
+                crate::interaction::focused_escape(
+                    self.channel_work
+                        .view
+                        .view(
+                            width,
+                            (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
+                        )
+                        .map(Message::ChannelWork),
+                    || Message::ChannelWorkEscape,
+                ),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
         let indicators = self.context_rail_indicators();
         let tabs = widget::row::with_children(
             ContextTab::ALL
@@ -2458,13 +3864,27 @@ impl Cagents {
         // including a docked inspector: the workspace header must not also
         // show the update or the icon stays on the far side of the window.
         let end = widget::row::with_children(vec![
-            widget::row::with_children(self.notice_control()).into(),
+            self.attention_and_notice_controls(),
             widget::row::with_children(self.update_control()).into(),
         ])
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let tabs = widget::row::with_children(vec![
+            tabs.into(),
+            crate::ui_controls::button::secondary("Channel work")
+                .name("Open current channel work")
+                .on_press_maybe(
+                    self.durable
+                        .active_channel
+                        .filter(|_| !self.modal_is_open())
+                        .map(Message::OpenChannelWork),
+                )
+                .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::XS);
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)

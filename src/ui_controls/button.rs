@@ -140,7 +140,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         .class(style(weight))
         .padding([0.0, space::M])
         .width(width)
-        .height(design::DENSE_ROW_HEIGHT)
+        .height(design::DENSE_ROW_HEIGHT.max(design::interface_size() + 5.0))
         .on_press_maybe(on_press);
         if let Some(id) = id {
             button = button.id(id);
@@ -175,7 +175,7 @@ fn paint(weight: Weight, status: Status, theme: &cosmic::Theme) -> Paint {
         return Paint {
             fill: (weight != Weight::Quiet).then(|| lift(0.05)),
             edge: None,
-            ink: design::mix(surface, on, 0.42),
+            ink: design::disabled_color(theme),
         };
     }
     let filled = |component: &cosmic::cosmic_theme::Component| Paint {

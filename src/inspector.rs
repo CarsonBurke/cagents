@@ -29,7 +29,7 @@ use crate::{
         BrowserRestoreFidelity, CardId, CardKind, CardState, ProjectId, Residency,
         TerminalContinuity,
     },
-    repository_widget::RepositoryInspectorContext,
+    repository_widget::{CompletionTarget, RepositoryInspectorContext},
     sidebar::{SidebarProject, SidebarWorktree},
     ui_controls::Icon,
 };
@@ -373,6 +373,8 @@ pub enum InspectorAction {
     },
     FocusProjectSearch,
     CloseCard(CardId),
+    /// Copy the complete original protocol diagnostic on explicit request.
+    CopyLspDiagnostic(LspDiagnostic),
     /// Move the caret of `card`'s open document. Self-contained: a language
     /// server replaces a document's diagnostics without being asked, so a row
     /// that carried a position in a list the application holds could resolve
@@ -390,14 +392,13 @@ pub enum InspectorAction {
         at: LspPosition,
         coordinates: LspCoordinates,
     },
-    /// Apply `card`'s completion candidate. Applying a candidate needs the
-    /// whole item, which the application holds, so this addresses it by
-    /// position; `label` is the fingerprint the application compares against
-    /// the item it finds before touching the buffer.
+    /// Apply the immutable completion captured when this row was presented.
+    /// `index` preserves its position in the original unsorted response;
+    /// `target` fences the document, buffer revision and accepted response.
     ApplyLspCompletion {
         card: CardId,
         index: usize,
-        label: String,
+        target: CompletionTarget,
     },
     RequestLspHover(CardId),
     GoToLspDefinition(CardId),
@@ -426,6 +427,8 @@ pub struct Fact {
     pub markdown: bool,
     /// Pressing the fact's row emits this message.
     pub action: Option<InspectorAction>,
+    /// Shared full payload; serialization happens only on explicit copy.
+    pub copy_diagnostic: Option<LspDiagnostic>,
 }
 
 impl Fact {
@@ -436,6 +439,7 @@ impl Fact {
             value: value.into(),
             markdown: false,
             action: None,
+            copy_diagnostic: None,
         }
     }
 
@@ -503,6 +507,32 @@ pub struct InspectorModel {
     pub actions: Vec<Action>,
 }
 
+/// Known chat payload owners, not process RSS or a complete heap estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatMemory {
+    pub source_bytes: usize,
+    pub presentation_bytes: usize,
+    pub selection_bytes: usize,
+    pub prepared_items: usize,
+}
+
+pub fn with_chat_memory(mut model: InspectorModel, memory: ChatMemory) -> InspectorModel {
+    if let Some(section) = model
+        .sections
+        .iter_mut()
+        .find(|section| section.title == "Chat")
+    {
+        section.facts.extend([
+            Fact::new("Loaded transcript payload", format!("{} bytes", memory.source_bytes)).diagnostic(),
+            Fact::new("Prepared presentation payload", format!("{} bytes", memory.presentation_bytes)).diagnostic(),
+            Fact::new("Logical selection payload", format!("{} bytes", memory.selection_bytes)).diagnostic(),
+            Fact::new("Prepared transcript items", memory.prepared_items.to_string()).diagnostic(),
+            Fact::new("Memory accounting", "Known payload only. Shared bodies, parser/font/renderer allocations and images are not a complete heap or RSS estimate.").diagnostic(),
+        ]);
+    }
+    model
+}
+
 pub fn model_for_card(
     card: &CardState,
     runtime: RuntimeStatus,
@@ -518,6 +548,7 @@ pub fn model_for_card(
         CardKind::Settings => "Settings",
         CardKind::Accounts => "Accounts",
         CardKind::Automations => "Automations",
+        CardKind::Work => "Work",
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
@@ -861,7 +892,7 @@ pub fn model_for_card(
         }
         // Utility panes show application state, which the pane itself lays
         // out; the inspector has nothing to add beyond its status.
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => {}
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {}
     }
 
     sections.push(Section::new(
@@ -905,11 +936,12 @@ pub fn model_for_card(
 /// widget state.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LspInspectorContext {
+    pub live_servers: std::sync::Arc<[String]>,
     pub status: Option<LspStatus>,
     pub diagnostics: Vec<LspDiagnostic>,
     pub hover: Option<String>,
     pub locations: Option<(LocationKind, Vec<LspLocation>)>,
-    pub completions: Vec<LspCompletionItem>,
+    pub completions: Vec<CompletionTarget>,
     pub notice: Option<String>,
 }
 
@@ -933,7 +965,8 @@ pub const LSP_ROW_LIMIT: usize = 24;
 pub struct DiagnosticRow<'a> {
     /// `Error · line 42 · rustc E0308`, already assembled.
     pub label: String,
-    pub message: &'a str,
+    pub message: Cow<'a, str>,
+    pub diagnostic: &'a LspDiagnostic,
     /// Where activating the row should place the caret.
     pub at: LspPosition,
     pub severity: LspSeverity,
@@ -957,7 +990,8 @@ pub fn diagnostic_rows(diagnostics: &[LspDiagnostic], limit: usize) -> Diagnosti
         .take(limit)
         .map(|diagnostic| DiagnosticRow {
             label: diagnostic_label(diagnostic),
-            message: diagnostic.message.as_str(),
+            message: diagnostic.message_preview(),
+            diagnostic,
             at: diagnostic.range.start,
             severity: diagnostic.severity,
         })
@@ -982,6 +1016,15 @@ pub fn with_lsp(
         lsp.status.as_ref(),
         lsp.notice.as_deref(),
     ));
+    if !lsp.live_servers.is_empty() {
+        model.sections.push(Section::new(
+            "Live language servers",
+            lsp.live_servers
+                .iter()
+                .map(|server| Fact::new("Server", server))
+                .collect(),
+        ));
+    }
     model
         .sections
         .extend(diagnostics_section(card, &lsp.diagnostics));
@@ -1056,8 +1099,10 @@ fn diagnostics_section(card: CardId, diagnostics: &[LspDiagnostic]) -> Option<Se
         .rows
         .into_iter()
         .map(|row| {
-            Fact::new(row.label, row.message)
-                .activated(InspectorAction::JumpToLspDiagnostic { card, at: row.at })
+            let mut fact = Fact::new(row.label, row.message.into_owned())
+                .activated(InspectorAction::JumpToLspDiagnostic { card, at: row.at });
+            fact.copy_diagnostic = Some(row.diagnostic.clone());
+            fact
         })
         .collect();
     if presented.withheld > 0 {
@@ -1105,26 +1150,28 @@ fn locations_section(card: CardId, kind: LocationKind, locations: &[LspLocation]
     )
 }
 
-fn completions_section(card: CardId, completions: &[LspCompletionItem]) -> Option<Section> {
+fn completions_section(card: CardId, completions: &[CompletionTarget]) -> Option<Section> {
     if completions.is_empty() {
         return None;
     }
-    let mut ordered: Vec<(usize, &LspCompletionItem)> = completions.iter().enumerate().collect();
+    let mut ordered: Vec<(usize, &CompletionTarget)> = completions.iter().enumerate().collect();
     // The preselected candidate is the one the editor would accept by default,
     // so it leads; the rest keep the server's ranking.
-    ordered.sort_by_key(|(_, item)| !item.preselect);
+    ordered.sort_by_key(|(_, target)| !target.item().preselect);
     let withheld = ordered.len().saturating_sub(LSP_ROW_LIMIT);
     let mut facts: Vec<Fact> = ordered
         .into_iter()
         .take(LSP_ROW_LIMIT)
-        .map(|(index, item)| {
-            Fact::new(completion_label(item), completion_value(item)).activated(
-                InspectorAction::ApplyLspCompletion {
-                    card,
-                    index,
-                    label: item.label.clone(),
-                },
+        .map(|(index, target)| {
+            Fact::new(
+                completion_label(target.item()),
+                completion_value(target.item()),
             )
+            .activated(InspectorAction::ApplyLspCompletion {
+                card,
+                index,
+                target: target.clone(),
+            })
         })
         .collect();
     if withheld > 0 {
@@ -1207,16 +1254,18 @@ fn withheld_label(withheld: usize, singular: &str, plural: &str) -> String {
 }
 
 fn diagnostic_label(diagnostic: &LspDiagnostic) -> String {
-    let origin = match (&diagnostic.source, &diagnostic.code) {
-        (Some(source), Some(code)) => format!(" · {source} {code}"),
-        (Some(text), None) | (None, Some(text)) => format!(" · {text}"),
-        (None, None) => String::new(),
+    let origin = diagnostic.origin_preview();
+    let origin = if origin.is_empty() {
+        String::new()
+    } else {
+        format!(" · {origin}")
     };
-    format!(
+    crate::lsp::diagnostic_preview(&format!(
         "{} · line {}{origin}",
         severity_label(diagnostic.severity),
         diagnostic.range.start.line.saturating_add(1)
-    )
+    ))
+    .into_owned()
 }
 
 fn location_fact(card: CardId, location: &LspLocation) -> Fact {
@@ -1377,7 +1426,7 @@ fn repository_context<'a>(
                     .first()
                     .map(|worktree| (project, worktree))
             }),
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => None,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => None,
     }
 }
 
@@ -1541,10 +1590,20 @@ impl SegmentedActions {
 /// because the editor offers no gutter or overlay to host a language server's
 /// results.
 fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
-    match fact.action {
+    let copy = fact.copy_diagnostic;
+    let body = match fact.action {
         Some(action) => {
+            let completion_key = match &action {
+                InspectorAction::ApplyLspCompletion { target, .. } => Some(target.native_key()),
+                _ => None,
+            };
             let name = format!("{}: {}", fact.label, fact.value);
-            widget::button::custom(
+            let name = if copy.is_some() {
+                crate::lsp::diagnostic_preview(&name).into_owned()
+            } else {
+                name
+            };
+            let button = widget::button::custom(
                 widget::column::with_children(vec![
                     design::caption(fact.label).into(),
                     fact_body(fact.value, fact.markdown, false),
@@ -1555,8 +1614,14 @@ fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
             .name(name)
             .padding([0.0, space::XS])
             .width(Length::Fill)
-            .on_press(action)
-            .into()
+            .on_press(action);
+            if let Some(key) = completion_key {
+                // The release of a press on an old response must not trigger
+                // the new callback occupying the same visual row.
+                crate::ui_controls::owned(key, button)
+            } else {
+                button.into()
+            }
         }
         None => widget::column::with_children(vec![
             design::caption(fact.label).into(),
@@ -1564,6 +1629,18 @@ fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
         ])
         .width(Length::Fill)
         .into(),
+    };
+    if let Some(diagnostic) = copy {
+        widget::column::with_children(vec![
+            body,
+            widget::button::text("Copy full diagnostic")
+                .on_press(InspectorAction::CopyLspDiagnostic(diagnostic))
+                .into(),
+        ])
+        .width(Length::Fill)
+        .into()
+    } else {
+        body
     }
 }
 
@@ -1572,9 +1649,10 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
         markdown_body(&value)
     } else if selectable {
         widget::selectable_text(value)
-            .size(design::TEXT_BODY)
+            .font(design::interface_font())
+            .size(design::interface_size())
             .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-                18.0.into(),
+                (design::interface_size() + 5.0).into(),
             ))
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
@@ -2449,13 +2527,13 @@ mod tests {
     }
 
     fn diagnostic(line: u32, severity: LspSeverity, message: &str) -> LspDiagnostic {
-        LspDiagnostic {
-            range: LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 4)),
+        LspDiagnostic::new(
+            LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 4)),
             severity,
-            message: message.to_owned(),
-            source: None,
-            code: None,
-        }
+            message.to_owned(),
+            None,
+            None,
+        )
     }
 
     fn location(target: LspTarget, coordinates: LspCoordinates) -> LspLocation {
@@ -2484,6 +2562,13 @@ mod tests {
             },
             additional_edits: Vec::new(),
         }
+    }
+
+    fn completion_targets(card: CardId, items: Vec<LspCompletionItem>) -> Vec<CompletionTarget> {
+        let (mut runtime, _) =
+            crate::repository_widget::RepositoryRuntime::lsp_open_fixture(card, "tail\n");
+        runtime.set_editor_completions(items);
+        runtime.editor_completion_targets(card)
     }
 
     fn lsp_model(card: &CardState, lsp: &LspInspectorContext) -> InspectorModel {
@@ -2591,6 +2676,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn diagnostic_inspector_bounds_previews_and_retains_shared_full_copy() {
+        let card = repository_card();
+        let message = "😀".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES) + " FULL MESSAGE END";
+        let item = LspDiagnostic::new(
+            LspRange::default(),
+            LspSeverity::Error,
+            message.clone(),
+            Some("λ".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES)),
+            Some("κ".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES)),
+        );
+        let lsp = LspInspectorContext {
+            diagnostics: vec![item.clone()],
+            ..Default::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let fact = &section(&model, "Diagnostics").facts[0];
+        assert!(fact.value.len() <= crate::lsp::DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(fact.label.len() <= crate::lsp::DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(fact.value.contains("preview truncated"));
+        assert!(!fact.value.contains("FULL MESSAGE END"));
+        let copy = fact
+            .copy_diagnostic
+            .as_ref()
+            .expect("explicit full-copy control");
+        assert!(std::sync::Arc::ptr_eq(&copy.protocol, &item.protocol));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&copy.copy_text()).unwrap()["message"],
+            message
+        );
+        let _view = fact_element(fact.clone());
     }
 
     #[test]
@@ -2944,10 +3062,13 @@ mod tests {
     fn completions_lead_with_the_preselected_candidate_and_mark_the_deprecated_one() {
         let card = repository_card();
         let lsp = LspInspectorContext {
-            completions: vec![
-                completion("legacy", false, true),
-                completion("preferred", true, false),
-            ],
+            completions: completion_targets(
+                card.id,
+                vec![
+                    completion("legacy", false, true),
+                    completion("preferred", true, false),
+                ],
+            ),
             ..LspInspectorContext::default()
         };
         let model = lsp_model(&card, &lsp);
@@ -2959,15 +3080,149 @@ mod tests {
             Some(InspectorAction::ApplyLspCompletion {
                 card: card.id,
                 index: 1,
-                label: "preferred".to_owned()
+                target: lsp.completions[1].clone()
             }),
-            "the message must address the application's own unsorted list, and \
-             fingerprint the item it expects to find there"
+            "the message must preserve the original unsorted index and immutable target"
         );
         assert!(facts[0].label.contains("preselected"), "{:?}", facts[0]);
         assert!(facts[0].label.contains("Function"), "{:?}", facts[0]);
         assert!(facts[0].value.contains("fn preferred()"), "{:?}", facts[0]);
         assert!(facts[1].label.contains("deprecated"), "{:?}", facts[1]);
+    }
+
+    #[test]
+    fn completion_native_press_rejects_replaced_responses_and_accepts_unchanged_targets() {
+        use crate::repository_widget::RepositoryRuntime;
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+
+        fn completion_fact(card: CardId, runtime: &RepositoryRuntime) -> Fact {
+            completions_section(card, &runtime.editor_completion_targets(card))
+                .unwrap()
+                .facts
+                .remove(0)
+        }
+
+        fn mouse_event(
+            element: &mut Element<'static, InspectorAction>,
+            tree: &mut Tree,
+            node: &layout::Node,
+            renderer: &Renderer,
+            event: mouse::Event,
+            messages: &mut Vec<InspectorAction>,
+        ) {
+            element.as_widget_mut().update(
+                tree,
+                &Event::Mouse(event),
+                Layout::new(node),
+                mouse::Cursor::Available(node.bounds().center()),
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(messages),
+                &Rectangle::with_size(Size::new(400.0, 300.0)),
+            );
+        }
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        // A new response invalidates the press even when every visible field,
+        // or the entire item, remains equal. Re-rendering one unchanged
+        // response must preserve its ordinary press/release interaction.
+        for replacement in [None, Some("original"), Some("replacement")] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "tail\n");
+            let mut item = completion("candidate", false, false);
+            item.edit.new_text = "original".into();
+            runtime.set_editor_completions(vec![item.clone()]);
+            let old_target = runtime.editor_completion_targets(card).remove(0);
+            let mut element = fact_element(completion_fact(card, &runtime));
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 300.0));
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            mouse_event(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+
+            if let Some(text) = replacement {
+                item.edit.new_text = text.into();
+                runtime.set_editor_completions(vec![item]);
+            }
+            let current_target = runtime.editor_completion_targets(card).remove(0);
+            element = fact_element(completion_fact(card, &runtime));
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            mouse_event(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                &mut messages,
+            );
+            if replacement.is_some() {
+                assert_ne!(old_target, current_target);
+                assert!(
+                    messages.is_empty(),
+                    "an old press accepted a replacement response"
+                );
+                assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+                // A fresh click on the replacement is still usable.
+                mouse_event(
+                    &mut element,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    &mut messages,
+                );
+                mouse_event(
+                    &mut element,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                    &mut messages,
+                );
+            } else {
+                assert_eq!(old_target, current_target);
+            }
+            let [
+                InspectorAction::ApplyLspCompletion {
+                    card: emitted_card,
+                    index,
+                    target,
+                },
+            ] = messages.as_slice()
+            else {
+                panic!("the current response must emit exactly its captured target: {messages:?}");
+            };
+            assert_eq!(*emitted_card, card);
+            assert_eq!(*index, 0);
+            assert_eq!(target, &current_target);
+            assert!(runtime.apply_completion_target(card, target));
+            assert_eq!(
+                runtime.editor_text().unwrap(),
+                format!("{}tail\n", replacement.unwrap_or("original"))
+            );
+        }
     }
 
     #[test]
@@ -2988,9 +3243,12 @@ mod tests {
                     })
                     .collect(),
             )),
-            completions: (0..LSP_ROW_LIMIT + extra)
-                .map(|index| completion(&format!("candidate{index}"), false, false))
-                .collect(),
+            completions: completion_targets(
+                card.id,
+                (0..LSP_ROW_LIMIT + extra)
+                    .map(|index| completion(&format!("candidate{index}"), false, false))
+                    .collect(),
+            ),
             ..LspInspectorContext::default()
         };
         let model = lsp_model(&card, &lsp);

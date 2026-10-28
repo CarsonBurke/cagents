@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/user_fixture.rs"]
+mod user_fixture;
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -446,7 +449,185 @@ esac
 }
 
 #[test]
+fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let prefix = root.path().join("install");
+    for version in ["old", "new"] {
+        let bin = prefix.join("versions").join(version).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            fs::write(bin.join(name), "complete matched fixture").unwrap();
+        }
+    }
+    let candidate = prefix.join("versions/new/bin/cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &candidate).unwrap();
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("versions/new", prefix.join("current")).unwrap();
+    let marker = prefix.join("versions/new/.deferred-owner.json");
+    fs::write(&marker, r#"{"version":1,"owner_version":"old"}"#).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let name = if cfg!(any(debug_assertions, feature = "development")) {
+        "cagents-development-ui.lock"
+    } else {
+        "cagents-ui.lock"
+    };
+    // After cooperative UI shutdown the coordinator keeps both fences alive.
+    // There is deliberately no daemon or window to authenticate instead.
+    let legacy = file(&runtime.join(name));
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    let update_path = runtime.join(format!("{name}.update"));
+    let update = file(&update_path);
+    let run = |inherited: Option<&File>, marker: Option<&str>| {
+        let mut command = Command::new(&candidate);
+        command
+            .args(["--json", "daemon", "status"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+            .env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+        if let Some(marker) = marker {
+            command.env("CAGENTS_UI_UPDATE_GUARD_FD", marker);
+        }
+        let descriptor = inherited.map(AsRawFd::as_raw_fd);
+        // SAFETY: only descriptor operations run after fork, and the parent
+        // retains each input description until the child exits.
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(descriptor) = descriptor {
+                    if libc::dup2(descriptor, 197) == -1 || libc::fcntl(197, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    libc::close(197);
+                }
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+    let ordinary = run(None, None);
+    assert!(
+        !ordinary.status.success(),
+        "legacy contention must remain a refusal: {ordinary:?}"
+    );
+    for (descriptor, marker) in [
+        (None, "197"),
+        (Some(&update), "197"),
+        (Some(&update), "999"),
+    ] {
+        let output = run(descriptor, Some(marker));
+        assert!(
+            !output.status.success(),
+            "missing, unheld or malformed authority: {output:?}"
+        );
+    }
+    assert_eq!(
+        unsafe { libc::flock(update.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let different = file(&runtime.join("unrelated-update"));
+    let independent = File::open(&update_path).unwrap();
+    for descriptor in [&different, &independent] {
+        let output = run(Some(descriptor), Some("197"));
+        assert!(
+            !output.status.success(),
+            "a different description must not borrow authority: {output:?}"
+        );
+    }
+    let valid = run(Some(&update), Some("197"));
+    assert!(valid.status.success(), "{valid:?}");
+    let result: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(result["data"]["running"], false);
+    assert_eq!(
+        unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        -1,
+        "validation must not release the coordinator's exclusive fence"
+    );
+    assert_eq!(unsafe { libc::flock(update.as_raw_fd(), libc::LOCK_UN) }, 0);
+    // An older coordinator releases its launch fence before native reopen, but
+    // keeps the shared legacy fence until the new window handshakes. Pin an
+    // actual candidate executable with the daemon's kernel lease, not a stale
+    // path/marker claim. No provider or production daemon is contacted.
+    let daemon_dir = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate_daemon = prefix.join("versions/new/bin/cagentsd");
+    fs::copy("/bin/sleep", &candidate_daemon).unwrap();
+    let daemon_lock_path = daemon_dir.join("cagentsd.lock");
+    let daemon_lock = file(&daemon_lock_path);
+    assert_eq!(
+        unsafe { libc::flock(daemon_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let mut command = Command::new(&candidate_daemon);
+    command.arg("30");
+    let descriptor = daemon_lock.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let daemon = OwnedProcess(command.spawn().unwrap());
+    fs::write(&daemon_lock_path, format!(r#"{{"pid":{}}}"#, daemon.0.id())).unwrap();
+    let native = prefix.join("versions/new/bin/cagents-ui");
+    fs::copy(std::env::current_exe().unwrap(), &native).unwrap();
+    let reopened = Command::new(&native)
+        .args(["--exact", "staged_native_ui_owner_fixture", "--nocapture"])
+        .env("CAGENTS_TEST_STAGED_NATIVE_OWNER", "candidate")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .output()
+        .unwrap();
+    assert!(reopened.status.success(), "{reopened:?}");
+    let candidate_status = run(None, None);
+    assert!(candidate_status.status.success(), "{candidate_status:?}");
+    let result: serde_json::Value = serde_json::from_slice(&candidate_status.stdout).unwrap();
+    assert_eq!(result["data"]["running"], true);
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let legacy_owner = run(None, None);
+    assert!(
+        !legacy_owner.status.success(),
+        "an exclusive legacy UI cannot be bypassed by a candidate daemon: {legacy_owner:?}"
+    );
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    drop(daemon);
+    drop(daemon_lock);
+    let stopped_candidate = run(None, None);
+    assert!(
+        !stopped_candidate.status.success(),
+        "a stopped candidate cannot relax unknown shared legacy ownership: {stopped_candidate:?}"
+    );
+}
+
+#[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
+    if !user_fixture::enter() {
+        return;
+    }
     let _fixture = OS_FIXTURE.lock().unwrap();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let prefix = root.path().join("install");
@@ -623,10 +804,11 @@ printf '%s\n' "$*"
         &runtime,
         &root.path().join("surviving-ui-ready"),
     );
-    for args in [
-        vec!["--json", "daemon", "status"],
-        vec!["daemon", "preflight"],
-        vec!["daemon", "stop"],
+    for (args, expected) in [
+        (vec!["--json", "daemon", "status"], "--json daemon status"),
+        (vec!["daemon", "preflight"], "daemon preflight"),
+        // Stop carries its implicit no-start policy to the matched owner.
+        (vec!["daemon", "stop"], "--no-start daemon stop"),
     ] {
         let output = Command::new(new.join("cagents"))
             .args(&args)
@@ -635,10 +817,7 @@ printf '%s\n' "$*"
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            args.join(" ")
-        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
     assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
     let handoff = OpenOptions::new()
@@ -680,7 +859,7 @@ printf '%s\n' "$*"
     );
     assert_eq!(
         fs::read_to_string(&actions).unwrap(),
-        "--json daemon status\ndaemon preflight\ndaemon stop\ndaemon start\n"
+        "--json daemon status\ndaemon preflight\n--no-start daemon stop\ndaemon start\n"
     );
     drop(window);
     // A stopped owner does not authorize stale routing: the candidate reports

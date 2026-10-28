@@ -11,16 +11,14 @@ use crate::{
     model::{MessageId, TerminalId},
 };
 use rusqlite::{
-    Connection, Row, Transaction, TransactionBehavior, params,
+    Connection, Row, TransactionBehavior, params,
     types::{ToSql, ToSqlOutput},
 };
 
 /// How many messages `cagents inbox --all` lists.
 const RECENT: usize = 50;
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -50,20 +48,17 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
                  ON messages(recipient_lineage, state, created_ms);
              CREATE INDEX IF NOT EXISTS messages_pending
                  ON messages(created_ms) WHERE state = 'pending';
-             CREATE INDEX IF NOT EXISTS messages_by_reply ON messages(reply_to);
-             PRAGMA user_version = 5;",
+             CREATE INDEX IF NOT EXISTS messages_by_reply ON messages(reply_to);",
         )
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Eligible arrival heads are notification evidence, not read receipts.
 /// Normal posts advance atomically; held replies are admitted only while
 /// still pending after release. Partial reads never manufacture an arrival.
-pub(super) fn migrate_attention(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
+pub(super) fn migrate_attention(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS mailbox_attention_heads(
         lineage TEXT PRIMARY KEY, message TEXT NOT NULL
@@ -78,11 +73,10 @@ pub(super) fn migrate_attention(db: &Connection) -> Result<(), String> {
                        OR (m.state != 'pending' AND m.settled_ms >= asked.wait_until_ms)))
                    OR (asked.id IS NULL AND m.state='pending'))
             GROUP BY m.recipient_lineage
-        );
-    PRAGMA user_version=12;",
+        );",
     )
     .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// A lineage column; NULL stands for the user.
@@ -671,9 +665,20 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -688,7 +693,13 @@ mod tests {
             .db
             .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -890,9 +901,20 @@ mod tests {
         registry.post_message(&last).unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             last.id

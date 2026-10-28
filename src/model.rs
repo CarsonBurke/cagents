@@ -218,6 +218,8 @@ pub enum CardKind {
     Accounts,
     /// Daemon-owned schedules and their durable execution history.
     Automations,
+    /// The daemon's Work board of every worktree and branch in progress.
+    Work,
 }
 
 impl CardKind {
@@ -225,7 +227,10 @@ impl CardKind {
     /// show application state rather than a session, file or page, so a
     /// window holds at most one of each and they never hibernate.
     pub fn is_utility(&self) -> bool {
-        matches!(self, Self::Settings | Self::Accounts | Self::Automations)
+        matches!(
+            self,
+            Self::Settings | Self::Accounts | Self::Automations | Self::Work
+        )
     }
 }
 
@@ -1108,8 +1113,8 @@ pub struct ProjectChannel {
     pub focused: Option<CardId>,
 }
 
-/// Legacy nonempty names remain authoritative; inferred names may improve
-/// only until a provider supplies a title or a person explicitly renames it.
+/// Legacy nonempty names and explicit renames remain authoritative. Automatic
+/// names may refresh only with the current conversation's shared-view proof.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChannelTitleSource {
     Prompt,
@@ -1121,6 +1126,12 @@ pub enum ChannelTitleSource {
 impl ChannelTitleSource {
     pub fn accepts(self, title: &str, suggested: Self) -> bool {
         suggested != Self::Manual && (title.is_empty() || suggested > self)
+    }
+
+    /// Refreshes from the same conversation only after its shared ownership has
+    /// been checked. Legacy unproven suggestions retain the stricter upgrade rule.
+    pub fn accepts_refresh(self, title: &str, suggested: Self) -> bool {
+        suggested != Self::Manual && (title.is_empty() || suggested >= self)
     }
 }
 
@@ -1215,6 +1226,8 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    #[serde(default)]
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1235,6 +1248,10 @@ pub struct WorkspaceState {
     pub workspace_model_identity: Option<uuid::Uuid>,
     #[serde(default)]
     pub local_only_cards: HashSet<CardId>,
+    /// Saved shared sources kept inert until their exact descriptor is admitted.
+    /// This is local presentation state, never provider or retirement authority.
+    #[serde(default)]
+    pub pending_chat_admissions: HashMap<CardId, crate::chat::Session>,
     /// Explicit terminal creations awaiting the daemon's accepted view. Their
     /// exact recipe, scope and insertion order are stored with the pane.
     #[serde(default)]
@@ -1257,11 +1274,13 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
     }

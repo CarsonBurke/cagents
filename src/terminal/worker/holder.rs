@@ -23,20 +23,24 @@
 //! ignored by a holder that predates it, and descriptors travel as
 //! `SCM_RIGHTS` on a message's first byte.
 
+mod watch;
+use watch::Watch;
+
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, Read},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
-            fs::MetadataExt,
+            fs::{MetadataExt, OpenOptionsExt},
             net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    thread::{self, JoinHandle},
+    sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -55,7 +59,7 @@ use crate::terminal::{
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
 /// Protocol 1 holders could not be detached.
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 5;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
@@ -66,9 +70,6 @@ const MAX_DESCRIPTORS: usize = 4;
 /// How long a released holder has to exit before it is killed. It exits as
 /// soon as it reads the release, so this only bounds a wedged one.
 const RELEASE_GRACE: Duration = Duration::from_millis(500);
-/// How long a released holder's watch waits to see its release, which a
-/// concurrent fork can hold up.
-const RELEASE_SETTLE: Duration = Duration::from_millis(100);
 
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
@@ -129,10 +130,12 @@ enum Request {
 enum Report {
     ScreenCached,
     AdoptionCommitted,
-    /// Carries the PTY master, then a pidfd for the root.
+    /// Protocol 5 carries PTY master, root pidfd, and original launch directory.
     Started {
         protocol: u32,
         pid: libc::pid_t,
+        #[serde(default)]
+        launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
     },
     Failed(String),
     /// The root's raw wait status, reported once, after the holder reaps it.
@@ -159,6 +162,8 @@ enum Report {
         output: String,
         #[serde(default)]
         screen_lost: bool,
+        #[serde(default)]
+        launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
     },
 }
 
@@ -167,6 +172,88 @@ pub(super) struct Held {
     pub(super) master: PtyMaster,
     pub(super) child: HeldChild,
     pub(super) holder: Holder,
+    pub(super) launch_directory: Option<LaunchDirectoryPin>,
+}
+
+pub(super) type LaunchDirectoryPin = (crate::agent_execution::DirectoryIdentity, Arc<File>);
+
+/// Validate the physical launch directory, never resolving a caller pathname.
+pub(super) fn checked_launch_directory(
+    identity: crate::agent_execution::DirectoryIdentity,
+    file: Arc<File>,
+) -> Result<LaunchDirectoryPin, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect launch directory: {error}"))?;
+    if !metadata.is_dir()
+        || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != identity
+    {
+        return Err(
+            "terminal launch directory descriptor does not match its original identity".into(),
+        );
+    }
+    // SAFETY: F_GETFD inspects this live, owned descriptor without mutation.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err("terminal launch directory descriptor is not close-on-exec".into());
+    }
+    Ok((identity, file))
+}
+
+fn pin_launch_directory(command: &CommandBuilder) -> Result<LaunchDirectoryPin, String> {
+    let directory = match command.get_cwd() {
+        Some(directory) => PathBuf::from(directory),
+        None => match command.get_env("HOME").and_then(|home| home.to_str()) {
+            Some(home) => PathBuf::from(home),
+            None => {
+                // Match portable-pty's default-home selection in this execed
+                // holder. Production recipes always set an explicit cwd.
+                let user = unsafe { libc::getpwuid(libc::getuid()) };
+                if user.is_null() {
+                    PathBuf::from("/")
+                } else {
+                    PathBuf::from(
+                        unsafe { std::ffi::CStr::from_ptr((*user).pw_dir) }
+                            .to_str()
+                            .map_err(|_| "terminal home is not UTF-8")?,
+                    )
+                }
+            }
+        },
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&directory)
+        .map_err(|error| {
+            format!(
+                "pin terminal launch directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+        &file.metadata().map_err(|error| error.to_string())?,
+    );
+    checked_launch_directory(identity, Arc::new(file))
+}
+
+/// Called only inside the dedicated execed holder, before it starts threads
+/// or the PTY root. Relative executable and PATH lookups then use '.' rather
+/// than /proc/self/fd/N, whose fd portable-pty closes before exec.
+fn enter_launch_directory(
+    command: &mut CommandBuilder,
+    pin: &LaunchDirectoryPin,
+) -> Result<(), String> {
+    checked_launch_directory(pin.0, Arc::clone(&pin.1))?;
+    // SAFETY: the directory File is pinned and this holder has its own cwd.
+    if unsafe { libc::fchdir(pin.1.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "enter pinned terminal launch directory: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    command.cwd(".");
+    Ok(())
 }
 
 /// Starts a holder that spawns `command` on a new PTY of `size`. The root's
@@ -185,6 +272,18 @@ pub(super) fn spawn_recoverable(
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
+) -> Result<Held, String> {
+    let reservation = crate::daemon::child_reaper::reserve()
+        .map_err(|error| format!("reserve terminal holder child custody: {error}"))?;
+    spawn_reserved(command, size, exits, recovery, reservation)
+}
+
+fn spawn_reserved(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
@@ -218,56 +317,54 @@ pub(super) fn spawn_recoverable(
     crate::host::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
-    let process = process
-        .spawn()
+    let process = spawn_original(&mut process, reservation)
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
-    let pidfd = open_pidfd(process.id() as libc::pid_t);
+    let pidfd = open_pidfd(process.child.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(process));
+    // Preserve the captured descriptor in the cleanup owner before any other
+    // fallible setup step can return through Holder::drop.
+    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
-    let owner = registry::Process::read(holder.process.as_ref().unwrap().id() as i32)
+    let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
         .map_err(|error| error.to_string())?;
     holder.registered = recovery.is_some();
-    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
-    let started = holder
-        .control
-        .set_read_timeout(Some(START_TIMEOUT))
-        .and_then(|()| holder.control.set_write_timeout(Some(START_TIMEOUT)))
-        .and_then(|()| {
-            send(
-                &holder.control,
-                &Request::Spawn {
-                    command,
-                    size,
-                    recovery,
-                },
-                &[],
-            )
-        })
-        .and_then(|()| receive::<Report>(&holder.control))
-        .and_then(|report| {
-            holder.control.set_read_timeout(None)?;
-            holder.control.set_write_timeout(None)?;
-            Ok(report)
-        });
-    let (report, descriptors) = match started {
-        Ok(Some(report)) => report,
-        Ok(None) => return Err("terminal holder exited before starting the terminal".into()),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            return Err(format!(
-                "terminal holder did not start the terminal within {}s",
-                START_TIMEOUT.as_secs()
-            ));
-        }
-        Err(error) => return Err(format!("start terminal holder: {error}")),
-    };
-    let pid = match report {
-        Report::Started { protocol, pid } if protocol == PROTOCOL => pid,
+    let deadline = Instant::now() + START_TIMEOUT;
+    let started = crate::descriptor_frame::send_json_with_fds_until(
+        &holder.control,
+        &Request::Spawn {
+            command,
+            size,
+            recovery,
+        },
+        &[],
+        deadline,
+        MAX_FRAME as usize,
+        3,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .and_then(|()| {
+        crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+            &holder.control,
+            deadline,
+            MAX_FRAME as usize,
+            3,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )
+    })
+    .map_err(|error| format!("start terminal holder: {error}"))?;
+    let (report, descriptors) = started;
+    let (pid, launch_directory) = match report {
+        Report::Started {
+            protocol,
+            pid,
+            launch_directory,
+        } if protocol == PROTOCOL => (pid, launch_directory),
         Report::Started { protocol, .. } => {
             return Err(format!(
                 "terminal holder speaks protocol {protocol}, expected {PROTOCOL}"
@@ -286,7 +383,7 @@ pub(super) fn spawn_recoverable(
         }
         holder.record = Some(record);
     }
-    watched(holder, pid, descriptors, None, exits)
+    watched(holder, pid, descriptors, None, exits, launch_directory)
 }
 
 /// A terminal taken over from a detached holder.
@@ -313,7 +410,42 @@ pub(super) fn adopt_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
-    let evidence = registry::evidence(socket)?;
+    let evidence = crate::daemon::holder_registry::recovery_candidate(
+        socket,
+        crate::daemon::holder_registry::Kind::Terminal,
+    )?;
+    let mut original_role = None;
+    if let Some(record) = &evidence
+        && record.application != crate::instance::APPLICATION_ID
+    {
+        let next = recovery
+            .as_ref()
+            .ok_or("Cross-role adoption requires issued recovery lineage")?;
+        let proof = next
+            .source
+            .continuity
+            .live_proof()
+            .ok_or("Cross-role adoption has no successor proof")?;
+        let (original, _) = inspect(socket, record, &proof)?;
+        if next.execution_recipe != original.execution_recipe
+            || next.execution_environment != original.execution_environment
+            || next.source.launch != original.source.launch
+            || (next.source != original.source && !next.previous_sources.contains(&original.source))
+        {
+            return Err(
+                "Cross-role adoption does not retain the holder's exact issued source".into(),
+            );
+        }
+        original_role = crate::daemon::holder_registry::OriginalRole::authenticated(
+            record,
+            &original
+                .source
+                .continuity
+                .live_proof()
+                .ok_or("Original holder source has no proof")?,
+            &proof,
+        )?;
+    }
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
     let control = crate::daemon::holder_registry::connect(socket).map_err(failed)?;
@@ -335,26 +467,28 @@ pub(super) fn adopt_recoverable(
     // A refused or malformed handshake grants no authority to release it.
     holder.detached = true;
     holder.pidfd = Some(pidfd);
-    let attached = holder
-        .control
-        .set_read_timeout(Some(HANDOVER_TIMEOUT))
-        .and_then(|()| {
-            send(
-                &holder.control,
-                &Request::Attach {
-                    protocol: PROTOCOL,
-                    recovery,
-                },
-                &[],
-            )
-        })
-        .and_then(|()| receive::<Report>(&holder.control))
-        .and_then(|report| {
-            holder.control.set_read_timeout(None)?;
-            Ok(report)
-        })
-        .map_err(failed)?
-        .ok_or_else(|| format!("terminal holder at {} closed", socket.display()))?;
+    let deadline = Instant::now() + HANDOVER_TIMEOUT;
+    crate::descriptor_frame::send_json_with_fds_until(
+        &holder.control,
+        &Request::Attach {
+            protocol: PROTOCOL,
+            recovery,
+        },
+        &[],
+        deadline,
+        MAX_FRAME as usize,
+        3,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .map_err(|error| failed(io::Error::other(error)))?;
+    let attached = crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+        &holder.control,
+        deadline,
+        MAX_FRAME as usize,
+        3,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .map_err(|error| failed(io::Error::other(error)))?;
     let (report, descriptors) = attached;
     let Report::Attached {
         protocol,
@@ -363,6 +497,7 @@ pub(super) fn adopt_recoverable(
         screen,
         output,
         screen_lost,
+        launch_directory,
     } = report
     else {
         return Err(format!(
@@ -388,13 +523,18 @@ pub(super) fn adopt_recoverable(
     };
     let (screen, output) = (decode(screen)?, decode(output)?);
     holder.protocol = protocol;
-    holder.detached = false;
     holder.adoption_pending = evidence.is_some();
     holder.registered = evidence.is_some();
     holder.record = evidence;
+    holder.original_role = original_role;
     holder.screen_lost = screen_lost;
+    // No release/kill authority is acquired until descriptor provenance and
+    // every fallible watch resource have been installed. Anonymous holders do
+    // not have adoption_pending to protect a refused handoff in Drop.
+    let mut held = watched(holder, pid, descriptors, exited, exits, launch_directory)?;
+    held.holder.detached = false;
     Ok(Adopted {
-        held: watched(holder, pid, descriptors, exited, exits)?,
+        held,
         screen,
         output,
         screen_lost,
@@ -408,40 +548,67 @@ fn watched(
     descriptors: Vec<OwnedFd>,
     exited: Option<libc::c_int>,
     exits: Sender<ChildExit>,
+    launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
 ) -> Result<Held, String> {
-    let [master, pidfd]: [OwnedFd; 2] = descriptors
-        .try_into()
-        .map_err(|_| "terminal holder sent the wrong descriptors")?;
+    let (master, pidfd, launch_directory) =
+        decode_held_descriptors(holder.protocol, launch_directory, descriptors)?;
     let root = File::from(pidfd);
     if let Some(wait_status) = exited {
         let _ = exits.try_send(Ok(exit_status(wait_status)));
     }
     let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
     holder.acknowledged = Some(acknowledged);
-    let watching = (|| {
-        let reader = holder.control.try_clone()?;
-        let root = root.try_clone()?;
-        let (released, release) = std::io::pipe()?;
-        holder.release = Some(release);
-        thread::Builder::new()
-            .name(format!("terminal-holder-{pid}"))
-            .spawn(move || {
-                watch(
-                    &reader,
-                    &root,
-                    &released,
-                    &exits,
-                    &acknowledge,
-                    exited.is_some(),
-                );
-            })
-    })();
-    holder.watch = Some(watching.map_err(|error| format!("watch terminal holder: {error}"))?);
+    let reader = holder
+        .control
+        .try_clone()
+        .map_err(|error| format!("watch terminal holder: {error}"))?;
+    let watched_root = root
+        .try_clone()
+        .map_err(|error| format!("watch terminal root: {error}"))?;
+    let (released, release) =
+        std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
+    let watch = Watch::start(
+        reader,
+        watched_root,
+        released,
+        exits,
+        acknowledge,
+        exited.is_some(),
+    )?;
+    holder.release = Some(release);
+    holder.watch = Some(watch);
     Ok(Held {
         master: PtyMaster(master),
         child: HeldChild { pid, pidfd: root },
         holder,
+        launch_directory,
     })
+}
+
+fn decode_held_descriptors(
+    protocol: u32,
+    identity: Option<crate::agent_execution::DirectoryIdentity>,
+    descriptors: Vec<OwnedFd>,
+) -> Result<(OwnedFd, OwnedFd, Option<LaunchDirectoryPin>), String> {
+    if !ADOPTABLE.contains(&protocol) {
+        return Err("unsupported terminal launch-directory protocol".into());
+    }
+    if protocol >= 5 {
+        let [master, pidfd, directory]: [OwnedFd; 3] = descriptors
+            .try_into()
+            .map_err(|_| "terminal holder sent the wrong launch-directory descriptors")?;
+        let identity = identity.ok_or("terminal holder did not attest its launch directory")?;
+        let pin = checked_launch_directory(identity, Arc::new(File::from(directory)))?;
+        Ok((master, pidfd, Some(pin)))
+    } else {
+        if identity.is_some() {
+            return Err("legacy holder cannot attest a launch directory".into());
+        }
+        let [master, pidfd]: [OwnedFd; 2] = descriptors
+            .try_into()
+            .map_err(|_| "legacy terminal holder sent the wrong descriptors")?;
+        Ok((master, pidfd, None))
+    }
 }
 
 fn exit_status(wait_status: libc::c_int) -> ExitStatus {
@@ -449,75 +616,70 @@ fn exit_status(wait_status: libc::c_int) -> ExitStatus {
     ExitStatus::from(std::process::ExitStatus::from_raw(wait_status))
 }
 
-/// Delivers the root's exit and the holder's answers to a detach, then waits
-/// for the holder to go away.
-///
-/// A holder that vanishes first - killed, or crashed - leaves its root
-/// running on a terminal this daemon still reads. That root has not exited,
-/// so its exit is reported only once its pidfd says so, with the status the
-/// holder took with it unknown. `released` hanging up ends the wait.
-fn watch(
-    control: &UnixStream,
-    root: &File,
-    released: &std::io::PipeReader,
-    exits: &Sender<ChildExit>,
-    acknowledge: &Sender<Result<(), String>>,
-    mut reported: bool,
-) {
-    loop {
-        match receive::<Report>(control) {
-            Ok(Some((Report::Exited { wait_status }, _))) if !reported => {
-                reported = true;
-                let _ = exits.try_send(Ok(exit_status(wait_status)));
-            }
-            // The holder keeps the terminal for a successor; nothing it does
-            // from here concerns this daemon.
-            Ok(Some((Report::Detached, _))) => {
-                let _ = acknowledge.try_send(Ok(()));
-                return;
-            }
-            Ok(Some((Report::ScreenCached | Report::AdoptionCommitted, _))) => {
-                let _ = acknowledge.try_send(Ok(()));
-            }
-            Ok(Some((Report::Failed(message), _))) => {
-                let _ = acknowledge.try_send(Err(message));
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break,
+/// Spawn-time credit and original wait authority must never be separated by a
+/// fallible ownership transfer. Adopted holders do not have this authority.
+struct OriginalChild {
+    child: Child,
+    reservation: crate::daemon::child_reaper::Reservation,
+}
+
+fn spawn_original(
+    command: &mut Command,
+    reservation: crate::daemon::child_reaper::Reservation,
+) -> io::Result<OriginalChild> {
+    Ok(OriginalChild {
+        child: command.spawn()?,
+        reservation,
+    })
+}
+
+impl OriginalChild {
+    fn retain(self, pidfd: Option<File>, reason: &str) {
+        let Self { child, reservation } = self;
+        reservation.quarantine();
+        let Some(pidfd) = pidfd else {
+            reservation.preserve_suspended(child, None, reason);
+            return;
+        };
+        if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+            // retain returns every original operand intact on validation,
+            // wakeup or service failure. No second reaper or PID lookup.
+            reservation.preserve_suspended(child, Some(pidfd), &format!("{reason}: {error}"));
         }
     }
-    // A root already reported leaves nothing to wait for, and a holder this
-    // daemon released ends its connection too.
-    if reported || hung_up(released) {
-        return;
-    }
-    tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
-    let mut targets = [
-        libc::pollfd {
-            fd: root.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: released.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
+}
+
+/// Local acknowledgement identity. The wire reports stay distinct all the way
+/// to the operation waiting for them; an earlier operation may have timed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acknowledgement {
+    ScreenCached,
+    AdoptionCommitted,
+    Detached,
+}
+
+fn await_acknowledgement(
+    answers: &Receiver<Result<Acknowledgement, String>>,
+    expected: Acknowledgement,
+    deadline: Instant,
+) -> Result<(), String> {
     loop {
-        // SAFETY: both pollfds live for the duration of the call.
-        match unsafe { libc::poll(targets.as_mut_ptr(), 2, -1) } {
-            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            -1 => return,
-            _ if targets[1].revents != 0 => return,
-            _ if targets[0].revents != 0 => {
-                let _ = exits.try_send(Err(
-                    "the terminal's holder ended before it, so its exit status is unknown".into(),
-                ));
-                return;
-            }
-            _ => return,
+        if Instant::now() >= deadline {
+            return Err("terminal holder acknowledgement deadline elapsed".into());
         }
+        let observed = answers
+            .recv_deadline(deadline)
+            .map_err(|error| error.to_string())??;
+        if observed == expected {
+            return Ok(());
+        }
+        // A late success for a different request cannot transfer custody.
+        // Keep the original deadline rather than granting another full wait.
+        tracing::warn!(
+            ?expected,
+            ?observed,
+            "ignored a different terminal holder acknowledgement"
+        );
     }
 }
 
@@ -527,28 +689,54 @@ pub(super) struct Holder {
     control: UnixStream,
     /// A holder this daemon started is its child, which it reaps. An adopted
     /// holder's parent is whoever inherited it from the daemon that started it.
-    process: Option<Child>,
+    process: Option<OriginalChild>,
     pidfd: Option<File>,
     protocol: u32,
-    watch: Option<JoinHandle<()>>,
+    watch: Option<Watch>,
     /// Dropping this ends a watch still waiting on a root its holder left.
     release: Option<std::io::PipeWriter>,
-    /// The holder's answer to a detach, relayed by the watch.
-    acknowledged: Option<Receiver<Result<(), String>>>,
+    /// The holder's typed answers, relayed by the original control watch.
+    acknowledged: Option<Receiver<Result<Acknowledgement, String>>>,
     detached: bool,
     adoption_pending: bool,
     registered: bool,
     screen_lost: bool,
     cleanup_proved: bool,
     record: Option<Record>,
+    original_role: Option<crate::daemon::holder_registry::OriginalRole>,
 }
 
 impl Holder {
+    pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
+        self.original_role.as_ref()
+    }
     pub(super) fn record(&self) -> Option<&Record> {
         self.record.as_ref()
     }
     pub(super) fn prove_cleanup(&mut self) {
         self.cleanup_proved = true;
+    }
+
+    /// Only a checked close of the exact original family authorizes discarding
+    /// an unconfirmed startup replay. It supersedes provisional adoption; an
+    /// ordinary Drop, failed inspection or timeout never calls this method.
+    pub(super) fn prove_startup_cleanup(&mut self) {
+        self.cleanup_proved = true;
+        self.adoption_pending = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_after_actual_commit_for_test(&mut self) -> Result<(), String> {
+        self.commit_adoption()?; // real original holder acknowledged and cleared replay
+        // Inject the caller's uncertain outcome at precisely that irreversible
+        // boundary, retaining the conservative phase of a lost acknowledgement.
+        self.adoption_pending = true;
+        Err("injected local failure AFTER actual holder commit acknowledgement".into())
+    }
+
+    #[cfg(test)]
+    pub(super) fn startup_cleanup_state_for_test(&self) -> (bool, bool) {
+        (self.adoption_pending, self.cleanup_proved)
     }
     pub(super) fn registered(&self) -> bool {
         self.registered
@@ -577,11 +765,13 @@ impl Holder {
             })
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| error.to_string())?;
-        self.acknowledged
-            .as_ref()
-            .ok_or("holder acknowledgement unavailable")?
-            .recv_timeout(HANDOVER_TIMEOUT)
-            .map_err(|error| error.to_string())?
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::ScreenCached,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )
     }
     pub(super) fn commit_adoption(&mut self) -> Result<(), String> {
         if !self.adoption_pending {
@@ -592,15 +782,17 @@ impl Holder {
             .and_then(|()| send(&self.control, &Request::CommitAdoption, &[]))
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| error.to_string())?;
-        self.acknowledged
-            .as_ref()
-            .ok_or("holder acknowledgement unavailable")?
-            .recv_timeout(HANDOVER_TIMEOUT)
-            .map_err(|error| error.to_string())??;
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::AdoptionCommitted,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )?;
         self.adoption_pending = false;
         Ok(())
     }
-    fn new(control: UnixStream, process: Option<Child>) -> Self {
+    fn new(control: UnixStream, process: Option<OriginalChild>) -> Self {
         Self {
             control,
             process,
@@ -615,6 +807,7 @@ impl Holder {
             screen_lost: false,
             cleanup_proved: false,
             record: None,
+            original_role: None,
         }
     }
 
@@ -654,38 +847,15 @@ impl Holder {
             .and_then(|()| send(&self.control, &request, &[]))
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| format!("detach terminal holder: {error}"))?;
-        let answer = self
-            .acknowledged
-            .as_ref()
-            .map(|answer| answer.recv_timeout(HANDOVER_TIMEOUT));
-        match answer {
-            Some(Ok(Ok(()))) => {
-                self.detached = true;
-                Ok(())
-            }
-            Some(Ok(Err(message))) => Err(message),
-            _ => Err("terminal holder did not acknowledge detaching".to_owned()),
-        }
-    }
-}
-
-/// Whether the write end of `pipe` closes within [`RELEASE_SETTLE`].
-///
-/// A release closes it before the holder can exit, but a fork elsewhere in
-/// the daemon can briefly hold a copy until that child execs.
-fn hung_up(pipe: &std::io::PipeReader) -> bool {
-    let mut target = libc::pollfd {
-        fd: pipe.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = RELEASE_SETTLE.as_millis() as libc::c_int;
-    loop {
-        // SAFETY: one live pollfd for the duration of the call.
-        match unsafe { libc::poll(&mut target, 1, timeout) } {
-            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            ready => return ready == 1,
-        }
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::Detached,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )?;
+        self.detached = true;
+        Ok(())
     }
 }
 
@@ -714,18 +884,17 @@ impl Drop for Holder {
                 // A proved release may still be fsyncing its receipt. Keep
                 // that exact owner alive; killing it would erase the only
                 // authority for a retry after the daemon exits.
-                if let Some(mut process) = self.process.take() {
-                    let _ = thread::Builder::new()
-                        .name("terminal-release".into())
-                        .spawn(move || {
-                            let _ = process.wait();
-                        });
+                if let Some(process) = self.process.take() {
+                    process.retain(
+                        self.pidfd.take(),
+                        "Terminal receipt release remains pending",
+                    );
                 }
             } else if !exited {
                 tracing::warn!("killing a terminal holder that did not exit when released");
                 match (&mut self.process, &self.pidfd) {
                     (Some(process), _) => {
-                        let _ = process.kill();
+                        let _ = process.child.kill();
                     }
                     (None, Some(pidfd)) => {
                         let _ = signal(pidfd, libc::SIGKILL);
@@ -734,14 +903,25 @@ impl Drop for Holder {
                 }
             }
             if let Some(mut process) = self.process.take() {
-                let _ = process.wait();
+                if let Err(error) = process.child.wait() {
+                    process.retain(
+                        self.pidfd.take(),
+                        &format!("Terminal child wait failed: {error}"),
+                    );
+                }
+                // Successful exact wait drops its reservation normally.
             }
+        } else if let Some(process) = self.process.take() {
+            process.retain(
+                self.pidfd.take(),
+                "Detached terminal child custody transfer",
+            );
         }
-        // A released holder is gone, and a detached one outlives this daemon,
-        // which reaps it only by exiting; either way its watch is ending.
+        // Ending a watch does not end original child custody. A detached
+        // original is now owned by the bounded exact-child reaper.
         drop(self.release.take());
         if let Some(watch) = self.watch.take() {
-            let _ = watch.join();
+            watch.stop();
         }
     }
 }
@@ -808,6 +988,11 @@ pub(super) struct HeldChild {
 impl HeldChild {
     pub(super) fn pid(&self) -> libc::pid_t {
         self.pid
+    }
+
+    /// Clone this exact root pidfd; File::try_clone uses close-on-exec custody.
+    pub(super) fn duplicate_pidfd(&self) -> io::Result<File> {
+        self.pidfd.try_clone()
     }
 
     /// Whether the root has not been reaped yet. Anything read about its pid
@@ -965,6 +1150,9 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let record = Record {
             version: PROTOCOL,
+            build: Some(crate::daemon::holder_registry::BuildIdentity::current(
+                crate::daemon::holder_registry::Kind::Terminal,
+            )),
             kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
@@ -1067,7 +1255,7 @@ fn serve(control: UnixStream) -> i32 {
             return fail(format!("authorize terminal holder: {error}"));
         }
     }
-    let command = match STANDARD
+    let mut command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
         .and_then(|command| {
@@ -1081,6 +1269,10 @@ fn serve(control: UnixStream) -> i32 {
         .first()
         .map(|program| program.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let launch_directory = match pin_launch_directory(&command) {
+        Ok(pin) => pin,
+        Err(error) => return fail(error),
+    };
     // Isolate this execed keeper before the PTY root and all of its tools
     // inherit its cgroup. A failed request retains the existing launch path.
     let _ = crate::daemon::process_scope::enroll_holder();
@@ -1088,6 +1280,9 @@ fn serve(control: UnixStream) -> i32 {
         Ok(pair) => pair,
         Err(error) => return fail(format!("open PTY: {error:#}")),
     };
+    if let Err(error) = enter_launch_directory(&mut command, &launch_directory) {
+        return fail(error);
+    }
     let child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
@@ -1133,8 +1328,20 @@ fn serve(control: UnixStream) -> i32 {
     let started = Report::Started {
         protocol: PROTOCOL,
         pid,
+        launch_directory: Some(launch_directory.0),
     };
-    let mut lost = send(&control, &started, &[master, pidfd.as_raw_fd()]).is_err();
+    // SAFETY: pair.master owns this exact live descriptor through the send.
+    let master_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
+    let mut lost = crate::descriptor_frame::send_json_with_fds_until(
+        &control,
+        &started,
+        &[master_fd, pidfd.as_fd(), launch_directory.1.as_fd()],
+        Instant::now() + START_TIMEOUT,
+        MAX_FRAME as usize,
+        3,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .is_err();
 
     let mut exit = None;
     let mut cached_screen = None;
@@ -1221,6 +1428,7 @@ fn serve(control: UnixStream) -> i32 {
             &mut recovery,
             screen_lost,
             output,
+            &launch_directory,
         );
         if residence.is_none() {
             let _ = std::fs::remove_file(&socket);
@@ -1374,6 +1582,7 @@ fn await_successor(
     recovery: &mut Option<Recovery>,
     screen_lost: bool,
     mut output: Vec<u8>,
+    launch_directory: &LaunchDirectoryPin,
 ) -> Option<(UnixStream, Vec<u8>)> {
     let deadline = orphan_deadline(record.is_some(), Instant::now());
     let mut buffer = vec![0u8; 64 << 10];
@@ -1445,6 +1654,7 @@ fn await_successor(
                 record,
                 recovery,
                 screen_lost,
+                launch_directory,
             )
             .is_ok_and(|attached| attached)
         {
@@ -1470,15 +1680,23 @@ fn hand_over(
     record: Option<&Record>,
     recovery: &mut Option<Recovery>,
     screen_lost: bool,
+    launch_directory: &LaunchDirectoryPin,
 ) -> io::Result<bool> {
     // SAFETY: getuid cannot fail.
     let peer = peer_credentials(successor)?;
     if peer.uid != unsafe { libc::getuid() } {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
-    successor.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
-    successor.set_write_timeout(Some(HANDOVER_TIMEOUT))?;
-    let proposed = match receive::<Request>(successor)? {
+    let deadline = Instant::now() + HANDOVER_TIMEOUT;
+    let request = crate::descriptor_frame::receive_json_with_fds_until::<Request>(
+        successor,
+        deadline,
+        MAX_FRAME as usize,
+        0,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .map_err(io::Error::other)?;
+    let proposed = match Some(request) {
         Some((Request::Inspect { proof }, _)) => {
             let (Some(record), Some(recovery)) = (record, recovery.as_ref()) else {
                 return Err(io::ErrorKind::InvalidData.into());
@@ -1501,7 +1719,7 @@ fn hand_over(
                 recovery.options.cell_height_px =
                     u32::from(size.ws_ypixel / size.ws_row.max(1)).max(1);
             }
-            send(
+            crate::descriptor_frame::send_json_with_fds_until(
                 successor,
                 &Report::Inspected {
                     record: record.clone(),
@@ -1509,7 +1727,12 @@ fn hand_over(
                     screen_lost,
                 },
                 &[],
-            )?;
+                deadline,
+                MAX_FRAME as usize,
+                0,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )
+            .map_err(io::Error::other)?;
             return Ok(false);
         }
         Some((
@@ -1534,11 +1757,18 @@ fn hand_over(
                 .ok_or(io::ErrorKind::PermissionDenied)?,
         )?;
         if next.source.launch != current.source.launch
-            || !next.previous_sources.iter().any(|source| {
-                source.id == current.source.id
-                    && source.launch == current.source.launch
-                    && source.continuity.live_proof() == current.source.continuity.live_proof()
-            })
+            || next.execution_recipe != current.execution_recipe
+            || (next.source != current.source
+                && !next.previous_sources.iter().any(|source| {
+                    source.id == current.source.id
+                        && source.launch == current.source.launch
+                        && source.continuity.live_proof() == current.source.continuity.live_proof()
+                }))
+            || (next.source == current.source
+                && !current
+                    .previous_sources
+                    .iter()
+                    .all(|source| next.previous_sources.contains(source)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1553,10 +1783,20 @@ fn hand_over(
         screen: screen.to_owned(),
         output: STANDARD.encode(output),
         screen_lost,
+        launch_directory: Some(launch_directory.0),
     };
-    send(successor, &attached, &[master, pidfd.as_raw_fd()])?;
-    successor.set_read_timeout(None)?;
-    successor.set_write_timeout(None)?;
+    // SAFETY: the caller owns this live master for the whole bounded send.
+    let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
+    crate::descriptor_frame::send_json_with_fds_until(
+        successor,
+        &attached,
+        &[master, pidfd.as_fd(), launch_directory.1.as_fd()],
+        deadline,
+        MAX_FRAME as usize,
+        3,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )
+    .map_err(io::Error::other)?;
     if proposed.is_some() {
         *recovery = proposed;
     }
@@ -1862,12 +2102,11 @@ mod tests {
             None,
             &mut None,
             false,
+            &pin_launch_directory(&command("true")).unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        ));
+        assert_eq!(error.to_string(), "descriptor frame deadline expired");
+        assert!(started.elapsed() >= HANDOVER_TIMEOUT);
         assert!(started.elapsed() < HANDOVER_TIMEOUT * 2 + Duration::from_secs(1));
     }
 
@@ -1930,7 +2169,7 @@ mod tests {
     }
 
     fn holder_pid(held: &Held) -> u32 {
-        held.holder.process.as_ref().unwrap().id()
+        held.holder.process.as_ref().unwrap().child.id()
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -1968,6 +2207,7 @@ mod tests {
             &Report::Started {
                 protocol: PROTOCOL,
                 pid: 7,
+                launch_directory: None,
             },
             &[write.as_raw_fd()],
         )
@@ -1990,6 +2230,397 @@ mod tests {
         assert!(descriptors.is_empty());
         drop(left);
         assert!(receive::<Report>(&right).unwrap().is_none());
+    }
+
+    #[test]
+    fn pinned_directory_before_launch_survives_replacement_for_relative_program_and_path() {
+        const CHILD: &str = "CAGENTS_PINNED_DIRECTORY_CASE";
+        const PRESENCE: &str = "CAGENTS_PINNED_DIRECTORY_AUTH_PRESENT";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let stdout_path = directory.path().join("stdout.log");
+            let stderr_path = directory.path().join("stderr.log");
+            let present = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::holder::tests::pinned_directory_before_launch_survives_replacement_for_relative_program_and_path", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env(PRESENCE, present.to_string())
+                .stdin(Stdio::null())
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break child.wait().unwrap();
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if !status.success() {
+                eprintln!("saved exact child logs: {}", directory.keep().display());
+            }
+            assert!(status.success(), "isolated pinned launch control failed");
+            return;
+        }
+        assert_eq!(
+            std::env::var(PRESENCE).unwrap(),
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .is_some()
+                .to_string()
+        );
+        let original_cwd = File::open(".").unwrap();
+        for relative_path in [false, true] {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let original = directory.path().join("launch");
+            let moved = directory.path().join("moved");
+            std::fs::create_dir_all(original.join("bin")).unwrap();
+            std::fs::write(original.join("payload"), "ORIGINAL_PAYLOAD\n").unwrap();
+            let program = original.join("bin/probe");
+            std::fs::write(&program, "#!/bin/sh\n/usr/bin/stat -Lc 'PIN_ID:%d:%i' .\n/bin/cat payload\nprintf 'PIN_OK\\n'\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut command = CommandBuilder::new(if relative_path {
+                "probe"
+            } else {
+                "./bin/probe"
+            });
+            command.cwd(&original);
+            command.env("PATH", "bin:/usr/bin:/bin");
+            let pin = pin_launch_directory(&command).unwrap();
+            std::fs::rename(&original, &moved).unwrap();
+            std::fs::create_dir_all(original.join("bin")).unwrap();
+            std::fs::write(original.join("payload"), "REPLACEMENT_PAYLOAD\n").unwrap();
+            std::fs::write(
+                original.join("bin/probe"),
+                "#!/bin/sh\nprintf 'REPLACEMENT_EXEC\\n'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                original.join("bin/probe"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            // This is a dedicated exact self-exec case; never a UI/daemon cwd.
+            enter_launch_directory(&mut command, &pin).unwrap();
+            let pair = native_pty_system().openpty(size()).unwrap();
+            let mut child = pair.slave.spawn_command(command).unwrap();
+            drop(pair.slave);
+            let master = pair.master.as_raw_fd().unwrap();
+            let duplicate = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(duplicate >= 0);
+            let master = PtyMaster(unsafe { OwnedFd::from_raw_fd(duplicate) });
+            let output = read_until(&master, "PIN_OK");
+            assert!(
+                output.contains(&format!("PIN_ID:{}:{}", pin.0.device, pin.0.inode)),
+                "{output}"
+            );
+            assert!(output.contains("ORIGINAL_PAYLOAD"), "{output}");
+            assert!(!output.contains("REPLACEMENT"), "{output}");
+            assert_eq!(child.wait().unwrap().exit_code(), 0);
+            assert_eq!(
+                crate::agent_execution::DirectoryIdentity::from_metadata(
+                    &pin.1.metadata().unwrap()
+                ),
+                pin.0
+            );
+            assert_eq!(unsafe { libc::fchdir(original_cwd.as_raw_fd()) }, 0);
+        }
+    }
+
+    #[test]
+    fn adopted_terminal_transfers_the_same_original_launch_directory_and_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("launch");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("payload"), "ORIGINAL_PAYLOAD\n").unwrap();
+        let mut command = command(
+            "echo started >> launches; /usr/bin/stat -Lc 'PIN_ID:%d:%i' .; echo ready; read line; /bin/cat payload; echo PIN_DONE",
+        );
+        command.cwd(&original);
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn(command, size(), exits).unwrap();
+        let pin = held.launch_directory.as_ref().unwrap().clone();
+        let child_pid = held.child.pid();
+        assert!(
+            read_until(&held.master, "ready")
+                .contains(&format!("PIN_ID:{}:{}", pin.0.device, pin.0.inode))
+        );
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("payload"), "REPLACEMENT_PAYLOAD\n").unwrap();
+        let socket = directory.path().join("holder.sock");
+        held.holder.detach(&socket, b"original screen").unwrap();
+        drop(held);
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt(&socket, exits).unwrap();
+        assert_eq!(adopted.held.child.pid(), child_pid);
+        let adopted_pin = adopted.held.launch_directory.as_ref().unwrap();
+        assert_eq!(adopted_pin.0, pin.0);
+        assert_eq!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &adopted_pin.1.metadata().unwrap()
+            ),
+            pin.0
+        );
+        assert_ne!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(&original).unwrap()
+            ),
+            pin.0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(adopted_pin.1.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut writer = File::from(adopted.held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"continue\n").unwrap();
+        let output = read_until(&adopted.held.master, "PIN_DONE");
+        assert!(output.contains("ORIGINAL_PAYLOAD"), "{output}");
+        assert!(!output.contains("REPLACEMENT_PAYLOAD"));
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            0
+        );
+        drop(adopted);
+        assert_eq!(
+            std::fs::read_to_string(moved.join("launches")).unwrap(),
+            "started\n"
+        );
+        assert_eq!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(&pin.1.metadata().unwrap()),
+            pin.0
+        );
+    }
+
+    #[test]
+    fn anonymous_malformed_pin_refusal_never_releases_the_original() {
+        const CHILD: &str = "CAGENTS_ANONYMOUS_PIN_REFUSAL_CASE";
+        const PRESENCE: &str = "CAGENTS_ANONYMOUS_PIN_REFUSAL_AUTH_PRESENT";
+        if std::env::var_os(CHILD).is_none() {
+            // A pre-fix refusal could signal the socket peer. Keep that peer
+            // in an exact self-exec child, never the parent test process.
+            let directory = tempfile::tempdir().unwrap();
+            let stdout_path = directory.path().join("stdout.log");
+            let stderr_path = directory.path().join("stderr.log");
+            let present = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::holder::tests::anonymous_malformed_pin_refusal_never_releases_the_original", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env(PRESENCE, present.to_string())
+                .stdin(Stdio::null())
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break child.wait().unwrap();
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if !status.success() {
+                eprintln!("saved exact child logs: {}", directory.keep().display());
+            }
+            assert!(status.success(), "anonymous pin refusal control failed");
+            return;
+        }
+        assert_eq!(
+            std::env::var(PRESENCE).unwrap(),
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .is_some()
+                .to_string()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn(
+            command("echo ready; read line; echo ORIGINAL_SURVIVED"),
+            size(),
+            exits,
+        )
+        .unwrap();
+        assert!(read_until(&held.master, "ready").contains("ready"));
+        let original_pid = held.child.pid();
+        let master = held.master.duplicate().unwrap();
+        let pidfd = held.child.pidfd.try_clone().unwrap();
+        let invalid_directory = tempfile::tempfile().unwrap();
+        let expected = pin_launch_directory(&command("true")).unwrap().0;
+        let socket = directory.path().join("anonymous.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (request, rights) = receive::<Request>(&control).unwrap().unwrap();
+            assert!(matches!(
+                request,
+                Request::Attach {
+                    protocol: PROTOCOL,
+                    recovery: None
+                }
+            ));
+            assert!(rights.is_empty());
+            crate::descriptor_frame::send_json_with_fds_until(
+                &control,
+                &Report::Attached {
+                    protocol: PROTOCOL,
+                    pid: original_pid,
+                    exited: None,
+                    screen: String::new(),
+                    output: String::new(),
+                    screen_lost: false,
+                    launch_directory: Some(expected),
+                },
+                &[master.as_fd(), pidfd.as_fd(), invalid_directory.as_fd()],
+                Instant::now() + Duration::from_secs(5),
+                MAX_FRAME as usize,
+                3,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )
+            .unwrap();
+            // EOF proves the refused setup dropped the connection without
+            // sending Release/ReleaseProved or any other control request.
+            assert!(receive::<Request>(&control).unwrap().is_none());
+        });
+        let (refused_exits, _refused_exited) = crossbeam_channel::bounded(1);
+        let error = match adopt(&socket, refused_exits) {
+            Ok(_) => panic!("regular file accepted as a launch directory"),
+            Err(error) => error,
+        };
+        assert!(error.contains("launch directory"), "{error}");
+        server.join().unwrap();
+        assert!(alive(original_pid));
+        assert!(!exits_within(&held.child.pidfd, Duration::ZERO).unwrap());
+        let mut input = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut input, b"continue\n").unwrap();
+        assert!(read_until(&held.master, "ORIGINAL_SURVIVED").contains("ORIGINAL_SURVIVED"));
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            0
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn legacy_and_malformed_launch_directory_descriptors_never_become_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = File::open(directory.path()).unwrap();
+        let identity =
+            crate::agent_execution::DirectoryIdentity::from_metadata(&file.metadata().unwrap());
+        let fds = |with_directory: bool| {
+            let mut descriptors = vec![
+                OwnedFd::from(tempfile::tempfile().unwrap()),
+                OwnedFd::from(tempfile::tempfile().unwrap()),
+            ];
+            if with_directory {
+                descriptors.push(OwnedFd::from(file.try_clone().unwrap()));
+            }
+            descriptors
+        };
+        for protocol in 2..=4 {
+            assert!(
+                decode_held_descriptors(protocol, None, fds(false))
+                    .unwrap()
+                    .2
+                    .is_none()
+            );
+            assert!(decode_held_descriptors(protocol, Some(identity), fds(true)).is_err());
+        }
+        for unsupported in [0, 1, 6] {
+            assert!(decode_held_descriptors(unsupported, Some(identity), fds(true)).is_err());
+        }
+        assert!(decode_held_descriptors(5, None, fds(true)).is_err());
+        assert!(decode_held_descriptors(5, Some(identity), fds(false)).is_err());
+        let wrong = crate::agent_execution::DirectoryIdentity {
+            inode: identity.inode.wrapping_add(1),
+            ..identity
+        };
+        assert!(decode_held_descriptors(5, Some(wrong), fds(true)).is_err());
+        let mut regular = fds(false);
+        regular.push(OwnedFd::from(tempfile::tempfile().unwrap()));
+        assert!(decode_held_descriptors(5, Some(identity), regular).is_err());
+        assert_eq!(
+            decode_held_descriptors(5, Some(identity), fds(true))
+                .unwrap()
+                .2
+                .unwrap()
+                .0,
+            identity
+        );
+        let not_cloexec = File::open(directory.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(not_cloexec.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        assert!(checked_launch_directory(identity, Arc::new(not_cloexec)).is_err());
+    }
+
+    #[test]
+    fn an_invalid_explicit_launch_directory_refuses_before_any_root_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("started");
+        for cwd in [
+            directory.path().join("missing"),
+            directory.path().join("regular"),
+        ] {
+            if cwd.ends_with("regular") {
+                std::fs::write(&cwd, b"not a directory").unwrap();
+            }
+            let mut command = command(r#"printf started > "$PIN_STARTED""#);
+            command.env("PIN_STARTED", &marker);
+            command.cwd(&cwd);
+            let (exits, _exited) = crossbeam_channel::bounded(1);
+            let error = match spawn(command, size(), exits) {
+                Ok(_) => panic!("invalid cwd launched a root"),
+                Err(error) => error,
+            };
+            assert!(error.contains("pin terminal launch directory"), "{error}");
+            assert!(!marker.exists());
+        }
+        // Truly absent cwd retains portable-pty's selected HOME fallback.
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "echo HOME_PIN_READY; read line"]);
+        command.env("HOME", directory.path());
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn(command, size(), exits).unwrap();
+        assert_eq!(
+            held.launch_directory.as_ref().unwrap().0,
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(directory.path()).unwrap()
+            )
+        );
+        read_until(&held.master, "HOME_PIN_READY");
+        let mut writer = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"\n").unwrap();
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            0
+        );
     }
 
     #[test]
@@ -2087,15 +2718,203 @@ mod tests {
     }
 
     #[test]
+    fn same_parent_detach_adopt_close_reaps_the_original_holder_without_other_waits() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        struct Unrelated(Child);
+        impl Drop for Unrelated {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut unrelated = Unrelated(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 23"])
+                .spawn()
+                .unwrap(),
+        );
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        assert_eq!(reaper.free(), 0);
+        let socket = directory.path().join("custody.sock");
+        held.holder.detach(&socket, b"screen").unwrap();
+        drop(held);
+        assert!(owner.is_current());
+        assert!(root.is_current());
+        assert_eq!(reaper.retained_custody_error(), None);
+        assert_eq!(
+            reaper.free(),
+            0,
+            "live original child still owns its spawn credit"
+        );
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt(&socket, exits).unwrap().held;
+        assert!(
+            adopted.holder.process.is_none(),
+            "adoption must not invent original wait authority"
+        );
+        assert_eq!(adopted.child.pid(), root.pid);
+        adopted.child.kill().unwrap();
+        exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(adopted);
+        reaper.await_free(1);
+        assert!(
+            !owner.is_current(),
+            "same-parent holder was observed but not reaped"
+        );
+        assert!(
+            !root.is_current(),
+            "the terminal holder did not reap its own root"
+        );
+        assert_eq!(
+            unrelated.0.wait().unwrap().code(),
+            Some(23),
+            "another owner's child status was consumed"
+        );
+    }
+
+    #[test]
+    fn detached_holder_transfer_failure_preserves_custody_until_explicit_exact_retry() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        let socket = directory.path().join("retry.sock");
+        held.holder.detach(&socket, b"screen").unwrap();
+        reaper.fail_wake(true);
+        drop(held);
+        assert!(reaper.is_suspended(owner.pid as u32));
+        assert!(
+            reaper
+                .retained_custody_error()
+                .unwrap()
+                .contains("injected")
+        );
+        assert_eq!(reaper.free(), 0);
+        assert!(
+            reaper.reserve().is_err(),
+            "failed handoff must not release admission credit"
+        );
+        assert!(owner.is_current() && root.is_current());
+        // The failure preserves the helper without signalling it. A real
+        // successor can still use its socket, close its root, and release it.
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt(&socket, exits).unwrap().held;
+        assert!(adopted.holder.process.is_none());
+        let exact_exit = adopted.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
+        adopted.child.kill().unwrap();
+        exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(adopted);
+        assert!(exits_within(&exact_exit, Duration::from_secs(5)).unwrap());
+        assert!(
+            owner.is_current(),
+            "suspended service must not silently reap before recovery"
+        );
+        assert!(reaper.is_suspended(owner.pid as u32));
+        reaper.fail_wake(false);
+        let retry = reaper.retry_preserved().unwrap();
+        assert_eq!((retry.rearmed, retry.retained), (1, 0));
+        assert_eq!(reaper.retained_custody_error(), None);
+        reaper.await_free(1);
+        assert!(!owner.is_current() && !root.is_current());
+        assert!(reaper.reserve().is_ok());
+    }
+
+    #[test]
+    fn failed_terminal_holder_spawn_returns_its_preallocated_child_credit() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir().unwrap();
+        let reservation = reaper.reserve().unwrap();
+        assert_eq!(reaper.free(), 0);
+        let result = spawn_original(
+            &mut Command::new(directory.path().join("missing-holder")),
+            reservation,
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
+        assert_eq!(reaper.free(), 1);
+        assert!(reaper.reserve().is_ok());
+    }
+
+    #[test]
+    fn normal_terminal_holder_close_returns_its_original_child_credit() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        assert_eq!(reaper.free(), 0);
+        // Normal worker shutdown waits for the holder's post-reap root report
+        // before releasing the holder. Raw Held drop only promises a hangup.
+        let root_identity = super::super::RootIdentity::capture(root.pid, None).unwrap();
+        super::super::shutdown_child_exit(&held.child, Some(&root_identity), &exited, false)
+            .expect("normal shutdown must confirm the exact root was reaped");
+        assert!(!held.child.unreaped());
+        assert_eq!(
+            reaper.free(),
+            0,
+            "the original holder still owns its credit"
+        );
+        drop(held);
+        assert_eq!(reaper.free(), 1);
+        assert!(!owner.is_current());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while root.is_current() {
+            assert!(
+                Instant::now() < deadline,
+                "normal holder close left its root"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn releasing_a_holder_hangs_up_its_terminal() {
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let Held {
             master,
             child,
             holder,
+            ..
         } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
         let root = child.pid();
-        let holder_pid = holder.process.as_ref().unwrap().id() as libc::pid_t;
+        let holder_pid = holder.process.as_ref().unwrap().child.id() as libc::pid_t;
         // The terminal hangs up once its last master closes.
         drop(master);
         drop(holder);
@@ -2110,6 +2929,7 @@ mod tests {
             master,
             child,
             mut holder,
+            ..
         } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
         let root = child.pid();
         let mut process = holder.process.take().unwrap();
@@ -2117,7 +2937,7 @@ mod tests {
         drop(master);
         let _ = holder.control.shutdown(std::net::Shutdown::Both);
         drop(holder);
-        let status = process.wait().unwrap();
+        let status = process.child.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
     }
@@ -2175,6 +2995,7 @@ mod tests {
                 relaunches: Vec::new(),
                 options: crate::terminal::TerminalSpawnOptions::default(),
                 execution_environment: None,
+                execution_recipe: None,
             };
             let (exits, _exited) = crossbeam_channel::bounded(1);
             assert!(
@@ -2313,6 +3134,7 @@ mod tests {
             master,
             child,
             mut holder,
+            ..
         } = adopted.held;
         holder.commit_adoption().unwrap();
         let mut writer = File::from(master.duplicate().unwrap());
@@ -2341,8 +3163,9 @@ mod tests {
             boot_id: boot.clone(),
             host_incarnation: crate::model::HostIncarnation::new("third"),
         };
-        // The same successor can retry allocation under its existing lease.
-        next.previous_sources.push(next.source.clone());
+        // The same successor can retry the identical allocation under its
+        // existing lease, without fabricating a self-alias after a lost ACK.
+        let retry_source = next.source.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let (exits, _) = crossbeam_channel::bounded(1);
@@ -2352,6 +3175,16 @@ mod tests {
             // No commit: dropping failed parser setup must preserve every byte
             // already returned in Attached as well as the surviving process.
             drop(attempt);
+            assert_eq!(next.source, retry_source);
+            assert_eq!(
+                crate::daemon::holder_registry::recovery_candidate(
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
+                )
+                .unwrap(),
+                Some(record.clone()),
+                "adoption rewrote the original holder role/identity"
+            );
             if replayed {
                 break;
             }
@@ -2496,6 +3329,7 @@ mod tests {
             master,
             child,
             mut holder,
+            ..
         } = spawn(command(script), size(), exits).unwrap();
         read_until(&master, "ready");
         let socket = directory.join("holder.sock");
@@ -2599,7 +3433,14 @@ mod tests {
 
     #[test]
     fn a_holder_can_be_detached_again_by_its_successor() {
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let (socket, root) = detached("echo ready; read line; exit 2", directory.path());
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = adopt(&socket, exits).unwrap().held;

@@ -4,5 +4,6 @@ jobs = 2
 
 [env]
 # Cargo shares relocatable path-package artifacts across worktrees. Track this
-# identity only in our crates, retaining the warm third-party dependency cache.
+# identity in owned crates and local patches for source fidelity. Unrelated
+# external dependencies can reuse cached artifacts; dependents may rebuild.
 CAGENTS_CHECKOUT_ROOT = { value = ".", relative = true, force = true }

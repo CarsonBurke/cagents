@@ -263,7 +263,7 @@ fn index(
         let mut conversations = Vec::new();
         let mut titles = Vec::new();
         for mut found in catalog::find_all(cache, &seeds, batch, workers, cancel) {
-            if let Some(name) = names.get(&found.id) {
+            if let Some(name) = names.get(found.seed).and_then(|names| names.get(&found.id)) {
                 found.title = name.clone();
                 found.titled = true;
                 found.named = true;
@@ -728,6 +728,7 @@ impl Cagents {
             .iter()
             .find(|card| {
                 card.existence.is_open()
+                    && !self.chat_awaiting_admission(card.id)
                     && match &card.kind {
                         CardKind::Chat(current) => same_conversation(current, session),
                         CardKind::Terminal(current) => chat_ui::conversion(current)
@@ -764,7 +765,10 @@ impl Cagents {
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
-        if entry.open {
+        let local_pending = self.chat_awaiting_admission(entry.card)
+            && matches!(self.card_state(entry.card).map(|card| &card.kind),
+                Some(CardKind::Chat(session)) if session == &entry.session);
+        if entry.open && !local_pending {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
@@ -1382,7 +1386,7 @@ mod tests {
                 &path,
                 format!(
                     "{}\n",
-                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Prompt {age}")}})
+                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Review prompt {age}")}})
                 ),
             )
             .unwrap();
@@ -1431,7 +1435,7 @@ mod tests {
         assert_eq!(conversations.len(), FIRST_BATCH - 2);
         assert_eq!(conversations[0].id, ids[0]);
         assert_eq!(conversations[1].id, ids[2]);
-        assert_eq!(titles, &[(entry.card, "Prompt 1".to_owned())]);
+        assert_eq!(titles, &[(entry.card, "Review prompt 1".to_owned())]);
         let Progress::Found { read, .. } = &progress[3] else {
             panic!("the rest follow")
         };
