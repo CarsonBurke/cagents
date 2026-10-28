@@ -5339,7 +5339,9 @@ impl RepositoryRuntime {
             let result = tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
                 if cancellation.is_cancelled() { return None; }
-                let after = snapshot.text();
+                // Rows share this worker-owned source without populating the
+                // serialized cache retained by the live native buffer.
+                let after = Arc::<str>::from(snapshot.to_string_uncached());
                 let serialized_us = started.elapsed().as_micros() as u64;
                 let model = if rich {
                     let mut model = build_document_diff_sources_with_font(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, font, &cancellation)?;
@@ -13539,6 +13541,119 @@ mod tests {
     }
 
     #[test]
+    fn working_diff_serializes_native_source_only_on_an_uncancelled_worker() {
+        use cosmic::iced::futures::StreamExt;
+
+        for cancelled in [false, true] {
+            let card = CardId::new();
+            let baseline = "xlet café = \"😀\";\nsecond\r\n\rthird\rfourth";
+            let saved = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let after = "xlet café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let (mut runtime, _) = working_diff_runtime(card, baseline, saved);
+            runtime.set_lsp_document(None);
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            runtime.source_surface = SourceSurface::Diff;
+            runtime.working_diff.applied = None;
+            drop(runtime.working_diff_task(card));
+            let ticket = runtime.working_diff.timer.unwrap();
+            runtime.working_diff.deadline = Some(Instant::now());
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("native buffer")
+            };
+            let snapshot = document.content.text_snapshot();
+            let editor_state = |runtime: &RepositoryRuntime| {
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!("native buffer")
+                };
+                (
+                    document.saved_text.clone(),
+                    document.saved_history_revision,
+                    document.dirty,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.cursor(),
+                )
+            };
+            let original_state = editor_state(&runtime);
+            assert!(runtime.is_dirty());
+            text_editor::take_text_call_count();
+
+            let task = runtime.start_working_diff(card, ticket);
+            assert_eq!(
+                text_editor::take_text_call_count(),
+                0,
+                "starting a debounced diff must not serialize on the UI thread"
+            );
+            assert_eq!(snapshot.serialization_count(), 0);
+            assert_eq!(editor_state(&runtime), original_state);
+            if cancelled {
+                runtime
+                    .working_diff
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .cancellation
+                    .cancel();
+            }
+
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = action {
+                        return action;
+                    }
+                }
+                panic!("the diff worker must return its completion")
+            });
+            let RepositoryAction::WorkingDiffLoaded { result, .. } = &completion else {
+                panic!("working diff completion")
+            };
+            if cancelled {
+                assert!(matches!(result, Ok(None)));
+                assert_eq!(snapshot.serialization_count(), 0);
+            } else {
+                let model = result
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .as_ref()
+                    .expect("the visible diff produces its rich model");
+                let expected = crate::diff_view::build_diff(baseline, after);
+                for marker in ["[LF]", "[CRLF]", "[no newline]"] {
+                    assert!(
+                        expected
+                            .inline_rows
+                            .iter()
+                            .any(|row| row.text.ends_with(marker))
+                    );
+                }
+                assert_eq!(model.line_counts, expected.line_counts);
+                assert_eq!(model.inline_rows, expected.inline_rows);
+                assert_eq!(model.split_rows, expected.split_rows);
+                assert_eq!(snapshot.serialization_count(), 1);
+            }
+            drop(runtime.update(completion));
+            if !cancelled {
+                assert!(runtime.working_annotations_current());
+            }
+            assert_eq!(editor_state(&runtime), original_state);
+            assert!(
+                !snapshot.is_materialized(),
+                "a transient diff input must not stay cached in native history"
+            );
+        }
+    }
+
+    #[test]
     fn working_diff_coalesces_edits_and_rejects_cancelled_revision_results() {
         let card = CardId::new();
         let (mut runtime, identity) = working_diff_runtime(card, "old\n", "first\n");
@@ -13636,7 +13751,8 @@ mod tests {
         let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else {
             panic!("diff output")
         };
-        assert!(snapshot.is_materialized());
+        assert!(!snapshot.is_materialized());
+        assert_eq!(snapshot.serialization_count(), 1);
         let RepositoryAction::WorkingDiffLoaded {
             result: Ok(Some(output)),
             ..
@@ -13664,6 +13780,8 @@ mod tests {
         assert!(runtime.working_diff.applied_rich);
         assert!(runtime.working_diff_current());
         assert_eq!(runtime.diff_model().unwrap().after.as_ref(), "new\n");
+        assert!(!snapshot.is_materialized());
+        assert_eq!(snapshot.serialization_count(), 2);
     }
 
     #[tokio::test]
