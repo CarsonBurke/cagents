@@ -1,5 +1,6 @@
 mod service {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         os::unix::process::CommandExt,
         process::{Command, Output, Stdio},
         sync::{Arc, LazyLock},
@@ -41,6 +42,30 @@ mod service {
     pub struct WaitingAgent {
         pub session: crate::model::TerminalId,
         pub label: String,
+        context: Option<WaitingContext>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum WaitingSurface {
+        Chat,
+        Console,
+    }
+
+    impl WaitingSurface {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Chat => "Chat",
+                Self::Console => "Console",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct WaitingContext {
+        provider: crate::agent::Provider,
+        title: Option<String>,
+        directory: std::path::PathBuf,
+        surface: WaitingSurface,
     }
 
     impl WaitingAgent {
@@ -49,21 +74,166 @@ mod service {
             provider: crate::agent::Provider,
             title: Option<&str>,
             directory: &std::path::Path,
+            surface: WaitingSurface,
         ) -> Self {
-            let title = title.map(bounded_label).filter(|title| !title.is_empty());
-            let basename = directory
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .map(bounded_label)
-                .filter(|name| !name.is_empty());
-            let label = match title.or(basename) {
-                Some(name) => format!("{} · {name}", provider.label()),
-                None => format!("{} · Waiting agent", provider.label()),
+            let context = WaitingContext {
+                provider,
+                title: title.map(clean_label).filter(|title| !title.is_empty()),
+                directory: directory.into(),
+                surface,
             };
-            Self {
+            let scope = scope_components(&context)
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "/".into());
+            let mut row = Self {
                 session,
-                label: bounded_label(&label),
+                label: String::new(),
+                context: Some(context),
+            };
+            row.label = row.prepared_label(&scope, None);
+            row
+        }
+
+        fn prepared_label(&self, scope: &str, extra: Option<&str>) -> String {
+            let extra = extra.map(|extra| format!(" · {extra}")).unwrap_or_default();
+            let budget = LABEL_CHARS - extra.chars().count();
+            let label = if let Some(context) = &self.context {
+                let prefix = format!("{} · ", context.provider.label());
+                let scope = compact_label(scope, 44.min(budget - prefix.chars().count()));
+                if let Some(title) = &context.title {
+                    if title == &scope {
+                        format!("{prefix}{scope}")
+                    } else {
+                        let suffix = format!(" — {scope}");
+                        let title = compact_label(
+                            title,
+                            budget - prefix.chars().count() - suffix.chars().count(),
+                        );
+                        format!("{prefix}{title}{suffix}")
+                    }
+                } else {
+                    format!("{prefix}{scope}")
+                }
+            } else {
+                compact_label(&self.label, budget)
+            };
+            format!("{label}{extra}")
+        }
+    }
+
+    /// Only human display metadata enters label preparation. Keep the last
+    /// eight path components; recipes, environment and runtime IDs never do.
+    fn scope_components(context: &WaitingContext) -> Vec<String> {
+        let mut parts = context
+            .directory
+            .components()
+            .rev()
+            .take(8)
+            .filter_map(|part| match part {
+                std::path::Component::Normal(part) => Some(clean_label(&part.to_string_lossy())),
+                _ => None,
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        parts.reverse();
+        parts
+    }
+
+    fn duplicate_labels(labels: &[String]) -> BTreeSet<usize> {
+        let mut first = BTreeMap::new();
+        let mut duplicates = BTreeSet::new();
+        for (index, label) in labels.iter().enumerate() {
+            if let Some(previous) = first.insert(label, index) {
+                duplicates.insert(previous);
+                duplicates.insert(index);
             }
+        }
+        duplicates
+    }
+
+    /// Scope and disambiguators get their space before title elision. The last
+    /// pass compares final strings, including natural labels resembling a suffix.
+    fn prepare_waiting_labels(
+        rows: &mut [WaitingAgent],
+        numbers: &mut BTreeMap<crate::model::TerminalId, usize>,
+    ) {
+        let current = rows.iter().map(|row| row.session).collect::<BTreeSet<_>>();
+        numbers.retain(|session, _| current.contains(session));
+        let mut used = numbers.values().copied().collect::<BTreeSet<_>>();
+        for session in current {
+            numbers.entry(session).or_insert_with(|| {
+                let number = (1..).find(|number| !used.contains(number)).unwrap();
+                used.insert(number);
+                number
+            });
+        }
+        let paths = rows
+            .iter()
+            .map(|row| {
+                row.context
+                    .as_ref()
+                    .map(scope_components)
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let suffix =
+            |path: &[String], depth: usize| path[path.len().saturating_sub(depth)..].join("/");
+        let scopes = paths
+            .iter()
+            .map(|path| {
+                if path.is_empty() {
+                    return "/".into();
+                }
+                let mut depth = 1;
+                while depth < path.len()
+                    && paths
+                        .iter()
+                        .any(|other| other != path && suffix(other, depth) == suffix(path, depth))
+                {
+                    depth += 1;
+                }
+                suffix(path, depth)
+            })
+            .collect::<Vec<String>>();
+        let plain = rows
+            .iter()
+            .zip(&scopes)
+            .map(|(row, scope)| row.prepared_label(scope, None))
+            .collect::<Vec<_>>();
+        let surfaces = duplicate_labels(&plain);
+        let mut numbered = BTreeSet::new();
+        loop {
+            let labels = rows
+                .iter()
+                .zip(&scopes)
+                .enumerate()
+                .map(|(index, (row, scope))| {
+                    let surface = row
+                        .context
+                        .as_ref()
+                        .map(|context| context.surface.label())
+                        .unwrap_or("Agent");
+                    let extra = if numbered.contains(&index) {
+                        Some(format!("{surface} {}", numbers[&row.session]))
+                    } else if surfaces.contains(&index) && row.context.is_some() {
+                        Some(surface.into())
+                    } else {
+                        None
+                    };
+                    row.prepared_label(scope, extra.as_deref())
+                })
+                .collect::<Vec<_>>();
+            let duplicates = duplicate_labels(&labels);
+            if duplicates.is_empty() {
+                for (row, label) in rows.iter_mut().zip(labels) {
+                    row.label = label;
+                }
+                return;
+            }
+            // Unique visible numbers make numbered rows distinct. At least one
+            // previously unnumbered natural collision is added on each pass.
+            numbered.extend(duplicates);
         }
     }
 
@@ -79,7 +249,7 @@ mod service {
     impl TraySnapshot {
         fn bounded(self) -> Self {
             let mut waiting_agents: Vec<WaitingAgent> = Vec::new();
-            for agent in self
+            for mut agent in self
                 .waiting_agents
                 .into_iter()
                 .take(MAX_WAITING_AGENTS.min(self.tally.waiting))
@@ -91,14 +261,12 @@ mod service {
                     continue;
                 }
                 let label = bounded_label(&agent.label);
-                waiting_agents.push(WaitingAgent {
-                    session: agent.session,
-                    label: if label.is_empty() {
-                        "Waiting agent".into()
-                    } else {
-                        label
-                    },
-                });
+                agent.label = if label.is_empty() {
+                    "Waiting agent".into()
+                } else {
+                    label
+                };
+                waiting_agents.push(agent);
             }
             Self {
                 tally: self.tally,
@@ -107,11 +275,9 @@ mod service {
         }
     }
 
-    fn bounded_label(text: &str) -> String {
+    fn clean_label(text: &str) -> String {
         let mut label = String::new();
-        let mut count = 0;
         for ch in text.chars().take(LABEL_SCAN_CHARS) {
-            // Strip invisible direction/format controls as well as C0/C1.
             if matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
             {
                 continue;
@@ -126,14 +292,28 @@ mod service {
             } else {
                 ch
             };
-            if count == LABEL_CHARS {
-                break;
-            }
             label.push(ch);
-            count += 1;
         }
         label.truncate(label.trim_end().len());
         label
+    }
+
+    fn compact_label(text: &str, limit: usize) -> String {
+        let chars = text.chars().collect::<Vec<_>>();
+        if chars.len() <= limit {
+            return text.into();
+        }
+        let head = limit.saturating_sub(1) / 2;
+        let tail = limit.saturating_sub(head + 1);
+        chars[..head]
+            .iter()
+            .chain(std::iter::once(&'…'))
+            .chain(chars[chars.len() - tail..].iter())
+            .collect()
+    }
+
+    fn bounded_label(text: &str) -> String {
+        compact_label(&clean_label(text), LABEL_CHARS)
     }
 
     impl AgentTally {
@@ -230,6 +410,7 @@ mod service {
         outcome: Option<Outcome>,
         tally: AgentTally,
         waiting_agents: Vec<WaitingAgent>,
+        label_numbers: BTreeMap<crate::model::TerminalId, usize>,
         focus_agent: Option<FocusAgent>,
         updates: mpsc::UnboundedSender<ActionResult>,
     }
@@ -241,6 +422,7 @@ mod service {
                 outcome: None,
                 tally: AgentTally::default(),
                 waiting_agents: Vec::new(),
+                label_numbers: BTreeMap::new(),
                 focus_agent: None,
                 updates,
             }
@@ -283,7 +465,8 @@ mod service {
         }
 
         fn install_snapshot(&mut self, snapshot: TraySnapshot) {
-            let snapshot = snapshot.bounded();
+            let mut snapshot = snapshot.bounded();
+            prepare_waiting_labels(&mut snapshot.waiting_agents, &mut self.label_numbers);
             self.tally = snapshot.tally;
             self.waiting_agents = snapshot.waiting_agents;
         }
@@ -494,6 +677,31 @@ mod service {
     }
 
     #[cfg(test)]
+    pub(crate) fn waiting_menu_for_test(
+        snapshot: TraySnapshot,
+    ) -> Vec<(crate::model::TerminalId, String)> {
+        let (updates, _) = mpsc::unbounded_channel();
+        let mut tray = DaemonTray::new(updates);
+        tray.focus_agent = Some(Arc::new(|_| panic!("rendering cannot activate an agent")));
+        tray.install_snapshot(snapshot);
+        waiting_menu_rows(&tray)
+    }
+
+    #[cfg(test)]
+    fn waiting_menu_rows(tray: &DaemonTray) -> Vec<(crate::model::TerminalId, String)> {
+        ksni::Tray::menu(tray)
+            .into_iter()
+            .filter_map(|item| {
+                let ksni::MenuItem::Standard(item) = item else {
+                    return None;
+                };
+                let session = item.key?.parse().unwrap();
+                Some((session, item.label))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
 
@@ -640,6 +848,7 @@ mod service {
                     "界🦀".repeat(1000)
                 )),
                 std::path::Path::new("/private/parent/project"),
+                WaitingSurface::Chat,
             );
             assert!(label.label.starts_with("Claude Code · feature_one "));
             assert!(label.label.chars().count() <= LABEL_CHARS);
@@ -656,6 +865,7 @@ mod service {
                 crate::agent::Provider::Claude,
                 Some(" \n\t"),
                 std::path::Path::new("/private/parent/项目_name"),
+                WaitingSurface::Chat,
             );
             assert_eq!(fallback.label, "Claude Code · 项目_name");
             let unnamed = WaitingAgent::new(
@@ -663,8 +873,9 @@ mod service {
                 crate::agent::Provider::Claude,
                 None,
                 std::path::Path::new("/"),
+                WaitingSurface::Chat,
             );
-            assert_eq!(unnamed.label, "Claude Code · Waiting agent");
+            assert_eq!(unnamed.label, "Claude Code · /");
             assert!(!unnamed.label.contains(session.to_string().as_str()));
             // Public fields cannot bypass sanitization at component ingress.
             let (updates, _results) = mpsc::unbounded_channel();
@@ -678,6 +889,7 @@ mod service {
                 waiting_agents: vec![WaitingAgent {
                     session,
                     label: "\nA_B\t界\u{202e}".into(),
+                    context: None,
                 }],
             });
             let menu = ksni::Tray::menu(&tray);
@@ -703,6 +915,7 @@ mod service {
                     .map(|_| WaitingAgent {
                         session: crate::model::TerminalId::new(),
                         label: "界".repeat(1000),
+                        context: None,
                     })
                     .collect(),
             });
@@ -735,6 +948,220 @@ mod service {
             assert!(tray.waiting_agents.is_empty());
         }
 
+        fn scoped_row(
+            id: u128,
+            title: Option<&str>,
+            directory: &str,
+            surface: WaitingSurface,
+        ) -> WaitingAgent {
+            WaitingAgent::new(
+                uuid::Uuid::from_u128(id).into(),
+                crate::agent::Provider::Claude,
+                title,
+                std::path::Path::new(directory),
+                surface,
+            )
+        }
+
+        fn snapshot_rows(rows: Vec<WaitingAgent>) -> TraySnapshot {
+            TraySnapshot {
+                tally: AgentTally {
+                    working: 3,
+                    waiting: rows.len(),
+                },
+                waiting_agents: rows,
+            }
+        }
+
+        #[test]
+        fn waiting_full_menu_keeps_title_and_distinguishing_directory_scope() {
+            let rows = vec![
+                scoped_row(
+                    1,
+                    Some("Review changes"),
+                    "/private/client/project",
+                    WaitingSurface::Chat,
+                ),
+                scoped_row(
+                    2,
+                    Some("Review changes"),
+                    "/private/service/project",
+                    WaitingSurface::Chat,
+                ),
+                scoped_row(
+                    3,
+                    Some("Review changes"),
+                    "/private/worktrees/release",
+                    WaitingSurface::Console,
+                ),
+                scoped_row(4, None, "/private/worktrees/topic", WaitingSurface::Console),
+            ];
+            let menu = waiting_menu_for_test(snapshot_rows(rows));
+            assert_eq!(
+                menu.iter()
+                    .map(|(_, label)| label.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "Claude Code · Review changes — client/project",
+                    "Claude Code · Review changes — service/project",
+                    "Claude Code · Review changes — release",
+                    "Claude Code · topic",
+                ]
+            );
+            for (index, (session, label)) in menu.iter().enumerate() {
+                assert_eq!(
+                    *session,
+                    crate::model::TerminalId::from_uuid(uuid::Uuid::from_u128(index as u128 + 1))
+                );
+                assert!(!label.contains("private"));
+                assert!(!label.contains(&session.to_string()));
+            }
+        }
+
+        #[test]
+        fn waiting_full_menu_same_scope_surface_and_numbers_survive_reorder_and_new_rows() {
+            let (updates, _results) = mpsc::unbounded_channel();
+            let (selected, received) = std::sync::mpsc::channel();
+            let mut tray = DaemonTray::new(updates);
+            tray.focus_agent = Some(Arc::new(move |session| {
+                selected.send(session).unwrap();
+                Ok("Requested waiting agent".into())
+            }));
+            let a = scoped_row(10, Some("Review"), "/private/project", WaitingSurface::Chat);
+            let b = scoped_row(
+                20,
+                Some("Review"),
+                "/private/project",
+                WaitingSurface::Console,
+            );
+            let c = scoped_row(30, Some("Review"), "/private/project", WaitingSurface::Chat);
+            tray.install_snapshot(snapshot_rows(vec![a.clone(), b.clone(), c.clone()]));
+            let first = waiting_menu_rows(&tray)
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(first[&a.session], "Claude Code · Review — project · Chat 1");
+            assert_eq!(
+                first[&b.session],
+                "Claude Code · Review — project · Console"
+            );
+            assert_eq!(first[&c.session], "Claude Code · Review — project · Chat 3");
+            let d = scoped_row(5, Some("Review"), "/private/project", WaitingSurface::Chat);
+            tray.install_snapshot(snapshot_rows(vec![c, d.clone(), b, a.clone()]));
+            let after = waiting_menu_rows(&tray);
+            let by_id = after.iter().cloned().collect::<BTreeMap<_, _>>();
+            for (session, label) in first {
+                assert_eq!(by_id[&session], label);
+            }
+            assert_eq!(by_id[&d.session], "Claude Code · Review — project · Chat 4");
+            assert_eq!(by_id.values().collect::<BTreeSet<_>>().len(), 4);
+            let mut menu = ksni::Tray::menu(&tray);
+            let row = menu
+                .iter_mut()
+                .find_map(|item| match item {
+                    ksni::MenuItem::Standard(item)
+                        if item.key.as_deref() == Some(a.session.to_string().as_str()) =>
+                    {
+                        Some(item)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(row.label, by_id[&a.session]);
+            (row.activate)(&mut tray);
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                a.session
+            );
+        }
+
+        #[test]
+        fn waiting_full_menu_reserves_scope_and_disambiguates_final_truncation() {
+            let title = format!(" \u{202e}{}", "界_".repeat(180));
+            let rows = vec![
+                scoped_row(
+                    1,
+                    Some(&format!("{title}alpha")),
+                    "/private/project",
+                    WaitingSurface::Chat,
+                ),
+                scoped_row(
+                    2,
+                    Some(&format!("{title}beta")),
+                    "/private/project",
+                    WaitingSurface::Chat,
+                ),
+                scoped_row(3, Some(&title), "/private/project", WaitingSurface::Console),
+                scoped_row(
+                    4,
+                    Some("Inspect"),
+                    &format!("/private/{}left", "路径".repeat(80)),
+                    WaitingSurface::Console,
+                ),
+                scoped_row(
+                    5,
+                    Some("Inspect"),
+                    &format!("/private/{}right", "路径".repeat(80)),
+                    WaitingSurface::Console,
+                ),
+            ];
+            let menu = waiting_menu_for_test(snapshot_rows(rows));
+            assert_eq!(
+                menu.iter()
+                    .map(|(_, label)| label)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                menu.len()
+            );
+            for (session, label) in &menu {
+                let human = label.replace("__", "_");
+                assert!(human.chars().count() <= LABEL_CHARS);
+                assert!(!human.chars().any(char::is_control));
+                assert!(!human.contains('\u{202e}'));
+                assert!(!human.contains(&session.to_string()));
+                assert!(human.contains('…'));
+            }
+            assert!(menu[0].1.ends_with(" — project · Chat 1"));
+            assert!(menu[1].1.ends_with(" — project · Chat 2"));
+            assert!(menu[2].1.ends_with(" — project · Console"));
+            assert!(menu[3].1.ends_with("left"));
+            assert!(menu[4].1.ends_with("right"));
+        }
+
+        #[test]
+        fn waiting_full_menu_natural_generated_label_collision_is_resolved_after_elision() {
+            let mut tray = DaemonTray::new(mpsc::unbounded_channel().0);
+            tray.focus_agent = Some(Arc::new(|_| panic!("rendering cannot activate")));
+            let raw = |id, label: String| WaitingAgent {
+                session: uuid::Uuid::from_u128(id).into(),
+                label,
+                context: None,
+            };
+            let first = raw(1, "Same".into());
+            let second = raw(2, "Same".into());
+            tray.install_snapshot(snapshot_rows(vec![first.clone(), second.clone()]));
+            let before = waiting_menu_rows(&tray);
+            let natural = raw(3, before[0].1.clone());
+            tray.install_snapshot(snapshot_rows(vec![first, second, natural]));
+            let after = waiting_menu_rows(&tray);
+            assert_eq!(after[0], before[0]);
+            assert_eq!(after[1], before[1]);
+            assert_eq!(after[2].1, "Same · Agent 1 · Agent 3");
+            assert_eq!(
+                after
+                    .iter()
+                    .map(|(_, label)| label)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                3
+            );
+            assert_eq!(tray.label_numbers.len(), 3);
+            tray.install_snapshot(TraySnapshot::default());
+            assert!(
+                tray.label_numbers.is_empty(),
+                "label number cache only retains visible rows"
+            );
+        }
+
         #[test]
         fn waiting_menu_captures_exact_session_and_blocks_duplicate_pending_actions() {
             let (updates, _results) = mpsc::unbounded_channel();
@@ -744,10 +1171,12 @@ mod service {
             let first = WaitingAgent {
                 session: crate::model::TerminalId::new(),
                 label: "First".into(),
+                context: None,
             };
             let second = WaitingAgent {
                 session: crate::model::TerminalId::new(),
                 label: "Second".into(),
+                context: None,
             };
             let expected = first.session;
             tray.focus_agent = Some(Arc::new(move |id| {
@@ -814,6 +1243,7 @@ mod service {
                 waiting_agents: vec![WaitingAgent {
                     session: old,
                     label: "Old".into(),
+                    context: None,
                 }],
             });
             let mut old_menu = ksni::Tray::menu(&tray);
@@ -822,6 +1252,7 @@ mod service {
                 waiting_agents: vec![WaitingAgent {
                     session: current,
                     label: "Current".into(),
+                    context: None,
                 }],
             });
             let ksni::MenuItem::Standard(old_row) = &mut old_menu[2] else {
@@ -1153,6 +1584,9 @@ mod service {
 }
 
 pub use service::{
-    AgentTally, MAX_WAITING_AGENTS, TrayGuard, TraySnapshot, WaitingAgent, start,
+    AgentTally, MAX_WAITING_AGENTS, TrayGuard, TraySnapshot, WaitingAgent, WaitingSurface, start,
     start_with_attention,
 };
+
+#[cfg(test)]
+pub(crate) use service::waiting_menu_for_test;

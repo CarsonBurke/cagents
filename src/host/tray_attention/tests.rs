@@ -372,6 +372,79 @@ fn sampled_policy_preserves_pair_fallback_counts_all_waiting_and_omits_ambiguous
 }
 
 #[test]
+fn captured_native_and_console_scope_reaches_distinguishable_full_menu_without_recipe_details() {
+    let host = empty_host();
+    let (left, _) = Handle::fixture_remote_attachment_pair();
+    let (right, _) = Handle::fixture_remote_attachment_pair();
+    let left_id = left.actor_identity().unwrap().record.terminal;
+    let right_id = right.actor_identity().unwrap().record.terminal;
+    let console_id = TerminalId::new();
+    let console = RenderStreamFixture::new(|_| {});
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        install_chat(&mut state, left_id, left);
+        install_chat(&mut state, right_id, right);
+        for (id, path) in [
+            (left_id, "/private/client/project"),
+            (right_id, "/private/service/project"),
+        ] {
+            let recipe = &mut state.chats.get_mut(&id).unwrap().session.launch.recipe;
+            recipe.working_directory = path.into();
+            recipe.environment.insert(
+                "TRAY_DISPLAY_SECRET".into(),
+                "never-render-recipe-value".into(),
+            );
+        }
+        let mut source = terminal(console_id);
+        source.launch.working_directory = "/private/client/project".into();
+        source.launch.environment.insert(
+            "TRAY_DISPLAY_SECRET".into(),
+            "never-render-recipe-value".into(),
+        );
+        state
+            .finish_spawn(1, source, console.handle.clone(), false)
+            .unwrap();
+    }
+    // Use the actual Host capture and sampled activity reducer. Synthetic
+    // observations establish display preparation, not real provider readiness.
+    let snapshot = snapshot_with(&host, |id, candidate, snapshot| {
+        candidate.observe_sampled(
+            id,
+            candidate.terminal.as_ref().map(|_| Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Waiting,
+            }),
+            candidate.chat.as_ref().map(|_| ActivityObservation {
+                ready: true,
+                activity: ActivityState::Waiting,
+                title: None,
+            }),
+            snapshot,
+        );
+    });
+    assert_eq!(
+        snapshot.tally,
+        AgentTally {
+            working: 0,
+            waiting: 3
+        }
+    );
+    let menu = crate::tray::waiting_menu_for_test(snapshot)
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(menu[&left_id], "Claude Code · client/project · Chat");
+    assert_eq!(menu[&right_id], "Claude Code · service/project");
+    assert_eq!(menu[&console_id], "Claude Code · client/project · Console");
+    for (session, label) in menu {
+        assert!(!label.contains(&session.to_string()));
+        assert!(!label.contains("TRAY_DISPLAY_SECRET"));
+        assert!(!label.contains("never-render-recipe-value"));
+        assert!(!label.contains("private"));
+    }
+}
+
+#[test]
 fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
     for case in 0..4 {
         let host = empty_host();

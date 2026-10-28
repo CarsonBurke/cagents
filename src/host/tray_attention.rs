@@ -1,7 +1,7 @@
 //! Resident tray observations never read transcripts or hold Host across actor
 //! sampling, window sockets or child launch. A menu ID is a navigation hint;
 //! activation must resolve its current, unambiguous resident owner again.
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use super::state::{HostState, SharedHost};
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
     model::{TerminalId, TerminalSession},
     notifications::{Application, Destination},
     terminal::TerminalHandle,
-    tray::{AgentTally, TraySnapshot, WaitingAgent},
+    tray::{AgentTally, TraySnapshot, WaitingAgent, WaitingSurface},
 };
 
 pub(super) fn start(host: &SharedHost, application: Application) -> crate::tray::TrayGuard {
@@ -56,13 +56,13 @@ fn attention_enabled(
 struct TerminalSample {
     handle: TerminalHandle,
     title: Option<String>,
-    basename: String,
+    directory: PathBuf,
 }
 
 struct ChatSample {
     handle: Handle,
     provider: Provider,
-    basename: String,
+    directory: PathBuf,
 }
 
 #[derive(Default)]
@@ -71,15 +71,6 @@ struct Candidate {
     chat: Option<ChatSample>,
     paired: bool,
     ambiguous: bool,
-}
-
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .chars()
-        .take(100)
-        .collect()
 }
 
 fn paired(state: &HostState, id: TerminalId) -> bool {
@@ -102,8 +93,8 @@ fn capture(state: &HostState) -> BTreeMap<TerminalId, Candidate> {
                 handle: record.handle.clone(),
                 title: record
                     .conversation_title()
-                    .map(|title| title.chars().take(100).collect()),
-                basename: basename(record.current_directory()),
+                    .map(|title| title.chars().take(256).collect()),
+                directory: record.current_directory().into(),
             });
         }
     }
@@ -112,7 +103,7 @@ fn capture(state: &HostState) -> BTreeMap<TerminalId, Candidate> {
         candidate.chat = Some(ChatSample {
             handle: record.handle.clone(),
             provider: record.session.launch.provider,
-            basename: basename(&record.session.launch.recipe.working_directory),
+            directory: record.session.launch.recipe.working_directory.clone(),
         });
         candidate.paired = paired(state, id);
         candidate.ambiguous = state.terminals.contains_key(&id) && !candidate.paired;
@@ -152,17 +143,18 @@ impl Candidate {
     ) {
         let activity = native_activity(&native);
         let ambiguous = self.ambiguous;
-        let mut record = |state, provider, title: Option<&str>, directory: &str| match state {
+        let mut record = |state,
+                          provider,
+                          title: Option<&str>,
+                          directory: &std::path::Path,
+                          surface| match state {
             ActivityState::Working => snapshot.tally.working += 1,
             ActivityState::Waiting => {
                 snapshot.tally.waiting += 1;
                 if !ambiguous && snapshot.waiting_agents.len() < crate::tray::MAX_WAITING_AGENTS {
-                    snapshot.waiting_agents.push(WaitingAgent::new(
-                        id,
-                        provider,
-                        title,
-                        Path::new(directory),
-                    ));
+                    snapshot
+                        .waiting_agents
+                        .push(WaitingAgent::new(id, provider, title, directory, surface));
                 }
             }
             ActivityState::Idle | ActivityState::Unknown => {}
@@ -173,7 +165,8 @@ impl Candidate {
                     activity,
                     chat.provider,
                     native.as_ref().and_then(|s| s.title.as_deref()),
-                    &chat.basename,
+                    &chat.directory,
+                    WaitingSurface::Chat,
                 );
             }
         }
@@ -184,7 +177,8 @@ impl Candidate {
                 activity.state,
                 activity.provider,
                 sample.title.as_deref(),
-                &sample.basename,
+                &sample.directory,
+                WaitingSurface::Console,
             );
         }
     }
