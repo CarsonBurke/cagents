@@ -2229,3 +2229,334 @@ fn current_channel_ack_accepts_matching_registry_and_bootstrap_before_first_conn
         assert_eq!(app.durable.active_channel, Some(channel));
     }
 }
+
+/// Keep the actual publisher callback from one successful model-bearing edit.
+/// A navigation reply emits Read; an explicit reopen emits Reopened.
+fn framed_model_publication_callback(edit: ModelEdit, model: WorkspaceModel) -> ModelUpdate {
+    let expected = edit.clone();
+    let peer = Peer::new(vec![connected()], move |_, peer| {
+        let request = expect_edit(peer, &expected);
+        response(
+            peer,
+            &request,
+            ServerMessage::Response {
+                response: ServerResponse::WorkspaceModel {
+                    model: model.clone(),
+                },
+            },
+        );
+        true
+    });
+    let context = PublicationContext {
+        authority: Authority::default(),
+        remote: false,
+        no_start: true,
+    };
+    let (tx, requests) = async_channel::unbounded();
+    tx.send_blocking(edit).unwrap();
+    drop(tx);
+    let (updates, received) = async_channel::unbounded();
+    let mut pending = None;
+    let connections = Cell::new(0);
+    let error = publish_with(&updates, &requests, &mut pending, || {
+        connections.set(connections.get() + 1);
+        existing(&context, &peer.socket)
+    })
+    .unwrap_err();
+    assert_eq!(error, "the window stopped publishing");
+    assert_eq!(connections.get(), 1);
+    assert!(pending.is_none() && requests.is_empty());
+    peer.finished();
+    let callback = received.try_recv().unwrap();
+    assert!(matches!(
+        callback,
+        ModelUpdate::Read(_) | ModelUpdate::Reopened { .. }
+    ));
+    assert!(received.is_empty());
+    callback
+}
+
+#[test]
+fn old_registry_model_reply_cannot_rebind_or_settle_replacement_workspace_intent() {
+    use crate::app::Message;
+    for reopened in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        let create = take_creation_publications(&requests)
+            .into_iter()
+            .find(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+            .unwrap();
+        let old_model = channel_publication_model(canonical, &create);
+        let edit = if reopened {
+            ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "Old reopen".into(),
+                kind: ProjectKind::Folder,
+            }
+        } else {
+            ModelEdit::ResetNavigation {
+                repository: repository.clone(),
+            }
+        };
+        let delayed = framed_model_publication_callback(edit, old_model);
+        assert_eq!(matches!(&delayed, ModelUpdate::Reopened { .. }), reopened);
+        let replacement = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 1,
+            ..WorkspaceModel::default()
+        };
+        // Only the observer's Connected callback introduces the replacement.
+        // Its ordinary migration request remains pending throughout this race.
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                replacement.clone(),
+            ))),
+        );
+        app.project_ui.closed.insert(repository.clone());
+        app.project_ui.reopening.insert(project, repository.clone());
+        let closed = app.project_ui.closed.clone();
+        let reopening = app.project_ui.reopening.clone();
+        let publications = app.workspace_model_publications.clone();
+        let queued = requests.len();
+        let channels = app.durable.channels.clone();
+        let cards = app.durable.cards.clone();
+        let drafts = app.durable.chat_drafts.clone();
+        let focused = app.workspace.focused();
+        let active_channel = app.durable.active_channel;
+
+        drop(app.update(Message::WorkspaceModelObserved(delayed)));
+        let identity_after_reply = app.workspace_model.identity;
+        let durable_identity_after_reply = app.durable.workspace_model_identity;
+        let closed_after_reply = app.project_ui.closed.clone();
+        let reopening_after_reply = app.project_ui.reopening.clone();
+        let publications_after_reply = app.workspace_model_publications.clone();
+        // Execute the real newer-authority absence path too: the old callback
+        // must not have promoted this local channel into shared deletion scope.
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                replacement.clone(),
+            ))),
+        );
+        assert_eq!(
+            identity_after_reply, replacement.identity,
+            "reopened {reopened}: old callback cannot replace current registry"
+        );
+        assert_eq!(
+            durable_identity_after_reply,
+            Some(replacement.identity),
+            "reopened {reopened}: old callback cannot roll back durable registry custody"
+        );
+        assert_eq!(closed_after_reply, closed);
+        assert_eq!(
+            reopening_after_reply, reopening,
+            "an old reopen is not the replacement registry's pending intent"
+        );
+        assert_eq!(publications_after_reply, publications);
+        assert_eq!(app.workspace_model, replacement);
+        assert_eq!(
+            app.durable.workspace_model_identity,
+            Some(app.workspace_model.identity)
+        );
+        assert_eq!(app.project_ui.closed, closed);
+        assert_eq!(app.project_ui.reopening, reopening);
+        assert_eq!(app.workspace_model_publications, publications);
+        assert_eq!(
+            requests.len(),
+            queued,
+            "no replacement migration, replay or compensating retirement"
+        );
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert_eq!(app.durable.channels, channels);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|local| local.id == channel && !local.shared)
+        );
+        assert_eq!(app.durable.cards, cards);
+        assert!(
+            cards
+                .iter()
+                .all(|card| app.card_state(card.id).unwrap().existence.is_open())
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.durable.active_channel, active_channel);
+    }
+}
+
+#[test]
+fn current_or_bootstrap_model_reply_preserves_read_and_reopen_acknowledgement_behavior() {
+    use crate::app::Message;
+    for reopened in [false, true] {
+        for bootstrap in [false, true] {
+            let (_directory, mut app, project, channel, repository, requests, canonical) =
+                if bootstrap {
+                    let (directory, mut app, project, channel, repository, requests) =
+                        creation_fixture();
+                    let card = app
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|local| local.id == channel)
+                        .unwrap()
+                        .cards[0];
+                    write_creation_draft(&mut app, card, "Keep bootstrap model-reply draft");
+                    assert_eq!(
+                        app.workspace_model.identity,
+                        crate::workspace_model::NO_REGISTRY
+                    );
+                    let canonical = WorkspaceModel {
+                        identity: uuid::Uuid::new_v4(),
+                        sequence: 7,
+                        ..WorkspaceModel::default()
+                    };
+                    (
+                        directory, app, project, channel, repository, requests, canonical,
+                    )
+                } else {
+                    publication_reconciliation_fixture()
+                };
+            let create = take_creation_publications(&requests)
+                .into_iter()
+                .find(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+                .unwrap();
+            let admitted = channel_publication_model(canonical, &create);
+            let edit = if reopened {
+                ModelEdit::ReopenProject {
+                    repository: repository.clone(),
+                    name: "Current reopen".into(),
+                    kind: ProjectKind::Folder,
+                }
+            } else {
+                ModelEdit::ResetNavigation {
+                    repository: repository.clone(),
+                }
+            };
+            let callback = framed_model_publication_callback(edit, admitted.clone());
+            app.project_ui.closed.insert(repository.clone());
+            app.project_ui.reopening.insert(project, repository.clone());
+            let drafts = app.durable.chat_drafts.clone();
+            let focused = app.workspace.focused();
+            drop(app.update(Message::WorkspaceModelObserved(callback.clone())));
+            assert_eq!(app.workspace_model.identity, admitted.identity);
+            assert_eq!(app.project_ui.closed.contains(&repository), !reopened);
+            assert_eq!(
+                app.project_ui.is_reopening(&repository),
+                !reopened,
+                "only the matching Reopened receipt settles the pending local reopen"
+            );
+            let local = app
+                .durable
+                .channels
+                .iter()
+                .find(|local| local.id == channel)
+                .unwrap();
+            assert!(local.shared && local.ordinal == 21);
+            // Connected remains the legitimate authority boundary. Equal
+            // same-registry responses still perform ordinary reconciliation.
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                    admitted.clone(),
+                ))),
+            );
+            drop(app.update(Message::WorkspaceModelObserved(callback)));
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    admitted.clone(),
+                ))),
+            );
+            assert_eq!(app.workspace_model, admitted);
+            assert_eq!(
+                app.durable.workspace_model_identity,
+                Some(app.workspace_model.identity)
+            );
+            assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|local| local.id == channel && local.shared && !local.cards.is_empty())
+            );
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focused);
+            assert_eq!(app.durable.active_channel, Some(channel));
+        }
+    }
+    // A restored window may have old shared claims before its observer mounts.
+    // The first legitimate publisher snapshot must join its registry before
+    // projecting absence, just as Connected does. A fresh NO_REGISTRY cache
+    // alone does not mean the saved channels were never shared elsewhere.
+    for reopened in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, _old_model) =
+            publication_reconciliation_fixture();
+        take_creation_publications(&requests);
+        std::sync::Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|local| local.id == channel)
+            .unwrap()
+            .shared = true;
+        app.workspace_model = WorkspaceModel::default();
+        let mut incoming = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 1,
+            ..WorkspaceModel::default()
+        };
+        if reopened {
+            incoming
+                .projects
+                .push(crate::workspace_model::ModelProject {
+                    repository: repository.clone(),
+                    name: "Restored reopened project".into(),
+                    kind: ProjectKind::Folder,
+                    ordinal: 1,
+                });
+        }
+        assert_ne!(
+            app.durable.workspace_model_identity,
+            Some(incoming.identity)
+        );
+        let edit = if reopened {
+            app.project_ui.reopening.insert(project, repository.clone());
+            ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "Restored reopen".into(),
+                kind: ProjectKind::Folder,
+            }
+        } else {
+            ModelEdit::ResetNavigation {
+                repository: repository.clone(),
+            }
+        };
+        let callback = framed_model_publication_callback(edit, incoming.clone());
+        let drafts = app.durable.chat_drafts.clone();
+        let cards = app.durable.cards.clone();
+        let focused = app.workspace.focused();
+        drop(app.update(Message::WorkspaceModelObserved(callback)));
+        assert_eq!(app.workspace_model.identity, incoming.identity);
+        assert_eq!(
+            app.durable.workspace_model_identity,
+            Some(incoming.identity),
+            "bootstrap reopened {reopened}: join the real incoming registry before projecting its silence"
+        );
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|local| local.id == channel && !local.shared && !local.cards.is_empty())
+        );
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focused);
+        let migration = take_creation_publications(&requests);
+        assert_eq!(
+            migration.len(),
+            2,
+            "bootstrap migration has one project/channel pair"
+        );
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(incoming))));
+        assert!(take_creation_publications(&requests).is_empty());
+    }
+}
