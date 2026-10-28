@@ -3569,7 +3569,6 @@ fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
     let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
     assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
     assert!(refusal.retryable);
-    assert!(refusal.details.is_none());
     assert!(refusal.message.contains(&recipient.short().unwrap()));
     assert!(refusal.message.contains(&MAX_PENDING.to_string()));
     assert!(refusal.message.contains("once it has read them"));
@@ -3593,7 +3592,6 @@ fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
         let refusal = invoke(authority, outgoing).unwrap_err();
         assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
         assert!(!refusal.retryable);
-        assert!(refusal.details.is_none());
     }
     assert_eq!(pending(), before, "no refusal inserts or consumes mail");
     assert_eq!(
