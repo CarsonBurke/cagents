@@ -2137,7 +2137,7 @@ pub(super) struct Runtime {
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
-    failures: Vec<(Option<String>, String)>,
+    failures: Vec<failure::Note>,
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
@@ -3109,26 +3109,40 @@ impl Runtime {
             .map(str::to_owned);
         self.note_at(anchor, notice);
     }
+    /// Records `notice` for the prompt message `anchor`, drawn after the
+    /// transcript's current last group: work started by a delivery after
+    /// that prompt still precedes the notice.
     fn note_at(&mut self, anchor: Option<String>, notice: String) {
         let provider = self.session.launch.provider;
+        let group = self.turns.last().map(|turn| turn.key.clone());
         if chat::requires_sign_in(provider, &notice) {
             // An updated verification failure replaces this exchange's active
             // auth warning; other exchanges and tool failures remain history.
-            self.failures.retain(|(previous, message)| {
-                !failure::same_prompt(provider, previous.as_deref(), anchor.as_deref())
-                    || !chat::requires_sign_in(provider, message)
+            self.failures.retain(|note| {
+                !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                    || !chat::requires_sign_in(provider, &note.text)
             });
         }
-        if self.failures.iter().any(|(previous, message)| {
-            failure::same_prompt(provider, previous.as_deref(), anchor.as_deref())
-                && message == &notice
+        if let Some(note) = self.failures.iter_mut().find(|note| {
+            failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                && note.text == notice
         }) {
+            // The same failure recurring later in this exchange is still one
+            // notice, now after the work that produced it again.
+            if note.group != group {
+                note.group = group;
+                self.refresh_failure_ui();
+            }
             return;
         }
         if self.failures.len() == 32 {
             self.failures.remove(0);
         }
-        self.failures.push((anchor, notice));
+        self.failures.push(failure::Note {
+            message: anchor,
+            group,
+            text: notice,
+        });
         self.refresh_failure_ui();
     }
     /// Puts a first message that was never sent back in the composer, ahead
@@ -4288,9 +4302,9 @@ impl Runtime {
             && failure::same_prompt(self.session.launch.provider, current_anchor, next_anchor)
         {
             let provider = self.session.launch.provider;
-            self.failures.retain(|(anchor, message)| {
-                !failure::same_prompt(provider, anchor.as_deref(), current_anchor)
-                    || !chat::requires_sign_in(provider, message)
+            self.failures.retain(|note| {
+                !failure::same_prompt(provider, note.message.as_deref(), current_anchor)
+                    || !chat::requires_sign_in(provider, &note.text)
             });
         }
         let next_anchor = next_anchor.map(str::to_owned);
@@ -14371,7 +14385,7 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.failures, recorded);
         assert_ne!(
-            runtime.failures[0].0.as_ref(),
+            runtime.failures[0].group.as_ref(),
             runtime.turns.last().map(|turn| &turn.key)
         );
         assert!(runtime.snapshot.error.is_none());
@@ -22402,7 +22416,7 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|(_, notice)| notice.contains("does not offer gpt-b")),
+                .any(|note| note.text.contains("does not offer gpt-b")),
             "{:?}",
             runtime.failures
         );
@@ -22575,7 +22589,7 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|(_, notice)| notice.contains("acknowledgement timed out")),
+                .any(|note| note.text.contains("acknowledgement timed out")),
             "{:?}",
             runtime.failures
         );
@@ -25215,7 +25229,7 @@ mod tests {
         runtime.note(message.clone());
         assert_eq!(runtime.failures.len(), 1);
         runtime.error = Some(message.clone());
-        assert!(runtime.active_auth_notice(&runtime.failures[0].0, &message));
+        assert!(runtime.active_auth_notice(&runtime.failures[0].message, &message));
         // A later exchange must be able to report the same failure again.
         let next = chat::Item {
             id: "next-auth-exchange".into(),
@@ -25234,10 +25248,10 @@ mod tests {
         runtime.install_snapshot(Arc::new(snapshot), None);
         runtime.note(message.clone());
         assert_eq!(runtime.failures.len(), 2);
-        assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &message));
-        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &message));
+        assert!(!runtime.active_auth_notice(&runtime.failures[0].message, &message));
+        assert!(runtime.active_auth_notice(&runtime.failures[1].message, &message));
         runtime.error = None;
-        assert!(!runtime.active_auth_notice(&runtime.failures[1].0, &message));
+        assert!(!runtime.active_auth_notice(&runtime.failures[1].message, &message));
     }
     #[test]
     fn auth_recovery_requires_the_recipe_to_bind_a_known_account_home() {
@@ -25434,9 +25448,12 @@ mod tests {
         let current = runtime
             .notice_anchor(&runtime.snapshot, &runtime.turns)
             .map(str::to_owned);
-        runtime
-            .failures
-            .insert(0, (Some("older-exchange".into()), failure.into()));
+        let older = failure::Note {
+            message: Some("older-exchange".into()),
+            group: Some("older-exchange".into()),
+            text: failure.into(),
+        };
+        runtime.failures.insert(0, older.clone());
         runtime.note("Tool deployment failed with HTTP 401".into());
         runtime.note(chat::sign_in_verification_failure(
             failure,
@@ -25450,8 +25467,8 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .filter(|(anchor, message)| anchor == &current
-                    && chat::requires_sign_in(Provider::Codex, message))
+                .filter(|note| note.message == current
+                    && chat::requires_sign_in(Provider::Codex, &note.text))
                 .count(),
             1
         );
@@ -25463,16 +25480,10 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.snapshot.items, transcript);
         assert_eq!(runtime.failures.len(), 2);
-        assert_eq!(
-            runtime.failures[0],
-            (Some("older-exchange".into()), failure.into())
-        );
+        assert_eq!(runtime.failures[0], older);
         assert!(
-            runtime
-                .failures
-                .iter()
-                .any(|(anchor, message)| anchor == &current
-                    && message == "Tool deployment failed with HTTP 401")
+            runtime.failures.iter().any(|note| note.message == current
+                && note.text == "Tool deployment failed with HTTP 401")
         );
     }
 

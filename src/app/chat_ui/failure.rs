@@ -12,6 +12,19 @@ enum Source {
     Snapshot,
 }
 
+/// A notice kept in the transcript after its live source has gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Note {
+    /// The prompt message it concerns: its identity for deduplication,
+    /// incident scope and sign-in recovery.
+    pub message: Option<String>,
+    /// The key of the group it is drawn after, which was the transcript's
+    /// last when it was recorded. That can lie past the message's own
+    /// exchange, such as after work a delivery started.
+    pub group: Option<String>,
+    pub text: String,
+}
+
 pub(super) struct Incident {
     pub key: String,
     pub summary: String,
@@ -134,34 +147,51 @@ pub(super) fn same_prompt(provider: Provider, left: Option<&str>, right: Option<
     }
 }
 
-/// Where a retained note is drawn: the last group of its message's exchange,
-/// as when it was recorded. A note names its message for identity, while a
-/// reply can span several groups. After paging, a visible later part of the
-/// same message stands in for an absent first part. `None` when no visible
-/// prompt belongs to the note.
+/// The prompt items in `turn` that the reader typed, not deliveries.
+fn typed_prompt<'a>(runtime: &'a Runtime, turn: &'a turn::Turn) -> impl Iterator<Item = &'a str> {
+    turn.prompt.iter().filter_map(|index| {
+        runtime
+            .snapshot
+            .items
+            .get(*index)
+            .filter(|item| {
+                item.role == chat::Role::User
+                    && !matches!(item.content, ItemContent::Delivery { .. })
+            })
+            .map(|item| item.id.as_str())
+    })
+}
+
+/// Where a retained note is drawn: after the group recorded with it, while
+/// that group is visible. Once paging has re-keyed or removed that group, a
+/// visible part of the note's message stands in, and the note goes after
+/// the last visible group before the reader's next prompt. `None` when
+/// neither is visible, so the note never borrows another exchange.
 fn note_destination<'a>(
     runtime: &'a Runtime,
-    anchor: &str,
+    note: &'a Note,
     user_carriers: &HashMap<&str, String>,
 ) -> Option<&'a str> {
+    if let Some(group) = note.group.as_deref()
+        && runtime.turns.iter().any(|turn| turn.key == group)
+    {
+        return Some(group);
+    }
+    let anchor = note.message.as_deref()?;
     let provider = runtime.session.launch.provider;
     let carrier = attachment_draft::message_key(provider, anchor)
         .filter(|carrier| user_carriers.contains_key(carrier));
     let start = runtime.turns.iter().position(|turn| {
-        turn.prompt.iter().any(|index| {
-            runtime.snapshot.items.get(*index).is_some_and(|item| {
-                item.role == chat::Role::User
-                    && !matches!(item.content, ItemContent::Delivery { .. })
-                    && (item.id == anchor
-                        || carrier.is_some_and(|carrier| {
-                            attachment_draft::message_key(provider, &item.id) == Some(carrier)
-                        }))
-            })
+        typed_prompt(runtime, turn).any(|id| {
+            id == anchor
+                || carrier.is_some_and(|carrier| {
+                    attachment_draft::message_key(provider, id) == Some(carrier)
+                })
         })
     })?;
     let replies = runtime.turns[start + 1..]
         .iter()
-        .take_while(|turn| turn.prompt.is_empty())
+        .take_while(|turn| typed_prompt(runtime, turn).next().is_none())
         .count();
     Some(runtime.turns[start + replies].key.as_str())
 }
@@ -428,15 +458,14 @@ impl State {
             }
         }
 
-        for (index, (_, text)) in runtime.failures.iter().enumerate() {
-            if !runtime.expected_remote_close_error(text) {
+        for (index, note) in runtime.failures.iter().enumerate() {
+            if !runtime.expected_remote_close_error(&note.text) {
                 state.push(
                     provider,
-                    text,
+                    &note.text,
                     Source::Note(index),
                     false,
-                    runtime.failures[index]
-                        .0
+                    note.message
                         .as_deref()
                         .and_then(|id| {
                             contexts.get(id).or_else(|| {
@@ -483,10 +512,10 @@ impl State {
                 && incident.kind == Some(FailureKind::Authentication)
                 && incident.sources.iter().any(|source| match source {
                     Source::Local(_) | Source::Snapshot => true,
-                    Source::Note(index) => runtime.active_auth_notice(
-                        &runtime.failures[*index].0,
-                        &runtime.failures[*index].1,
-                    ),
+                    Source::Note(index) => {
+                        let note = &runtime.failures[*index];
+                        runtime.active_auth_notice(&note.message, &note.text)
+                    }
                     Source::Item(id) => contexts
                         .get(id.as_str())
                         .is_some_and(|owner| owner == &context),
@@ -537,11 +566,16 @@ impl State {
                         .iter()
                         .find_map(|source| match source {
                             Source::Note(index) => {
-                                Some(runtime.failures[*index].0.as_deref().map(|anchor| {
-                                    note_destination(runtime, anchor, &user_carriers)
-                                        .unwrap_or(anchor)
-                                        .to_owned()
-                                }))
+                                let note = &runtime.failures[*index];
+                                // An unresolved note keeps a key no visible
+                                // group has, which hides it; only a note
+                                // with no placement at all leads the transcript.
+                                Some(
+                                    note_destination(runtime, note, &user_carriers)
+                                        .or(note.group.as_deref())
+                                        .or(note.message.as_deref())
+                                        .map(str::to_owned),
+                                )
                             }
                             _ => None,
                         })
@@ -667,7 +701,7 @@ impl Runtime {
                 .iter()
                 .find(|child| &child.id == id)
                 .map(|child| child.detail.as_str()),
-            Source::Note(index) => self.failures.get(*index).map(|(_, text)| text.as_str()),
+            Source::Note(index) => self.failures.get(*index).map(|note| note.text.as_str()),
             Source::Local(raw) => Some(raw),
             Source::Snapshot => self.snapshot.error.as_deref(),
         }
@@ -961,6 +995,29 @@ mod tests {
         }
     }
 
+    fn delivery(id: &str, summary: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::User, "");
+        item.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: summary.into(),
+            body: String::new(),
+        };
+        item
+    }
+
+    fn tool(id: &str) -> chat::Item {
+        let mut item = text(id, chat::Role::Assistant, "");
+        item.content = ItemContent::Tool {
+            name: "Bash".into(),
+            input: "ls".into(),
+            output: String::new(),
+            status: chat::ToolStatus::Succeeded,
+        };
+        item
+    }
+
     fn live_fixture(provider: Provider, items: Vec<chat::Item>) -> (Runtime, Arc<ClientHandle>) {
         let session = fresh_chat_session(
             provider,
@@ -1034,8 +1091,15 @@ mod tests {
                 1,
                 "one notice per message, not per content part: {provider:?}"
             );
-            let key = runtime.failure_ui.incidents[0].key.clone();
+            let incident = &runtime.failure_ui.incidents[0];
+            assert_eq!(
+                incident.anchor.as_deref(),
+                Some(part(provider, message, 0).as_str()),
+                "drawn after the prompt's only group"
+            );
+            let key = incident.key.clone();
             assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw));
+            assert!(notice_visible(&mut runtime, &key));
 
             let revision = runtime.failure_ui.revision;
             runtime.refresh();
@@ -1047,20 +1111,13 @@ mod tests {
     fn notice_stays_below_a_reply_that_spans_several_groups() {
         let provider = Provider::Claude;
         let message = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-        let mut tool = text("reply-tool", chat::Role::Assistant, "");
-        tool.content = ItemContent::Tool {
-            name: "Bash".into(),
-            input: "ls".into(),
-            output: String::new(),
-            status: chat::ToolStatus::Succeeded,
-        };
         let (mut runtime, handle) = live_fixture(
             provider,
             vec![
                 text(&part(provider, message, 0), chat::Role::User, "Inspect"),
                 image(&part(provider, message, 1)),
                 text("reply-prose", chat::Role::Assistant, "Checking the images."),
-                tool,
+                tool("reply-tool"),
             ],
         );
         assert_eq!(
@@ -1088,6 +1145,73 @@ mod tests {
     }
 
     #[test]
+    fn notice_follows_work_that_a_delivery_started_after_the_prompt() {
+        let provider = Provider::Claude;
+        let message = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text(&part(provider, message, 0), chat::Role::User, "Inspect"),
+                image(&part(provider, message, 1)),
+                text(
+                    "reply",
+                    chat::Role::Assistant,
+                    "Started a background check.",
+                ),
+                delivery("finished", "Background command completed"),
+                tool("followup-tool"),
+                text("followup", chat::Role::Assistant, "Reviewing its output."),
+            ],
+        );
+        assert_eq!(
+            runtime.turns.last().map(|turn| turn.key.as_str()),
+            Some("finished"),
+            "the delivery opens the group of the work it prompted"
+        );
+        let raw = "Opaque provider failure";
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(
+            runtime.failures[0].message.as_deref(),
+            Some(part(provider, message, 0).as_str()),
+            "a delivery is not the reader's prompt"
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished"),
+            "below the delivery's work, where the reader is"
+        );
+
+        // The same failure recurring after more delivered work stays one
+        // notice and moves below that work.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-again", "Background command completed")),
+                Arc::new(text("more", chat::Role::Assistant, "Checking again.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failures.len(), 1);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+
+        // The reader's next prompt does not take the notice with it.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items
+                .push(Arc::new(text("next-message:0", chat::Role::User, "Next")));
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+    }
+
+    #[test]
     fn paged_out_first_part_keeps_the_notice_beside_the_remaining_part() {
         let provider = Provider::Claude;
         let message = "22222222-2222-4222-8222-222222222222";
@@ -1105,7 +1229,7 @@ mod tests {
             page.has_earlier = true;
             page.items.retain(|item| item.id == last);
         });
-        assert_eq!(runtime.failures[0].0.as_deref(), Some(first.as_str()));
+        assert_eq!(runtime.failures[0].message.as_deref(), Some(first.as_str()));
         assert_eq!(runtime.failure_ui.incidents.len(), 1);
         assert_eq!(runtime.failure_ui.incidents[0].key, key);
         assert_eq!(
@@ -1236,7 +1360,7 @@ mod tests {
             });
             assert_eq!(runtime.turns.len(), 1, "adjacent prompts share a turn");
             assert_eq!(
-                runtime.failures[0].0.as_deref(),
+                runtime.failures[0].message.as_deref(),
                 Some(part(provider, b, 0).as_str())
             );
             assert_eq!(runtime.failure_ui.incidents.len(), 1, "{provider:?}");
@@ -1278,7 +1402,10 @@ mod tests {
             publish_error(&mut runtime, &handle, raw);
             // The note belongs to the later item but displays on the turn
             // that contains it, keyed by the first item.
-            assert_eq!(runtime.failures[0].0.as_deref(), Some("legacy-second"));
+            assert_eq!(
+                runtime.failures[0].message.as_deref(),
+                Some("legacy-second")
+            );
             assert_eq!(
                 runtime.failure_ui.incidents[0].anchor.as_deref(),
                 Some("legacy-first")
@@ -1292,9 +1419,10 @@ mod tests {
                 "clearing the error keeps the retained note"
             );
 
-            // Without its item there is no proof of where the note belongs.
+            // Without its group or item there is no proof of where the
+            // note belongs.
             publish(&mut runtime, &handle, |next| {
-                next.items.retain(|item| item.id != "legacy-second");
+                next.items = vec![Arc::new(text("legacy-third", chat::Role::User, "Third"))];
             });
             assert!(!notice_visible(&mut runtime, &key), "{provider:?}");
         }
@@ -1332,16 +1460,20 @@ mod tests {
         assert_eq!(runtime.turns.len(), 1);
         assert_eq!(runtime.failures.len(), 2);
         assert_eq!(runtime.failures[0], first_note);
-        assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &runtime.failures[0].1));
-        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
+        let active = |runtime: &Runtime, index: usize| {
+            let note = &runtime.failures[index];
+            runtime.active_auth_notice(&note.message, &note.text)
+        };
+        assert!(!active(&runtime, 0));
+        assert!(active(&runtime, 1));
 
         // Paging B's first part away keeps B's scope for dedup and recovery.
         publish(&mut runtime, &handle, |page| {
             page.has_earlier = true;
             page.items.retain(|item| item.id == part(provider, b, 1));
         });
-        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
-        runtime.note(runtime.failures[1].1.clone());
+        assert!(active(&runtime, 1));
+        runtime.note(runtime.failures[1].text.clone());
         assert_eq!(runtime.failures.len(), 2);
 
         publish(&mut runtime, &handle, |next| {

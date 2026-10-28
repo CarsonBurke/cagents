@@ -10838,10 +10838,13 @@ mod tests {
             "Repeated failure\n{}\nHIDDEN_DIAGNOSTIC_END",
             "original raw bytes ".repeat(8192)
         );
-        runtime.failures = vec![
-            (Some(first.clone()), raw.clone()),
-            (Some(second.clone()), raw.clone()),
-        ];
+        runtime.failures = [&first, &second]
+            .map(|key| failure::Note {
+                message: Some(key.clone()),
+                group: Some(key.clone()),
+                text: raw.clone(),
+            })
+            .into();
         runtime.error = Some("Current failure".into());
         runtime.refresh_failure_ui();
         let keys: Vec<_> = runtime
@@ -10898,7 +10901,7 @@ mod tests {
         );
         // A same-anchor source replacement must retire the old preview and
         // its catalog identity, rather than keep invisible original bytes.
-        runtime.failures[0].1 = "Replacement failure at the original first prompt".into();
+        runtime.failures[0].text = "Replacement failure at the original first prompt".into();
         runtime.refresh_failure_ui();
         let (replacement, _) = runtime.selection_document();
         assert!(
@@ -10920,7 +10923,7 @@ mod tests {
                 .iter()
                 .any(|incident| incident.anchor.as_ref() == Some(&first)
                     && runtime.failure_details(&incident.key).as_deref()
-                        == Some(runtime.failures[0].1.as_str()))
+                        == Some(runtime.failures[0].text.as_str()))
         );
     }
 
