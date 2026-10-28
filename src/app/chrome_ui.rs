@@ -67,6 +67,7 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    include!("chrome_ui/notice_actions_tests.rs");
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -1340,6 +1341,10 @@ impl State {
         self.popup.is_some() || self.rename.is_some()
     }
 
+    pub(super) fn notices_are_open(&self) -> bool {
+        self.popup == Some(Popup::Notices)
+    }
+
     pub(super) fn close(&mut self) {
         self.popup = None;
     }
@@ -1560,6 +1565,7 @@ const NOTICES_CONTROL_ID: &str = "chrome.notices";
 const RETIRING_NOTICES_ID: &str = "chrome.notices.retiring";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
+const POPUP_SCROLL_ID: &str = "chrome.popup.scroll";
 
 /// Check ownership and transfer focus in one runtime operation chain. An
 /// asynchronous boolean reply would become stale if another field, dialog or
@@ -1624,6 +1630,84 @@ fn notice_expiry_stream(
 
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
+}
+
+fn notice_details_id(id: u64) -> String {
+    format!("chrome.notices.details.{id}")
+}
+
+fn notice_open_id(id: u64) -> String {
+    format!("chrome.notices.open.{id}")
+}
+
+/// Focus the current control, then reveal its actual bounds in the popup body.
+/// Header controls are outside that body and must preserve the reader's offset.
+fn focus_and_reveal_popup_control<T: Send + 'static>(id: widget::Id) -> iced::Task<T> {
+    use iced::advanced::widget::{Operation, operation};
+
+    struct FocusControl {
+        id: widget::Id,
+        bounds: Option<iced::Rectangle>,
+    }
+    impl<T: 'static> Operation<T> for FocusControl {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if id == Some(&self.id) {
+                state.focus();
+                self.bounds = Some(bounds);
+            } else {
+                state.unfocus();
+            }
+        }
+        fn finish(&self) -> operation::Outcome<T> {
+            self.bounds.map_or(operation::Outcome::None, |bounds| {
+                operation::Outcome::Chain(Box::new(RevealControl { bounds }))
+            })
+        }
+    }
+    struct RevealControl {
+        bounds: iced::Rectangle,
+    }
+    impl<T> Operation<T> for RevealControl {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            translation: iced::Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id != Some(&widget::Id::new(POPUP_SCROLL_ID)) || !content.intersects(&self.bounds) {
+                return;
+            }
+            let control = self.bounds - translation;
+            let delta = if control.y < bounds.y || control.height > bounds.height {
+                control.y - bounds.y
+            } else if control.y + control.height > bounds.y + bounds.height {
+                control.y + control.height - bounds.y - bounds.height
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                state.scroll_by(
+                    operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                    bounds,
+                    content,
+                );
+            }
+        }
+    }
+    iced::advanced::widget::operate(FocusControl { id, bounds: None })
 }
 
 fn command<'a>(
@@ -1731,11 +1815,15 @@ impl Cagents {
                     ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
                 }
                 ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
-                ring.extend(
-                    self.notices
-                        .recent()
-                        .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
-                );
+                for entry in self.notices.recent() {
+                    if self.notice_card_target(entry.id).is_some() {
+                        ring.push(Cow::Owned(notice_open_id(entry.id)));
+                    }
+                    if entry.notice.details.is_some() {
+                        ring.push(Cow::Owned(notice_details_id(entry.id)));
+                    }
+                    ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
+                }
                 // In the order the notices draw them: the lane's own notice,
                 // then the refused writes. Only one of them offers a retry.
                 let health = self.save_health.as_ref();
@@ -1763,7 +1851,7 @@ impl Cagents {
         };
         self.chrome_ui.focus_index = self.chrome_ui.focus_index.min(last);
         let id = ring[self.chrome_ui.focus_index].clone();
-        iced::widget::operation::focus(widget::Id::new(id)).map(cosmic::Action::App)
+        focus_and_reveal_popup_control(widget::Id::new(id)).map(cosmic::Action::App)
     }
 
     /// Gives an open popup sole ownership of Tab, and hands it back to the
@@ -2444,8 +2532,49 @@ impl Cagents {
                 for entry in self.notices.recent() {
                     let severity = entry.notice.severity;
                     let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    let mut actions = Vec::new();
+                    if let Some(card) = self.notice_card_target(entry.id) {
+                        let name = self
+                            .notice_pane_name(card)
+                            .unwrap_or_else(|| "the related pane".into());
+                        actions.push(super::notice_surface_action(
+                            severity,
+                            "Open pane",
+                            format!("Open {name}"),
+                            widget::Id::new(notice_open_id(entry.id)),
+                            Message::OpenNoticePane(entry.id),
+                        ));
+                    }
+                    if entry.notice.details.is_some() {
+                        actions.push(super::notice_surface_action(
+                            severity,
+                            if entry.details_open {
+                                "Collapse details"
+                            } else {
+                                "Expand details"
+                            },
+                            if entry.details_open {
+                                "Collapse diagnostic details"
+                            } else {
+                                "Expand full diagnostic details"
+                            },
+                            widget::Id::new(notice_details_id(entry.id)),
+                            Message::ToggleNoticeDetails(entry.id),
+                        ));
+                    }
+                    if !actions.is_empty() {
+                        lines.push(
+                            widget::column::with_children(actions)
+                                .spacing(space::XS)
+                                .into(),
+                        );
+                    }
                     if let Some(details) = &entry.notice.details {
-                        lines.push(super::notice_surface_details(severity, details));
+                        lines.push(if entry.details_open {
+                            super::notice_surface_detail(severity, details)
+                        } else {
+                            super::notice_surface_details(severity, details)
+                        });
                     }
                     if entry.repeats > 1 {
                         lines.push(super::notice_surface_detail(
@@ -2524,6 +2653,7 @@ impl Cagents {
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
+                        .id(widget::Id::new(POPUP_SCROLL_ID))
                         .height(Length::Shrink)
                         .into(),
                     ])

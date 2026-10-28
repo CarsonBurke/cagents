@@ -15,6 +15,8 @@ cargo fmt --check || cargo_status=$?
 included_status=0
 rustfmt --edition 2024 --check \
     src/modules.rs \
+    src/app/chat_ui/notice_actions_tests.rs \
+    src/app/chrome_ui/notice_actions_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
     tests/support/iced_tree.rs \

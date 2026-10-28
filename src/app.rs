@@ -319,6 +319,8 @@ const NOTICE_SUCCESS_LIFETIME: Duration = Duration::from_secs(6);
 struct LoggedNotice {
     id: u64,
     notice: TransientNotice,
+    /// Local disclosure belongs to this report's identity, not its key.
+    details_open: bool,
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
@@ -377,6 +379,7 @@ impl NoticeLog {
         self.entries.push_back(LoggedNotice {
             id: self.next_id,
             notice,
+            details_open: false,
             repeats: 1,
             expires_at,
         });
@@ -811,7 +814,7 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
 fn notice_surface_action<'a>(
     severity: NoticeSeverity,
     label: &'a str,
-    accessible_name: &'a str,
+    accessible_name: impl Into<std::borrow::Cow<'a, str>>,
     id: widget::Id,
     message: Message,
 ) -> Element<'a, Message> {
@@ -4612,6 +4615,10 @@ pub enum Message {
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
+    /// Expands exactly the diagnostic report the reader activated.
+    ToggleNoticeDetails(u64),
+    /// Reveals the live pane still identified by this report's typed key.
+    OpenNoticePane(u64),
     DismissAllNotices,
     /// The earliest confirmation in the notice log is due to retire.
     ExpireNotices,
@@ -11919,6 +11926,23 @@ impl Cagents {
             .map(|state| format!("“{}”", self.repository_chrome(state).0))
     }
 
+    fn notice_card_target(&self, notice: u64) -> Option<CardId> {
+        let entry = self
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.id == notice)?;
+        let NoticeKey::ChatAttach(card) = entry.notice.key? else {
+            return None;
+        };
+        self.card_state(card)
+            .filter(|state| {
+                state.existence.is_open()
+                    && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
+            })
+            .map(|state| state.id)
+    }
+
     /// Withdraws reports about cards that are gone. A card leaves by many
     /// paths - a close, a deleted worktree or channel, a sign-in's terminal
     /// retiring, another client removing a shared pane - so this holds for
@@ -17431,6 +17455,42 @@ impl Application for Cagents {
                 self.notices.dismiss(id);
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
+            }
+            Message::ToggleNoticeDetails(id) => {
+                if !self.chrome_ui.notices_are_open()
+                    || self.modal_is_open()
+                {
+                    return Task::none();
+                }
+                if let Some(entry) = self
+                    .notices
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.id == id && entry.notice.details.is_some())
+                {
+                    entry.details_open = !entry.details_open;
+                }
+                Task::none()
+            }
+            Message::OpenNoticePane(id) => {
+                if !self.chrome_ui.notices_are_open()
+                    || self.modal_is_open()
+                    || self.exit.is_some()
+                    || self.focused_repository_is_saving()
+                    || self.update_prepared
+                    || self.context_inspector_is_overlay()
+                    || self.palette.is_open()
+                {
+                    return Task::none();
+                }
+                let Some(card) = self.notice_card_target(id) else {
+                    return Task::none();
+                };
+                // Use the existing scope/protection-aware pane navigation,
+                // including Work's captured leave/cancel path. Closing this
+                // popup must not queue a header focus over the destination.
+                self.chrome_ui.close();
+                self.update(Message::Palette(palette_ui::Action::FocusPane(card)))
             }
             Message::ExpireNotices => {
                 // Nothing is due while the countdown is paused, which also
