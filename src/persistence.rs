@@ -12055,111 +12055,197 @@ mod tests {
 
     #[test]
     fn closed_identity_lookup_uses_only_its_indexed_lineage_after_reopen() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("state.sqlite3");
-        let boot_id = boot("indexed-closure");
-        let store = StateStore::open(&path, boot_id.clone()).unwrap();
-        let mut state = workspace_with_terminal(&boot_id);
-        let CardKind::Terminal(source) = &mut state.cards[0].kind else {
-            unreachable!()
-        };
-        source.resume_hint = None;
-        source.launch.program = "/bin/sh".into();
-        source.launch.arguments = vec!["-c".into(), "true".into()];
-        let CardKind::Terminal(first) = state.cards[0].kind.clone() else {
-            unreachable!()
-        };
-        let mut second = state.cards[0].clone();
-        second.id = CardId::new();
-        let CardKind::Terminal(second_terminal) = &mut second.kind else {
-            unreachable!()
-        };
-        second_terminal.id = TerminalId::new();
-        let second_root = second_terminal.id;
-        state.cards.push(second);
-        for card in &mut state.cards {
-            card.existence = closed_by_user();
-        }
-        state.focused = None;
-        SaveLane::default().save(&store, &state).unwrap();
-        // An unrelated damaged historical payload cannot be a reason to scan
-        // and decode all history while opening or checking another identity.
-        store
-            .lock_inner()
-            .unwrap()
-            .connection
-            .execute(
-                "UPDATE closed_terminal_claim_keys SET claim_json='{invalid' WHERE terminal_id=?1",
-                [second_root.to_string()],
-            )
-            .unwrap();
-        store.shutdown().unwrap();
-        drop(store);
-        let store = StateStore::open(&path, boot_id.clone()).unwrap();
-        let mut hosted = first.clone();
-        hosted.id = TerminalId::new();
-        hosted.recovery_origin = Some(first.id);
-        hosted.continuity = TerminalContinuity::Live {
-            host_session_id: HostSessionId::new("new"),
-            boot_id,
-            host_incarnation: HostIncarnation::new("new"),
-        };
-        assert_eq!(store.cached_closure(&ClosureQuery::terminal(&hosted)), None);
-        assert!(store.terminal_was_closed(&hosted));
-        assert!(!store.has_unknown_closed_claims());
-        hosted.launch.arguments.push("different-content".into());
-        assert_eq!(
-            store.cached_closure(&ClosureQuery::terminal(&hosted)),
-            None,
-            "an answer cannot be relabelled with another recovery recipe"
-        );
-        assert!(!store.terminal_was_closed(&hosted));
-        let inner = store.lock_inner().unwrap();
-        for (sql, index) in [
-            (
-                "EXPLAIN QUERY PLAN SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1",
-                "closed_terminal_claim_keys_id",
-            ),
-            (
-                "EXPLAIN QUERY PLAN SELECT claim_json FROM closed_terminal_claim_keys WHERE lineage_root=?1",
-                "closed_terminal_claim_keys_root",
-            ),
+        // Both faults keep SQLite's STRICT TEXT storage class. Invalid UTF-8
+        // fails String extraction before JSON parsing and must still quarantine.
+        for damage_sql in [
+            "UPDATE closed_terminal_claim_keys SET claim_json='{invalid' WHERE terminal_id=?1",
+            "UPDATE closed_terminal_claim_keys SET claim_json=CAST(X'80' AS TEXT) WHERE terminal_id=?1",
         ] {
-            let plans = inner
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("state.sqlite3");
+            let boot_id = boot("indexed-closure");
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            let mut state = workspace_with_terminal(&boot_id);
+            let CardKind::Terminal(source) = &mut state.cards[0].kind else {
+                unreachable!()
+            };
+            source.resume_hint = None;
+            source.launch.program = "/bin/sh".into();
+            source.launch.arguments = vec!["-c".into(), "true".into()];
+            let CardKind::Terminal(first) = state.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let mut second = state.cards[0].clone();
+            second.id = CardId::new();
+            let CardKind::Terminal(second_terminal) = &mut second.kind else {
+                unreachable!()
+            };
+            second_terminal.id = TerminalId::new();
+            let second_root = second_terminal.id;
+            state.cards.push(second);
+            for card in &mut state.cards {
+                card.existence = closed_by_user();
+            }
+            state.focused = None;
+            SaveLane::default().save(&store, &state).unwrap();
+            // An unrelated damaged historical payload cannot be a reason to scan
+            // and decode all history while opening or checking another identity.
+            store
+                .lock_inner()
+                .unwrap()
                 .connection
-                .prepare(sql)
-                .unwrap()
-                .query_map([first.id.to_string()], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
+                .execute(damage_sql, [second_root.to_string()])
                 .unwrap();
-            assert!(plans.iter().any(|plan| plan.contains(index)), "{plans:?}");
-        }
-        drop(inner);
-        hosted.recovery_origin = Some(second_root);
-        assert!(
-            store.terminal_was_closed(&hosted),
-            "the actually requested damaged lineage refuses"
-        );
-        assert!(store.has_unknown_closed_claims());
-        hosted.recovery_origin = Some(TerminalId::new());
-        assert!(
-            store.terminal_was_closed(&hosted),
-            "a failed canonical read cannot heal through another request"
-        );
-        let cards = [
-            ClosureQuery::Card(CardId::new()),
-            ClosureQuery::Card(CardId::new()),
-        ];
-        for query in &cards {
-            assert!(!store.resolve_closure(query.clone()).unwrap());
-        }
-        for query in &cards {
+            store.shutdown().unwrap();
+            drop(store);
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            let mut hosted = first.clone();
+            hosted.id = TerminalId::new();
+            hosted.recovery_origin = Some(first.id);
+            hosted.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new("new"),
+                boot_id,
+                host_incarnation: HostIncarnation::new("new"),
+            };
+            assert_eq!(store.cached_closure(&ClosureQuery::terminal(&hosted)), None);
+            assert!(store.terminal_was_closed(&hosted));
+            assert!(!store.has_unknown_closed_claims());
+            hosted.launch.arguments.push("different-content".into());
             assert_eq!(
-                store.cached_closure(query),
-                Some(false),
-                "sticky terminal quarantine cannot evict unrelated card answers repeatedly"
+                store.cached_closure(&ClosureQuery::terminal(&hosted)),
+                None,
+                "an answer cannot be relabelled with another recovery recipe"
             );
+            assert!(!store.terminal_was_closed(&hosted));
+            let inner = store.lock_inner().unwrap();
+            for (sql, index) in [
+                (
+                    "EXPLAIN QUERY PLAN SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1",
+                    "closed_terminal_claim_keys_id",
+                ),
+                (
+                    "EXPLAIN QUERY PLAN SELECT claim_json FROM closed_terminal_claim_keys WHERE lineage_root=?1",
+                    "closed_terminal_claim_keys_root",
+                ),
+            ] {
+                let plans = inner
+                    .connection
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([first.id.to_string()], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(plans.iter().any(|plan| plan.contains(index)), "{plans:?}");
+            }
+            drop(inner);
+            hosted.recovery_origin = Some(second_root);
+            assert!(
+                store.terminal_was_closed(&hosted),
+                "the actually requested damaged lineage refuses"
+            );
+            assert!(store.has_unknown_closed_claims());
+            hosted.recovery_origin = Some(TerminalId::new());
+            assert!(
+                store.terminal_was_closed(&hosted),
+                "a failed canonical read cannot heal through another request"
+            );
+            let cards = [
+                ClosureQuery::Card(CardId::new()),
+                ClosureQuery::Card(CardId::new()),
+            ];
+            for query in &cards {
+                assert!(!store.resolve_closure(query.clone()).unwrap());
+            }
+            for query in &cards {
+                assert_eq!(
+                    store.cached_closure(query),
+                    Some(false),
+                    "sticky terminal quarantine cannot evict unrelated card answers repeatedly"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operational_lookup_refusal_does_not_quarantine_unrelated_terminals() {
+        for before_stamp in [true, false] {
+            let directory = tempdir().unwrap();
+            let boot_id = boot("closure-operational-refusal");
+            let store =
+                StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+            let mut state = workspace_with_terminal(&boot_id);
+            let terminal = match &state.cards[0].kind {
+                CardKind::Terminal(session) => session.clone(),
+                _ => unreachable!(),
+            };
+            let closed = state.cards[0].id;
+            if !before_stamp {
+                // A real earlier close makes the ordinary zero-history fast
+                // negative unavailable. No terminal attribution is damaged.
+                state.cards[0].kind = CardKind::Settings;
+                state.cards[0].existence = closed_by_user();
+                state.focused = None;
+                SaveLane::default().save(&store, &state).unwrap();
+            }
+            let refused = ClosureQuery::Card(CardId::new());
+            assert_eq!(
+                store.cached_closure(&refused),
+                before_stamp.then_some(false)
+            );
+            let (break_sql, restore_sql) = if before_stamp {
+                (
+                    "ALTER TABLE closed_cards RENAME TO closed_cards_fault",
+                    "ALTER TABLE closed_cards_fault RENAME TO closed_cards",
+                )
+            } else {
+                // MAX(sequence) remains readable, but the requested Card
+                // lookup fails. Restore the exact original column and rows.
+                (
+                    "ALTER TABLE closed_cards RENAME COLUMN card_id TO card_id_fault",
+                    "ALTER TABLE closed_cards RENAME COLUMN card_id_fault TO card_id",
+                )
+            };
+            // Deterministic query-fault injection, not a claim that WAL readers
+            // block behind an ordinary BEGIN IMMEDIATE writer.
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(break_sql)
+                .unwrap();
+            assert!(store.resolve_closure(refused.clone()).is_err());
+            assert_eq!(store.cached_closure_result(&refused), Some(Err(())));
+            assert!(
+                !store.has_unknown_closed_claims(),
+                "an operational Card/stamp error is not corrupt terminal attribution"
+            );
+            let unrelated = ClosureQuery::terminal(&terminal);
+            assert_eq!(
+                store.cached_closure_result(&unrelated),
+                None,
+                "an unverified stamp must not reuse seq0/cached negatives; unrelated work must seek real authority"
+            );
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(restore_sql)
+                .unwrap();
+            assert_eq!(store.cached_closure_result(&refused), Some(Err(())));
+            assert_eq!(store.cached_closure_result(&unrelated), None);
+            assert!(!store.resolve_closure(unrelated.clone()).unwrap());
+            assert_eq!(store.cached_closure_result(&unrelated), Some(Ok(false)));
+            assert_eq!(
+                store.cached_closure_result(&refused),
+                Some(Err(())),
+                "a different healthy request cannot automatically retry the exact failed request"
+            );
+            if !before_stamp {
+                assert!(store.resolve_closure(ClosureQuery::Card(closed)).unwrap());
+            }
+            assert!(!store.has_unknown_closed_claims());
+            store.shutdown().unwrap();
         }
     }
 

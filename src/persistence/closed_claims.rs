@@ -163,6 +163,9 @@ impl ClosureStamp {
 
 pub(super) struct ClosedAuthority {
     stamp: ClosureStamp,
+    // A failed stamp read withdraws all cached negatives until a fresh
+    // observation succeeds. This is not damaged-attribution quarantine.
+    stamp_verified: bool,
     // Contains answers only for identities actually requested in this process.
     // A new closure discards answers before its transaction can commit.
     answers: HashMap<ClosureKey, (ClosureQuery, std::result::Result<bool, ()>)>,
@@ -173,16 +176,29 @@ impl ClosedAuthority {
     pub(super) fn open(connection: &Connection) -> Result<Self> {
         Ok(Self {
             stamp: ClosureStamp::read(connection)?,
+            stamp_verified: true,
             answers: HashMap::new(),
             changed: false,
             pending_commit: false,
         })
     }
+    fn invalidate_answers(&mut self) {
+        // A changed/unverified stamp revokes successful observations, while
+        // exact refusals still require a changed request rather than a retry.
+        self.answers.retain(|_, (_, result)| result.is_err());
+    }
     fn lookup(&self, query: &ClosureQuery) -> Option<std::result::Result<bool, ()>> {
         if matches!(query, ClosureQuery::Terminal(_)) && self.stamp.unknown {
             return Some(Err(()));
         }
-        if self.pending_commit {
+        // An exact failed request is refused, not automatically retried by
+        // another query or a stamp refresh.
+        if let Some((receipt, Err(()))) = self.answers.get(&query.key())
+            && receipt == query
+        {
+            return Some(Err(()));
+        }
+        if self.pending_commit || !self.stamp_verified {
             return None;
         }
         if let Some((receipt, closed)) = self.answers.get(&query.key()) {
@@ -191,6 +207,19 @@ impl ClosedAuthority {
             }
         }
         (self.stamp.sequence == 0).then_some(Ok(false))
+    }
+}
+
+/// Operational lookup errors refuse only their exact request. A decoded
+/// attribution failure must still quarantine all terminal discovery.
+#[derive(Debug)]
+enum ClosureLookupFailure {
+    Operational(StoreError),
+    Attribution(StoreError),
+}
+impl From<rusqlite::Error> for ClosureLookupFailure {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Operational(error.into())
     }
 }
 
@@ -208,7 +237,7 @@ impl StateStore {
             .map_err(|_| StoreError::MutexPoisoned)?;
         if stamp.sequence != authority.stamp.sequence || (stamp.unknown && !authority.stamp.unknown)
         {
-            authority.answers.clear();
+            authority.invalidate_answers();
             // Never publish an uncommitted sequence: a rolled-back sequence
             // may later be reused by the actual next closure.
             authority.pending_commit = true;
@@ -223,6 +252,7 @@ impl StateStore {
             .map_err(|_| StoreError::MutexPoisoned)?;
         authority.stamp.sequence = stamp.sequence;
         authority.stamp.unknown |= stamp.unknown;
+        authority.stamp_verified = true;
         authority.pending_commit = false;
         Ok(())
     }
@@ -256,7 +286,8 @@ impl StateStore {
             Ok(inner) => inner,
             Err(error) => {
                 if let Ok(mut authority) = self.closed_authority.write() {
-                    authority.stamp.unknown = true;
+                    authority.stamp_verified = false;
+                    authority.invalidate_answers();
                     authority.answers.insert(query.key(), (query, Err(())));
                     authority.changed = true;
                 }
@@ -264,6 +295,7 @@ impl StateStore {
             }
         };
         let mut actual_stamp = None;
+        let mut attribution_failed = false;
         let result = ensure_open(&inner).and_then(|_| {
             let stamp = ClosureStamp::read(&inner.connection)?;
             actual_stamp = Some(stamp);
@@ -273,6 +305,13 @@ impl StateStore {
                 ));
             }
             self.query_closure(&inner.connection, &query)
+                .map_err(|failure| match failure {
+                    ClosureLookupFailure::Operational(error) => error,
+                    ClosureLookupFailure::Attribution(error) => {
+                        attribution_failed = true;
+                        error
+                    }
+                })
         });
         let mut authority = self
             .closed_authority
@@ -282,15 +321,17 @@ impl StateStore {
             if stamp.sequence != authority.stamp.sequence
                 || (stamp.unknown && !authority.stamp.unknown)
             {
-                authority.answers.clear();
+                authority.invalidate_answers();
             }
             authority.stamp.sequence = stamp.sequence;
             authority.stamp.unknown |= stamp.unknown;
+            authority.stamp_verified = true;
+        } else {
+            authority.stamp_verified = false;
+            authority.invalidate_answers();
         }
         authority.pending_commit = false;
-        if result.is_err() {
-            authority.stamp.unknown = true;
-        }
+        authority.stamp.unknown |= attribution_failed;
         authority.answers.insert(
             query.key(),
             (query, result.as_ref().copied().map_err(|_| ())),
@@ -298,16 +339,20 @@ impl StateStore {
         authority.changed = true;
         result
     }
-    fn query_closure(&self, connection: &Connection, query: &ClosureQuery) -> Result<bool> {
+    fn query_closure(
+        &self,
+        connection: &Connection,
+        query: &ClosureQuery,
+    ) -> std::result::Result<bool, ClosureLookupFailure> {
         match query {
             ClosureQuery::Card(id) => Ok(connection
                 .prepare_cached("SELECT EXISTS(SELECT 1 FROM closed_cards WHERE card_id=?1)")?
                 .query_row([id.to_string()], |row| row.get(0))?),
             ClosureQuery::Terminal(receipt) => {
                 if self.has_unknown_closed_claims() {
-                    return Err(StoreError::InvalidState(
+                    return Err(ClosureLookupFailure::Attribution(StoreError::InvalidState(
                         "closed terminal attribution is unavailable".into(),
-                    ));
+                    )));
                 }
                 if connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1)")?
                     .query_row([receipt.id.to_string()], |row| row.get::<_, bool>(0))? { return Ok(true); }
@@ -317,10 +362,15 @@ impl StateStore {
                 let mut statement = connection.prepare_cached(
                     "SELECT claim_json FROM closed_terminal_claim_keys WHERE lineage_root=?1",
                 )?;
-                let rows =
-                    statement.query_map([root.to_string()], |row| row.get::<_, String>(0))?;
-                for row in rows {
-                    let claim: ClosedTerminalClaim = from_json("closed terminal claim", &row?)?;
+                let mut rows = statement.query([root.to_string()])?;
+                while let Some(row) = rows.next()? {
+                    // Reading a row can fail operationally; decoding its stored
+                    // claim is attribution damage, including invalid UTF-8 TEXT.
+                    let json: String = row
+                        .get(0)
+                        .map_err(|error| ClosureLookupFailure::Attribution(error.into()))?;
+                    let claim: ClosedTerminalClaim = from_json("closed terminal claim", &json)
+                        .map_err(ClosureLookupFailure::Attribution)?;
                     if claim.proof.is_some()
                         && claim.proof != receipt.proof
                         && receipt.origin == Some(claim.origin.unwrap_or(claim.id))
