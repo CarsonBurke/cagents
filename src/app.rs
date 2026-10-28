@@ -16914,7 +16914,9 @@ impl Application for Cagents {
                                     chat_ui::images::ImageCommand::Copy,
                                 ));
                             }
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            // Escape that dismissed the viewer's context menu
+                            // arrives captured and leaves the viewer open.
+                            keyboard::Key::Named(keyboard::key::Named::Escape) if !captured => {
                                 self.chat_ui.image_viewer = None
                             }
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {

@@ -51,10 +51,12 @@ pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
 /// native widget stores one `MenuState` per open level, and its `MenuBounds`
 /// holds a position and a size per item of the list that level was opened on.
 /// Our menus are flat, so the top-level item count is their entire shape.
-/// Retain the click in window space as well, to size the popup's anchor.
+/// Retain the click in window space as well, to size the popup's anchor, and
+/// whether the last overlay pass found the menu open.
 struct MenuItems {
     count: usize,
     anchor: Point,
+    open: bool,
 }
 
 struct MenuSurface<'a, Message> {
@@ -102,6 +104,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         tree::State::new(MenuItems {
             count: self.items,
             anchor: Point::ORIGIN,
+            open: false,
         })
     }
 
@@ -183,6 +186,19 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             }
             self.native.diff(&mut tree.children[0]);
         }
+        // The native widget closes an open menu on Escape but leaves the key
+        // uncaptured, so the dialog or pane beneath would also take it as its
+        // own Escape. The menu is what Escape dismisses; claim it for the menu.
+        let dismissing = tree.state.downcast_ref::<MenuItems>().open
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Escape
+                    ),
+                    ..
+                })
+            );
         // The native widget records the anchor it opens at from this cursor,
         // and the runtime drives the overlay it returns in window space. A
         // scrollable, though, hands its content an untranslated layout and a
@@ -223,6 +239,11 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         );
         if opening {
             shell.invalidate_layout();
+            shell.request_redraw();
+        }
+        if dismissing {
+            tree.state.downcast_mut::<MenuItems>().open = false;
+            shell.capture_event();
             shell.request_redraw();
         }
     }
@@ -291,6 +312,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             viewport,
             Vector::ZERO,
         );
+        tree.state.downcast_mut::<MenuItems>().open = native.is_some();
         if native.is_none() && self.builder.is_some() {
             tree.state.downcast_mut::<MenuItems>().count = 0;
             self.items = 0;
@@ -311,6 +333,82 @@ mod tests {
         type Message = ();
 
         fn message(&self) {}
+    }
+
+    #[test]
+    fn escape_that_dismisses_the_menu_is_not_left_for_the_surface_beneath() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless renderer");
+        let window = Size::new(400.0, 400.0);
+        let viewport = Rectangle::new(Point::ORIGIN, window);
+        let mut element: Element<'_, ()> = surface(widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![widget::menu::Item::Button("Action", None, Action)],
+        ));
+        let widget = element.as_widget_mut();
+        let mut tree = Tree::new(&*widget);
+        widget.diff(&mut tree);
+        let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+        let cursor = mouse::Cursor::Available(Point::new(40.0, 40.0));
+        let escape = Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+            key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+            modified_key: cosmic::iced::keyboard::Key::Named(
+                cosmic::iced::keyboard::key::Named::Escape,
+            ),
+            physical_key: cosmic::iced::keyboard::key::Physical::Code(
+                cosmic::iced::keyboard::key::Code::Escape,
+            ),
+            location: cosmic::iced::keyboard::Location::Standard,
+            modifiers: cosmic::iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut send = |widget: &mut dyn Widget<(), Theme, Renderer>,
+                        tree: &mut Tree,
+                        event: &Event| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            widget.update(
+                tree,
+                event,
+                Layout::new(&row),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            shell.is_event_captured()
+        };
+        // A closed menu leaves Escape to whatever owns it.
+        assert!(!send(widget, &mut tree, &escape));
+        send(
+            widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+        );
+        assert!(
+            widget
+                .overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO)
+                .is_some(),
+            "opened menu"
+        );
+        assert!(send(widget, &mut tree, &escape), "Escape closed the menu");
+        assert!(
+            widget
+                .overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO)
+                .is_none(),
+            "the menu is closed"
+        );
+        assert!(!send(widget, &mut tree, &escape));
     }
 
     #[test]

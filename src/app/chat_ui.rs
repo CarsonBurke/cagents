@@ -12224,6 +12224,27 @@ mod tests {
         assert_eq!(copied(&mut app, effects), ["image/png"]);
         assert_eq!(notice(&app).1, "Copied image");
         assert!(app.chat_ui.image_viewer.is_some(), "copying keeps the viewer open");
+
+        // Escape that its context menu claimed closes only the menu.
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.update(Message::KeyEvent {
+            event: escape.clone(),
+            captured: true,
+        }));
+        assert!(app.chat_ui.image_viewer.is_some());
+        drop(app.update(Message::KeyEvent {
+            event: escape,
+            captured: false,
+        }));
+        assert!(app.chat_ui.image_viewer.is_none());
     }
 
     #[test]
