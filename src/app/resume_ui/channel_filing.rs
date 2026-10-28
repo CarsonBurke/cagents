@@ -142,6 +142,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_launch_directory(None)
+        }
+
+        fn with_launch_directory(launch_directory: Option<PathBuf>) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -152,7 +156,7 @@ mod tests {
             let mut session = chat::fresh_session(
                 Provider::Claude,
                 TerminalId::new(),
-                root.clone(),
+                launch_directory.unwrap_or_else(|| root.clone()),
                 &crate::account::Account::system(Provider::Claude),
             )
             .unwrap();
@@ -651,23 +655,43 @@ mod tests {
         // directory disappears. A usable remembered Q may display it, without
         // rewriting P or executing any provider task in this headless fixture.
         for remembered_available in [true, false] {
-            let mut fixture = Fixture::new();
             // Separate from Q's tree, so old scope-root discovery cannot
             // silently substitute an existing ancestor for the missing P.
             let original_directory = tempfile::tempdir().unwrap();
             let original = original_directory.path().to_path_buf();
-            let CardKind::Chat(session) = &mut fixture
-                .app
-                .card_state_mut(fixture.conversation)
-                .unwrap()
-                .kind
+            // Launch identity is immutable after the first save. Start with P;
+            // changing it later would correctly tombstone the original recipe.
+            let mut fixture = Fixture::with_launch_directory(Some(original.clone()));
+            let CardKind::Chat(session) =
+                &fixture.app.card_state(fixture.conversation).unwrap().kind
             else {
                 panic!("chat")
             };
-            session.launch.recipe.working_directory = original.clone();
+            let launch = session.launch.clone();
+            let persisted = fixture
+                .app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .saved_conversations()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.card == fixture.conversation)
+                .unwrap();
+            assert!(persisted.open);
+            assert_eq!(persisted.session.launch, launch);
+            assert_eq!(persisted.session.launch.recipe.working_directory, original);
             fixture.close(fixture.conversation);
             let entry = fixture.reopen(fixture.conversation);
+            assert_eq!(entry.session.launch, launch);
+            assert_eq!(entry.session.launch.recipe.working_directory, original);
+            assert!(!entry.session.launch.needs_read_only_history());
             original_directory.close().unwrap();
+            assert_eq!(
+                std::fs::metadata(&original).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
             assert!(entry.session.launch.needs_read_only_history());
             let runtime = fixture.directory.path().join("history-lease-runtime");
             std::fs::create_dir(&runtime).unwrap();
