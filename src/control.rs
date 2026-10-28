@@ -24,6 +24,8 @@ mod channel_work;
 mod channels;
 mod chat;
 #[cfg(test)]
+mod automation_work_authority_tests;
+#[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
