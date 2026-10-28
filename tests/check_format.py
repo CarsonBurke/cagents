@@ -336,9 +336,6 @@ sys.exit({status})
         proxy = self.root / "fake/rustup"
         actual = self.root / "fake/toolchain/rustfmt"
         self.write("fake/rustup", "\x7fELFproxy")
-        self.write("fake/toolchain/rustfmt", "\x7fELFfirst formatter")
-        link = self.root / "fake/rustfmt"
-        link.symlink_to(proxy)
         real_which = shutil.which
 
         def which(name):
@@ -353,15 +350,44 @@ sys.exit({status})
                 return (str(actual) + "\n").encode()
             return real_check_output(command, **kwargs)
 
-        with mock.patch.object(helper.shutil, "which", side_effect=which):
-            with mock.patch.object(helper.subprocess, "check_output", side_effect=check_output):
-                with mock.patch.object(helper, "formatter_libraries"):
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                link = self.root / f"fake/rustfmt-{kind}"
+                if kind == "symlink":
+                    link.symlink_to(proxy)
+                else:
+                    os.link(proxy, link)
+                self.write("fake/toolchain/rustfmt", "\x7fELFfirst formatter")
+                with mock.patch.object(helper.shutil, "which", side_effect=which), \
+                        mock.patch.object(helper.subprocess, "check_output", side_effect=check_output) as lookup, \
+                        mock.patch.object(helper, "formatter_libraries"):
                     first = helper.InputHashes()
                     helper.rustfmt_binary(first, str(link))
                     self.write("fake/toolchain/rustfmt", "\x7fELFsecond formatter")
                     second = helper.InputHashes()
                     helper.rustfmt_binary(second, str(link))
-        self.assertNotEqual(first.hexdigest(), second.hexdigest())
+                self.assertNotEqual(first.hexdigest(), second.hexdigest())
+                self.assertEqual(lookup.call_count, 2)
+
+    def test_unverified_hardlinked_formatter_disables_cache(self):
+        helper, _args = self.cache_fixture()
+        proxy = self.root / "fake/rustup"
+        formatter = self.root / "fake/rustfmt"
+        other = self.root / "fake/other-rustup"
+        self.write("fake/rustup", "\x7fELFproxy")
+        self.write("fake/other-rustup", "\x7fELFother")
+        os.link(proxy, formatter)
+        for discovered in (None, str(other)):
+            with self.subTest(discovered=discovered):
+                with mock.patch.object(helper.shutil, "which", return_value=discovered), \
+                        mock.patch.object(helper.subprocess, "check_output") as lookup:
+                    with self.assertRaises(helper.Uncacheable):
+                        helper.rustfmt_binary(helper.InputHashes(), str(formatter))
+                lookup.assert_not_called()
+        with mock.patch.object(helper.shutil, "which", return_value=str(proxy)), \
+                mock.patch.object(helper.subprocess, "check_output", return_value=(str(formatter) + "\n").encode()):
+            with self.assertRaises(helper.Uncacheable):
+                helper.rustfmt_binary(helper.InputHashes(), str(formatter))
 
     def test_formatter_library_contents_and_unverified_graphs(self):
         helper, _args = self.cache_fixture()

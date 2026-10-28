@@ -308,15 +308,16 @@ def rustfmt_binary(hasher, executable):
     proxy = Path(executable).resolve(strict=True)
     elf_tool(hasher, proxy)
     actual = proxy
-    if proxy.name == "rustup":
-        rustup = shutil.which("rustup")
-        if rustup is None or Path(rustup).resolve(strict=True) != proxy:
+    rustup = shutil.which("rustup")
+    matches_rustup = rustup is not None and proxy.samefile(rustup)
+    if proxy.name == "rustup" or matches_rustup:
+        if not matches_rustup:
             raise Uncacheable("unverified rustup proxy")
         selected = subprocess.check_output(
             [rustup, "which", "rustfmt"], cwd=ROOT, timeout=3,
         ).decode().strip()
         actual = Path(selected)
-        if not actual.is_absolute() or actual.resolve(strict=True) == proxy:
+        if not actual.is_absolute() or actual.samefile(proxy):
             raise Uncacheable("rustup did not select a rustfmt binary")
         actual = actual.resolve(strict=True)
         elf_tool(hasher, actual)
@@ -341,6 +342,10 @@ def rustfmt_binary(hasher, executable):
                     add_file(hasher, path, "toolchain-override")
                 except FileNotFoundError:
                     add(hasher, "absent")
+    elif proxy.stat().st_nlink > 1:
+        # A hardlinked multicall proxy keeps the rustfmt basename. Without a
+        # matching rustup executable its selected backend cannot be verified.
+        raise Uncacheable("unverified hardlinked formatter")
     formatter_libraries(hasher, actual)
 
 
