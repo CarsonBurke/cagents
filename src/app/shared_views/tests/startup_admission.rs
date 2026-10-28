@@ -10,7 +10,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixListener},
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -66,11 +66,29 @@ struct UpgradeScript {
     refuse_lineage: bool,
 }
 
+fn scripted_proof() -> HostSessionProof {
+    HostSessionProof {
+        host_session_id: "live-host".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "live-incarnation".into(),
+    }
+}
+
+fn current_owner(pane: &mut Pane) -> Session {
+    let CardKind::Chat(session) = &mut pane.kind else {
+        unreachable!()
+    };
+    session.proof = Some(scripted_proof());
+    session.clone()
+}
+
 struct ScriptedDaemon {
     providers: Arc<Mutex<Vec<Session>>>,
     resolutions: Arc<Mutex<Vec<Session>>>,
     connections: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     stopped: Arc<AtomicBool>,
+    visibility_cancellations: Arc<AtomicUsize>,
+    visibility_canceled: std::sync::mpsc::Receiver<u64>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -80,6 +98,21 @@ impl ScriptedDaemon {
     }
 
     fn with_upgrade(upgrade: Option<UpgradeScript>) -> Self {
+        Self::with_attachment(upgrade, false)
+    }
+
+    fn with_owner(session: Session) -> Self {
+        assert_eq!(session.proof, Some(scripted_proof()));
+        // Ordinary startup attaches this exact current owner. The dedicated
+        // upgrade fixtures below retain old-proof lineage and writer coverage.
+        Self::with_upgrade(Some(UpgradeScript {
+            source: session.clone(),
+            canonical: session,
+            refuse_lineage: false,
+        }))
+    }
+
+    fn with_attachment(upgrade: Option<UpgradeScript>, refuse_attachment: bool) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
@@ -88,16 +121,15 @@ impl ScriptedDaemon {
         let resolutions = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
+        let visibility_cancellations = Arc::new(AtomicUsize::new(0));
+        let (visibility_canceled_tx, visibility_canceled) = std::sync::mpsc::channel();
+        let cancellations = visibility_cancellations.clone();
         let recorded = providers.clone();
         let resolved = resolutions.clone();
         let sockets = connections.clone();
         let stop = stopped.clone();
         let worker = std::thread::spawn(move || {
-            let proof = HostSessionProof {
-                host_session_id: "live-host".into(),
-                boot_id: "boot".into(),
-                host_incarnation: "live-incarnation".into(),
-            };
+            let proof = scripted_proof();
             let mut clients = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
@@ -121,6 +153,8 @@ impl ScriptedDaemon {
                 let proof = proof.clone();
                 let upgrade = upgrade.clone();
                 let stop = stop.clone();
+                let cancellations = cancellations.clone();
+                let visibility_canceled_tx = visibility_canceled_tx.clone();
                 clients.push(std::thread::spawn(move || {
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
@@ -132,6 +166,11 @@ impl ScriptedDaemon {
                             Err(_) if stop.load(Ordering::Acquire) => break,
                             Err(error) => panic!("scripted client read: {error}"),
                         };
+                        let replaceable_visibility = matches!(
+                            &request.request,
+                            ClientRequest::ChatVisibility { chat_id, .. }
+                                if upgrade.as_ref().is_some_and(|script| *chat_id == script.canonical.id)
+                        );
                         let message = match request.request {
                             ClientRequest::Connect { .. } => ServerMessage::Response {
                                 response: ServerResponse::Connected {
@@ -167,7 +206,7 @@ impl ScriptedDaemon {
                             ClientRequest::ChatStart { session, .. } => {
                                 assert!(
                                     upgrade.is_none(),
-                                    "strict upgrade cannot start a provider"
+                                    "automatic restore cannot start a provider"
                                 );
                                 recorded.lock().unwrap().push(session);
                                 ServerMessage::Error(ProtocolError::new(
@@ -180,15 +219,22 @@ impl ScriptedDaemon {
                                 recorded.lock().unwrap().push(session.clone());
                                 if let Some(script) = &upgrade {
                                     assert_eq!(session, script.canonical);
-                                    ServerMessage::Response {
-                                        response: ServerResponse::ChatAttached {
+                                    if refuse_attachment {
+                                        ServerMessage::Error(ProtocolError::new(
+                                            ProtocolErrorCode::TerminalUnavailable,
+                                            "Scripted exact attachment refused",
+                                            false,
+                                        ))
+                                    } else {
+                                        let response = ServerResponse::ChatAttached {
                                             snapshot: crate::chat::Snapshot {
                                                 session_id: session.launch.session_id.clone(),
                                                 ready: true,
                                                 ..Default::default()
                                             },
                                             session,
-                                        },
+                                        };
+                                        ServerMessage::Response { response }
                                     }
                                 } else {
                                     ServerMessage::Error(ProtocolError::new(
@@ -229,6 +275,17 @@ impl ScriptedDaemon {
                             if stop.load(Ordering::Acquire) {
                                 break;
                             }
+                            if replaceable_visibility
+                                && matches!(&error, crate::terminal_ipc::FrameError::Io(io)
+                                    if matches!(io.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset))
+                            {
+                                // The offscreen attachment queues replaceable visibility
+                                // before Ready. A retired target drops that late handle,
+                                // shutting down its socket without awaiting this reply.
+                                cancellations.fetch_add(1, Ordering::AcqRel);
+                                let _ = visibility_canceled_tx.send(request.request_id);
+                                break;
+                            }
                             panic!("scripted client write: {error}");
                         }
                     }
@@ -243,6 +300,8 @@ impl ScriptedDaemon {
             resolutions,
             connections,
             stopped,
+            visibility_cancellations,
+            visibility_canceled,
             worker: Some(worker),
         }
     }
@@ -473,18 +532,18 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
     if isolated("authoritative_offscreen_chat_executes_exact_descriptor_once") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    let CardKind::Chat(canonical) = &mut pane.kind else {
+        unreachable!()
+    };
+    canonical.launch.recipe.arguments = vec!["--permission-mode=plan".into()];
+    let expected = current_owner(&mut pane);
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
     app.chat_ui =
         chat_ui::State::with_drafts(HashMap::from([(pane.id, "Deferred shared draft".into())]));
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert!(daemon.requests().is_empty());
-    let CardKind::Chat(canonical) = &mut pane.kind else {
-        unreachable!()
-    };
-    canonical.launch.recipe.arguments = vec!["--permission-mode=plan".into()];
-    let expected = canonical.clone();
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     admit(
@@ -504,6 +563,8 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
         requests[0].launch, expected.launch,
         "the authoritative descriptor replaces the cache before effects"
     );
+    assert_eq!(requests[0], expected);
+    assert!(daemon.resolutions().is_empty());
     let repeated = app.reconcile_shared_views();
     settle(&mut app, repeated);
     assert_eq!(daemon.requests().len(), 1);
@@ -523,8 +584,10 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
     if isolated("local_only_cached_chat_still_restores_and_preserves_its_draft") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
-    let (mut app, _, _, pane, _) = cached_chat();
+    let (mut app, _, _, mut pane, _) = cached_chat();
+    let expected = current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
     Arc::make_mut(&mut app.durable)
         .local_only_cards
         .insert(pane.id);
@@ -550,6 +613,8 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
             _ => unreachable!(),
         }
     );
+    assert_eq!(requests[0], expected);
+    assert!(daemon.resolutions().is_empty());
     assert_eq!(
         app.persistent_workspace()
             .chat_drafts
@@ -703,20 +768,20 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     if isolated("replacement_admission_keeps_old_draft_beside_exact_canonical_chat") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
-    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
-    app.workspace = Cagents::rebuild_workspace(&app.durable);
-    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "Old source only".into())]));
     let original = pane.kind.clone();
-    let startup = app.initialize_runtimes();
-    settle(&mut app, startup);
     let CardKind::Chat(replacement) = &mut pane.kind else {
         unreachable!()
     };
     replacement.id = TerminalId::new();
     replacement.launch.session_id = Some("canonical-replacement-thread".into());
-    let expected = replacement.clone();
+    let expected = current_owner(&mut pane);
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "Old source only".into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     admit(
@@ -727,6 +792,8 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     );
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(daemon.requests()[0].id, expected.id);
+    assert_eq!(daemon.requests()[0], expected);
+    assert!(daemon.resolutions().is_empty());
     let saved = app.persistent_workspace();
     assert!(!saved.chat_drafts.contains_key(&pane.id));
     let copy = *saved
@@ -854,8 +921,21 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
         return;
     }
     use crate::app::workspace_model_sync::ModelUpdate;
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, pane, identity) = cached_chat();
+    let CardKind::Chat(expected) = &pane.kind else {
+        unreachable!()
+    };
+    let expected = expected.clone();
+    let mut canonical = expected.clone();
+    canonical.proof = Some(scripted_proof());
+    let daemon = ScriptedDaemon::with_attachment(
+        Some(UpgradeScript {
+            source: expected.clone(),
+            canonical: canonical.clone(),
+            refuse_lineage: false,
+        }),
+        true,
+    );
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert_eq!(app.startup_pane_check(), Ok(false));
@@ -889,12 +969,16 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
         model: authoritative,
     });
     settle(&mut app, hidden_ack);
-    let CardKind::Chat(expected) = pane.kind else {
-        unreachable!()
-    };
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(daemon.requests()[0].launch, expected.launch);
     assert_eq!(daemon.requests()[0].id, expected.id);
+    assert_eq!(daemon.requests(), vec![canonical]);
+    assert_eq!(daemon.resolutions(), vec![expected.clone()]);
+    assert_eq!(
+        app.card_state(pane.id).unwrap().kind,
+        CardKind::Chat(expected),
+        "a refused attachment must retain its saved source"
+    );
     assert_eq!(app.durable.active_channel, Some(active));
     assert!(
         app.startup_pane_check().is_err(),
@@ -1323,4 +1407,151 @@ fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignore
         return;
     }
     exercise_canonical_upgrade(false, true);
+}
+
+#[test]
+fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission() {
+    if isolated("an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission") {
+        return;
+    }
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    fn exchange(
+        stream: &mut UnixStream,
+        proof: &HostSessionProof,
+        request_id: u64,
+        request: ClientRequest,
+    ) -> ServerResponse {
+        let connecting = matches!(&request, ClientRequest::Connect { .. });
+        write_frame(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                proof: (!connecting).then(|| proof.clone()),
+                request,
+            },
+        )
+        .unwrap();
+        let reply = read_frame::<ServerEnvelope>(stream).unwrap().unwrap();
+        assert_eq!(reply.version, PROTOCOL_VERSION);
+        assert_eq!(reply.request_id, Some(request_id));
+        assert_eq!(&reply.proof, proof);
+        match reply.message {
+            ServerMessage::Response { response } => response,
+            other => panic!("expected actual handshake reply: {other:?}"),
+        }
+    }
+
+    let (_app, _, _, pane, _) = cached_chat();
+    let CardKind::Chat(source) = pane.kind else {
+        unreachable!()
+    };
+    let mut canonical = source.clone();
+    let proof = HostSessionProof {
+        host_session_id: "live-host".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "live-incarnation".into(),
+    };
+    canonical.proof = Some(proof.clone());
+    let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: source.clone(),
+        canonical: canonical.clone(),
+        refuse_lineage: false,
+    }));
+    for close_reader in [true, false] {
+        let mut stream =
+            UnixStream::connect(crate::terminal_ipc::daemon_socket_path().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        match exchange(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: None,
+                resume: vec![],
+            },
+        ) {
+            ServerResponse::Connected {
+                proof: connected,
+                resumed,
+            } => {
+                assert_eq!(connected, proof);
+                assert!(resumed.is_empty());
+            }
+            other => panic!("Connect must succeed: {other:?}"),
+        }
+        match exchange(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::ResolveUpgradeChat {
+                source: source.clone(),
+            },
+        ) {
+            ServerResponse::UpgradeChatResolved { session } => assert_eq!(session, canonical),
+            other => panic!("exact lineage must succeed: {other:?}"),
+        }
+        match exchange(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::ChatAttach {
+                session: canonical.clone(),
+            },
+        ) {
+            ServerResponse::ChatAttached { session, snapshot } => {
+                assert_eq!(session, canonical);
+                assert!(snapshot.ready);
+                assert_eq!(snapshot.session_id, canonical.launch.session_id);
+            }
+            other => panic!("exact attachment must succeed: {other:?}"),
+        }
+        let visibility = ClientRequest::ChatVisibility {
+            chat_id: canonical.id,
+            visible: false,
+        };
+        if close_reader {
+            // Keep the write half live so the real server receives the whole
+            // request after its peer has already stopped accepting replies.
+            stream.shutdown(Shutdown::Read).unwrap();
+            write_frame(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 4,
+                    proof: Some(proof.clone()),
+                    request: visibility,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                daemon
+                    .visibility_canceled
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap(),
+                4
+            );
+        } else {
+            assert!(matches!(
+                exchange(&mut stream, &proof, 4, visibility),
+                ServerResponse::Accepted
+            ));
+        }
+        assert_eq!(daemon.visibility_cancellations.load(Ordering::Acquire), 1);
+    }
+    assert_eq!(daemon.resolutions(), vec![source.clone(), source]);
+    assert_eq!(daemon.requests(), vec![canonical.clone(), canonical]);
+    assert!(matches!(
+        daemon.visibility_canceled.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    // Drop must join both actual server connections without masking a panic.
+    drop(daemon);
 }

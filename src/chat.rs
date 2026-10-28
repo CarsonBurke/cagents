@@ -299,6 +299,9 @@ pub enum Intent {
     /// Begin this launch. A conversation the launch names by id is resumed by
     /// the provider's own argv rather than by attaching to a daemon writer.
     Start,
+    /// Retry an exact, explicitly requested named launch. Resolve any existing
+    /// owner first so a lost start reply cannot create a second provider.
+    RetryStart,
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
@@ -825,7 +828,53 @@ impl Session {
     }
 
     pub fn has_valid_native_continuity(&self) -> bool {
-        match &self.native_continuity {
+        self.valid_native_continuity(&self.native_continuity)
+    }
+
+    /// A saved transcript is eligible for the forced, read-only history API.
+    /// This shape is never authority to launch, close or resume a provider.
+    pub(crate) fn is_saved_claude_history(&self) -> bool {
+        self.launch.provider == Provider::Claude
+            && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
+            && self.terminal.is_none()
+            && self.owned_codex_listener.is_none()
+            && self
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+            && self
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
+    /// Import an installed capability observed on this exact authenticated
+    /// attachment. A missing capability never revokes one already recorded.
+    /// Validation applies to the resulting descriptor, including pre-ID
+    /// Claude actors; a valid ReconnectOnly source alone grants nothing.
+    pub(crate) fn learn_native_continuity(&mut self, observed: &NativeContinuity) {
+        if observed.retains_provider() && self.valid_native_continuity(observed) {
+            self.native_continuity = observed.clone();
+        }
+    }
+
+    /// Runtime projections may learn provider identity/capability, but may
+    /// never borrow it from another allocation, account or daemon epoch.
+    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+        if self.id == observed.id
+            && self.proof == observed.proof
+            && self.launch.provider == observed.launch.provider
+            && self.launch.recipe == observed.launch.recipe
+            && self.terminal == observed.terminal
+            && self.owned_codex_listener == observed.owned_codex_listener
+        {
+            self.learn_native_continuity(&observed.native_continuity);
+        }
+    }
+
+    fn valid_native_continuity(&self, continuity: &NativeContinuity) -> bool {
+        match continuity {
             NativeContinuity::ReconnectOnly => true,
             NativeContinuity::RetainedClaudeActor { protocol } => {
                 *protocol == 2
@@ -1191,12 +1240,12 @@ impl PermissionDenial {
 
 impl QueuedMessage {
     pub const LIMIT: usize = 128;
+    pub const PREVIEW_BYTES: usize = 16 * 1024;
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
-        const PREVIEW_BYTES: usize = 16 * 1024;
-        let whole = text.len() <= PREVIEW_BYTES;
+        let whole = text.len() <= Self::PREVIEW_BYTES;
         if !whole {
-            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.truncate(text.floor_char_boundary(Self::PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
@@ -1286,6 +1335,29 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Drop renderable history while retaining provider continuity, controls,
+    /// activity and pending interactions. Only the UI client's disposable copy
+    /// uses this: the daemon still owns paging and the authoritative transcript.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+
+    /// Logical body bytes referenced by this owner, not unique heap bytes:
+    /// immutable items can be Arc-shared with other snapshots and caches.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
@@ -2312,6 +2384,48 @@ mod retained_native_pair_tests {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    #[test]
+    fn observed_retained_capability_requires_the_exact_valid_owner_and_never_downgrades() {
+        for confirmed in [false, true] {
+            let (observed, _) = pair(confirmed);
+            let mut source = observed.clone();
+            source.native_continuity = NativeContinuity::ReconnectOnly;
+            for mutation in 0..5 {
+                let mut foreign = observed.clone();
+                match mutation {
+                    0 => foreign.id = TerminalId::new(),
+                    1 => foreign.proof.as_mut().unwrap().host_incarnation = "another-owner".into(),
+                    2 => foreign.launch.provider = Provider::Codex,
+                    3 => {
+                        foreign
+                            .launch
+                            .recipe
+                            .environment
+                            .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+                    }
+                    _ => foreign.launch.recipe.arguments.push("--different".into()),
+                }
+                let mut retained = source.clone();
+                retained.learn_native_continuity_from(&foreign);
+                assert_eq!(retained, source);
+            }
+            let mut missing_proof = source.clone();
+            missing_proof.proof = None;
+            missing_proof.learn_native_continuity(&observed.native_continuity);
+            assert_eq!(
+                missing_proof.native_continuity,
+                NativeContinuity::ReconnectOnly
+            );
+            source.learn_native_continuity_from(&observed);
+            assert_eq!(source, observed);
+            assert!(source.has_valid_native_continuity());
+            source.learn_native_continuity(&NativeContinuity::ReconnectOnly);
+            assert_eq!(source, observed);
+            source.learn_native_continuity(&NativeContinuity::RetainedClaudeActor { protocol: 3 });
+            assert_eq!(source, observed);
         }
     }
 

@@ -60,13 +60,40 @@ impl std::fmt::Debug for Authority {
 
 impl Authority {
     pub fn from_environment() -> Self {
-        Self(std::env::var(AUTHORITY_ENV).ok())
+        Self(match std::env::var(AUTHORITY_ENV) {
+            Ok(token) => Some(token),
+            Err(std::env::VarError::NotPresent) => None,
+            // Presence must not become User scope. Empty credentials already
+            // fail the normal authority parser without exposing the raw value.
+            Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+        })
     }
     pub(crate) fn session(token: String) -> Self {
         Self(Some(token))
     }
     pub(crate) fn token(&self) -> Option<&str> {
         self.0.as_deref()
+    }
+}
+
+/// Internal acceptance failures; these are never serialized onto the wire.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AcceptanceError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    MailboxFull(String),
+}
+
+impl From<String> for AcceptanceError {
+    fn from(value: String) -> Self {
+        Self::Invalid(value)
+    }
+}
+
+impl From<&str> for AcceptanceError {
+    fn from(value: &str) -> Self {
+        Self::Invalid(value.into())
     }
 }
 
@@ -732,3 +759,6 @@ mod tests {
         assert!(submit(&"x".repeat(65)).validate().is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+mod authority_environment_tests;

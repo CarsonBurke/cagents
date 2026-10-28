@@ -11,8 +11,9 @@
 
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
-is only a native build prerequisite of the full Servo dependency graph.
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
+is also required by the ceditor development/installation scripts, experimental
+hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -55,7 +56,16 @@ cargo check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
 cargo check --locked --features integrated-browser --bin cagents-ui
+
+# Standalone editor: separate package using the browserless UI graph.
+cargo check --locked --package ceditor --bin ceditor
 ```
+
+Changes to ceditor or shared UI, editor, or notification public contracts also
+require the standalone editor check above. The workspace's
+`default-members = ["."]` selects only cagents: root UI checks and root
+`--all-targets` tests do not compile the downstream ceditor binary. Run the
+ceditor check separately from the CLI, host, and UI checks.
 
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
@@ -235,20 +245,21 @@ Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
 otherwise reuse another checkout's code and version stamp. The local Cargo
 configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
-in compiler dep-info, and the version build script watches it as well. Switching
-checkouts rebuilds owned code while keeping the third-party cache warm. Keep
-this identity reference in new owned workspace crates. Cargo must run from
-this checkout or its descendants so it reads the local configuration.
+in compiler dep-info. The version build script tracks it at compilation and
+execution: a runtime watch alone can rerun another checkout's compiled script
+body. Switching checkouts rebuilds owned code while keeping the third-party
+cache warm. Keep this identity reference in new owned workspace crates. Run Cargo
+from this checkout or its descendants so it reads the local configuration.
 
 `python3 scripts/qualify-checkout-cache.py` verifies the boundary using a small,
 offline workspace in `/var/tmp`: an unfixed control reproduces stale reuse,
 then the actual configuration and build script follow A → B → A with the same
-commit, different dirty sources, and old timestamps. It also verifies that an
-unchanged dependency remains cached. Pass `--evidence PATH` to retain the
-fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
-workloads. Its historical-producer control also demonstrates the supported
-package bootstrap below and checks that unrelated dependency bytes and mtimes
-remain unchanged.
+commit, different dirty sources and stamping-script bodies, and old timestamps.
+It also verifies that an unchanged dependency remains cached. Pass
+`--evidence PATH` to retain the fixture and Cargo logs in a new directory. Run it
+sequentially with other Cargo workloads. Its historical-producer control also
+demonstrates the supported package bootstrap below and checks that unrelated
+dependency bytes and mtimes remain unchanged.
 
 A historical checkout without the compile-time checkout anchor can replace a
 shared build-script executable. Returning to an anchored checkout can then
@@ -344,13 +355,54 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches:
+its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
+below before running that lane:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --features host --all-targets
 cargo test --locked --no-default-features --features ui --all-targets
 ```
+
+HOST fixtures that exec retained actors require
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
+checkout and source state as the tests. Build it immediately before testing,
+keeping sources, Cargo environment, target, configuration and any explicit
+profile overrides fixed. Ordinary build and test profile defaults differ as
+expected.
+The existing artifact helper reads Cargo's exact executable path, including
+configured target directories/triples. A matching version alone does not prove
+that two dirty source trees match.
+
+Use a fresh private temporary directory with a short, physical absolute path
+outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
+directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
+meets those conditions before creating the root. The **final** nested Unix
+socket path must be shorter than 108 bytes, including fixture suffixes. For
+example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
+bytes, so that layout requires a temporary base of at most 28 bytes. Longer
+fixture layouts need more room; a short base alone is not proof.
+
+```sh
+(
+    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    export TMPDIR
+    printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    cargo test --locked --no-default-features --features host --all-targets
+)
+```
+
+A helper build failure prevents the test command. Use the same preparation for
+narrow HOST targets that need retained actors. Keep the temporary root and any
+separately retained fixture evidence until their original children have settled;
+this recipe deliberately installs no automatic deletion trap. Do not change
+socket limits, remove enclosing Git markers or silently select another runtime
+root to make a failed preparation pass.
 
 Prefer the narrow target that covers the changed contract, for example:
 
@@ -360,11 +412,53 @@ cargo test --locked --no-default-features --features host --test terminal_load_c
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
-Explicitly selecting a gated target without its feature, including through a
+The four named-tree reconciliation contracts share their cases between the root
+UI target and a focused workspace package. For edits confined to vendored
+iced-core tree reconciliation, run the focused package first:
+
+```sh
+cargo test --locked -p cagents-iced-contracts
+```
+
+The package uses the UI's exact iced-core Git revision; the root Cargo patch
+resolves both targets to `vendor/iced-core`, with the production `a11y` Id
+implementation. It compiles without the application, libcosmic renderer, or
+native UI runtime. The cases do not render; the isolated harness uses an
+uninhabited renderer. Retain validation through the UI's concrete renderer when
+changing the tree contract or UI integration:
+
+```sh
+cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+```
+
+Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
 
-Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
+The 40,000-path mutation regression lives in `repository_scale_contract`, so a
+library-suite run does not also create and mutate that filesystem fixture.
+`--all-targets` still runs it in both HOST and UI lanes. When changing repository
+mutations or pathspec handling, include its explicit target:
+
+```sh
+cargo test --locked --no-default-features --features host --test repository_scale_contract
+```
+
+The fixture retains its disk-backed private namespace, subprocess deadline and
+process-family cleanup checks. Its test count and workload are unchanged.
+
+Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Cargo roots and directly checks `src/modules.rs` and nested Rust-source
+`include!` fragments, which rustfmt does not discover through macro expansion.
+Both stages report their diagnostics and any failure makes the command fail;
+the check never rewrites source or formats vendored packages. When adding a
+Rust-source `include!`, update the explicit list in the script. Its lightweight
+regression is `python3 tests/check_format.py` (mocked command routing and bounded
+real-rustfmt fixtures, with no Cargo/application build). Set
+`CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
+fixture; this still runs only `cargo fmt`, with no application build.
+
+For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
@@ -416,8 +510,9 @@ source visible alongside an error. Rendering is debounced, uses at most two
 workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
 
 The development runner uses an isolated application and settings identity.
-The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
-built executable.
+The editor runner and installer require Python 3 to read executable paths from
+Cargo's build output. This honors configured targets and output directories,
+including `build.target` in Cargo configuration and `CARGO_BUILD_TARGET`.
 
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session

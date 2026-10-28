@@ -1,3 +1,4 @@
+mod admission;
 mod archive;
 mod carry;
 mod close_processes;
@@ -6,6 +7,7 @@ mod close_tests;
 #[cfg(test)]
 mod event_dispatch_tests;
 pub(crate) mod holder;
+mod input_queue;
 mod joins;
 #[cfg(test)]
 mod pty_reader_tests;
@@ -14,7 +16,7 @@ use close_processes::{FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -59,6 +61,9 @@ use super::{
 
 const PTY_READ_SIZE: usize = 16 * 1024;
 const PTY_BATCH_LIMIT: usize = 256 * 1024;
+/// Encoded ordinary input plus pre-reserved physical-release capacity.
+const PTY_WRITE_CAPACITY: usize = admission::ORDINARY_BYTES + admission::CLEANUP_LIMIT * 512 + 128;
+const PTY_WRITE_RETRY: Duration = Duration::from_millis(10);
 /// Marker appended once when a transcript hits its size cap.
 const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: size cap reached]\n";
 /// Foreground observation cadence. Every tick descends `/proc` over the PTY
@@ -95,6 +100,23 @@ const BELL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 enum Command {
+    InputClaim {
+        claim: Arc<admission::Cleanup>,
+        ticket: Option<admission::QueuedPress>,
+        command: Box<Command>,
+    },
+    Admitted {
+        permit: Arc<admission::Permit>,
+        command: Box<Command>,
+    },
+    Interrupt(Option<KeyInput>),
+    OrderedInput {
+        generation: u64,
+        // Lives through encoding/cancellation, not through PTY consumption.
+        admission: Option<Arc<u64>>,
+        input: Box<Command>,
+    },
+
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
@@ -128,6 +150,11 @@ enum Command {
         visible: bool,
     },
     ObserveAgent(Sender<Option<String>>),
+    PrepareInputHandoff {
+        token: Arc<AtomicBool>,
+        resumed: Sender<Result<(), String>>,
+        reply: Sender<Result<(), String>>,
+    },
     PrepareUpgrade(Sender<Result<UpgradeSnapshot, String>>),
     Carry {
         socket: PathBuf,
@@ -366,6 +393,50 @@ pub(crate) fn flush_archived_notices() {
         .expect("the archive notifier stalled");
 }
 
+#[derive(Default)]
+struct InputOrder {
+    /// Ownership change or checked close has fenced admission until its outcome is known.
+    handoff: bool,
+    prepared_input: Option<Arc<AtomicBool>>,
+    cleanup_sealed: bool,
+    generation: u64,
+    interrupt_key: Option<KeyInput>,
+    interrupt_claim: Option<Arc<admission::Cleanup>>,
+    interrupt_ticket: Option<admission::QueuedPress>,
+    next_sequence: u64,
+    pending: VecDeque<Weak<u64>>,
+}
+
+impl InputOrder {
+    fn next_sequence(&mut self) -> u64 {
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .expect("terminal input admission order exhausted");
+        self.next_sequence
+    }
+
+    fn track_input(&mut self) -> Arc<u64> {
+        // At most one ticket per accepted ordinary input command, plus the
+        // current admission attempt while this same lock is held. Tickets do
+        // not retain encoded byte credits or wait for the child to read.
+        self.pending.retain(|ticket| ticket.strong_count() != 0);
+        let ticket = Arc::new(self.next_sequence());
+        self.pending.push_back(Arc::downgrade(&ticket));
+        ticket
+    }
+
+    fn earliest_pending(&mut self) -> Option<u64> {
+        while let Some(front) = self.pending.front() {
+            if let Some(ticket) = front.upgrade() {
+                return Some(*ticket);
+            }
+            self.pending.pop_front();
+        }
+        None
+    }
+}
+
 struct PublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
@@ -384,10 +455,31 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
+    /// An adopted original has not proved its startup commit. Its raw prefix
+    /// and parked reader remain on the original worker until explicit Close.
+    startup_unresolved: AtomicBool,
+    startup_diagnostic: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_fail_startup_commit: AtomicBool,
+    #[cfg(test)]
+    test_startup_probe: Mutex<Option<Sender<(Vec<u8>, bool, bool)>>>,
     shutdown_requested: AtomicBool,
+    interrupt_requested: AtomicBool,
+    input_order: Mutex<InputOrder>,
+    command_budget: OnceLock<Arc<admission::Budget>>,
+    input_storage: admission::StoragePool,
+    priority_permit: Arc<admission::Permit>,
+    cleanup_pool: admission::CleanupPool,
+    cleanup_commands: Mutex<VecDeque<(Arc<admission::Cleanup>, u64, Command)>>,
+    priority_close: Mutex<Option<Command>>,
+    #[cfg(test)]
+    close_inspection_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    test_input_root_pidfd: OnceLock<File>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -442,6 +534,7 @@ impl PublishedState {
 
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
+        let cleanup_pool = admission::CleanupPool::new(capture_tx.clone());
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             published_generation: AtomicU64::new(0),
@@ -460,9 +553,30 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
+            startup_unresolved: AtomicBool::new(false),
+            startup_diagnostic: Mutex::new(None),
+            #[cfg(test)]
+            test_fail_startup_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            test_startup_probe: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            interrupt_requested: AtomicBool::new(false),
+            input_order: Mutex::new(InputOrder::default()),
+            command_budget: OnceLock::new(),
+            input_storage: admission::StoragePool::ordinary(),
+            priority_permit: admission::Permit::generated(
+                admission::StoragePool::ordinary().reserve(128, 4).unwrap(),
+            ),
+            cleanup_pool,
+            cleanup_commands: Mutex::new(VecDeque::new()),
+            priority_close: Mutex::new(None),
+            #[cfg(test)]
+            close_inspection_gate: Mutex::new(None),
+            #[cfg(test)]
+            test_input_root_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            launch_directory: OnceLock::new(),
             original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
@@ -471,6 +585,58 @@ impl PublishedState {
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
         }
+    }
+
+    fn request_interrupt(&self, key: Option<KeyInput>) -> bool {
+        let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        if order.handoff || self.shutdown_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        let prepared = if let Some(input) = &key {
+            let Some(prepared) = self.cleanup_pool.press(admission::Identity::key(input)) else {
+                return false;
+            };
+            Some(prepared)
+        } else {
+            None
+        };
+        if let Some((claim, ticket)) = prepared {
+            order.interrupt_ticket = ticket;
+            order.interrupt_claim = Some(claim);
+        } else {
+            order.interrupt_ticket = None;
+            order.interrupt_claim = None;
+        }
+        order.generation = order
+            .generation
+            .checked_add(1)
+            .expect("terminal input generation exhausted");
+        order.interrupt_key = key;
+        self.interrupt_requested.store(true, Ordering::Release);
+        let _ = self.capture_tx.try_send(());
+        true
+    }
+
+    fn take_cleanup_command(&self, ready_only: bool) -> Option<Command> {
+        // Match producer lock order: admission before the reserved mailbox.
+        // A later owned up cannot overtake earlier accepted input merely
+        // because its own down has already encoded. Earlier input only needs
+        // to encode or be explicitly canceled; backpressured bytes stay FIFO.
+        let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        let earliest = order.earliest_pending();
+        let mut commands = self
+            .cleanup_commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let index = commands.iter().position(|(claim, sequence, _)| {
+            !ready_only || claim.ready() && earliest.is_none_or(|pending| pending >= *sequence)
+        })?;
+        let (claim, _, command) = commands.remove(index).unwrap();
+        Some(Command::InputClaim {
+            claim,
+            ticket: None,
+            command: Box::new(command),
+        })
     }
 
     fn request_shutdown(&self) {
@@ -497,6 +663,23 @@ impl PublishedState {
     }
 
     fn archived_command(self: &Arc<Self>, command: Command) -> Result<(), TerminalSendError> {
+        match command {
+            Command::Admitted {
+                permit: _permit,
+                command,
+            } => return self.archived_command(*command),
+            Command::InputClaim {
+                claim: _claim,
+                ticket: _ticket,
+                command,
+            } => return self.archived_command(*command),
+            Command::OrderedInput {
+                admission: _admission,
+                input,
+                ..
+            } => return self.archived_command(*input),
+            _ => {}
+        }
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(TerminalSendError::Closed);
         }
@@ -732,6 +915,11 @@ struct HandleInner {
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
+        // Dropping an error/observer is not authorization to destroy an
+        // adopted replay prefix. HOST owns its separate slot before commit.
+        if self.published.startup_unresolved.load(Ordering::Acquire) {
+            return;
+        }
         self.published.request_shutdown();
         // The body can be this very thread or blocked in a callback/TLS.
         // Pending custody outlives this handle; destruction never joins here.
@@ -817,6 +1005,49 @@ impl TerminalHandle {
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
     }
+    #[cfg(test)]
+    pub(crate) fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .ok_or_else(|| std::io::Error::other("original root pidfd was not captured"))?
+            .try_clone()
+    }
+    /// Physical provenance of the original PTY launch, not caller authority.
+    /// A caller must still revalidate its current Host record/source ownership;
+    /// these atomic worker checks do not make a source mutation atomic.
+    pub(crate) fn pinned_launch_directory(
+        &self,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if self.is_completed()
+            || self
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        {
+            return Err("terminal worker is no longer active".into());
+        }
+        let ((identity, file), root) = self
+            .inner
+            .published
+            .launch_directory
+            .get()
+            .ok_or("this terminal holder cannot attest its original launch directory")?;
+        let mut original = libc::pollfd {
+            fd: root.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll observes the already-held original root, never a PID
+        // lookup. A kernel exit must refuse even before Completed is published.
+        let ready = unsafe { libc::poll(&mut original, 1, 0) };
+        if ready != 0 {
+            return Err("terminal original root is no longer live or cannot be observed".into());
+        }
+        holder::checked_launch_directory(*identity, Arc::clone(file))
+    }
     pub(crate) fn transcript_location(&self) -> Option<crate::model::TranscriptLocationReceipt> {
         self.inner
             .published
@@ -840,6 +1071,19 @@ impl TerminalHandle {
         execution_recipe: Option<LaunchRecipe>,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_with_execution_installed(session, config, execution_recipe, wake, |_| Ok(()))
+    }
+
+    /// HOST installs an independent live custody slot before this method permits
+    /// its original thread to prepare or commit adoption. Refusal before that
+    /// installation has no adopted owner to unwind.
+    pub(crate) fn spawn_with_execution_installed(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
+    ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
         super::reactor::runtime().map_err(TerminalStartError::Worker)?;
@@ -861,43 +1105,99 @@ impl TerminalHandle {
         let worker_owner = join_owner.clone();
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        published
+            .startup_unresolved
+            .store(config.adoption.is_some(), Ordering::Release);
+        let handle = Self {
+            inner: Arc::new(HandleInner {
+                commands: command_tx,
+                events: event_rx,
+                published: published.clone(),
+                worker: join_owner.clone(),
+            }),
+        };
+        if let Err(error) = install(&handle) {
+            published.startup_unresolved.store(false, Ordering::Release);
+            return Err(TerminalStartError::Worker(error));
+        }
 
         let worker = thread::Builder::new()
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let _body = joins::BodyCompletion(worker_owner);
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(
-                    session,
-                    config,
-                    execution_recipe,
-                    command_rx,
-                    event_tx,
-                    worker_published,
-                );
+                if admitted.recv().is_err() {
+                    completion
+                        .startup_unresolved
+                        .store(false, Ordering::Release);
+                    completion.completed.store(true, Ordering::Release);
+                    return;
+                }
+                let adopting = config.adoption.is_some();
+                // Preparation has not sent CommitAdoption. A panic here can
+                // only release a provisional control whose holder still owns
+                // its replay backup; it never unwinds a committed local owner.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Worker::prepare(session, config, execution_recipe, command_rx, event_tx, worker_published)
+                })).unwrap_or_else(|_| Err("Terminal preparation panicked before adoption commit".into()));
                 match result {
-                    Ok(worker) => {
-                        let _ = startup_tx.send(Ok(()));
-                        worker.run();
+                    Ok(mut worker) => {
+                        // Crucially the COMPLETE Worker is outside the unwind
+                        // closure. Even a commit/activation panic cannot drop
+                        // the original raw queue, reader, master or control.
+                        let retained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            worker.commit_start()
+                        })).unwrap_or_else(|_| Some("Adoption commit/activation panicked; complete original Worker retained".into()));
+                        if !adopting && let Some(message) = &retained {
+                            completion.startup_unresolved.store(false, Ordering::Release);
+                            completion.completed.store(true, Ordering::Release);
+                            let _ = startup_tx.send(Err(message.clone()));
+                            return;
+                        }
+
+                        if let Some(message) = retained {
+                            *completion
+                                .startup_diagnostic
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) = Some(message.clone());
+                            // A notification callback must not unwind the
+                            // complete owner after the holder discarded replay.
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                worker.error(
+                                    "adoption commit unconfirmed; original output retained",
+                                    message.clone(),
+                                );
+                            }));
+                            let _ = startup_tx.send(Ok(Some(message)));
+                            worker.run_retained_startup();
+                        } else {
+                            completion
+                                .startup_unresolved
+                                .store(false, Ordering::Release);
+                            let _ = startup_tx.send(Ok(None));
+                            worker.run();
+                        }
                     }
                     Err(error) => {
+                        completion
+                            .startup_unresolved
+                            .store(false, Ordering::Release);
                         let _ = startup_tx.send(Err(error));
                         completion.completed.store(true, Ordering::Release);
                     }
                 }
             })
-            .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
+            .map_err(|error| {
+                published.startup_unresolved.store(false, Ordering::Release);
+                TerminalStartError::Worker(error.to_string())
+            })?;
         join_owner.install(worker);
+        let _ = begin.send(());
 
         match startup_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                inner: Arc::new(HandleInner {
-                    commands: command_tx,
-                    events: event_rx,
-                    published,
-                    worker: join_owner,
-                }),
-            }),
+            Ok(Ok(None)) => Ok(handle),
+            Ok(Ok(Some(message))) => Err(TerminalStartError::CustodyRetained { handle, message }),
             Ok(Err(error)) => {
                 joins::request(&join_owner, true, true);
                 let _ = joins::wait_until(
@@ -906,6 +1206,13 @@ impl TerminalHandle {
                     true,
                 );
                 Err(TerminalStartError::Worker(error))
+            }
+            Err(_) if published.startup_unresolved.load(Ordering::Acquire) => {
+                Err(TerminalStartError::CustodyRetained {
+                    handle,
+                    message: "The original startup thread did not report its adoption outcome"
+                        .into(),
+                })
             }
             Err(_) => {
                 joins::request(&join_owner, true, true);
@@ -1158,7 +1465,8 @@ impl TerminalHandle {
                 events,
                 worker_published,
             )
-            .unwrap();
+            .unwrap()
+            .0;
             assert!(
                 !worker.holder.registered(),
                 "failure fixture must not write holder recovery into user state"
@@ -1270,7 +1578,11 @@ impl TerminalHandle {
     }
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
-        self.try_command(Command::Input(bytes.into()))
+        let bytes = bytes.into();
+        if bytes == [3] {
+            return self.try_command(Command::Interrupt(None));
+        }
+        self.try_command(Command::Input(bytes))
     }
 
     pub fn paste(
@@ -1281,7 +1593,15 @@ impl TerminalHandle {
         self.try_command(Command::Paste(text.into(), origin))
     }
 
-    pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
+    pub fn key(&self, mut key: KeyInput) -> Result<(), TerminalSendError> {
+        // Associated text belongs to a down/repeat, never to physical cleanup.
+        // Normalize before reserving or publishing the release admission.
+        if key.action == KeyAction::Release {
+            key.text = None;
+        }
+        if key.action != KeyAction::Release && is_interrupt_key(&key) {
+            return self.try_command(Command::Interrupt(Some(key)));
+        }
         self.try_command(Command::Key(key))
     }
 
@@ -1408,10 +1728,94 @@ impl TerminalHandle {
             .map_err(|error| format!("Cannot inspect the active agent: {error}"))
     }
 
+    /// A reversible cut for an already admitted daemon upgrade. The caller
+    /// owns this unique token until carry or emergency preservation settles.
+    pub(crate) fn prepare_input_handoff(
+        &self,
+        token: Arc<AtomicBool>,
+        resumed: Sender<Result<(), String>>,
+    ) -> Result<(), String> {
+        if self.is_completed() {
+            let _ = resumed.send(Ok(()));
+            return Ok(());
+        }
+        {
+            let mut order = self
+                .inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order.handoff {
+                let _ = resumed.send(Ok(()));
+                return Err("Terminal ownership is already changing".into());
+            }
+            order.handoff = true;
+            order.cleanup_sealed = true;
+            order.prepared_input = Some(token.clone());
+        }
+        let (reply, result) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send_command(Command::PrepareInputHandoff {
+            token: token.clone(),
+            resumed: resumed.clone(),
+            reply,
+        }) {
+            // This command was not accepted; no worker owns the cut.
+            let mut order = self
+                .inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order
+                .prepared_input
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &token))
+            {
+                order.prepared_input = None;
+                order.handoff = false;
+                order.cleanup_sealed = false;
+            }
+            token.store(false, Ordering::Release);
+            let _ = resumed.send(Ok(()));
+            return Err(error.to_string());
+        }
+        let answer = result
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|error| format!("Terminal input handoff remains unconfirmed: {error}"));
+        if !matches!(answer, Ok(Ok(()))) {
+            self.cancel_input_handoff(&token);
+        }
+        answer?
+    }
+
+    pub(crate) fn cancel_input_handoff(&self, token: &Arc<AtomicBool>) {
+        token.store(false, Ordering::Release);
+        // Out-of-band cancellation cannot be starved by a full command queue.
+        // The matching worker alone confirms restart before reopening input.
+        let _ = self.inner.published.capture_tx.try_send(());
+    }
+
     pub(crate) fn prepare_upgrade(&self) -> Result<UpgradeSnapshot, String> {
         let (sender, receiver) = crossbeam_channel::bounded(1);
-        self.try_command(Command::PrepareUpgrade(sender))
-            .map_err(|error| error.to_string())?;
+        let prepared = self
+            .inner
+            .published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .prepared_input
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::Acquire));
+        // The committed non-continuity fallback may inspect/relaunch an
+        // already-cut terminal. Keep its reader/input fenced; ordinary new
+        // controls still cannot cross that ownership boundary.
+        if prepared {
+            self.send_command(Command::PrepareUpgrade(sender))
+        } else {
+            self.try_command(Command::PrepareUpgrade(sender))
+        }
+        .map_err(|error| error.to_string())?;
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| format!("Cannot freeze terminal for upgrade: {error}"))?
@@ -1426,12 +1830,48 @@ impl TerminalHandle {
     /// This waits for the worker's answer however long it takes: a caller that stopped
     /// waiting could not tell a terminal left here from one already carried.
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
+        {
+            let mut order = self
+                .inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order.handoff
+                && !order
+                    .prepared_input
+                    .as_ref()
+                    .is_some_and(|token| token.load(Ordering::Acquire))
+            {
+                return Err("Terminal ownership is already changing".into());
+            }
+            order.handoff = true;
+            order.cleanup_sealed = true;
+        }
+        let reopen = || {
+            let mut order = self
+                .inner
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order.prepared_input.is_none() {
+                order.handoff = false;
+                order.cleanup_sealed = false;
+            }
+        };
         let (reply, result) = crossbeam_channel::bounded(1);
-        self.send_command(Command::Carry { socket, reply })
-            .map_err(|error| error.to_string())?;
-        let carried = result
-            .recv()
-            .map_err(|_| "the terminal ended before it could be carried".to_owned())??;
+        if let Err(error) = self.send_command(Command::Carry { socket, reply }) {
+            reopen();
+            return Err(error.to_string());
+        }
+        let carried = match result.recv() {
+            Ok(Ok(carried)) => carried,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err("the terminal ended before its carry outcome was confirmed".into());
+            }
+        };
         joins::request(&self.inner.worker, false, false);
         if !joins::wait_until(&self.inner.worker, None, false) {
             return Err("Terminal worker failed while completing its carry".into());
@@ -1517,6 +1957,9 @@ impl TerminalHandle {
     /// Starts shutdown before joining any workers, so a daemon with many
     /// terminals lets all roots handle their hangups concurrently.
     pub(crate) fn request_shutdown(&self) {
+        if self.startup_unresolved() {
+            return;
+        }
         self.inner.published.request_shutdown();
         joins::request(&self.inner.worker, true, false);
     }
@@ -1529,6 +1972,9 @@ impl TerminalHandle {
         &self,
         deadline: std::time::Instant,
     ) -> Result<(), TerminalSendError> {
+        if self.startup_unresolved() {
+            return Err(TerminalSendError::Closed);
+        }
         self.request_shutdown();
         if !joins::wait_until(&self.inner.worker, Some(deadline), true) {
             return Err(TerminalSendError::Closed);
@@ -1591,13 +2037,48 @@ impl TerminalHandle {
     /// holder. Serialize with completion, then transfer any final retained
     /// screen; a live parser that cannot serialize is honestly screen-lost.
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
-        let (reply, result) = crossbeam_channel::bounded(1);
-        if self
-            .send_command(Command::PreserveForRestart(reply))
-            .is_ok()
-            && let Ok(result) = result.recv()
-        {
-            result?;
+        if !self.is_completed() {
+            {
+                let mut order = self
+                    .inner
+                    .published
+                    .input_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if order.handoff
+                    && !order
+                        .prepared_input
+                        .as_ref()
+                        .is_some_and(|token| token.load(Ordering::Acquire))
+                {
+                    return Err("Terminal ownership is already changing".into());
+                }
+                order.handoff = true;
+                order.cleanup_sealed = true;
+            }
+            let reopen = || {
+                let mut order = self
+                    .inner
+                    .published
+                    .input_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if order.prepared_input.is_none() {
+                    order.handoff = false;
+                    order.cleanup_sealed = false;
+                }
+            };
+            let (reply, result) = crossbeam_channel::bounded(1);
+            if let Err(error) = self.send_command(Command::PreserveForRestart(reply)) {
+                reopen();
+                return Err(error.to_string());
+            }
+            match result.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) if self.is_completed() => {}
+                Err(_) => return Err("terminal preservation outcome remains unconfirmed".into()),
+            }
         }
         joins::request(&self.inner.worker, false, false);
         if !joins::wait_until(&self.inner.worker, None, false) {
@@ -1607,7 +2088,62 @@ impl TerminalHandle {
         Ok(())
     }
 
+    pub(crate) fn startup_unresolved(&self) -> bool {
+        self.inner
+            .published
+            .startup_unresolved
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_startup_commit_after_ack_for_test(&self) {
+        self.inner
+            .published
+            .test_fail_startup_commit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_startup_bytes_for_test(&self) -> Vec<u8> {
+        self.retained_startup_state_for_test().0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_startup_state_for_test(&self) -> (Vec<u8>, bool, bool) {
+        assert!(self.startup_unresolved());
+        let (reply, result) = crossbeam_channel::bounded(1);
+        *self.inner.published.test_startup_probe.lock().unwrap() = Some(reply);
+        let _ = self.inner.published.capture_tx.try_send(());
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original retained worker probe")
+    }
+
+    pub(crate) fn startup_diagnostic(&self) -> Option<String> {
+        self.inner
+            .published
+            .startup_diagnostic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        if self.startup_unresolved() {
+            match &command {
+                Command::CloseChecked { .. } => {}
+                // Subscription is observational; it must not activate or parse
+                // the parked reader merely to list/inspect/close its owner.
+                Command::HostVisibility(visibility) => {
+                    self.inner
+                        .published
+                        .visible
+                        .store(*visibility == Visibility::Visible, Ordering::Release);
+                    return Ok(());
+                }
+                _ => return Err(TerminalSendError::Closed),
+            }
+        }
         // Stop closes admission even when an existing cached reader holds the
         // archive lock. Natural completion alone leaves read-only commands live.
         if self
@@ -1618,6 +2154,7 @@ impl TerminalHandle {
         {
             return Err(TerminalSendError::Closed);
         }
+
         // Enqueue and archive preparation share this lock. No accepted query
         // can land between the final drain and worker teardown.
         let published = &self.inner.published;
@@ -1629,6 +2166,29 @@ impl TerminalHandle {
                 .visible
                 .store(*visibility == Visibility::Visible, Ordering::Release);
             return Ok(());
+        }
+        // Fast terminal controls share a bounded dispatcher. Waiting for a
+        // different terminal's final screen would occupy its input capacity;
+        // refuse admission so the caller can retry after archival completes.
+        if matches!(*phase, ArchivePhase::Preparing)
+            && matches!(
+                command,
+                Command::Interrupt(_)
+                    | Command::Input(_)
+                    | Command::Paste(..)
+                    | Command::Key(_)
+                    | Command::Mouse(_)
+                    | Command::Focus(_)
+                    | Command::Resize(_)
+                    | Command::Scroll(_)
+                    | Command::SetTheme(_)
+                    | Command::Hide
+                    | Command::Reveal
+                    | Command::Hibernate
+                    | Command::Restore { .. }
+            )
+        {
+            return Err(TerminalSendError::Full);
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while matches!(*phase, ArchivePhase::Preparing) {
@@ -1652,20 +2212,261 @@ impl TerminalHandle {
         if matches!(*phase, ArchivePhase::Released) {
             return Err(TerminalSendError::Closed);
         }
+        if matches!(
+            command,
+            Command::Interrupt(_) | Command::CloseChecked { .. }
+        ) {
+            if published.completed.load(Ordering::Acquire) {
+                return Err(TerminalSendError::Closed);
+            }
+        }
+        if let Command::Interrupt(key) = command {
+            return if published.request_interrupt(key) {
+                Ok(())
+            } else {
+                Err(TerminalSendError::Closed)
+            };
+        }
+        // Serialize input admission with the priority cancellation boundary.
+        // Commands submitted after Ctrl+C must survive its queue drain.
+        let mut order = self
+            .inner
+            .published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if published.shutdown_requested.load(Ordering::Acquire) {
+            return Err(TerminalSendError::Closed);
+        }
+        if order.prepared_input.is_some() {
+            // A stable upgrade cut has no cleanup/retry escape hatch: it was
+            // admitted only after all held input settled. The exact-token
+            // rollback must restore the reader before any new command enters.
+            return Err(TerminalSendError::Closed);
+        }
+        if let Some((identity, KeyAction::Release)) = command_pair(&command) {
+            if order.cleanup_sealed {
+                return Err(TerminalSendError::Closed);
+            }
+            if let Some(claim) = published.cleanup_pool.find(identity) {
+                if claim.enqueue_once() {
+                    let mut releases = published
+                        .cleanup_commands
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    assert!(
+                        releases.len() < admission::CLEANUP_LIMIT,
+                        "each admitted press reserves its one cleanup slot"
+                    );
+                    releases.push_back((claim, order.next_sequence(), command));
+                    let _ = published.capture_tx.try_send(());
+                }
+                return Ok(());
+            }
+        }
+        if order.handoff && !order.cleanup_sealed {
+            return Err(TerminalSendError::Closed);
+        }
+        if matches!(command, Command::CloseChecked { .. }) {
+            let mut priority = published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if priority.is_some() {
+                return Err(TerminalSendError::Full);
+            }
+            *priority = Some(command);
+            let _ = published.capture_tx.try_send(());
+            return Ok(());
+        }
+        if order.handoff {
+            return Err(TerminalSendError::Closed);
+        }
+        let input = matches!(
+            command,
+            Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
+        );
+        let pair = command_pair(&command);
+        let input_claim = match pair {
+            Some((identity, KeyAction::Press)) => Some(
+                published
+                    .cleanup_pool
+                    .press(identity)
+                    .ok_or(TerminalSendError::Full)?,
+            ),
+            Some((identity, KeyAction::Repeat)) => {
+                if let Some(claim) = published.cleanup_pool.find(identity) {
+                    // An already accepted up still owns the end of this cycle.
+                    let ticket = claim.queue_press().ok_or(TerminalSendError::Full)?;
+                    Some((claim, Some(ticket)))
+                } else {
+                    // Cancellation may have discarded the original wholly
+                    // unsent down. A later physical repeat can establish a
+                    // fresh pair, with the same pre-ACK cleanup reservation.
+                    Some(
+                        published
+                            .cleanup_pool
+                            .press(identity)
+                            .ok_or(TerminalSendError::Full)?,
+                    )
+                }
+            }
+            _ => None,
+        };
+        let command = if matches!(
+            command,
+            Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
+        ) {
+            Command::OrderedInput {
+                generation: order.generation,
+                admission: Some(order.track_input()),
+                input: Box::new(command),
+            }
+        } else {
+            command
+        };
+        let command = if let Some((claim, ticket)) = input_claim {
+            Command::InputClaim {
+                claim,
+                ticket,
+                command: Box::new(command),
+            }
+        } else {
+            command
+        };
+        let storage = command_storage_bound(&command)
+            .map(|bound| {
+                let bytes = bound.ok_or(TerminalSendError::Full)?;
+                published
+                    .input_storage
+                    .reserve(bytes, 1)
+                    .ok_or(TerminalSendError::Full)
+            })
+            .transpose()?;
+        let mut permit = self
+            .command_budget()
+            .try_acquire()
+            .ok_or(TerminalSendError::Full)?;
+        if let Some(storage) = storage {
+            admission::Permit::attach_storage(&mut permit, storage);
+        }
         self.inner
             .commands
-            .try_send(command)
+            .try_send(Command::Admitted {
+                permit,
+                command: Box::new(command),
+            })
             .map_err(|error| match error {
                 TrySendError::Full(_) => TerminalSendError::Full,
                 TrySendError::Disconnected(_) => TerminalSendError::Closed,
-            })
+            })?;
+        Ok(())
+    }
+
+    fn command_budget(&self) -> &Arc<admission::Budget> {
+        self.inner.published.command_budget.get_or_init(|| {
+            admission::Budget::new(
+                self.inner
+                    .commands
+                    .capacity()
+                    .expect("terminal command channel is bounded"),
+            )
+        })
     }
 
     fn send_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+        let permit = self
+            .command_budget()
+            .acquire_until(deadline)
+            .ok_or(TerminalSendError::Full)?;
         self.inner
             .commands
-            .send(command)
-            .map_err(|_| TerminalSendError::Closed)
+            .send_timeout(
+                Command::Admitted {
+                    permit,
+                    command: Box::new(command),
+                },
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|error| match error {
+                crossbeam_channel::SendTimeoutError::Timeout(_) => TerminalSendError::Full,
+                crossbeam_channel::SendTimeoutError::Disconnected(_) => TerminalSendError::Closed,
+            })
+    }
+}
+
+fn is_interrupt_key(key: &KeyInput) -> bool {
+    key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.super_key
+        && matches!(key.key, TerminalKey::Character('c' | 'C'))
+        // Compound text is ordinary input, not the fixed-size priority key.
+        && key.text.as_ref().is_none_or(|text| text.chars().nth(1).is_none())
+}
+
+fn command_storage_bound(command: &Command) -> Option<Option<usize>> {
+    match command {
+        Command::Admitted { command, .. } | Command::InputClaim { command, .. } => {
+            command_storage_bound(command)
+        }
+        Command::OrderedInput { input, .. } => command_storage_bound(input),
+        Command::Input(bytes) => Some(Some(bytes.len())),
+        Command::Paste(text, _) => Some(text.len().checked_add(BRACKETED_PASTE_FRAME_BYTES)),
+        Command::Key(input) => Some(key_storage_bound(input)),
+        Command::Mouse(_) | Command::Focus(_) | Command::SetTheme(_) => Some(Some(128)),
+        _ => None,
+    }
+}
+
+fn key_storage_bound(input: &KeyInput) -> Option<usize> {
+    input.text.as_ref().map_or(Some(128), |text| {
+        text.len()
+            .checked_mul(8)
+            .and_then(|length| length.checked_add(128))
+    })
+}
+
+fn command_pair(command: &Command) -> Option<(admission::Identity, KeyAction)> {
+    match command {
+        Command::Admitted { command, .. } | Command::InputClaim { command, .. } => {
+            command_pair(command)
+        }
+        Command::OrderedInput { input, .. } => command_pair(input),
+        Command::Key(input) => Some((admission::Identity::key(input), input.action)),
+        Command::Mouse(input) if input.action != MouseAction::Motion => {
+            let button = input.button?;
+            if matches!(button, MouseButton::WheelUp | MouseButton::WheelDown) {
+                return None;
+            }
+            Some((
+                admission::Identity::Mouse(button),
+                if input.action == MouseAction::Release {
+                    KeyAction::Release
+                } else {
+                    KeyAction::Press
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn is_cancelable_input_before(command: &Command, boundary: u64) -> bool {
+    match command {
+        Command::Admitted { command, .. } | Command::InputClaim { command, .. } => {
+            is_cancelable_input_before(command, boundary)
+        }
+        Command::OrderedInput {
+            generation, input, ..
+        } => *generation < boundary && is_cancelable_input_before(input, boundary),
+        // A press may already be consumed. Preserve key and button releases
+        // while canceling bulk input, so raw/extended apps never keep a key or
+        // button pressed merely because Ctrl+C overtook its queued release.
+        Command::Key(key) if key.action == KeyAction::Release => false,
+        Command::Mouse(mouse) if mouse.action == MouseAction::Release => false,
+        Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_) => true,
+        _ => false,
     }
 }
 
@@ -1677,6 +2478,11 @@ struct WorkerCompletion {
     event: Option<TerminalEvent>,
     /// A confirmed root exit or already-committed carry released ownership.
     ownership_released: bool,
+}
+
+struct InputHandoff {
+    token: Arc<AtomicBool>,
+    resumed: Option<Sender<Result<(), String>>>,
 }
 
 struct Worker {
@@ -1707,6 +2513,7 @@ struct Worker {
         Option<u64>,
         u16,
         Sender<Result<Arc<RenderSnapshot>, String>>,
+        Option<Arc<admission::Permit>>,
     )>,
     force_capture: bool,
     /// When a capture was first withheld for the synchronized update still in
@@ -1728,6 +2535,14 @@ struct Worker {
     published: Arc<PublishedState>,
     master: holder::PtyMaster,
     writer: File,
+    pending_input: input_queue::PendingInput,
+    writer_failed: bool,
+    #[cfg(test)]
+    test_write_budget: Option<usize>,
+    kernel_preservation_warned: bool,
+    retained_commands: VecDeque<Command>,
+    current_admission: Option<Arc<admission::Permit>>,
+    current_input_claim: Option<Arc<admission::Cleanup>>,
     child: holder::HeldChild,
     child_exit_rx: Receiver<ChildExit>,
     child_identity: Option<RootIdentity>,
@@ -1738,7 +2553,15 @@ struct Worker {
     /// The process that owns this terminal's PTY and reaps its root.
     /// Released last, once nothing here reads or writes the terminal.
     holder: holder::Holder,
+    input_handoff: Option<InputHandoff>,
+    reader_restart_pending: bool,
+    reply_backpressured: bool,
     reader: Option<JoinHandle<()>>,
+    /// Retained startup never lets this reader consume the PTY. The queued
+    /// original replay prefix stays in pty_rx until explicit recovery.
+    reader_start: Option<Sender<()>>,
+    #[cfg(test)]
+    test_startup_queue: Option<Sender<PtyMessage>>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
     reader_wake: Option<OwnedFd>,
@@ -1759,6 +2582,8 @@ struct Reader {
     wake: OwnedFd,
     done: Receiver<()>,
     output: Receiver<PtyMessage>,
+    #[cfg(test)]
+    test_queue: Sender<PtyMessage>,
     discard_pending: Arc<AtomicBool>,
 }
 
@@ -1800,6 +2625,8 @@ impl Reader {
         if !pending.is_empty() {
             let _ = pty_tx.send(PtyMessage::Bytes(pending));
         }
+        #[cfg(test)]
+        let test_queue = pty_tx.clone();
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let (start, started) = crossbeam_channel::bounded(1);
         let discard_pending = Arc::new(AtomicBool::new(false));
@@ -1825,6 +2652,8 @@ impl Reader {
             wake,
             done,
             output,
+            #[cfg(test)]
+            test_queue,
             discard_pending,
         })
     }
@@ -1837,7 +2666,7 @@ impl Reader {
 }
 
 impl Worker {
-    fn start(
+    fn prepare(
         session: TerminalSession,
         config: TerminalConfig,
         execution_recipe: Option<LaunchRecipe>,
@@ -1861,7 +2690,7 @@ impl Worker {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: current_size.columns,
             rows: current_size.rows,
-            max_scrollback: config.max_scrollback,
+            max_scrollback: config.max_scrollback_bytes,
         })
         .map_err(|error| format!("create Ghostty terminal: {error}"))?;
         apply_theme(&mut terminal, config.theme)
@@ -2017,7 +2846,32 @@ impl Worker {
                 .duplicate()
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
+        #[cfg(test)]
+        {
+            // The existing holder pidfd must still reach its original root
+            // after opening the fixture capability. A reaped/reused PID never
+            // reaches the failure guard. Quick natural exits need no fallback.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, held.child.pid(), 0) };
+            if raw >= 0 {
+                let descriptor = unsafe { File::from_raw_fd(raw as i32) };
+                if held.child.unreaped() {
+                    let _ = published.test_input_root_pidfd.set(descriptor);
+                }
+            }
+        }
         let writer = File::from(duplicate("writing")?);
+        // Duplicated master descriptors share status flags. Existing reader
+        // and detached-holder paths already rearm on WouldBlock.
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(format!(
+                "make PTY nonblocking: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
         let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
@@ -2053,19 +2907,34 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
-        held.holder.commit_adoption()?;
+        // Install only an already-held exact root identity, and allocate its
+        // CLOEXEC clone before adoption commit can transfer replay custody.
+        let launch_directory = held
+            .launch_directory
+            .as_ref()
+            .map(|(identity, file)| {
+                held.child
+                    .duplicate_pidfd()
+                    .map(|root| ((*identity, Arc::clone(file)), root))
+                    .map_err(|error| format!("pin original terminal root: {error}"))
+            })
+            .transpose()?;
+        // Replay transfer and reader activation remain in commit_start, after
+        // the complete original Worker has moved outside the panic guard.
         if let Some(role) = held.holder.original_role() {
             let _ = published.original_holder_role.set(role.clone());
         }
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }
-        reader.activate();
+        if let Some(pin) = launch_directory {
+            let _ = published.launch_directory.set(pin);
+        }
 
         let events = Arc::new(events);
         let _ = published.semantic_events.set(Arc::downgrade(&events));
 
-        Ok(Self {
+        let worker = Self {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&execution),
             resume_foreground: None,
@@ -2100,6 +2969,14 @@ impl Worker {
             published,
             master: held.master,
             writer,
+            pending_input: input_queue::PendingInput::default(),
+            writer_failed: false,
+            #[cfg(test)]
+            test_write_budget: None,
+            kernel_preservation_warned: false,
+            retained_commands: VecDeque::new(),
+            current_admission: None,
+            current_input_claim: None,
             child: held.child,
             child_exit_rx,
             child_identity,
@@ -2107,11 +2984,148 @@ impl Worker {
             carried: false,
             holder: held.holder,
             pty_capacity: config.pty_capacity,
+            input_handoff: None,
+            reader_restart_pending: false,
+            reply_backpressured: false,
             reader: Some(reader.thread),
+            reader_start: reader.start.take(),
+            #[cfg(test)]
+            test_startup_queue: Some(reader.test_queue),
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
             reader_discard_pending: reader.discard_pending,
-        })
+        };
+        Ok(worker)
+    }
+
+    /// Called only with the entire original Worker owned OUTSIDE the caller's
+    /// panic guard. No error/panic can unwind its replay prefix out of custody.
+    fn commit_start(&mut self) -> Option<String> {
+        #[cfg(test)]
+        let retained = if self
+            .published
+            .test_fail_startup_commit
+            .load(Ordering::Acquire)
+        {
+            self.holder.fail_after_actual_commit_for_test().err()
+        } else {
+            self.holder.commit_adoption().err()
+        };
+        #[cfg(not(test))]
+        let retained = self.holder.commit_adoption().err();
+        let mut retained = retained;
+        if retained.is_none() {
+            if let Some(start) = self.reader_start.take()
+                && start.send(()).is_err()
+            {
+                retained = Some(
+                    "The prepared reader did not accept activation; original replay is retained"
+                        .into(),
+                );
+            }
+        }
+        #[cfg(test)]
+        if retained.is_none() {
+            drop(self.test_startup_queue.take());
+        }
+        retained
+    }
+
+    #[cfg(test)]
+    fn start(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        commands: Receiver<Command>,
+        events: Sender<TerminalEvent>,
+        published: Arc<PublishedState>,
+    ) -> Result<(Self, Option<String>), String> {
+        let mut worker = Self::prepare(
+            session,
+            config,
+            execution_recipe,
+            commands,
+            events,
+            published,
+        )?;
+        let retained =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.commit_start()))
+                .unwrap_or_else(|_| {
+                    Some("Commit panicked with its complete original owner retained".into())
+                });
+        Ok((worker, retained))
+    }
+
+    fn run_retained_startup(mut self) {
+        loop {
+            #[cfg(test)]
+            {
+                let probe = self.published.test_startup_probe.lock().unwrap().take();
+                if let Some(probe) = probe {
+                    // The reader is unactivated: this observes and reinstalls
+                    // its actual sole replay message, not a second model/DTO.
+                    let queued = self.pty_rx.try_iter().collect::<Vec<_>>();
+                    let mut raw = Vec::new();
+                    for message in queued {
+                        if let PtyMessage::Bytes(bytes) = &message {
+                            raw.extend_from_slice(bytes);
+                        }
+                        self.test_startup_queue
+                            .as_ref()
+                            .unwrap()
+                            .try_send(message)
+                            .unwrap();
+                    }
+                    let (pending, cleanup) = self.holder.startup_cleanup_state_for_test();
+                    let _ = probe.send((raw, pending, cleanup));
+                }
+            }
+            let close = self
+                .published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(command) = close {
+                if let Command::CloseChecked {
+                    allow_active,
+                    deadline,
+                    reply,
+                } = command
+                {
+                    // A panicking observer/inspection cannot unwind this
+                    // complete original owner out of its parked frame.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.checked_close(allow_active, deadline)
+                    }))
+                    .unwrap_or_else(|_| {
+                        super::ipc::TerminalCloseResult::Unknown(
+                            "Checked close panicked; original startup custody remains retained"
+                                .into(),
+                        )
+                    });
+                    let closed = outcome == super::ipc::TerminalCloseResult::Closed;
+                    if closed {
+                        // Only an explicit checked destructive close releases
+                        // unresolved replay. Ordinary shutdown/Drop does not.
+                        self.holder.prove_startup_cleanup();
+                        drop(self.reader_start.take());
+                        self.published
+                            .startup_unresolved
+                            .store(false, Ordering::Release);
+                        self.published.request_shutdown();
+                        let _ = reply.send(outcome);
+                        self.run();
+                        return;
+                    }
+                    let _ = reply.send(outcome);
+                }
+            }
+            // The original reader remains unactivated. In particular, no raw
+            // query can be parsed or answered before ownership is confirmed.
+            // A dropped external observer is not an owner-release instruction.
+            let _ = self.published.capture_rx.recv();
+        }
     }
 
     #[cfg(test)]
@@ -2151,18 +3165,64 @@ impl Worker {
         let mut shutting_down = false;
         let mut carried_command = None;
         while !shutting_down && (pty_open || !exited) {
+            if self.resume_cancelled_input_handoff() || self.resume_reader_after_refusal() {
+                pty_open = true;
+            }
             if self.published.shutdown_requested.load(Ordering::Acquire) {
                 shutting_down = true;
                 break;
             }
+            if self.published.interrupt_requested.load(Ordering::Acquire) {
+                let boundary = self.interrupt_input_with_carried(carried_command.as_ref());
+                if carried_command
+                    .as_ref()
+                    .is_some_and(|command| is_cancelable_input_before(command, boundary))
+                {
+                    carried_command = None;
+                }
+            }
+            let close = self
+                .published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(close) = close {
+                if let Some(carried) = carried_command.take() {
+                    self.retained_commands.push_back(carried);
+                }
+                if self.handle_command(close) {
+                    shutting_down = true;
+                    break;
+                }
+            }
+            for _ in 0..admission::CLEANUP_LIMIT {
+                let Some(command) = self.published.take_cleanup_command(true) else {
+                    break;
+                };
+                let Some(command) = self.command_before_interrupt(command) else {
+                    break;
+                };
+                if self.handle_command(command) {
+                    shutting_down = true;
+                    break;
+                }
+            }
+            if shutting_down {
+                break;
+            }
+            self.flush_pty_input();
+            self.drain_effects();
             self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
             // timeout: an agent can start in an existing shell's process group.
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
                 self.observe_foreground();
             }
-            let event = carried_command
-                .take()
+            let event = self
+                .retained_commands
+                .pop_front()
+                .or_else(|| carried_command.take())
                 .map(|command| WorkerEvent::Command(Some(command)))
                 .unwrap_or_else(|| {
                     wait_for_worker_event(
@@ -2170,18 +3230,28 @@ impl Worker {
                         &self.pty_rx,
                         &self.child_exit_rx,
                         &self.published.capture_rx,
-                        pty_open,
+                        pty_open && self.reader.is_some() && !self.reply_pending(),
                         !exited,
                         self.foreground_poll
                             .saturating_sub(self.last_foreground_observation.elapsed()),
                         self.synchronized_release_after()
                             .into_iter()
                             .chain(self.bell.release_after())
+                            .chain(
+                                (!self.pending_input.is_empty() || self.reply_pending())
+                                    .then_some(PTY_WRITE_RETRY),
+                            )
                             .min(),
                     )
                 });
             match event {
                 WorkerEvent::Command(Some(command)) => {
+                    // A command selected together with the priority wake must
+                    // cross the cancellation boundary before it can write.
+                    let Some(command) = self.command_before_interrupt(command) else {
+                        continue;
+                    };
+                    self.retain_carried_for_handoff(&command, &mut carried_command);
                     // Wheel bursts otherwise queue one repaint per event. Fold
                     // adjacent viewport deltas before publishing a snapshot.
                     let command =
@@ -2454,14 +3524,87 @@ impl Worker {
     }
 
     /// Returns true when shutdown was requested.
+    fn command_before_interrupt(&mut self, command: Command) -> Option<Command> {
+        if self.published.interrupt_requested.load(Ordering::Acquire) {
+            // A coalesced scroll may already own the carry slot. Return the
+            // selected command to the inbox without replacing that control.
+            self.retained_commands.push_front(command);
+            None
+        } else {
+            Some(command)
+        }
+    }
+
+    fn retain_carried_for_handoff(&mut self, command: &Command, carried: &mut Option<Command>) {
+        fn changes_owner(command: &Command) -> bool {
+            match command {
+                Command::Admitted { command, .. } | Command::InputClaim { command, .. } => {
+                    changes_owner(command)
+                }
+                Command::PrepareInputHandoff { .. }
+                | Command::PrepareUpgrade(_)
+                | Command::Carry { .. }
+                | Command::PreserveForRestart(_) => true,
+                _ => false,
+            }
+        }
+        if changes_owner(command)
+            && let Some(command) = carried.take()
+        {
+            // A scroll coalescer may have consumed an accepted input before
+            // this control was selected. Include its SAME owner/credits in
+            // the drain proof before an irreversible handoff can proceed.
+            self.retained_commands.push_front(command);
+        }
+    }
+
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::InputClaim {
+                claim,
+                ticket,
+                command,
+            } => {
+                let previous = self.current_input_claim.replace(claim);
+                let close = self.handle_command(*command);
+                self.current_input_claim = previous;
+                drop(ticket);
+                return close;
+            }
+            Command::Admitted { permit, command } => {
+                let previous = self.current_admission.replace(permit);
+                let close = self.handle_command(*command);
+                self.current_admission = previous;
+                return close;
+            }
+            Command::OrderedInput {
+                admission, input, ..
+            } => {
+                let _admission = admission;
+                // A release can arrive after the loop selected this input.
+                // Finish eligible earlier releases before encoding it, while
+                // retaining this input's ticket so newer releases cannot pass.
+                let ordinary = self.current_admission.take();
+                for _ in 0..admission::CLEANUP_LIMIT {
+                    let Some(cleanup) = self.published.take_cleanup_command(true) else {
+                        break;
+                    };
+                    self.handle_command(cleanup);
+                }
+                self.current_admission = ordinary;
+                return self.handle_command(*input);
+            }
+            Command::Interrupt(key) => {
+                self.published.request_interrupt(key);
+            }
+
             Command::ReadViewport {
                 offset,
                 rows,
                 reply,
             } => {
-                self.viewport_reads.push((offset, rows, reply));
+                self.viewport_reads
+                    .push((offset, rows, reply, self.current_admission.clone()));
                 if self.capture_dirty {
                     // This explicit next-frame request grants one capture
                     // credit. Waiting for its future ACK would deadlock.
@@ -2543,26 +3686,42 @@ impl Worker {
                 deadline,
                 reply,
             } => {
-                use super::ipc::TerminalCloseResult;
-                let outcome = match self.inspect_close(deadline) {
-                    Ok((true, _)) if !allow_active => TerminalCloseResult::Active,
-                    Ok((_, mut family)) => match family.kill(deadline) {
-                        Ok(()) => {
-                            self.checked_shutdown = true;
-                            self.holder.prove_cleanup();
-                            TerminalCloseResult::Closed
-                        }
-                        Err(detail) => TerminalCloseResult::Unknown(detail),
-                    },
-                    Err(detail) => TerminalCloseResult::Unknown(detail),
-                };
-                let close = outcome == TerminalCloseResult::Closed;
+                let outcome = self.checked_close(allow_active, deadline);
+                let close = outcome == super::ipc::TerminalCloseResult::Closed;
                 let _ = reply.send(outcome);
                 return close;
             }
+            Command::PrepareInputHandoff {
+                token,
+                resumed,
+                reply,
+            } => {
+                self.input_handoff = Some(InputHandoff {
+                    token: token.clone(),
+                    resumed: Some(resumed),
+                });
+                let result = if !token.load(Ordering::Acquire) {
+                    Err("Terminal input preparation was cancelled".into())
+                } else {
+                    self.input_drained_for_handoff()
+                        .and_then(|()| self.stop_reading())
+                        .and_then(|()| self.input_drained_for_handoff())
+                        .and_then(|()| {
+                            token
+                                .load(Ordering::Acquire)
+                                .then_some(())
+                                .ok_or_else(|| "Terminal input preparation was cancelled".into())
+                        })
+                };
+                if result.is_err() {
+                    token.store(false, Ordering::Release);
+                    self.resume_cancelled_input_handoff();
+                }
+                let _ = reply.send(result);
+            }
             Command::PrepareUpgrade(reply) => {
-                let result = self
-                    .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3))
+                let result = self.input_drained_for_handoff().and_then(|()| self
+                    .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3)))
                     .and_then(|(active, family)| {
                         self.refresh_resume_hint(true);
                         if active && self.resume_hint.as_deref()
@@ -2589,12 +3748,27 @@ impl Worker {
             }
             Command::PreserveForRestart(reply) => {
                 if !self.holder.registered() {
+                    if self.input_handoff.is_none() {
+                        self.restart_reader_after_refusal();
+                    }
                     let _ = reply.send(Err(
                         "legacy terminal has no persistent holder endpoint".into()
                     ));
                     return false;
                 }
+                let result = self
+                    .input_drained_for_handoff()
+                    .and_then(|()| self.stop_reading())
+                    .and_then(|()| self.input_drained_for_handoff());
+                if let Err(error) = result {
+                    if self.input_handoff.is_none() {
+                        self.restart_reader_after_refusal();
+                    }
+                    let _ = reply.send(Err(error));
+                    return false;
+                }
                 self.carried = true;
+                self.complete_input_handoff();
                 self.holder.leave_for_successor();
                 let _ = reply.send(Ok(()));
                 return true;
@@ -2607,7 +3781,9 @@ impl Worker {
                 let process = self.observe_agent_process().cloned();
                 let _ = sender.send(process);
             }
-            Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
+            Command::Input(bytes) => {
+                self.write_user_input(&bytes, "write terminal input");
+            }
             Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
@@ -2630,7 +3806,9 @@ impl Worker {
                     focus::Event::Lost
                 };
                 match event.encode(&mut buffer) {
-                    Ok(written) => self.write_pty(&buffer[..written], "write focus report"),
+                    Ok(written) => {
+                        self.write_pty(&buffer[..written], "write focus report");
+                    }
                     Err(error) => self.error("encode focus report", error.to_string()),
                 }
             }
@@ -2712,9 +3890,47 @@ impl Worker {
         false
     }
 
-    fn encode_key(&mut self, input: KeyInput) {
-        match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
-            Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
+    fn encode_key(&mut self, mut input: KeyInput) {
+        if input.action == KeyAction::Repeat && !self.pending_input.has_key_owner(&input) {
+            // Its earlier unsent down may have been canceled at a priority
+            // boundary. A later accepted repeat establishes a fresh down.
+            input.action = KeyAction::Press;
+        }
+        let mut release = input.clone();
+        release.action = KeyAction::Release;
+        release.text = None;
+        let paired = match encode_key_input(&self.terminal, &mut self.key_encoder, release) {
+            Ok(bytes) => !bytes.is_empty(),
+            Err(error) => {
+                self.error("encode key release", error.to_string());
+                return;
+            }
+        };
+        match encode_key_input(&self.terminal, &mut self.key_encoder, input.clone()) {
+            Ok(encoded) => {
+                if self.pending_input.key_release_protocol_unknown(
+                    &input,
+                    &encoded,
+                    self.current_input_claim.as_ref(),
+                ) {
+                    self.error("release terminal key", "The terminal changed its key protocol before an owned release. Delivery is unconfirmed; the original input ownership is retained.".into());
+                    return;
+                }
+                self.flush_pty_input();
+                let admitted = self.pending_input.admit_key(
+                    &input,
+                    &encoded,
+                    paired,
+                    self.current_admission.clone(),
+                    self.current_input_claim.clone(),
+                );
+                if !admitted {
+                    self.input_backpressure("write encoded key");
+                }
+                if admitted {
+                    self.flush_pty_input();
+                }
+            }
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -2732,7 +3948,17 @@ impl Worker {
                 if self.visibility == Visibility::Visible {
                     self.publish_snapshot(false);
                 }
-                self.write_pty(&encoded, "write terminal paste");
+                self.flush_pty_input();
+                let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+                if !self.pending_input.admit_paste(
+                    &encoded,
+                    bracketed,
+                    self.current_admission.clone(),
+                ) {
+                    self.input_backpressure("write terminal paste");
+                    return;
+                }
+                self.flush_pty_input();
             }
             Err(error) => self.error("encode terminal paste", error.to_string()),
         }
@@ -2769,7 +3995,27 @@ impl Worker {
             });
         let mut encoded = Vec::with_capacity(32);
         match self.mouse_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => self.write_pty(&encoded, "write encoded mouse event"),
+            Ok(()) => {
+                if self.pending_input.mouse_release_protocol_unknown(
+                    &input,
+                    &encoded,
+                    self.current_input_claim.as_ref(),
+                ) {
+                    self.error("release terminal mouse button", "The terminal changed its mouse protocol before an owned release. Delivery is unconfirmed; the original input ownership is retained.".into());
+                    return;
+                }
+                self.flush_pty_input();
+                if !self.pending_input.admit_mouse(
+                    &input,
+                    &encoded,
+                    self.current_admission.clone(),
+                    self.current_input_claim.clone(),
+                ) {
+                    self.input_backpressure("write encoded mouse event");
+                    return;
+                }
+                self.flush_pty_input();
+            }
             Err(error) => self.error("encode mouse event", error.to_string()),
         }
     }
@@ -2964,7 +4210,7 @@ impl Worker {
             return;
         }
         let base = self.published.snapshot.load_full();
-        for (offset, rows, reply) in std::mem::take(&mut self.viewport_reads) {
+        for (offset, rows, reply, _permit) in std::mem::take(&mut self.viewport_reads) {
             let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -3022,9 +4268,23 @@ impl Worker {
 
     fn drain_effects(&mut self) {
         let effects = std::mem::take(&mut *self.effects.borrow_mut());
-        for effect in effects.ordered {
+        let mut remaining = effects.ordered.into_iter();
+        while let Some(effect) = remaining.next() {
             match effect {
-                Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
+                Effect::PtyWrite(bytes) => {
+                    if let Err(bytes) = self.admit_pty_reply(bytes) {
+                        if !self.reply_backpressured {
+                            self.input_backpressure("write terminal response");
+                            self.reply_backpressured = true;
+                        }
+                        let mut pending = self.effects.borrow_mut();
+                        pending.push(Effect::PtyWrite(bytes));
+                        for effect in remaining {
+                            pending.push(effect);
+                        }
+                        return;
+                    }
+                }
                 Effect::Bell => {
                     self.bell.pending = true;
                     self.publish_bell();
@@ -3091,6 +4351,7 @@ impl Worker {
                 }
             }
         }
+        self.reply_backpressured = false;
     }
 
     /// OSC titles win. Shells that do not publish one still expose the
@@ -3125,44 +4386,189 @@ impl Worker {
     /// cannot be detached is read again; one whose reader would not stop is
     /// left to that reader.
     fn carry(&mut self, socket: &std::path::Path) -> Result<Carried, String> {
-        // Observed while this worker still owns the terminal's processes.
-        self.refresh_resume_hint(true);
-        self.stop_reading()?;
-        let detached = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
-            .and_then(|screen| self.holder.detach(socket, &screen));
-        if let Err(error) = detached {
-            match Reader::start(
-                self.terminal_id,
-                &self.master,
-                self.pty_capacity,
-                Vec::new(),
-            ) {
-                Ok(reader) => {
-                    self.reader = Some(reader.thread);
-                    self.reader_wake = Some(reader.wake);
-                    self.reader_done = reader.done;
-                    self.reader_discard_pending = reader.discard_pending;
-                    self.pty_rx = reader.output;
-                }
-                Err(restart) => self.error("resume reading terminal", restart),
-            }
-            return Err(error);
+        let result = (|| {
+            self.input_drained_for_handoff()?;
+            self.refresh_resume_hint(true);
+            self.stop_reading()?;
+            self.input_drained_for_handoff()?;
+            carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+                .and_then(|screen| self.holder.detach(socket, &screen))?;
+            self.carried = true;
+            self.complete_input_handoff();
+            Ok(Carried {
+                size: self.current_size,
+                theme: self.theme.get(),
+                hint: self.resume_hint.clone(),
+            })
+        })();
+        if result.is_err() && self.input_handoff.is_none() {
+            self.restart_reader_after_refusal();
         }
-        self.carried = true;
-        Ok(Carried {
-            size: self.current_size,
-            theme: self.theme.get(),
-            hint: self.resume_hint.clone(),
-        })
+        result
+    }
+
+    /// Restore the same lossless reader ordering. Its existing bounded output
+    /// channel remains the sole owner of all unread batches; never replace
+    /// that receiver before the stopped reader is joined and it is drained.
+    fn restart_reader(&mut self) -> Result<bool, String> {
+        if self.reader.is_some() && self.reader_wake.is_some() {
+            return Ok(true);
+        }
+        if self.reader.is_some() {
+            if matches!(self.reader_done.try_recv(), Err(TryRecvError::Empty)) {
+                return Ok(false);
+            }
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+        self.drain_effects();
+        if self.reply_pending() {
+            return Ok(false);
+        }
+        // Actual join above means no producer can extend this fixed batch.
+        for _ in 0..self.pty_rx.len() {
+            match self.pty_rx.try_recv() {
+                Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
+                Ok(PtyMessage::Eof | PtyMessage::Error(_)) => {}
+                Err(_) => break,
+            }
+            if self.reply_pending() {
+                return Ok(false);
+            }
+        }
+        let reader = Reader::start(
+            self.terminal_id,
+            &self.master,
+            self.pty_capacity,
+            Vec::new(),
+        )?;
+        self.reader = Some(reader.thread);
+        self.reader_wake = Some(reader.wake);
+        self.reader_done = reader.done;
+        self.reader_discard_pending = reader.discard_pending;
+        self.pty_rx = reader.output;
+        Ok(true)
+    }
+
+    fn restart_reader_after_refusal(&mut self) {
+        self.reader_restart_pending = true;
+        let _ = self.resume_reader_after_refusal();
+    }
+
+    fn resume_reader_after_refusal(&mut self) -> bool {
+        if !self.reader_restart_pending || self.input_handoff.is_some() {
+            return false;
+        }
+        match self.restart_reader() {
+            Ok(true) => {
+                self.reader_restart_pending = false;
+                let mut order = self
+                    .published
+                    .input_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if order.prepared_input.is_none() {
+                    order.handoff = false;
+                    order.cleanup_sealed = false;
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                self.reader_restart_pending = false;
+                self.error("resume reading terminal", error);
+                false
+            }
+        }
+    }
+
+    fn resume_cancelled_input_handoff(&mut self) -> bool {
+        let Some(cut) = &self.input_handoff else {
+            return false;
+        };
+        if cut.token.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.restart_reader() {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                if let Some(reply) = self
+                    .input_handoff
+                    .as_mut()
+                    .and_then(|cut| cut.resumed.take())
+                {
+                    let _ = reply.send(Err(error));
+                }
+                return false;
+            }
+        }
+        let cut = self.input_handoff.take().expect("matching cancelled cut");
+        let mut order = self
+            .published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if order
+            .prepared_input
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &cut.token))
+        {
+            order.prepared_input = None;
+            order.handoff = false;
+            order.cleanup_sealed = false;
+        }
+        drop(order);
+        if let Some(reply) = cut.resumed {
+            let _ = reply.send(Ok(()));
+        }
+        true
+    }
+
+    fn complete_input_handoff(&mut self) {
+        if let Some(cut) = self.input_handoff.take() {
+            let mut order = self
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order
+                .prepared_input
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &cut.token))
+            {
+                order.prepared_input = None;
+            }
+            drop(order);
+            if let Some(reply) = cut.resumed {
+                let _ = reply.send(Ok(()));
+            }
+        }
     }
 
     /// Stops the reader and takes in everything it read. A reader that will
     /// not stop may still read, which leaves the terminal to it.
     fn stop_reading(&mut self) -> Result<(), String> {
+        if self.reply_pending() {
+            return Err("Terminal reply is still pending; reader cut remains unconfirmed".into());
+        }
+        if self.reader.is_none() {
+            return if self.pty_rx.is_empty() {
+                Ok(())
+            } else {
+                Err("Terminal output is still pending; reader cut remains unconfirmed".into())
+            };
+        }
         drop(self.reader_wake.take());
         let deadline = std::time::Instant::now() + READER_SHUTDOWN_GRACE;
         let mut reading = true;
         while reading {
+            if self.reply_pending() {
+                return Err(
+                    "Terminal reply is still pending; reader cut remains unconfirmed".into(),
+                );
+            }
             crossbeam_channel::select! {
                 recv(self.pty_rx) -> message => match message {
                     Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
@@ -3180,12 +4586,102 @@ impl Worker {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        while let Ok(message) = self.pty_rx.try_recv() {
-            if let PtyMessage::Bytes(bytes) = message {
-                self.process_output(bytes);
+        while !self.reply_pending() {
+            match self.pty_rx.try_recv() {
+                Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
+                Ok(PtyMessage::Eof | PtyMessage::Error(_)) => {}
+                Err(_) => break,
             }
         }
+        if self.reply_pending() {
+            return Err("Terminal reply is still pending; reader cut remains unconfirmed".into());
+        }
         Ok(())
+    }
+
+    fn input_drained_for_handoff(&self) -> Result<(), String> {
+        if !self.pending_input.is_empty()
+            || self.reply_pending()
+            || self.pending_input.has_held_input()
+            || !self.viewport_reads.is_empty()
+            || !self
+                .published
+                .cleanup_commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+            || !self.commands.is_empty()
+            || !self.retained_commands.is_empty()
+        {
+            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+        }
+        Ok(())
+    }
+
+    fn checked_close(
+        &mut self,
+        allow_active: bool,
+        deadline: std::time::Instant,
+    ) -> super::ipc::TerminalCloseResult {
+        use super::ipc::TerminalCloseResult;
+
+        // Fence new input at the shared admission lock. Reserved cleanup can
+        // still balance a prior owned press while inspection is reversible;
+        // it is sealed too before any destructive process signal. No mutex is
+        // held during /proc inspection or process cleanup.
+        {
+            let mut order = self
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if order.handoff && !order.cleanup_sealed {
+                return TerminalCloseResult::Unknown(
+                    "Terminal ownership is already changing".into(),
+                );
+            }
+            order.handoff = true;
+        }
+        let inspection = self.inspect_close(deadline);
+        #[cfg(test)]
+        if let Some((inspected, resume)) =
+            self.published.close_inspection_gate.lock().unwrap().take()
+        {
+            inspected.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let outcome = match inspection {
+            Ok((true, family)) if !allow_active => {
+                // Thaw the inspected family before restoring input admission.
+                drop(family);
+                TerminalCloseResult::Active
+            }
+            Err(detail) => TerminalCloseResult::Unknown(detail),
+            Ok((_, mut family)) => {
+                // Once kill is attempted, an error cannot prove the original
+                // family is intact. Seal even reserved cleanup admission at
+                // the same lock before the first destructive process signal.
+                self.published
+                    .input_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .cleanup_sealed = true;
+                return match family.kill(deadline) {
+                    Ok(()) => {
+                        self.checked_shutdown = true;
+                        self.holder.prove_cleanup();
+                        TerminalCloseResult::Closed
+                    }
+                    Err(detail) => TerminalCloseResult::Unknown(detail),
+                };
+            }
+        };
+        self.published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .handoff = false;
+        outcome
     }
 
     fn inspect_close(&self, deadline: std::time::Instant) -> Result<(bool, FrozenFamily), String> {
@@ -3204,7 +4700,20 @@ impl Worker {
         // command from inheriting an idle shell's authority.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
-            family.has_jobs() || foreground != root.process.group || !idle_shell,
+            family.has_jobs()
+                || foreground != root.process.group
+                || !idle_shell
+                || !self.pending_input.is_empty()
+                || self.pending_input.has_held_input()
+                || !self.commands.is_empty()
+                || !self.retained_commands.is_empty()
+                || self.published.interrupt_requested.load(Ordering::Acquire)
+                || !self
+                    .published
+                    .cleanup_commands
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty(),
             family,
         ))
     }
@@ -3329,16 +4838,276 @@ impl Worker {
         }
     }
 
-    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
+    fn reply_pending(&self) -> bool {
+        !self.effects.borrow().ordered.is_empty()
+    }
+
+    fn admit_pty_reply(&mut self, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        self.flush_pty_input();
+        let Some(storage) = self.published.input_storage.reserve(bytes.len(), 1) else {
+            return Err(bytes);
+        };
+        let permit = Some(admission::Permit::generated(storage));
+        if !self.pending_input.admit_bytes(&bytes, false, permit) {
+            return Err(bytes);
+        }
+        // A fatal/partial OS write is not an admission failure: its original
+        // remaining frame is already owned by PendingInput, never replay it.
+        self.flush_pty_input();
+        Ok(())
+    }
+
+    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) -> bool {
+        self.write_bytes(bytes, operation, false)
+    }
+
+    fn write_user_input(&mut self, bytes: &[u8], operation: &'static str) -> bool {
+        self.write_bytes(bytes, operation, true)
+    }
+
+    fn input_backpressure(&self, operation: &'static str) {
+        self.input_notice(operation, format!(
+            "Terminal is not reading input; {} KiB pending. Some input may already have been sent. Ctrl+C cancels input that has not been sent.",
+            self.pending_input.len().div_ceil(1024),
+        ));
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8], operation: &'static str, user: bool) -> bool {
+        self.flush_pty_input();
         if bytes.is_empty() {
+            return !self.writer_failed;
+        }
+        let permit = if self
+            .current_admission
+            .as_ref()
+            .is_some_and(|permit| permit.has_storage())
+        {
+            self.current_admission.clone()
+        } else {
+            let Some(storage) = self.published.input_storage.reserve(bytes.len(), 1) else {
+                self.input_backpressure(operation);
+                return false;
+            };
+            Some(admission::Permit::generated(storage))
+        };
+        if !self.pending_input.admit_bytes(bytes, user, permit) {
+            self.input_backpressure(operation);
+            return false;
+        }
+        self.flush_pty_input()
+    }
+
+    fn flush_pty_input(&mut self) -> bool {
+        if self.writer_failed {
+            return false;
+        }
+        let mut budget = PTY_BATCH_LIMIT;
+        #[cfg(test)]
+        if let Some(limit) = self.test_write_budget {
+            budget = limit;
+        }
+        while !self.pending_input.is_empty() && budget > 0 {
+            let mut ready = libc::pollfd {
+                fd: self.writer.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut ready, 1, 0) } <= 0
+                || ready.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0
+            {
+                break;
+            }
+            let front = self.pending_input.front();
+            match self.writer.write(&front[..front.len().min(budget)]) {
+                Ok(0) => {
+                    self.writer_failed = true;
+                    self.error(
+                        "write terminal input",
+                        "PTY write returned zero bytes".into(),
+                    );
+                    return false;
+                }
+                Ok(written) => {
+                    self.pending_input.consume(written);
+                    budget -= written;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.writer_failed = true;
+                    self.error("write terminal input", error.to_string());
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn interrupt_input(&mut self) -> u64 {
+        self.interrupt_input_with_carried(None)
+    }
+
+    fn interrupt_input_with_carried(&mut self, carried: Option<&Command>) -> u64 {
+        let (boundary, mut key, interrupt_claim, _interrupt_ticket) = {
+            let mut order = self
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.published
+                .interrupt_requested
+                .store(false, Ordering::Release);
+            (
+                order.generation,
+                order.interrupt_key.take(),
+                order.interrupt_claim.take(),
+                order.interrupt_ticket.take(),
+            )
+        };
+        if let Some(input) = &mut key
+            && input.action == KeyAction::Repeat
+            && !self.pending_input.has_key_owner(input)
+        {
+            input.action = KeyAction::Press;
+        }
+        let interrupt_key = key.clone();
+        let encoded = match key {
+            Some(key) => match encode_key_input(&self.terminal, &mut self.key_encoder, key) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.error("encode interrupt", error.to_string());
+                    return boundary;
+                }
+            },
+            None => vec![3],
+        };
+        let can_flush_kernel = self.pending_input.can_flush_kernel();
+        let pending_before_cancel = self.pending_input.len();
+        self.pending_input.cancel();
+        // The loop drops its coalesced local owner after this call. Account
+        // for that exact older-generation input without moving its custody.
+        let mut discarded_unsent = self.pending_input.len() < pending_before_cancel
+            || carried.is_some_and(|command| is_cancelable_input_before(command, boundary));
+        self.retained_commands.retain(|command| {
+            let keep = !is_cancelable_input_before(command, boundary);
+            discarded_unsent |= !keep;
+            keep
+        });
+        // A producer may keep filling the bounded inbox. Drain only the
+        // commands present at this boundary so cancellation itself is bounded.
+        for _ in 0..self.commands.len() {
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
+            if is_cancelable_input_before(&command, boundary) {
+                discarded_unsent = true;
+            } else {
+                self.retained_commands.push_back(command);
+            }
+        }
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        // The master exposes its exact slave's line discipline. POLLOUT only
+        // describes the flip queue: even a writable master can have a full
+        // slave input buffer that strands a conventional interrupt byte.
+        let conventional_interrupt =
+            unsafe { libc::tcgetattr(self.writer.as_raw_fd(), &mut attributes) } == 0
+                && attributes.c_lflag & libc::ISIG != 0
+                && encoded.len() == 1
+                && encoded[0] != 0
+                && encoded[0] == attributes.c_cc[libc::VINTR];
+        if can_flush_kernel {
+            self.cancel_kernel_input();
+        } else if !self.kernel_preservation_warned {
+            self.kernel_preservation_warned = true;
+            // A started protocol frame is deliberately preserved, not a
+            // failed transport. Keep activity and the attachment live while
+            // the original endings/releases remain ordered before new input.
+            let message = if discarded_unsent {
+                "Unsent input was canceled. Previously sent input was preserved."
+            } else {
+                "Previously sent input was preserved."
+            };
+            self.input_notice("cancel terminal input", message.into());
+        }
+        // The flush above may discard only the old cancelable kernel input.
+        // Retry original blocked replies AFTER that flush, before a newer
+        // interrupt frame can overtake them. Never flush these new replies.
+        self.drain_effects();
+        // Finish older owned releases before encoding a newly requested
+        // interrupt press. A release of this not-yet-encoded interrupt waits
+        // on its queued-press ticket and cannot run ahead of its own down.
+        for _ in 0..admission::CLEANUP_LIMIT {
+            let Some(command) = self.published.take_cleanup_command(true) else {
+                break;
+            };
+            self.handle_command(command);
+        }
+        let _admitted = if conventional_interrupt {
+            // TIOCSIG targets the foreground group bound to this exact PTY.
+            // Raw applications and extended key encodings retain their bytes.
+            let result =
+                unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
+            if result < 0 {
+                self.error(
+                    "interrupt terminal",
+                    std::io::Error::last_os_error().to_string(),
+                );
+            }
+            result >= 0
+        } else if let Some(input) = interrupt_key {
+            let mut release = input.clone();
+            release.action = KeyAction::Release;
+            release.text = None;
+            let paired = encode_key_input(&self.terminal, &mut self.key_encoder, release)
+                .is_ok_and(|bytes| !bytes.is_empty());
+            let admitted = self.pending_input.admit_key(
+                &input,
+                &encoded,
+                paired,
+                self.current_admission.clone(),
+                interrupt_claim.clone(),
+            );
+            if !admitted {
+                self.input_backpressure("interrupt terminal");
+            }
+            admitted && self.flush_pty_input()
+        } else {
+            let previous = self
+                .current_admission
+                .replace(self.published.priority_permit.clone());
+            let admitted = self.write_user_input(&encoded, "interrupt terminal");
+            self.current_admission = previous;
+            admitted
+        };
+        boundary
+    }
+
+    fn cancel_kernel_input(&self) {
+        // The peer ioctl opens this exact slave without a reusable path or a
+        // controlling-terminal change. Flushing TCIFLUSH on the master would
+        // discard child output; flushing the peer discards canceled input.
+        let peer = unsafe {
+            libc::ioctl(
+                self.writer.as_raw_fd(),
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if peer < 0 {
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
             return;
         }
-        if let Err(error) = self
-            .writer
-            .write_all(bytes)
-            .and_then(|()| self.writer.flush())
-        {
-            self.error(operation, error.to_string());
+        // SAFETY: the successful ioctl returned a fresh owned descriptor.
+        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+        if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
         }
     }
 
@@ -3349,6 +5118,10 @@ impl Worker {
     fn error(&self, operation: &'static str, message: String) {
         self.set_agent_activity(None);
         self.emit(TerminalEvent::Error { operation, message });
+    }
+
+    fn input_notice(&self, operation: &'static str, message: String) {
+        self.emit(TerminalEvent::InputNotice { operation, message });
     }
 }
 
@@ -3422,25 +5195,52 @@ fn coalesce_scroll_command(
     commands: &Receiver<Command>,
     carried: &mut Option<Command>,
 ) -> Command {
-    let Command::Scroll(ScrollCommand::Delta(mut delta)) = command else {
-        return command;
-    };
-    while let Ok(next) = commands.try_recv() {
-        match next {
-            Command::Scroll(ScrollCommand::Delta(next_delta)) => {
-                delta = delta.saturating_add(next_delta);
-            }
-            other => {
-                *carried = Some(other);
-                break;
-            }
-        }
-    }
-    Command::Scroll(ScrollCommand::Delta(delta))
+    coalesce_scroll_command_with(command, commands, carried, || {})
 }
 
-/// Set parser defaults, not resolved UI RGB values: truecolor and application
-/// OSC overrides retain their meaning, and OSC queries observe the same colors.
+fn coalesce_scroll_command_with(
+    mut command: Command,
+    commands: &Receiver<Command>,
+    carried: &mut Option<Command>,
+    mut folded: impl FnMut(),
+) -> Command {
+    fn delta(command: &Command) -> Option<isize> {
+        match command {
+            Command::Admitted { command, .. } => delta(command),
+            Command::Scroll(ScrollCommand::Delta(delta)) => Some(*delta),
+            _ => None,
+        }
+    }
+    fn replace(command: &mut Command, value: isize) {
+        match command {
+            Command::Admitted { command, .. } => replace(command, value),
+            Command::Scroll(ScrollCommand::Delta(delta)) => *delta = value,
+            _ => unreachable!("coalesced command is a scroll delta"),
+        }
+    }
+    let Some(mut value) = delta(&command) else {
+        return command;
+    };
+    // Returning a folded command's admission credit lets a producer refill
+    // the inbox. Bound this turn to the queue observed at entry so a wheel
+    // flood cannot postpone priority interrupts or PTY output indefinitely.
+    for _ in 0..commands.len() {
+        let Ok(next) = commands.try_recv() else {
+            break;
+        };
+        if let Some(next_delta) = delta(&next) {
+            value = value.saturating_add(next_delta);
+            drop(next);
+            folded();
+        } else {
+            *carried = Some(next);
+            break;
+        }
+    }
+    replace(&mut command, value);
+    command
+}
+
 fn apply_theme(
     terminal: &mut Terminal<'_, '_>,
     theme: TerminalTheme,
@@ -3502,7 +5302,13 @@ fn wait_for_worker_event(
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
             default(timer(Some(observe_after))) => WorkerEvent::Timer,
         },
-        (false, false) => WorkerEvent::Command(commands.recv().ok()),
+        (false, false) => crossbeam_channel::select! {
+            recv(commands) -> message => WorkerEvent::Command(message.ok()),
+            // A stable cut can outlive its child's exit report. Its exact
+            // cancellation still has to wake/restart the original reader.
+            recv(capture) -> _ => WorkerEvent::Capture,
+            default(timer(None)) => WorkerEvent::Timer,
+        },
     }
 }
 
@@ -4028,6 +5834,12 @@ fn encode_key_input(
     encoder: &mut KeyEncoder<'_>,
     input: KeyInput,
 ) -> Result<Vec<u8>, libghostty_vt::Error> {
+    // Use the same checked bound reserved before Handle admission. The pinned
+    // wrapper retries a short buffer only once; allocating the proved bound
+    // also handles large associated-text events across negotiated modes.
+    let capacity = key_storage_bound(&input).ok_or(libghostty_vt::Error::OutOfSpace {
+        required: usize::MAX,
+    })?;
     // Legacy encodings have no repeat event type, so a repeated event must be
     // encoded as another press. Keep Repeat only when the child asked for it.
     let report_events = terminal
@@ -4044,7 +5856,7 @@ fn encode_key_input(
     }
 
     encoder.set_options_from_terminal(terminal);
-    let mut encoded = Vec::with_capacity(32);
+    let mut encoded = Vec::with_capacity(capacity);
     encoder.encode_to_vec(&event, &mut encoded)?;
     // Legacy shells cannot distinguish Ctrl+Backspace's BS from Ctrl+H.
     // Use their conventional backward-kill-word binding, but leave negotiated
@@ -4284,6 +6096,8 @@ fn working_directory_path<S: AsRef<str>>(
 #[cfg(test)]
 mod tests {
 
+    include!("worker/bounded_input_tests.rs");
+
     use std::{
         collections::BTreeMap,
         ffi::OsStr,
@@ -4341,6 +6155,36 @@ mod tests {
         let local = published.prepare_search(None, 1);
         assert_eq!(published.searches.lock().unwrap().len(), 1);
         assert_eq!(local.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn default_scrollback_byte_budget_retains_over_ten_thousand_rows() {
+        let config = TerminalConfig::default();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: config.columns,
+            rows: config.rows,
+            max_scrollback: config.max_scrollback_bytes,
+        })
+        .unwrap();
+        terminal.vt_write(&b"output\r\n".repeat(20_000));
+        assert!(terminal.scrollbar().unwrap().total > 10_000);
+    }
+
+    #[test]
+    fn scrollback_byte_budget_changes_retained_history() {
+        let retained = |budget| {
+            let mut terminal = Terminal::new(TerminalOptions {
+                cols: 80,
+                rows: 24,
+                max_scrollback: budget,
+            })
+            .unwrap();
+            terminal.vt_write(&b"output\r\n".repeat(20_000));
+            terminal.scrollbar().unwrap().total
+        };
+        let low = retained(2 * 1024 * 1024);
+        let high = retained(TerminalConfig::default().max_scrollback_bytes);
+        assert!(high > low * 2, "low={low}, high={high}");
     }
 
     #[test]
@@ -5168,9 +7012,120 @@ mod tests {
         let (events, receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         (
-            Worker::start(session, config, None, commands, events, published).unwrap(),
+            Worker::start(session, config, None, commands, events, published)
+                .unwrap()
+                .0,
             receiver,
         )
+    }
+
+    #[test]
+    fn terminal_handle_exposes_only_the_live_original_launch_pin_and_clones_keep_it_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("launch");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "echo PIN_HANDLE_READY; read line".into()],
+            working_directory: original.clone(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+        // Startup success itself guarantees installation; no later path lookup.
+        let (identity, file) = handle.pinned_launch_directory().unwrap();
+        wait_for_text(&handle, "PIN_HANDLE_READY");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let (again, cloned) = handle.pinned_launch_directory().unwrap();
+        assert_eq!(again, identity);
+        assert!(Arc::ptr_eq(&file, &cloned));
+        assert_ne!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(&original).unwrap()
+            ),
+            identity
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        handle.input(b"\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.pinned_launch_directory().is_err());
+        handle.shutdown().unwrap();
+        drop(handle);
+        drop(cloned);
+        assert_eq!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(&file.metadata().unwrap()),
+            identity
+        );
+    }
+
+    #[test]
+    fn launch_pin_refuses_kernel_exit_before_worker_completion_publication() {
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; echo ROOT_EXIT_DONE".into()],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        });
+        let (commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: Arc::clone(&worker.published),
+                worker: joins::JoinOwner::empty(Arc::clone(&worker.published)),
+            }),
+        };
+        assert!(handle.pinned_launch_directory().is_ok());
+        let (_, original) = handle.inner.published.launch_directory.get().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        // The actual event loop is deliberately not running. The shell exits
+        // naturally while its queued exit report cannot publish Completed.
+        worker.writer.write_all(b"continue\n").unwrap();
+        assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+        assert!(!handle.is_completed());
+        assert!(
+            !handle
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            handle
+                .pinned_launch_directory()
+                .unwrap_err()
+                .contains("original root")
+        );
+        worker.run();
+        assert!(handle.is_completed());
+        assert!(handle.shutdown().is_ok());
     }
 
     #[test]
@@ -7073,7 +9028,7 @@ mod tests {
                 environment: BTreeMap::new(),
             },
             TerminalConfig {
-                max_scrollback: 4_000_000,
+                max_scrollback_bytes: 4_000_000,
                 ..TerminalConfig::default()
             },
         );

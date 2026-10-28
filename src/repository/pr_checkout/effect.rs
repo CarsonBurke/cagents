@@ -483,17 +483,22 @@ fn transaction<E: ProcessExecutor>(
     Ok(())
 }
 
-/// Keep accepted-operation ownership until every child has closed the original
+/// Keep accepted-operation ownership until every holder has closed the original
 /// flock description. Cancellation requests do not mean detached children exited.
-fn settle_descendants(observer: &fs::File) -> bool {
-    let mut observed_descendant = false;
+/// A flock cannot attribute the holder: an unrelated fork can inherit this
+/// CLOEXEC descriptor until exec. Unknown holders still require a refusal.
+fn settle_lease(observer: &fs::File) -> bool {
+    let mut observed_holder = false;
     loop {
         // SAFETY: observer is an independent, owned open description of the
         // original lease inode, retained before any subprocess can replace it.
         if unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return observed_descendant;
+            return observed_holder;
         }
-        observed_descendant = true;
+        if !observed_holder {
+            test_phase("retained_lease_observed");
+            observed_holder = true;
+        }
         // A noncooperating policy child deliberately leaves this operation
         // unsettled. Do not clear UI busy/close guards or directory protection.
         std::thread::sleep(Duration::from_millis(100));
@@ -843,9 +848,9 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         .join(private_name);
     drop(lease);
     test_phase("before_lease_observation");
-    let observed_descendant = settle_descendants(&lease_observer);
-    let descendant = if observed_descendant {
-        Err("A policy or Git descendant outlived its command; it has now released the operation lease. Refresh and inspect the checkout before continuing".to_owned())
+    let observed_holder = settle_lease(&lease_observer);
+    let lease_settlement = if observed_holder {
+        Err("The operation lease remained held after its command and has now been released. Its holder could not be identified; a policy or Git descendant, or an unrelated child before exec, may have inherited it. Refresh and inspect the checkout before continuing".to_owned())
     } else {
         Ok(())
     };
@@ -863,7 +868,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     let effects = changed
         || private.path().join("checkout-started").exists()
         || private.path().join("ref-committed").exists();
-    if let Err(detail) = attempt.and(descendant) {
+    if let Err(detail) = attempt.and(lease_settlement) {
         let current = state();
         let detail = format!(
             "{detail}. {current}. Operation evidence: {}",
@@ -871,7 +876,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         );
         let _retained_path = private.keep();
         return Err(PrCheckoutFailure {
-            kind: if effects || observed_descendant {
+            kind: if effects || observed_holder {
                 PrCheckoutFailureKind::PartialOrUnknown
             } else {
                 PrCheckoutFailureKind::Refused

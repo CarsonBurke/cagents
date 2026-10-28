@@ -42,19 +42,25 @@ struct Boundary {
 }
 /// KMP scans folded characters once. Only query-length source boundaries are
 /// retained: large Unicode output never needs a second copy or per-byte map.
-struct Matcher {
+pub(super) struct Pattern {
     needle: Vec<char>,
     prefix: Vec<usize>,
-    matched: usize,
-    window: VecDeque<Boundary>,
-    limit: usize,
-    result: Highlights,
 }
-impl Matcher {
-    fn new(needle: Vec<char>, limit: usize) -> Self {
+impl Pattern {
+    pub(super) fn prepare(query: &str, current: &impl Fn() -> bool) -> Option<Self> {
+        let mut needle = Vec::new();
+        for (index, character) in query.case_fold().enumerate() {
+            if index % 1024 == 0 && !current() {
+                return None;
+            }
+            needle.push(character);
+        }
         let mut prefix = vec![0; needle.len()];
         let mut matched = 0;
         for index in 1..needle.len() {
+            if index % 1024 == 0 && !current() {
+                return None;
+            }
             while matched > 0 && needle[index] != needle[matched] {
                 matched = prefix[matched - 1];
             }
@@ -63,11 +69,28 @@ impl Matcher {
             }
             prefix[index] = matched;
         }
+        Some(Self { needle, prefix })
+    }
+    pub(super) fn bytes(&self) -> usize {
+        self.needle.capacity() * std::mem::size_of::<char>()
+            + self.prefix.capacity() * std::mem::size_of::<usize>()
+    }
+}
+struct Matcher<'a> {
+    needle: &'a [char],
+    prefix: &'a [usize],
+    matched: usize,
+    window: VecDeque<Boundary>,
+    limit: usize,
+    result: Highlights,
+}
+impl<'a> Matcher<'a> {
+    fn new(pattern: &'a Pattern, limit: usize) -> Self {
         Self {
-            window: VecDeque::with_capacity(needle.len()),
-            needle,
-            prefix,
+            needle: &pattern.needle,
+            prefix: &pattern.prefix,
             matched: 0,
+            window: VecDeque::with_capacity(pattern.needle.len()),
             limit,
             result: Highlights::empty(),
         }
@@ -111,15 +134,34 @@ impl Matcher {
     }
 }
 fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
-    if query.is_empty() {
-        return Highlights::empty();
+    matched_ranges_checked(text, query, limit, &|| true).unwrap_or_else(Highlights::empty)
+}
+/// Check cancellation while folding both the query and a huge source block.
+pub(super) fn matched_ranges_checked(
+    text: &str,
+    query: &str,
+    limit: usize,
+    current: &impl Fn() -> bool,
+) -> Option<Highlights> {
+    let pattern = Pattern::prepare(query, current)?;
+    matched_pattern_checked(text, &pattern, limit, current)
+}
+pub(super) fn matched_pattern_checked(
+    text: &str,
+    pattern: &Pattern,
+    limit: usize,
+    current: &impl Fn() -> bool,
+) -> Option<Highlights> {
+    // Unicode default folding emits at most three scalar values per source
+    // scalar. This O(1) refusal also bounds scratch for a tiny inline leaf.
+    if pattern.needle.is_empty() || pattern.needle.len() > text.len().saturating_mul(3) {
+        return Some(Highlights::empty());
     }
-    let needle: Vec<char> = query.case_fold().collect();
-    if needle.is_empty() {
-        return Highlights::empty();
-    }
-    let mut matcher = Matcher::new(needle, limit);
-    'source: for (offset, character) in text.char_indices() {
+    let mut matcher = Matcher::new(pattern, limit);
+    'source: for (index, (offset, character)) in text.char_indices().enumerate() {
+        if index % 1024 == 0 && !current() {
+            return None;
+        }
         if character.is_ascii() {
             if matcher.push(
                 character.to_ascii_lowercase(),
@@ -148,8 +190,12 @@ fn matched_ranges(text: &str, query: &str, limit: usize) -> Highlights {
             }
         }
     }
-    matcher.result
+    current().then_some(matcher.result)
 }
+pub(super) fn first(text: &str, query: &str) -> Option<Range<usize>> {
+    matched_ranges(text, query, 1).ranges.into_iter().next()
+}
+
 pub(super) fn contains(text: &str, query: &str) -> bool {
     matched_ranges(text, query, 0).truncated
 }
@@ -409,5 +455,43 @@ mod tests {
         expanded.remove("automatic");
         search.restore(&mut expanded, &mut unfolded, &mut opened);
         assert!(!expanded.contains("automatic"));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancellation_interrupts_inside_a_giant_unicode_source_and_query() {
+        let calls = std::cell::Cell::new(0usize);
+        let current = || {
+            let next = calls.get() + 1;
+            calls.set(next);
+            next < 5
+        };
+        assert!(
+            matched_ranges_checked(
+                &"漢ß".repeat(1_000_000),
+                "absent",
+                HIGHLIGHT_LIMIT,
+                &current
+            )
+            .is_none()
+        );
+        assert_eq!(calls.get(), 5, "cancellation is checked within the block");
+        calls.set(0);
+        assert!(Pattern::prepare(&"İß漢".repeat(100_000), &current).is_none());
+        assert_eq!(calls.get(), 5, "query folding is cancellable too");
+    }
+    #[test]
+    fn huge_prepared_query_refuses_tiny_source_without_source_scratch() {
+        let pattern = Pattern::prepare(&"needle".repeat(100_000), &|| true).unwrap();
+        let result = matched_pattern_checked("tiny ß", &pattern, HIGHLIGHT_LIMIT, &|| {
+            panic!("O(1) length proof precedes scanning")
+        })
+        .unwrap();
+        assert!(result.ranges.is_empty());
+        assert_eq!(result.peak_window, 0);
+        assert_eq!(result.folded_characters, 0);
     }
 }

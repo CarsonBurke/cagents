@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     os::{
-        fd::{AsRawFd, FromRawFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::MetadataExt,
             net::{UnixListener, UnixStream},
@@ -276,6 +276,18 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
                 .0;
         }
         Ok(*outcome)
+    }
+}
+#[cfg(test)]
+fn fixture_preserve_and_join(actor: &RemoteActor) {
+    actor.preserve().unwrap();
+    // Model the old daemon's exit before rotating its lease. Preserve stops
+    // the observer asynchronously; its last authentication request can still
+    // briefly probe the lease after it drops. Join only that fixture observer,
+    // retaining the actual helper/provider and the old proxy's epoch checks.
+    let worker = actor.0.worker.lock().unwrap().take();
+    if let Some(worker) = worker {
+        worker.join().expect("preserved fixture observer panicked");
     }
 }
 #[cfg(test)]
@@ -783,6 +795,9 @@ impl RemoteActor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Exec resets the process-local saved limit. Restore it before the
+        // helper starts, so its provider and tools inherit the caller's limit.
+        crate::host::descriptor_limit::inherit(&mut command);
         unsafe {
             command.pre_exec(move || {
                 crate::daemon::seal_inherited_descriptors()?;
@@ -1116,6 +1131,13 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // Installation is acknowledged independently of observer
+                // revisions. A state RPC issued before commit can arrive
+                // after its ACK with equal changed/generation values.
+                || (state.installed && !resident.installed)
+                || (matches!(state.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL })
+                    && resident.native_continuity != state.native_continuity)
             {
                 return false;
             }
@@ -1184,7 +1206,14 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(resident) = resident {
+        if let Some(mut resident) = resident {
+            // A close response may also have been issued before installation
+            // was acknowledged. Keep that actor-scoped fact monotonic while
+            // retaining the exact final snapshot/receipt above unchanged.
+            if state.installed {
+                resident.installed = true;
+                resident.native_continuity = state.native_continuity.clone();
+            }
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
@@ -1240,6 +1269,51 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+    }
+    pub(in crate::chat::runtime) fn pinned_launch_directory(
+        &self,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if self.0.close_only {
+            return Err(close_only_refusal());
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "pinned_directory".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (response, mut descriptors) = crate::descriptor_frame::receive_json_with_fds_until::<
+            Result<crate::agent_execution::DirectoryIdentity, String>,
+        >(
+            &control,
+            deadline,
+            MAX_FRAME,
+            1,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match response {
+            Err(error) => Err(error),
+            Ok(identity) => {
+                if descriptors.len() != 1 {
+                    return Err(
+                        "Retained provider did not transfer exactly one directory descriptor"
+                            .into(),
+                    );
+                }
+                let directory = Arc::new(File::from(descriptors.remove(0)));
+                crate::chat::protocol::validate_launch_directory(&directory, identity)?;
+                Ok((identity, directory))
+            }
+        }
     }
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
         self.call_until(method, args, Instant::now() + TIMEOUT)
@@ -1577,8 +1651,11 @@ impl RemoteActor {
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
-        self.0.installed.store(true, Ordering::Release);
+        // Use the same publication fence as the observer. No local revision
+        // is invented: the next authentic helper publication owns its clocks.
         {
+            let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+            self.0.installed.store(true, Ordering::Release);
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
@@ -2233,6 +2310,24 @@ impl Server {
             } else {true}
         });
     }
+    fn pinned_launch_directory(
+        &self,
+        request: &Invocation,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if request.epoch != Some(self.epoch) || request.proof != self.proof {
+            return Err(
+                "Retained actor attachment was superseded; stale directory queries are refused"
+                    .into(),
+            );
+        }
+        if self.close_only {
+            return Err(close_only_refusal());
+        }
+        if !self.installed || self.attachment_preserved || self.closed_snapshot.is_some() {
+            return Err("Retained provider has no current installed directory owner".into());
+        }
+        self.actor.pinned_launch_directory()
+    }
     fn invoke(&mut self, request: Invocation) -> Result<Value, String> {
         if request.method == "inspect" {
             self.remember_descriptor(&self.source)?;
@@ -2870,15 +2965,42 @@ impl Server {
             }
             match self.listener.accept() {
                 Ok((control, _)) => {
-                    let mut finished = false;
-                    let response = (|| {
+                    let request = (|| {
                         let request: Invocation = receive(&control, TIMEOUT)?;
                         authorize(&control, &request.proof)?;
+                        Ok::<_, String>(request)
+                    })();
+                    if let Ok(request) = &request
+                        && request.method == "pinned_directory"
+                    {
+                        let pin = self.pinned_launch_directory(request);
+                        let response = pin
+                            .as_ref()
+                            .map(|(identity, _)| *identity)
+                            .map_err(Clone::clone);
+                        let descriptors: Vec<_> = pin
+                            .as_ref()
+                            .ok()
+                            .map(|(_, file)| vec![file.as_fd()])
+                            .unwrap_or_default();
+                        let _ = crate::descriptor_frame::send_json_with_fds_until(
+                            &control,
+                            &response,
+                            &descriptors,
+                            Instant::now() + TIMEOUT,
+                            MAX_FRAME,
+                            1,
+                            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+                        );
+                        continue;
+                    }
+                    let mut finished = false;
+                    let response = request.and_then(|request| {
                         let close = request.method == "retire";
                         let result = self.invoke(request);
                         finished = close && result.is_ok();
                         result
-                    })();
+                    });
                     // Authentication failures use the same result boundary. Only an
                     // explicit retirement after durable semantic ACK exits the
                     // helper; a lost provider-close reply retains its journal.
@@ -3752,6 +3874,193 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         }
     }
     #[test]
+    fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
+        const CHILD: &str = "CAGENTS_RETAINED_DIRECTORY_PIN_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let name = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .env("CAGENTS_LOCAL_DEBUG", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(root.path().join("claude")).unwrap();
+        std::fs::write(cwd.join("marker"), "original").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let provider = cwd.join("fixture-claude");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > arguments
+session=
+for argument do
+    case "$argument" in --session-id=*) session=${argument#--session-id=} ;; esac
+done
+[ -n "$session" ] || exit 2
+printf '%s' "$session" > session-id
+/bin/cat marker > observed
+IFS= read -r frame || exit 3
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
+exec /bin/sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(&cwd).unwrap(),
+        );
+        let mut source = fixture_source();
+        source.launch.recipe = crate::model::LaunchRecipe {
+            program: provider.to_str().unwrap().to_owned(),
+            arguments: Vec::new(),
+            working_directory: cwd.clone(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().to_string_lossy().into_owned()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    root.path().join("claude").to_string_lossy().into_owned(),
+                ),
+            ]),
+            unset_environment: Default::default(),
+        };
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let issued_session = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .expect("real fresh Claude preparation must issue its exact session ID")
+            .to_owned();
+        uuid::Uuid::parse_str(&issued_session).unwrap();
+        let public_arguments = spec.arguments.clone();
+        assert!(spec.execution.is_none()); // ordinary, no inherited startup directory FD
+        let prepared = adapter.prepared_launch_identity().unwrap();
+        struct Owner(RemoteActor);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+                let _ = self.0.finish_close();
+            }
+        }
+        let original = Owner(
+            RemoteActor::spawn(spec, source.clone(), prepared, BTreeMap::new(), |_| {}).unwrap(),
+        );
+        original.0.commit_installation().unwrap();
+        let record = original.0.identity().record;
+        let deadline = Instant::now() + TIMEOUT;
+        while std::fs::read_to_string(cwd.join("observed"))
+            .ok()
+            .as_deref()
+            != Some("original")
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("arguments")).unwrap(),
+            public_arguments.join("\n") + "\n",
+            "the private executable receives the real adapter's complete public argv"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("session-id")).unwrap(),
+            issued_session
+        );
+        while original.0.state().session_id.as_deref() != Some(issued_session.as_str()) {
+            assert!(
+                Instant::now() < deadline,
+                "prepared session identity was not observed"
+            );
+            original.0.refresh_state().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::rename(&cwd, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "replacement").unwrap();
+        assert_eq!(original.0.pinned_launch_directory().unwrap().0, expected);
+        let control = registry::connect(&original.0.0.socket).unwrap();
+        let mut wrong = proof.clone();
+        wrong.host_incarnation = crate::model::HostIncarnation::new("wrong-directory-query");
+        send(
+            &control,
+            &Invocation {
+                proof: wrong,
+                epoch: Some(original.0.0.epoch),
+                method: "pinned_directory".into(),
+                args: Value::Null,
+            },
+            TIMEOUT,
+        )
+        .unwrap();
+        let (refused, rights) = crate::descriptor_frame::receive_json_with_fds_until::<
+            Result<crate::agent_execution::DirectoryIdentity, String>,
+        >(
+            &control,
+            Instant::now() + TIMEOUT,
+            MAX_FRAME,
+            1,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )
+        .unwrap();
+        assert!(refused.is_err());
+        assert!(rights.is_empty());
+        let adopted =
+            Owner(RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap());
+        assert!(
+            original.0.pinned_launch_directory().is_err(),
+            "stale epoch cannot receive directory authority"
+        );
+        let (identity, pin) = adopted.0.pinned_launch_directory().unwrap();
+        assert_eq!(identity, expected);
+        let fd = unsafe {
+            libc::openat(
+                pin.as_raw_fd(),
+                c"marker".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        let mut text = String::new();
+        use std::io::Read;
+        unsafe { File::from_raw_fd(fd) }
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "original");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("marker")).unwrap(),
+            "replacement"
+        );
+        let close = Owner(RemoteActor::adopt_for_close(&record, source, proof, |_| {}).unwrap());
+        assert!(close.0.pinned_launch_directory().is_err());
+        assert!(adopted.0.pinned_launch_directory().is_err());
+        close.0.close().unwrap();
+        close.0.finish_close().unwrap();
+        assert!(!record.root.is_current());
+    }
+
+    #[test]
     fn helper_control_rejects_regular_files_and_unconnected_listeners() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let file = File::create(root.path().join("ordinary-file")).unwrap();
@@ -3820,6 +4129,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             .unwrap();
         let mut spec = ProcessSpec::from(&source.launch.recipe);
         spec.execution = Some(context.clone());
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         // This execs the real retained-helper entry and its real provider
         // spawning path. Omitting the entry seal leaks both inherited FDs.
         let actor = RemoteActor::spawn(spec, source, prepared, BTreeMap::new(), |_| {}).unwrap();
@@ -3835,6 +4145,12 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         actor.commit_installation().unwrap();
         let provider = actor.state().provider_process.clone().unwrap();
         assert!(provider.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(provider.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            actor.native_holder_record().holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         let inherited = std::fs::read_dir(format!("/proc/{}/fd", provider.pid))
             .unwrap()
             .filter_map(|entry| {
@@ -4780,6 +5096,65 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         );
     }
     #[test]
+    fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.installed.store(false, Ordering::Release);
+        let before = {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.installed = false;
+            state.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            state.clone()
+        };
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "commit");
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            send(&control, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
+        });
+        actor.commit_installation().unwrap();
+        peer.join().unwrap();
+        // This is the exact precommit response an already-issued observer
+        // RPC can return. Equal revisions cannot revoke a successful ACK.
+        assert!(!actor.publish_resident(before.clone()));
+        let installed = actor.state();
+        assert!(installed.installed);
+        assert_eq!(installed.changed, before.changed);
+        assert_eq!(installed.generation, before.generation);
+        assert_eq!(installed.confirmed_session, before.confirmed_session);
+        assert_eq!(
+            installed.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        );
+        let mut contradictory = installed.as_ref().clone();
+        contradictory.changed += 1;
+        contradictory.generation += 1;
+        contradictory.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(!actor.publish_resident(contradictory));
+        let mut next = installed.as_ref().clone();
+        next.changed += 1;
+        next.generation += 1;
+        assert!(actor.publish_resident(next));
+        assert_eq!(actor.state().generation, before.generation + 1);
+        let final_snapshot = Snapshot {
+            exited: true,
+            ..Default::default()
+        };
+        actor.publish_closed_inner(final_snapshot.clone(), Some(before));
+        assert!(actor.state().completed);
+        assert!(actor.state().installed);
+        assert_eq!(actor.state().native_continuity, installed.native_continuity);
+        assert_eq!(actor.snapshot(None), Some(final_snapshot));
+    }
+    #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("refresh.sock");
@@ -5085,7 +5460,7 @@ done"#;
         let orphaned: Vec<InputReceipt> = actor.call("acknowledged_inputs", Value::Null).unwrap();
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].identity, identity);
-        actor.preserve().unwrap();
+        fixture_preserve_and_join(actor);
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();

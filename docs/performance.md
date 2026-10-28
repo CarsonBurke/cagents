@@ -5,6 +5,7 @@
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Native chat viewport](#native-chat-viewport)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -272,6 +273,197 @@ ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
 helper delegates to the original character-by-character implementation.
 The two additional Unicode-miss guard workloads have optimized samples only
 in this reference; no before/after claim is made for those cases.
+
+## Native chat viewport
+
+Run the headless viewport contract with optimized application code, separately
+from native application measurements:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+  --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
+  --config 'profile.dev-runtime.debug-assertions=false' --lib \
+  chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The workload compares a 16 KiB answer with ten tool rows against single 1 MiB
+paragraph, many-paragraph and fenced-code answers with 300 tool rows, at a fixed
+viewport. It warms the real pane/composer, then records refresh separately from
+view, native widget layout, pointer update, headless draw and widget/cache
+disposal CPU time. The event total includes those latter stages. Its median must
+be at most 2 ms and at most twice the small workload. These are explicit test
+budgets, not claims of achieved results. The test excludes GPU submission and
+compositor presentation. Run the neighboring long-streaming workloads separately
+for a busy parent and a selected running child whose parent is idle. Streaming
+fixtures apply validated `Presentation` deltas and record append lineage. They
+complete and verify each current rendered publication before sampling its steady
+frame, and separately report synchronous fixture wall time for refresh, the owned
+parser engine, installation and geometry settling. This phase is diagnostic work
+attribution, not native worker scheduling/input latency. An unconsumed new source
+or a Loading placeholder cannot count as the rendered streaming workload. Native
+80-delta/second input and completion timing must be measured separately.
+
+A native comparison must use the same scripted provider, workload text, pane
+geometry and build profile on both revisions. Record the exact commit and dirty
+state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
+raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
+40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
+the 1 MiB answer has a 150 MB RSS growth budget; after switching away, the UI
+must return within 30 MB of its prior baseline. Repeat hide/reveal and close
+cycles, including Hide tab. Use the isolated development runner described in
+[development.md](development.md), preserving existing sessions.
+
+Full-context shaping holds one output permit through UI consumption; queued
+completion messages do not release it. Accepted installation releases the permit
+while the visible paragraph keeps its geometry. Discarded results retain the
+permit through background disposal. Parser and shaper workers wait for earlier
+retirement before allocating another generation. A hide can retire its existing
+active graph as one batch; this bounds generation amplification, not total live
+glyph storage or process RSS. Optional `cagents::memory=trace` includes pending
+retirement item counts for native visit/hide qualification. Actual permit release
+also publishes one coalesced availability event; visible deferred readers retry
+without depending on unrelated input, provider output, or another redraw. Parser
+disposal checks continuation/reference allocations even when the document has no
+rendered items. The selected growing source retains its Markdown parser
+continuation across verified appends. A changed fence rebuilds its syntax
+palettes on the worker; only unchanged matching fences share prepared palettes.
+Worker placement does not establish acceptable streaming CPU or input latency;
+those costs remain part of native qualification.
+
+Nested reader bookmarks retain a byte length and full source digest, alongside
+geometry and the exact logical reader identity. After hiding releases bodies,
+the admitted parser worker verifies that exact prefix in the authoritative new
+code/tool source, including its partial final hash chunk. Only the matching
+context/reader bookmark advances to the verified new digest. Inputs and outputs
+are bounded by the existing 1,024 bookmark entries; unbookmarked sources need no
+extra verification pass. No source bytes or acceptance graph remain hidden.
+Changed tools with exact remembered reader paths use the same admitted worker
+even while collapsed. Reopening preserves pending verification; installation
+uses the current disclosure state. The worker also builds immutable tool text
+and source descriptors, shared through visible collapse/reopen instead of
+rehashing/copying the full body during UI installation. Hiding evicts these
+body owners with the rest of the cache. A rewrite cannot overwrite a valid
+bookmark before verification.
+
+Literal user messages use the same admitted preparation engine without Markdown
+interpretation. The worker prepares their full text, legacy collapsed preview
+and selection checkpoints. Cold views show a bounded preview until the exact
+current source is ready. A queued first message moves its canonical string into
+an immutable local source and retains the same source reservation through its
+final raw destruction, including cancellation before a subscription starts.
+Compact local follow-ups prepare their preview at explicit submission. Provider
+queue previews reuse immutable records across unrelated publications; changed
+records are copied only within the existing 128-message, 16 KiB source-preview
+limits, with the existing truncation marker appended. Comparing those bounded
+sources on a changed snapshot remains UI work.
+Copy resolves the exact current record at explicit intent and preserves raw
+bytes independently of its displayed preview.
+
+Search results, Notice bodies and Image descriptions/paths use the same admitted
+literal preparation boundary. Stable logical readers preserve their displayed
+text for selection and Find without interpreting it as Markdown. Search fields
+share prepared document storage; long Notice previews preserve the existing
+three-line policy. Ready values must match the current canonical item before
+installation, and rejected or evicted payloads use the existing reclaimer.
+
+Find Next/Previous retains its existing matching-turn/item counts and temporary
+disclosure ownership. Raw group discovery, provider-aware disclosure plans,
+rendered-block lookup and lazy visible Flow highlights share one try-admitted
+worker. A fixed aggregate small-input path handles tiny searches synchronously.
+Unicode query folding and its matcher table are shared across phases. Large
+sources are scanned on the worker, with cancellation checked inside both query
+preparation and source matching. Highlights bind the exact painted ready source;
+their existing 4,096-range limit applies to each block. Output reservations stay
+with painted range owners, including retained widget clones.
+Retained Flow widgets read current marks against the exact ready prefix they
+paint, so an asynchronous completion does not require rebuilding the element.
+A late per-block limit notice appears below the text without moving its glyph
+origin. Accepted query contexts carry a separate render revision when their
+exact tool-disclosure bindings change; unrelated publications reuse it.
+
+Link destinations share immutable storage through parser output, native spans,
+hit testing and reader actions. Rendering does not clone a long URL just because
+its displayed label is short. Resolving a clicked destination remains explicit
+UI work and preserves its complete destination.
+
+Every normal raw outcome, including failure, retains the same admission through
+message consumption or background disposal. Query and attempt epochs reject old
+errors before they can change a newer search. Metadata pressure retires displaced
+plans and waits for actual metadata capacity release, independently of worker-slot
+wakes. Pending searches and failed searches have distinct visible states; failure
+does not masquerade as a successful zero-match result. Exact unchanged groups can
+remain available during unrelated streamed publications while changed groups
+await current indexing.
+
+Each selected group is resolved to its first matching rendered logical block and
+UTF-8 byte. Navigation
+then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
+geometry, including horizontal readers. One initial coarse realization may be
+needed while matching worker geometry is pending; it belongs to the intent's
+maximum sixteen actual coordinate corrections and absolute thirty-second
+deadline. Waiting for that geometry does not consume further corrections,
+including across verified source publications or unrelated completion wakes.
+Parser and shape completions wake pending geometry without a timer subscription.
+Matching metadata without rendered plaintext keeps the coarse group anchor.
+Loading is never an exact glyph match.
+Independent intent and rendered-document epochs guard both async replies and
+the eventual native scroll mutation. Query/context/disclosure/hide changes and
+native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
+queued corrections. A Find scroll does not masquerade as new user input.
+
+The final owners of parser requests, canonical continuations and logical
+selection catalogs transfer their raw allocations to the same reclaimer. This
+also covers subscriptions and retained widgets that outlive cache eviction.
+Canceled and discarded work releases reservations after its actual owned payloads.
+Independent native widget/read clones still contribute to measured event and
+cache-disposal costs; this is not a guarantee that every UI allocation frees on
+the reclaimer.
+
+The pane inspector's diagnostics disclose known source, prepared-presentation
+and logical-selection payload owners for the selected chat. These counters
+exclude opaque parser/font/renderer/image allocations and allocator retention;
+they are not RSS or a complete heap estimate. Use process measurements to verify
+residency budgets rather than inferring them from logical byte counts.
+
+Transcript row factories share one UI-local immutable AST root per parser
+publication, using index paths for quotes, lists and table cells. Ordinary
+publications clone that graph once on the parser worker; the unchanged
+inline/code text backing is shared. This removes recursive factory clones
+during view rebuilding. Final raw graph disposal runs on the persistent
+reclaimer even when retained widgets outlive the cache. Raw graphs in rejected
+output are dropped inside the existing retirement batch before its admission
+permit and FIFO barrier. Coordination recognition and all rich prompt, brief
+and result parts use the same provider-aware admitted parser worker; the UI
+detects preparation candidates from bounded item metadata. Exact-source
+disclosure changes reuse those parts and their palettes. Canonical coordination
+graphs and recognition
+metadata also retire off the UI thread. Process measurements must include the
+extra publication graph containers. The worker also prepares aggregate subtree
+sizes, code line counts and row estimates. A recursive tree of short quote/list
+children cannot opt into a dense column merely because each immediate list is
+small. Rows share slices of one flat logical outline. Binding that outline to
+an item/root namespace first visits logical metadata on the UI thread; later
+views reuse the binding. Virtual column geometry/index rebuilding still visits
+its aliases on a revision change. These costs are not claimed constant-time or
+small for arbitrary rich documents.
+Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains
+required.
+
+Parser admission retains at most 128 selected-source entries and 72 MiB of
+queued source bytes; these are source reservations, not RSS estimates.
+Temporary pressure leaves the immutable source in its authoritative snapshot
+and resumes automatically from a metadata cursor after entry or final
+source-lease release. Each resumed pump visits at most 128 positions; initial
+cache enumeration still visits the selected history. The watch sends a
+current-state event when subscribed so an idle UI cannot miss capacity released
+during subscription installation. Newest text gets first admission; historical
+inputs retain deterministic order. Sources that individually cannot fit the
+budget remain explicit errors. No shell/JSON parse runs on the UI during
+pressure; commands of at most 2,048 bytes can be excluded using the
+recognizer's existing program-name predicate. Full rich coordination parts are
+still reparsed on changed publications; off-thread ownership does not make this
+cost incremental.
 
 ## Reference results
 

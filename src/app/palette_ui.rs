@@ -41,6 +41,7 @@ enum EntryIdentity {
     ResumeConversation,
     Workboard,
     MovePane(CardId, crate::model::ChannelId),
+    Diagnostic(CardId, bool),
 }
 
 impl EntryIdentity {
@@ -67,6 +68,10 @@ impl EntryIdentity {
             Message::ResumeConversation(resume_ui::Action::Open) => Self::ResumeConversation,
             Message::Sidebar(SidebarAction::OpenWork) => Self::Workboard,
             Message::MovePaneToChannel { card, channel } => Self::MovePane(*card, *channel),
+            Message::Repository(RepositoryAction::Language {
+                card,
+                action: repository_widget::EditorLspAction::Diagnostic(forward),
+            }) => Self::Diagnostic(*card, *forward),
             _ => return None,
         })
     }
@@ -104,6 +109,13 @@ impl EntryIdentity {
                 Self::MovePane(expected_card, expected_channel),
                 Message::MovePaneToChannel { card, channel },
             ) => expected_card == card && expected_channel == channel,
+            (
+                Self::Diagnostic(expected_card, expected_forward),
+                Message::Repository(RepositoryAction::Language {
+                    card,
+                    action: repository_widget::EditorLspAction::Diagnostic(forward),
+                }),
+            ) => expected_card == card && expected_forward == forward,
             _ => false,
         }
     }
@@ -264,7 +276,7 @@ impl Cagents {
                 Task::none()
             }
             Action::Open => {
-                if self.workspace_inputs_blocked() {
+                if self.shell_inputs_blocked() {
                     return Task::none();
                 }
                 self.chrome_ui.close();
@@ -399,6 +411,11 @@ impl Cagents {
 
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if let Some(field) = self.palette.recording {
+            // Recording is globally visible, but a real dialog owns its
+            // key before the recording or settings draft can change.
+            if self.modal_is_open() {
+                return None;
+            }
             if is_escape_press(event) {
                 self.palette.recording = None;
                 return Some(Task::none());
@@ -465,10 +482,9 @@ impl Cagents {
                         if !chords.contains(&chord) {
                             chords.push(chord);
                         }
-                        return Some(self.update(Message::SettingsDraftChanged {
-                            field,
-                            value: settings::format_chords(&chords),
-                        }));
+                        return Some(
+                            self.queue_setting_input(field, settings::format_chords(&chords)),
+                        );
                     }
                 }
             }
@@ -691,6 +707,24 @@ impl Cagents {
                 )
             })
             .collect();
+        if self.workspace_surfaces_visible()
+            && let Some(card) = self.workspace.focused()
+            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
+        {
+            for (label, chord, forward) in [
+                ("Next diagnostic", "F8", true),
+                ("Previous diagnostic", "Shift+F8", false),
+            ] {
+                entries.push((
+                    label.into(),
+                    chord.into(),
+                    Message::Repository(RepositoryAction::Language {
+                        card,
+                        action: repository_widget::EditorLspAction::Diagnostic(forward),
+                    }),
+                ));
+            }
+        }
         entries.push((
             "Resume conversation".into(),
             "Search saved native chats".into(),
@@ -1463,7 +1497,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let initial = focus_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(initial.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
 
             let open = app.update_palette(Action::Open);
@@ -1473,7 +1507,7 @@ mod tests {
             assert!(
                 !while_open
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             assert!(
                 while_open
@@ -1485,7 +1519,7 @@ mod tests {
             assert!(!app.palette.is_open());
             let after = focus_fixture_step(&app, &mut tree, &renderer, dismiss, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
         }
     }
@@ -1516,7 +1550,7 @@ mod tests {
         assert!(!app.palette.is_open());
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -1542,7 +1576,7 @@ mod tests {
         ));
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -1572,7 +1606,7 @@ mod tests {
             assert!(
                 !after
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
         }
     }
@@ -1787,22 +1821,38 @@ mod tests {
                 matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
             }).unwrap();
             let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
-            let before = (app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone());
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
             let (response, _) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare, response,
+                action: instance::UiUpdateAction::Prepare,
+                response,
             })));
-            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            assert!(
+                app.update_prepared,
+                "real Prepare admitted the palette-open window"
+            );
             drop(app.update(held.clone()));
-            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone()), before);
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
             assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
             let (response, receiver) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Cancel, response,
+                action: instance::UiUpdateAction::Cancel,
+                response,
             })));
             assert_eq!(receiver.try_recv().unwrap(), "ok");
             drop(app.update(held));
@@ -1888,7 +1938,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
-    }    #[test]
+    }
+    #[test]
     fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();
@@ -2445,6 +2496,157 @@ mod tests {
             }
             drop(exclusive);
         }
+    }
+
+    fn diagnostic_palette_fixture() -> (Cagents, CardId) {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        // Diagnostics are already-delivered fixture metadata. No server is
+        // configured and every returned Task is dropped.
+        app.settings.language_servers.clear();
+        app.lsp = LspManager::new(Vec::new());
+        let card = app.workspace.focused().unwrap();
+        let (mut runtime, _) = repository_widget::RepositoryRuntime::open_fixture(
+            card,
+            "notes.txt",
+            "first\nsecond\nthird\n",
+        );
+        runtime.set_editor_diagnostics(
+            [1, 2]
+                .into_iter()
+                .map(|line| {
+                    crate::lsp::LspDiagnostic::new(
+                        crate::lsp::LspRange::new(
+                            crate::lsp::LspPosition::new(line, 0),
+                            crate::lsp::LspPosition::new(line, 3),
+                        ),
+                        crate::lsp::LspSeverity::Warning,
+                        "Fixture diagnostic".into(),
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        assert!(runtime.move_cursor_to(crate::lsp::LspPosition::new(0, 0)));
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        (app, card)
+    }
+
+    fn diagnostic_cursor(app: &Cagents, card: CardId) -> Option<crate::lsp::LspPosition> {
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            panic!("fixture editor is retained")
+        };
+        runtime.cursor_position()
+    }
+
+    fn click_diagnostic_palette_row(app: &Cagents, card: CardId, forward: bool) -> Message {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let renderer = crate::app::tests::headless_renderer();
+        let identity = EntryIdentity::Diagnostic(card, forward);
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            app,
+            &mut tree,
+            &renderer,
+            &identity,
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        let (_, mut messages) = palette_pointer_step(
+            app,
+            &mut tree,
+            &renderer,
+            &identity,
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(matches!(messages.as_slice(),
+            [Message::Palette(Action::Run(MessageBox(message)))]
+            if matches!(message.as_ref(), Message::Repository(RepositoryAction::Language {
+                card: actual,
+                action: repository_widget::EditorLspAction::Diagnostic(direction),
+            }) if *actual == card && *direction == forward)));
+        messages.pop().unwrap()
+    }
+
+    #[test]
+    fn diagnostic_palette_rows_mount_and_pointer_and_submit_navigate_the_exact_editor_direction() {
+        let (mut app, card) = diagnostic_palette_fixture();
+        for (query, forward, line) in [
+            ("Next diagnostic", true, 1),
+            ("Previous diagnostic", false, 2),
+        ] {
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query(format!(">{query}"))));
+            assert_eq!(
+                app.palette.selected,
+                Some(EntryIdentity::Diagnostic(card, forward))
+            );
+            let message = click_diagnostic_palette_row(&app, card, forward);
+            drop(app.update(message));
+            assert!(!app.palette.is_open());
+            assert_eq!(
+                diagnostic_cursor(&app, card),
+                Some(crate::lsp::LspPosition::new(line, 0))
+            );
+        }
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
+        drop(app.update(Message::Palette(Action::Submit)));
+        assert!(!app.palette.is_open());
+        assert_eq!(
+            diagnostic_cursor(&app, card),
+            Some(crate::lsp::LspPosition::new(1, 0))
+        );
+    }
+
+    #[test]
+    fn main_work_hides_diagnostics_and_refuses_queued_rows_until_conversations_returns() {
+        let (mut app, card) = diagnostic_palette_fixture();
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
+        let queued = click_diagnostic_palette_row(&app, card, true);
+        drop(app.update_palette(Action::Close));
+        let channel = crate::model::ChannelId::new();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model
+            .channels
+            .push(crate::workspace_model::ModelChannel {
+                id: channel,
+                repository: "/repo".into(),
+                title: "Diagnostic fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            });
+        drop(app.open_channel_work(channel));
+        assert!(app.channel_work_is_main());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">diagnostic".into())));
+        assert!(app.palette_entries().is_empty());
+        assert_eq!(app.palette.selected, None);
+        drop(app.update(Message::Palette(Action::Submit)));
+        drop(app.update(queued));
+        assert!(app.channel_work_is_main());
+        assert_eq!(
+            diagnostic_cursor(&app, card),
+            Some(crate::lsp::LspPosition::new(0, 0))
+        );
+
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
+        assert!(!app.channel_work_is_main());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
+        let message = click_diagnostic_palette_row(&app, card, true);
+        drop(app.update(message));
+        assert_eq!(
+            diagnostic_cursor(&app, card),
+            Some(crate::lsp::LspPosition::new(1, 0))
+        );
     }
 
     #[test]
