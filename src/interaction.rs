@@ -78,6 +78,98 @@ pub fn guarded_focus<Message>(
     }))
 }
 
+/// Cycle within a surface while retiring focus on every covered control.
+/// Counting is scoped; applying the chosen index visits the whole tree, so
+/// controls without IDs remain reachable and background focus cannot survive.
+pub fn cycle_focus_in_scope<Message>(scope: Id, backwards: bool) -> cosmic::iced::Task<Message> {
+    struct Cycle {
+        scope: Id,
+        backwards: bool,
+        count: Box<dyn Operation<operation::focusable::Count>>,
+    }
+    impl Operation for Cycle {
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            self.count.container(id, bounds);
+        }
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            self.count
+                .traverse(&mut |op| visit(&mut operation::black_box(op)));
+        }
+        fn finish(&self) -> operation::Outcome<()> {
+            let operation::Outcome::Some(count) = self.count.finish() else {
+                return operation::Outcome::None;
+            };
+            if count.total == 0 {
+                return operation::Outcome::None;
+            }
+            let target = match (count.focused, self.backwards) {
+                (Some(index), true) => (index + count.total - 1) % count.total,
+                (Some(index), false) => (index + 1) % count.total,
+                (None, true) => count.total - 1,
+                (None, false) => 0,
+            };
+            operation::Outcome::Chain(Box::new(Apply {
+                scope: self.scope.clone(),
+                entering: false,
+                inside: FocusIndex { target, current: 0 },
+            }))
+        }
+    }
+    struct FocusIndex {
+        target: usize,
+        current: usize,
+    }
+    impl Operation for FocusIndex {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&Id>,
+            _: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if self.current == self.target {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+            self.current += 1;
+        }
+    }
+    struct Apply {
+        scope: Id,
+        entering: bool,
+        inside: FocusIndex,
+    }
+    impl Operation for Apply {
+        fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+            self.entering = id == Some(&self.scope);
+        }
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            if self.entering {
+                visit(&mut self.inside);
+            } else {
+                visit(self);
+            }
+            self.entering = false;
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&Id>,
+            _: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            state.unfocus();
+        }
+    }
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::widget(Cycle {
+        scope: scope.clone(),
+        backwards,
+        count: Box::new(operation::scoped(scope, operation::focusable::count())),
+    }))
+}
+
 struct GuardedFocus {
     target: Id,
     same_owner: Vec<Id>,

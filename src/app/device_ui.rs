@@ -422,16 +422,7 @@ impl Cagents {
             if !self.device_dialog_on_top() || *scope != self.device_ui.keyboard_scope {
                 return Task::none();
             }
-            use iced::advanced::widget::{Operation, operation};
-            let traversal: Box<dyn Operation> = if *backwards {
-                Box::new(operation::focusable::focus_previous())
-            } else {
-                Box::new(operation::focusable::focus_next())
-            };
-            return iced::runtime::task::effect(iced::runtime::Action::widget(operation::scoped(
-                scope.clone(),
-                traversal,
-            )));
+            return crate::interaction::cycle_focus_in_scope(scope.clone(), *backwards);
         }
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
@@ -547,16 +538,16 @@ impl Cagents {
                     Ok(()) => {
                         self.device_ui
                             .set_devices(crate::device::list().unwrap_or_default());
-                        self.device_ui.open = false;
-                        self.device_ui.keyboard_scope = widget::Id::unique();
+                        let restore = self.update_device(Action::Close);
                         if let Some(index) = self
                             .device_ui
                             .devices
                             .iter()
                             .position(|name| name == &self.device_ui.config_name)
                         {
-                            return self.update_device(Action::Device(index));
+                            return restore.chain(self.update_device(Action::Device(index)));
                         }
+                        return restore;
                     }
                     Err(error) => self.device_ui.notice = Some(error),
                 }
@@ -1665,7 +1656,12 @@ mod tests {
         }
 
         for global_navigation in [false, true] {
-            for initially_focused in [false, true] {
+            for (initial_focus, first_backwards) in [
+                (None, false),
+                (Some("device-tools.directory"), false),
+                (Some("device-test.background"), false),
+                (Some("device-test.background"), true),
+            ] {
                 let mut app = super::super::tests::context_inspector_test_app(false);
                 app.device_ui.open = true;
                 app.core.set_keyboard_nav(global_navigation);
@@ -1679,14 +1675,14 @@ mod tests {
                     &renderer,
                     &layout::Limits::new(iced::Size::ZERO, bounds.size()),
                 );
-                if initially_focused {
+                if let Some(initial_focus) = initial_focus {
                     operate(
                         &mut element,
                         &mut tree,
                         &node,
                         &renderer,
                         Box::new(operation::focusable::focus::<()>(widget::Id::new(
-                            "device-tools.directory",
+                            initial_focus,
                         ))),
                     );
                 }
@@ -1703,8 +1699,13 @@ mod tests {
                     assert_eq!(before.0[0].0.as_ref(), Some(&background));
                     let device_count = before.0.len() - 1;
                     assert!(device_count > 2);
-                    let previous = before.0.iter().position(|(_, focused)| *focused);
-                    let backwards = step % 3 == 1;
+                    let previous = before
+                        .0
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .find_map(|(index, (_, focused))| focused.then_some(index));
+                    let backwards = (step + usize::from(first_backwards)) % 3 == 1;
                     let mut event =
                         super::super::dialog_ui::tests::key_press(keyboard::key::Named::Tab);
                     if let keyboard::Event::KeyPressed {
@@ -1771,7 +1772,81 @@ mod tests {
                     );
                     assert_eq!(app.core.keyboard_nav(), global_navigation);
                 }
+                // An already emitted operation must leave a newer opening
+                // and its background focus untouched when its scope retired.
+                let obsolete_scope = app.device_ui.keyboard_scope.clone();
+                let obsolete = app.update_device(Action::Traverse(obsolete_scope, false));
+                drop(app.update_device(Action::Close));
+                app.device_ui.open = true;
+                let mut element = mount(&app, &background);
+                element.as_widget_mut().diff(&mut tree);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+                );
+                operate(
+                    &mut element,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    Box::new(operation::focusable::focus::<()>(background.clone())),
+                );
+                apply(&mut element, &mut tree, &node, &renderer, obsolete);
+                let after = probe(&mut element, &mut tree, &node, &renderer);
+                assert!(after.0[0].1);
+                assert_eq!(after.0.iter().filter(|(_, focused)| *focused).count(), 1);
             }
+        }
+    }
+
+    #[test]
+    fn successful_configuration_retirement_restores_the_exposed_native_focus() {
+        for scene in ["workspace", "reset", "already-selected", "failed-switch"] {
+            let covered_reset = scene == "reset";
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            app.workspace.resize_viewport(1200.0);
+            if covered_reset {
+                drop(app.update(Message::ResetSettings));
+            }
+            let expected = if covered_reset {
+                app.reset_settings_control_id(true)
+            } else {
+                app.card_keyboard_focus(app.workspace.focused().unwrap())
+            };
+            drop(app.update_device(Action::Configure));
+            // No configuration is saved and no peer process is launched. A
+            // successful receipt whose list entry disappeared must still
+            // restore the surface exposed by retiring Configure.
+            app.device_ui.config_name = if scene == "already-selected" {
+                crate::device::selected()
+                    .map(|device| device.name.as_str())
+                    .unwrap_or("local")
+                    .to_owned()
+            } else {
+                format!("unregistered-test-{}", uuid::Uuid::new_v4())
+            };
+            app.device_ui.busy = true;
+            let mut task = app.update_device(Action::ConfigSaved(Ok(())));
+            if scene == "failed-switch" {
+                app.device_ui.busy = true;
+                task = task.chain(app.update_device(Action::DeviceOpened {
+                    result: Err("fixture connection failed".into()),
+                    replace: true,
+                }));
+            }
+            assert!(!app.device_ui.open && !app.device_ui.busy);
+            let focused = if covered_reset {
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    task,
+                )
+            } else {
+                super::super::tests::focused(&app, task)
+            };
+            assert_eq!(focused, Some(expected), "{scene}");
+            assert!(iced::runtime::task::into_stream(app.update_device(Action::Close)).is_none());
         }
     }
 
