@@ -132,7 +132,7 @@ class Qualifier:
             raise RuntimeError("Matched helper/test executable hash drift")
         return source
 
-    def observed(self, label, command, seconds=180):
+    def observed(self, label, command, seconds=180, *, build_only=False):
         before = self.integrity()
         phase = self.evidence / label
         observer = self.bundle / "scripts/ci/observe-command-owned-fixtures.py"
@@ -151,16 +151,34 @@ class Qualifier:
         cleanup = metadata.get("cleanup", {})
         initial = cleanup.get("initial_census", [])
         leader = metadata.get("leader", {}).get("pid")
-        unassisted = (metadata.get("exit_reason") == "exited" and len(initial) == 1
-                      and initial[0].get("pid") == leader and initial[0].get("state") == "Z")
+        retained = [row for row in initial if row.get("pid") == leader]
+        dead_leader = (len(retained) == 1 and retained[0].get("state") == "Z"
+                       and isinstance(retained[0].get("start_ticks"), int) and retained[0]["start_ticks"] > 0
+                       and retained[0].get("start_ticks") == metadata.get("leader", {}).get("start_ticks"))
+        orphans = [row for row in initial if row.get("pid") != leader]
+        # A compiler can leave an already-exited adopted child for our
+        # subreaper. Reaping a proved zombie cannot terminate live work. This
+        # exception is explicit at Cargo build/--no-run callsites only; actual
+        # test parents AND exact listings still require the dead leader alone.
+        dead_build_orphans = all(
+            row.get("state") == "Z"
+            and isinstance(row.get("start_ticks"), int) and row["start_ticks"] > 0
+            and row.get("membership", {}).get("kind") in {"kernel-direct-child", "reserved-leader-session"}
+            and row.get("start_ticks") == row.get("membership", {}).get("start_ticks")
+            for row in orphans
+        )
+        unassisted = (metadata.get("exit_reason") == "exited" and dead_leader
+                      and (dead_build_orphans if build_only else not orphans))
         closed = (cleanup.get("complete") is True and cleanup.get("remaining") == []
                   and cleanup.get("membership_uncertain") == [] and cleanup.get("leader_reaped") is True
                   and metadata.get("sampler_closed") is True)
         result = {"label": label, "argv": argv, "observer_exit": launch.returncode,
                   "command_exit": metadata.get("command_exit"), "source_before": before,
                   "source_after": after, "cleanup_complete": closed,
-                  "unassisted_parent_closure": unassisted,
-                  "cleanup_classification": "Initial census must contain only the already-exited leader; observer signals/reaping are recorded, never credited as successful product retirement",
+                  "command_scope": "build-only" if build_only else "original-parent-or-list",
+                  "unassisted_command_closure": unassisted,
+                  "already_dead_build_orphans_reaped": orphans if build_only else [],
+                  "cleanup_classification": "Build-only mode permits reaping already-dead proved owned zombies; test parents/listings require the dead leader alone. No live member or assisted termination can qualify; observer signals remain recorded.",
                   "passed": launch.returncode == 0 and metadata.get("command_exit") == 0 and closed and unassisted}
         write_json(phase / "qualification.json", result)
         self.results.append(result)
@@ -265,7 +283,7 @@ def run():
         os.environ["TMPDIR"] = str(scratch)
         flags = ["--locked", "--no-default-features", "--features", "host"]
         built, helper_phase = qualifier.observed("helper-build", ["cargo", "build", *flags, "--bin", "cagentsd",
-                                                                   "--message-format=json-render-diagnostics"], 1800)
+                                                                   "--message-format=json-render-diagnostics"], 1800, build_only=True)
         if not built["passed"]:
             results.append({"pr": product["pr"], "passed": False, "reason": "helper build failed"})
             write_json(evidence / "results.json", results)
@@ -273,7 +291,7 @@ def run():
         helper = qualifier.artifact(helper_phase, "cagentsd", False)
         os.environ[HELPER_ENV] = str(helper)
         compiled, test_phase = qualifier.observed("test-build", ["cargo", "test", *flags, *product["compile_targets"],
-                                                                  "--no-run", "--message-format=json-render-diagnostics"], 1800)
+                                                                  "--no-run", "--message-format=json-render-diagnostics"], 1800, build_only=True)
         if not compiled["passed"]:
             results.append({"pr": product["pr"], "passed": False, "reason": "owning test build failed"})
             write_json(evidence / "results.json", results)

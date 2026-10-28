@@ -81,8 +81,8 @@
     }
   ],
   "control_sha256": {
-    ".github/workflows/fixture-host-qualification.yml": "23c037d411d23f93989effeccccd79d9fe9ac38242e5bfecb8d3b86e30e23422",
-    "scripts/ci/fixture-host-qualification.py": "ad9c6c927d0e872dfd59011b43d53821d8d66e9aefe972779a7be05f1cd38daa",
+    ".github/workflows/fixture-host-qualification.yml": "45a7f256ad3f1c9b5c0dda01ee4aaa04cf9b23264bafab3d043eac81c5f9e7fe",
+    "scripts/ci/fixture-host-qualification.py": "56cfebd233767fd9e4e101419902d1d91bae950e779a8c2f61419501ea7ee6f2",
     "scripts/ci/observe-command-owned-fixtures.py": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a"
   }
 }
