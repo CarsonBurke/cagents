@@ -731,21 +731,22 @@ impl Codex {
         }
     }
 
+    /// Advance admission before exposing a changed pair. Callers publish Models
+    /// before the returned Goal revision: runtime readers can sample between
+    /// Step events, and a new pair with an old revision only refuses stale work.
     fn changing_selection(
         &mut self,
         model: Option<&str>,
         reasoning: Option<&str>,
-        step: &mut Step,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if (self.selected.as_deref() != model || self.reasoning.as_deref() != reasoning)
             && let Some(state) = &mut self.goal
-            && state
-                .invalidate_idle_controls()
-                .map_err(|error| error.to_string())?
         {
-            self.publish_goal(step);
+            return state
+                .invalidate_idle_controls()
+                .map_err(|error| error.to_string());
         }
-        Ok(())
+        Ok(false)
     }
 
     fn selection_is_applied(&self) -> bool {
@@ -2239,9 +2240,10 @@ impl Adapter for Codex {
                 let selected = self.models.iter().find(|m| m.id == model).ok_or("Choose a model from the Codex model catalog")?;
                 if (self.service_tier.as_deref() == Some("fast") || self.pending.values().any(|pending| matches!(pending, Pending::FastMode { enabled:true, .. }))) && !self.fast_models.contains(&model) { return Err("Turn off fast mode before selecting a Codex model that does not support it".into()); }
                 if reasoning.as_ref().is_some_and(|r| !selected.reasoning.contains(r)) { return Err("The model does not advertise this reasoning effort".into()); }
-                self.changing_selection(Some(&model), reasoning.as_deref(), &mut step)?;
+                let changed_controls = self.changing_selection(Some(&model), reasoning.as_deref())?;
                 self.selected = Some(model); self.reasoning = reasoning; self.selection_dirty = true;
                 self.model_events(&mut step);
+                if changed_controls { self.publish_goal(&mut step); }
                 step.events.push(Event::Status { busy: self.busy, detail: "Model/reasoning selection will apply to your next new turn, not the running turn".into() });
             }
             Command::SetFastMode { enabled } => {
@@ -2655,10 +2657,9 @@ impl Adapter for Codex {
                     self.thread = Some(id.into());
                     self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
-                    self.changing_selection(
+                    let changed_controls = self.changing_selection(
                         result["model"].as_str(),
                         result["reasoningEffort"].as_str(),
-                        &mut step,
                     )?;
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.effective_model = self.selected.clone();
@@ -2687,6 +2688,9 @@ impl Adapter for Codex {
                     });
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
+                    if changed_controls {
+                        self.publish_goal(&mut step);
+                    }
                     self.call(
                         &mut step,
                         "thread/list",
@@ -3390,10 +3394,9 @@ impl Adapter for Codex {
                 step.events
                     .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
-                    self.changing_selection(
+                    let changed_controls = self.changing_selection(
                         params["threadSettings"]["model"].as_str(),
                         params["threadSettings"]["effort"].as_str(),
-                        &mut step,
                     )?;
                     self.selected = params["threadSettings"]["model"]
                         .as_str()
@@ -3402,6 +3405,9 @@ impl Adapter for Codex {
                         .as_str()
                         .map(str::to_owned);
                     self.model_events(&mut step);
+                    if changed_controls {
+                        self.publish_goal(&mut step);
+                    }
                 }
                 self.finish_goal_settings(&mut step)?;
             }
@@ -3913,11 +3919,12 @@ impl Codex {
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
         let mut changed_model = false;
+        let mut changed_controls = false;
         if !self.selection_dirty
             && let Some(model) = thread["model"].as_str().filter(|model| !model.is_empty())
         {
             let reasoning = self.reasoning.clone();
-            self.changing_selection(Some(model), reasoning.as_deref(), step)?;
+            changed_controls = self.changing_selection(Some(model), reasoning.as_deref())?;
             changed_model = self.selected.as_deref() != Some(model);
             self.selected = Some(model.to_owned());
         }
@@ -3936,6 +3943,9 @@ impl Codex {
             self.model_events(step);
         } else {
             step.events.push(Event::Capabilities(self.capabilities()));
+        }
+        if changed_controls {
+            self.publish_goal(step);
         }
         Ok(())
     }

@@ -36,6 +36,23 @@ fn published(step: &Step) -> &Snapshot {
         .expect("actual adapter must publish its goal observation")
 }
 
+fn models_precede_goal_revision(step: &Step) {
+    let models = step
+        .events
+        .iter()
+        .position(|event| matches!(event, Event::Models { .. }))
+        .expect("changed selection must publish Models");
+    let goal = step
+        .events
+        .iter()
+        .position(|event| matches!(event, Event::Goal(_)))
+        .expect("changed selection must publish its new Goal revision");
+    assert!(
+        models < goal,
+        "per-event readers may see the new pair with old revision (refusal), never the old pair with new revision"
+    );
+}
+
 fn command(adapter: &mut Codex, operation: Operation) -> Step {
     let observed = snapshot(adapter);
     adapter
@@ -121,6 +138,7 @@ fn changed_staged_selection_rejects_queued_goal_work_before_provider_writes() {
                 })
                 .unwrap();
             assert!(selected.writes.is_empty());
+            models_precede_goal_revision(&selected);
             let fresh = published(&selected).clone();
             assert_eq!(fresh.revision, captured.revision + 1);
             assert_eq!(fresh.read, captured.read);
@@ -257,6 +275,7 @@ fn observed_selection_changes_invalidate_idle_controls_without_inventing_goal_tr
         }}))
         .unwrap();
     let fresh = published(&changed);
+    models_precede_goal_revision(&changed);
     assert_eq!(fresh.revision, before.revision + 1);
     assert_eq!(fresh.read, before.read);
     assert_eq!(fresh.support, before.support);
@@ -279,6 +298,7 @@ fn observed_selection_changes_invalidate_idle_controls_without_inventing_goal_tr
         }}))
         .unwrap();
     assert_eq!(published(&metadata).revision, previous.revision + 1);
+    models_precede_goal_revision(&metadata);
     assert_eq!(published(&metadata).read, previous.read);
     assert!(
         metadata.events.iter().any(|event| matches!(
@@ -289,6 +309,8 @@ fn observed_selection_changes_invalidate_idle_controls_without_inventing_goal_tr
         )),
         "selection and its invalidating Goal revision share this same step"
     );
+    let reattached = attach(&mut adapter);
+    models_precede_goal_revision(&reattached);
 }
 
 #[test]
