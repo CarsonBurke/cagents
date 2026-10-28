@@ -1169,6 +1169,7 @@ mod tests {
         ready_diagnostic_probe(&mut app, card);
         drop(app.reveal_terminal_transcript(card));
         let operation = app.terminal_failure.probes[&card].operation;
+        app.terminal_failure.probes.get_mut(&card).unwrap().failures = 4;
         // A changed incident must retire an old in-flight activation even
         // when the terminal descriptor itself stays the same. Otherwise the
         // rejected completion would leave this probe pending forever.
@@ -1182,6 +1183,144 @@ mod tests {
         let probe = &app.terminal_failure.probes[&card];
         assert_ne!(probe.operation, operation);
         assert!(probe.activation.is_none());
+        assert_eq!(probe.failures, 0, "a new incident starts a fresh backoff");
+    }
+
+    #[test]
+    fn stale_diagnostic_errors_cannot_change_current_retry_deadline_or_arm_a_timer() {
+        for scenario in 1..5 {
+            let (mut app, card, _) = app_and_session();
+            ready_diagnostic_probe(&mut app, card);
+            let old_owner = app.terminal_diagnostic_intent(card).unwrap();
+            // Admit the original action, without polling any host/file-manager work.
+            drop(app.reveal_terminal_transcript(card));
+            replace_diagnostic_source(&mut app, card, scenario);
+            let current_owner = app.terminal_diagnostic_intent(card).unwrap();
+            drop(app.reveal_terminal_transcript(card));
+            let probe = app.terminal_failure.probes.get_mut(&card).unwrap();
+            probe.failures = 2;
+            probe.retry_at = Instant::now() + Duration::from_secs(80);
+            let expected = (
+                probe.operation,
+                probe.available,
+                probe.pending,
+                probe.retry_at,
+                probe.failures,
+            );
+            armed();
+            for prepared in [false, true] {
+                // Deliberately use the *current* operation. Only the original
+                // diagnostic source can reject this stale completion.
+                let action = if prepared {
+                    Action::Prepared {
+                        card,
+                        operation: expected.0,
+                        owner: old_owner.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                } else {
+                    Action::Revealed {
+                        card,
+                        operation: expected.0,
+                        owner: old_owner.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                };
+                assert_eq!(app.update_terminal_failure(action).units(), 0);
+                let probe = &app.terminal_failure.probes[&card];
+                assert_eq!(
+                    (
+                        probe.operation,
+                        probe.available,
+                        probe.pending,
+                        probe.retry_at,
+                        probe.failures,
+                    ),
+                    expected,
+                    "an old incident must not consume the current retry budget"
+                );
+                assert_eq!(probe.activation.as_ref(), Some(&current_owner));
+                assert!(app.status.is_none());
+                assert!(armed().is_empty());
+            }
+            let before = Instant::now();
+            assert_eq!(
+                app.update_terminal_failure(Action::Prepared {
+                    card,
+                    operation: expected.0,
+                    owner: current_owner,
+                    result: Err(transcript_location::Unavailable::Changed),
+                })
+                .units(),
+                1,
+                "a current error still returns its retry task"
+            );
+            let probe = &app.terminal_failure.probes[&card];
+            assert_eq!(probe.failures, 3);
+            assert!(!probe.pending && !probe.available);
+            assert!(probe.retry_at >= before + Duration::from_secs(40));
+            assert_eq!(armed(), vec![probe.retry_at]);
+            assert!(app.status.is_some());
+        }
+    }
+
+    #[test]
+    fn a_retired_incidents_retry_wake_respects_the_current_deadline_and_pending_probe() {
+        let (mut app, card, original) = app_and_session();
+        app.cards.insert(card, CardRuntime::Completed);
+        let _ = app.workspace.resize_viewport(1200.0);
+        let operation = probing(&mut app, card, &original);
+        armed();
+        drop(app.update_terminal_failure(Action::Probed {
+            card,
+            operation,
+            available: false,
+        }));
+        assert_eq!(armed().len(), 1, "the retired owner really armed a wake");
+        replace_diagnostic_source(&mut app, card, 1);
+        let CardKind::Terminal(current) = &app.card_state(card).unwrap().kind else {
+            unreachable!()
+        };
+        let current = current.clone();
+        // Put the replacement at the published policy's last backoff step
+        // through actual reducer replies, without polling transcript I/O.
+        for _ in 0..6 {
+            let operation = probing(&mut app, card, &current);
+            drop(app.update_terminal_failure(Action::Probed {
+                card,
+                operation,
+                available: false,
+            }));
+        }
+        armed();
+        let probe = &app.terminal_failure.probes[&card];
+        let expected = (probe.operation, probe.retry_at, probe.failures);
+        assert_eq!(probe.failures, 6);
+        assert!(Instant::now() < probe.retry_at);
+        // Deliver the real App action an old timer would publish. It has no
+        // authority to advance the replacement's still-future deadline.
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!((probe.operation, probe.retry_at, probe.failures), expected);
+        assert!(!probe.pending && !probe.available);
+        assert_eq!(probe.session, current);
+        assert!(armed().is_empty());
+        app.terminal_failure.probes.get_mut(&card).unwrap().retry_at = Instant::now();
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        let current_operation = probe.operation;
+        assert_ne!(current_operation, expected.0, "a due current probe starts");
+        assert!(probe.pending);
+        assert_eq!(probe.failures, 6);
+        assert_eq!(probe.session, current);
+        assert!(probe.activation.is_none());
+        // A coincident retired wake cannot start a second pending probe.
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!(probe.operation, current_operation);
+        assert!(probe.pending);
+        assert_eq!(probe.failures, 6);
+        assert!(armed().is_empty());
     }
     #[test]
     fn diagnostics_copy_uses_known_fields_and_never_raw_errors_or_launch_secrets() {
