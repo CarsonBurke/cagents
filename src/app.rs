@@ -20931,6 +20931,87 @@ mod tests {
         assert_eq!(app.settings.terminal_font_size, 22.0);
         app.save_settings_now().unwrap();
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, 22.0);
+
+        for older_fails in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.toml");
+            let recovery = directory.path().join("last-good-settings.toml");
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+            app.settings.terminal_font_family = "Terminal Mono".into();
+            app.settings.terminal_font_size = 22.0;
+            app.settings.editor_font_family = Some("Original Editor".into());
+            app.settings.editor_font_size = Some(18.0);
+            app.settings_base = app.settings.clone();
+            settings::save(&path, &app.settings).unwrap();
+
+            app.settings.editor_font_family = Some("Earlier Editor".into());
+            app.settings.editor_font_size = Some(20.0);
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let older = app.capture_settings_save().unwrap();
+            let older_generation = older.generation;
+            app.settings.editor_font_family = None;
+            app.settings.editor_font_size = None;
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let newer = app.capture_settings_save().unwrap();
+            let newer_generation = newer.generation;
+
+            // Preserve a real private file for recovery. Both failure cases
+            // run production storage; no SettingsSaved receipt is fabricated.
+            if older_fails {
+                std::fs::copy(&path, &recovery).unwrap();
+                std::fs::write(&path, "not valid toml").unwrap();
+            }
+            let older_result = older.run();
+            if older_fails {
+                assert!(older_result.is_err());
+            } else {
+                assert!(older_result.is_ok());
+                std::fs::copy(&path, &recovery).unwrap();
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let newer_error = newer.run().unwrap_err();
+            if let Err(older_error) = &older_result {
+                assert_ne!(older_error, &newer_error);
+            }
+
+            drop(app.update(Message::SettingsSaved {
+                generation: newer_generation,
+                result: Err(newer_error.clone()),
+            }));
+            drop(app.update(Message::SettingsSaved {
+                generation: older_generation,
+                result: older_result,
+            }));
+            assert!(
+                matches!(&app.settings_feedback, Some(SettingsFeedback::Error(error))
+                    if error == &newer_error),
+                "an older completion cannot hide or replace the latest failed save"
+            );
+            assert_eq!(app.settings.editor_font_family, None);
+            assert_eq!(app.settings.editor_font_size, None);
+            assert!(app.settings_draft.editor_font_family.is_empty());
+            assert!(app.settings_draft.editor_font_size.is_empty());
+            assert_eq!(app.settings.editor_font_family(), "Terminal Mono");
+            assert_eq!(app.settings.editor_font_size(), 22.0);
+            assert!(app.settings_pending.is_empty());
+
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&recovery, &path).unwrap();
+            let retry = app.apply_setting_input(SettingsField::EditorFontSize, String::new());
+            settle_settings_task(&mut app, retry);
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(saved.editor_font_family, None);
+            assert_eq!(saved.editor_font_size, None);
+            assert_eq!(saved.editor_font_family(), "Terminal Mono");
+            assert_eq!(saved.editor_font_size(), 22.0);
+            assert!(matches!(
+                app.settings_feedback,
+                Some(SettingsFeedback::Saved)
+            ));
+        }
     }
 
     #[test]
