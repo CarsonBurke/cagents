@@ -247,10 +247,11 @@ jobs:
                   return subprocess.check_output(['git', *args], text=True).strip()
               source = {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
                         'status': git('status', '--porcelain')}
-              assert source['head'] == '65b83c897485b212bb5c244f29428797a6cc0bd2'
-              assert source['tree'] == 'd242557813be61eda65bf8f0533df1b821b250af'
-              assert not source['status']
               return source
+          def source_is_exact(source):
+              return (source['head'] == '65b83c897485b212bb5c244f29428797a6cc0bd2'
+                      and source['tree'] == 'd242557813be61eda65bf8f0533df1b821b250af'
+                      and not source['status'])
           def remaining_fixture_processes():
               found = []
               for entry in pathlib.Path('/proc').iterdir():
@@ -261,7 +262,10 @@ jobs:
                           continue
                       comm = (entry / 'comm').read_text().strip()
                       args = (entry / 'cmdline').read_bytes().split(b'\0')
-                      owned = comm in {'cagentsd', test_executable.name[:15]} or any(
+                      fixture_provider = any(arg.startswith(b'/tmp/updater1513-')
+                                             or (arg.startswith(b'/var/tmp/') and b'/bin/claude' in arg)
+                                             for arg in args)
+                      owned = fixture_provider or comm in {'cagentsd', test_executable.name[:15]} or any(
                           str(root).encode() in arg for root in fixture_roots for arg in args)
                       if owned:
                           found.append({'pid': int(entry.name), 'comm': comm,
@@ -271,10 +275,12 @@ jobs:
               return found
           assert not remaining_fixture_processes(), 'Unexpected pre-existing fixture helper'
           for index, root_name in enumerate(roots, 1):
+              assert not [name for name in os.environ if name.startswith('CAGENTS_') and name not in allowed_context]
               assert 'CAGENTS_AGENT_AUTHORITY' not in os.environ
               assert hashlib.sha256(helper.read_bytes()).hexdigest() == helper_identity['sha256']
               assert hashlib.sha256(test_executable.read_bytes()).hexdigest() == test_identity['sha256']
               source_before = product_source()
+              assert source_is_exact(source_before), 'Product source drift before exact parent'
               phase = evidence / f'parent-{index}'
               phase.mkdir(mode=0o700)
               baseline = remaining_fixture_processes()
@@ -323,7 +329,10 @@ jobs:
                       time.sleep(0.01)
                   status = child.wait()
               stdout = (phase / 'stdout').read_text(errors='replace')
-              for directory in re.findall(r'archived-history fixture evidence: (/var/tmp/[^\s]+)', stdout):
+              parent_output = stdout + '\n' + (phase / 'stderr').read_text(errors='replace')
+              archived_roots = set(re.findall(r'archived-history fixture evidence: (/var/tmp/[^\s]+)', parent_output))
+              archived_roots.update(re.findall(r'archived-history fixture (/var/tmp/[^\s:]+):', parent_output))
+              for directory in archived_roots:
                   try:
                       capture_logs(pathlib.Path(directory))
                   except Exception as error:
@@ -343,25 +352,39 @@ jobs:
                                      **identity})
               remaining = remaining_fixture_processes()
               source_after = product_source()
+              unexpected_context = sorted(name for name in os.environ
+                                          if name.startswith('CAGENTS_') and name not in allowed_context)
+              helper_hash_after = hashlib.sha256(helper.read_bytes()).hexdigest()
+              test_hash_after = hashlib.sha256(test_executable.read_bytes()).hexdigest()
+              integrity = (source_is_exact(source_after) and not unexpected_context and not remaining
+                           and helper_hash_after == helper_identity['sha256']
+                           and test_hash_after == test_identity['sha256'])
               passed = (status == 0 and stdout.count(f'test {root_name} ...') == 1
                         and len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', stdout, re.M)) == 1
-                        and not remaining)
+                        and integrity)
               result = {'root': root_name, 'argv': argv, 'exit': status, 'passed': passed,
                         'expected_selected_count': 1, 'outer_runtime_bound_seconds': 150,
                         'duration_seconds': time.monotonic() - started, 'child_logs': child_logs,
                         'test_executable': test_identity, 'helper': helper_identity,
                         'source_before': source_before, 'source_after': source_after,
+                        'integrity_qualified': integrity, 'unexpected_context_names': unexpected_context,
+                        'helper_sha256_after': helper_hash_after, 'test_sha256_after': test_hash_after,
                         'preexisting_fixture_processes': baseline,
                         'child_log_monitoring': {'complete': len(child_logs) == 2 and not capture_errors,
                                                  'errors': capture_errors,
                                                  'scope': 'Observational only; missing capture is not a product test failure'},
                         'remaining_fixture_processes': remaining,
+                        'outer_timeout_or_kill_status': status in (124, 137),
                         'external_cleanup_performed': False,
                         'cleanup_scope': 'Test-owned guards and original assertions; no assisted cleanup counted as normal retirement'}
               (phase / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
               results.append(result)
               (evidence / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-              assert passed, f'Exact parent {index} failed; retain all raw logs and cleanup evidence'
+              # A failed product oracle remains a failure, but does not hide
+              # the other independent parents when custody/source stay intact.
+              assert integrity, f'Integrity/custody lost after parent {index}; abort before another fixture'
+          assert len(results) == len(roots) and all(result['passed'] for result in results), \
+              'One or more exact parents failed; no failure is waived'
           PY
 
       - name: Preserve supplementary qualification evidence
