@@ -66,6 +66,22 @@ struct UpgradeScript {
     refuse_lineage: bool,
 }
 
+fn scripted_proof() -> HostSessionProof {
+    HostSessionProof {
+        host_session_id: "live-host".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "live-incarnation".into(),
+    }
+}
+
+fn current_owner(pane: &mut Pane) -> Session {
+    let CardKind::Chat(session) = &mut pane.kind else {
+        unreachable!()
+    };
+    session.proof = Some(scripted_proof());
+    session.clone()
+}
+
 struct ScriptedDaemon {
     providers: Arc<Mutex<Vec<Session>>>,
     resolutions: Arc<Mutex<Vec<Session>>>,
@@ -82,6 +98,21 @@ impl ScriptedDaemon {
     }
 
     fn with_upgrade(upgrade: Option<UpgradeScript>) -> Self {
+        Self::with_attachment(upgrade, false)
+    }
+
+    fn with_owner(session: Session) -> Self {
+        assert_eq!(session.proof, Some(scripted_proof()));
+        // Ordinary startup attaches this exact current owner. The dedicated
+        // upgrade fixtures below retain old-proof lineage and writer coverage.
+        Self::with_upgrade(Some(UpgradeScript {
+            source: session.clone(),
+            canonical: session,
+            refuse_lineage: false,
+        }))
+    }
+
+    fn with_attachment(upgrade: Option<UpgradeScript>, refuse_attachment: bool) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
@@ -98,11 +129,7 @@ impl ScriptedDaemon {
         let sockets = connections.clone();
         let stop = stopped.clone();
         let worker = std::thread::spawn(move || {
-            let proof = HostSessionProof {
-                host_session_id: "live-host".into(),
-                boot_id: "boot".into(),
-                host_incarnation: "live-incarnation".into(),
-            };
+            let proof = scripted_proof();
             let mut clients = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
@@ -179,7 +206,7 @@ impl ScriptedDaemon {
                             ClientRequest::ChatStart { session, .. } => {
                                 assert!(
                                     upgrade.is_none(),
-                                    "strict upgrade cannot start a provider"
+                                    "automatic restore cannot start a provider"
                                 );
                                 recorded.lock().unwrap().push(session);
                                 ServerMessage::Error(ProtocolError::new(
@@ -192,15 +219,22 @@ impl ScriptedDaemon {
                                 recorded.lock().unwrap().push(session.clone());
                                 if let Some(script) = &upgrade {
                                     assert_eq!(session, script.canonical);
-                                    ServerMessage::Response {
-                                        response: ServerResponse::ChatAttached {
+                                    if refuse_attachment {
+                                        ServerMessage::Error(ProtocolError::new(
+                                            ProtocolErrorCode::TerminalUnavailable,
+                                            "Scripted exact attachment refused",
+                                            false,
+                                        ))
+                                    } else {
+                                        let response = ServerResponse::ChatAttached {
                                             snapshot: crate::chat::Snapshot {
                                                 session_id: session.launch.session_id.clone(),
                                                 ready: true,
                                                 ..Default::default()
                                             },
                                             session,
-                                        },
+                                        };
+                                        ServerMessage::Response { response }
                                     }
                                 } else {
                                     ServerMessage::Error(ProtocolError::new(
@@ -498,18 +532,18 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
     if isolated("authoritative_offscreen_chat_executes_exact_descriptor_once") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    let CardKind::Chat(canonical) = &mut pane.kind else {
+        unreachable!()
+    };
+    canonical.launch.recipe.arguments = vec!["--permission-mode=plan".into()];
+    let expected = current_owner(&mut pane);
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
     app.chat_ui =
         chat_ui::State::with_drafts(HashMap::from([(pane.id, "Deferred shared draft".into())]));
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert!(daemon.requests().is_empty());
-    let CardKind::Chat(canonical) = &mut pane.kind else {
-        unreachable!()
-    };
-    canonical.launch.recipe.arguments = vec!["--permission-mode=plan".into()];
-    let expected = canonical.clone();
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     admit(
@@ -529,6 +563,8 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
         requests[0].launch, expected.launch,
         "the authoritative descriptor replaces the cache before effects"
     );
+    assert_eq!(requests[0], expected);
+    assert!(daemon.resolutions().is_empty());
     let repeated = app.reconcile_shared_views();
     settle(&mut app, repeated);
     assert_eq!(daemon.requests().len(), 1);
@@ -548,8 +584,10 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
     if isolated("local_only_cached_chat_still_restores_and_preserves_its_draft") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
-    let (mut app, _, _, pane, _) = cached_chat();
+    let (mut app, _, _, mut pane, _) = cached_chat();
+    let expected = current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
     Arc::make_mut(&mut app.durable)
         .local_only_cards
         .insert(pane.id);
@@ -575,6 +613,8 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
             _ => unreachable!(),
         }
     );
+    assert_eq!(requests[0], expected);
+    assert!(daemon.resolutions().is_empty());
     assert_eq!(
         app.persistent_workspace()
             .chat_drafts
@@ -728,20 +768,20 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     if isolated("replacement_admission_keeps_old_draft_beside_exact_canonical_chat") {
         return;
     }
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
-    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
-    app.workspace = Cagents::rebuild_workspace(&app.durable);
-    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "Old source only".into())]));
     let original = pane.kind.clone();
-    let startup = app.initialize_runtimes();
-    settle(&mut app, startup);
     let CardKind::Chat(replacement) = &mut pane.kind else {
         unreachable!()
     };
     replacement.id = TerminalId::new();
     replacement.launch.session_id = Some("canonical-replacement-thread".into());
-    let expected = replacement.clone();
+    let expected = current_owner(&mut pane);
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "Old source only".into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     admit(
@@ -752,6 +792,8 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     );
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(daemon.requests()[0].id, expected.id);
+    assert_eq!(daemon.requests()[0], expected);
+    assert!(daemon.resolutions().is_empty());
     let saved = app.persistent_workspace();
     assert!(!saved.chat_drafts.contains_key(&pane.id));
     let copy = *saved
@@ -883,8 +925,21 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
         return;
     }
     use crate::app::workspace_model_sync::ModelUpdate;
-    let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, pane, identity) = cached_chat();
+    let CardKind::Chat(expected) = &pane.kind else {
+        unreachable!()
+    };
+    let expected = expected.clone();
+    let mut canonical = expected.clone();
+    canonical.proof = Some(scripted_proof());
+    let daemon = ScriptedDaemon::with_attachment(
+        Some(UpgradeScript {
+            source: expected.clone(),
+            canonical: canonical.clone(),
+            refuse_lineage: false,
+        }),
+        true,
+    );
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert_eq!(app.startup_pane_check(), Ok(false));
@@ -918,12 +973,16 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
         model: authoritative,
     });
     settle(&mut app, hidden_ack);
-    let CardKind::Chat(expected) = pane.kind else {
-        unreachable!()
-    };
     assert_eq!(daemon.requests().len(), 1);
     assert_eq!(daemon.requests()[0].launch, expected.launch);
     assert_eq!(daemon.requests()[0].id, expected.id);
+    assert_eq!(daemon.requests(), vec![canonical]);
+    assert_eq!(daemon.resolutions(), vec![expected.clone()]);
+    assert_eq!(
+        app.card_state(pane.id).unwrap().kind,
+        CardKind::Chat(expected),
+        "a refused attachment must retain its saved source"
+    );
     assert_eq!(app.durable.active_channel, Some(active));
     assert!(
         app.startup_pane_check().is_err(),

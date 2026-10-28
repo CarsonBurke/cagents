@@ -2224,9 +2224,12 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
+            let saved_history = self.has_connected_saved_history(snapshot);
             let enabled = !transitioning
                 && self.pending.is_none()
-                && self.attachment_chooser_pending.is_none();
+                && self.attachment_chooser_pending.is_none()
+                && self.pastes_pending == 0
+                && (!saved_history || !snapshot.history_loading);
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -2246,7 +2249,12 @@ impl Runtime {
                 })
                 .width(Length::Fill)
                 .into(),
-                icon(
+                if saved_history {
+                    widget::button::custom(design::caption("Resume conversation"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .on_press_maybe(enabled.then(|| action(Action::ResumeSaved(target))))
+                        .into()
+                } else { icon(
                     Icon::Refresh,
                     if unresumable {
                         "Resume this conversation again"
@@ -2255,7 +2263,7 @@ impl Runtime {
                     },
                     enabled,
                     Action::Reconnect(target),
-                ),
+                ) },
             ];
             if unresumable {
                 controls.push(icon(
@@ -2721,13 +2729,20 @@ impl Runtime {
                 .into(),
             );
         }
-        if snapshot.capabilities.attachments {
-            actions.push(icon(
-                Icon::Attachment,
-                "Attach files",
-                available && self.attachment_chooser_pending.is_none(),
-                Action::Attach(target),
-            ));
+        if self.accepts_draft_attachments() {
+            let editable = !transitioning
+                && (!snapshot.exited || self.has_connected_saved_history(snapshot))
+                && !self.closed_elsewhere
+                && !self.disconnected
+                && self.pending.is_none()
+                && self.queued.is_none()
+                && self.attachment_chooser_pending.is_none();
+            actions.push(
+                crate::ui_controls::icon_button(Icon::Attachment, "Attach files")
+                    .id(card_control_id(target.card, "chat-attach"))
+                    .on_press_maybe(editable.then(|| action(Action::Attach(target))))
+                    .into(),
+            );
         }
         // Commands are reached by typing `/`, which is how every agent surface
         // a user arrives from works and what the composer already answers to.
@@ -5658,6 +5673,127 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_history_composer_exposes_attachment_control_without_enabling_send() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Bounds {
+            id: widget::Id,
+            rect: Option<iced::Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    self.rect = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for transitioning in [false, true] {
+            let (mut runtime, _) = frame_cost::live_runtime(&[]);
+            runtime.session.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+            runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            runtime.session.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            });
+            let snapshot = Snapshot {
+                session_id: runtime.session.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Working directory no longer exists".into()),
+                ..Default::default()
+            };
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            assert!(runtime.has_connected_saved_history(&runtime.snapshot));
+            assert!(!runtime.snapshot.capabilities.attachments);
+            let target = runtime.target;
+            let mut element = runtime.view(
+                None,
+                transitioning,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "Fixture".into(),
+                    channel: None,
+                    branch: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            let mut bounds = Bounds {
+                id: card_control_id(target.card, "chat-attach"),
+                rect: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let rect = bounds
+                .rect
+                .expect("the composer mounts its attachment control");
+            assert!(rect.width > 0.0 && rect.height > 0.0 && rect.y < viewport.height);
+            let cursor =
+                mouse::Cursor::Available(iced::Point::new(rect.center_x(), rect.center_y()));
+            let mut messages = vec![];
+            let mut captured = vec![];
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                captured.push(shell.is_event_captured());
+            }
+            if transitioning {
+                assert!(messages.is_empty(), "switching disables draft controls");
+            } else {
+                // Clicking outside COSMIC's native editor first emits its
+                // ordinary ClearSelection. The following release must admit
+                // exactly one chooser, without editing/submitting the draft.
+                assert!(
+                    matches!(messages.as_slice(), [
+                        Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
+                        Message::ChatUi(Action::Attach(found)),
+                    ] if *editor == target && *found == target),
+                    "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {

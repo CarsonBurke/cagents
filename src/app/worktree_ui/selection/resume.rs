@@ -53,6 +53,7 @@ impl Snapshot {
 
 pub(super) struct Intent {
     entry: Arc<SavedConversation>,
+    preparation: resume_ui::ResumePreparation,
     picker: Picker,
     snapshot: Snapshot,
     generation: u64,
@@ -67,6 +68,7 @@ pub(super) struct Intent {
 impl std::fmt::Debug for Intent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumeIntent")
+            .field("preparation", &self.preparation)
             .field("picker", &self.picker)
             .field("generation", &self.generation)
             .finish_non_exhaustive()
@@ -76,6 +78,7 @@ impl std::fmt::Debug for Intent {
 impl PartialEq for Intent {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.entry, &other.entry)
+            && self.preparation == other.preparation
             && self.picker == other.picker
             && self.snapshot == other.snapshot
             && self.generation == other.generation
@@ -182,6 +185,7 @@ pub(super) fn refresh(app: &mut Cagents, request: &Request) -> Request {
     let previous = request.resume.as_ref().expect("resume request");
     let intent = Arc::new(Intent {
         entry: previous.entry.clone(),
+        preparation: previous.preparation,
         picker: previous.picker.clone(),
         snapshot: Snapshot::capture(app, &previous.entry),
         generation: previous.generation,
@@ -249,6 +253,7 @@ impl Cagents {
     pub(in crate::app) fn prepare_local_resume(
         &mut self,
         entry: SavedConversation,
+        preparation: resume_ui::ResumePreparation,
     ) -> Task<Message> {
         if !self.resume_history_is_available() {
             return Task::none();
@@ -257,6 +262,7 @@ impl Cagents {
         let intent = Arc::new(Intent {
             snapshot: Snapshot::capture(self, &entry),
             entry: Arc::new(entry),
+            preparation,
             picker: Picker::capture(self),
             generation: self.worktree_selection.generation,
             #[cfg(test)]
@@ -381,6 +387,10 @@ pub(super) fn commit(
         }),
         Destination::KeepScope => Task::none(),
     };
-    let next = app.commit_prepared_resume((*intent.entry).clone(), intent.picker.replace);
+    let next = app.commit_prepared_resume(
+        (*intent.entry).clone(),
+        intent.picker.replace,
+        intent.preparation,
+    );
     Task::batch([scope, next])
 }

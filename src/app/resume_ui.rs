@@ -16,6 +16,14 @@ const PAGE: usize = 100;
 const ROW_HEIGHT: f32 = 96.0;
 const ROW_SPACING: f32 = 8.0;
 
+/// Preserve an issued preparation result through local filesystem admission.
+/// Provider ownership is still checked by normal HOST Start/Attach admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ResumePreparation {
+    Unprepared,
+    Prepared,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
@@ -665,11 +673,12 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 match result {
                     Ok(session) => {
-                        entry.session = session;
-                        if self.existing_conversation_card(&entry.session).is_some() {
-                            return self.resume_saved_conversation(entry);
+                        if !prepared_resume_matches(&entry.session, &session) {
+                            self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
+                            return Task::none();
                         }
-                        self.insert_resumed_conversation(entry)
+                        entry.session = session;
+                        self.insert_resumed_conversation(entry, ResumePreparation::Prepared)
                     }
                     Err(error) => {
                         self.resume_error(&error);
@@ -803,7 +812,7 @@ impl Cagents {
         }
         self.resume_ui.error = None;
         if self.existing_conversation_card(&entry.session).is_some() {
-            return self.prepare_local_resume(entry);
+            return self.prepare_local_resume(entry, ResumePreparation::Unprepared);
         }
         let local_pending = self.chat_awaiting_admission(entry.card)
             && matches!(self.card_state(entry.card).map(|card| &card.kind),
@@ -813,10 +822,7 @@ impl Cagents {
             return Task::none();
         }
         let session = &entry.session;
-        if matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
             return cosmic::task::future(async move {
@@ -834,11 +840,15 @@ impl Cagents {
                 Message::ResumeConversation(Action::Prepared(generation, entry, result))
             });
         }
-        self.insert_resumed_conversation(entry)
+        self.insert_resumed_conversation(entry, ResumePreparation::Unprepared)
     }
 
-    fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
-        self.prepare_local_resume(entry)
+    fn insert_resumed_conversation(
+        &mut self,
+        entry: SavedConversation,
+        preparation: ResumePreparation,
+    ) -> Task<Message> {
+        self.prepare_local_resume(entry, preparation)
     }
 
     /// Capture the exact recorded filing identity without filesystem reads.
@@ -868,16 +878,17 @@ impl Cagents {
         &mut self,
         entry: SavedConversation,
         replace: Option<CardId>,
+        preparation: ResumePreparation,
     ) -> Task<Message> {
         if let Some(card) = self.existing_conversation_card(&entry.session) {
             self.close_resume();
             return cosmic::task::message(Message::FocusCard(card));
         }
         let mut session = entry.session;
-        if !matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        // Preparation may either retain a live actor or allocate its exact
+        // successor after proved retirement. Both answers must survive intact;
+        // a second locally allocated ID loses the daemon's issued lineage.
+        if preparation == ResumePreparation::Unprepared {
             session.reset_owned_codex_listener();
             session.id = TerminalId::new();
             session.proof = None;
@@ -1088,6 +1099,26 @@ impl Cagents {
             1.0,
         ))
     }
+}
+
+/// Shape validation of the authenticated preparation reply. It grants no
+/// provider ownership; Start/Attach still runs normal HOST admission.
+fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
+    if source == prepared {
+        return true;
+    }
+    if !source.has_valid_native_continuity()
+        || source.launch.session_id.is_none()
+        || prepared.id == source.id
+    {
+        return false;
+    }
+    let mut expected = source.clone();
+    expected.reset_owned_codex_listener();
+    expected.id = prepared.id;
+    expected.proof = None;
+    expected.terminal = None;
+    &expected == prepared
 }
 
 /// Indices of the rows matching `query` within `scope`.
@@ -1691,6 +1722,96 @@ mod tests {
             Ok(entry.session),
         )));
         assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn retained_claude_resume_waits_for_preparation_and_keeps_its_exact_allocation() {
+        for (successor, adopted_disappears) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.configure_local_resume_for_test(runtime.path().to_owned());
+            let mut entry = saved(directory.path());
+            entry.session.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "saved-owner".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "saved-incarnation".into(),
+            });
+            entry.session.native_continuity =
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            assert!(entry.session.has_valid_native_continuity());
+            let source = entry.session.clone();
+            // This existing typed reply-admission fixture does not execute or
+            // impersonate HOST preparation. HOST owns authentication/lineage.
+            // The new local worker and its retirement are actually driven.
+            drop(app.resume_saved_conversation(entry.clone()));
+            assert!(app.resume_ui.loading);
+            assert!(app.durable.cards.is_empty());
+            let mut prepared = source.clone();
+            if successor {
+                prepared.reset_owned_codex_listener();
+                prepared.id = TerminalId::new();
+                prepared.proof = None;
+                prepared.terminal = None;
+            }
+            let adopted = adopted_disappears.then(|| {
+                let mut card = crate::app::tests::terminal_card_state();
+                card.kind = CardKind::Chat(prepared.clone());
+                let id = card.id;
+                Arc::make_mut(&mut app.durable).cards.push(card);
+                app.cards.insert(id, CardRuntime::Loading);
+                id
+            });
+            let generation = app.resume_ui.generation;
+            let task = app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone())));
+            if let Some(adopted) = adopted {
+                let receipt = Cagents::local_resume_prepared_for_test(task);
+                Arc::make_mut(&mut app.durable)
+                    .cards
+                    .retain(|card| card.id != adopted);
+                app.cards.remove(&adopted);
+                let retiring = app.update(receipt);
+                assert!(app.durable.cards.is_empty());
+                assert!(app.resume_ui.loading);
+                let retired = Cagents::local_resume_retired_for_test(retiring);
+                let fresh = app.update(retired);
+                // The existing card was in the original snapshot. Its loss
+                // requires real retirement and fresh local preparation while
+                // retaining the issued reply's exact actor identity/proof.
+                app.finish_local_resume_for_test(fresh);
+            } else {
+                app.finish_local_resume_for_test(task);
+            }
+            let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+            assert_eq!(card.kind, CardKind::Chat(prepared));
+            assert_eq!(card.title, "Review peripheral Rust modules");
+            assert!(!app.resume_ui.loading);
+        }
+    }
+
+    #[test]
+    fn preparation_cannot_change_the_saved_thread_account_or_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = saved(directory.path()).session;
+        let mut prepared = source.clone();
+        prepared.id = TerminalId::new();
+        assert!(prepared_resume_matches(&source, &prepared));
+        for mutation in 0..4 {
+            let mut altered = prepared.clone();
+            match mutation {
+                0 => altered.launch.session_id = Some("another-thread".into()),
+                1 => {
+                    altered
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                2 => altered.launch.recipe.arguments.push("--different".into()),
+                _ => altered.launch.provider = Provider::Codex,
+            }
+            assert!(!prepared_resume_matches(&source, &altered));
+        }
     }
 
     #[test]
