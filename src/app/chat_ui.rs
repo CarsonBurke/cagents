@@ -6728,7 +6728,11 @@ impl Cagents {
         let scope = if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
-            self.select_worktree(working_directory, false)
+            let (selected, scope) = self.select_worktree_checked(working_directory, false);
+            if !selected {
+                return scope;
+            }
+            scope
         } else {
             Task::none()
         };
@@ -15140,6 +15144,129 @@ mod tests {
     const FIXTURE_DIRECTORY: &str = "/workspace/chat-fixture";
     /// Providers name conversations by UUID; resume refuses anything else.
     const KNOWN_THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    #[test]
+    fn native_chat_creation_waits_for_successful_worktree_selection() {
+        for in_channel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let current = directory.path().join("current");
+            let next = directory.path().join("next");
+            std::fs::create_dir(&current).unwrap();
+            std::fs::create_dir(&next).unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(runtime.path().into());
+            // The real constructor creates an unstarted local draft. Drop its
+            // Tasks: no provider, daemon, selection worker or indexer is run.
+            let source = draft_in(&mut app, &current);
+            let target = chat_runtime(&app, source).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("Keep this unsent draft"));
+            let channel = in_channel.then(crate::model::ChannelId::new);
+            if let Some(channel) = channel {
+                let state = Arc::make_mut(&mut app.durable);
+                state.channels.push(crate::model::ProjectChannel {
+                    title_source: Default::default(),
+                    id: channel,
+                    project_id: crate::model::ProjectId::new(),
+                    title: "Existing channel".into(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![source],
+                    focused: Some(source),
+                });
+                state.active_channel = Some(channel);
+            }
+            let before = app.durable.clone();
+            let order = app.workspace.order().collect::<Vec<_>>();
+            let runtimes = app.cards.len();
+            let drafts = app.chat_ui.drafts.clone();
+            let defaults = app.chat_ui.default_chats.clone();
+            assert_eq!(app.active_workspace.as_ref(), Some(&current));
+            assert_eq!(app.workspace.focused(), Some(source));
+            assert!(
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &current, true)
+                    .is_err()
+            );
+            // This is the actual cleanup lock refused by protect_next, not an
+            // injected boolean, missing directory or a local deletion marker.
+            let exclusive =
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &next, true).unwrap();
+            drop(app.new_native_chat(Provider::Codex, Some(next.clone())));
+            if !in_channel {
+                assert!(
+                    Arc::ptr_eq(&app.durable, &before),
+                    "refusal cannot save a new card or scope"
+                );
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                assert_eq!(app.workspace.focused(), Some(source));
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+                assert_eq!(app.cards.len(), runtimes);
+                assert_eq!(app.chat_ui.drafts, drafts);
+                assert_eq!(app.chat_ui.default_chats, defaults);
+                assert!(
+                    app.status
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("Cannot open this worktree yet")
+                );
+                assert!(
+                    app.durable
+                        .cards
+                        .iter()
+                        .all(|card| !app.chat_start_pending(card.id))
+                );
+                assert_eq!(
+                    chat_runtime(&app, source).composer.text(),
+                    "Keep this unsent draft"
+                );
+                drop(exclusive);
+                // A fresh attempt after actual protection becomes available
+                // selects that destination and inserts exactly one draft.
+                drop(app.new_native_chat(Provider::Codex, Some(next.clone())));
+            } else {
+                // A launch in another directory deliberately keeps the active
+                // channel's filing. The original conditional must still skip
+                // worktree selection, even when that other scope is busy.
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                assert_eq!(app.durable.active_channel, channel);
+                drop(exclusive);
+            }
+            assert_eq!(app.durable.cards.len(), before.cards.len() + 1);
+            assert_eq!(app.cards.len(), runtimes + 1);
+            let added = app.workspace.focused().unwrap();
+            assert_ne!(added, source);
+            let draft = chat_runtime(&app, added);
+            assert!(draft.is_draft() && draft.session.is_unstarted());
+            assert_eq!(draft.session.launch.provider, Provider::Codex);
+            assert_eq!(draft.session.launch.recipe.working_directory, next);
+            assert!(!app.chat_start_pending(added));
+            assert_eq!(
+                chat_runtime(&app, source).composer.text(),
+                "Keep this unsent draft"
+            );
+            if let Some(channel) = channel {
+                assert_eq!(app.active_workspace.as_ref(), Some(&current));
+                let channel = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|item| item.id == channel)
+                    .unwrap();
+                assert!(channel.cards.contains(&added) && channel.cards.contains(&source));
+            } else {
+                assert_eq!(app.active_workspace.as_ref(), Some(&next));
+                assert!(app.durable.active_channel.is_none());
+                assert!(
+                    crate::worktree_cleanup::fixture_protection(runtime.path(), &next, true)
+                        .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn new_panes_keep_the_selected_channel_when_launch_directory_changes() {
