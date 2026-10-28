@@ -293,6 +293,127 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
 }
 
 #[test]
+fn failed_first_start_save_can_retry_the_same_candidate_after_its_cause_is_repaired() {
+    let (mut app, _directory, card, target) = fixture();
+    let source = runtime(&app, card).session.clone();
+    let images = runtime(&app, card).attachments.clone();
+    let channel = crate::model::ChannelId::new();
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "Retry scope".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    let registry = app.workspace_model.identity;
+    let store = app.session.as_ref().unwrap().operation_store();
+    // The same guarded store seam used by the refusal regression makes the
+    // actual writer refuse its first A -> B replacement. Repair only this
+    // task-owned fixture's cause through that API; no successful receipt is
+    // fabricated and no provider-start Task is polled.
+    let mut foreign = source.clone();
+    foreign.id = TerminalId::new();
+    store
+        .replace_chat_identity(card, source.id, &foreign)
+        .unwrap();
+    let first = app.start_chat_draft(target);
+    let candidate = app.chat_ui.draft_checkpoints[&card].candidate.clone();
+    let writer = app.chat_ui.draft_checkpoints[&card].writer.clone();
+    let (first_target, first_attempt, first_result) = checkpoint(first);
+    assert!(first_result.is_err());
+    drop(app.draft_start_checkpointed(first_target, first_attempt, first_result.clone()));
+    no_starter(&app, card);
+    assert_eq!(runtime(&app, card).session, source);
+    assert_eq!(
+        runtime(&app, card).composer.text(),
+        "First prompt remains local"
+    );
+    assert_eq!(runtime(&app, card).attachments, images);
+    assert_eq!(
+        app.chat_ui.canceled_draft_starts[&card].candidate,
+        candidate
+    );
+
+    store
+        .replace_chat_identity(card, foreign.id, &source)
+        .unwrap();
+    let retry = app.start_chat_draft(target);
+    let pending = &app.chat_ui.draft_checkpoints[&card];
+    assert_eq!(pending.target, target);
+    assert_eq!(pending.source, source);
+    assert_eq!(pending.candidate, candidate);
+    assert_eq!(pending.registry, registry);
+    assert_eq!(
+        pending.scope,
+        Some(crate::workspace_model::views::Scope::Channel(channel))
+    );
+    assert!(pending.writer.ptr_eq(&writer));
+    assert_ne!(pending.attempt, first_attempt);
+    let retry_attempt = pending.attempt;
+    assert_eq!(runtime(&app, card).session, source);
+    assert_eq!(
+        runtime(&app, card).composer.text(),
+        "First prompt remains local"
+    );
+    assert_eq!(runtime(&app, card).attachments, images);
+    drop(app.draft_start_checkpointed(first_target, first_attempt, first_result));
+    no_starter(&app, card);
+    assert_eq!(app.chat_ui.draft_checkpoints[&card].attempt, retry_attempt);
+
+    let (retry_target, received_attempt, result) = checkpoint(retry);
+    assert_eq!(retry_target, target);
+    assert_eq!(received_attempt, retry_attempt);
+    assert!(
+        result.is_ok(),
+        "the repaired writer must accept this exact retry: {result:?}"
+    );
+    assert_eq!(stored(&app, card), candidate);
+    let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+    assert_eq!(saved.chat_drafts[&card], "First prompt remains local");
+    assert_eq!(saved.chat_draft_attachments[&card], images);
+    // Even this real successful receipt carries no authority for the old
+    // nonce. Only the current retry can transition the original draft.
+    drop(app.draft_start_checkpointed(first_target, first_attempt, result.clone()));
+    no_starter(&app, card);
+    let start = app.draft_start_checkpointed(retry_target, retry_attempt, result.clone());
+    let started = app
+        .chat_ui
+        .attempt(card)
+        .expect("one authorized start")
+        .target;
+    assert!(
+        matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(attempt))
+        if attempt.target == started && attempt.session == candidate)
+    );
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        "First prompt remains local"
+    );
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().attachments,
+        images
+    );
+    drop(app.draft_start_checkpointed(retry_target, retry_attempt, result.clone()));
+    drop(app.draft_start_checkpointed(first_target, first_attempt, result));
+    assert_eq!(app.chat_ui.attempt(card).unwrap().target, started);
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        "First prompt remains local"
+    );
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().attachments,
+        images
+    );
+    drop(start);
+}
+
+#[test]
 fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() {
     for context in [
         "current",
