@@ -41,6 +41,7 @@ struct Devices {
 /// exactly one context; this does not introduce per-pane device selection.
 struct ConnectionContext {
     device: Device,
+    no_start: bool,
     environment: OnceLock<
         std::collections::BTreeMap<
             crate::agent::Provider,
@@ -56,6 +57,12 @@ impl ConnectionContext {
     fn new(device: Device) -> Self {
         Self {
             device,
+            // The UI selects its device without entering the CLI StartPolicy.
+            // Capture its inherited policy now, before deferred bridge work.
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
             environment: OnceLock::new(),
             home: OnceLock::new(),
             shell: OnceLock::new(),
@@ -492,7 +499,7 @@ impl ConnectionContext {
         fs::create_dir(&directory)?;
         let transport = Arc::new(Transport {
             device: self.device.clone(),
-            no_start: crate::control::daemon_autostart_disabled(),
+            no_start: self.no_start,
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
