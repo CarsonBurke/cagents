@@ -9,6 +9,16 @@ use std::{fs, path::Path};
 
 #[test]
 fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_adoption() {
+    for marker in [
+        crate::agent_execution::AUTHORITY_ENV,
+        "CAGENTS_AGENT_TOKEN",
+        "CAGENTS_SESSION_TOKEN",
+    ] {
+        assert!(
+            std::env::var_os(marker).is_none(),
+            "This isolated User fixture cannot run with inherited agent authority ({marker})",
+        );
+    }
     const MODE: &str = "CAGENTS_RETAINED_EXECUTION_EXIT_TEST";
     if std::env::var_os(MODE).is_none() {
         for mode in ["cold-close", "reconcile"] {

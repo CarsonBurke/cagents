@@ -204,6 +204,8 @@ fn isolated() -> Option<std::path::PathBuf> {
     // child owns only its fresh HOME/runtime/data and never becomes User.
     for (key, _) in std::env::vars_os() {
         if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && key != std::ffi::OsStr::new("CAGENTS_AGENT_TOKEN")
+            && key != std::ffi::OsStr::new("CAGENTS_SESSION_TOKEN")
             && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
         {
             command = command.env_remove(key);

@@ -9,6 +9,16 @@ use std::{
 };
 
 fn isolated(name: &str) -> Option<PathBuf> {
+    for marker in [
+        crate::agent_execution::AUTHORITY_ENV,
+        "CAGENTS_AGENT_TOKEN",
+        "CAGENTS_SESSION_TOKEN",
+    ] {
+        assert!(
+            std::env::var_os(marker).is_none(),
+            "This isolated User fixture cannot run with inherited agent authority ({marker})",
+        );
+    }
     const MODE: &str = "CAGENTS_RETAINED_ADMISSION_TEST";
     if std::env::var(MODE).as_deref() == Ok(name) {
         return Some(PathBuf::from(
