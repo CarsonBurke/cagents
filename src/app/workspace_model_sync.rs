@@ -4107,6 +4107,11 @@ mod tests {
                 .collect()
         }
         let (mut app, project, repository) = app_with_project();
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("channel-order.sqlite3");
+        let boot = crate::model::BootId::new("channel-order-reopen");
+        let (session, _) = crate::session::SessionRuntime::open(&database, boot.clone()).unwrap();
+        app.session = Some(session);
         let main = crate::model::WorktreeId::new();
         app.sidebar_model.projects[0].worktrees =
             vec![crate::sidebar::SidebarWorktree::from_durable(
@@ -4145,6 +4150,30 @@ mod tests {
             items: manual.clone(),
         });
         drop(app.reconcile_workspace_model());
+        // Put real user work in an existing channel before creating others.
+        // Opening it through the actual update creates its inert native draft;
+        // typing promotes the placeholder, without starting a provider.
+        drop(
+            app.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
+                saved[2].id,
+            ))),
+        );
+        let draft_card = app.workspace.focused().expect("the old composer opens");
+        let target = match app.cards.get(&draft_card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => panic!("the channel's default pane must be a native draft"),
+        };
+        let draft = "Keep this edited draft  \nUnicode 🦀 and exact trailing spaces  ";
+        drop(
+            app.update(Message::ChatUi(super::super::chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(draft.to_owned())),
+                ),
+            ))),
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts[&draft_card], draft);
+        let saved = app.durable.channels.clone();
         let published = intercept_publishes(&mut app);
         let mut created = Vec::new();
         for _ in 0..6 {
@@ -4278,15 +4307,60 @@ mod tests {
         let rows =
             crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
         assert_eq!(rows[7], SelectionRow::Worktree(project, main));
-        let encoded = serde_json::to_vec(app.durable.as_ref()).unwrap();
-        let restored: crate::model::WorkspaceState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(app.persistent_workspace().chat_drafts[&draft_card], draft);
+        assert!(app.shared_chat_has_local_work(draft_card));
+        let before_restart = app.durable.channels.clone();
+        // No explicit snapshot here: creation and model reconciliation must have
+        // saved their own result through the production persistence path.
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
+        let (mut restored_session, restored) =
+            crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let restored = restored.expect("the automatic writes saved this workspace");
+        assert_eq!(restored.chat_drafts[&draft_card], draft);
+        // Empty default composers are intentionally omitted from storage, so
+        // compare identities/ranks and the edited channel's real membership.
+        assert_eq!(
+            restored
+                .channels
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect::<Vec<_>>(),
+            before_restart
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored
+                .channels
+                .iter()
+                .find(|channel| channel.id == saved[2].id),
+            saved.iter().find(|channel| channel.id == saved[2].id)
+        );
         let (mut reopened, _, _) = app_with_project();
         reopened.sidebar_model = app.sidebar_model.clone();
+        for project in &mut reopened.sidebar_model.projects {
+            project.channels.clear();
+        }
+        reopened.chat_ui = super::super::chat_ui::State::with_drafts(restored.chat_drafts.clone());
         reopened.durable = Arc::new(restored);
         reopened.workspace_model = settled.clone();
         reopened.refresh_sidebar_channels();
         assert_eq!(channel_rows(&reopened), channel_rows(&app));
         assert_eq!(reopened.durable.active_channel, created.last().copied());
+        drop(
+            reopened.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
+                saved[2].id,
+            ))),
+        );
+        assert_eq!(reopened.workspace.focused(), Some(draft_card));
+        assert_eq!(
+            reopened.persistent_workspace().chat_drafts[&draft_card],
+            draft
+        );
+        restored_session.shutdown();
         // Another window derives exactly the same order from authoritative IDs.
         let (mut peer, _, _) = app_with_project();
         peer.sidebar_model = app.sidebar_model.clone();
