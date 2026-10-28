@@ -445,11 +445,25 @@ impl Runtime {
             })
             .and_then(|item| {
                 let path = content_path(&item.content)?;
+                let verb = turn::step_verb(&item.content);
+                let summary_target = if verb.is_empty() {
+                    turn.summary.as_str()
+                } else {
+                    turn.summary.strip_prefix(verb)?.strip_prefix(' ')?
+                };
+                // Match the complete semantic prefix, keeping status text after
+                // the original target. A filename such as `a` may also occur
+                // inside `Read`, so searching for its first occurrence is unsafe.
+                let suffix = summary_target.strip_prefix(path)?;
                 let label = content_path_label(
                     &item.content,
                     &self.session.launch.recipe.working_directory,
                 )?;
-                Some(turn.summary.replacen(path, &label.display, 1))
+                Some(if verb.is_empty() {
+                    format!("{}{suffix}", label.display)
+                } else {
+                    format!("{verb} {}{suffix}", label.display)
+                })
             })
             .unwrap_or_else(|| turn.summary.clone());
         let key = turn.key.as_str();
