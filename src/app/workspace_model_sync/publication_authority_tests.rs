@@ -1,3 +1,6 @@
+#[path = "../../../tests/support/user_fixture.rs"]
+mod user_fixture;
+
 use super::{ModelEdit, ModelUpdate, PublicationContext, QueuedEdit, publish_with};
 use crate::{
     agent_execution::Authority,
@@ -1487,6 +1490,10 @@ fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_loc
 #[test]
 fn local_retirement_resolves_publication_notice_without_waiting_for_another_model_update() {
     use crate::app::{Message, NoticeKey};
+    if !user_fixture::enter() {
+        return;
+    }
+    assert!(Authority::from_environment().token().is_none());
     let (_directory, mut app, project, channel, _repository, requests) = creation_fixture();
     let project_edit = requests.try_recv().unwrap().edit;
     let channel_edit = requests.try_recv().unwrap().edit;
