@@ -3657,7 +3657,11 @@ mod tests {
         assert!(app.project_ui.closed.contains(&repository));
         assert!(app.workspace_model.project(&repository).is_none());
         assert!(app.workspace_model.channels.is_empty());
-        assert!(app.workspace_model_loads.contains_key(&project_id));
+        assert!(!app.workspace_model_loads.contains_key(&project_id));
+        assert!(!app.workspace_model_opens.contains(&repository));
+        assert!(!app.repository_generations.contains_key(&project_id));
+        assert!(!app.refresh_ui.projects.contains_key(&project_id));
+        assert!(cancellation.is_cancelled());
         let discarded = app.update(Message::RepositoryLoaded {
             open_cards: false,
             project_id,

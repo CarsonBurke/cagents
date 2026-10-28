@@ -530,6 +530,22 @@ impl Cagents {
         if self.project_ui.is_reopening(repository) {
             return Task::none();
         }
+        // A concurrent explicit open can install a different project ID while
+        // a passive read is still pending. Closing the repository retires both
+        // identities, so that old read cannot adopt a pre-close listing or
+        // release the reservation belonging to a later reopen.
+        let loads = self
+            .workspace_model_loads
+            .iter()
+            .filter(|(_, (path, _))| path == repository)
+            .map(|(&project, (_, generation))| (project, *generation))
+            .collect::<Vec<_>>();
+        for (project, generation) in loads {
+            if let Some(cancellation) = self.refresh_ui.projects.remove(&project) {
+                cancellation.cancel();
+            }
+            self.finish_workspace_model_load(project, generation, true);
+        }
         self.project_ui.removing.remove(repository);
         if !self.project_ui.closed.insert(repository.to_path_buf()) {
             return self.complete_closed_projects();
