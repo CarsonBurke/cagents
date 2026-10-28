@@ -1,6 +1,33 @@
 use super::coordination::Coordinated;
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ViewTransition {
+    Idle,
+    FirstStart,
+    SessionChange,
+}
+
+impl From<Option<&Phase>> for ViewTransition {
+    fn from(phase: Option<&Phase>) -> Self {
+        match phase {
+            None => Self::Idle,
+            Some(Phase::SavingDraft { .. }) => Self::FirstStart,
+            Some(_) => Self::SessionChange,
+        }
+    }
+}
+
+impl From<bool> for ViewTransition {
+    fn from(transitioning: bool) -> Self {
+        if transitioning {
+            Self::SessionChange
+        } else {
+            Self::Idle
+        }
+    }
+}
+
 /// Bind a link to the surface that rendered it, before another pane, project,
 /// or child conversation can become selected.
 pub(super) fn capture_document_link(
@@ -998,7 +1025,7 @@ impl Cagents {
                 };
                 let view = runtime.view(
                     self.chat_auth_recovery(runtime),
-                    self.chat_start_pending(card),
+                    self.chat_ui.phases.get(&card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
                     self.workspace
@@ -1633,7 +1660,7 @@ impl Runtime {
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
-        transitioning: bool,
+        transition: impl Into<ViewTransition>,
         enter_sends: bool,
         shortcuts: &crate::settings::KeyboardShortcuts,
         content_width: f32,
@@ -1642,6 +1669,8 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
     ) -> Element<'a, Message> {
+        let transition = transition.into();
+        let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
             return self.pending_admission_view();
         }
@@ -2192,9 +2221,10 @@ impl Runtime {
         // A draft starting for its first message says so on the message
         // itself.
         if transitioning && self.queued.is_none() {
-            content.push(body(
-                "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
-            ));
+            content.push(body(match transition {
+                ViewTransition::FirstStart => "Starting this conversation… Editing and session controls are disabled. You can still read and copy the conversation.",
+                _ => "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
+            }));
         }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
@@ -2879,7 +2909,11 @@ impl Runtime {
         // sessions, that something is being sent, that the agent has stopped
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = self.conversation_status(transitioning);
+        let (glyph, state) = if matches!(transition, ViewTransition::FirstStart) {
+            (Some(Icon::AgentWorking), "Starting".to_owned())
+        } else {
+            self.conversation_status(transitioning)
+        };
         if let Some(glyph) = glyph {
             status.push(if glyph == Icon::AgentWorking {
                 crate::ui_controls::activity_spinner(
