@@ -1,7 +1,7 @@
 use super::*;
 use crate::automation_ui::{Action, Effect, TargetChoice};
 
-mod transport;
+pub(super) mod transport;
 
 impl Cagents {
     pub(super) fn automation_subscription(&self) -> Subscription<Message> {
