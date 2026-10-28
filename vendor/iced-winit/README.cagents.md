@@ -34,3 +34,12 @@ reads keep their original paths. Raw-transfer errors remain logs/None under the
 generic clipboard API. Remove this fallback when the pinned backend provides
 equivalently bounded raw X11 reads. The ignored raw_selection_fixture test pairs
 with a real private X11 owner for direct, INCR and malformed-transfer coverage.
+
+The pinned shell kept an already-elapsed `WaitUntil` deadline whenever a later
+one was requested, because it always preferred the earlier deadline. A redraw
+scheduled with `RedrawRequest::At` while an older deadline was still the event
+loop's control flow therefore left the loop polling with a zero timeout until
+the new deadline arrived: one timed animation held the UI thread busy for most
+of every interval between its frames. An elapsed deadline is no longer pending
+and now yields to the requested one; pending deadlines keep their precedence.
+Remove this backport when the pinned dependency merges control flow the same way.
