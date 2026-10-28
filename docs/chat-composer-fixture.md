@@ -75,15 +75,23 @@ Store screenshots under `docs/screenshots/` for PR evidence. Stop the owned
 nested session, close its synthetic agent, and stop only its isolated daemon
 when finished. The fixture directory can then be removed.
 
+The daemon removes `CAGENTS_*` variables from a provider's environment, so
+optional fixture behaviors are switched on by files in
+`$fixture_root/home/.claude`, the fixture's Claude config directory. A file
+takes effect from the provider's next start.
+
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
-`$fixture_root/home/.claude/fixture-image-prompt-error`. The daemon starts
-providers with their own environment, so this switch is a file rather than a
-variable. Any prompt containing an image then settles with that error before any
-reply. One Send of text plus images must show one failure notice.
+`fixture-image-prompt-error`. Any prompt containing an image then settles with
+that error before any reply. One Send of text plus images must show one failure
+notice.
 
-For tool disclosure checks, set `CAGENTS_FIXTURE_VERBOSITY=1` in the same
-fixture environment before starting the runner and daemon. Each turn emits a
+To check where a failure is drawn after delivered work, write a diagnostic to
+`fixture-delivery-error` instead. Every prompt then gets a reply, a background
+command's completion notice, a follow-up, and that error. The notice must
+appear once, after the follow-up.
+
+For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
 synthetic provider history, so the same transcript can be reopened.
