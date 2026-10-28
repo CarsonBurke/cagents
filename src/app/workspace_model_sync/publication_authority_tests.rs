@@ -1849,3 +1849,132 @@ fn refused_publication_does_not_block_a_successor_or_new_explicit_channel() {
     );
     assert_eq!(app.durable.chat_drafts, drafts);
 }
+
+#[test]
+fn refused_title_with_failed_canonical_read_restores_only_its_still_owned_candidate() {
+    use crate::model::{ChannelTitleSource, ProjectId, RepositoryId};
+    for authority in [
+        Authority::default(),
+        Authority::session("fixture-title-read-failure".into()),
+    ] {
+        for disconnect in [false, true] {
+            for changed in ["unchanged", "newer_candidate", "newer_scope"] {
+                let (mut app, edit, queued) =
+                    title_fixture("Confirmed", ChannelTitleSource::Prompt);
+                let expected_edit = edit.clone();
+                let expected_authority = authority.clone();
+                let peer = Peer::new(vec![connected()], move |_, peer| {
+                    if expected_authority.token().is_some() {
+                        authenticate(peer, &expected_authority);
+                    }
+                    let request = expect_edit(peer, &expected_edit);
+                    response(peer, &request, refused());
+                    let read = next(peer);
+                    assert!(
+                        matches!(read.request, ClientRequest::ReadWorkspaceModel),
+                        "try the original admitted connection before using cached title evidence"
+                    );
+                    if disconnect {
+                        // Drop after observing the read, so this tests failed
+                        // recovery after a definite edit refusal, not an
+                        // ambiguous edit that may have been accepted.
+                        false
+                    } else {
+                        response(peer, &read, refused());
+                        true
+                    }
+                });
+                let context = PublicationContext {
+                    authority: authority.clone(),
+                    remote: false,
+                    no_start: true,
+                };
+                let (tx, requests) = async_channel::unbounded();
+                tx.send_blocking(edit.clone()).unwrap();
+                drop(tx);
+                let (updates, received) = async_channel::unbounded();
+                let mut pending = None;
+                let connections = Cell::new(0);
+                let error = publish_with(&updates, &requests, &mut pending, || {
+                    connections.set(connections.get() + 1);
+                    existing(&context, &peer.socket)
+                })
+                .unwrap_err();
+                assert!(error.contains("PermissionDenied"));
+                assert_eq!(
+                    connections.get(),
+                    1,
+                    "no fresh or unauthenticated recovery connection"
+                );
+                assert!(pending.is_none() && requests.is_empty());
+                peer.finished();
+                let refusal = received.try_recv().expect(
+                    "a permanently refused title still needs a reducer outcome when its canonical read fails"
+                );
+                assert!(matches!(&refusal, ModelUpdate::TitleRefused(actual) if actual == &edit));
+                assert!(
+                    received.is_empty(),
+                    "one targeted fallback, no false canonical snapshot"
+                );
+
+                let unrelated = app.durable.channels[1].clone();
+                let card = app.durable.channels[0].cards[0];
+                if changed == "newer_candidate" {
+                    assert!(app.suggest_channel_title(
+                        card,
+                        "Newer candidate".into(),
+                        ChannelTitleSource::Provider
+                    ));
+                    assert!(matches!(queued.try_recv().unwrap(),
+                        ModelEdit::SuggestConversationTitle { title, .. } if title == "Newer candidate"));
+                } else if changed == "newer_scope" {
+                    let successor = ProjectId::new();
+                    app.sidebar_model
+                        .projects
+                        .push(crate::sidebar::SidebarProject::new(
+                            successor,
+                            RepositoryId::new(),
+                            "Successor project".into(),
+                            PathBuf::from("/private-publication-fixture/successor"),
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    std::sync::Arc::make_mut(&mut app.durable).channels[0].project_id = successor;
+                }
+                let channels_before = app.durable.channels.clone();
+                let cards_before = app.durable.cards.clone();
+                let model_before = app.workspace_model.clone();
+                drop(app.apply_workspace_model_update(refusal));
+                if changed == "unchanged" {
+                    assert_eq!(app.durable.channels[0].title, "Confirmed");
+                    assert_eq!(
+                        app.durable.channels[0].title_source,
+                        ChannelTitleSource::Prompt
+                    );
+                    let channel = app.durable.channels[0].id;
+                    assert_eq!(
+                        app.sidebar_model.projects[0]
+                            .channels
+                            .iter()
+                            .find(|row| row.id == channel)
+                            .unwrap()
+                            .title,
+                        "Confirmed"
+                    );
+                } else {
+                    assert_eq!(
+                        app.durable.channels, channels_before,
+                        "the old refused request cannot restore over {changed}"
+                    );
+                }
+                assert_eq!(app.durable.channels[1], unrelated);
+                assert_eq!(app.durable.cards, cards_before);
+                assert_eq!(app.workspace_model, model_before);
+                assert!(
+                    queued.is_empty(),
+                    "cached restoration must not publish a compensating mutation"
+                );
+            }
+        }
+    }
+}
