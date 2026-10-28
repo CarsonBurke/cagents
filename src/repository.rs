@@ -11057,7 +11057,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
-            for name in ["a", "assumed", "skipped", "unselected"] {
+            for name in ["a", "selected", "assumed", "skipped", "unselected"] {
                 fs::write(root.join(name), b"base\n").unwrap();
             }
             git(root, &["add", "-A"]);
@@ -11102,6 +11102,55 @@ mod tests {
                 unselected
             );
             assert_eq!(fs::read(root.join("a/immediate")).unwrap(), b"unselected\n");
+
+            // The first case stages one row. Reset only its index entry so
+            // the same replacement tree now tests a two-row sibling action.
+            git(root, &["reset", "--quiet", "HEAD", "--", "a"]);
+            fs::write(root.join("selected"), b"selected work\n").unwrap();
+            let outcome = service()
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection: vec![
+                            PathSelection::new(path("a")),
+                            PathSelection::new(path("selected")),
+                        ],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+
+            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(git_output(root, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                git_output(root, &["diff", "--cached", "--name-status", "-z"]),
+                b"D\0a\0M\0selected\0M\0unselected\0"
+            );
+            assert_eq!(
+                git_output(
+                    root,
+                    &["ls-files", "-sv", "--", "assumed", "skipped", "unselected"]
+                ),
+                unselected
+            );
+            assert_eq!(
+                fs::read(root.join("assumed")).unwrap(),
+                b"unselected work\n"
+            );
+            assert_eq!(
+                fs::read(root.join("skipped")).unwrap(),
+                b"unselected work\n"
+            );
+            assert_eq!(
+                fs::read(root.join("unselected")).unwrap(),
+                b"already staged\n"
+            );
+            assert_eq!(fs::read(root.join("selected")).unwrap(), b"selected work\n");
+            assert_eq!(fs::read(root.join("a/immediate")).unwrap(), b"unselected\n");
+            assert_eq!(
+                fs::read(root.join("a/deep/deeper/file")).unwrap(),
+                b"unselected\n"
+            );
         }
 
         #[cfg(unix)]
