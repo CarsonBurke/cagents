@@ -708,6 +708,8 @@ mod tests {
             let readers=chat::source_owners::readers().clone().acquire_many_owned(2).await.unwrap();
             let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
             let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+            let input=app.chat_runtime_mut(target).unwrap().raw_original.entries[&Key::of(&part)]
+                .pending_copy.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
             let mut stream=iced::runtime::task::into_stream(task).unwrap();
             // Task::stream yields once before polling its copy future. Poll past that yield into the blocked reader acquisition.
             for _ in 0..2 {assert!(stream.next().now_or_never().is_none());}
@@ -724,7 +726,18 @@ mod tests {
                     _=>unreachable!(),
                 }
             }
-            flush();assert!(body.upgrade().is_none(),"revocation {revoke} releases the body while the copy future and both reader permits remain alive");
+            assert!(input.0.lock().unwrap().is_none(),"revocation {revoke} withdraws the queued copy input before any reader is released");
+            flush();
+            if revoke==0 {
+                // Hiding now also checkpoints the admitted original for EOF
+                // recovery. That separate writer may legitimately retain the
+                // same body after the copy has withdrawn it; wait for its spill
+                // while the copy stream and both readers remain blocked.
+                tokio::time::timeout(Duration::from_secs(5),async {
+                    while body.upgrade().is_some() {tokio::time::sleep(Duration::from_millis(1)).await;}
+                }).await.expect("the private EOF writer releases its captured original after spilling");
+            }
+            assert!(body.upgrade().is_none(),"revocation {revoke} releases the body while the copy future and both reader permits remain alive");
             assert!(stream.next().now_or_never().is_none(),"copy still waits for a reader after revocation");drop(readers);
             let completed=tokio::time::timeout(Duration::from_secs(5),async {
                 while let Some(event)=stream.next().await {if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::RawOriginalCopied(..))))=event {return action;}}

@@ -432,12 +432,15 @@ impl State {
         }
         data.error = Some(error.clone());
         data.unavailable = true;
-        // Publish an honest read-only status without overwriting authoritative
-        // error/outcome metadata. Hide/show can retry when source budget frees.
-        Arc::make_mut(&mut snapshot).read_only_reason = Some(format!(
-            "Connection lost; the last cached view is temporarily unavailable: {error}. Hide and reopen this pane to retry."
-        ));
-        owner.transcript_resident.store(true, Ordering::Release);
+        // A failed sidecar restore cannot invalidate an authoritative final
+        // transcript that arrived while hidden. Only an evicted body needs the
+        // cache-unavailable placeholder; hide/show can retry its private file.
+        if !owner.transcript_resident.load(Ordering::Acquire) {
+            Arc::make_mut(&mut snapshot).read_only_reason = Some(format!(
+                "Connection lost; the last cached view is temporarily unavailable: {error}. Hide and reopen this pane to retry."
+            ));
+            owner.transcript_resident.store(true, Ordering::Release);
+        }
         drop(data);
         drop(snapshot);
         tracing::warn!(target: "cagents::memory", %error, "Cannot restore cached chat view");
@@ -971,6 +974,104 @@ mod tests {
         wait("revoked fallback did not release", || {
             body.upgrade().is_none()
         });
+    }
+
+    #[test]
+    fn truncated_view_restore_preserves_resident_final_and_explains_evicted_failure() {
+        for (resident_final, final_reason) in [
+            (true, Some("Authoritative closed transcript")),
+            (true, None),
+            (false, None),
+        ] {
+            let handle = handle();
+            hidden_on_disk(&handle);
+            wait("hidden cache worker did not settle", || {
+                !handle.inner.offline.queued.load(Ordering::Acquire)
+            });
+            {
+                let data = handle.inner.offline.data.lock().unwrap();
+                let cached = data.cached.as_ref().expect("completed disk spill");
+                assert_eq!(cached.file.metadata().unwrap().nlink(), 0);
+                assert!(cached.bytes > 0);
+                // Damage the actual owned anonymous file, not a decoder stub.
+                cached.file.set_len(0).unwrap();
+            }
+            if resident_final {
+                // Model the final reader publication under its snapshot lock;
+                // the wire test separately drives authenticated ChatClosed.
+                let final_snapshot = Snapshot {
+                    generation: 99,
+                    ready: true,
+                    session_id: Some("private-offline".into()),
+                    exited: true,
+                    finished_at: Some(99),
+                    read_only_reason: final_reason.map(str::to_owned),
+                    items: vec![Arc::new(super::super::super::Item {
+                        id: "authoritative-final".into(),
+                        role: super::super::super::Role::Assistant,
+                        content: super::super::super::ItemContent::Text {
+                            text: "authoritative final body".into(),
+                            thinking: false,
+                            phase: Default::default(),
+                        },
+                        started_at: None,
+                        at: None,
+                    })],
+                    ..Snapshot::default()
+                };
+                let mut current = handle.inner.snapshot.lock().unwrap();
+                *current = Arc::new(final_snapshot);
+                handle
+                    .inner
+                    .transcript_resident
+                    .store(true, Ordering::Release);
+            }
+            let before = handle.snapshot();
+            let (epoch, request) = {
+                let data = handle.inner.offline.data.lock().unwrap();
+                (data.epoch, data.request)
+            };
+            handle.set_visible(true).unwrap();
+            wait("truncated cache read did not fail", || {
+                handle.inner.offline.data.lock().unwrap().unavailable
+            });
+            wait("failed restore worker did not settle", || {
+                !handle.inner.offline.queued.load(Ordering::Acquire)
+            });
+            let after = handle
+                .resident_snapshot()
+                .expect("readable final or status");
+            if resident_final {
+                assert!(Arc::ptr_eq(&before, &after));
+                assert_eq!(after.as_ref(), before.as_ref());
+                assert_eq!(after.read_only_reason.as_deref(), final_reason);
+                assert!(after.exited);
+                assert_eq!(after.finished_at, Some(99));
+                let super::super::super::ItemContent::Text { text, .. } = &after.items[0].content
+                else {
+                    panic!("final text");
+                };
+                assert_eq!(text, "authoritative final body");
+            } else {
+                assert!(!Arc::ptr_eq(&before, &after));
+                assert_eq!(after.transcript_bytes(), 0);
+                let reason = after.read_only_reason.as_deref().unwrap();
+                assert!(reason.contains("last cached view is temporarily unavailable"));
+                assert!(reason.contains("Hide and reopen this pane to retry"));
+                assert_eq!(after.generation, before.generation);
+                assert_eq!(after.exited, before.exited);
+            }
+            let data = handle.inner.offline.data.lock().unwrap();
+            assert!(data.error.as_ref().is_some_and(|error| !error.is_empty()));
+            assert!(data.unavailable);
+            assert_eq!(data.epoch, epoch);
+            assert_eq!(data.request, request.wrapping_add(1));
+            assert!(!data.restore);
+            assert!(!data.revoked);
+            assert!(data.cached.is_some(), "retain the file for a later retry");
+            assert!(data.restored_raw.is_none());
+            assert!(data.restored_changes.is_none());
+        }
     }
 
     #[test]
