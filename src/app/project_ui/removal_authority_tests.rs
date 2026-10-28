@@ -815,6 +815,11 @@ fn retained_project_recovery(role: &str) {
             initial.chats(vec![source.clone()]);
             let close = initial.chat_close(&source);
             initial.refuse(&close);
+            let detach = initial.request();
+            assert!(
+                matches!(detach.request, ClientRequest::ChatDetach { chat_id } if chat_id == source.id)
+            );
+            initial.response(&detach, ServerResponse::Detached);
             initial.eof();
             let mut recovery = server.connect(&expected, false).unwrap();
             recovery.model(&model);
