@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+mod no_start_tests;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
