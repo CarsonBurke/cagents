@@ -33,6 +33,7 @@ host = [
     "dep:ashpd",
     "dep:futures-util",
     "dep:base64",
+    "dep:blake3",
     "dep:hmac",
     "dep:image",
     "dep:imara-diff",

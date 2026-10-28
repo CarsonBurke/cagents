@@ -3482,7 +3482,7 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
     let directory = context.directory_descriptor().ok_or_else(|| {
         ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,
-            "The native handoff has no verified working-directory descriptor".into(),
+            "The native handoff has no verified working-directory descriptor",
             false,
         )
     })?;
@@ -3496,7 +3496,7 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
     if !metadata.is_dir() || metadata.nlink() == 0 {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,
-            "The native handoff directory is no longer available".into(),
+            "The native handoff directory is no longer available",
             false,
         ));
     }
