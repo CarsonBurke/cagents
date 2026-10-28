@@ -4589,7 +4589,7 @@ done
             kind: crate::model::ProjectKind::Folder,
         }).unwrap();
         registry.apply(&crate::workspace_model::ModelEdit::SeedView {
-            scope: crate::workspace_model::Scope::Worktree {
+            scope: crate::workspace_model::views::Scope::Worktree {
                 repository: source.launch.recipe.working_directory.clone(),
                 path: source.launch.recipe.working_directory.clone(),
             },

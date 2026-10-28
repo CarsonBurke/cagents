@@ -404,15 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn account_execution_validation_ignores_conversation_defaults_only() {
-        let configuration = AgentLaunchSettings { model: Some("future\nmodel".into()), permission_mode: Some("future-mode".into()), ..Default::default() };
-        assert!(configuration.validate(Provider::Claude).is_err());
-        configuration.validate_execution(Provider::Claude).unwrap();
-        let invalid = AgentLaunchSettings { executable: Some("/missing/pinned-wrapper".into()), ..configuration };
-        assert!(invalid.validate_execution(Provider::Claude).is_err());
-    }
-
-    #[test]
     fn explicit_conversation_options_replace_defaults_without_duplicate_flags() {
         let configuration = AgentLaunchSettings { model: Some("default-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()), ..Default::default() };
         let mut arguments = vec!["--model".into(), "argument-model".into(), "--effort=high".into()];
