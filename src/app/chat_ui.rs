@@ -70,6 +70,9 @@ fn chat_title<'a>(
 ) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
     design::body(text)
         .size(design::chat_size())
+        .line_height(iced::widget::text::LineHeight::Relative(
+            design::LINE_BODY / design::TEXT_PROSE,
+        ))
         .font(iced::Font {
             weight: iced::font::Weight::Semibold,
             ..design::chat_font()
@@ -11503,6 +11506,76 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_chat_title_allocates_chat_line_pitch_independently_of_interface_size() {
+        use iced::advanced::{layout, text::Paragraph as _, widget::Tree};
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+
+        let _restore = design::typography_test_guard();
+        let renderer = crate::app::tests::headless_renderer();
+        let family = design::installed_font_families(false)
+            .first()
+            .expect("the real renderer has an installed chat family");
+        // No hard breaks: every additional run must come from the title's
+        // actual paragraph wrapping at this narrow width.
+        let text = "Session heading with a long agent name and a readable summary ".repeat(3);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(160.0, 10_000.0));
+        let mut tree = Tree::empty();
+        let mut large_chat_layout = None;
+        for (interface, chat, expected_pitch) in [
+            (13.0, 14.0, 18.0),
+            (10.0, 40.0, 360.0 / 7.0),
+            (24.0, 40.0, 360.0 / 7.0),
+            (24.0, 8.0, 72.0 / 7.0),
+            (13.0, 14.0, 18.0),
+        ] {
+            design::configure_typography("", interface, family, chat);
+            let mut title: cosmic::Element<'_, ()> = super::chat_title(text.as_str()).into();
+            tree.diff(title.as_widget_mut());
+            let node = title.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let paragraph = tree.state.downcast_ref::<TextState>().paragraph.raw();
+            assert_eq!(paragraph.size().0, chat);
+            assert_eq!(
+                paragraph.font(),
+                iced::Font {
+                    weight: iced::font::Weight::Semibold,
+                    ..design::chat_font()
+                },
+                "the chat family and title emphasis survive the line-box correction"
+            );
+            let pitch = paragraph.line_height().to_absolute(paragraph.size()).0;
+            assert!((pitch - expected_pitch).abs() < 0.01);
+            let runs: Vec<_> = paragraph
+                .buffer()
+                .layout_runs()
+                .map(|run| (run.line_y, run.line_height))
+                .collect();
+            assert!(runs.len() > 1, "exercise actual soft-wrapped heading lines");
+            for (_, height) in &runs {
+                assert!((height - expected_pitch).abs() < 0.01);
+            }
+            for pair in runs.windows(2) {
+                assert!((pair[1].0 - pair[0].0 - expected_pitch).abs() < 0.01);
+            }
+            assert!(
+                (node.size().height - expected_pitch * runs.len() as f32).abs() < 0.1,
+                "all wrapped lines must fit the widget allocation at interface={interface}, chat={chat}"
+            );
+            assert!((node.size().height - paragraph.min_bounds().height).abs() < 0.1);
+            if chat == 40.0 {
+                let current = (node.size(), runs.len());
+                if let Some(previous) = large_chat_layout {
+                    assert_eq!(
+                        current, previous,
+                        "changing only interface size must not reflow the retained chat heading"
+                    );
+                }
+                large_chat_layout = Some(current);
+            }
+        }
+    }
+
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
