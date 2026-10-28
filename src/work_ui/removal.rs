@@ -432,6 +432,38 @@ impl State {
                         operation.message = Some("Inspection completed. The original removal result remains unconfirmed.".into());
                     }
                     Ok(prepared) => {
+                        if operation.recovering {
+                            // A fresh plan is not a receipt for the original
+                            // mutation. Preserve that request before a new review
+                            // can be dismissed, replaced, or explicitly confirmed.
+                            if self.unresolved.len() == MAX_UNRESOLVED {
+                                operation.phase = Phase::Uncertain;
+                                operation.recovering = false;
+                                operation.message = Some("The original removal result remains unconfirmed. All unresolved slots are occupied; its record has not been discarded.".into());
+                                self.rotate();
+                                return None;
+                            }
+                            let Some(submitted) = operation.submitted.as_ref() else {
+                                operation.phase = Phase::Uncertain;
+                                operation.recovering = false;
+                                operation.message = Some("The original removal result remains unconfirmed. No new removal was sent.".into());
+                                self.rotate();
+                                return None;
+                            };
+                            let mut original = operation.clone();
+                            original.subject = submitted.subject.clone();
+                            original.prepared = Some(submitted.prepared.clone());
+                            original.keep = Some(submitted.request.keep);
+                            original.delete_branch = submitted.request.delete_branch;
+                            original.message = submitted.diagnostic.clone();
+                            original.phase = Phase::Uncertain;
+                            original.recovering = false;
+                            self.unresolved.push(Unresolved {
+                                id: Uuid::new_v4(),
+                                operation: original,
+                            });
+                            operation.submitted = None;
+                        }
                         operation.keep = match prepared.plan.inspection.verdict {
                             Verdict::Unsaved { .. } => prepared
                                 .plan
@@ -1859,6 +1891,221 @@ mod tests {
         };
         assert_eq!(request.keep, Keep::Discard);
         assert!(!request.delete_branch);
+    }
+
+    #[test]
+    fn fresh_review_keeps_original_unknown_custody_when_dismissed_replaced_or_confirmed() {
+        for next in ["dismiss", "other", "confirm"] {
+            let mut state = State::default();
+            let original = distinct_subject(1);
+            let (_, original_request) = uncertain(&mut state, original.clone());
+            let submitted = state.operation.as_ref().unwrap().submitted.clone().unwrap();
+            let Some(Effect::Plan {
+                generation,
+                backend: Some(backend),
+                subject,
+            }) = state.update(
+                Action::Reinspect {
+                    generation: state.generation(),
+                },
+                true,
+            )
+            else {
+                panic!("explicit original-host inspection only");
+            };
+            assert_eq!(backend, submitted.prepared.backend);
+            assert_eq!(subject, original);
+            let mut fresh = prepared(&original, Verdict::Landed);
+            fresh.plan.inspection.token = Some("fresh-consent-token".into());
+            assert!(
+                state
+                    .update(
+                        Action::Planned {
+                            generation,
+                            result: Ok(fresh)
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            // A new explicit decision remains possible. Inspection is not a
+            // completion receipt for the earlier submitted mutation.
+            assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Review);
+            assert!(!state.operation.as_ref().unwrap().delete_branch);
+            match next {
+                "dismiss" => {
+                    assert!(
+                        state
+                            .update(
+                                Action::Dismiss {
+                                    generation: state.generation()
+                                },
+                                true
+                            )
+                            .is_none()
+                    );
+                    assert!(state.operation.is_none());
+                }
+                "other" => {
+                    assert!(matches!(
+                        state.update(
+                            Action::Open {
+                                generation: state.generation(),
+                                subject: distinct_subject(2),
+                            },
+                            true
+                        ),
+                        Some(Effect::Plan { .. })
+                    ));
+                }
+                "confirm" => {
+                    let Some(Effect::Remove { request, .. }) = state.update(
+                        Action::Confirm {
+                            generation: state.generation(),
+                        },
+                        true,
+                    ) else {
+                        panic!("fresh explicit confirmation is still allowed");
+                    };
+                    assert_eq!(request.token, "fresh-consent-token");
+                    assert!(!request.delete_branch);
+                    assert_ne!(request, original_request);
+                }
+                _ => unreachable!(),
+            }
+            let retained = state
+                .unresolved
+                .iter()
+                .find(|saved| {
+                    saved
+                        .operation
+                        .submitted
+                        .as_ref()
+                        .is_some_and(|old| old.request == original_request)
+                })
+                .unwrap_or_else(|| {
+                    panic!("{next}: a fresh plan cannot erase original unknown custody")
+                });
+            assert_eq!(state.unresolved.len(), 1);
+            assert_eq!(retained.operation.phase, Phase::Uncertain);
+            let old = retained.operation.submitted.as_ref().unwrap();
+            assert_eq!(old.subject, original);
+            assert_eq!(old.request, original_request);
+            assert_eq!(old.prepared.backend, submitted.prepared.backend);
+            assert_eq!(
+                old.prepared.plan.inspection.token,
+                submitted.prepared.plan.inspection.token
+            );
+            assert_eq!(old.diagnostic.as_deref(), Some("EOF after submission"));
+            assert!(
+                outline(&state)
+                    .iter()
+                    .any(|text| text.contains("unconfirmed"))
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_recovery_retention_never_duplicates_or_discards_at_capacity() {
+        let mut state = State::default();
+        for number in 0..MAX_UNRESOLVED - 1 {
+            uncertain(&mut state, distinct_subject(number));
+            keep_unresolved(&mut state);
+        }
+        let original = distinct_subject(MAX_UNRESOLVED);
+        uncertain(&mut state, original.clone());
+        state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            true,
+        );
+        state.update(
+            Action::Planned {
+                generation: state.generation(),
+                result: Ok(prepared(&original, Verdict::Landed)),
+            },
+            true,
+        );
+        assert_eq!(state.unresolved.len(), MAX_UNRESOLVED);
+        assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Review);
+        assert!(state.operation.as_ref().unwrap().submitted.is_none());
+        let ids: Vec<_> = state.unresolved.iter().map(|saved| saved.id).collect();
+        // Rechecking a fresh review must not archive the original twice.
+        state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            true,
+        );
+        state.update(
+            Action::Planned {
+                generation: state.generation(),
+                result: Ok(prepared(&original, Verdict::Landed)),
+            },
+            true,
+        );
+        assert_eq!(state.unresolved.len(), MAX_UNRESOLVED);
+        let Some(Effect::Remove {
+            generation,
+            request,
+            ..
+        }) = state.update(
+            Action::Confirm {
+                generation: state.generation(),
+            },
+            true,
+        )
+        else {
+            panic!("a new explicit request remains possible");
+        };
+        state.update(
+            Action::Finished {
+                generation,
+                result: RemovalOutcome::Uncertain("second request unknown".into()),
+            },
+            true,
+        );
+        state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            true,
+        );
+        state.update(
+            Action::Planned {
+                generation: state.generation(),
+                result: Ok(prepared(&original, Verdict::Landed)),
+            },
+            true,
+        );
+        let operation = state.operation.as_ref().unwrap();
+        assert_eq!(operation.phase, Phase::Uncertain);
+        assert_eq!(operation.submitted.as_ref().unwrap().request, request);
+        assert_eq!(
+            operation.submitted.as_ref().unwrap().diagnostic.as_deref(),
+            Some("second request unknown")
+        );
+        assert_eq!(
+            state
+                .unresolved
+                .iter()
+                .map(|saved| saved.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text.contains("has not been discarded"))
+        );
+        state.update(
+            Action::Dismiss {
+                generation: state.generation(),
+            },
+            true,
+        );
+        assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Uncertain);
     }
 
     #[test]
