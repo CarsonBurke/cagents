@@ -5267,6 +5267,10 @@ pub struct Cagents {
     /// no resize border. Tracked here rather than read from `core`, which only
     /// learns it from Wayland window states.
     window_filled: bool,
+    /// Whether a Wayland window state has arrived for the main window. Those
+    /// events then report maximized and fullscreen, so only a backend without
+    /// them, such as X11, needs `query_window_filled` on every resize.
+    window_state_observed: bool,
     /// Whether the compositor reports the main window's right edge as tiled,
     /// so the shell offers no resize border there.
     right_edge_tiled: bool,
@@ -6190,9 +6194,12 @@ impl Cagents {
 
     /// Reads whether the main window is maximized or fullscreen from the
     /// windowing backend, which is what the shell's resize border consults.
-    /// Wayland also reports this through window states, but X11 has no such
-    /// event, so every resize asks again.
+    /// Wayland reports this through window states, which make the query
+    /// redundant; X11 has no such event, so there every resize asks again.
     fn query_window_filled(&self) -> Task<Message> {
+        if self.window_state_observed {
+            return Task::none();
+        }
         let Some(window) = self.core.main_window_id() else {
             return Task::none();
         };
@@ -14186,6 +14193,7 @@ impl Application for Cagents {
             window_width: 1_600.0,
             window_height: 900.0,
             window_filled: false,
+            window_state_observed: false,
             right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
@@ -16666,6 +16674,7 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let inset = self.window_edge_inset();
+                self.window_state_observed = true;
                 self.window_filled = filled;
                 self.right_edge_tiled = right_edge_tiled;
                 if self.window_edge_inset() == inset {
@@ -23366,10 +23375,7 @@ mod tests {
         // The border is in compositor pixels; the interface scale enlarges
         // every interface pixel.
         app.settings.ui_scale = 1.25;
-        assert_eq!(
-            app.window_edge_inset(),
-            design::WINDOW_RESIZE_BORDER / 1.25
-        );
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER / 1.25);
         app.settings.ui_scale = 1.0;
 
         // Another window's state does not move the main window's content.
@@ -23381,7 +23387,10 @@ mod tests {
         // A tiled right edge has no border, so content returns to the edge.
         // Other tiled edges leave the right border in place.
         for (flags, inset) in [
-            (WindowState::TILED_LEFT | WindowState::TILED_TOP, design::WINDOW_RESIZE_BORDER),
+            (
+                WindowState::TILED_LEFT | WindowState::TILED_TOP,
+                design::WINDOW_RESIZE_BORDER,
+            ),
             (WindowState::TILED_RIGHT | WindowState::ACTIVATED, 0.0),
             (WindowState::ACTIVATED, design::WINDOW_RESIZE_BORDER),
         ] {
@@ -23392,8 +23401,8 @@ mod tests {
 
         // A maximized or fullscreen window has no border at all, whether the
         // Wayland state or the backend query reports it.
-        let maximized = window_edge_message(&state(WindowState::MAXIMIZED), main)
-            .expect("window state event");
+        let maximized =
+            window_edge_message(&state(WindowState::MAXIMIZED), main).expect("window state event");
         let _ = app.update(maximized);
         assert_eq!(app.window_edge_inset(), 0.0);
         let _ = app.update(Message::WindowFilled(main, false));
@@ -23403,6 +23412,27 @@ mod tests {
         let _ = app.update(Message::WindowFilled(main, true));
         assert_eq!(app.window_edge_inset(), 0.0);
         assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
+    }
+
+    #[test]
+    fn resizes_query_the_window_state_only_until_wayland_reports_it() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let mut app = context_inspector_test_app(false);
+        let resize = |app: &mut Cagents| app.update(Message::WindowResized(1600.0, 900.0)).units();
+        let without_query = resize(&mut app);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        // X11 sends no window states, so every resize asks the backend.
+        assert!(resize(&mut app) > without_query);
+        assert!(resize(&mut app) > without_query);
+
+        let state = iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
+            wayland::Event::Window(wayland::WindowEvent::WindowState(WindowState::ACTIVATED)),
+        ));
+        let _ = app.update(window_edge_message(&state, main).expect("window state event"));
+        assert_eq!(resize(&mut app), without_query);
     }
 
     #[test]
@@ -29005,6 +29035,7 @@ mod tests {
             window_width: 1_600.0,
             window_height: 900.0,
             window_filled: false,
+            window_state_observed: false,
             right_edge_tiled: false,
             core,
             settings_path: None,
