@@ -19299,9 +19299,11 @@ mod tests {
                 assert!(app.can_move_pane_to_channel(card, destination));
             } else {
                 drop(app.move_pane_to_channel(card, destination));
-                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                assert!(
+                    matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
                     change: Change::Transfer { id, .. }, ..
-                } if id == card));
+                } if id == card)
+                );
                 drop(app.begin_chat_close(card));
                 assert!(!app.chat_close_owned(card));
                 assert!(app.card_state(card).unwrap().existence.is_open());
@@ -21016,7 +21018,7 @@ mod tests {
             assert!(!app.channel_ui.was_deleted(channel));
             assert!(app.channel_work.retire_candidates.contains(&home));
             let mut before_ack = Vec::new();
-            while let Ok(edit) = published.try_recv() {
+            while let Ok(edit) = published.try_recv().map(|queued| queued.edit) {
                 before_ack.push(edit);
             }
             assert!(
@@ -21042,7 +21044,7 @@ mod tests {
                 model: settled.clone(),
             }));
             let mut after_ack = Vec::new();
-            while let Ok(edit) = published.try_recv() {
+            while let Ok(edit) = published.try_recv().map(|queued| queued.edit) {
                 after_ack.push(edit);
             }
             let retire_requests = after_ack

@@ -82,6 +82,89 @@ impl PublicationContext {
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Local correlation travels with the queued edit, never over the daemon wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenOrigin {
+    nonce: uuid::Uuid,
+    registry: uuid::Uuid,
+    project: ProjectId,
+    repository: PathBuf,
+    inventory_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QueuedEdit {
+    pub(super) edit: ModelEdit,
+    pub(super) reopen: Option<ReopenOrigin>,
+}
+
+impl From<ModelEdit> for QueuedEdit {
+    fn from(edit: ModelEdit) -> Self {
+        Self { edit, reopen: None }
+    }
+}
+
+struct ReopenAcknowledgement {
+    origin: ReopenOrigin,
+    registry: uuid::Uuid,
+    sequence: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ReopenTracking {
+    active: HashMap<ProjectId, ReopenOrigin>,
+    deferred: HashMap<ProjectId, ReopenAcknowledgement>,
+    queued: HashSet<ProjectId>,
+    retryable: HashSet<ProjectId>,
+}
+
+impl ReopenTracking {
+    pub(super) fn invalidate(&mut self, project: ProjectId) {
+        self.active.remove(&project);
+        self.deferred.remove(&project);
+        self.queued.remove(&project);
+        self.retryable.remove(&project);
+    }
+
+    pub(super) fn begin(
+        &mut self,
+        project: ProjectId,
+        repository: PathBuf,
+        registry: uuid::Uuid,
+        inventory_generation: Option<u64>,
+    ) {
+        self.invalidate(project);
+        self.active.insert(
+            project,
+            ReopenOrigin {
+                nonce: uuid::Uuid::new_v4(),
+                registry,
+                project,
+                repository,
+                inventory_generation,
+            },
+        );
+    }
+
+    pub(super) fn remap(&mut self, previous: ProjectId, project: ProjectId) {
+        let origin = self.active.get(&previous).cloned();
+        self.invalidate(previous);
+        self.invalidate(project);
+        if let Some(mut origin) = origin {
+            origin.project = project;
+            self.active.insert(project, origin);
+        }
+    }
+
+    pub(super) fn can_retry(&self, repository: &Path) -> bool {
+        self.active.values().any(|origin| {
+            origin.repository == repository
+                && (self.retryable.contains(&origin.project)
+                    || self.deferred.contains_key(&origin.project))
+        })
+    }
+}
+
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
@@ -97,10 +180,12 @@ pub enum ModelUpdate {
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
+        origin: Option<ReopenOrigin>,
     },
     ReopenFailed {
         repository: PathBuf,
         error: String,
+        origin: Option<ReopenOrigin>,
     },
     Edited {
         sequence: u64,
@@ -236,7 +321,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelEdit>,
+    requests: async_channel::Receiver<QueuedEdit>,
 ) {
     let context = PublicationContext::capture();
     let publisher = std::thread::Builder::new()
@@ -262,16 +347,16 @@ pub(super) fn publish_workspace_model(
 fn publish(
     context: &PublicationContext,
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    pending: &mut Option<QueuedEdit>,
 ) -> Result<(), String> {
     publish_with(updates, requests, pending, || context.connect())
 }
 
 fn publish_with(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    pending: &mut Option<QueuedEdit>,
     mut connect: impl FnMut() -> Result<ControlClient, ControlError>,
 ) -> Result<(), String> {
     let mut client = None;
@@ -292,7 +377,7 @@ fn publish_with(
             if client.is_none() {
                 client = Some(connect()?);
             }
-            send(client.as_mut().unwrap(), request.clone(), updates)
+            send_queued(client.as_mut().unwrap(), request.clone(), updates)
         })();
         match result {
             Ok(()) => *pending = None,
@@ -309,21 +394,21 @@ fn publish_with(
                 ) {
                     *pending = None;
                     if matches!(
-                        &request,
+                        &request.edit,
                         ModelEdit::OpenProject { .. } | ModelEdit::CreateChannel { .. }
                     ) {
                         let _ = updates.send_blocking(ModelUpdate::PublicationFailed {
-                            edit: request.clone(),
+                            edit: request.edit.clone(),
                         });
                     }
                     if matches!(
-                        &request,
+                        &request.edit,
                         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
+                    if matches!(&request.edit, ModelEdit::SuggestConversationTitle { .. }) {
                         if let Some(model) = client
                             .as_mut()
                             .and_then(|client| client.read_workspace_model().ok())
@@ -336,13 +421,13 @@ fn publish_with(
                             // or the canonical read may fail after a definite edit
                             // refusal. Reconcile only the still-owned candidate
                             // from the UI's last confirmed model in either case.
-                            let _ =
-                                updates.send_blocking(ModelUpdate::TitleRefused(request.clone()));
+                            let _ = updates
+                                .send_blocking(ModelUpdate::TitleRefused(request.edit.clone()));
                         }
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
-                    } = &request
+                    } = &request.edit
                     {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
@@ -350,10 +435,11 @@ fn publish_with(
                             error: error.to_string(),
                         });
                     }
-                    if let ModelEdit::ReopenProject { repository, .. } = request {
+                    if let ModelEdit::ReopenProject { repository, .. } = request.edit {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
                             error: error.to_string(),
+                            origin: request.reopen,
                         });
                     }
                 }
@@ -363,11 +449,21 @@ fn publish_with(
     }
 }
 
+#[cfg(test)]
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
+    send_queued(client, edit.into(), updates)
+}
+
+fn send_queued(
+    client: &mut ControlClient,
+    queued: QueuedEdit,
+    updates: &async_channel::Sender<ModelUpdate>,
+) -> Result<(), ControlError> {
+    let QueuedEdit { edit, reopen } = queued;
     let reordered = matches!(
         &edit,
         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -488,7 +584,11 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
-        let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
+        let _ = updates.send_blocking(ModelUpdate::Reopened {
+            repository,
+            model,
+            origin: reopen,
+        });
     }
     Ok(())
 }
@@ -530,6 +630,149 @@ enum Adoption {
 }
 
 impl Cagents {
+    fn live_reopen_intent(&self, origin: &ReopenOrigin) -> bool {
+        self.workspace_model_reopens.active.get(&origin.project) == Some(origin)
+            && self.project_ui.reopening.get(&origin.project) == Some(&origin.repository)
+            && !self.project_ui.closed.contains(&origin.repository)
+            && self.sidebar_model.project(origin.project).map_or_else(
+                // A new picker has no row until its inventory read completes.
+                || {
+                    !self
+                        .workspace_model_reopens
+                        .queued
+                        .contains(&origin.project)
+                },
+                |project| project.repository == origin.repository,
+            )
+    }
+
+    fn current_reopen(&self, origin: &ReopenOrigin) -> bool {
+        self.live_reopen_intent(origin)
+            && self
+                .sidebar_model
+                .project(origin.project)
+                .is_some_and(|project| project.repository == origin.repository)
+    }
+
+    fn capture_reopen_origin(
+        &mut self,
+        edit: &ModelEdit,
+        registry: uuid::Uuid,
+    ) -> Option<ReopenOrigin> {
+        let ModelEdit::ReopenProject { repository, .. } = edit else {
+            return None;
+        };
+        let project = self.project_ui.reopening.iter().find_map(|(id, path)| {
+            (path == repository
+                && self
+                    .sidebar_model
+                    .project(*id)
+                    .is_some_and(|project| project.repository == *repository))
+            .then_some(*id)
+        })?;
+        // Passive repository refreshes publish through this same path. They
+        // retain the explicit picker's nonce rather than minting a new intent.
+        let generation = self.repository_generations.get(&project).copied();
+        let queued = self.workspace_model_reopens.queued.contains(&project);
+        let origin = self.workspace_model_reopens.active.get_mut(&project)?;
+        if origin.repository != *repository {
+            return None;
+        }
+        if !queued {
+            origin.registry = registry;
+            origin.inventory_generation = generation;
+        }
+        Some(origin.clone())
+    }
+
+    fn defer_reopen_acknowledgement(
+        &mut self,
+        repository: &Path,
+        model: &WorkspaceModel,
+        origin: Option<&ReopenOrigin>,
+    ) {
+        if let Some(origin) = origin
+            && origin.repository == repository
+            && self.current_reopen(origin)
+            && !self
+                .workspace_model_reopens
+                .retryable
+                .contains(&origin.project)
+            && model.identity != NO_REGISTRY
+            && model.project(repository).is_some()
+        {
+            self.workspace_model_reopens.deferred.insert(
+                origin.project,
+                ReopenAcknowledgement {
+                    origin: origin.clone(),
+                    registry: model.identity,
+                    sequence: model.sequence,
+                },
+            );
+        }
+    }
+
+    fn settle_reopen_acknowledgements(&mut self, connected: Option<uuid::Uuid>) -> bool {
+        let obsolete: Vec<_> = self
+            .workspace_model_reopens
+            .active
+            .values()
+            .filter(|origin| !self.live_reopen_intent(origin))
+            .map(|origin| origin.project)
+            .collect();
+        for project in obsolete {
+            if self
+                .workspace_model_reopens
+                .active
+                .get(&project)
+                .is_some_and(|origin| {
+                    self.project_ui.reopening.get(&project) == Some(&origin.repository)
+                })
+            {
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+            } else {
+                self.workspace_model_reopens.invalidate(project);
+            }
+        }
+        let completed: Vec<_> = self
+            .workspace_model_reopens
+            .deferred
+            .iter()
+            .filter(|(_, ack)| self.current_reopen(&ack.origin))
+            .filter_map(|(project, ack)| {
+                let confirmed = self.workspace_model.identity == ack.registry
+                    && self.workspace_model.sequence >= ack.sequence;
+                let replaced = connected.is_some_and(|registry| registry != ack.registry);
+                (confirmed || replaced).then_some((
+                    *project,
+                    ack.origin.repository.clone(),
+                    confirmed,
+                ))
+            })
+            .collect();
+        let mut changed = false;
+        for (project, repository, confirmed) in completed {
+            if confirmed && self.workspace_model.project(&repository).is_some() {
+                self.workspace_model_reopens.invalidate(project);
+                self.project_ui.reopening.remove(&project);
+                self.cancel_shared_project_close(&repository);
+                self.project_ui.closed.remove(&repository);
+                changed = true;
+            } else {
+                // Keep the local-work shield until an explicit new picker
+                // attempt replaces it. A different connection's tombstone is
+                // not permission to retire this unfinished local reopen.
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+                self.status = Some(TransientNotice::warning(
+                    "Project reopening could not be confirmed on the current workspace connection. Open the project again to retry.",
+                ));
+            }
+        }
+        changed
+    }
+
     pub(super) fn reorder_sidebar_member(
         &mut self,
         project: crate::model::ProjectId,
@@ -642,7 +885,27 @@ impl Cagents {
         // Publisher replies can cross the observer's Connected boundary. Only
         // that observer may replace an already known registry; an old read or
         // reopen must not roll back sharing or settle a successor's intent.
-        if let ModelUpdate::Read(model) | ModelUpdate::Reopened { model, .. } = &update
+        if let ModelUpdate::Reopened {
+            repository,
+            origin: Some(origin),
+            ..
+        } = &update
+            && (origin.repository != *repository || !self.current_reopen(origin))
+        {
+            return (Task::none(), false);
+        }
+        if let ModelUpdate::Reopened {
+            repository,
+            model,
+            origin,
+        } = &update
+            && self.workspace_model.identity != NO_REGISTRY
+            && model.identity != self.workspace_model.identity
+        {
+            self.defer_reopen_acknowledgement(repository, model, origin.as_ref());
+            return (Task::none(), false);
+        }
+        if let ModelUpdate::Read(model) = &update
             && self.workspace_model.identity != NO_REGISTRY
             && model.identity != self.workspace_model.identity
         {
@@ -654,7 +917,20 @@ impl Cagents {
         {
             return (Task::none(), false);
         }
+        let connected = match &update {
+            ModelUpdate::Connected(model) => Some(model.identity),
+            _ => None,
+        };
         let task = self.apply_workspace_model_update_inner(update);
+        let task = if self.settle_reopen_acknowledgements(connected) {
+            Task::batch([
+                task,
+                self.apply_closed_project_tombstones(),
+                self.reconcile_workspace_model(),
+            ])
+        } else {
+            task
+        };
         self.resolve_workspace_publication_notices();
         (task, true)
     }
@@ -745,31 +1021,42 @@ impl Cagents {
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Reopened { repository, model } => {
+            ModelUpdate::Reopened {
+                repository,
+                model,
+                origin,
+            } => {
+                self.defer_reopen_acknowledgement(&repository, &model, origin.as_ref());
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.workspace_model.sequence
                 {
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
-                    return self.apply_closed_project_tombstones();
+                    return Task::none();
                 }
-                self.join_workspace_model(model.identity);
-                if model.project(&repository).is_some() {
-                    self.cancel_shared_project_close(&repository);
-                    self.project_ui.closed.remove(&repository);
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
+                if self.workspace_model.identity == NO_REGISTRY {
+                    self.join_workspace_model(model.identity);
                 }
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::ReopenFailed { repository, error } => {
-                self.project_ui
-                    .reopening
-                    .retain(|_, path| path != &repository);
+            ModelUpdate::ReopenFailed {
+                repository,
+                error,
+                origin,
+            } => {
+                if let Some(origin) = origin {
+                    if origin.repository != repository || !self.current_reopen(&origin) {
+                        return Task::none();
+                    }
+                    self.workspace_model_reopens
+                        .deferred
+                        .remove(&origin.project);
+                    self.workspace_model_reopens
+                        .retryable
+                        .insert(origin.project);
+                } else if self.project_ui.is_reopening(&repository) {
+                    return Task::none();
+                }
                 self.status = Some(crate::app::TransientNotice::error(format!(
                     "Could not reopen project: {error}"
                 )));
@@ -1928,15 +2215,43 @@ impl Cagents {
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
-        if let Err(error) = self.workspace_model_tx.try_send(edit) {
+        let reopen = self.capture_reopen_origin(&edit, registry);
+        if reopen.as_ref().is_some_and(|origin| {
+            self.workspace_model_reopens
+                .queued
+                .contains(&origin.project)
+                || self
+                    .workspace_model_reopens
+                    .retryable
+                    .contains(&origin.project)
+        }) {
+            return;
+        }
+        if let Err(error) = self.workspace_model_tx.try_send(QueuedEdit {
+            edit,
+            reopen: reopen.clone(),
+        }) {
+            if let Some(origin) = reopen {
+                self.workspace_model_reopens
+                    .retryable
+                    .insert(origin.project);
+                self.status = Some(TransientNotice::warning(
+                    "Could not queue reopening this project. Open the project again to retry.",
+                ));
+            }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
                 self.status = Some(TransientNotice::warning(
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
-        } else if let Some(publication) = publication {
-            self.workspace_model_publications.insert(publication);
+        } else {
+            if let Some(origin) = reopen {
+                self.workspace_model_reopens.queued.insert(origin.project);
+            }
+            if let Some(publication) = publication {
+                self.workspace_model_publications.insert(publication);
+            }
         }
     }
 }
@@ -2776,8 +3091,8 @@ mod tests {
                     "a truly blocked scope must not create a fresh card or Starting Task"
                 );
                 assert!(!app.chat_start_pending(card));
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
-                    matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|queued|
+                    matches!(queued.edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
                 // The next authoritative read removes the conflict while the
                 // previous projection's blocked flag is still set locally.
                 model.views[0].panes.clear();
@@ -2788,7 +3103,9 @@ mod tests {
             model.sequence += 1;
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-            let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let edits = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|queued| queued.edit)
+                .collect::<Vec<_>>();
             let inserts = edits
                 .iter()
                 .filter_map(|edit| match edit {
@@ -2850,8 +3167,8 @@ mod tests {
             // rather than re-issuing it or treating the old empty view as close.
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
             assert!(app.card_state(card).unwrap().existence.is_open());
-            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
-                matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|queued|
+                matches!(queued.edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
             let change = Change::Insert {
                 pane: pane.clone(),
                 before: None,
@@ -3629,6 +3946,12 @@ mod tests {
     fn an_unchanged_explicit_open_acknowledges_the_pending_reopen() {
         let (mut app, project, repository) = app_with_project();
         app.project_ui.reopening.insert(project, repository.clone());
+        app.workspace_model_reopens.begin(
+            project,
+            repository.clone(),
+            app.workspace_model.identity,
+            None,
+        );
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
             kind: Default::default(),
@@ -3636,9 +3959,18 @@ mod tests {
             name: "repo".into(),
             ordinal: 1,
         });
+        let origin = app.capture_reopen_origin(
+            &ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: Default::default(),
+            },
+            app.workspace_model.identity,
+        );
         drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
             repository: repository.clone(),
             model,
+            origin,
         }));
         assert!(!app.project_ui.is_reopening(&repository));
         assert!(app.sidebar_model.project(project).is_some());
@@ -3646,14 +3978,16 @@ mod tests {
 
     /// Replaces the publish queue with one the test can read, which is how the
     /// window's side of a publish is observed without a daemon.
-    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
+    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<QueuedEdit> {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         rx
     }
 
-    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    fn drain(rx: &async_channel::Receiver<QueuedEdit>) -> Vec<ModelEdit> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|queued| queued.edit)
+            .collect()
     }
 
     /// A real checkout, because adopting a project runs the repository loader

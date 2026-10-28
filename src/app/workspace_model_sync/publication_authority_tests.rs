@@ -1,4 +1,4 @@
-use super::{ModelEdit, ModelUpdate, PublicationContext, publish_with};
+use super::{ModelEdit, ModelUpdate, PublicationContext, QueuedEdit, publish_with};
 use crate::{
     agent_execution::Authority,
     control::{ControlClient, ControlError},
@@ -228,8 +228,8 @@ fn user_publication_preserves_ready_no_start_remote_and_ordered_connection_reuse
             let starts = Cell::new(0);
             let connections = Cell::new(0);
             let (tx, requests) = async_channel::unbounded();
-            tx.send_blocking(first).unwrap();
-            tx.send_blocking(second).unwrap();
+            tx.send_blocking(first.into()).unwrap();
+            tx.send_blocking(second.into()).unwrap();
             drop(tx);
             let (updates, received) = async_channel::unbounded();
             let mut pending = None;
@@ -284,7 +284,7 @@ fn scoped_publication_authenticates_original_capture_before_one_refused_edit() {
         no_start: false,
     };
     let (tx, requests) = async_channel::unbounded();
-    tx.send_blocking(edit).unwrap();
+    tx.send_blocking(edit.into()).unwrap();
     drop(tx);
     let (updates, received) = async_channel::unbounded();
     let mut pending = None;
@@ -334,7 +334,7 @@ fn invalid_and_empty_authentication_refusals_drain_distinct_edits_without_user_f
         };
         let (tx, requests) = async_channel::unbounded();
         for name in ["denied-first", "denied-second"] {
-            tx.send_blocking(reopen(name)).unwrap();
+            tx.send_blocking(reopen(name).into()).unwrap();
         }
         drop(tx);
         let (updates, received) = async_channel::unbounded();
@@ -423,7 +423,7 @@ fn scoped_remote_refuses_before_all_resolvers_and_rejects_the_current_edit() {
                 no_start,
             };
             let (tx, requests) = async_channel::unbounded();
-            tx.send_blocking(reopen("remote")).unwrap();
+            tx.send_blocking(reopen("remote").into()).unwrap();
             drop(tx);
             let (updates, received) = async_channel::unbounded();
             let mut pending = None;
@@ -546,8 +546,8 @@ fn transient_disconnect_keeps_pending_order_and_reconnects_with_original_authori
         no_start: false,
     };
     let (tx, requests) = async_channel::unbounded();
-    tx.send_blocking(first.clone()).unwrap();
-    tx.send_blocking(second).unwrap();
+    tx.send_blocking(first.clone().into()).unwrap();
+    tx.send_blocking(second.into()).unwrap();
     drop(tx);
     let (updates, received) = async_channel::unbounded();
     let mut pending = None;
@@ -559,7 +559,8 @@ fn transient_disconnect_keeps_pending_order_and_reconnects_with_original_authori
     };
     let error = publish_with(&updates, &requests, &mut pending, &mut connect).unwrap_err();
     assert!(error.contains("closed the connection"));
-    assert_eq!(pending, Some(first));
+    assert_eq!(pending.as_ref().map(|queued| &queued.edit), Some(&first));
+    assert!(pending.as_ref().unwrap().reopen.is_none());
     assert_eq!(requests.len(), 1);
     assert!(received.try_recv().is_err());
     let error = publish_with(&updates, &requests, &mut pending, &mut connect).unwrap_err();
@@ -612,7 +613,7 @@ fn authentication_refusal_uses_existing_navigation_view_and_reopen_rejections() 
     };
     let (tx, requests) = async_channel::unbounded();
     for edit in edits {
-        tx.send_blocking(edit).unwrap();
+        tx.send_blocking(edit.into()).unwrap();
     }
     drop(tx);
     let (updates, received) = async_channel::unbounded();
@@ -672,7 +673,7 @@ fn failed_authentication_drains_title_and_reports_original_candidate_without_rea
     };
     let (tx, requests) = async_channel::unbounded();
     let expected_edit = edit.clone();
-    tx.send_blocking(edit).unwrap();
+    tx.send_blocking(edit.into()).unwrap();
     drop(tx);
     let (updates, received) = async_channel::unbounded();
     let mut pending = None;
@@ -730,7 +731,7 @@ fn title_fixture(
 ) -> (
     crate::app::Cagents,
     ModelEdit,
-    async_channel::Receiver<ModelEdit>,
+    async_channel::Receiver<QueuedEdit>,
 ) {
     use crate::model::{
         CardKind, ChannelTitleSource, ProjectChannel, ProjectId, RepositoryId, TerminalId,
@@ -852,7 +853,7 @@ fn title_fixture(
     app.publish_view_changes();
     let mut seeds = Vec::new();
     while let Ok(seed) = queued.try_recv() {
-        seeds.push(seed);
+        seeds.push(seed.edit);
     }
     assert_eq!(
         seeds.len(),
@@ -891,7 +892,7 @@ fn title_fixture(
         "Candidate to refuse".into(),
         ChannelTitleSource::Provider
     ));
-    let edit = queued.try_recv().unwrap();
+    let edit = queued.try_recv().unwrap().edit;
     assert!(
         matches!(&edit, ModelEdit::SuggestConversationTitle { id, card: actual_card, expected_revision: 17, title, source: ChannelTitleSource::Provider }
         if *id == channel && *actual_card == card && title == "Candidate to refuse")
@@ -969,7 +970,7 @@ fn a_newer_real_optimistic_title_survives_an_older_title_refusal() {
         "Newer candidate".into(),
         ChannelTitleSource::Provider
     ));
-    let new_edit = queued.try_recv().unwrap();
+    let new_edit = queued.try_recv().unwrap().edit;
     let before = app.durable.channels.clone();
     drop(app.apply_workspace_model_update(ModelUpdate::TitleRefused(old_edit)));
     assert_eq!(app.durable.channels, before);
@@ -1074,7 +1075,9 @@ fn title_refusal_does_not_project_after_source_channel_or_ownership_replacement(
 fn scoped_remote_title_refusal_restores_the_confirmed_row_without_a_resolver() {
     use crate::model::ChannelTitleSource;
     let (mut app, edit, requests) = title_fixture("Confirmed", ChannelTitleSource::Prompt);
-    app.workspace_model_tx.send_blocking(edit.clone()).unwrap();
+    app.workspace_model_tx
+        .send_blocking(edit.clone().into())
+        .unwrap();
     let context = PublicationContext {
         authority: Authority::session("fixture-remote-title-refusal".into()),
         remote: true,
@@ -1143,7 +1146,7 @@ fn post_edit_title_refusal_reads_the_same_authenticated_or_user_connection() {
             no_start: true,
         };
         let (tx, requests) = async_channel::unbounded();
-        tx.send_blocking(edit).unwrap();
+        tx.send_blocking(edit.into()).unwrap();
         drop(tx);
         let (updates, received) = async_channel::unbounded();
         let mut pending = None;
@@ -1175,7 +1178,7 @@ fn creation_fixture() -> (
     crate::model::ProjectId,
     ChannelId,
     PathBuf,
-    async_channel::Receiver<ModelEdit>,
+    async_channel::Receiver<QueuedEdit>,
 ) {
     use crate::{
         app::channel_ui::Action,
@@ -1365,7 +1368,10 @@ fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_loc
     use crate::app::{NoticeKey, TransientNotice};
     use crate::workspace_model::{ModelChannel, ModelProject};
     let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
-    let queued = [requests.try_recv().unwrap(), requests.try_recv().unwrap()];
+    let queued = [
+        requests.try_recv().unwrap().edit,
+        requests.try_recv().unwrap().edit,
+    ];
     assert!(requests.try_recv().is_err());
     let draft_card = app
         .durable
@@ -1435,7 +1441,7 @@ fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_loc
     assert!(requests.is_empty());
     let (tx, admitted) = async_channel::unbounded();
     for edit in &queued {
-        tx.send_blocking(edit.clone()).unwrap();
+        tx.send_blocking(edit.clone().into()).unwrap();
     }
     drop(tx);
     let context = PublicationContext {
@@ -1482,8 +1488,8 @@ fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_loc
 fn local_retirement_resolves_publication_notice_without_waiting_for_another_model_update() {
     use crate::app::{Message, NoticeKey};
     let (_directory, mut app, project, channel, _repository, requests) = creation_fixture();
-    let project_edit = requests.try_recv().unwrap();
-    let channel_edit = requests.try_recv().unwrap();
+    let project_edit = requests.try_recv().unwrap().edit;
+    let channel_edit = requests.try_recv().unwrap().edit;
     assert!(requests.try_recv().is_err());
     drop(app.apply_workspace_model_update(ModelUpdate::PublicationFailed { edit: channel_edit }));
     app.notices.record(app.status.take().unwrap());
@@ -1524,7 +1530,7 @@ fn local_retirement_resolves_publication_notice_without_waiting_for_another_mode
     // No registry callback or successful sharing receipt was needed for cleanup.
     assert!(matches!(project_edit, ModelEdit::OpenProject { .. }));
     let mut deleted = false;
-    while let Ok(edit) = requests.try_recv() {
+    while let Ok(QueuedEdit { edit, .. }) = requests.try_recv() {
         deleted |= matches!(edit, ModelEdit::DeleteChannel { id } if id == channel);
     }
     assert!(deleted);
@@ -1535,8 +1541,8 @@ fn publication_notice_does_not_follow_same_id_into_a_successor_project() {
     use crate::app::{Message, NoticeKey};
     use crate::model::{ProjectId, RepositoryId};
     let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
-    let _ = requests.try_recv().unwrap();
-    let old_edit = requests.try_recv().unwrap();
+    let _ = requests.try_recv().unwrap().edit;
+    let old_edit = requests.try_recv().unwrap().edit;
     assert!(requests.try_recv().is_err());
     drop(
         app.apply_workspace_model_update(ModelUpdate::PublicationFailed {
@@ -1584,7 +1590,7 @@ fn publication_reconciliation_fixture() -> (
     crate::model::ProjectId,
     ChannelId,
     PathBuf,
-    async_channel::Receiver<ModelEdit>,
+    async_channel::Receiver<QueuedEdit>,
     WorkspaceModel,
 ) {
     let (directory, mut app, project, channel, repository, requests) = creation_fixture();
@@ -1611,9 +1617,9 @@ fn publication_reconciliation_fixture() -> (
     )
 }
 
-fn take_creation_publications(requests: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+fn take_creation_publications(requests: &async_channel::Receiver<QueuedEdit>) -> Vec<ModelEdit> {
     let mut creations = Vec::new();
-    while let Ok(edit) = requests.try_recv() {
+    while let Ok(QueuedEdit { edit, .. }) = requests.try_recv() {
         if matches!(
             edit,
             ModelEdit::OpenProject { .. } | ModelEdit::CreateChannel { .. }
@@ -1628,7 +1634,7 @@ fn take_creation_publications(requests: &async_channel::Receiver<ModelEdit>) -> 
 /// ordinary app notice drain. Scoped remote refusal invokes no resolver/peer.
 fn refuse_creation_publications(
     app: &mut crate::app::Cagents,
-    requests: &async_channel::Receiver<ModelEdit>,
+    requests: &async_channel::Receiver<QueuedEdit>,
 ) {
     use crate::app::Message;
     let context = PublicationContext {
@@ -1892,7 +1898,7 @@ fn refused_title_with_failed_canonical_read_restores_only_its_still_owned_candid
                     no_start: true,
                 };
                 let (tx, requests) = async_channel::unbounded();
-                tx.send_blocking(edit.clone()).unwrap();
+                tx.send_blocking(edit.clone().into()).unwrap();
                 drop(tx);
                 let (updates, received) = async_channel::unbounded();
                 let mut pending = None;
@@ -1927,7 +1933,7 @@ fn refused_title_with_failed_canonical_read_restores_only_its_still_owned_candid
                         "Newer candidate".into(),
                         ChannelTitleSource::Provider
                     ));
-                    assert!(matches!(queued.try_recv().unwrap(),
+                    assert!(matches!(queued.try_recv().unwrap().edit,
                         ModelEdit::SuggestConversationTitle { title, .. } if title == "Newer candidate"));
                 } else if changed == "newer_scope" {
                     let successor = ProjectId::new();
@@ -2001,7 +2007,7 @@ fn framed_channel_publication_ack(edit: ModelEdit, model: WorkspaceModel) -> Mod
         true
     });
     let (tx, requests) = async_channel::unbounded();
-    tx.send_blocking(edit).unwrap();
+    tx.send_blocking(edit.into()).unwrap();
     drop(tx);
     let (updates, received) = async_channel::unbounded();
     let context = PublicationContext {
@@ -2232,8 +2238,50 @@ fn current_channel_ack_accepts_matching_registry_and_bootstrap_before_first_conn
 
 /// Keep the actual publisher callback from one successful model-bearing edit.
 /// A navigation reply emits Read; an explicit reopen emits Reopened.
-fn framed_model_publication_callback(edit: ModelEdit, model: WorkspaceModel) -> ModelUpdate {
-    let expected = edit.clone();
+fn enqueue_model_callback(
+    app: &mut crate::app::Cagents,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    edit: ModelEdit,
+) -> QueuedEdit {
+    if let ModelEdit::ReopenProject { repository, .. } = &edit {
+        let project = app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == *repository)
+            .unwrap()
+            .id;
+        if !app.project_ui.is_reopening(repository)
+            || !app.workspace_model_reopens.active.contains_key(&project)
+        {
+            app.project_ui.reopening.remove(&project);
+            drop(app.project_load_task(
+                repository.clone(),
+                Some(project),
+                true,
+                Some(ProjectKind::Folder),
+            ));
+        }
+    }
+    app.publish_model_edit(edit.clone());
+    loop {
+        let queued = requests
+            .try_recv()
+            .expect("the real enqueue must publish its edit");
+        if queued.edit == edit {
+            if matches!(edit, ModelEdit::ReopenProject { .. }) {
+                assert!(
+                    queued.reopen.is_some(),
+                    "the origin is captured before publication"
+                );
+            }
+            return queued;
+        }
+    }
+}
+
+fn framed_model_publication_callback(edit: QueuedEdit, model: WorkspaceModel) -> ModelUpdate {
+    let expected = edit.edit.clone();
     let peer = Peer::new(vec![connected()], move |_, peer| {
         let request = expect_edit(peer, &expected);
         response(
@@ -2298,7 +2346,8 @@ fn old_registry_model_reply_cannot_rebind_or_settle_replacement_workspace_intent
                 repository: repository.clone(),
             }
         };
-        let delayed = framed_model_publication_callback(edit, old_model);
+        let queued = enqueue_model_callback(&mut app, &requests, edit);
+        let delayed = framed_model_publication_callback(queued, old_model);
         assert_eq!(matches!(&delayed, ModelUpdate::Reopened { .. }), reopened);
         let replacement = WorkspaceModel {
             identity: uuid::Uuid::new_v4(),
@@ -2433,9 +2482,14 @@ fn current_or_bootstrap_model_reply_preserves_read_and_reopen_acknowledgement_be
                     repository: repository.clone(),
                 }
             };
-            let callback = framed_model_publication_callback(edit, admitted.clone());
+            // Set the explicit-open state before enqueueing its receipt. A
+            // later close is a different intent and must not be cleared by it.
             app.project_ui.closed.insert(repository.clone());
-            app.project_ui.reopening.insert(project, repository.clone());
+            if !reopened {
+                app.project_ui.reopening.insert(project, repository.clone());
+            }
+            let queued = enqueue_model_callback(&mut app, &requests, edit);
+            let callback = framed_model_publication_callback(queued, admitted.clone());
             let drafts = app.durable.chat_drafts.clone();
             let focused = app.workspace.focused();
             drop(app.update(Message::WorkspaceModelObserved(callback.clone())));
@@ -2529,7 +2583,8 @@ fn current_or_bootstrap_model_reply_preserves_read_and_reopen_acknowledgement_be
                 repository: repository.clone(),
             }
         };
-        let callback = framed_model_publication_callback(edit, incoming.clone());
+        let queued = enqueue_model_callback(&mut app, &requests, edit);
+        let callback = framed_model_publication_callback(queued, incoming.clone());
         let drafts = app.durable.chat_drafts.clone();
         let cards = app.durable.cards.clone();
         let focused = app.workspace.focused();
@@ -2669,5 +2724,588 @@ fn bootstrap_channel_ack_binds_registry_before_saved_registry_reconnect_and_keep
         _ => panic!("the original saved conversation runtime must survive"),
     };
     assert_eq!(runtime_after, runtime_before);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+/// The explicit inventory admission and public publication capture the origin;
+/// this helper never constructs or changes the proof after receiving a reply.
+fn enqueue_explicit_reopen(
+    app: &mut crate::app::Cagents,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    project: crate::model::ProjectId,
+) -> QueuedEdit {
+    let repository = app
+        .sidebar_model
+        .project(project)
+        .unwrap()
+        .repository
+        .clone();
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    assert!(app.project_ui.is_reopening(&repository));
+    app.publish_project_opened(project);
+    loop {
+        let queued = requests
+            .try_recv()
+            .expect("explicit reopen must enqueue its captured request");
+        if matches!(&queued.edit, ModelEdit::ReopenProject { repository: path, .. } if path == &repository)
+        {
+            assert!(queued.reopen.is_some());
+            return queued;
+        }
+    }
+}
+
+fn framed_reopen_failure(queued: QueuedEdit) -> ModelUpdate {
+    let expected = queued.edit.clone();
+    let original = queued
+        .reopen
+        .clone()
+        .expect("an actual queued origin is required");
+    let peer = Peer::new(vec![connected()], move |_, peer| {
+        let request = expect_edit(peer, &expected);
+        response(peer, &request, refused());
+        true
+    });
+    let context = PublicationContext {
+        authority: Authority::default(),
+        remote: false,
+        no_start: true,
+    };
+    let (tx, requests) = async_channel::unbounded();
+    tx.send_blocking(queued).unwrap();
+    drop(tx);
+    let (updates, received) = async_channel::unbounded();
+    let mut pending = None;
+    let error = publish_with(&updates, &requests, &mut pending, || {
+        existing(&context, &peer.socket)
+    })
+    .unwrap_err();
+    assert!(error.contains("PermissionDenied"));
+    assert!(pending.is_none() && requests.is_empty());
+    peer.finished();
+    let update = received.try_recv().unwrap();
+    assert!(
+        matches!(&update, ModelUpdate::ReopenFailed { origin: Some(origin), .. } if origin == &original)
+    );
+    assert!(received.is_empty());
+    update
+}
+
+fn reopened_project_model(mut model: WorkspaceModel, repository: &Path) -> WorkspaceModel {
+    model.sequence += 1;
+    model.projects.push(crate::workspace_model::ModelProject {
+        repository: repository.to_path_buf(),
+        name: "Publisher reopen receipt".into(),
+        kind: ProjectKind::Folder,
+        ordinal: 1,
+    });
+    model.closed_projects.retain(|path| path != repository);
+    model
+}
+
+#[test]
+fn queued_old_reopen_success_and_failure_cannot_settle_new_registry_or_aba_intent() {
+    use crate::app::Message;
+    for replacement_registry in [false, true] {
+        for success in [false, true] {
+            let (_directory, mut app, project, channel, repository, requests, canonical) =
+                publication_reconciliation_fixture();
+            take_creation_publications(&requests);
+            let old = enqueue_explicit_reopen(&mut app, &requests, project);
+            let old_origin = old.reopen.clone().unwrap();
+            let old_callback = if success {
+                framed_model_publication_callback(
+                    old,
+                    reopened_project_model(canonical.clone(), &repository),
+                )
+            } else {
+                framed_reopen_failure(old)
+            };
+            let old_generation = app.repository_generations[&project];
+            // Its own failed inventory attempt ends the old local intent. The
+            // next explicit retry must receive fresh nonce/generation proof.
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: true,
+                project_id: project,
+                generation: old_generation,
+                result: Err("Original explicit inventory failed".into()),
+            }));
+            assert!(!app.project_ui.is_reopening(&repository));
+            let mut current = canonical;
+            if replacement_registry {
+                current.identity = uuid::Uuid::new_v4();
+                current.sequence = 1;
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                        current.clone(),
+                    ))),
+                );
+            } else {
+                current.sequence += 2;
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                        current.clone(),
+                    ))),
+                );
+            }
+            let new = enqueue_explicit_reopen(&mut app, &requests, project);
+            let new_origin = new.reopen.clone().unwrap();
+            assert_ne!(
+                old_origin, new_origin,
+                "same project/path is not the same explicit attempt"
+            );
+            assert!(app.repository_generations[&project] > old_generation);
+            let model_before = app.workspace_model.clone();
+            let channels = app.durable.channels.clone();
+            let cards = app.durable.cards.clone();
+            let drafts = app.durable.chat_drafts.clone();
+            let focused = app.workspace.focused();
+            let pending = app.project_ui.reopening.clone();
+            let notices = app.notices.entries.len();
+            drop(app.update(Message::WorkspaceModelObserved(old_callback)));
+            assert_eq!(
+                app.workspace_model, model_before,
+                "old or foreign receipt cannot replace newer authority"
+            );
+            assert_eq!(app.project_ui.reopening, pending);
+            assert!(app.current_reopen(&new_origin));
+            assert!(app.workspace_model_reopens.deferred.is_empty());
+            assert_eq!(
+                app.notices.entries.len(),
+                notices,
+                "old refusal cannot report against the new open"
+            );
+            assert_eq!(app.durable.channels, channels);
+            assert_eq!(app.durable.cards, cards);
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+            let completion = framed_model_publication_callback(
+                new,
+                reopened_project_model(current, &repository),
+            );
+            drop(app.update(Message::WorkspaceModelObserved(completion)));
+            assert!(!app.project_ui.is_reopening(&repository));
+            assert!(!app.current_reopen(&new_origin));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        }
+    }
+}
+
+#[test]
+fn exact_reopen_reply_before_connected_defers_only_proof_until_fresh_observer_confirmation() {
+    use crate::app::Message;
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let origin = queued.reopen.clone().unwrap();
+    let receipt_model = reopened_project_model(
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 19,
+            ..WorkspaceModel::default()
+        },
+        &repository,
+    );
+    let reply = framed_model_publication_callback(queued, receipt_model.clone());
+    let drafts = app.durable.chat_drafts.clone();
+    let cards = app.durable.cards.clone();
+    let focus = app.workspace.focused();
+    drop(app.update(Message::WorkspaceModelObserved(reply)));
+    assert_eq!(
+        app.workspace_model, canonical,
+        "a reply from B is not an observer connection to B"
+    );
+    assert!(app.current_reopen(&origin) && app.project_ui.is_reopening(&repository));
+    assert!(app.workspace_model_reopens.deferred.contains_key(&project));
+    let mut earlier = receipt_model.clone();
+    earlier.sequence -= 1;
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            earlier,
+        ))),
+    );
+    assert!(
+        app.project_ui.is_reopening(&repository),
+        "wait for the actual receipt sequence"
+    );
+    let mut fresh = receipt_model;
+    fresh.projects[0].name = "Fresh observer metadata wins".into();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            fresh.clone(),
+        ))),
+    );
+    assert_eq!(
+        app.workspace_model, fresh,
+        "settlement cannot install the held publisher snapshot"
+    );
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(
+        app.workspace_model_reopens.active.is_empty()
+            && app.workspace_model_reopens.deferred.is_empty()
+    );
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focus);
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+}
+
+#[test]
+fn fresh_project_close_outranks_a_queued_reopen_acknowledgement() {
+    use crate::app::Message;
+    let (_directory, mut app, project, _channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let origin = queued.reopen.clone().unwrap();
+    let reply = framed_model_publication_callback(
+        queued,
+        reopened_project_model(
+            WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 19,
+                ..WorkspaceModel::default()
+            },
+            &repository,
+        ),
+    );
+    app.project_ui.closed.insert(repository.clone());
+    app.project_ui.reopening.remove(&project);
+    let drafts = app.durable.chat_drafts.clone();
+    drop(app.update(Message::WorkspaceModelObserved(reply)));
+    assert_eq!(app.workspace_model, canonical);
+    assert!(app.project_ui.closed.contains(&repository));
+    assert!(!app.current_reopen(&origin));
+    assert!(app.workspace_model_reopens.deferred.is_empty());
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+#[test]
+fn background_inventory_failure_cannot_retire_the_explicit_reopen_origin_or_its_close_shield() {
+    use crate::app::Message;
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let origin = queued.reopen.clone().unwrap();
+    // A passive refresh advances the inventory generation while the explicit
+    // queued reopen retains its original intent nonce and close protection.
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        false,
+        Some(ProjectKind::Folder),
+    ));
+    let passive_generation = app.repository_generations[&project];
+    let mut closed_snapshot = canonical.clone();
+    closed_snapshot.sequence += 1;
+    closed_snapshot.closed_projects.push(repository.clone());
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            closed_snapshot,
+        ))),
+    );
+    assert!(app.project_ui.is_reopening(&repository));
+    let drafts = app.durable.chat_drafts.clone();
+    let cards = app.durable.cards.clone();
+    let focus = app.workspace.focused();
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: false,
+        project_id: project,
+        generation: passive_generation,
+        result: Err("Passive inventory refresh failed".into()),
+    }));
+    assert!(app.project_ui.is_reopening(&repository) && app.current_reopen(&origin));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focus);
+    let mut admitted = reopened_project_model(canonical, &repository);
+    admitted.sequence += 1;
+    let ack = framed_model_publication_callback(queued, admitted);
+    drop(app.update(Message::WorkspaceModelObserved(ack)));
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+#[test]
+fn contradicted_deferred_reopen_keeps_work_protected_and_allows_a_new_explicit_retry() {
+    use crate::app::Message;
+    let (_directory, mut app, project, channel, repository, requests, _canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let old_origin = queued.reopen.clone().unwrap();
+    let reply = framed_model_publication_callback(
+        queued,
+        reopened_project_model(
+            WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 19,
+                ..WorkspaceModel::default()
+            },
+            &repository,
+        ),
+    );
+    drop(app.update(Message::WorkspaceModelObserved(reply)));
+    let other = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 1,
+        closed_projects: vec![repository.clone()],
+        ..WorkspaceModel::default()
+    };
+    let drafts = app.durable.chat_drafts.clone();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            other.clone(),
+        ))),
+    );
+    assert!(
+        app.project_ui.is_reopening(&repository),
+        "an unrelated connection must not remove the close shield"
+    );
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    while requests.try_recv().is_ok() {}
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        false,
+        Some(ProjectKind::Folder),
+    ));
+    app.publish_project_opened(project);
+    assert!(
+        requests.is_empty(),
+        "a passive refresh cannot replay a completed or contradicted reopen"
+    );
+    let retry = enqueue_explicit_reopen(&mut app, &requests, project);
+    let fresh_origin = retry.reopen.clone().unwrap();
+    assert_ne!(old_origin, fresh_origin);
+    let ack = framed_model_publication_callback(retry, reopened_project_model(other, &repository));
+    drop(app.update(Message::WorkspaceModelObserved(ack)));
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+#[test]
+fn contradicted_reopen_proof_cannot_repeat_a_dismissed_warning_or_settle_on_later_presence() {
+    use crate::app::Message;
+    for different_connection in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, _canonical) =
+            publication_reconciliation_fixture();
+        take_creation_publications(&requests);
+        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+        let original = queued.reopen.clone().unwrap();
+        let receipt = reopened_project_model(
+            WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 19,
+                ..WorkspaceModel::default()
+            },
+            &repository,
+        );
+        let callback = framed_model_publication_callback(queued, receipt.clone());
+        drop(app.update(Message::WorkspaceModelObserved(callback.clone())));
+        assert!(app.workspace_model_reopens.deferred.contains_key(&project));
+        let mut closed = receipt.clone();
+        closed.sequence += 1;
+        closed.projects.clear();
+        closed.closed_projects.push(repository.clone());
+        if different_connection {
+            closed.identity = uuid::Uuid::new_v4();
+        }
+        let drafts = app.persistent_workspace().chat_drafts;
+        let cards = app.durable.cards.clone();
+        let focus = app.workspace.focused();
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                closed.clone(),
+            ))),
+        );
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        assert!(app.workspace_model_reopens.deferred.is_empty());
+        let warning = app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .notice
+                    .message
+                    .contains("reopening could not be confirmed")
+            })
+            .expect("a contradicted receipt must explain the explicit retry")
+            .id;
+        drop(app.update(Message::DismissNotice(warning)));
+        let notices = app.notices.entries.clone();
+        // Neither ordinary activity nor a duplicate physical callback can
+        // rearm completed proof after the user has dismissed its failure.
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))));
+        drop(app.update(Message::WorkspaceModelObserved(callback)));
+        assert_eq!(app.notices.entries, notices);
+        assert!(app.workspace_model_reopens.deferred.is_empty());
+        let mut later = receipt;
+        later.sequence += 2;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                later.clone(),
+            ))),
+        );
+        assert!(app.current_reopen(&original));
+        assert!(app.project_ui.is_reopening(&repository));
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        assert_eq!(app.notices.entries, notices);
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focus);
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        let retry = enqueue_explicit_reopen(&mut app, &requests, project);
+        assert_ne!(retry.reopen.as_ref().unwrap(), &original);
+        let ack =
+            framed_model_publication_callback(retry, reopened_project_model(later, &repository));
+        drop(app.update(Message::WorkspaceModelObserved(ack)));
+        assert!(!app.project_ui.is_reopening(&repository));
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    }
+}
+
+#[test]
+fn model_updates_before_first_inventory_reply_keep_the_explicit_origin_and_first_publication() {
+    use crate::app::Message;
+    use crate::model::ProjectId;
+    let (_directory, mut app, _project, _channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let path = repository.join("unlisted-picker-folder");
+    std::fs::create_dir(&path).unwrap();
+    let provisional = ProjectId::new();
+    drop(app.project_load_task(
+        path.clone(),
+        Some(provisional),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    let generation = app.repository_generations[&provisional];
+    let original = app
+        .workspace_model_reopens
+        .active
+        .get(&provisional)
+        .unwrap()
+        .clone();
+    assert!(app.sidebar_model.project(provisional).is_none());
+    let drafts = app.durable.chat_drafts.clone();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            canonical.clone(),
+        ))),
+    );
+    let mut observed = canonical;
+    observed.sequence += 1;
+    observed.closed_projects.push(path.clone());
+    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(observed))));
+    assert!(app.project_ui.is_reopening(&path));
+    assert_eq!(
+        app.workspace_model_reopens
+            .active
+            .get(&provisional)
+            .unwrap()
+            .nonce,
+        original.nonce
+    );
+    assert!(
+        !app.workspace_model_reopens.can_retry(&path),
+        "no completed/refused request exists before first inventory"
+    );
+    // Use the actual bounded folder loader; no provider, daemon, Git helper or
+    // returned UI task is executed by this regression.
+    let loaded = crate::app::load_project(
+        &path,
+        Some(provisional),
+        tokio_util::sync::CancellationToken::default(),
+        Some(ProjectKind::Folder),
+    )
+    .unwrap();
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: true,
+        project_id: provisional,
+        generation,
+        result: Ok(Box::new(loaded)),
+    }));
+    let mut reopens = Vec::new();
+    while let Ok(queued) = requests.try_recv() {
+        if matches!(&queued.edit, ModelEdit::ReopenProject { repository, .. } if repository == &path)
+        {
+            reopens.push(queued);
+        }
+    }
+    assert_eq!(
+        reopens.len(),
+        1,
+        "a listed picker must publish its first origin-backed reopen exactly once"
+    );
+    assert_eq!(reopens[0].reopen.as_ref().unwrap().nonce, original.nonce);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+#[test]
+fn a_closed_publication_queue_keeps_reopen_protection_and_allows_an_explicit_new_attempt() {
+    let (_directory, mut app, project, channel, repository, requests, _canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    let original = app
+        .workspace_model_reopens
+        .active
+        .get(&project)
+        .unwrap()
+        .clone();
+    let cards = app.durable.cards.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    let (tx, closed) = async_channel::unbounded();
+    drop(closed);
+    app.workspace_model_tx = tx;
+    app.publish_project_opened(project);
+    assert!(app.current_reopen(&original) && app.project_ui.is_reopening(&repository));
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    assert!(!app.workspace_model_reopens.queued.contains(&project));
+    assert!(app.status.as_ref().is_some_and(|notice| {
+        notice
+            .message
+            .contains("Could not queue reopening this project")
+    }));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    let retry = app.workspace_model_reopens.active.get(&project).unwrap();
+    assert_ne!(
+        retry.nonce, original.nonce,
+        "a fresh explicit picker can recover despite the stopped publisher"
+    );
+    assert!(app.current_reopen(retry));
+    assert!(!app.workspace_model_reopens.queued.contains(&project));
+    assert_eq!(app.durable.cards, cards);
     assert_eq!(app.persistent_workspace().chat_drafts, drafts);
 }
