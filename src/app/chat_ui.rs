@@ -3195,6 +3195,13 @@ impl Runtime {
             && self.is_saved_history_snapshot(snapshot)
     }
 
+    /// A history reader has no provider commands, but its local draft can
+    /// still hold Claude attachments for an explicit, separately admitted
+    /// resume. Do not turn this into a provider capability or send permission.
+    fn accepts_draft_attachments(&self) -> bool {
+        self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
+    }
+
     pub(super) fn parent_transcript_selected(&self) -> bool {
         self.selected_subagent.is_none()
     }
@@ -9308,6 +9315,13 @@ impl Cagents {
                     );
                     return Task::none();
                 }
+                if runtime.pastes_pending > 0 {
+                    runtime.error = Some(
+                        "Wait for the attachments to finish loading before reconnecting the chat."
+                            .into(),
+                    );
+                    return Task::none();
+                }
                 let session = runtime.session.clone();
                 let intent = self.chat_retry_intent(target.card, &session);
                 return self.start_chat(target.card, session, intent, None, false);
@@ -9320,7 +9334,10 @@ impl Cagents {
                     return Task::none();
                 };
                 let session = runtime.session.clone();
-                if runtime.pending.is_some() || runtime.attachment_chooser_pending.is_some() {
+                if runtime.pending.is_some()
+                    || runtime.attachment_chooser_pending.is_some()
+                    || runtime.pastes_pending > 0
+                {
                     return Task::none();
                 }
                 if self.chat_retry_intent(target.card, &session) == chat::Intent::RetryStart {
@@ -9520,7 +9537,7 @@ impl Cagents {
                     return Task::none();
                 }
                 let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
-                let refusal = if !runtime.snapshot.capabilities.attachments {
+                let refusal = if !runtime.accepts_draft_attachments() {
                     Some("The current model cannot accept images.")
                 } else if rules.max_count.is_some_and(|limit| {
                     runtime.attachments.len() + runtime.image_pastes_saving >= limit
@@ -9599,7 +9616,7 @@ impl Cagents {
                         chat::AttachmentRules::for_provider(runtime.session.launch.provider);
                     let success = match result {
                         Ok(attachment)
-                            if runtime.snapshot.capabilities.attachments
+                            if runtime.accepts_draft_attachments()
                                 && rules
                                     .max_count
                                     .is_none_or(|limit| runtime.attachments.len() < limit) =>
@@ -9610,7 +9627,7 @@ impl Cagents {
                             runtime.cancel_attachment_insert(
                                 id.id,
                                 Some(
-                                    if runtime.snapshot.capabilities.attachments {
+                                    if runtime.accepts_draft_attachments() {
                                         "This chat has reached its attachment limit."
                                     } else {
                                         "The current model cannot accept images."
@@ -9641,7 +9658,7 @@ impl Cagents {
                     let rules =
                         chat::AttachmentRules::for_provider(runtime.session.launch.provider);
                     match result {
-                        Ok(attachments) if runtime.snapshot.capabilities.attachments
+                        Ok(attachments) if runtime.accepts_draft_attachments()
                             && rules.max_count.is_none_or(|limit| runtime.attachments.len() + attachments.len() <= limit) => {
                             let success = runtime.finish_attachment_insert(id.id, "", attachments);
                             if success && runtime.pastes_pending == 0 && let Some(mode) = runtime.submit_after_paste.take() {
@@ -10868,7 +10885,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime.snapshot.capabilities.attachments
+                if !runtime.accepts_draft_attachments()
                     || runtime.attachment_chooser_pending.is_some()
                 {
                     return Task::none();
@@ -10935,9 +10952,7 @@ impl Cagents {
                 // instead, with web addresses and dropped text, as they are.
                 let mut staged = None;
                 let dropped = match payload.decode() {
-                    file_drop::Dropped::Items(items)
-                        if runtime.snapshot.capabilities.attachments =>
-                    {
+                    file_drop::Dropped::Items(items) if runtime.accepts_draft_attachments() => {
                         let rules =
                             chat::AttachmentRules::for_provider(runtime.session.launch.provider);
                         let mut room = rules.max_count.map_or(usize::MAX, |limit| {
@@ -17825,6 +17840,14 @@ mod tests {
                 ticket.active(),
                 "same-drop prose must preserve actual staging admission"
             );
+            assert_eq!(chat_runtime(&app, card).pastes_pending, 1);
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "resume/reconnect cannot cancel an admitted attachment worker"
+            );
+            assert!(ticket.active());
             drop(app.handle_chat_ui(Action::AttachmentsPrepared(
                 target,
                 ticket,
@@ -19399,6 +19422,75 @@ mod tests {
                 _ => assert!(ready.is_err()),
             }
         }
+    }
+
+    #[test]
+    fn saved_history_admits_attachment_chooser_and_completion_without_starting_or_sending() {
+        let _admission = attachment_draft::test_admission();
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.session_id = Some(KNOWN_THREAD.into());
+            runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            let snapshot = Snapshot {
+                session_id: runtime.session.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Working directory no longer exists".into()),
+                ..Default::default()
+            };
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            runtime.replace_draft(text_editor::Content::with_text("Keep this draft unsent"));
+            assert!(!runtime.snapshot.capabilities.attachments);
+            assert!(runtime.accepts_draft_attachments());
+
+            // Exercise chooser admission and its normal callbacks. The native
+            // fixture exercises the portal; this test supplies its chosen path
+            // and the real asset-store receipt, without pre-seeding the draft.
+            drop(app.handle_chat_ui(Action::Attach(target)));
+            let runtime = chat_runtime(&app, card);
+            let id = runtime
+                .attachment_chooser_pending
+                .expect("chooser was admitted");
+            let ticket = runtime.attachment_ticket(id).unwrap();
+            drop(app.handle_chat_ui(Action::Attached(
+                target,
+                ticket.clone(),
+                Ok(Some(vec![image.path.clone()])),
+            )));
+            assert!(
+                chat_runtime(&app, card)
+                    .attachment_chooser_pending
+                    .is_none()
+            );
+            drop(app.handle_chat_ui(Action::AttachmentsPrepared(
+                target,
+                ticket,
+                Ok(vec![image.clone()]),
+            )));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.attachments, [image]);
+            assert!(runtime.composer.text().contains("Keep this draft unsent"));
+            assert!(runtime.composer.text().contains("[Image 1]"));
+            assert_eq!(runtime.pastes_pending, 0);
+            assert!(
+                !runtime.snapshot.capabilities.attachments,
+                "local draft editing cannot grant provider capabilities"
+            );
+            let draft = runtime.composer.text();
+            let attachments = runtime.attachments.clone();
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), draft);
+            assert_eq!(runtime.attachments, attachments);
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(app.chat_ui.attempt(card).is_none());
+        });
     }
 
     #[test]
