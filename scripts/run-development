@@ -41,6 +41,9 @@ Options:
   --hot-integrated  Explicit embedded-browser hot reload
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
   --help           Show this help
+
+Environment:
+  CAGENTS_ZIG      Absolute Zig path; zig env must report an executable named zig
 USAGE
             exit 0
             ;;
@@ -97,7 +100,7 @@ fi
 # rediscover itself. Select the pinned installation directly, then give Cargo
 # its real executable on PATH without changing the caller's environment.
 case $zig_command in
-    */mise/shims/zig)
+    */shims/zig)
         if [ -L "$zig_command" ]; then
             shim_target=$(readlink "$zig_command") || shim_target=
             case $shim_target in
@@ -152,6 +155,13 @@ zig_version=$(printf '%s\n' "$zig_env" | sed -n \
     printf '%s\n' "Zig version ${zig_version:-unknown} does not match mise.toml pin ${pinned_zig_version:-unknown}" >&2
     exit 1
 }
+case ${zig_executable##*/} in
+    zig) ;;
+    *)
+        printf '%s\n' 'Zig must report an executable named zig so Cargo uses the verified installation; select its zig path with CAGENTS_ZIG' >&2
+        exit 1
+        ;;
+esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
