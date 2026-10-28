@@ -296,50 +296,70 @@ jobs:
               return sorted(n for n in os.environ if n.startswith('CAGENTS')
                             or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'})
           def census():
-              # Read-only candidate census, not ancestry/custody authority.
-              # Never signal processes found through these observations.
-              found, errors = [], []
+              # Authored isolation uses current_exe child modes; expected
+              # scripted peers use threads. Nominate by readable comm/argv
+              # before protected exe/cwd observations. This bounded diagnostic
+              # is not whole-host/family/custody proof or signal authority.
+              found, candidate_errors, diagnostics = [], [], []
+              noncandidates, other_uids = 0, 0
               for entry in pathlib.Path('/proc').iterdir():
                   if not entry.name.isdigit():
                       continue
+                  reasons, comm, started = [], None, None
+                  stage = 'uid'
                   try:
                       if entry.stat().st_uid != os.getuid():
+                          other_uids += 1
                           continue
+                      stage = 'stat_before_nomination'
                       before = (entry / 'stat').read_text()
                       comm = before[before.index('(') + 1:before.rindex(')')]
                       tail = before[before.rindex(')') + 2:].split()
                       started = int(tail[19])
-                      reasons = []
-                      try:
-                          info = (entry / 'exe').stat()
-                          if (info.st_dev, info.st_ino) == (identity['device'], identity['inode']):
-                              reasons.append('exact_test_executable_file_identity')
-                      except FileNotFoundError:
-                          pass
                       if comm == executable.name[:15]:
                           reasons.append('matching_test_comm_candidate')
+                      stage = 'cmdline_nomination'
                       args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      if args and args[0] == str(executable).encode():
+                          reasons.append('exact_test_executable_argument')
                       prefix = str(fixture_root).encode() + b'/'
                       if any(arg == str(fixture_root).encode() or arg.startswith(prefix) for arg in args):
                           reasons.append('private_fixture_path_argument')
-                      try:
-                          cwd = (entry / 'cwd').resolve(strict=True)
-                          if cwd == fixture_root or fixture_root in cwd.parents:
-                              reasons.append('private_fixture_working_directory')
-                      except FileNotFoundError:
-                          pass
+                      stage = 'stat_after_nomination'
+                      nominated = (entry / 'stat').read_text()
+                      if int(nominated[nominated.rindex(')') + 2:].split()[19]) != started:
+                          raise ValueError('identity_changed_during_nomination')
+                      if not reasons:
+                          noncandidates += 1
+                          continue
+                      # Positively nominated uncertainty fails closed. Do not
+                      # probe these protected details for unrelated processes.
+                      stage = 'candidate_executable'
+                      info = (entry / 'exe').stat()
+                      if (info.st_dev, info.st_ino) == (identity['device'], identity['inode']):
+                          reasons.append('exact_test_executable_file_identity')
+                      stage = 'candidate_working_directory'
+                      cwd = (entry / 'cwd').resolve(strict=True)
+                      if cwd == fixture_root or fixture_root in cwd.parents:
+                          reasons.append('private_fixture_working_directory')
+                      stage = 'candidate_stat_after_details'
                       after = (entry / 'stat').read_text()
                       if int(after[after.rindex(')') + 2:].split()[19]) != started:
-                          errors.append({'pid': int(entry.name), 'error': 'identity_changed_during_observation'})
-                      elif reasons:
-                          found.append({'pid': int(entry.name), 'start_ticks': started,
-                                        'comm': comm, 'state': tail[0], 'candidate_reasons': reasons})
-                  except (FileNotFoundError, ProcessLookupError):
-                      continue
-                  except (PermissionError, OSError, ValueError) as error:
-                      errors.append({'pid': int(entry.name), 'error': type(error).__name__})
-              return {'candidates': found, 'observation_errors': errors,
-                      'scope': 'Exact artifact and private-path candidates only; no PPID custody or signaling'}
+                          raise ValueError('candidate_identity_changed_during_observation')
+                      found.append({'pid': int(entry.name), 'start_ticks': started,
+                                    'comm': comm, 'state': tail[0], 'candidate_reasons': reasons})
+                  except (OSError, ValueError, IndexError) as error:
+                      detail = {'pid': int(entry.name), 'start_ticks': started,
+                                'comm': comm, 'stage': stage, 'error': type(error).__name__,
+                                'candidate_reasons': reasons}
+                      (candidate_errors if reasons else diagnostics).append(detail)
+              return {'candidates': found, 'candidate_observation_errors': candidate_errors,
+                      'unclassified_observation_diagnostics': diagnostics,
+                      'same_uid_readable_noncandidates': noncandidates,
+                      'other_uid_processes_outside_scope': other_uids,
+                      'whole_host_observation_complete': False,
+                      'strict_family_or_custody_proof': False,
+                      'scope': 'Bounded comm/argv-nominated artifact/private-path observations only; unreadable unclassified processes remain incomplete diagnostics. No whole-host/family-zero claim, PPID custody or signaling'}
           for index, selector in enumerate(selectors, 1):
               phase = evidence / f'parent-{index:02d}'
               phase.mkdir(mode=0o700)
@@ -348,7 +368,7 @@ jobs:
                            'forbidden_context_names': names, 'test_sha256': digest(executable)}
               (phase / 'preflight.json').write_text(json.dumps(preflight, indent=2) + '\n')
               assert exact(pre_source) and not names
-              assert not pre_census['candidates'] and not pre_census['observation_errors']
+              assert not pre_census['candidates'] and not pre_census['candidate_observation_errors']
               assert preflight['test_sha256'] == identity['sha256']
               argv = ['timeout', '--signal=TERM', '--kill-after=15s', '150s',
                       str(executable), selector, '--exact', '--nocapture', '--test-threads=1']
@@ -361,7 +381,7 @@ jobs:
               summary = re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;.*$', output, re.M)
               selected = output.count(f'test {selector} ...')
               integrity = (exact(post_source) and not post_names
-                           and not post_census['candidates'] and not post_census['observation_errors']
+                           and not post_census['candidates'] and not post_census['candidate_observation_errors']
                            and hash_after == identity['sha256'])
               passed = (result.returncode == 0 and selected == 1 and len(summary) == 1
                         and len(re.findall(r'^running 1 test$', output, re.M)) == 1 and integrity)
