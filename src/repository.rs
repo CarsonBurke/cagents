@@ -5844,6 +5844,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 local_name,
             )?));
         }
+        if name.starts_with("refs/heads/") {
+            return Err(ValidationError::InvalidBase(format!(
+                "Local branch {local_name} does not exist; choose another base"
+            ))
+            .into());
+        }
         let tag = format!(
             "refs/tags/{}",
             name.strip_prefix("refs/tags/").unwrap_or(name)
@@ -7577,6 +7583,108 @@ mod tests {
             };
             assert_eq!(old.text(), Some("rename contents\n"));
             assert_eq!(new.text(), Some("rename contents\n"));
+        }
+
+        #[test]
+        fn explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote() {
+            if isolated_git_test(concat!(
+                module_path!(),
+                "::explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote"
+            )) {
+                return;
+            }
+
+            let mut unexpected_fallbacks = Vec::new();
+            for decoy in ["tag", "remote"] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                git(root, &["init", "-b", "main"]);
+                git(root, &["commit", "--allow-empty", "-m", "initial"]);
+                let head = String::from_utf8(git_output(root, &["rev-parse", "HEAD"]))
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(root, &["update-ref", "refs/heads/existing", "HEAD"]);
+                git(root, &["update-ref", "refs/tags/release", "HEAD"]);
+
+                if decoy == "tag" {
+                    git(
+                        root,
+                        &["update-ref", "refs/tags/refs/heads/missing", "HEAD"],
+                    );
+                } else {
+                    let unavailable = root.join("unavailable-local-remote.git");
+                    git(
+                        root,
+                        &["remote", "add", "refs", unavailable.to_str().unwrap()],
+                    );
+                    git(
+                        root,
+                        &["update-ref", "refs/remotes/refs/heads/missing", "HEAD"],
+                    );
+                }
+
+                let service = service();
+                let cancellation = CancellationToken::new();
+                let input = |base: &str| WorktreeInput {
+                    repository: root.into(),
+                    input: "new-from-base".into(),
+                    base: base.into(),
+                    managed_directory: ".worktrees/".into(),
+                    destination: String::new(),
+                    operation_id: OperationId::new(),
+                };
+                let resolve =
+                    |base: &str| service.resolve_worktree_request(&input(base), &cancellation);
+
+                let local = resolve("refs/heads/existing").unwrap();
+                assert_eq!(
+                    local.base,
+                    BaseRevision::LocalBranch(ValidatedBranchName::parse("existing").unwrap()),
+                    "an existing explicitly qualified local branch remains local"
+                );
+                assert!(!local.track);
+                assert_eq!(
+                    resolve("release").unwrap().base,
+                    BaseRevision::object_id(head.clone()).unwrap(),
+                    "unqualified tag bases retain their existing meaning"
+                );
+                if decoy == "tag" {
+                    assert_eq!(
+                        resolve("refs/tags/refs/heads/missing").unwrap().base,
+                        BaseRevision::object_id(head.clone()).unwrap(),
+                        "the decoy tag remains available through its own explicit namespace"
+                    );
+                } else {
+                    for base in ["heads/missing", "refs/remotes/refs/heads/missing"] {
+                        let request = resolve(base).unwrap();
+                        assert_eq!(
+                            request.base,
+                            BaseRevision::remote_ref("refs/remotes/refs/heads/missing").unwrap(),
+                            "cached remote base {base} retains its existing meaning"
+                        );
+                        assert!(!request.track, "a base override creates local history");
+                    }
+                }
+
+                // Neither a tag with this spelling nor a cached branch on the remote
+                // named `refs` can satisfy a request for this absent local branch.
+                let result = resolve("refs/heads/missing");
+                if !matches!(
+                    &result,
+                    Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+                ) {
+                    unexpected_fallbacks.push((decoy, result));
+                }
+                assert!(
+                    !root.join(".worktrees").exists(),
+                    "resolving a base must not create the worktree destination"
+                );
+            }
+            assert!(
+                unexpected_fallbacks.is_empty(),
+                "an explicitly qualified missing local branch must fail instead of selecting a decoy: {unexpected_fallbacks:?}"
+            );
         }
 
         #[test]
@@ -11540,12 +11648,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     cancellation,
                 )?;
             } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
-                let cached = self.resolve_optional_revision(
+                // A tag with a remote ref's spelling is not a cached branch.
+                let cache_check = self.git_read(
                     &journal.request.repository,
-                    reference,
-                    cancellation,
-                )?;
-                if journal.request.track || cached.is_none() {
+                    ["show-ref", "--verify", "--quiet", "--", reference.as_str()],
+                );
+                let cache_output = self.run(&cache_check, cancellation)?;
+                let cached = if cache_output.success {
+                    true
+                } else if cache_output.exit_code == Some(1) {
+                    false
+                } else {
+                    return Err(git_failure(&cache_check, cache_output).into());
+                };
+                if journal.request.track || !cached {
                     let remotes = self.remotes(&journal.request.repository, cancellation)?;
                     let (remote, branch) = remotes
                         .iter()
@@ -11575,7 +11691,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                     fetch.inherited_lease = Some(lease.as_raw_fd());
                     if let Err(failure) = self.run_checked(&fetch, cancellation) {
-                        if cached.is_none() || cancellation.is_cancelled() {
+                        if !cached || cancellation.is_cancelled() {
                             return Err(failure.into());
                         }
                         remote_refresh_warning = Some(format!(
@@ -11586,13 +11702,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     }
                 }
             }
+            // Resolve exact typed refs before peeling their objects. A full ref
+            // passed to rev-parse can still fall through to a similarly named
+            // tag or remote if the branch disappeared after input resolution.
+            let exact_ref = match &journal.request.base {
+                BaseRevision::LocalBranch(branch) => Some(branch.full_ref()),
+                BaseRevision::RemoteRef(reference) => Some(reference.clone()),
+                BaseRevision::ObjectId(_) => None,
+            };
+            let base_revision = if let Some(reference) = exact_ref {
+                let exact = self.git_read(
+                    &journal.request.repository,
+                    ["show-ref", "--verify", "--hash", "--", reference.as_str()],
+                );
+                let output = self.run_checked(&exact, cancellation)?;
+                let oid = Oid::parse_object(parse_utf8_line(&output.stdout, "base_ref_oid")?)
+                    .map_err(|error| RepositoryError::InvalidOutput {
+                        field: "base_ref_oid",
+                        reason: error.to_string(),
+                    })?;
+                oid.to_string()
+            } else {
+                journal.request.base.revision_argument()
+            };
             let resolve = self.git_read(
                 &journal.request.repository,
                 [
                     OsString::from("rev-parse"),
                     OsString::from("--verify"),
                     OsString::from("--end-of-options"),
-                    format!("{}^{{commit}}", journal.request.base.revision_argument()).into(),
+                    format!("{base_revision}^{{commit}}").into(),
                 ],
             );
             let output = self.run_checked(&resolve, cancellation)?;
