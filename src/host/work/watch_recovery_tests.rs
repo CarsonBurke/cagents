@@ -41,7 +41,13 @@ fn git(root: &Path, arguments: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
+        .args(["-c", "commit.gpgsign=false"])
         .args(arguments)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .unwrap();
     assert!(output.status.success(), "{arguments:?}: {output:?}");
@@ -105,7 +111,8 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     git(&root, &["commit", "-qm", "fixture"]);
     let oid = git(&root, &["rev-parse", "HEAD"]);
     let root = root.canonicalize().unwrap();
-    let refs = root.join(".git/refs");
+    let repository = root.join(".git");
+    let refs = repository.join("refs");
     let handle = Handle(Arc::new(Inner {
         host: Weak::new(),
         shared: Mutex::new(Shared {
@@ -127,7 +134,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         store: Mutex::new(None),
         cancellation: CancellationToken::new(),
     }));
-    let id = handle.shared().track(&root, "fixture").id;
+    let id = handle.shared().track(&repository, "fixture").id;
     let refuse = Arc::new(AtomicBool::new(true));
     let attempts = Arc::new(AtomicUsize::new(0));
     let monitor = {
@@ -159,7 +166,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         refreshed: None,
     };
     complete_scan(&mut scanner, &handle);
-    let original = handle.shared().projects[&root]
+    let original = handle.shared().projects[&repository]
         .local
         .as_ref()
         .unwrap()
@@ -172,8 +179,12 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
 
     // Initial registration can request one reconciliation scan. Its unchanged
     // plan and all ordinary coordinator wakes stay inside the retry backoff.
-    handle.shared().projects.get_mut(&root).unwrap().last_scan =
-        Some(Instant::now() - SCAN_SPACING);
+    handle
+        .shared()
+        .projects
+        .get_mut(&repository)
+        .unwrap()
+        .last_scan = Some(Instant::now() - SCAN_SPACING);
     complete_scan(&mut scanner, &handle);
     for _ in 0..100 {
         scanner.configure(&handle);
@@ -184,13 +195,17 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     // two-minute sleep. dispatch generates the real fallback poll, the worker
     // runs Git, and publish retains the exact unchanged watch-plan Arc.
     let poll = |scanner: &mut Scanner| {
-        handle.shared().projects.get_mut(&root).unwrap().last_scan =
-            Some(Instant::now() - IDLE_POLL);
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .last_scan = Some(Instant::now() - IDLE_POLL);
         scanner.configured.get_mut(&id).unwrap().attempted = Instant::now() - ACTIVE_POLL;
         complete_scan(scanner, &handle);
         assert!(Arc::ptr_eq(
             &original,
-            handle.shared().projects[&root]
+            handle.shared().projects[&repository]
                 .local
                 .as_ref()
                 .unwrap()
@@ -220,16 +235,20 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     std::fs::write(root.join(".git/refs/heads/recovered"), format!("{oid}\n")).unwrap();
     wait_until(|| {
         scanner.drain(&handle);
-        handle.shared().projects[&root]
+        handle.shared().projects[&repository]
             .pending
             .as_ref()
             .is_some_and(|change| change.references)
     });
-    handle.shared().projects.get_mut(&root).unwrap().last_scan =
-        Some(Instant::now() - SCAN_SPACING);
+    handle
+        .shared()
+        .projects
+        .get_mut(&repository)
+        .unwrap()
+        .last_scan = Some(Instant::now() - SCAN_SPACING);
     complete_scan(&mut scanner, &handle);
     assert!(
-        handle.shared().projects[&root]
+        handle.shared().projects[&repository]
             .local
             .as_ref()
             .unwrap()
