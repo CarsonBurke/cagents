@@ -1,0 +1,124 @@
+name: Device inherited no-start UI boundary
+
+on:
+  push:
+    branches:
+      - research/pr1844-ui-check-20261028
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-no-start-ui-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+
+jobs:
+  check-ui:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/research/pr1844-ui-check-20261028'
+    name: Literal 833 browserless UI check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the reviewed workflow
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the exact product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 83377f3faff86c979dc95cf2a7b0df65171f59bf
+          path: device-source
+          persist-credentials: false
+      - name: Reuse the qualified pinned Linux build setup
+        uses: ./device-source/.github/actions/setup-linux-build
+      - name: Check only the isolated UI graph and retain its source binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVICE_TOOLCHAIN_BIN="$(dirname "$(rustup which --toolchain 1.93.0 cargo)")"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          revision = '83377f3faff86c979dc95cf2a7b0df65171f59bf'
+          tree = 'a48fb887a9d2b5143f928fd4bb58a05516bf9141'
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'device-source'
+          output = Path(os.environ['RUNNER_TEMP']) / 'pr1844-ui-results'
+          target = Path(os.environ['RUNNER_TEMP']) / 'pr1844-ui-target'
+          if output.exists() or target.exists():
+              raise RuntimeError('fresh private hosted paths required')
+          output.mkdir(mode=0o700)
+
+          def write(name, value):
+              (output / name).write_text(json.dumps(value, indent=2) + '\n')
+
+          def git(*args):
+              return subprocess.check_output(['git', '--no-optional-locks', '-C', str(source), *args], text=True).strip()
+
+          def point():
+              if (git('rev-parse', 'HEAD') != revision or git('rev-parse', 'HEAD^{tree}') != tree
+                      or git('rev-parse', '--abbrev-ref', 'HEAD') != 'HEAD'
+                      or git('status', '--porcelain=v1', '--untracked-files=all')):
+                  raise RuntimeError('literal product checkout changed')
+              return {'head': revision, 'tree': tree, 'clean_detached': True}
+
+          point()
+          tools = Path(os.environ['DEVICE_TOOLCHAIN_BIN'])
+          if tools.resolve(strict=True) != tools:
+              raise RuntimeError('physical Rust toolchain required')
+          env = os.environ.copy()
+          env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_JOBS='2', RUSTUP_TOOLCHAIN='1.93.0',
+                     RUSTC=str(tools / 'rustc'), RUSTDOC=str(tools / 'rustdoc'),
+                     PATH=str(tools) + os.pathsep + env['PATH'])
+          versions = {name: subprocess.check_output([str(tools / name), '--version'], env=env, text=True).strip()
+                      for name in ['cargo', 'rustc', 'rustdoc']}
+          if not all('1.93.0' in value for value in versions.values()):
+              raise RuntimeError('wrong Rust version')
+          command = [str(tools / 'cargo'), 'check', '--locked', '--no-default-features', '--features', 'ui',
+                     '--bin', 'cagents-ui', '--message-format=json']
+          write('PROVENANCE.json', {'source': point(), 'research_head': os.environ['GITHUB_SHA'],
+                'command': command, 'tool_versions': versions,
+                'tool_hashes': {name: hashlib.sha256((tools / name).read_bytes()).hexdigest() for name in versions},
+                'target': str(target), 'jobs': 2,
+                'environment': 'Inherited HOME, authority and no-start unchanged; only compiler and target variables set.',
+                'containment': 'GitHub-hosted VM and native 60-minute job timeout; no local process observer.'})
+          with (output / 'cargo.stdout.jsonl').open('wb') as stdout, (output / 'cargo.stderr.log').open('wb') as stderr:
+              code = subprocess.run(command, cwd=source, env=env, stdout=stdout, stderr=stderr, check=False).returncode
+          write('EXIT.json', {'actual_exit': code})
+          after = point()
+          if code != 0:
+              raise RuntimeError('isolated UI check failed; raw logs retained')
+          events = [json.loads(line) for line in (output / 'cargo.stdout.jsonl').read_text().splitlines()]
+          artifacts = [event for event in events if event.get('reason') == 'compiler-artifact']
+          if [event['success'] for event in events if event.get('reason') == 'build-finished'] != [True]:
+              raise RuntimeError('missing successful Cargo completion')
+          if not artifacts or any('ghostty' in (event['package_id'] + ' ' + event['target']['name']).lower()
+                                  for event in artifacts):
+              raise RuntimeError('UI artifact graph missing or includes Ghostty')
+          selected = [event for event in artifacts if event['manifest_path'] == str(source / 'Cargo.toml')
+                      and event['target']['name'] == 'cagents-ui' and event['target']['kind'] == ['bin']]
+          if len(selected) != 1 or selected[0]['features'] != ['ui'] or selected[0]['profile']['test'] is not False:
+              raise RuntimeError('wrong isolated UI product artifact')
+          write('FINAL.json', {'qualified_ui_check': True, 'source': after, 'actual_exit': code,
+                'artifact': selected[0], 'compiler_artifact_count': len(artifacts),
+                'graph': [{'package': event['package_id'], 'target': event['target']['name'], 'features': event['features']}
+                          for event in artifacts],
+                'limit': 'Compile-only UI boundary; no native app, interaction, provider or runtime qualification.'})
+          print(json.dumps({'qualified_ui_check': True, 'source': after, 'artifact_count': len(artifacts)}), flush=True)
+          PY
+      - name: Retain raw compiler logs and exact source and graph bindings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr1844-ui-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr1844-ui-results
+          if-no-files-found: warn
+          retention-days: 30
