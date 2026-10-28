@@ -259,6 +259,21 @@ fn content_path(content: &ItemContent) -> Option<&str> {
     }
 }
 
+/// Resolve Read targets from the tool's directory while displaying paths
+/// relative to the conversation. These directories can name different trees.
+fn content_path_label(content: &ItemContent, cwd: &std::path::Path) -> Option<PathLabel> {
+    let path = content_path(content)?;
+    let source_cwd = match content {
+        ItemContent::Command {
+            working_directory, ..
+        } => cwd.join(working_directory),
+        _ => cwd.to_path_buf(),
+    };
+    let mut label = path_label(path, &source_cwd);
+    label.display = display_path(&label.absolute, cwd).to_owned();
+    Some(label)
+}
+
 fn diff_stat(changes: &[FileChange]) -> (usize, usize) {
     let (mut added, mut removed) = (0, 0);
     for change in changes {
@@ -428,13 +443,13 @@ impl Runtime {
                     .and_then(|cached| cached.coordination.as_deref())
                     .is_none()
             })
-            .and_then(|item| content_path(&item.content))
-            .map(|path| {
-                turn.summary.replacen(
-                    path,
-                    &path_label(path, &self.session.launch.recipe.working_directory).display,
-                    1,
-                )
+            .and_then(|item| {
+                let path = content_path(&item.content)?;
+                let label = content_path_label(
+                    &item.content,
+                    &self.session.launch.recipe.working_directory,
+                )?;
+                Some(turn.summary.replacen(path, &label.display, 1))
             })
             .unwrap_or_else(|| turn.summary.clone());
         let key = turn.key.as_str();
@@ -637,9 +652,8 @@ impl Runtime {
         let cwd = &self.session.launch.recipe.working_directory;
         let path = coordinated
             .is_none()
-            .then(|| content_path(&item.content))
-            .flatten()
-            .map(|path| path_label(path, cwd));
+            .then(|| content_path_label(&item.content, cwd))
+            .flatten();
         if let Some(path) = &path {
             label = path.display.clone();
             preview = vec![crate::interaction::tooltip(
