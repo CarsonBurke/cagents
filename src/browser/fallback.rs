@@ -5,6 +5,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use raw_window_handle::{
@@ -94,6 +95,7 @@ pub struct RawWaylandSubsurfaceFactory {
     parent_surface: usize,
     lifetime_guard: Arc<dyn Any + Send + Sync>,
     host: Mutex<FactoryHost>,
+    probe_span: tracing::Span,
 }
 
 impl std::fmt::Debug for RawWaylandSubsurfaceFactory {
@@ -163,6 +165,7 @@ impl RawWaylandSubsurfaceFactory {
             parent_surface: window.surface.as_ptr() as usize,
             lifetime_guard,
             host: Mutex::new(FactoryHost::Uninitialized),
+            probe_span: tracing::Span::current(),
         })
     }
 
@@ -180,7 +183,11 @@ impl RawWaylandSubsurfaceFactory {
             return CapabilityProbe::Unavailable(BrowserUnavailable::InitializationFailed);
         };
         if matches!(*slot, FactoryHost::Uninitialized) {
-            match WaylandPreparation::new(self.display, self.parent_surface) {
+            match WaylandPreparation::new(
+                self.display,
+                self.parent_surface,
+                self.probe_span.clone(),
+            ) {
                 Ok(preparation) => *slot = FactoryHost::Checking(preparation),
                 Err(reason) => *slot = FactoryHost::Unavailable(reason),
             }
@@ -225,6 +232,9 @@ impl RawWaylandSubsurfaceFactory {
     /// Browser leases must have been joined/dropped first.
     pub fn release_parent(&self) {
         if let Ok(mut slot) = self.host.lock() {
+            if let FactoryHost::Checking(preparation) = &*slot {
+                preparation.trace_progress("retired");
+            }
             *slot = FactoryHost::Retired;
         }
     }
@@ -330,9 +340,18 @@ struct WaylandPreparation {
     _sync: wl_callback::WlCallback,
     parent: wl_surface::WlSurface,
     bound: Option<BoundGlobals>,
+    probe_span: tracing::Span,
+    started: Instant,
+    polls: u32,
+    dispatched: u64,
+    flush_would_block: u32,
 }
 impl WaylandPreparation {
-    fn new(display: usize, parent_surface: usize) -> Result<Self, BrowserUnavailable> {
+    fn new(
+        display: usize,
+        parent_surface: usize,
+        probe_span: tracing::Span,
+    ) -> Result<Self, BrowserUnavailable> {
         // SAFETY: the caller runs inside a live parent's UI callback; the app
         // retains and explicitly releases this foreign queue before the owner.
         let backend = unsafe { Backend::from_foreign_display((display as *mut c_void).cast()) };
@@ -358,20 +377,66 @@ impl WaylandPreparation {
             _sync: sync,
             parent,
             bound: None,
+            probe_span,
+            started: Instant::now(),
+            polls: 0,
+            dispatched: 0,
+            flush_would_block: 0,
         })
     }
+
+    // Only first poll, stage transitions, errors and retirement emit a record.
+    fn trace_progress(&self, event: &'static str) {
+        tracing::info!(
+            target: "cagents::browser_capability",
+            parent: &self.probe_span,
+            phase = event,
+            sync_stage = if self.bound.is_some() { "bound_sync" } else { "registry_sync" },
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            globals = self.state.globals.len(),
+            bound = self.bound.is_some(),
+            sync_complete = self.state.complete,
+            polls = self.polls,
+            dispatched = self.dispatched,
+            flush_would_block = self.flush_would_block,
+            "browser protocol capability progress"
+        );
+    }
+
     fn poll(&mut self) -> Result<bool, BrowserUnavailable> {
-        self.queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|_| BrowserUnavailable::InitializationFailed)?;
+        self.polls = self.polls.saturating_add(1);
+        let dispatched = match self.queue.dispatch_pending(&mut self.state) {
+            Ok(count) => count,
+            Err(_) => {
+                self.trace_progress("dispatch_error");
+                return Err(BrowserUnavailable::InitializationFailed);
+            }
+        };
+        self.dispatched = self.dispatched.saturating_add(dispatched as u64);
         if self.state.complete && self.bound.is_none() {
-            self.bind_required()?;
+            self.trace_progress("registry_sync_complete");
+            if let Err(reason) = self.bind_required() {
+                self.trace_progress("binding_error");
+                return Err(reason);
+            }
+            self.trace_progress("bound_sync_queued");
+        } else if self.state.complete {
+            self.trace_progress("bound_sync_complete");
         }
         match self.connection.flush() {
             Ok(()) => {}
             Err(wayland_client::backend::WaylandError::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err(BrowserUnavailable::InitializationFailed),
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                self.flush_would_block = self.flush_would_block.saturating_add(1);
+            }
+            Err(_) => {
+                self.trace_progress("flush_error");
+                return Err(BrowserUnavailable::InitializationFailed);
+            }
+        }
+        if self.polls == 1 {
+            self.trace_progress("first_poll");
         }
         Ok(self.state.complete)
     }

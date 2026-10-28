@@ -22,6 +22,27 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const PACE: Duration = Duration::from_secs(6);
 const BURST: u32 = 10;
 
+/// How long a shell's monitor may wait to start a read that has fallen due
+/// while its window is focused. A settled repository falls due once per
+/// [`REFRESH`] however often this ticks, and a tick with nothing due changes
+/// nothing.
+const FOCUSED_TICK: Duration = Duration::from_secs(10);
+/// Out of focus, discovery mostly serves the desktop alerts, which exist for
+/// someone looking elsewhere. Two minutes keeps those on a human timescale,
+/// twice [`REFRESH`], while waking the window a twelfth as often. A shell
+/// ticks once more when its window regains focus, so whatever fell due in
+/// the meantime is read at once.
+const BACKGROUND_TICK: Duration = Duration::from_secs(2 * 60);
+
+/// How often a shell should tick its monitor.
+pub fn tick_interval(focused: bool) -> Duration {
+    if focused {
+        FOCUSED_TICK
+    } else {
+        BACKGROUND_TICK
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
@@ -61,6 +82,8 @@ pub struct Monitor {
     paced: Option<Instant>,
     /// Reads in a row, across every repository, that failed.
     failing: usize,
+    /// Advances whenever [`Monitor::snapshots`] would yield something else.
+    revision: u64,
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -110,6 +133,27 @@ impl Monitor {
         ))
     }
 
+    /// Unchanged while every snapshot, and the set of repositories they
+    /// belong to, stays the same, so a shell can skip republishing them.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_for_test(&self) -> Option<&(GitHubRepoKey, u64)> {
+        self.busy.as_ref()
+    }
+
+    /// Makes every repository due, with the request budget refilled.
+    #[cfg(test)]
+    pub(crate) fn make_due_for_test(&mut self) {
+        let now = Instant::now();
+        for entry in self.entries.values_mut() {
+            entry.due = now;
+        }
+        self.paced = None;
+    }
+
     pub fn snapshots(&self) -> impl Iterator<Item = (&GitHubRepoKey, &Arc<Snapshot>)> {
         self.entries
             .iter()
@@ -132,11 +176,14 @@ impl Monitor {
             .collect::<std::collections::HashSet<_>>();
         let state = self;
         state.observed.clear();
+        let watched = state.entries.len();
         state
             .entries
             .retain(|repository, _| repositories.iter().any(|key| key == repository));
+        let mut revised = state.entries.len() != watched;
         for repository in &repositories {
             if !state.entries.contains_key(repository) {
+                revised = true;
                 state.generation = state.generation.wrapping_add(1);
                 state.entries.insert(
                     repository.clone(),
@@ -150,6 +197,9 @@ impl Monitor {
                     },
                 );
             }
+        }
+        if revised {
+            state.revision = state.revision.wrapping_add(1);
         }
         let failing = state.failing;
         if let Action::Loaded {
@@ -220,11 +270,20 @@ impl Monitor {
                 if applied.is_err() {
                     entry.scan.failed_history(&work);
                 }
-                entry.snapshot = Arc::new(Snapshot {
-                    viewer: entry.scan.viewer.clone(),
-                    requested: entry.scan.requested.clone(),
-                    error: applied.err(),
-                });
+                // Most reads find what the last one did. Keeping its snapshot
+                // lets every shell see that nothing changed.
+                let error = applied.err();
+                if entry.snapshot.viewer != entry.scan.viewer
+                    || entry.snapshot.requested != entry.scan.requested
+                    || entry.snapshot.error != error
+                {
+                    entry.snapshot = Arc::new(Snapshot {
+                        viewer: entry.scan.viewer.clone(),
+                        requested: entry.scan.requested.clone(),
+                        error,
+                    });
+                    state.revision = state.revision.wrapping_add(1);
+                }
                 // A pass that met a failure keeps backing off until it
                 // settles, so one timeline that always fails cannot reset the
                 // backoff through the pages read between its attempts.
@@ -331,6 +390,71 @@ mod tests {
             next_cursor: None,
         })
     }
+    #[test]
+    fn only_a_changed_read_or_repository_set_revises_the_snapshots() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        let unwatched = monitor.revision();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        assert_ne!(
+            monitor.revision(),
+            unwatched,
+            "a new repository is a change"
+        );
+        let read = |monitor: &mut Monitor, result: Result<Reply, String>| {
+            monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+            monitor.paced = None;
+            drop(monitor.update(Action::Tick, [repository.clone()]));
+            let (_, generation) = monitor.busy.clone().expect("a read started");
+            drop(monitor.update(
+                Action::Loaded {
+                    repository: repository.clone(),
+                    generation,
+                    work: Work::Page { cursor: None },
+                    result,
+                },
+                [repository.clone()],
+            ));
+        };
+        read(&mut monitor, Ok(reply("viewer", Some("request51"))));
+        let revision = monitor.revision();
+        let published = Arc::clone(&monitor.entries[&repository].snapshot);
+
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        read(&mut monitor, Ok(reply("viewer", Some("request51"))));
+        assert_eq!(
+            monitor.revision(),
+            revision,
+            "an identical read changes nothing"
+        );
+        assert!(Arc::ptr_eq(
+            &published,
+            &monitor.entries[&repository].snapshot
+        ));
+
+        // A re-request keeps the pull request listed under a new request node,
+        // which is what an alert's focus target names.
+        read(&mut monitor, Ok(reply("viewer", Some("request52"))));
+        assert_ne!(monitor.revision(), revision);
+        assert_eq!(
+            monitor.entries[&repository].snapshot.requested[&51]
+                .current
+                .id,
+            "request52"
+        );
+
+        let revision = monitor.revision();
+        read(&mut monitor, Err("rate limited".into()));
+        assert_ne!(monitor.revision(), revision, "a failed read is shown");
+        let revision = monitor.revision();
+        drop(monitor.update(Action::Tick, []));
+        assert_ne!(
+            monitor.revision(),
+            revision,
+            "a dropped repository is a change"
+        );
+    }
+
     #[test]
     fn reads_spend_a_burst_then_one_per_pace() {
         let mut monitor = Monitor::default();

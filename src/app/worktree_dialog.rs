@@ -20,6 +20,7 @@ pub struct WorktreeDraft {
     pub branch: String,
     pub base: String,
     pub destination: String,
+    pub(super) pr_checkout: Option<super::pr_checkout_ui::PrCheckoutOrigin>,
 }
 
 impl WorktreeDraft {
@@ -188,6 +189,7 @@ pub struct WorktreeDialog {
     repository: PathBuf,
     draft: WorktreeDraft,
     advanced: bool,
+    checkout_notice: Option<String>,
     resolving: Option<Resolution>,
     error: Option<WorktreeInputError>,
     /// The failed creation this dialog reopened. Its row stays until this
@@ -196,11 +198,19 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
+    pub(super) fn set_checkout_notice(&mut self, notice: String) {
+        self.checkout_notice = Some(notice);
+    }
+
     pub fn new(project_id: ProjectId, repository: PathBuf, draft: WorktreeDraft) -> Self {
         Self {
             project_id,
             repository,
             advanced: draft.uses_options(),
+            checkout_notice: draft
+                .pr_checkout
+                .as_ref()
+                .map(|origin| origin.notice.clone()),
             draft,
             resolving: None,
             error: None,
@@ -220,7 +230,10 @@ impl WorktreeDialog {
     /// Edits a field. An error about that field no longer describes it; one
     /// about another field, or about the request as a whole, still does.
     pub fn edit(&mut self, field: WorktreeField, value: String) {
-        if self.resolving.is_some() {
+        if self.resolving.is_some()
+            || (self.checkout_notice.is_some()
+                && matches!(field, WorktreeField::Branch | WorktreeField::Base))
+        {
             return;
         }
         *match field {
@@ -311,6 +324,20 @@ impl Cagents {
             }
             return Task::none();
         }
+        if self
+            .worktree_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.draft.pr_checkout.as_ref())
+            .is_some_and(|origin| !self.pr_creation_origin_is_current(origin))
+        {
+            return self
+                .worktree_dialog
+                .as_mut()
+                .unwrap()
+                .show_error(WorktreeInputError::general(
+                    "The owning PR changed or closed. Prepare checkout again from its review.",
+                ));
+        }
         let managed_directory = self.settings.managed_worktree_directory.clone();
         let Some(dialog) = &mut self.worktree_dialog else {
             return Task::none();
@@ -340,9 +367,14 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &token)
-                    .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
+                let service = RepositoryService::system("git");
+                let resolved = match draft.pr_checkout.as_ref() {
+                    Some(origin) => {
+                        service.resolve_worktree_request_for_pr(&input, &origin.consent, &token)
+                    }
+                    None => service.resolve_worktree_request(&input, &token),
+                };
+                resolved.map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
             .await
             .map_err(|error| WorktreeInputError::general(error.to_string()))
@@ -364,6 +396,25 @@ impl Cagents {
         operation_id: OperationId,
         result: Result<CreateWorktreeRequest, WorktreeInputError>,
     ) -> Task<Message> {
+        if self
+            .worktree_dialog
+            .as_ref()
+            .filter(|dialog| {
+                dialog.project_id == project_id
+                    && dialog
+                        .resolving
+                        .as_ref()
+                        .is_some_and(|resolution| resolution.id == operation_id)
+            })
+            .and_then(|dialog| dialog.draft.pr_checkout.as_ref())
+            .is_some_and(|origin| !self.pr_creation_origin_is_current(origin))
+        {
+            let dialog = self.worktree_dialog.as_mut().unwrap();
+            dialog.resolving = None;
+            return dialog.show_error(WorktreeInputError::general(
+                "The owning PR changed while resolving. Prepare checkout again from its review.",
+            ));
+        }
         let Some(dialog) = self.worktree_dialog.as_mut().filter(|dialog| {
             dialog.project_id == project_id
                 && dialog
@@ -455,7 +506,10 @@ impl Cagents {
             let mut input = crate::ui_controls::field::text(placeholder, value)
                 .id(field.focus_id())
                 .on_submit(|_| Message::SubmitWorktree);
-            if editable {
+            if editable
+                && !(dialog.checkout_notice.is_some()
+                    && matches!(field, WorktreeField::Branch | WorktreeField::Base))
+            {
                 input = input.on_input(on_input);
             }
             if let Some(error) = field_error(field) {
@@ -509,6 +563,9 @@ impl Cagents {
             .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
             .into(),
         ];
+        if let Some(notice) = &dialog.checkout_notice {
+            rows.insert(1, design::caption(notice).into());
+        }
         if dialog.advanced {
             rows.push(field(
                 "Base branch (optional)",
@@ -672,6 +729,205 @@ mod tests {
     }
 
     #[test]
+    fn new_pr_checkout_retains_original_owner_through_resolution_worker_and_publication() {
+        use crate::model::WorktreeId;
+        use crate::repository::{
+            BaseRevision, PrWorktreeCreationConsent, ValidatedBranchName, WorktreeLock,
+            WorktreeRecord,
+        };
+        for boundary in ["submit", "resolved", "accepted", "published"] {
+            let Fixture {
+                mut app,
+                project,
+                _state,
+            } = fixture();
+            drop(app.update(Message::CancelDialog));
+            let (card, task) = app.add_pull_requests_card("/repo".into());
+            drop(task);
+            let mut loaded = crate::pull_request_review::tests::loaded(Vec::new(), Vec::new());
+            loaded.pull_request.head_repository =
+                Some(crate::github::GitHubHeadRepository { name: "r".into() });
+            loaded.pull_request.head_repository_owner = Some(crate::github::GitHubActor {
+                login: "o".into(),
+                name: None,
+                is_bot: false,
+            });
+            let mut target = crate::pull_request_review::tests::target(1);
+            target.pull_request = Arc::new(loaded.pull_request.clone());
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                panic!("review");
+            };
+            drop(
+                pane.review
+                    .update(pull_request_review::Action::Open(target)),
+            );
+            let generation = pane.review.selection_generation();
+            // This app owns a real review cache. Complete its miss before
+            // answering the live load that the cache completion starts.
+            drop(pane.review.update(pull_request_review::Action::Cached {
+                generation,
+                result: Ok(None),
+            }));
+            drop(pane.review.update(pull_request_review::Action::Loaded {
+                generation,
+                load: 1,
+                result: Ok(Arc::new(loaded.clone())),
+            }));
+            assert!(matches!(
+                pane.review.load_state(),
+                pull_request_review::LoadState::Ready
+            ));
+            drop(pane.review.take_effects());
+            drop(pane.review.update(pull_request_review::Action::Checkout));
+            let effects = pane.review.take_effects();
+            let [pull_request_review::Effect::Checkout(target)] = effects.as_slice() else {
+                panic!("checkout");
+            };
+            let target = target.clone();
+            let origin = super::super::pr_checkout_ui::PrCheckoutOrigin {
+                card,
+                project,
+                generation,
+                consent: PrWorktreeCreationConsent::new(
+                    target.head_repository.clone().unwrap(),
+                    ValidatedBranchName::parse(&target.head_ref_name).unwrap(),
+                    target.head.clone(),
+                    "origin".into(),
+                    true,
+                )
+                .unwrap(),
+                target,
+                notice: "Reviewed PR".into(),
+            };
+            drop(app.open_worktree_dialog(
+                project,
+                "/repo".into(),
+                WorktreeDraft {
+                    branch: "origin/feature".into(),
+                    pr_checkout: Some(origin.clone()),
+                    ..Default::default()
+                },
+                None,
+            ));
+            let mut id = OperationId::new();
+            if boundary != "submit" {
+                // Accept but do not poll the read-only resolution Task.
+                drop(app.update(Message::SubmitWorktree));
+                id = resolution(&app);
+            }
+            let request = CreateWorktreeRequest {
+                repository: "/repo".into(),
+                managed_root: "/worktrees".into(),
+                managed_ignore_root: None,
+                destination: "/worktrees/feature".into(),
+                branch: ValidatedBranchName::parse("feature").unwrap(),
+                base: BaseRevision::remote_ref("refs/remotes/origin/feature").unwrap(),
+                track: true,
+                operation_id: id,
+                setup_intent: None,
+            };
+            if matches!(boundary, "accepted" | "published") {
+                // Accept the actual operation Task and hold it before worker execution.
+                drop(app.update(Message::WorktreeInputResolved {
+                    project_id: project,
+                    operation_id: id,
+                    result: Ok(request.clone()),
+                }));
+                assert!(app.worktree_operations[&id].pr_creation_running(card));
+                assert_eq!(app.worktree_operations[&id].pr_origin(), Some(&origin));
+                drop(app.update(Message::CloseCardUnasked(card)));
+                assert!(app.cards.contains_key(&card));
+            }
+            // Deliver same-OID metadata adoption through the actual App reducer behind the dialog.
+            loaded.pull_request.head_ref_name = "renamed".into();
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: pull_request_review::Action::Loaded {
+                    generation,
+                    load: 1,
+                    result: Ok(Arc::new(loaded)),
+                },
+            }));
+            match boundary {
+                "submit" => {
+                    drop(app.update(Message::SubmitWorktree));
+                    assert!(dialog(&app).error.is_some());
+                    assert!(dialog(&app).resolving.is_none());
+                }
+                "resolved" => {
+                    drop(app.update(Message::WorktreeInputResolved {
+                        project_id: project,
+                        operation_id: id,
+                        result: Ok(request.clone()),
+                    }));
+                    assert!(dialog(&app).error.is_some());
+                }
+                _ => assert!(
+                    app.worktree_operations[&id]
+                        .pr_cancellation_for_test()
+                        .unwrap()
+                        .is_cancelled()
+                ),
+            }
+            if boundary == "published" {
+                // Substitute only a completed journal report; this checks reducer publication, not a live Git worker.
+                let outcome = WorktreeCreationOutcome::Created {
+                    worktree: WorktreeRecord {
+                        id: WorktreeId::new(),
+                        path: request.destination.clone(),
+                        created_at_unix_ms: None,
+                        head_oid: Some(origin.target.head.as_str().into()),
+                        branch: Some("refs/heads/feature".into()),
+                        detached: false,
+                        bare: false,
+                        lock: WorktreeLock {
+                            locked: false,
+                            reason: None,
+                        },
+                        prunable_reason: None,
+                    },
+                    warnings: Vec::new(),
+                };
+                drop(app.finish_worktree_operation(
+                    id,
+                    1,
+                    Ok(crate::repository::WorktreeOperationReport {
+                        operation_id: id,
+                        generation: 1,
+                        request: Some(request.clone()),
+                        state: WorktreeOperationState::Created,
+                        outcome: Some(outcome.clone()),
+                        detail: "Created".into(),
+                        created_at_unix_ms: 1,
+                    }),
+                ));
+                let active = app.active_workspace.clone();
+                let count = app.sidebar_model.project(project).unwrap().worktrees.len();
+                drop(app.update(Message::PrWorktreeCreated {
+                    origin,
+                    repository: request.repository,
+                    outcome,
+                }));
+                assert_eq!(app.active_workspace, active);
+                assert_eq!(
+                    app.sidebar_model.project(project).unwrap().worktrees.len(),
+                    count
+                );
+                assert!(
+                    app.status
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("journal result is retained")
+                );
+            }
+            if matches!(boundary, "submit" | "resolved") {
+                assert!(app.worktree_operations.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn submitting_without_a_valid_branch_explains_why_and_starts_nothing() {
         let Fixture { mut app, .. } = fixture();
         let _ = app.update(Message::SubmitWorktree);
@@ -826,6 +1082,7 @@ mod tests {
             setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
+            managed_ignore_root: None,
             destination: "/one".into(),
             branch: crate::repository::ValidatedBranchName::parse("feature/one").unwrap(),
             base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
@@ -1036,5 +1293,20 @@ mod tests {
         );
         dialog.edit(WorktreeField::Branch, "feature/one".into());
         assert_eq!(dialog.branch_preview(), None);
+    }
+    #[test]
+    fn prepared_pr_checkout_keeps_its_head_branch_and_base_while_destination_is_editable() {
+        let mut dialog = WorktreeDialog::new(
+            ProjectId::new(),
+            "/repo".into(),
+            WorktreeDraft::branch("origin/feature"),
+        );
+        dialog.set_checkout_notice("Checks out feature tracking origin/feature.".into());
+        dialog.edit(WorktreeField::Branch, "unrelated-local-branch".into());
+        dialog.edit(WorktreeField::Base, "HEAD~20".into());
+        dialog.edit(WorktreeField::Destination, "chosen-destination".into());
+        assert_eq!(dialog.draft.branch, "origin/feature");
+        assert!(dialog.draft.base.is_empty());
+        assert_eq!(dialog.draft.destination, "chosen-destination");
     }
 }

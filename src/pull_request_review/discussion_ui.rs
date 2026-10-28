@@ -236,7 +236,11 @@ impl State {
 
     /// Local review input and write receipts must survive until explicitly resolved.
     pub fn restart_blocker(&self) -> Option<&'static str> {
-        if self.discussion.busy {
+        if self.existing_checkout.busy() {
+            Some(
+                "Wait for checkout reconciliation to settle before closing or updating the window.",
+            )
+        } else if self.discussion.busy {
             Some("Wait for the GitHub review write to finish before closing the window.")
         } else if self.discussion.unknown.is_some() {
             Some(
@@ -257,6 +261,10 @@ impl State {
     }
 
     pub(super) fn block_discussion_navigation(&mut self) -> bool {
+        if self.existing_checkout.busy() {
+            self.notice = Some("Wait for checkout reconciliation to settle before leaving this review. You can request cancellation below.".into());
+            return true;
+        }
         let message = if self.cache.is_some() && !self.discussion.drafts_saved {
             Some("Wait for the local review draft to finish saving before leaving this review.")
         } else if self.discussion.busy {

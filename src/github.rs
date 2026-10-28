@@ -24,6 +24,7 @@ use crate::repository::{
 
 #[cfg(feature = "ui")]
 pub mod avatar;
+pub mod checkout;
 pub mod polling;
 mod review_batches;
 mod review_refresh;
@@ -32,6 +33,11 @@ pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+/// The Work board's view of the user's own pull requests: identity and state
+/// only. Check rollups are the expensive part of a listing (a hundred of them
+/// can time out GitHub's GraphQL), so they are read for open ones alone.
+const PR_AUTHORED_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url";
+const PR_AUTHORED_REVIEW_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
@@ -661,6 +667,16 @@ impl PullRequestStateFilter {
             Self::All => "all",
         }
     }
+}
+
+/// The signed-in user's pull requests, most recently updated first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredPullRequestsRequest {
+    pub repository: GitHubRepoKey,
+    pub state: PullRequestStateFilter,
+    pub limit: u16,
+    /// Also read review decisions and check rollups.
+    pub review: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1612,6 +1628,30 @@ impl<E: ProcessExecutor> GitHubService<E> {
         ])
     }
 
+    pub fn list_authored_command(&self, request: &AuthoredPullRequestsRequest) -> CommandSpec {
+        self.gh_command([
+            OsString::from("pr"),
+            OsString::from("list"),
+            OsString::from("-R"),
+            request.repository.gh_selector().into(),
+            OsString::from("--author"),
+            OsString::from("@me"),
+            OsString::from("--state"),
+            request.state.as_str().into(),
+            OsString::from("--search"),
+            OsString::from("sort:updated-desc"),
+            OsString::from("--limit"),
+            request.limit.clamp(1, 200).to_string().into(),
+            OsString::from("--json"),
+            if request.review {
+                PR_AUTHORED_REVIEW_FIELDS
+            } else {
+                PR_AUTHORED_FIELDS
+            }
+            .into(),
+        ])
+    }
+
     pub fn view_command(&self, key: &PullRequestKey) -> CommandSpec {
         self.gh_command([
             OsString::from("pr"),
@@ -1761,13 +1801,50 @@ impl<E: ProcessExecutor> GitHubService<E> {
         )
     }
 
+    pub fn list_authored(
+        &self,
+        request: &AuthoredPullRequestsRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        let command = self.list_authored_command(request);
+        let output = self.run_checked(&command, &request.repository, cancellation)?;
+        attach_process(
+            parse_pull_request_list(&output.stdout, &request.repository),
+            &output,
+        )
+    }
+
     pub fn view(
         &self,
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, None)
+    }
+
+    /// A targeted read can use a smaller process budget without changing the
+    /// defaults of unrelated GitHub operations. Cancellation also bounds its
+    /// wait for the shared process permit.
+    pub fn view_with_timeout(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, Some(timeout))
+    }
+
+    fn view_with_budget(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<PullRequest, GitHubError> {
         key.validate()?;
-        let command = self.view_command(key);
+        let mut command = self.view_command(key);
+        if let Some(timeout) = timeout {
+            command = command.timeout(timeout);
+        }
         let output = self.run_checked(&command, &key.repository, cancellation)?;
         let pull_request =
             attach_process(parse_pull_request(&output.stdout, &key.repository), &output)?;
@@ -3123,8 +3200,8 @@ pub fn pull_request_number(
         .ok_or_else(|| GitHubValidationError::InvalidPullRequestUrl(url.to_string()))?
         .collect();
     if segments.len() != 4
-        || segments[0] != repository.owner
-        || segments[1] != repository.name
+        || !segments[0].eq_ignore_ascii_case(&repository.owner)
+        || !segments[1].eq_ignore_ascii_case(&repository.name)
         || segments[2] != "pull"
     {
         return Err(GitHubValidationError::InvalidPullRequestUrl(
@@ -3657,6 +3734,49 @@ mod tests {
     }
 
     #[test]
+    fn authored_listing_asks_for_rollups_only_when_reviews_are_wanted() {
+        let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
+        let arguments = |review| {
+            service
+                .list_authored_command(&AuthoredPullRequestsRequest {
+                    repository: repository(),
+                    state: PullRequestStateFilter::All,
+                    limit: 500,
+                    review,
+                })
+                .arguments
+                .into_iter()
+                .map(|argument| argument.into_string().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let cheap = arguments(false);
+        assert_eq!(
+            cheap[..12],
+            [
+                "pr",
+                "list",
+                "-R",
+                "github.com/owner/repo",
+                "--author",
+                "@me",
+                "--state",
+                "all",
+                "--search",
+                "sort:updated-desc",
+                "--limit",
+                "200"
+            ]
+        );
+        assert!(!cheap.last().unwrap().contains("statusCheckRollup"));
+        assert!(
+            arguments(true)
+                .last()
+                .unwrap()
+                .contains("statusCheckRollup")
+        );
+    }
+
+    #[test]
     fn remote_association_requires_public_github_or_a_known_enterprise_host() {
         let remote = |url: &str| crate::repository::RemoteRecord {
             name: "origin".into(),
@@ -4108,25 +4228,25 @@ mod tests {
             "remote",
             "add",
             "origin",
-            "https://github.com/CarsonBurke/cleanrl.git",
+            "https://github.com/ExampleContributor/example-project.git",
         ]);
         git(&[
             "remote",
             "add",
             "upstream",
-            "https://github.com/vwxyzjn/cleanrl.git",
+            "https://github.com/ExampleUpstream/example-project.git",
         ]);
         git(&["config", "branch.Feature/Case.remote", "upstream"]);
         git(&["config", "branch.Feature/Case.pushRemote", "origin"]);
         git(&[
             "config",
             "remote.origin.pushurl",
-            "git@github.com:ActualPublisher/cleanrl.git",
+            "git@github.com:ActualPublisher/example-project.git",
         ]);
         let key = worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
             .unwrap();
         assert_eq!(key.owner, "ActualPublisher");
-        assert_eq!(key.name, "cleanrl");
+        assert_eq!(key.name, "example-project");
         git(&["config", "branch.Feature/Case.pushRemote", "unknown"]);
         assert!(
             worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
@@ -4816,3 +4936,6 @@ mod tests {
         assert!(argument_strings(&commands[0]).contains(&"path=src/lib.rs".to_owned()));
     }
 }
+
+#[cfg(test)]
+mod channel_work_tests;

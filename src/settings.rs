@@ -22,7 +22,8 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
+const MAX_LEGACY_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -331,6 +332,10 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
+
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 38] {
         [
@@ -623,8 +628,21 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Approximate the old line preference at 1 KiB per requested line, rounded
+/// up to MiB. Its former direct use as bytes retained almost no history.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    if lines > MAX_LEGACY_TERMINAL_SCROLLBACK_LINES {
+        return MAX_TERMINAL_SCROLLBACK_MIB + 1;
+    }
+    lines.div_ceil(1024)
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -635,8 +653,11 @@ const fn default_terminal_scroll_speed() -> f32 {
     1.0
 }
 
+/// Clone-local default shared by the local and device creation paths.
+pub const DEFAULT_MANAGED_WORKTREE_DIRECTORY: &str = ".worktrees/";
+
 fn default_managed_worktree_directory() -> String {
-    "worktrees/".to_owned()
+    DEFAULT_MANAGED_WORKTREE_DIRECTORY.to_owned()
 }
 
 const fn default_focus_follows_mouse() -> bool {
@@ -676,6 +697,10 @@ const fn default_show_worktree_changes_icons() -> bool {
 
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
+}
+
+const fn default_work_stale_after_days() -> u16 {
+    crate::work::DEFAULT_STALE_AFTER_DAYS
 }
 
 const fn default_check_for_updates() -> bool {
@@ -793,6 +818,9 @@ impl DefaultPane {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub schema_version: u32,
+    /// Stable palette entry keys, newest first. Old settings default to empty.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     #[serde(default = "default_focus_follows_mouse")]
@@ -822,8 +850,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -902,6 +930,10 @@ pub struct AppSettings {
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// Days without activity after which a Work board card is stale. The
+    /// daemon reads it from this file too; see `crate::work::stale_after_days`.
+    #[serde(default = "default_work_stale_after_days")]
+    pub work_stale_after_days: u16,
     /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
     /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
     /// without it is read as revision 1, and loading records the revision it
@@ -909,6 +941,14 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -920,6 +960,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -931,6 +973,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
+            palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
@@ -948,7 +991,7 @@ impl Default for AppSettings {
             sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
@@ -975,11 +1018,32 @@ impl Default for AppSettings {
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
+            work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1002,6 +1066,9 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    /// Sent in initialize before the server begins loading its workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1014,6 +1081,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
         root_markers: &[&str],
     ) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: languages
                 .iter()
@@ -1122,7 +1190,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -1546,7 +1614,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -1589,6 +1657,10 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let mut seen = std::collections::HashSet::new();
+        self.palette_recents
+            .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
+        self.palette_recents.truncate(24);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1617,6 +1689,11 @@ impl AppSettings {
         if self.hibernation_delay_ms > MAX_TOML_INTEGER {
             return Err(SettingsError::Invalid(
                 "hibernation_delay_ms must not exceed 9223372036854775807",
+            ));
+        }
+        if !(1..=crate::work::MAX_STALE_AFTER_DAYS).contains(&self.work_stale_after_days) {
+            return Err(SettingsError::Invalid(
+                "work_stale_after_days must be between 1 and 365",
             ));
         }
         if !(0.8..=1.5).contains(&self.ui_scale) {
@@ -1701,9 +1778,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -1714,6 +1791,16 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid(
                 "managed_worktree_directory must be a nonempty path without control characters",
+            ));
+        }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
             ));
         }
         self.keyboard_shortcuts.validate()?;
@@ -1730,6 +1817,14 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
 
     for server in servers {
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} initialization_options exceed 1 MiB",
+                server.id
+            )));
+        }
         let id = server.id.as_str();
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -2012,6 +2107,23 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if let Some(legacy) = table.remove("terminal_scrollback_lines") {
+        // An explicit current value wins, even when it is unreadable. Retain
+        // invalid legacy input under the current key so normal per-setting
+        // diagnostics/preservation apply rather than silently dropping it.
+        table
+            .entry("terminal_scrollback_mib")
+            .or_insert_with(|| match legacy {
+                toml::Value::Integer(lines)
+                    if (0..=MAX_LEGACY_TERMINAL_SCROLLBACK_LINES as i64).contains(&lines) =>
+                {
+                    usize::try_from(lines).map_or(toml::Value::Integer(lines), |lines| {
+                        toml::Value::Integer(legacy_scrollback_mib(lines) as i64)
+                    })
+                }
+                value => value,
+            });
+    }
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -2813,6 +2925,63 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn language_server_initialization_options_round_trip_and_are_bounded() {
+        let mut settings = AppSettings::default();
+        let options = serde_json::json!({
+            "checkOnSave": false,
+            "cargo": {"extraArgs": ["--locked", "--offline"]}
+        });
+        settings.language_servers[0].initialization_options = Some(options.clone());
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            decoded.language_servers[0].initialization_options,
+            Some(options)
+        );
+        assert!(decoded.validate().is_ok());
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"oversized": "x".repeat(1024 * 1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -3014,6 +3183,36 @@ mod tests {
     }
 
     #[test]
+    fn palette_recents_survive_save_and_old_settings_default_to_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        save(&path, &settings).unwrap();
+        assert_eq!(
+            load(&path).unwrap().palette_recents,
+            settings.palette_recents
+        );
+        let mut legacy = toml::Value::try_from(&settings).unwrap();
+        legacy.as_table_mut().unwrap().remove("palette_recents");
+        let restored: AppSettings = legacy.try_into().unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec![
+            String::new(),
+            "command:open_settings".into(),
+            "command:open_settings".into(),
+            "x".repeat(129),
+        ];
+        settings
+            .palette_recents
+            .extend((0..30).map(|i| format!("pane:{i}")));
+        let validated = settings.validate().unwrap();
+        assert_eq!(validated.palette_recents.len(), 24);
+        assert_eq!(validated.palette_recents[0], "command:open_settings");
+        assert_eq!(validated.palette_recents[1], "pane:0");
+    }
+
+    #[test]
     fn browser_preference_and_both_gestures_are_independent_and_persist() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3180,7 +3379,7 @@ mod tests {
             .unwrap()
             .remove("managed_worktree_directory");
         let decoded: AppSettings = old.try_into().unwrap();
-        assert_eq!(decoded.managed_worktree_directory, "worktrees/");
+        assert_eq!(decoded.managed_worktree_directory, ".worktrees/");
         for path in ["", "  ", "trees\nelsewhere", "trees\0elsewhere"] {
             assert!(
                 AppSettings {
@@ -4076,14 +4275,104 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
-    fn terminal_scrollback_is_bounded() {
+    fn legacy_scrollback_lines_migrate_and_save_only_the_explicit_byte_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {lines}\nfuture_history = 'keep'\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, mib);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(
+                saved["terminal_scrollback_mib"].as_integer(),
+                Some(mib as i64)
+            );
+            assert_eq!(saved["future_history"].as_str(), Some("keep"));
+            assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib);
+        }
+        assert_eq!(AppSettings::default().terminal_scrollback_mib, 16);
+        assert_eq!(
+            load_current_toml("schema_version = 3")
+                .unwrap()
+                .settings
+                .terminal_scrollback_mib,
+            16
+        );
+    }
+
+    #[test]
+    fn explicit_scrollback_mib_wins_and_invalid_legacy_input_is_not_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for legacy in ["10000", "-1", "1000001", "'unreadable'"] {
+            fs::write(&path, format!(
+                "schema_version = 3\nterminal_scrollback_lines = {legacy}\nterminal_scrollback_mib = 32\n"
+            )).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 32);
+            assert_eq!(loaded.set_aside().count(), 0);
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+            assert_eq!(saved["terminal_scrollback_mib"].as_integer(), Some(32));
+        }
+        for invalid in ["-1", "1000001", "9223372036854775807", "'unreadable'"] {
+            fs::write(
+                &path,
+                format!("schema_version = 3\nterminal_scrollback_lines = {invalid}\n"),
+            )
+            .unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.settings.terminal_scrollback_mib, 16);
+            assert_eq!(loaded.set_aside().count(), 1, "{invalid}");
+            save(&path, &loaded.settings).unwrap();
+            let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let original: toml::Table = toml::from_str(&format!("value = {invalid}")).unwrap();
+            assert_eq!(saved["terminal_scrollback_mib"], original["value"]);
+            assert!(!saved.contains_key("terminal_scrollback_lines"));
+        }
+        let invalid_current = load_current_toml(
+            "schema_version = 3\nterminal_scrollback_lines = 10000\nterminal_scrollback_mib = -1\n",
+        )
+        .unwrap();
+        assert_eq!(invalid_current.settings.terminal_scrollback_mib, 16);
+        assert_eq!(invalid_current.set_aside().count(), 1);
+    }
+
+    #[test]
+    fn version_two_scrollback_migration_keeps_legacy_bounds_and_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (lines, expected) in [
+            (0, Some(0)),
+            (10_000, Some(10)),
+            (1_000_000, Some(977)),
+            (1_000_001, None),
+        ] {
+            fs::write(&path, format!(
+                "schema_version = 2\nmax_hot_cards = 8\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 260.0\ndefault_column_fraction = 0.5\nterminal_scrollback_lines = {lines}\n"
+            )).unwrap();
+            match expected {
+                Some(mib) => assert_eq!(load(&path).unwrap().terminal_scrollback_mib, mib),
+                None => assert!(matches!(load(&path), Err(SettingsError::Invalid(_)))),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scrollback_mib_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(

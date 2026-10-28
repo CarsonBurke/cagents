@@ -497,6 +497,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
             // Migration is additive, including old independent windows. Closed
@@ -567,7 +568,9 @@ pub(super) fn apply(
                             .revision
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
-                        write(transaction, &target)?;
+                        // Publish only after the source relinquishes its
+                        // active placement, inside this same transaction.
+                        deferred_target = Some(target);
                         transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
@@ -671,17 +674,34 @@ pub(super) fn apply(
             .revision
             .checked_add(1)
             .ok_or("view revision exhausted")?;
-        transaction.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
-            params![key(scope)?, view.revision,
-                serde_json::to_string(&view.panes).map_err(|error| error.to_string())?,
-                serde_json::to_string(&view.retired).map_err(|error| error.to_string())?])
-            .map_err(|error| error.to_string())?;
+        write(transaction, &view)?;
+    }
+    if let Some(target) = deferred_target {
+        write(transaction, &target)?;
     }
     Ok(changed || !existed)
 }
 
 impl Registry {
+    pub(crate) fn title_conversation(
+        &self,
+        id: crate::model::ChannelId,
+        card: crate::model::CardId,
+        revision: u64,
+    ) -> Result<crate::chat::Session, String> {
+        let view = read(&self.db, &Scope::Channel(id))?;
+        if view.revision != revision || view.primary_chat() != Some(card) {
+            return Err("The channel's primary conversation changed".into());
+        }
+        view.panes
+            .into_iter()
+            .find_map(|pane| match pane.kind {
+                crate::model::CardKind::Chat(session) if pane.id == card => Some(session),
+                _ => None,
+            })
+            .ok_or_else(|| "The primary chat is unavailable".into())
+    }
+
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
@@ -725,7 +745,157 @@ fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, Str
     .map(|id| parse_scope(&id))
     .transpose()
 }
+
+/// Rotate an existing canonical pane with its authenticated holder, before the
+/// new Agent descriptor becomes visible. A stale or replaced pane is evidence
+/// to preserve, not permission to insert a pane or discover another alias.
+pub(super) fn adopt_authenticated_agent_pane(
+    db: &Connection,
+    agent: crate::model::AgentId,
+    retained: &[crate::agent_execution::HostedSession],
+    successor: &crate::agent_execution::HostedSession,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(false);
+    };
+    let mut view = read(db, &scope)?;
+    let before = view.clone();
+    if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
+        return Ok(false);
+    }
+    let pane = view.panes.iter_mut().find(|pane| pane.id == id).unwrap();
+    let replacement = match (&pane.kind, successor) {
+        (CardKind::Chat(current), HostedSession::Chat(next))
+            if retained.contains(&HostedSession::Chat(current.clone()))
+                && (crate::chat::is_upgrade_recovery(current, next)
+                    || crate::chat::is_upgrade_identity_learning(current, next)) =>
+        {
+            CardKind::Chat(next.clone())
+        }
+        (CardKind::Terminal(current), _) => {
+            let terminal = |source: &HostedSession| match source {
+                HostedSession::Terminal(session) => Some(session.clone()),
+                HostedSession::Chat(session) => session.terminal.clone(),
+            };
+            let Some(next) = terminal(successor) else {
+                return Ok(false);
+            };
+            if !retained.iter().any(|source| {
+                terminal(source).as_ref() == Some(current)
+                    && match (source, successor) {
+                        (HostedSession::Terminal(_), HostedSession::Terminal(_)) => true,
+                        (HostedSession::Chat(old), HostedSession::Chat(next)) => {
+                            crate::chat::is_upgrade_recovery(old, next)
+                                || crate::chat::is_upgrade_identity_learning(old, next)
+                        }
+                        _ => false,
+                    }
+            }) || !current
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete())
+                || !next
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+            {
+                return Ok(false);
+            }
+            CardKind::Terminal(next)
+        }
+        _ => return Ok(false),
+    };
+    if pane.kind == replacement {
+        return Ok(false);
+    }
+    pane.kind = replacement;
+    view.revision = view
+        .revision
+        .checked_add(1)
+        .ok_or("view revision exhausted")?;
+    channel_work::placement::observe_view_transition(db, &before, &view)?;
+    // Holder continuity does not start a new channel naming choice, including
+    // learning a previously unobserved provider thread. Preserve all placement,
+    // presentation, retirement and naming state outside the descriptor itself.
+    db.execute(
+        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
+        params![
+            key(&scope)?,
+            view.revision,
+            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Record removal before foreign-key cascades erase canonical membership.
+/// Like normal view writes, this must participate in the deleting transaction.
+pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
+    retire_scope_placements(db, &Scope::Channel(channel))
+}
+
+pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
+    if db.is_autocommit() {
+        return Err("Placement removal requires the canonical view transaction".into());
+    }
+    let repository = repository_key(repository)?;
+    let scopes = {
+        let mut statement = db
+            .prepare(
+                "SELECT s.scope FROM shared_view_scopes s
+             LEFT JOIN channels c ON c.id=s.channel
+             WHERE s.repository=?1 OR c.repository=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([repository], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
+    };
+    for raw in scopes {
+        let scope = parse_scope(&raw)?;
+        retire_scope_placements(db, &scope)?;
+    }
+    Ok(())
+}
+
+fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
+    let before = read(db, scope)?;
+    let mut after = before.clone();
+    after.panes.clear();
+    channel_work::placement::observe_view_transition(db, &before, &after)
+}
+
 fn write(db: &Connection, view: &View) -> Result<(), String> {
+    let before = read(db, &view.scope)?;
+    channel_work::placement::observe_view_transition(db, &before, view)?;
+    if let Scope::Channel(id) = &view.scope {
+        let primary = |view: &View| {
+            view.panes.iter().find_map(|pane| match &pane.kind {
+                crate::model::CardKind::Chat(session) => Some((
+                    pane.id,
+                    session.id,
+                    session.launch.provider,
+                    session.launch.session_id.clone(),
+                )),
+                _ => None,
+            })
+        };
+        if primary(&before) != primary(view) {
+            // A new primary conversation starts a new automatic naming choice.
+            // Manual/legacy names describe the channel and survive all moves.
+            db.execute(
+                "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
+                [id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            channel_work::renamed_in(db, *id)?;
+        }
+    }
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
         params![key(&view.scope)?, view.revision,
@@ -955,6 +1125,97 @@ mod tests {
         Pane {
             kind: CardKind::Terminal(terminal),
             ..pane()
+        }
+    }
+
+    #[test]
+    fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
+        for manual in [false, true] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            // Default titles are manual/legacy names. This case must own a
+            // genuinely inferred channel before testing automatic clearing.
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Initial inferred title".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                })
+                .unwrap();
+            let mut original = live_source_pane();
+            let CardKind::Terminal(terminal) = original.kind else {
+                unreachable!()
+            };
+            original.kind = CardKind::Chat(crate::chat::Session {
+                id: terminal.id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: terminal.launch.clone(),
+                    session_id: Some("first-thread".into()),
+                },
+                proof: terminal.continuity.live_proof(),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+            seed(&mut registry, channel, vec![original.clone()]);
+            registry
+                .apply(&if manual {
+                    ModelEdit::RetitleChannel {
+                        id: channel,
+                        title: "User chosen".into(),
+                    }
+                } else {
+                    ModelEdit::SuggestChannelTitle {
+                        id: channel,
+                        title: "Provider chosen".into(),
+                        source: crate::model::ChannelTitleSource::Provider,
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                if manual {
+                    "User chosen"
+                } else {
+                    "Provider chosen"
+                },
+                "establish the naming source before replacing the primary thread"
+            );
+            let mut successor = original.clone();
+            let CardKind::Chat(chat) = &mut successor.kind else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some("replacement-thread".into());
+            let update = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: successor,
+                },
+            );
+            registry.apply(&update).unwrap();
+            let model = registry.model().unwrap();
+            let canonical = model.channel(channel).unwrap();
+            assert_eq!(canonical.title, if manual { "User chosen" } else { "" });
+            let title: String = registry
+                .db
+                .query_row(
+                    "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                    params![channel.to_string(), canonical.ordinal],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                title, canonical.title,
+                "retained title follows the exact current canonical incarnation"
+            );
+            assert!(
+                channel_work::renamed_in(&registry.db, channel).is_err(),
+                "title synchronization cannot escape the canonical transaction"
+            );
         }
     }
 
@@ -1454,17 +1715,26 @@ mod tests {
     }
 
     #[test]
-    fn transfer_requires_the_current_process_after_same_id_successor_adoption() {
+    fn authenticated_adoption_refreshes_canonical_panes_and_stale_transfer_still_refuses() {
         use crate::{
             agent::Provider,
             agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
         };
-        for (native_chat, console, changed_launch) in [
-            (false, false, false),
-            (false, false, true),
-            (true, false, false),
-            (true, false, true),
-            (true, true, false),
+        for (native_chat, console, changed_launch, evidence) in [
+            (false, false, false, "exact"),
+            (false, false, true, "exact"),
+            (true, false, false, "exact"),
+            (true, false, true, "exact"),
+            (true, true, false, "exact"),
+            (true, false, false, "thread"),
+            (true, false, false, "recipe"),
+            (true, false, false, "proof"),
+            (true, false, false, "unproved"),
+            (true, false, false, "alias"),
+            (true, false, false, "absent"),
+            (true, false, false, "retired"),
+            (true, false, false, "changed-thread"),
+            (true, false, false, "learn-thread"),
         ] {
             let (mut r, _directory, a, b) = setup();
             let accepted = r
@@ -1515,7 +1785,7 @@ mod tests {
                     host_incarnation: crate::model::HostIncarnation::new("host"),
                 },
             };
-            let source = if native_chat {
+            let mut source = if native_chat {
                 HostedSession::Chat(crate::chat::Session {
                     id: terminal.id,
                     launch: crate::chat::Launch {
@@ -1531,6 +1801,11 @@ mod tests {
             } else {
                 HostedSession::Terminal(terminal.clone())
             };
+            if evidence == "learn-thread"
+                && let HostedSession::Chat(session) = &mut source
+            {
+                session.launch.session_id = None;
+            }
             let original = r
                 .bind_agent(accepted.agent.id, None, source.clone())
                 .unwrap();
@@ -1545,15 +1820,55 @@ mod tests {
                 }
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
-            let p = Pane {
+            let mut p = Pane {
                 id: CardId::from_uuid(original.id.as_uuid()),
                 kind: presentation(&source),
+                user_title: Some("My retained actor".into()),
+                width_fraction: 0.75,
                 ..pane()
             };
-            seed(&mut r, a, vec![p.clone()]);
+            if let CardKind::Chat(session) = &mut p.kind {
+                match evidence {
+                    "thread" => session.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                    "recipe" => session.launch.recipe.arguments.push("unrelated".into()),
+                    "proof" => {
+                        session.proof.as_mut().unwrap().host_incarnation =
+                            crate::model::HostIncarnation::new("unrelated")
+                    }
+                    "unproved" => session.proof = None,
+                    _ => {}
+                }
+            }
+            if evidence == "alias" {
+                p.id = CardId::new();
+            }
+            seed(
+                &mut r,
+                a,
+                if evidence == "absent" {
+                    vec![]
+                } else {
+                    vec![p.clone()]
+                },
+            );
+            if evidence == "retired" {
+                let removal = edit(&mut r, a, Change::Remove { id: p.id });
+                r.apply(&removal).unwrap();
+            }
+            r.apply(&ModelEdit::SuggestChannelTitle {
+                id: a,
+                title: "Retained conversation".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            })
+            .unwrap();
+            let before_adoption = r.model().unwrap();
+            let before_view = read(&r.db, &Scope::Channel(a)).unwrap();
             let mut successor = source.clone();
             match &mut successor {
                 HostedSession::Chat(session) => {
+                    if matches!(evidence, "changed-thread" | "learn-thread") {
+                        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    }
                     if changed_launch {
                         session.launch.recipe.arguments.push("successor".into());
                     } else {
@@ -1579,15 +1894,99 @@ mod tests {
                     }
                 }
             }
+            if !changed_launch && matches!(evidence, "exact" | "learn-thread") {
+                // A failed pane write must roll back Agent ownership as well.
+                r.db.execute_batch("CREATE TRIGGER reject_pane_adoption BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(ABORT, 'fixture failed pane commit'); END;").unwrap();
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .is_err()
+                );
+                assert_eq!(r.model().unwrap(), before_adoption);
+                r.db.execute_batch("DROP TRIGGER reject_pane_adoption;")
+                    .unwrap();
+                // Here the pane write succeeds first; a later ownership write
+                // must roll it back together with the model revision/sequence.
+                r.db.execute_batch("CREATE TRIGGER reject_agent_adoption BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture failed agent commit'); END;").unwrap();
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .is_err()
+                );
+                assert_eq!(r.model().unwrap(), before_adoption);
+                r.db.execute_batch("DROP TRIGGER reject_agent_adoption;")
+                    .unwrap();
+            }
             assert!(
                 r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
                     .unwrap()
             );
-            assert_eq!(
-                read(&r.db, &Scope::Channel(a)).unwrap().panes,
-                vec![p.clone()],
-                "adoption need not refresh shared panes atomically"
-            );
+            let refreshed = Pane {
+                kind: presentation(&successor),
+                ..p.clone()
+            };
+            let current = r.model().unwrap();
+            let current_agent = r.agent(original.id).unwrap();
+            let current_view = read(&r.db, &Scope::Channel(a)).unwrap();
+            assert_eq!(current.sequence, before_adoption.sequence + 1);
+            if !matches!(evidence, "exact" | "learn-thread") {
+                assert_eq!(
+                    current_view, before_view,
+                    "{evidence} must not authorize canonical pane recovery"
+                );
+                continue;
+            }
+            if !changed_launch || !native_chat {
+                assert_eq!(current_view.panes, vec![refreshed.clone()]);
+                assert_eq!(current_view.revision, before_view.revision + 1);
+                let display = crate::workspace_model::views::ManagedDisplayIndex::new(&current);
+                assert!(display.permits_projection(&current_agent, &refreshed));
+                assert!(display.resolve(&current_agent).is_some());
+                let mut ambiguous = current.clone();
+                ambiguous.views.push(current_view.clone());
+                assert!(
+                    crate::workspace_model::views::ManagedDisplayIndex::new(&ambiguous)
+                        .resolve(&current_agent)
+                        .is_none()
+                );
+                assert_eq!(current.channels, before_adoption.channels);
+                // Recreate a genuinely stale source after the atomic adoption.
+                // This simulates replacement/corrupt old evidence, rather than
+                // requiring normal holder recovery to publish an inert pane.
+                r.db.execute(
+                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
+                    params![
+                        key(&Scope::Channel(a)).unwrap(),
+                        serde_json::to_string(&vec![p.clone()]).unwrap()
+                    ],
+                )
+                .unwrap();
+                let stale_sequence = r.model().unwrap().sequence;
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .unwrap()
+                );
+                assert_eq!(
+                    read(&r.db, &Scope::Channel(a)).unwrap().panes,
+                    vec![refreshed.clone()]
+                );
+                assert_eq!(r.model().unwrap().sequence, stale_sequence + 1);
+                assert!(
+                    !r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .unwrap()
+                );
+                r.db.execute(
+                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
+                    params![
+                        key(&Scope::Channel(a)).unwrap(),
+                        serde_json::to_string(&vec![p.clone()]).unwrap()
+                    ],
+                )
+                .unwrap();
+            } else {
+                assert_eq!(
+                    current_view, before_view,
+                    "changed launch is not pane continuity"
+                );
+            }
             let change = Change::Transfer {
                 id: p.id,
                 destination: Scope::Channel(b),
@@ -1607,10 +2006,6 @@ mod tests {
                 before,
                 "stale proof/launch must preserve both views, agent and sequence"
             );
-            let refreshed = Pane {
-                kind: presentation(&successor),
-                ..p.clone()
-            };
             let refresh = edit(
                 &mut r,
                 a,
@@ -1852,4 +2247,6 @@ mod tests {
             assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
     }
+
+    include!("views/placement_tests.rs");
 }

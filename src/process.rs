@@ -1,5 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
+mod poll;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -30,7 +32,7 @@ pub(crate) const SIGTERM: i32 = 15;
 pub(crate) const SIGKILL: i32 = 9;
 /// How long the executor waits, after a child has been terminated, for the
 /// pipes to drain and for the kernel to report the exit status, before it
-/// interrupts its reader threads and returns without one.
+/// stops draining its pipes and returns without one.
 ///
 /// A bound is required rather than merely nice: a hook can `setsid` a
 /// background process that escapes the killed process group while still
@@ -41,6 +43,28 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_STDERR_LIMIT: usize = 4 * 1024 * 1024;
 const FAILURE_EXCERPT_LIMIT: usize = 64 * 1024;
+
+/// Descriptor numbers are part of an invocation's identity. Keeping the owner
+/// in both the spec and the prepared Command prevents reuse before spawn.
+#[derive(Debug, Clone)]
+struct InheritedFile(Arc<std::fs::File>);
+
+impl PartialEq for InheritedFile {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for InheritedFile {}
+
+fn validate_inherited_fd(fd: i32) -> io::Result<()> {
+    if fd < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inherited descriptors must not name standard input, output, or error",
+        ));
+    }
+    Ok(())
+}
 /// A command invocation. `program` and every argument are passed directly to
 /// [`Command`]; this type never accepts a shell command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +80,7 @@ pub struct CommandSpec {
     pub stderr_limit: usize,
     // Borrowed only during execute; the journal service holds the owning file.
     pub(crate) inherited_lease: Option<i32>,
+    inherited_files: Vec<InheritedFile>,
 }
 
 impl CommandSpec {
@@ -71,6 +96,7 @@ impl CommandSpec {
             stdout_limit: DEFAULT_STDOUT_LIMIT,
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
+            inherited_files: Vec::new(),
         }
     }
 
@@ -119,6 +145,15 @@ impl CommandSpec {
         self
     }
 
+    /// Retains the exact descriptor number used by `/proc/self/fd/<number>`.
+    /// The parent keeps CLOEXEC; only a forked child clears it. Ownership is
+    /// also retained by `to_command`, even if this spec is dropped first.
+    pub(crate) fn inherit_file(mut self, file: Arc<std::fs::File>) -> io::Result<Self> {
+        validate_inherited_fd(file.as_raw_fd())?;
+        self.inherited_files.push(InheritedFile(file));
+        Ok(self)
+    }
+
     pub fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
@@ -132,6 +167,27 @@ impl CommandSpec {
                     command.pre_exec(move || {
                         if libc::fcntl(lease, libc::F_DUPFD, 3) == -1 {
                             return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            if !self.inherited_files.is_empty() {
+                // Clone before fork. The closure owns these handles through
+                // spawn and never allocates, locks, or drops them in the child.
+                let inherited = self.inherited_files.clone();
+                // SAFETY: only async-signal-safe fcntl calls run after fork.
+                // Each fd has an owning Arc captured by this Command.
+                unsafe {
+                    command.pre_exec(move || {
+                        for file in &inherited {
+                            let fd = file.0.as_raw_fd();
+                            let flags = libc::fcntl(fd, libc::F_GETFD);
+                            if flags == -1
+                                || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                            {
+                                return Err(io::Error::last_os_error());
+                            }
                         }
                         Ok(())
                     });
@@ -303,13 +359,10 @@ impl ProcessOutput {
     }
 }
 
-/// What woke a blocking process wait.
+/// Test resource gates can observe cancellation without a descriptor.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitEvent {
-    Exited,
-    Stdout,
-    Stderr,
-    Stdin,
     Cancelled,
 }
 
@@ -336,18 +389,40 @@ struct CancellationState {
 /// Bounded signals coalesce repeated notifications and never block cancellation.
 #[derive(Debug)]
 enum CancellationNotifier {
+    #[cfg(all(test, feature = "ui"))]
     Process(mpsc::Sender<WaitEvent>),
     Signal(mpsc::SyncSender<()>),
+    Descriptor(Arc<OwnedFd>),
 }
 
 impl CancellationNotifier {
     fn notify(&self) {
         match self {
+            #[cfg(all(test, feature = "ui"))]
             Self::Process(sender) => {
                 let _ = sender.send(WaitEvent::Cancelled);
             }
             Self::Signal(sender) => {
                 let _ = sender.try_send(());
+            }
+            Self::Descriptor(descriptor) => {
+                let one = 1_u64;
+                loop {
+                    // SAFETY: the Arc retains this nonblocking eventfd; writing
+                    // one u64 only wakes the executor and cannot block cancel.
+                    let written = unsafe {
+                        libc::write(
+                            descriptor.as_raw_fd(),
+                            (&one as *const u64).cast(),
+                            std::mem::size_of::<u64>(),
+                        )
+                    };
+                    if written >= 0
+                        || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -375,6 +450,7 @@ impl CancellationToken {
 
     /// Registers a waker for the duration of one blocking wait. The returned
     /// guard deregisters it, so a long-lived token does not accumulate senders.
+    #[cfg(all(test, feature = "ui"))]
     pub(crate) fn register(&self, waker: mpsc::Sender<WaitEvent>) -> CancellationWaker<'_> {
         self.register_notifier(CancellationNotifier::Process(waker))
     }
@@ -426,13 +502,10 @@ pub trait ProcessExecutor: Send + Sync {
 
 /// Runs commands as real child processes.
 ///
-/// The wait path blocks rather than polls: a dedicated thread owns the `Child`
-/// and observes exit without reaping until group cleanup finishes; pipe readers
-/// announce their own completion, and
-/// cancellation arrives through [`CancellationToken`]. A `git` or `gh`
-/// invocation therefore pays no polling latency and causes no timer wakeups,
-/// which matters because a single sidebar refresh issues dozens of them back to
-/// back.
+/// The caller multiplexes nonblocking pipes, pushed cancellation and the
+/// original child's pidfd in one readiness wait. Ordinary commands create no
+/// helper threads and have no timer polling latency. A bounded-cleanup fallback
+/// retains one reaper only if SIGKILL cannot yet end a kernel-blocked task.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessExecutor;
 
@@ -460,300 +533,7 @@ impl ProcessExecutor for SystemProcessExecutor {
             ));
         }
 
-        let mut child = spec.to_command().spawn().map_err(|error| ProcessFailure {
-            kind: ProcessFailureKind::Spawn,
-            program: spec.program.clone(),
-            exit_code: None,
-            signal: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            message: error.to_string(),
-            started: false,
-        })?;
-
-        // Capture the original process capability before any exit observation.
-        // Reopening a pidfd later could identify a recycled replacement instead.
-        let identity = child_identity(&child);
-
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let status = terminate_process_tree(child, identity);
-                return Err(ProcessFailure {
-                    kind: ProcessFailureKind::Io,
-                    program: spec.program.clone(),
-                    exit_code: status.as_ref().and_then(ExitStatus::code),
-                    signal: status.as_ref().and_then(exit_signal),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    message: "stdout pipe was unavailable".into(),
-                    started: true,
-                });
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                let status = terminate_process_tree(child, identity);
-                return Err(ProcessFailure {
-                    kind: ProcessFailureKind::Io,
-                    program: spec.program.clone(),
-                    exit_code: status.as_ref().and_then(ExitStatus::code),
-                    signal: status.as_ref().and_then(exit_signal),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    message: "stderr pipe was unavailable".into(),
-                    started: true,
-                });
-            }
-        };
-
-        // Every thread below reports on `events`, and so does cancellation, so
-        // the main path can block on one receive instead of waking on a timer.
-        let (events, event_source) = mpsc::channel();
-        // Registered before the loop's first cancellation check, so a `cancel`
-        // racing this setup either sets the flag that check reads or wakes the
-        // blocking receive.
-        let _cancellation_waker = cancellation.register(events.clone());
-
-        // Interrupting a thread blocked on a pipe needs a descriptor that
-        // thread can poll alongside the pipe. Closing `stop_signal` makes
-        // `poll` report `POLLHUP` on `stop`, so the thread wakes immediately,
-        // with no timer and no polling interval.
-        let (stop, stop_signal) = match stop_pipe() {
-            Ok(pair) => pair,
-            Err(error) => {
-                let status = terminate_process_tree(child, identity);
-                return Err(ProcessFailure {
-                    kind: ProcessFailureKind::Io,
-                    program: spec.program.clone(),
-                    exit_code: status.as_ref().and_then(ExitStatus::code),
-                    signal: status.as_ref().and_then(exit_signal),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    message: format!("interrupt pipe was unavailable: {error}"),
-                    started: true,
-                });
-            }
-        };
-        let stop = Arc::new(stop);
-
-        let stdout_exceeded = Arc::new(AtomicBool::new(false));
-        let stdout_reader = {
-            let exceeded = Arc::clone(&stdout_exceeded);
-            let events = events.clone();
-            let limit = spec.stdout_limit;
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || {
-                let result = read_pipe(stdout, limit, &exceeded, &stop);
-                let _ = events.send(WaitEvent::Stdout);
-                result
-            })
-        };
-        let stderr_exceeded = Arc::new(AtomicBool::new(false));
-        let stderr_reader = {
-            let exceeded = Arc::clone(&stderr_exceeded);
-            let events = events.clone();
-            let limit = spec.stderr_limit;
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || {
-                let result = read_pipe(stderr, limit, &exceeded, &stop);
-                let _ = events.send(WaitEvent::Stderr);
-                result
-            })
-        };
-
-        let mut stdin_done = spec.stdin.is_none();
-        let stdin_writer = match (spec.stdin.clone(), child.stdin.take()) {
-            (Some(bytes), Some(stdin)) => {
-                let events = events.clone();
-                let stop = Arc::clone(&stop);
-                Some(thread::spawn(move || {
-                    let result = write_stdin(stdin, &bytes, &stop);
-                    let _ = events.send(WaitEvent::Stdin);
-                    result
-                }))
-            }
-            _ => None,
-        };
-
-        // Observe exit without releasing the leader's PID. The waiter only
-        // reaps after every possible group signal and pipe cleanup is finished.
-        let mut waiter = GroupWaiter::new(child, identity, Some(events.clone()));
-        let exit_source = &waiter.exit_source;
-
-        let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
-        let mut status = None;
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        let mut terminal_kind = None;
-        let mut wait_error = None;
-        loop {
-            if cancellation.is_cancelled() {
-                terminal_kind = Some(ProcessFailureKind::Cancelled);
-            } else if stdout_exceeded.load(Ordering::Acquire)
-                || stderr_exceeded.load(Ordering::Acquire)
-            {
-                terminal_kind = Some(ProcessFailureKind::OutputLimit);
-            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                terminal_kind = Some(ProcessFailureKind::TimedOut);
-            }
-
-            if terminal_kind.is_some() {
-                status = terminate_process_group(&waiter, status);
-                break;
-            }
-
-            if status.is_some() && stdout_done && stderr_done && stdin_done {
-                break;
-            }
-
-            let event = match deadline {
-                Some(deadline) => {
-                    event_source.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                }
-                None => event_source
-                    .recv()
-                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-            };
-            match event {
-                Ok(WaitEvent::Exited) => match exit_source.recv() {
-                    Ok(Ok(exit)) => status = Some(exit),
-                    Ok(Err(error)) => {
-                        wait_error = Some(error.to_string());
-                        terminal_kind = Some(ProcessFailureKind::Io);
-                        status = terminate_process_group(&waiter, None);
-                        break;
-                    }
-                    Err(_) => {
-                        wait_error = Some("process waiter reported no exit status".into());
-                        terminal_kind = Some(ProcessFailureKind::Io);
-                        status = terminate_process_group(&waiter, None);
-                        break;
-                    }
-                },
-                Ok(WaitEvent::Stdout) => stdout_done = true,
-                Ok(WaitEvent::Stderr) => stderr_done = true,
-                Ok(WaitEvent::Stdin) => stdin_done = true,
-                // Cancellation and the deadline are both re-read at the top of
-                // the loop; these wakeups carry nothing else.
-                Ok(WaitEvent::Cancelled) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                // Unreachable while the cancellation waker holds a sender, but
-                // breaking keeps a lost wakeup from turning into a hang; the
-                // missing exit status is reported below.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        // Bounded cleanup. Every path that breaks out of the loop early has
-        // already signalled the child's process group, but a process the hook
-        // chain left *outside* that group can still hold a pipe open. So the
-        // readers get a short grace to drain what was already written, and are
-        // then interrupted. Without that interrupt the joins below would never
-        // return, and the repository mutation lock the caller holds around this
-        // call would never be released.
-        let cleanup_deadline = Instant::now() + CLEANUP_GRACE;
-        while !(stdout_done && stderr_done && stdin_done) {
-            let remaining = cleanup_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match event_source.recv_timeout(remaining) {
-                Ok(WaitEvent::Stdout) => stdout_done = true,
-                Ok(WaitEvent::Stderr) => stderr_done = true,
-                Ok(WaitEvent::Stdin) => stdin_done = true,
-                Ok(WaitEvent::Exited) if status.is_none() => {
-                    status = exit_source
-                        .recv_timeout(remaining)
-                        .ok()
-                        .and_then(Result::ok);
-                }
-                Ok(WaitEvent::Exited | WaitEvent::Cancelled) => {}
-                Err(_) => break,
-            }
-        }
-        // Wakes both readers and the stdin writer out of `poll`, which is what
-        // bounds all three joins below.
-        drop(stop_signal);
-
-        let stdin_error = stdin_writer.and_then(|writer| match writer.join() {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("stdin: {error}")),
-            Err(_) => Some("stdin writer panicked".into()),
-        });
-        let (stdout_read, stderr_read, pipe_error) = join_readers(stdout_reader, stderr_reader);
-        let output_limit_exceeded = stdout_read.limit_exceeded || stderr_read.limit_exceeded;
-        if output_limit_exceeded && terminal_kind.is_none() {
-            status = terminate_process_group(&waiter, status);
-            terminal_kind = Some(ProcessFailureKind::OutputLimit);
-        }
-        // Reaping permission is released only after the final output-limit
-        // cleanup above. An uninterruptible child still leaves one bounded
-        // waiter thread until its eventual exit; no polling or unbounded join.
-        if let Some(error) = waiter.finish(status.is_some()) {
-            wait_error = Some(error);
-            if terminal_kind.is_none() {
-                terminal_kind = Some(ProcessFailureKind::Io);
-            }
-        }
-
-        let stdout = stdout_read.output;
-        let stderr = stderr_read.output;
-        if let Some(kind) = terminal_kind {
-            let message = match kind {
-                ProcessFailureKind::Cancelled => "operation was cancelled".into(),
-                ProcessFailureKind::TimedOut => match spec.timeout {
-                    Some(timeout) => format!("operation timed out after {timeout:?}"),
-                    None => "operation timed out".into(),
-                },
-                ProcessFailureKind::OutputLimit => output_limit_message(
-                    stdout_read.limit_exceeded,
-                    spec.stdout_limit,
-                    stderr_read.limit_exceeded,
-                    spec.stderr_limit,
-                ),
-                ProcessFailureKind::Io => match (wait_error, pipe_error) {
-                    (Some(wait), Some(pipe)) => format!("{wait}; {pipe}"),
-                    (Some(error), None) | (None, Some(error)) => error,
-                    (None, None) => "process wait failed".into(),
-                },
-                _ => unreachable!(),
-            };
-            return Err(ProcessFailure {
-                kind,
-                program: spec.program.clone(),
-                exit_code: status.as_ref().and_then(ExitStatus::code),
-                signal: status.as_ref().and_then(exit_signal),
-                stdout: failure_excerpt(stdout),
-                stderr: failure_excerpt(stderr),
-                message,
-                started: true,
-            });
-        }
-
-        let status = status.ok_or_else(|| ProcessFailure {
-            kind: ProcessFailureKind::Io,
-            program: spec.program.clone(),
-            exit_code: None,
-            signal: None,
-            stdout: failure_excerpt(stdout.clone()),
-            stderr: failure_excerpt(stderr.clone()),
-            message: "process ended without an exit status".into(),
-            started: true,
-        })?;
-        if let Some(message) = stdin_error.or(pipe_error) {
-            return Err(ProcessFailure {
-                kind: ProcessFailureKind::Io,
-                program: spec.program.clone(),
-                exit_code: status.code(),
-                signal: exit_signal(&status),
-                stdout: failure_excerpt(stdout),
-                stderr: failure_excerpt(stderr),
-                message,
-                started: true,
-            });
-        }
-        Ok(ProcessOutput::from_parts(status, stdout, stderr))
+        poll::execute(spec, cancellation)
     }
 }
 
@@ -825,11 +605,7 @@ struct GroupWaiter {
 }
 
 impl GroupWaiter {
-    fn new(
-        mut child: std::process::Child,
-        identity: io::Result<OwnedFd>,
-        events: Option<mpsc::Sender<WaitEvent>>,
-    ) -> Self {
+    fn new(mut child: std::process::Child, identity: io::Result<OwnedFd>) -> Self {
         let group = child.id();
         // Establish authority before the caller can signal. An already reaped
         // Child may retain a cached status but no longer owns its numeric PID.
@@ -871,9 +647,6 @@ impl GroupWaiter {
             }
             // Queue status before wakeup. WNOWAIT still pins the leader here.
             let _ = exit.send(status);
-            if let Some(events) = events {
-                let _ = events.send(WaitEvent::Exited);
-            }
             let _ = permission.recv();
             // Reaping and signalling share this lock, and permission only
             // arrives after the executor gives up all remaining group signals.
@@ -1049,7 +822,7 @@ fn terminate_process_tree(
     child: std::process::Child,
     identity: io::Result<OwnedFd>,
 ) -> Option<ExitStatus> {
-    let mut waiter = GroupWaiter::new(child, identity, None);
+    let mut waiter = GroupWaiter::new(child, identity);
     let status = terminate_process_group(&waiter, None);
     if waiter.finish(status.is_some()).is_some() {
         None
@@ -1061,32 +834,6 @@ fn terminate_process_tree(
 struct PipeRead {
     output: Vec<u8>,
     limit_exceeded: bool,
-}
-
-/// A descriptor pair whose only purpose is to interrupt a thread blocked on a
-/// pipe, returned as `(read, write)`.
-///
-/// `poll` reports `POLLHUP` on the read end once every write end is closed, and
-/// reports it whether or not the caller asked for any event, so dropping the
-/// write end is a complete wakeup that carries no data and needs no timer.
-/// `O_CLOEXEC` keeps the write end out of the child, which would otherwise hold
-/// the hangup off for as long as the child — or anything it spawned — lived.
-fn stop_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut descriptors = [-1_i32; 2];
-    // SAFETY: `descriptors` is a live two-element array of `c_int`, which is
-    // exactly the buffer `pipe2` writes its read and write ends into.
-    let created = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
-    if created < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `pipe2` reported success, so both descriptors are freshly opened
-    // and owned by this process alone; taking ownership cannot double-close.
-    unsafe {
-        Ok((
-            OwnedFd::from_raw_fd(descriptors[0]),
-            OwnedFd::from_raw_fd(descriptors[1]),
-        ))
-    }
 }
 
 /// Puts `descriptor` into non-blocking mode, so a read or write reports
@@ -1104,166 +851,6 @@ fn set_nonblocking(descriptor: BorrowedFd<'_>) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Blocks until `subject` is ready for `events`, or until `stop` is signalled.
-///
-/// `false` means the wait was interrupted and the caller must not touch
-/// `subject` again.
-fn wait_until_ready(
-    subject: BorrowedFd<'_>,
-    events: i16,
-    stop: BorrowedFd<'_>,
-) -> io::Result<bool> {
-    let mut watched = [
-        libc::pollfd {
-            fd: subject.as_raw_fd(),
-            events,
-            revents: 0,
-        },
-        // No requested events: a hangup is reported regardless, and a hangup is
-        // the only thing this descriptor ever produces.
-        libc::pollfd {
-            fd: stop.as_raw_fd(),
-            events: 0,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: `watched` is a fully initialised two-element array that
-        // outlives the call, and both descriptors are borrowed for its
-        // duration, so neither can be closed while the kernel inspects them.
-        let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as libc::nfds_t, -1) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        // Checked first: once cleanup has begun there is no reason to keep
-        // draining, even if both descriptors woke together.
-        if watched[1].revents != 0 {
-            return Ok(false);
-        }
-        if watched[0].revents != 0 {
-            return Ok(true);
-        }
-    }
-}
-
-fn read_pipe(
-    mut pipe: impl Read + AsFd,
-    limit: usize,
-    limit_exceeded: &AtomicBool,
-    stop: &OwnedFd,
-) -> io::Result<PipeRead> {
-    set_nonblocking(pipe.as_fd())?;
-    let mut output = Vec::with_capacity(limit.min(8 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let read = match pipe.read(&mut buffer) {
-            Ok(0) => {
-                return Ok(PipeRead {
-                    output,
-                    limit_exceeded: false,
-                });
-            }
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if wait_until_ready(pipe.as_fd(), libc::POLLIN, stop.as_fd())? {
-                    continue;
-                }
-                // Interrupted. Whatever still holds the write end is outside
-                // this executor's reach — a process the hook chain put in
-                // another session — and the caller is already returning the
-                // failure that explains why the command was abandoned.
-                return Ok(PipeRead {
-                    output,
-                    limit_exceeded: false,
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..read.min(remaining)]);
-        if read > remaining {
-            limit_exceeded.store(true, Ordering::Release);
-            return Ok(PipeRead {
-                output,
-                limit_exceeded: true,
-            });
-        }
-    }
-}
-
-/// Writes `bytes` to a child's stdin and closes it, interruptibly.
-///
-/// A child that exits without reading leaves this reporting `BrokenPipe`, which
-/// is the caller's business. The interrupt exists for the other case: a
-/// background process that inherited the read end and never reads from it,
-/// against which a blocking `write_all` has no defence at all.
-fn write_stdin(
-    mut stdin: std::process::ChildStdin,
-    bytes: &[u8],
-    stop: &OwnedFd,
-) -> io::Result<()> {
-    set_nonblocking(stdin.as_fd())?;
-    let mut written = 0;
-    while written < bytes.len() {
-        match stdin.write(&bytes[written..]) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(count) => written += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !wait_until_ready(stdin.as_fd(), libc::POLLOUT, stop.as_fd())? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "interrupted before the whole input was written",
-                    ));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    stdin.flush()
-}
-
-fn join_readers(
-    stdout: thread::JoinHandle<io::Result<PipeRead>>,
-    stderr: thread::JoinHandle<io::Result<PipeRead>>,
-) -> (PipeRead, PipeRead, Option<String>) {
-    fn join_one(
-        name: &'static str,
-        reader: thread::JoinHandle<io::Result<PipeRead>>,
-    ) -> (PipeRead, Option<String>) {
-        match reader.join() {
-            Ok(Ok(read)) => (read, None),
-            Ok(Err(error)) => (
-                PipeRead {
-                    output: Vec::new(),
-                    limit_exceeded: false,
-                },
-                Some(format!("{name}: {error}")),
-            ),
-            Err(_) => (
-                PipeRead {
-                    output: Vec::new(),
-                    limit_exceeded: false,
-                },
-                Some(format!("{name} reader panicked")),
-            ),
-        }
-    }
-    let (stdout, stdout_error) = join_one("stdout", stdout);
-    let (stderr, stderr_error) = join_one("stderr", stderr);
-    let error = match (stdout_error, stderr_error) {
-        (Some(stdout), Some(stderr)) => Some(format!("{stdout}; {stderr}")),
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (None, None) => None,
-    };
-    (stdout, stderr, error)
 }
 
 fn output_limit_message(
@@ -1291,6 +878,77 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn inherited_directory_survives_spec_drop_and_path_replacement() {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("selected");
+        std::fs::create_dir(&path).unwrap();
+        let root = crate::fs_safety::Root::open(&path).unwrap();
+        let metadata = root.metadata().unwrap();
+        let retained = Arc::new(root.retained_directory().unwrap());
+        let number = retained.as_raw_fd();
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c", "exec /usr/bin/stat -Lc '%d:%i' \"$1\"", "fixture"])
+            .arg(format!("/proc/self/fd/{number}"))
+            .inherit_file(retained.clone())
+            .unwrap();
+        let clone = spec.clone();
+        assert_eq!(spec, clone);
+        let mut command = clone.to_command();
+        drop(clone);
+        drop(spec);
+        drop(retained);
+        drop(root);
+        std::fs::rename(&path, temporary.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let replacement = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            (metadata.dev(), metadata.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn inherited_file_keeps_parent_cloexec_and_distinct_descriptor_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = Arc::new(std::fs::File::open(temporary.path()).unwrap());
+        let duplicate = Arc::new(original.try_clone().unwrap());
+        let descriptor = original.as_raw_fd();
+        // SAFETY: fcntl only inspects the live, owned descriptor.
+        let before = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_ne!(before & libc::FD_CLOEXEC, 0);
+        let spec = CommandSpec::new("/usr/bin/stat")
+            .args(["-L", &format!("/proc/self/fd/{descriptor}")])
+            .inherit_file(original.clone())
+            .unwrap();
+        let other = CommandSpec::new("/usr/bin/stat")
+            .args(["-L", &format!("/proc/self/fd/{descriptor}")])
+            .inherit_file(duplicate)
+            .unwrap();
+        assert_ne!(spec, other);
+        assert!(spec.to_command().output().unwrap().status.success());
+        // SAFETY: original still owns the descriptor after child execution.
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, before);
+        for fd in [-1, 0, 1, 2] {
+            assert!(validate_inherited_fd(fd).is_err());
+        }
+        assert!(validate_inherited_fd(descriptor).is_ok());
+    }
+
     use std::fs;
 
     #[test]
@@ -1302,8 +960,7 @@ mod tests {
             .spawn()
             .unwrap();
         let original = child_identity(&child).unwrap();
-        let mut waiter =
-            GroupWaiter::new(child, Err(io::Error::from_raw_os_error(libc::EMFILE)), None);
+        let mut waiter = GroupWaiter::new(child, Err(io::Error::from_raw_os_error(libc::EMFILE)));
         assert_eq!(
             waiter
                 .exit_source
@@ -1412,7 +1069,7 @@ sys.exit(7)
             if lost {
                 assert_eq!(child.wait().unwrap().code(), Some(7));
             }
-            let mut waiter = GroupWaiter::new(child, Ok(identity), None);
+            let mut waiter = GroupWaiter::new(child, Ok(identity));
             let observed = waiter
                 .exit_source
                 .recv_timeout(Duration::from_secs(2))
@@ -1551,7 +1208,7 @@ sys.exit(7)
             }
         }
         let cleanup = Cleanup(victim_identity);
-        let mut waiter = GroupWaiter::new(original, Ok(identity), None);
+        let mut waiter = GroupWaiter::new(original, Ok(identity));
         assert_eq!(
             waiter
                 .exit_source

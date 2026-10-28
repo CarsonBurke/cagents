@@ -385,16 +385,18 @@ set -eu
 [ "$(git config --get cagents.inherited)" = parameters ]
 [ "$(git config --get cagents.count)" = count ]
 [ "$(git config --get core.fsmonitor)" = false ]
-/bin/cat >/dev/null
+/bin/cat > "$CAGENTS_BRANCH_RACE_ROOT/delegate-input.$1"
 printf '%s\n' "$1" >> "$CAGENTS_BRANCH_RACE_ROOT/policy-phases"
 "##,
                 )
                 .unwrap();
                 fs::set_permissions(&delegate, fs::Permissions::from_mode(0o700)).unwrap();
                 let hook = hooks.join("reference-transaction");
+                let quoted_delegate =
+                    format!("'{}'", delegate.to_str().unwrap().replace('\'', "'\\''"));
                 fs::write(
                     &hook,
-                    "#!/bin/sh\n/bin/cat > \"$CAGENTS_BRANCH_RACE_ROOT/policy-input.$1\"\nexec git hook run cagents-policy -- \"$@\"\n",
+                    format!("#!/bin/sh\n/bin/cat > \"$CAGENTS_BRANCH_RACE_ROOT/policy-input.$1\"\nexec {quoted_delegate} \"$@\" < \"$CAGENTS_BRANCH_RACE_ROOT/policy-input.$1\"\n"),
                 )
                 .unwrap();
                 hook
@@ -429,6 +431,10 @@ printf '%s\n' "$1" >> "$CAGENTS_BRANCH_RACE_ROOT/policy-phases"
                     fs::read_to_string(root.join("policy-input.prepared"))
                         .unwrap()
                         .contains(" refs/heads/topic\n")
+                );
+                assert_eq!(
+                    fs::read(root.join("delegate-input.prepared")).unwrap(),
+                    fs::read(root.join("policy-input.prepared")).unwrap()
                 );
             } else {
                 assert!(result.is_err());
