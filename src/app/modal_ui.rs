@@ -262,6 +262,10 @@ impl Stack {
 impl Cagents {
     fn modal_instance(&self, modal: Modal) -> Option<Instance> {
         match modal {
+            Modal::Discard => self
+                .sidebar_state
+                .pending_discard()
+                .map(|pending| Instance::Operation(pending.instance)),
             Modal::Project(role) => self
                 .project_ui
                 .modal_target(role)
