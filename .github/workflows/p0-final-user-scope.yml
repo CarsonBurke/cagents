@@ -27,7 +27,7 @@ jobs:
     name: Final439 exact HOST parents in natural User scope
     if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 160
     env:
       P0_EVIDENCE_DIR: /tmp/p0-final-user-scope-host-${{ github.run_id }}-${{ github.run_attempt }}
       CARGO_TARGET_DIR: /tmp/p0-final-user-scope-host-target-${{ github.run_id }}-${{ github.run_attempt }}
@@ -303,9 +303,410 @@ jobs:
 
       - name: Preserve focused HOST qualification evidence
         if: always()
+        timeout-minutes: 10
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: p0-final-user-scope-host-${{ github.event.pull_request.head.sha }}
+          path: ${{ env.P0_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  ui-final439:
+    name: Exact439 UI23 and cold12 parents in natural hosted User scope
+    if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 210
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.93.0
+      CARGO_TARGET_DIR: /tmp/p0-final-ui-target-${{ github.run_id }}-${{ github.run_attempt }}
+      P0_EVIDENCE_DIR: /tmp/p0-final-user-scope-ui-${{ github.run_id }}-${{ github.run_attempt }}
+      P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
+      P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
+      P0_PRODUCT_HEAD: 439444b44611a1c05997f1b34f88b9d993411926
+      P0_PRODUCT_TREE: 0208332031f8a8499cabf1e5d5b652ab4ab43057
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Reject inherited roles before checkout or fixture isolation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          forbidden = sorted(name for name in os.environ
+                             if name.startswith('CAGENTS')
+                             or name in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'})
+          assert not forbidden, f'Inherited role/context names present: {forbidden}'
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          evidence.mkdir(mode=0o700)
+          (evidence / 'natural-user-preflight.json').write_text(json.dumps({
+              'hosted_runner': True, 'forbidden_names_present': forbidden,
+              'empty_present_values_also_refused': True,
+              'authority_or_role_removed_or_replaced': False,
+              'scope': 'Natural launch preflight, before fixture path isolation',
+          }, indent=2) + '\n')
+          PY
+
+      - name: Check out the immutable same-repository control head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Archive control, setup and exact product source binding
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          assert not [n for n in os.environ if n.startswith('CAGENTS')
+                      or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'}]
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          control_base = '4d18d788d03588621907b423a2df0e129f6e689c'
+          product = '439444b44611a1c05997f1b34f88b9d993411926'
+          tree = '0208332031f8a8499cabf1e5d5b652ab4ab43057'
+          assert control_base == os.environ['P0_CONTROL_BASE']
+          assert product == os.environ['P0_PRODUCT_HEAD'] and tree == os.environ['P0_PRODUCT_TREE']
+          workflow = '.github/workflows/p0-final-user-scope.yml'
+          setup = '.github/actions/setup-linux-build/action.yml'
+          setup_blob = 'f24f0b0a90c31306518ff7253463a52b63a3c0e3'
+          head = git('rev-parse', 'HEAD')
+          assert head == os.environ['P0_CONTROL_HEAD']
+          # Main-based control and immutable product source stay distinct.
+          # Fetch only the reviewed public product object, never a branch tip.
+          fetched = subprocess.run(['git', 'fetch', '--no-tags', 'origin', product],
+                                   capture_output=True, text=True, check=True)
+          (evidence / 'product-fetch.stdout').write_text(fetched.stdout)
+          (evidence / 'product-fetch.stderr').write_text(fetched.stderr)
+          assert git('rev-parse', product + '^{tree}') == tree
+          assert not git('status', '--porcelain')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', control_base, head], check=True)
+          assert git('diff', '--name-only', control_base, head).splitlines() == [workflow]
+          assert git('rev-parse', head + ':' + setup) == setup_blob
+          assert git('rev-parse', product + ':' + setup) == setup_blob
+          paths = [
+              'Cargo.toml', 'Cargo.lock', 'build.rs', setup,
+              'src/agent_execution.rs', 'src/app.rs', 'src/app/shared_views.rs',
+              'src/app/shared_views/tests/startup_admission.rs',
+              'src/app/shared_views/tests/history_start.rs',
+              'src/app/chat_ui/pending_admission.rs',
+              'src/app/chat_ui/pending_admission_retry_view_tests.rs',
+              'src/app/chat_ui.rs',
+              'src/app/chat_ui/retained_history_admission_tests.rs',
+              'src/chat/client.rs',
+              'src/chat/client/saved_history_fixture.rs',
+              'src/app/startup_gate.rs',
+              'src/session.rs',
+              'src/persistence.rs',
+          ]
+          def blob(path):
+              return subprocess.check_output(['git', 'show', product + ':' + path])
+          product_hashes = {p: hashlib.sha256(blob(p)).hexdigest() for p in paths}
+          assert product_hashes['src/app/chat_ui/retained_history_admission_tests.rs'] == '91ca4d1de27dab264bb3a63691b068d3259690dc09d40916dc1a5907a355be3c'
+          workflow_bytes = pathlib.Path(workflow).read_bytes()
+          setup_bytes = pathlib.Path(setup).read_bytes()
+          (evidence / 'workflow-control.yml').write_bytes(workflow_bytes)
+          (evidence / 'setup-action.yml').write_bytes(setup_bytes)
+          (evidence / 'control-source.json').write_text(json.dumps({
+              'control_head': head, 'control_tree': git('rev-parse', 'HEAD^{tree}'),
+              'control_base': control_base, 'control_base_tree': git('rev-parse', control_base + '^{tree}'),
+              'product_head': product, 'product_tree': tree,
+              'workflow_ref': os.environ.get('GITHUB_WORKFLOW_REF'),
+              'workflow_sha': os.environ.get('GITHUB_WORKFLOW_SHA'),
+              'workflow_sha256': hashlib.sha256(workflow_bytes).hexdigest(),
+              'setup_blob': setup_blob,
+              'setup_sha256': hashlib.sha256(setup_bytes).hexdigest(),
+              'authoritative_439_source_packet_sha256': '9897e3a24aecbfff6db743621cc5778cdf231d0136d45291b3ab7a6754e173fd',
+              'cold12_leaf_sha256': '91ca4d1de27dab264bb3a63691b068d3259690dc09d40916dc1a5907a355be3c',
+              'selector_names_reference_48c_bundle_sha256': 'c6b9e1d9ca37bb134b1b72e57ab3337a5bc2abe6a9706dae50b00caad8f1a83d',
+              'source_sha256': product_hashes,
+              'scope': 'Exact439 UI35 parents only; not native, HOST, full CI or recovery acceptance',
+          }, indent=2) + '\n')
+          (evidence / 'selectors.json').write_text(json.dumps(['app::shared_views::tests::startup_admission::retired_cached_shared_chat_executes_no_provider_start', 'app::shared_views::tests::startup_admission::authoritative_offscreen_chat_executes_exact_descriptor_once', 'app::shared_views::tests::startup_admission::local_only_cached_chat_still_restores_and_preserves_its_draft', 'app::shared_views::tests::startup_admission::retired_cached_draft_stays_readable_and_cannot_start_provider', 'app::shared_views::tests::startup_admission::replacement_admission_keeps_old_draft_beside_exact_canonical_chat', 'app::shared_views::tests::startup_admission::history_picker_does_not_focus_retained_unadmitted_cache', 'app::shared_views::tests::startup_admission::startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment', 'app::shared_views::tests::startup_admission::exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver', 'app::shared_views::tests::startup_admission::canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt', 'app::shared_views::tests::startup_admission::refused_canonical_upgrade_preserves_source_draft_without_provider_activation', 'app::shared_views::tests::startup_admission::canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment', 'app::shared_views::tests::startup_admission::an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission', 'app::shared_views::tests::startup_admission::refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider', 'app::shared_views::tests::startup_admission::failed_seed_retry_rejects_stale_owner_source_registry_and_attempt', 'app::shared_views::tests::startup_admission::failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor', 'app::shared_views::tests::startup_admission::failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts', 'app::shared_views::tests::startup_admission::retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots', 'app::shared_views::tests::startup_admission::closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat', 'app::shared_views::tests::startup_admission::retry_view::saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_all_widths', 'app::shared_views::tests::startup_admission::retry_view::closed_publisher_exposes_this_window_instruction_without_retry_or_keyboard_action', 'app::shared_views::tests::startup_admission::retry_view::native_retry_keyboard_dispatches_exact_attempt_and_queued_old_action_cannot_retry_its_successor', 'app::shared_views::tests::startup_admission::retry_view::retained_retry_press_cannot_cross_attempts_and_unchanged_attempt_keeps_its_native_press', 'app::shared_views::tests::startup_admission::retry_view::disabled_retry_keeps_failure_visible_and_reenabled_retry_requires_a_fresh_press', 'app::chat_ui::tests::cold_retained_copy_opens_history_after_atomic_ack_then_requires_explicit_resume', 'app::chat_ui::tests::retained_history_lost_ack_needs_fresh_explicit_retry_and_keeps_latest_content', 'app::chat_ui::tests::retained_history_coalesced_aba_does_not_rearm_cancelled_snapshot_provenance', 'app::chat_ui::tests::retained_history_stale_context_and_changed_ack_connection_remain_inert', 'app::chat_ui::tests::strict_retained_history_wire_refuses_actor_mismatch_and_unsettled_results', 'app::chat_ui::tests::retained_history_atomic_refusal_preserves_both_copies_and_latest_retry', 'app::chat_ui::tests::retained_history_close_while_ack_pending_persists_only_closed_reader', 'app::chat_ui::tests::cold_image_only_retained_copy_can_open_history_without_a_text_draft', 'app::chat_ui::tests::generic_cached_pending_pane_cannot_spend_a_retained_copy_admission', 'app::chat_ui::tests::admitted_retained_history_detaches_later_actor_frames_and_restores_with_strict_policy', 'app::chat_ui::tests::explicit_same_allocation_resume_spends_only_reader_policy_with_content_ack', 'app::chat_ui::tests::retained_history_full_checkpoint_projects_prior_rebinding_and_unrelated_copy'], indent=2) + '\n')
+          PY
+
+      - name: Prepare the unchanged trusted Linux environment before detach
+        timeout-minutes: 20
+        uses: ./.github/actions/setup-linux-build
+
+      - name: Detach the disposable checkout to exact439 before any Cargo
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          control = json.loads((evidence / 'control-source.json').read_text())
+          assert not [n for n in os.environ if n.startswith('CAGENTS')
+                      or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'}]
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == control['control_head']
+          assert not git('status', '--porcelain')
+          result = subprocess.run(['git', 'checkout', '--detach', control['product_head']],
+                                  capture_output=True, text=True, check=True)
+          (evidence / 'product-checkout.stdout').write_text(result.stdout)
+          (evidence / 'product-checkout.stderr').write_text(result.stderr)
+          assert git('rev-parse', 'HEAD') == control['product_head']
+          assert git('rev-parse', 'HEAD^{tree}') == control['product_tree']
+          assert not git('status', '--porcelain')
+          actual = {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+                    for p in control['source_sha256']}
+          assert actual == control['source_sha256']
+          rustc = subprocess.check_output(['rustc', '--version'], text=True).strip()
+          cargo = subprocess.check_output(['cargo', '--version'], text=True).strip()
+          assert rustc.startswith('rustc 1.93.0 ')
+          assert cargo.startswith('cargo 1.93.0 ')
+          (evidence / 'product-source.json').write_text(json.dumps({
+              'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+              'status': git('status', '--porcelain'), 'source_sha256': actual,
+              'rustc_version': rustc, 'cargo_version': cargo,
+              'build_jobs': os.environ['CARGO_BUILD_JOBS'],
+              'control_metadata_not_used_as_product_metadata': True,
+          }, indent=2) + '\n')
+          PY
+
+      - name: Check only the exact439 browserless UI executable boundary
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 439444b44611a1c05997f1b34f88b9d993411926
+          test "$(git rev-parse 'HEAD^{tree}')" = 0208332031f8a8499cabf1e5d5b652ab4ab43057
+          test -z "$(git status --porcelain)"
+          python3 - <<'PY'
+          import os
+          assert not [n for n in os.environ if n.startswith('CAGENTS')
+                      or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'}]
+          PY
+          set +e
+          timeout --signal=TERM --kill-after=15s 1800s \
+            cargo check --locked --no-default-features --features ui --bin cagents-ui \
+              --message-format=json \
+              > "$P0_EVIDENCE_DIR/ui-check.jsonl" 2> "$P0_EVIDENCE_DIR/ui-check.stderr"
+          result=$?
+          set -e
+          printf '%s\n' "$result" > "$P0_EVIDENCE_DIR/ui-check.exit"
+          git status --porcelain > "$P0_EVIDENCE_DIR/ui-check.source-status"
+          test ! -s "$P0_EVIDENCE_DIR/ui-check.source-status"
+          exit "$result"
+
+      - name: Compile the UI library libtest once and bind its exact artifact
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 439444b44611a1c05997f1b34f88b9d993411926
+          test "$(git rev-parse 'HEAD^{tree}')" = 0208332031f8a8499cabf1e5d5b652ab4ab43057
+          test -z "$(git status --porcelain)"
+          python3 - <<'PY'
+          import os
+          assert not [n for n in os.environ if n.startswith('CAGENTS')
+                      or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'}]
+          PY
+          set +e
+          timeout --signal=TERM --kill-after=15s 2400s \
+            cargo test --locked --no-default-features --features ui --lib --no-run \
+              --message-format=json \
+              > "$P0_EVIDENCE_DIR/test-build.jsonl" 2> "$P0_EVIDENCE_DIR/test-build.stderr"
+          result=$?
+          set -e
+          printf '%s\n' "$result" > "$P0_EVIDENCE_DIR/test-build.exit"
+          test "$result" -eq 0
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          control = json.loads((evidence / 'control-source.json').read_text())
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == control['product_head']
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == control['product_tree']
+          assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
+          rows = [json.loads(line) for line in (evidence / 'test-build.jsonl').read_text().splitlines()]
+          check_rows = [json.loads(line) for line in (evidence / 'ui-check.jsonl').read_text().splitlines()]
+          assert all('ghostty' not in row.get('package_id', '').lower()
+                     for row in rows + check_rows), 'Unexpected Ghostty graph in UI-only route'
+          artifacts = [row for row in rows if row.get('reason') == 'compiler-artifact'
+                       and row['target']['name'] == 'cagents' and 'lib' in row['target']['kind']
+                       and row.get('executable') and row['profile']['test']]
+          assert len(artifacts) == 1
+          artifact = artifacts[0]
+          assert pathlib.Path(artifact['manifest_path']).resolve() == pathlib.Path('Cargo.toml').resolve()
+          assert 'ui' in artifact['features'] and 'host' not in artifact['features']
+          assert 'integrated-browser' not in artifact['features']
+          executable = pathlib.Path(artifact['executable']).resolve(strict=True)
+          assert executable.is_file() and os.access(executable, os.X_OK)
+          checksum = hashlib.sha256()
+          with executable.open('rb') as stream:
+              for block in iter(lambda: stream.read(1024 * 1024), b''):
+                  checksum.update(block)
+          info = executable.stat()
+          (evidence / 'test-artifact.json').write_text(json.dumps({
+              'path': str(executable), 'sha256': checksum.hexdigest(),
+              'device': info.st_dev, 'inode': info.st_ino, 'size': info.st_size,
+              'source_head': control['product_head'], 'source_tree': control['product_tree'],
+              'control_head': control['control_head'], 'compiler_artifact': artifact,
+          }, indent=2) + '\n')
+          PY
+
+      - name: Prepare short private fixture paths after natural User preflight
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, tempfile
+          assert not [n for n in os.environ if n.startswith('CAGENTS')
+                      or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'}]
+          root = pathlib.Path(tempfile.mkdtemp(prefix='u49', dir='/tmp'))
+          for leaf in ['home', 'data', 'config', 'state', 'cache', 'tmp', 'run']:
+              (root / leaf).mkdir(mode=0o700)
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              for name, leaf in [('HOME', 'home'), ('XDG_DATA_HOME', 'data'),
+                                 ('XDG_CONFIG_HOME', 'config'), ('XDG_STATE_HOME', 'state'),
+                                 ('XDG_CACHE_HOME', 'cache'), ('TMPDIR', 'tmp'),
+                                 ('XDG_RUNTIME_DIR', 'run')]:
+                  output.write(f'{name}={root / leaf}\n')
+              output.write(f'P0_UI_FIXTURE_ROOT={root}\n')
+          paths = {str(p): {'mode': oct(p.stat().st_mode & 0o777),
+                           'uid': p.stat().st_uid, 'device': p.stat().st_dev,
+                           'inode': p.stat().st_ino} for p in [root, *sorted(root.iterdir())]}
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          (evidence / 'private-paths.json').write_text(json.dumps(paths, indent=2) + '\n')
+          PY
+
+      - name: Run all35 exact parents serially and stop at the first failure
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, time
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          control = json.loads((evidence / 'control-source.json').read_text())
+          identity = json.loads((evidence / 'test-artifact.json').read_text())
+          selectors = json.loads((evidence / 'selectors.json').read_text())
+          assert len(selectors) == 35 and len(set(selectors)) == 35
+          executable = pathlib.Path(identity['path'])
+          fixture_root = pathlib.Path(os.environ['P0_UI_FIXTURE_ROOT']).resolve(strict=True)
+          results = []
+          def digest(path):
+              checksum = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b''):
+                      checksum.update(block)
+              return checksum.hexdigest()
+          def source():
+              def git(*args):
+                  return subprocess.check_output(['git', *args], text=True).strip()
+              return {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+                      'status': git('status', '--porcelain'),
+                      'source_sha256': {p: digest(pathlib.Path(p)) for p in control['source_sha256']}}
+          def exact(value):
+              return (value['head'] == control['product_head'] and value['tree'] == control['product_tree']
+                      and not value['status'] and value['source_sha256'] == control['source_sha256'])
+          def context_names():
+              return sorted(n for n in os.environ if n.startswith('CAGENTS')
+                            or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'})
+          def census():
+              # Read-only candidate census, not ancestry/custody authority.
+              # Never signal processes found through these observations.
+              found, errors = [], []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      if entry.stat().st_uid != os.getuid():
+                          continue
+                      before = (entry / 'stat').read_text()
+                      comm = before[before.index('(') + 1:before.rindex(')')]
+                      tail = before[before.rindex(')') + 2:].split()
+                      started = int(tail[19])
+                      reasons = []
+                      try:
+                          info = (entry / 'exe').stat()
+                          if (info.st_dev, info.st_ino) == (identity['device'], identity['inode']):
+                              reasons.append('exact_test_executable_file_identity')
+                      except FileNotFoundError:
+                          pass
+                      if comm == executable.name[:15]:
+                          reasons.append('matching_test_comm_candidate')
+                      args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      prefix = str(fixture_root).encode() + b'/'
+                      if any(arg == str(fixture_root).encode() or arg.startswith(prefix) for arg in args):
+                          reasons.append('private_fixture_path_argument')
+                      try:
+                          cwd = (entry / 'cwd').resolve(strict=True)
+                          if cwd == fixture_root or fixture_root in cwd.parents:
+                              reasons.append('private_fixture_working_directory')
+                      except FileNotFoundError:
+                          pass
+                      after = (entry / 'stat').read_text()
+                      if int(after[after.rindex(')') + 2:].split()[19]) != started:
+                          errors.append({'pid': int(entry.name), 'error': 'identity_changed_during_observation'})
+                      elif reasons:
+                          found.append({'pid': int(entry.name), 'start_ticks': started,
+                                        'comm': comm, 'state': tail[0], 'candidate_reasons': reasons})
+                  except (FileNotFoundError, ProcessLookupError):
+                      continue
+                  except (PermissionError, OSError, ValueError) as error:
+                      errors.append({'pid': int(entry.name), 'error': type(error).__name__})
+              return {'candidates': found, 'observation_errors': errors,
+                      'scope': 'Exact artifact and private-path candidates only; no PPID custody or signaling'}
+          for index, selector in enumerate(selectors, 1):
+              phase = evidence / f'parent-{index:02d}'
+              phase.mkdir(mode=0o700)
+              pre_source, pre_census, names = source(), census(), context_names()
+              preflight = {'selector': selector, 'source': pre_source, 'census': pre_census,
+                           'forbidden_context_names': names, 'test_sha256': digest(executable)}
+              (phase / 'preflight.json').write_text(json.dumps(preflight, indent=2) + '\n')
+              assert exact(pre_source) and not names
+              assert not pre_census['candidates'] and not pre_census['observation_errors']
+              assert preflight['test_sha256'] == identity['sha256']
+              argv = ['timeout', '--signal=TERM', '--kill-after=15s', '150s',
+                      str(executable), selector, '--exact', '--nocapture', '--test-threads=1']
+              started = time.monotonic()
+              with (phase / 'stdout').open('wb') as stdout, (phase / 'stderr').open('wb') as stderr:
+                  result = subprocess.run(argv, stdout=stdout, stderr=stderr)
+              output = (phase / 'stdout').read_text(errors='replace')
+              post_source, post_census, post_names = source(), census(), context_names()
+              hash_after = digest(executable)
+              summary = re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;.*$', output, re.M)
+              selected = output.count(f'test {selector} ...')
+              integrity = (exact(post_source) and not post_names
+                           and not post_census['candidates'] and not post_census['observation_errors']
+                           and hash_after == identity['sha256'])
+              passed = (result.returncode == 0 and selected == 1 and len(summary) == 1
+                        and len(re.findall(r'^running 1 test$', output, re.M)) == 1 and integrity)
+              record = {'index': index, 'selector': selector, 'argv': argv,
+                        'parent_exit': result.returncode, 'selected_exact_parent_count': selected,
+                        'expected_exact_parent_count': 1, 'parent_summary': summary,
+                        'passed': passed, 'integrity_qualified': integrity,
+                        'elapsed_seconds': time.monotonic() - started, 'timeout_seconds': 150,
+                        'source_before': pre_source, 'source_after': post_source,
+                        'test_artifact': identity, 'test_sha256_after': hash_after,
+                        'pre_census': pre_census, 'post_census': post_census,
+                        'forbidden_context_names_after': post_names,
+                        'stdout_sha256': digest(phase / 'stdout'), 'stderr_sha256': digest(phase / 'stderr'),
+                        'nested_child_evidence': ('Fixture source asserts child exit success and stdout containing 1 passed for its exact-selector invocation; successful child pipes are privately consumed. Failure output is retained in parent stdout/stderr. No independent raw child exit/count receipt or added child count is claimed.' if selector in selectors[:18] else 'Direct UI parent; no nested libtest execution or independent child receipt is claimed.'),
+                        'cleanup': 'Only existing test-owned guards plus GNU timeout command-group bound; observational census never signals processes. Any timeout/assisted cleanup is a failure.',
+                        'outer_timeout_status': result.returncode in (124, 137),
+                        'scope': 'UI libtest parent only; no actual native app, HOST helper or live provider qualification'}
+              (phase / 'result.json').write_text(json.dumps(record, indent=2) + '\n')
+              results.append(record)
+              (evidence / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+              assert passed, f'Exact parent {index} failed; stop before another fixture'
+          assert len(results) == 35 and all(row['passed'] for row in results)
+          (evidence / 'qualification.json').write_text(json.dumps({
+              'source_head': control['product_head'], 'source_tree': control['product_tree'],
+              'exact_parents_passed': len(results), 'test_sha256': identity['sha256'],
+              'scope': '35 serial UI parents (23 admission and 12 cold storage/frame contracts); not baseline causal controls, full CI, native UX or installed recovery',
+          }, indent=2) + '\n')
+          PY
+
+      - name: Retain the temporary qualification evidence
+        timeout-minutes: 10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p0-final-user-scope-ui-${{ github.event.pull_request.head.sha }}
           path: ${{ env.P0_EVIDENCE_DIR }}
           if-no-files-found: error
           retention-days: 14
