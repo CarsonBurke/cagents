@@ -1213,3 +1213,136 @@ fn retained_history_full_checkpoint_projects_prior_rebinding_and_unrelated_copy(
         );
     });
 }
+
+#[test]
+fn retained_history_enqueue_refusal_keeps_content_and_allows_fresh_writer_retry() {
+    chat::attachment_assets::with_test_image(|image| {
+        let mut f = retained_history_fixture(&image, true);
+        let runtime_target = chat_runtime(&f.app, f.card).target;
+        let draft = chat_runtime(&f.app, f.card).unsent_text();
+        let attachments = chat_runtime(&f.app, f.card).unsent_attachments().to_vec();
+        let image_bytes = std::fs::read(&image.path).unwrap();
+        let operation = begin_retained_history(&mut f.app, f.card);
+        let (handle, witness, peer) = framed_retained_reader(&f.app, &f.source, operation, false);
+
+        // Keep this exact writer installed, but deterministically refuse its
+        // next enqueue. Unlike a transaction failure, no reader is retained.
+        f.app.session.as_mut().unwrap().shutdown();
+        let checkpoint = retained_open_reply(&mut f.app, operation, handle, witness);
+        let receipt = account_commit_reply(checkpoint);
+        assert!(matches!(
+            &receipt,
+            Message::ChatUi(Action::SavedHistoryCommitted(target, Err(error)))
+                if *target == operation && error == "Session writer is shutting down"
+        ));
+        drop(f.app.update(receipt));
+
+        assert!(!f.app.chat_ui.phases.contains_key(&f.card));
+        let runtime = chat_runtime(&f.app, f.card);
+        assert!(!runtime.history_opening);
+        assert!(runtime.awaiting_admission());
+        assert!(runtime.retained_history_candidate);
+        assert_eq!(runtime.target, runtime_target);
+        assert_eq!(runtime.session, f.source);
+        assert_eq!(runtime.unsent_text(), draft);
+        assert_eq!(runtime.unsent_attachments(), attachments.as_slice());
+        let error = runtime.error.as_deref().unwrap();
+        assert!(error.contains("Session writer is shutting down"));
+        assert!(error.contains("Retry Open history"));
+        assert_eq!(
+            f.app.card_state(f.card).unwrap().kind,
+            CardKind::Chat(f.source.clone())
+        );
+        assert!(f.app.durable.local_only_cards.contains(&f.card));
+        assert_eq!(f.app.durable.pending_chat_admissions[&f.card], f.source);
+        assert!(!f.app.chat_ui.explicit_starts.contains_key(&f.card));
+        assert!(!f.app.chat_ui.strict_history_readers.contains_key(&f.card));
+        assert_eq!(std::fs::read(&image.path).unwrap(), image_bytes);
+
+        // A stopped writer cannot recover. Reopen the same saved workspace;
+        // its original pending source and retained-copy receipt must survive.
+        drop(f.app.session.take());
+        let (writer, restored) =
+            crate::session::SessionRuntime::open(&f.path, "retained-old-boot".into()).unwrap();
+        let restored = restored.unwrap();
+        assert_eq!(
+            restored
+                .cards
+                .iter()
+                .find(|card| card.id == f.card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(f.source.clone())
+        );
+        assert!(restored.local_only_cards.contains(&f.card));
+        assert_eq!(restored.pending_chat_admissions[&f.card], f.source);
+        assert_eq!(restored.chat_drafts[&f.card], draft);
+        assert_eq!(restored.chat_draft_attachments[&f.card], attachments);
+        assert!(writer.has_retained_history_candidate(f.card));
+        f.app.session = Some(writer);
+
+        let retry = begin_retained_history(&mut f.app, f.card);
+        assert_ne!(retry, operation);
+        for result in [Err("Stale enqueue refusal".to_owned()), Ok(())] {
+            drop(
+                f.app
+                    .handle_chat_ui(Action::SavedHistoryCommitted(operation, result)),
+            );
+            assert_eq!(f.app.chat_ui.phases[&f.card].target(), retry);
+            let runtime = chat_runtime(&f.app, f.card);
+            assert!(runtime.history_opening);
+            assert!(runtime.awaiting_admission());
+            assert!(runtime.error.is_none());
+            assert_eq!(runtime.session, f.source);
+            assert_eq!(runtime.unsent_text(), draft);
+            assert_eq!(runtime.unsent_attachments(), attachments.as_slice());
+            assert_eq!(f.app.durable.pending_chat_admissions[&f.card], f.source);
+        }
+
+        let (handle, witness, retry_peer) = framed_retained_reader(&f.app, &f.source, retry, false);
+        let reader = witness.reader().clone();
+        let checkpoint = retained_open_reply(&mut f.app, retry, handle, witness);
+        assert!(f.app.chat_awaiting_admission(f.card));
+        assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
+        assert_eq!(f.app.durable.pending_chat_admissions[&f.card], f.source);
+        let receipt = account_commit_reply(checkpoint);
+        assert!(matches!(
+            &receipt,
+            Message::ChatUi(Action::SavedHistoryCommitted(target, Ok(()))) if *target == retry
+        ));
+        drop(f.app.update(receipt));
+
+        assert!(!f.app.chat_ui.phases.contains_key(&f.card));
+        let runtime = chat_runtime(&f.app, f.card);
+        assert!(!runtime.history_opening);
+        assert!(!runtime.awaiting_admission());
+        assert_eq!(runtime.session, reader);
+        assert!(runtime.has_connected_saved_history(&runtime.snapshot));
+        assert_eq!(runtime.unsent_text(), draft);
+        assert_eq!(runtime.unsent_attachments(), attachments.as_slice());
+        assert!(!f.app.durable.pending_chat_admissions.contains_key(&f.card));
+        assert!(f.app.is_retained_history_reader(f.card, &reader));
+        assert!(!f.app.chat_ui.explicit_starts.contains_key(&f.card));
+        assert!(!f.app.cards.contains_key(&f.original));
+        let writer = f.app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let saved = writer
+            .operation_store()
+            .load_workspace(f.app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.chat_drafts[&f.card], draft);
+        assert_eq!(saved.chat_draft_attachments[&f.card], attachments);
+        assert!(!saved.pending_chat_admissions.contains_key(&f.card));
+        assert_eq!(std::fs::read(&image.path).unwrap(), image_bytes);
+        for peer in [&peer, &retry_peer] {
+            assert!(
+                peer.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| ["Connect", "Resolve", "Attach", "Read"].contains(request))
+            );
+        }
+    });
+}
