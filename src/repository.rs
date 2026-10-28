@@ -7521,6 +7521,17 @@ mod tests {
                     command: &CommandSpec,
                     cancellation: &CancellationToken,
                 ) -> Result<ProcessOutput, ProcessFailure> {
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "show-ref")
+                    {
+                        assert_eq!(
+                            command.environment.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+                            Some(&OsString::from("1")),
+                            "selected-base reads must not fetch missing promisor objects"
+                        );
+                    }
                     let output = IsolatedExecutor.execute(command, cancellation)?;
                     if command
                         .arguments
@@ -9823,6 +9834,14 @@ mod tests {
                 operation_id: OperationId::new(),
             })
             .unwrap();
+
+        assert_eq!(
+            plan.check_branch_absent
+                .environment
+                .get(OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&OsString::from("1")),
+            "checking a new branch name must not fetch missing promisor objects"
+        );
 
         for command in [
             &plan.validate_branch,
