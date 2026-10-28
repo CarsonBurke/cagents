@@ -85,6 +85,10 @@ pub(crate) struct TerminalRecord {
 }
 
 impl TerminalRecord {
+    pub(super) fn is_running(&self) -> bool {
+        self.running
+    }
+
     pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
         self.execution_recipe
             .as_ref()
@@ -579,6 +583,64 @@ impl HostState {
             },
             super::notifications::Handle::snapshot,
         )
+    }
+
+    /// Select only a Cagents window which reports this exact session. The
+    /// Session socket acknowledgement, rather than its presence, admits focus.
+    pub(super) fn tray_destination(
+        &self,
+        session: TerminalId,
+    ) -> crate::notifications::Destination {
+        use crate::notifications::{Application, Destination};
+        self.notification_watchers
+            .values()
+            .filter(|presence| {
+                presence.application == Application::Cagents && presence.sessions.contains(&session)
+            })
+            .max_by_key(|presence| {
+                (
+                    presence.focused == Some(session),
+                    presence.window == crate::instance::PRIMARY_WINDOW,
+                )
+            })
+            .map_or_else(
+                || Destination {
+                    application: Application::Cagents,
+                    window: crate::instance::PRIMARY_WINDOW.to_owned(),
+                },
+                crate::notifications::Presence::destination,
+            )
+    }
+
+    pub(super) fn queue_tray_session(
+        &mut self,
+        destination: crate::notifications::Destination,
+        session: TerminalId,
+    ) -> Result<(), String> {
+        if destination.application != crate::notifications::Application::Cagents {
+            return Err("Waiting-agent navigation requires a Cagents window".into());
+        }
+        destination.validate()?;
+        if self.notification_activation.len() >= 32
+            && !self.notification_activation.contains_key(&destination)
+        {
+            return Err("The window navigation queue is full; try again shortly".into());
+        }
+        self.notification_activation
+            .insert(destination, crate::notifications::Target::Session(session));
+        Ok(())
+    }
+
+    pub(super) fn acknowledge_tray_session(
+        &mut self,
+        destination: &crate::notifications::Destination,
+        session: TerminalId,
+    ) {
+        if self.notification_activation.get(destination)
+            == Some(&crate::notifications::Target::Session(session))
+        {
+            self.notification_activation.remove(destination);
+        }
     }
 
     pub(super) fn watch_notifications(
