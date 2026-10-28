@@ -30,6 +30,8 @@ pub(crate) struct SourceInspectionRequest {
     pub(crate) protocol: u16,
     pub(crate) proof: Option<crate::model::HostSessionProof>,
     pub(crate) require_resumable: bool,
+    #[serde(default)]
+    pub(crate) reconcile_retained: bool,
 }
 
 pub(crate) fn preflight_source_panes(
