@@ -158,6 +158,27 @@ fn revision(tx: &Transaction<'_>) -> Result<i64, String> {
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+/// Full captures contain the provider's serialized native JSON value. Compare
+/// that representation without allocating another complete serialized body.
+fn same_native_json(stream: &str, full: &str) -> bool {
+    struct Compare<'a>(&'a [u8]);
+    impl std::io::Write for Compare<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.strip_prefix(bytes).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Different native JSON")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stream) else {
+        return false;
+    };
+    let mut compare = Compare(full.as_bytes());
+    serde_json::to_writer(&mut compare, &value).is_ok() && compare.0.is_empty()
+}
 fn insert(
     tx: &Transaction<'_>,
     source: &SourceKey,
@@ -313,6 +334,35 @@ impl Store {
             if *state == SEALED || old_name != name {
                 self.raw_fence_identity(source)?;
                 return Ok(Some("A provider reused an original tool identity with a different name or arguments; the ambiguous update was discarded".into()));
+            }
+            if let Some(length) = self
+                .raw_sources
+                .open
+                .get(source)
+                .copied()
+                .filter(|n| *n > 0)
+            {
+                // Claude's complete assistant carrier precedes block_stop.
+                // Prove it describes this complete stream before its Item can
+                // replace canonical chunks. Incomplete JSON cannot establish
+                // that identity; fence only this call, never unrelated sources.
+                let streamed = self.adapter_item(&crate::chat::protocol::CanonicalItemKey::new(
+                    None,
+                    &source.source_id,
+                ))?;
+                let matches = streamed.is_some_and(|item| match item.content {
+                    ItemContent::Tool {
+                        input: streamed, ..
+                    } => streamed.len() == length && same_native_json(&streamed, input),
+                    _ => false,
+                });
+                if !matches {
+                    self.raw_fence_identity(source)?;
+                    return Ok(Some("A complete original tool carrier did not match its streamed arguments; the ambiguous update was discarded".into()));
+                }
+                // Keep the exact streamed bytes and their StreamJson origin;
+                // the equal native object proves identity, not replacement.
+                return self.raw_seal(source, length, &hash, command);
             }
         }
         let command = command_bytes(command)?;
@@ -2169,6 +2219,125 @@ mod cache_fence_tests {
             store.lock().unwrap().apply(event).unwrap();
         }
         adapter.committed();
+    }
+    #[test]
+    fn full_carriers_preserve_streamed_identity_before_block_stop() {
+        fn carrier(id: &str, input: serde_json::Value) -> serde_json::Value {
+            json!({"type":"assistant","uuid":format!("carrier-{id}"),"message":{"id":"stream-message","content":[{"type":"tool_use","id":id,"name":"Opaque","input":input}]}})
+        }
+        fn query(id: &str) -> RawSourceQuery {
+            RawSourceQuery {
+                source: key("", id),
+                field: RawSourceField::ToolInput,
+                offset: 0,
+                limit: PAGE_BYTES,
+                expected_epoch: None,
+                until: None,
+            }
+        }
+        for (streamed, complete, matches) in [
+            (r#"{ "z": 1, "actual": "first" }"#, true, false),
+            (r#"{ "actual": "fir"#, false, false),
+            (r#"{ "z": 1, "actual": "first" }"#, true, true),
+        ] {
+            let store = std::sync::Arc::new(std::sync::Mutex::new(Store::new().unwrap()));
+            let mut adapter = crate::chat::protocol::claude::fixture_adapter();
+            adapter.bind_item_reader(super::super::adapter_item_reader(&store));
+            let initial = carrier("unrelated", json!({"actual":"unrelated"}));
+            let step = adapter.receive(initial).unwrap();
+            commit(&store, adapter.as_mut(), step);
+            let stream = |event| json!({"type":"stream_event","event":event});
+            for frame in [
+                stream(json!({"type":"message_start","message":{"id":"stream-message"}})),
+                stream(
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"Opaque"}}),
+                ),
+                stream(
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":streamed}}),
+                ),
+            ] {
+                let step = adapter.receive(frame).unwrap();
+                commit(&store, adapter.as_mut(), step);
+            }
+            assert!(store.lock().unwrap().pending_input.is_some());
+            // The native assistant carrier arrives before content_block_stop.
+            // An incomplete prefix is not proof of a matching complete call.
+            let input =
+                json!({"actual":if matches || !complete {"first"} else {"different"},"z":1});
+            let step = adapter.receive(carrier("same", input)).unwrap();
+            // The adapter's canonical reader flushes pending stream input,
+            // while the emitted Full/Item have not yet changed stored identity.
+            let metadata: Vec<u8> = store
+                .lock()
+                .unwrap()
+                .db
+                .query_row("SELECT metadata FROM items WHERE id='same'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            commit(&store, adapter.as_mut(), step);
+            {
+                let mut store = store.lock().unwrap();
+                if matches {
+                    let page = store.raw_source_page(query("same")).unwrap();
+                    assert_eq!(page.text, streamed);
+                    assert_eq!(page.metadata.representation, RawRepresentation::StreamJson);
+                    assert!(page.complete && page.metadata.complete_call);
+                } else {
+                    assert!(store.raw_source_page(query("same")).is_err());
+                    assert!(store.raw_revoked(&key("", "same")).unwrap());
+                    let retained: Vec<u8> = store
+                        .db
+                        .query_row("SELECT metadata FROM items WHERE id='same'", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(retained, metadata);
+                    assert_eq!(
+                        store.field("same", 0, 0, streamed.len()).unwrap(),
+                        streamed.as_bytes()
+                    );
+                }
+                assert!(store.raw_sources.blocked.is_none());
+            }
+            let step = adapter
+                .receive(stream(json!({"type":"content_block_stop","index":0})))
+                .unwrap();
+            commit(&store, adapter.as_mut(), step);
+            {
+                let mut store = store.lock().unwrap();
+                assert!(store.raw_sources.blocked.is_none());
+                let unrelated = store.raw_source_page(query("unrelated")).unwrap();
+                assert_eq!(unrelated.text, json!({"actual":"unrelated"}).to_string());
+                if matches {
+                    let page = store.raw_source_page(query("same")).unwrap();
+                    assert_eq!(page.text, streamed);
+                    assert_eq!(page.metadata.representation, RawRepresentation::StreamJson);
+                } else {
+                    assert!(store.raw_original(&key("", "same")).is_err());
+                    if complete {
+                        assert_eq!(
+                            store.field("same", 0, 0, streamed.len()).unwrap(),
+                            streamed.as_bytes()
+                        );
+                    }
+                }
+            }
+            let step = adapter
+                .receive(carrier("fresh", json!({"actual":"fresh"})))
+                .unwrap();
+            commit(&store, adapter.as_mut(), step);
+            let page = store
+                .lock()
+                .unwrap()
+                .raw_source_page(query("fresh"))
+                .unwrap();
+            assert_eq!(page.text, json!({"actual":"fresh"}).to_string());
+            assert_eq!(
+                page.metadata.representation,
+                RawRepresentation::CanonicalJson
+            );
+        }
     }
     #[test]
     fn a_resident_optional_tool_copy_cannot_bypass_canonical_privacy_revocation() {
