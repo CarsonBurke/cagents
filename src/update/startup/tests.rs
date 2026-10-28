@@ -41,6 +41,7 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
             phase,
             waiting: 0,
             blocked: 0,
+            startup_delayed: false,
             daemon_timeout: false,
         }),
     }
@@ -78,6 +79,81 @@ fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_
         fs::metadata(state.join("status.json")).unwrap().mode(),
         meta.mode()
     );
+}
+
+#[test]
+fn current_retained_startup_and_budget_failure_messages_keep_progress_and_fences() {
+    let (_root, executable, state) = installation();
+    let mut job = job(UpdatePhase::Installing);
+    job.message = super::super::installed::WAITING_FOR_STARTUP.into();
+    write(&state, &job);
+    let lock = super::super::acquire_lock(&state).unwrap();
+    let original = fs::read(state.join("status.json")).unwrap();
+    let mut follow = Follow::default();
+    let delayed = observe_installation(&executable, LockState::Held);
+    assert_eq!(delayed.heading(), "Waiting for saved sessions to restore");
+    assert!(
+        delayed
+            .explanation()
+            .contains("taking longer than expected")
+    );
+    assert!(delayed.explanation().contains("diagnostics"));
+    assert_eq!(delayed.helper_lock, LockState::Held);
+    assert!(!delayed.can_open() && !delayed.finished() && !follow.observe(&delayed));
+    assert!(matches!(
+        super::super::acquire_lock(&state),
+        Err(super::super::UpdateError::Busy)
+    ));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
+
+    let unknown = observe_installation(&executable, LockState::Unknown);
+    assert!(!unknown.can_open() && !unknown.finished() && !follow.observe(&unknown));
+    // Only the producer's complete known message is public progress. A raw
+    // error containing similar words must neither impersonate it nor leak.
+    job.message = format!(
+        "PRIVATE_SENTINEL {}",
+        super::super::installed::WAITING_FOR_STARTUP
+    );
+    write(&state, &job);
+    let unrelated = observe_installation(&executable, LockState::Held);
+    assert_eq!(unrelated.heading(), "Installing cagents");
+    assert!(!unrelated.explanation().contains("PRIVATE_SENTINEL"));
+
+    job.phase = UpdatePhase::Failed;
+    job.message = super::super::installed::WAITING_FOR_STARTUP.into();
+    write(&state, &job);
+    let terminal_progress = observe_installation(&executable, LockState::Held);
+    assert!(!terminal_progress.job.as_ref().unwrap().startup_delayed);
+    assert!(!terminal_progress.can_open() && !follow.observe(&terminal_progress));
+
+    // This is the current producer's actual terminal budget message, with
+    // private context around it. Project a category, never that raw context.
+    job.message = format!(
+        "PRIVATE_SENTINEL /private/path: {}",
+        crate::install_guard::DAEMON_START_BUDGET_EXCEEDED
+    );
+    write(&state, &job);
+    let original = fs::read(state.join("status.json")).unwrap();
+    let retained = observe_installation(&executable, LockState::Held);
+    assert!(retained.job.as_ref().unwrap().daemon_timeout);
+    assert!(!retained.can_open() && !retained.finished() && !follow.observe(&retained));
+    assert!(matches!(
+        super::super::acquire_lock(&state),
+        Err(super::super::UpdateError::Busy)
+    ));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
+    drop(lock);
+    let settled = observe_installation(&executable, LockState::Free);
+    assert_eq!(settled.heading(), "The update did not complete");
+    assert!(
+        settled
+            .explanation()
+            .contains("Startup took longer than allowed")
+    );
+    assert!(settled.can_open() && !settled.finished() && !follow.observe(&settled));
+    assert!(!settled.explanation().contains("PRIVATE_SENTINEL"));
+    assert!(!settled.explanation().contains("/private/path"));
+    assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
 }
 
 #[test]
@@ -147,7 +223,7 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
     assert!(
         failed
             .explanation()
-            .contains("daemon did not finish starting")
+            .contains("Startup took longer than allowed")
     );
 }
 

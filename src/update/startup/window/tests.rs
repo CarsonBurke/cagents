@@ -128,6 +128,7 @@ fn real_narrow_and_roomy_buttons_keep_details_progress_and_close_reachable() {
             phase: crate::update::UpdatePhase::WaitingForIdle,
             waiting: 2,
             blocked: 0,
+            startup_delayed: false,
             daemon_timeout: false,
         });
         for action in ["Technical details", "Existing window", "Close"] {
@@ -153,6 +154,25 @@ fn real_narrow_and_roomy_buttons_keep_details_progress_and_close_reachable() {
                 .iter()
                 .all(|label| !label.contains("os error") && !label.contains("status.json"))
         );
+        let job = state.snapshot.job.as_mut().unwrap();
+        job.phase = crate::update::UpdatePhase::Installing;
+        job.waiting = 0;
+        job.startup_delayed = true;
+        for action in ["Check diagnostics", "Existing window", "Close"] {
+            let (labels, messages) = rendered(&state, width, height, Some(action));
+            assert_eq!(messages.len(), 1);
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == "Waiting for saved sessions to restore")
+            );
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label.contains("taking longer than expected"))
+            );
+            assert!(!labels.iter().any(|label| label == "Installing cagents"));
+        }
     }
 }
 
@@ -293,6 +313,7 @@ fn observed_operation(id: &str, complete: bool) -> Snapshot {
             },
             waiting: 0,
             blocked: 0,
+            startup_delayed: false,
             daemon_timeout: false,
         }),
     }

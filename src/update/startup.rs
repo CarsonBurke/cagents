@@ -34,6 +34,7 @@ struct Job {
     phase: UpdatePhase,
     waiting: usize,
     blocked: usize,
+    startup_delayed: bool,
     daemon_timeout: bool,
 }
 
@@ -88,6 +89,11 @@ impl Snapshot {
             Some(UpdatePhase::AwaitingConfirmation) => "The update needs your approval",
             Some(UpdatePhase::WaitingForIdle) => "Waiting for conversations to finish",
             Some(UpdatePhase::ClosingWindows) => "Saving and closing your windows",
+            Some(UpdatePhase::Installing)
+                if self.job.as_ref().is_some_and(|job| job.startup_delayed) =>
+            {
+                "Waiting for saved sessions to restore"
+            }
             Some(UpdatePhase::Installing) => "Installing cagents",
             Some(UpdatePhase::Complete) => "Finishing the update",
             Some(UpdatePhase::Failed) => "Waiting for update recovery to finish",
@@ -102,7 +108,7 @@ impl Snapshot {
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref() {
                 Some(job) if job.phase == UpdatePhase::Failed && job.daemon_timeout =>
-                    "The daemon did not finish starting. Open cagents to review recovery, or check diagnostics before trying again.".into(),
+                    "Startup took longer than allowed. Open cagents to review recovery, or check diagnostics before trying again.".into(),
                 Some(job) if !job.phase.is_terminal() =>
                     "The update lease is no longer held. Its last recorded phase is not proof that the update completed. You can safely try opening cagents through the normal startup checks.".into(),
                 _ => "You can try opening cagents through its normal startup checks. This does not restart the updater or discard saved work.".into(),
@@ -113,6 +119,9 @@ impl Snapshot {
         };
         if self.helper_lock != LockState::Held {
             return "The last update record could not be matched to current helper ownership. The installation is still locked; cagents will keep checking without starting another updater.".into();
+        }
+        if job.phase == UpdatePhase::Installing && job.startup_delayed {
+            return "Restoring saved sessions is taking longer than expected. The update is waiting for startup to finish while keeping saved work protected. Progress keeps updating here; Technical details lets you check diagnostics.".into();
         }
         if job.blocked > 0 {
             return "An existing window needs attention before the update can continue. Open it to review unsaved work or a pending decision.".into();
@@ -273,8 +282,13 @@ fn observe_installation(executable: &Path, installation_lock: LockState) -> Snap
                             .filter(|session| session.disposition == Disposition::Blocked)
                             .count()
                 }),
+                startup_delayed: job.phase == UpdatePhase::Installing
+                    && job.message == super::installed::WAITING_FOR_STARTUP,
                 daemon_timeout: job.message.contains("daemon did not answer within")
-                    || job.message.contains("daemon startup timed out"),
+                    || job.message.contains("daemon startup timed out")
+                    || job
+                        .message
+                        .contains(crate::install_guard::DAEMON_START_BUDGET_EXCEEDED),
             });
         }
     }
