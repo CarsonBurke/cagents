@@ -160,13 +160,13 @@ impl<'a> VirtualRows<'a> {
 }
 
 /// Reserve an external action row so hovering never shifts the transcript.
-/// Iced's hover widget also keeps controls visible while keyboard-focused.
+/// The hover also keeps its controls visible while they are keyboard-focused.
 pub(super) fn message_actions<'a>(
     message: Element<'a, Message>,
     actions: Element<'a, Message>,
     alignment: Alignment,
 ) -> Element<'a, Message> {
-    iced::widget::hover(
+    super::hover::over(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),

@@ -1,4 +1,5 @@
-//! Chat tool-row hover preserving the semantic subtree and targeted actions.
+//! Chat hover for tool rows and messages, preserving the semantic subtree,
+//! targeted actions and the scrollable's virtual offset.
 //! Adapted from iced/widget/src/helpers.rs hover at libcosmic caec74c2559924443f12fc6faf97a5bcefe6271d.
 /*
 Copyright 2019 Héctor Ramón, Iced contributors
@@ -26,10 +27,50 @@ use iced::advanced::widget::Operation as _;
 use iced::advanced::{Widget, widget::operation};
 use iced::{Element, Length, window};
 
+/// Where the hover actions sit relative to the content they act on.
+#[derive(Clone, Copy)]
+enum Placement {
+    /// Beside the content, in space reserved for them, as a tool row's header.
+    Beside(f32),
+    /// Over the content, within its bounds, as iced's own `hover` places them.
+    Over,
+}
+
+/// Actions beside a tool row's header, revealed on hover or focus.
 pub(super) fn view<'a, Message, Theme, Renderer>(
     base: impl Into<Element<'a, Message, Theme, Renderer>>,
     top: impl Into<Element<'a, Message, Theme, Renderer>>,
     spacing: f32,
+) -> Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: core::Renderer + 'a,
+{
+    hover(base, top, Placement::Beside(spacing))
+}
+
+/// iced's `hover`, laid out the same way, that keeps the scroll offset and
+/// accessibility tree of what it wraps. The pinned upstream one rebuilds its
+/// children's layouts without the scrollable's virtual offset, which anchors a
+/// context menu inside a scrolled message in content space, and it exposes no
+/// accessibility nodes for the message at all.
+pub(super) fn over<'a, Message, Theme, Renderer>(
+    base: impl Into<Element<'a, Message, Theme, Renderer>>,
+    top: impl Into<Element<'a, Message, Theme, Renderer>>,
+) -> Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: core::Renderer + 'a,
+{
+    hover(base, top, Placement::Over)
+}
+
+fn hover<'a, Message, Theme, Renderer>(
+    base: impl Into<Element<'a, Message, Theme, Renderer>>,
+    top: impl Into<Element<'a, Message, Theme, Renderer>>,
+    placement: Placement,
 ) -> Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
@@ -46,7 +87,7 @@ where
     struct Hover<'a, Message, Theme, Renderer> {
         base: Element<'a, Message, Theme, Renderer>,
         top: Element<'a, Message, Theme, Renderer>,
-        spacing: f32,
+        placement: Placement,
     }
 
     fn child_layouts<'b>(
@@ -99,6 +140,19 @@ where
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
+            let Placement::Beside(spacing) = self.placement else {
+                let base = self.base.as_widget_mut().layout(
+                    &mut tree.children[0],
+                    renderer,
+                    limits,
+                );
+                let top = self.top.as_widget_mut().layout(
+                    &mut tree.children[1],
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, base.size()),
+                );
+                return layout::Node::with_children(base.size(), vec![base, top]);
+            };
             // The hidden actions reserve exactly the space they will paint.
             // A long date moves below the header in narrow panes, leaving at
             // least half the row for the command rather than covering it.
@@ -106,11 +160,11 @@ where
                 self.top
                     .as_widget_mut()
                     .layout(&mut tree.children[1], renderer, &limits.loose());
-            let stacked = top.size().width + self.spacing > limits.max().width / 2.0;
+            let stacked = top.size().width + spacing > limits.max().width / 2.0;
             let base_limits = if stacked {
-                limits.shrink(Size::new(0.0, top.size().height + self.spacing))
+                limits.shrink(Size::new(0.0, top.size().height + spacing))
             } else {
-                limits.shrink(Size::new(top.size().width + self.spacing, 0.0))
+                limits.shrink(Size::new(top.size().width + spacing, 0.0))
             };
             let base =
                 self.base
@@ -119,17 +173,17 @@ where
             let natural = if stacked {
                 Size::new(
                     base.size().width.max(top.size().width),
-                    base.size().height + self.spacing + top.size().height,
+                    base.size().height + spacing + top.size().height,
                 )
             } else {
                 Size::new(
-                    base.size().width + self.spacing + top.size().width,
+                    base.size().width + spacing + top.size().width,
                     base.size().height.max(top.size().height),
                 )
             };
             let size = limits.resolve(Length::Fill, Length::Shrink, natural);
             let (base, top) = if stacked {
-                let y = base.size().height + self.spacing;
+                let y = base.size().height + spacing;
                 let x = (size.width - top.size().width).max(0.0);
                 (base, top.move_to(iced::Point::new(x, y)))
             } else {
@@ -438,6 +492,44 @@ where
     Element::new(Hover {
         base: base.into(),
         top: top.into(),
-        spacing,
+        placement,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_controls::accessibility_probe::{Probe, headless_renderer};
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::mouse;
+    use iced::advanced::widget::Tree;
+    use iced::{Point, Size, Vector};
+
+    #[test]
+    fn overlaid_actions_keep_their_message_scroll_offset_and_accessibility() {
+        let mut element: Element<'_, (), cosmic::Theme, cosmic::Renderer> =
+            over(Element::new(Probe), iced::widget::Space::new());
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &headless_renderer(),
+            &Limits::new(Size::ZERO, Size::new(80.0, 40.0)),
+        );
+        // Laid out as iced's hover: the actions share the message's bounds.
+        assert_eq!(node.size(), Size::new(80.0, 40.0));
+        let node = node.move_to(Point::new(0.0, 100.0));
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node).with_virtual_offset(Vector::new(0.0, 37.0)),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        let message = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().label() == Some("Retained child"))
+            .expect("the message stays in the accessibility tree");
+        // The probe reports window space, so it saw the scrollable's offset.
+        assert_eq!(message.node().bounds().map(|bounds| bounds.y0), Some(63.0));
+    }
 }
