@@ -4995,6 +4995,18 @@ mod tests {
         test_host_with_incarnation("test-incarnation")
     }
 
+    fn isolated_upgrade_test(name: &str) -> bool {
+        // Check the caller before any fixture environment is sanitized. These
+        // real User upgrades must not acquire User scope by clearing delegation.
+        assert!(
+            crate::agent_execution::Authority::from_environment()
+                == crate::agent_execution::Authority::default(),
+            "this upgrade fixture requires a genuine User/CI process"
+        );
+        crate::host::agent_execution::tests::isolated(&format!("host::state::tests::{name}"))
+            .is_some()
+    }
+
     #[test]
     fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
         assert_eq!(
@@ -6331,6 +6343,12 @@ for line in sys.stdin:
 
     #[test]
     fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+        // Retained original-child custody is process-wide, even when this
+        // fixture's local HostState has no terminals. Run independently of
+        // other libtest fixtures without bypassing that production guard.
+        if isolated_upgrade_test("a_handoff_no_window_can_still_save_stops_refusing_the_upgrade") {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Launch, Session},
@@ -6745,6 +6763,11 @@ for line in sys.stdin:
 
     #[test]
     fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        if isolated_upgrade_test(
+            "restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+        ) {
+            return;
+        }
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
         let directory = tempfile::tempdir().unwrap();
         let empty_proc = directory.path().join("proc");
@@ -6799,37 +6822,89 @@ for line in sys.stdin:
             None,
         )
         .unwrap();
-        // Restore enqueues startup visibility controls; a descriptor and an
-        // empty checkpoint read do not acknowledge their worker-side completion.
-        // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
-        restored.observe_agent().unwrap();
-        // The command FIFO barrier does not wait for the shell's startup
-        // processes. Check the actual reversible process census before asking
-        // this fixture's idle shell to checkpoint again. Keep every production
-        // refusal intact: each active snapshot is thawed before the next probe,
-        // and a shell that keeps real work remains a test failure.
+        // Read real parsed PTY output after the shell has consumed startup and
+        // this input. Split arguments keep the marker out of the echoed command.
         let idle_deadline = Instant::now() + Duration::from_secs(10);
+        restored
+            .input(b"printf '%s%s\\n' 'UPGRADE_' 'SHELL_READY'\n".to_vec())
+            .unwrap();
         loop {
-            let snapshot = restored.prepare_upgrade().unwrap();
-            let active = snapshot.active;
-            drop(snapshot);
-            if !active {
+            let snapshot = restored.snapshot();
+            restored.acknowledge_redraw(snapshot.generation);
+            let text = snapshot
+                .lines
+                .iter()
+                .map(|line| {
+                    line.cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.contains("UPGRADE_SHELL_READY") {
                 break;
             }
             assert!(
                 Instant::now() < idle_deadline,
-                "restored shell still owns active work before the next checkpoint"
+                "restored shell did not produce its parsed ready marker: {text}"
             );
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(5));
         }
-        let capability = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown_preflight(Instant::now())
-            .unwrap()
-            .capability;
-        prepare_upgrade_with(&host, capability, || Store::open(directory.path())).unwrap();
+        // Dropping an idle probe thaws the shell, so it cannot authorize a
+        // later census. Retry the actual reversible transaction only for this
+        // exact shell's active-work refusal, using a fresh capability each time.
+        let active_refusal =
+            upgrade_blockers_message(&[describe_upgrade_blocker(&descriptor.session)], false);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let capability = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .shutdown_preflight(Instant::now())
+                .unwrap()
+                .capability;
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(failure) => {
+                    assert_eq!(
+                        failure.code,
+                        ProtocolErrorCode::InvalidRequest,
+                        "{failure:?}"
+                    );
+                    assert_eq!(failure.message, active_refusal, "{failure:?}");
+                    {
+                        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                        assert!(!state.shutting_down);
+                        assert!(state.upgrade.is_none());
+                        assert_eq!(state.terminals.len(), 1);
+                        assert!(state.terminals.contains_key(&source.id));
+                    }
+                    assert!(
+                        Store::open(directory.path())
+                            .unwrap()
+                            .load()
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        Instant::now() < idle_deadline,
+                        "restored shell remained active after {attempts} actual prepare attempts: {failure:?}"
+                    );
+                    if attempts == 1 {
+                        eprintln!(
+                            "retrying the restored shell's actual prepare refusal: {failure:?}"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
         finish_upgrade(&host).unwrap();
         let store = Store::open(directory.path()).unwrap();
         let second = store.load().unwrap().unwrap();
