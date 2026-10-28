@@ -150,7 +150,7 @@ impl Cagents {
                 self.core.set_keyboard_nav(false);
                 let generation = state.generation;
                 Task::batch([
-                    recovery_focus(0),
+                    recovery_focus(state, 0),
                     cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let recovery = store
@@ -187,12 +187,16 @@ impl Cagents {
                     Err(error) => self.session_recovery.error = Some(error),
                 }
                 self.session_recovery.focus = 0;
-                recovery_focus(0)
+                self.focus_session_recovery_if_exposed()
             }
             Action::Cancel if self.session_recovery.open() && !self.session_recovery.pending => {
                 self.close_session_recovery()
             }
-            Action::Confirm if self.session_recovery.open() && !self.session_recovery.pending => {
+            Action::Confirm
+                if self.session_recovery.open()
+                    && !self.session_recovery.pending
+                    && !self.session_recovery_is_covered() =>
+            {
                 let Some(review) = self.session_recovery.review.clone() else {
                     return Task::none();
                 };
@@ -202,7 +206,7 @@ impl Cagents {
                         "The refused pane changed. Cancel and review the current save notice."
                             .into(),
                     );
-                    return recovery_focus(0);
+                    return self.focus_session_recovery_if_exposed();
                 }
                 let snapshot = self.persistent_workspace();
                 let receipt = self
@@ -235,11 +239,37 @@ impl Cagents {
                     Err(error) => {
                         self.session_recovery.error = Some(error);
                         self.session_recovery.focus = 0;
-                        recovery_focus(0)
+                        self.focus_session_recovery_if_exposed()
                     }
                 }
             }
             _ => Task::none(),
+        }
+    }
+
+    fn session_recovery_is_covered(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return true;
+        }
+        self.automation_approval_open()
+            || self.transient_work_close.is_some()
+            || self.automation_ui.draft_dialog_open()
+            || self.device_ui.open
+            || self.chat_ui.image_viewer.is_some()
+            || self.terminal_paste.is_some()
+    }
+
+    pub(super) fn focus_session_recovery_after_cover(&mut self) -> Task<Message> {
+        self.session_recovery.focus = 0;
+        self.focus_session_recovery_if_exposed()
+    }
+
+    fn focus_session_recovery_if_exposed(&self) -> Task<Message> {
+        if self.session_recovery_is_covered() {
+            Task::none()
+        } else {
+            recovery_focus(&self.session_recovery, 0)
         }
     }
 
@@ -251,12 +281,21 @@ impl Cagents {
         if let Some(restore) = self.session_recovery.restore_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }
+        if self.session_recovery_is_covered() {
+            return Task::none();
+        }
         let target = self
             .workspace
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        iced::runtime::task::effect(iced::runtime::Action::widget(RecoveryFocus {
+            marker: None,
+            target,
+            mounted: false,
+            present: false,
+            foreign_focus: false,
+        }))
     }
 
     pub(super) fn adopt_session_recovery_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -273,10 +312,16 @@ impl Cagents {
         event: &keyboard::Event,
         captured: bool,
     ) -> Option<Task<Message>> {
-        if !self.session_recovery.open() {
+        if !self.session_recovery.open() || self.session_recovery_is_covered() {
             return None;
         }
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        } = event
+        else {
             return None;
         };
         let keyboard::Key::Named(key) = key else {
@@ -302,9 +347,13 @@ impl Cagents {
             } else {
                 (self.session_recovery.focus + 1) % count
             };
-            return Some(recovery_focus(self.session_recovery.focus));
+            return Some(recovery_focus(
+                &self.session_recovery,
+                self.session_recovery.focus,
+            ));
         }
         if *key == Named::Enter
+            && !repeat
             && !captured
             && !modifiers.control()
             && !modifiers.alt()
@@ -366,20 +415,86 @@ impl Cagents {
                 ),
         ));
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 600.0),
+            dialog_ui::surface(
+                widget::container(widget::column::with_children(rows).spacing(space::M))
+                    .id(recovery_marker(state)),
+                600.0,
+            ),
             (!state.pending).then_some(Message::SessionRecovery(Action::Cancel)),
             1.0,
         ))
     }
 }
 
-fn recovery_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 0 {
-        "session-recovery.cancel"
-    } else {
-        "session-recovery.confirm"
+fn recovery_marker(state: &State) -> widget::Id {
+    widget::Id::new(format!(
+        "session-recovery.{}.{}.{}.{}.dialog",
+        state.generation, state.preparing, state.pending, state.focus,
+    ))
+}
+
+fn recovery_focus(state: &State, index: usize) -> Task<Message> {
+    iced::runtime::task::effect(iced::runtime::Action::widget(RecoveryFocus {
+        marker: Some(recovery_marker(state)),
+        target: widget::Id::new(if index == 0 {
+            "session-recovery.cancel"
+        } else {
+            "session-recovery.confirm"
+        }),
+        mounted: false,
+        present: false,
+        foreign_focus: false,
     }))
-    .map(cosmic::Action::App)
+}
+
+/// A receipt can emit focus before another dialog opens, while its widget
+/// operation is still queued. Inspect the mounted frame before chaining the
+/// focus change so an absent or superseded recovery cannot blur that owner.
+struct RecoveryFocus {
+    marker: Option<widget::Id>,
+    target: widget::Id,
+    mounted: bool,
+    present: bool,
+    foreign_focus: bool,
+}
+
+impl iced::advanced::widget::Operation for RecoveryFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        visit(self);
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, _: iced::Rectangle) {
+        self.mounted |= self
+            .marker
+            .as_ref()
+            .is_some_and(|marker| id == Some(marker));
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        self.present |= id == Some(&self.target);
+        self.foreign_focus |= state.is_focused() && id != Some(&self.target);
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        use iced::advanced::widget::operation::{Outcome, focusable};
+        if self.present
+            && if self.marker.is_some() {
+                self.mounted
+            } else {
+                !self.foreign_focus
+            }
+        {
+            // Iced applies chained operations synchronously to this frame.
+            Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+        } else {
+            Outcome::None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +549,309 @@ mod tests {
         app.save_health = Some(save_health);
         app.core.set_keyboard_nav(true);
         (directory, app, card)
+    }
+
+    #[test]
+    fn device_files_keys_preserve_hidden_session_recovery_and_restore_its_focus() {
+        for captured in [false, true] {
+            let (_directory, mut app, card) = fixture();
+            let opening = app.update_session_recovery(Action::Open(card));
+            let prepared = reply(opening);
+            drop(app.update(prepared));
+            assert!(app.session_recovery.review.is_some());
+            let confirm_focus = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Tab, false),
+                captured: false,
+            });
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.session_recovery_dialog().unwrap(),
+                    confirm_focus,
+                ),
+                Some(widget::Id::new("session-recovery.confirm")),
+            );
+            assert_eq!(app.session_recovery.focus, 1);
+            app.device_ui.open = true;
+            for named in [keyboard::key::Named::Tab, keyboard::key::Named::Enter] {
+                let task = app.update(Message::KeyEvent {
+                    event: key(named, false),
+                    captured,
+                });
+                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_eq!(app.session_recovery.focus, 1);
+                assert!(app.session_recovery.open());
+            }
+            let task = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Escape, false),
+                captured,
+            });
+            assert!(!app.device_ui.open);
+            assert!(app.session_recovery.open());
+            assert_eq!(
+                super::super::tests::focused_element(app.session_recovery_dialog().unwrap(), task),
+                Some(widget::Id::new("session-recovery.cancel")),
+            );
+            assert_eq!(app.session_recovery.focus, 0);
+            drop(app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Enter, false),
+                captured: false,
+            }));
+            assert!(
+                !app.session_recovery.open(),
+                "Enter follows the visible Cancel focus"
+            );
+            drop(app.update_session_recovery(Action::Open(card)));
+            app.device_ui.open = true;
+            drop(app.update(Message::CancelDialog));
+            assert!(!app.device_ui.open);
+            assert!(app.session_recovery.open());
+        }
+    }
+
+    #[test]
+    fn modal_gallery_keeps_covered_recovery_keys_actions_and_focus_unchanged() {
+        for captured in [false, true] {
+            let (_directory, mut app, card) = fixture();
+            let prepared = reply(app.update_session_recovery(Action::Open(card)));
+            drop(app.update(prepared));
+            drop(app.session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false));
+            assert_eq!(app.session_recovery.focus, 1);
+            let review = app.session_recovery.review.clone();
+            let before = Arc::clone(&app.durable);
+            app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                "/fixture/public-image.png".into(),
+                None,
+                iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            ));
+            for named in [
+                keyboard::key::Named::Tab,
+                keyboard::key::Named::Enter,
+                keyboard::key::Named::Escape,
+            ] {
+                assert!(
+                    app.session_recovery_key_event(&key(named, false), captured)
+                        .is_none()
+                );
+            }
+            assert!(
+                iced::runtime::task::into_stream(app.update_session_recovery(Action::Confirm))
+                    .is_none()
+            );
+            assert!(!app.session_recovery.pending);
+            assert_eq!(app.session_recovery.review, review);
+            assert_eq!(app.session_recovery.focus, 1);
+            assert_eq!(app.durable, before);
+            assert!(
+                iced::runtime::task::into_stream(app.focus_session_recovery_if_exposed()).is_none()
+            );
+            drop(app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Escape, false),
+                captured,
+            }));
+            assert!(app.chat_ui.image_viewer.is_none());
+            assert!(app.session_recovery.open());
+            assert_eq!(app.session_recovery.review, review);
+            // A fresh explicit choice still works after the viewer retires.
+            let navigation = app
+                .session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false)
+                .unwrap();
+            assert_eq!(app.session_recovery.focus, 0);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.session_recovery_dialog().unwrap(),
+                    navigation,
+                ),
+                Some(widget::Id::new("session-recovery.cancel")),
+            );
+            drop(app.session_recovery_key_event(&key(keyboard::key::Named::Enter, false), false));
+            assert!(!app.session_recovery.open());
+            assert_eq!(app.durable, before);
+        }
+    }
+
+    #[test]
+    fn session_recovery_completions_do_not_focus_beneath_device_or_gallery() {
+        for gallery in [false, true] {
+            let cover = |app: &mut Cagents, open: bool| {
+                if gallery {
+                    app.chat_ui.image_viewer = open.then(|| {
+                        chat_ui::images::Gallery::file(
+                            "/fixture/public-image.png".into(),
+                            None,
+                            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                        )
+                    });
+                } else {
+                    app.device_ui.open = open;
+                }
+            };
+            let (_directory, mut app, card) = fixture();
+            drop(app.update_session_recovery(Action::Open(card)));
+            cover(&mut app, true);
+            let task = app.update(Message::SessionRecovery(Action::Prepared {
+                generation: app.session_recovery.generation,
+                result: Err("fixture preparation error".into()),
+            }));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(
+                app.session_recovery.error.as_deref(),
+                Some("fixture preparation error")
+            );
+            assert!(app.session_recovery_is_covered());
+            app.session_recovery.pending = true;
+            let task = app.update(Message::SessionRecovery(Action::Finished(Err(
+                "fixture write error".into(),
+            ))));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+            app.session_recovery.pending = true;
+            let task = app.update(Message::SessionRecovery(Action::Finished(Ok(()))));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(!app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+            // Explicit cancellation follows the same covered-close focus rule.
+            cover(&mut app, false);
+            drop(app.update_session_recovery(Action::Open(card)));
+            cover(&mut app, true);
+            let task = app.update(Message::SessionRecovery(Action::Cancel));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(!app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+        }
+    }
+
+    #[test]
+    fn delayed_session_recovery_effects_preserve_device_focus_opened_after_emission() {
+        for phase in ["opening", "prepared", "failed", "cancelled", "finished"] {
+            let (_directory, mut app, card) = fixture();
+            let opening = app.update_session_recovery(Action::Open(card));
+            let workspace_target = app.card_keyboard_focus(card);
+            let delayed = if phase == "opening" {
+                opening
+            } else {
+                drop(opening);
+                match phase {
+                    "prepared" => app.update(Message::SessionRecovery(Action::Prepared {
+                        generation: app.session_recovery.generation,
+                        result: Err("fixture preparation error".into()),
+                    })),
+                    "failed" => {
+                        app.session_recovery.pending = true;
+                        app.update(Message::SessionRecovery(Action::Finished(Err(
+                            "fixture write error".into(),
+                        ))))
+                    }
+                    "cancelled" => app.update(Message::SessionRecovery(Action::Cancel)),
+                    "finished" => {
+                        app.session_recovery.pending = true;
+                        app.update(Message::SessionRecovery(Action::Finished(Ok(()))))
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            // The receipt emitted its effect while Device files was closed.
+            // Its actual native input mounts before that effect is applied.
+            app.device_ui.open = true;
+            let owner = widget::Id::new("device-tools.directory");
+            let element = widget::column::with_children(vec![
+                app.device_dialog(),
+                crate::ui_controls::field::text("Retained workspace target", "")
+                    .id(workspace_target)
+                    .on_input(|_| Message::CancelDialog)
+                    .into(),
+            ])
+            .into();
+            // Keep the old workspace target mounted: restoration must refuse
+            // a foreign focused owner even when that target still exists.
+            let effects = iced::widget::operation::focus(owner.clone())
+                .map(cosmic::Action::App)
+                .chain(delayed);
+            assert_eq!(
+                super::super::tests::focused_element(element, effects),
+                Some(owner),
+                "late {phase} focus must preserve the visible Device field",
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_recovery_focus_requires_its_current_generation_and_keyboard_phase() {
+        let (_directory, mut app, card) = fixture();
+        let opening = app.update_session_recovery(Action::Open(card));
+        let prepared = reply(opening);
+        let delayed = app.update(prepared);
+        assert!(app.session_recovery.review.is_some());
+        let marker = recovery_marker(&app.session_recovery);
+        // A later real Tab selects Confirm. The earlier Prepared Cancel task
+        // must not redirect that selection when its operation finally runs.
+        drop(app.session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false));
+        assert_eq!(app.session_recovery.focus, 1);
+        assert_ne!(recovery_marker(&app.session_recovery), marker);
+        let confirm = widget::Id::new("session-recovery.confirm");
+        let effects = iced::widget::operation::focus(confirm.clone())
+            .map(cosmic::Action::App)
+            .chain(delayed);
+        assert_eq!(
+            super::super::tests::focused_element(app.session_recovery_dialog().unwrap(), effects),
+            Some(confirm.clone()),
+        );
+
+        app.session_recovery.focus = 0;
+        let old_generation = recovery_focus(&app.session_recovery, 0);
+        drop(app.update_session_recovery(Action::Cancel));
+        let opening = app.update_session_recovery(Action::Open(card));
+        let prepared = reply(opening);
+        drop(app.update(prepared));
+        assert!(app.session_recovery.review.is_some());
+        // Retain logical Cancel so only the new generation distinguishes the
+        // mounted marker from the earlier task; the control IDs are shared.
+        assert_eq!(app.session_recovery.focus, 0);
+        let effects = iced::widget::operation::focus(confirm.clone())
+            .map(cosmic::Action::App)
+            .chain(old_generation);
+        assert_eq!(
+            super::super::tests::focused_element(app.session_recovery_dialog().unwrap(), effects),
+            Some(confirm),
+        );
+    }
+
+    #[test]
+    fn current_recovery_effects_still_focus_the_dialog_and_exposed_workspace() {
+        let (_directory, mut app, card) = fixture();
+        drop(app.update_session_recovery(Action::Open(card)));
+        let prepared = app.update(Message::SessionRecovery(Action::Prepared {
+            generation: app.session_recovery.generation,
+            result: Err("fixture preparation error".into()),
+        }));
+        let workspace_target = app.card_keyboard_focus(card);
+        let element = widget::column::with_children(vec![
+            app.session_recovery_dialog().unwrap(),
+            crate::ui_controls::field::text("Previously focused workspace", "")
+                .id(workspace_target.clone())
+                .on_input(|_| Message::CancelDialog)
+                .into(),
+        ])
+        .into();
+        let effects = iced::widget::operation::focus(workspace_target.clone())
+            .map(cosmic::Action::App)
+            .chain(prepared);
+        assert_eq!(
+            super::super::tests::focused_element(element, effects),
+            Some(widget::Id::new("session-recovery.cancel")),
+            "the current mounted recovery may take focus from its background",
+        );
+        let restore = app.update(Message::SessionRecovery(Action::Cancel));
+        assert_eq!(
+            super::super::tests::focused_element(
+                crate::ui_controls::field::text("Exposed workspace", "")
+                    .id(workspace_target.clone())
+                    .on_input(|_| Message::CancelDialog)
+                    .into(),
+                restore,
+            ),
+            Some(workspace_target),
+        );
     }
 
     #[test]
@@ -614,7 +1032,31 @@ mod tests {
             card,
             "latest unsent work\nnot the reviewed snapshot".into(),
         )]));
-        let task = app.update_session_recovery(Action::Confirm);
+        drop(app.session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false));
+        assert_eq!(app.session_recovery.focus, 1);
+        let review = app.session_recovery.review.clone();
+        let before = Arc::clone(&app.durable);
+        let quarantine = app.save_health.as_ref().unwrap().quarantined.clone();
+        let store = app.session.as_ref().unwrap().operation_store();
+        let owner = review.as_ref().unwrap().recovery.alias;
+        let original_owner = store.load_card(owner, None).unwrap();
+        let original_target = store.load_card(card, None).unwrap();
+        let mut repeated = key(keyboard::key::Named::Enter, false);
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        for captured in [false, true] {
+            drop(app.session_recovery_key_event(&repeated, captured));
+            assert!(!app.session_recovery.pending);
+            assert_eq!(app.session_recovery.review, review);
+            assert_eq!(app.durable, before);
+            assert_eq!(app.save_health.as_ref().unwrap().quarantined, quarantine);
+            assert_eq!(store.load_card(owner, None).unwrap(), original_owner);
+            assert_eq!(store.load_card(card, None).unwrap(), original_target);
+        }
+        let task = app
+            .session_recovery_key_event(&key(keyboard::key::Named::Enter, false), false)
+            .unwrap();
         assert!(app.session_recovery.pending);
         assert!(app.save_health.as_ref().unwrap().window_state_refused());
         drop(app.update_session_recovery(Action::Cancel));

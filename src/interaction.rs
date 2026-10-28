@@ -60,6 +60,179 @@ pub fn focused_key<'a, Message: 'a>(
     .into()
 }
 
+/// Apply queued focus only while its target is still mounted and a newer
+/// native owner has not taken focus. Listed controls belong to the same
+/// surface and may yield focus only while its exact mounted phase remains.
+pub fn guarded_focus<Message>(
+    target: Id,
+    same_owner: Vec<Id>,
+    marker: Option<Id>,
+) -> cosmic::iced::Task<Message> {
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::widget(GuardedFocus {
+        target,
+        same_owner,
+        marker,
+        mounted: false,
+        present: false,
+        foreign_focus: false,
+    }))
+}
+
+/// Cycle within a surface while retiring focus on every covered control.
+/// Counting is scoped; applying the chosen index visits the whole tree, so
+/// controls without IDs remain reachable and background focus cannot survive.
+pub fn cycle_focus_in_scope<Message>(scope: Id, backwards: bool) -> cosmic::iced::Task<Message> {
+    struct Cycle {
+        scope: Id,
+        backwards: bool,
+        count: Box<dyn Operation<operation::focusable::Count>>,
+    }
+    impl Operation for Cycle {
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            self.count.container(id, bounds);
+        }
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            self.count
+                .traverse(&mut |op| visit(&mut operation::black_box(op)));
+        }
+        fn finish(&self) -> operation::Outcome<()> {
+            let operation::Outcome::Some(count) = self.count.finish() else {
+                return operation::Outcome::None;
+            };
+            if count.total == 0 {
+                return operation::Outcome::None;
+            }
+            let target = match (count.focused, self.backwards) {
+                (Some(index), true) => (index + count.total - 1) % count.total,
+                (Some(index), false) => (index + 1) % count.total,
+                (None, true) => count.total - 1,
+                (None, false) => 0,
+            };
+            operation::Outcome::Chain(Box::new(Apply {
+                scope: self.scope.clone(),
+                entering: false,
+                inside: FocusIndex { target, current: 0 },
+            }))
+        }
+    }
+    struct FocusIndex {
+        target: usize,
+        current: usize,
+    }
+    impl Operation for FocusIndex {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&Id>,
+            _: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if self.current == self.target {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+            self.current += 1;
+        }
+    }
+    struct Apply {
+        scope: Id,
+        entering: bool,
+        inside: FocusIndex,
+    }
+    impl Operation for Apply {
+        fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+            self.entering = id == Some(&self.scope);
+        }
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            if self.entering {
+                visit(&mut self.inside);
+            } else {
+                visit(self);
+            }
+            self.entering = false;
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&Id>,
+            _: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            state.unfocus();
+        }
+    }
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::widget(Cycle {
+        scope: scope.clone(),
+        backwards,
+        count: Box::new(operation::scoped(scope, operation::focusable::count())),
+    }))
+}
+
+struct GuardedFocus {
+    target: Id,
+    same_owner: Vec<Id>,
+    marker: Option<Id>,
+    mounted: bool,
+    present: bool,
+    foreign_focus: bool,
+}
+
+impl Operation for GuardedFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+        self.mounted |= self
+            .marker
+            .as_ref()
+            .is_some_and(|marker| id == Some(marker));
+    }
+    fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
+        self.present |= id == Some(&self.target);
+        self.foreign_focus |= state.is_focused()
+            && id != Some(&self.target)
+            && !(self.marker.is_some() && id.is_some_and(|id| self.same_owner.contains(id)));
+    }
+    fn finish(&self) -> operation::Outcome<()> {
+        if self.present && !self.foreign_focus && (self.marker.is_none() || self.mounted) {
+            operation::Outcome::Chain(Box::new(operation::focusable::focus(self.target.clone())))
+        } else {
+            operation::Outcome::None
+        }
+    }
+}
+
+/// Capture selected keys at a native surface boundary, including before any
+/// descendant has focus. Keys the callback declines retain native handling.
+pub fn key_listener<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyListener,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
+/// A held Enter may move focus into a newly opened confirmation. Its native
+/// repeats must not activate that control; a fresh Enter still does.
+pub(crate) fn non_repeating_activation<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::NonRepeatingActivation,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
 #[derive(Default)]
 struct ChildFocus(bool);
 
@@ -1241,6 +1414,8 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 enum Kind {
     KeyboardList(bool),
     FocusedKey,
+    KeyListener,
+    NonRepeatingActivation,
     ListRow,
     ListEntry,
     TabHistory(bool),
@@ -1297,11 +1472,13 @@ struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
 struct FocusedKeyTag;
+struct NonRepeatingActivationTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
+struct KeyListenerTag;
 struct KeyboardModalTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
@@ -1351,6 +1528,8 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::KeyListener => tree::Tag::of::<KeyListenerTag>(),
+            Kind::NonRepeatingActivation => tree::Tag::of::<NonRepeatingActivationTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1461,6 +1640,55 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if matches!(self.kind, Kind::KeyListener) {
+            if shell.is_event_captured() {
+                return;
+            }
+            if let Event::Keyboard(event) = event
+                && let Some(on_key) = &self.on_focused_key
+                && let Some(message) = on_key(event)
+            {
+                shell.publish(message);
+                shell.capture_event();
+                return;
+            }
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
+        if matches!(self.kind, Kind::NonRepeatingActivation)
+            && !shell.is_event_captured()
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Enter
+                    ),
+                    repeat: true,
+                    ..
+                })
+            )
+        {
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0 {
+                shell.capture_event();
+                return;
+            }
+        }
         if let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
         {
@@ -1588,7 +1816,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
-        if matches!(self.kind, Kind::TabHistory(_)) {
+        if matches!(
+            self.kind,
+            Kind::TabHistory(_) | Kind::NonRepeatingActivation
+        ) {
             return;
         }
         if matches!(self.kind, Kind::ContextMenu) {
@@ -1937,6 +2168,81 @@ mod tests {
                 Modifiers::CTRL | Modifiers::ALT
             ),
             None
+        );
+    }
+
+    #[test]
+    fn repeated_activation_is_captured_only_inside_the_focused_control() {
+        use cosmic::iced::{
+            keyboard,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let guarded = Id::new("activation.guarded");
+        let foreign = Id::new("activation.foreign");
+        let content = widget::column::with_children(vec![
+            non_repeating_activation(
+                widget::button::custom(crate::design::body("Guarded"))
+                    .id(guarded.clone())
+                    .on_press(1_u8),
+            ),
+            widget::button::custom(crate::design::body("Foreign"))
+                .id(foreign.clone())
+                .on_press(2_u8)
+                .into(),
+        ]);
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(320.0, 160.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let enter = |repeat| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            })
+        };
+        let mut messages = Vec::new();
+        // An unfocused guard must not consume another native control's key.
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(foreign));
+        ui.update(
+            &[enter(true)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [2]);
+        messages.clear();
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(guarded));
+        let (_, statuses) = ui.update(
+            &[enter(true)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [cosmic::iced::event::Status::Captured]);
+        assert!(messages.is_empty());
+        ui.update(
+            &[enter(false)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            messages,
+            [1],
+            "a fresh native Enter still activates exactly once"
         );
     }
 

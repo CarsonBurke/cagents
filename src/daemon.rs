@@ -608,6 +608,20 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
 
 #[cfg(feature = "ui")]
 impl RestartTarget {
+    /// An inert UI state-machine fixture. The regular file cannot name or
+    /// signal a process; tests must drop restart tasks without polling them.
+    #[cfg(test)]
+    pub(crate) fn inert_for_ui_test() -> Self {
+        Self {
+            process: tempfile::tempfile().expect("inert restart fixture"),
+            proof: HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("inert-ui-test"),
+                boot_id: BootId::new("inert-ui-test"),
+                host_incarnation: crate::model::HostIncarnation::new("inert-ui-test"),
+            },
+        }
+    }
+
     /// Try graceful termination, then finish the same confirmed process if it
     /// cannot respond. The kernel descriptor fences PID reuse throughout.
     pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
