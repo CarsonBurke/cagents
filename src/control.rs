@@ -2344,6 +2344,12 @@ where
     // original routing; a scoped legacy write uses this client's selected host.
     let project_channel_context =
         legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
+    if let Some(context) = &project_channel_context
+        && let Err(error) = context.admit_remote()
+    {
+        emit_error(cli.json, &error);
+        return ExitCode::FAILURE;
+    }
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
     {
