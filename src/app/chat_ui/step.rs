@@ -491,7 +491,16 @@ impl Runtime {
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.clone()).into());
         }
-        let name = if verb.is_empty() {
+        let name = if let Some(skill) = cached.preview.skill.as_deref() {
+            let verb = match item.content.status() {
+                Some(ToolStatus::Running) => "Using skill",
+                Some(ToolStatus::Failed) => "Failed skill",
+                Some(ToolStatus::Denied) => "Denied skill",
+                Some(ToolStatus::Stopped) => "Stopped skill",
+                _ => "Used skill",
+            };
+            format!("{verb} {skill}")
+        } else if verb.is_empty() {
             label
         } else {
             format!("{verb} {label}")

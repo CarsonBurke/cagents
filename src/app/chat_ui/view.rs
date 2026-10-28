@@ -5661,6 +5661,8 @@ fn model_list<'a>(
 mod frame_cost;
 #[cfg(test)]
 mod issue1506_tests;
+#[cfg(test)]
+mod presentation_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;

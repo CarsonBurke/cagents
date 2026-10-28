@@ -119,6 +119,8 @@ pub(super) struct ToolText {
 pub(super) struct Preview {
     pub(super) text: String,
     pub(super) tail: String,
+    /// Exact bounded skill target, prepared with the input off the view path.
+    pub(super) skill: Option<String>,
     language: Language,
     /// The text highlighted in both palettes, drawn from on every frame.
     block: prose::CodeBlock,
@@ -127,19 +129,34 @@ pub(super) struct Preview {
 
 /// A tool's short target when the input supplies one; otherwise describe
 /// the disclosure without promoting arbitrary payload text into the transcript.
-fn tool_preview(input: &str) -> String {
+fn tool_preview(input: &str, name: &str) -> (String, Option<String>) {
     // Bound all inspection, including trimming a whitespace-only JSON prefix
     // that Claude can publish before the rest of its streamed input arrives.
     if input.len() > CachedItem::HIGHLIGHT_LIMIT {
-        return "Input available".into();
+        return ("Input available".into(), None);
     }
     if input.trim().is_empty() {
-        return String::new();
+        return (String::new(), None);
     }
     let object = serde_json::from_str::<serde_json::Value>(input).ok();
     let Some(object) = object.as_ref().and_then(serde_json::Value::as_object) else {
-        return "Input available".into();
+        return ("Input available".into(), None);
     };
+    let skill = name
+        .eq_ignore_ascii_case("skill")
+        .then(|| {
+            object
+                .get("skill")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.chars().count() <= 120
+                        && !value.contains(['\n', '\r'])
+                })
+                .map(str::to_owned)
+        })
+        .flatten();
     for key in [
         "file_path",
         "path",
@@ -154,15 +171,18 @@ fn tool_preview(input: &str) -> String {
             // Long prose and multiline documents are detail, even when a
             // provider uses a familiar target field for them.
             if !value.is_empty() && value.chars().count() <= 120 && !value.contains(['\n', '\r']) {
-                return value.to_owned();
+                return (value.to_owned(), skill);
             }
         }
     }
-    match object.len() {
-        0 => String::new(),
-        1 => "1 input field".into(),
-        count => format!("{count} input fields"),
-    }
+    (
+        match object.len() {
+            0 => String::new(),
+            1 => "1 input field".into(),
+            count => format!("{count} input fields"),
+        },
+        skill,
+    )
 }
 
 impl Preview {
@@ -170,6 +190,7 @@ impl Preview {
         Self {
             text: String::new(),
             tail: String::new(),
+            skill: None,
             language: Language::Plain,
             block: prose::CodeBlock::new(None, "", theme),
             theme,
@@ -177,7 +198,10 @@ impl Preview {
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
-        self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
+        self.text.capacity()
+            + self.tail.capacity()
+            + self.skill.as_ref().map_or(0, String::capacity)
+            + self.block.retained_span_bytes()
     }
 
     pub(super) fn update(
@@ -185,6 +209,7 @@ impl Preview {
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
+        let mut skill = None;
         let (source, language, output) = match content {
             // Only a shell command is shell: a read's or a search's command
             // is the path or the pattern it was given.
@@ -219,22 +244,29 @@ impl Preview {
             // framing. Their raw arguments and successful output belong to
             // the explicit Input/Output disclosure, not the closed row.
             ItemContent::Tool {
+                name,
                 input,
                 output,
                 status,
                 ..
-            } => (
-                Cow::Owned(tool_preview(input)),
-                Language::Plain,
-                if matches!(
-                    status,
-                    chat::ToolStatus::Failed | chat::ToolStatus::Denied | chat::ToolStatus::Stopped
-                ) {
-                    output.as_str()
-                } else {
-                    ""
-                },
-            ),
+            } => {
+                let (preview, target) = tool_preview(input, name);
+                skill = target;
+                (
+                    Cow::Owned(preview),
+                    Language::Plain,
+                    if matches!(
+                        status,
+                        chat::ToolStatus::Failed
+                            | chat::ToolStatus::Denied
+                            | chat::ToolStatus::Stopped
+                    ) {
+                        output.as_str()
+                    } else {
+                        ""
+                    },
+                )
+            }
             _ => (
                 Cow::Borrowed(turn::step_label(content)),
                 Language::Plain,
@@ -261,6 +293,7 @@ impl Preview {
         );
         if let Some(previous) = previous
             && previous.text == text
+            && previous.skill == skill
             && previous.language == language
             && previous.theme == theme
         {
@@ -270,6 +303,7 @@ impl Preview {
         Self {
             text,
             tail,
+            skill,
             language,
             block,
             theme,
