@@ -329,18 +329,28 @@ pub(super) fn panel_with_focus<'a, Message: Clone + 'a>(
     ])
     .width(Length::Fill)
     .spacing(space::XS);
-    rows.push(ui_controls::owned(
-        ControlsKey {
-            subject: goal.map(|goal| (goal.thread_id.clone(), goal.objective.clone(), goal.status)),
-            support: state.support,
-            pending: state.pending,
-            uncertain: state.uncertain,
-            current: state.current,
-            work_ready: state.work_ready,
-            revision: state.observation_revision,
-        },
-        controls,
-    ));
+    // Keep the control owner in a fixed slot. Inserting a status caption before
+    // it would recreate the owner and restore old named button state before
+    // the new owner can compare its action key.
+    let presentation = widget::column::with_children(rows)
+        .width(Length::Fill)
+        .spacing(space::XS);
+    let mut rows: Vec<Element<'a, Message>> = vec![
+        presentation.into(),
+        ui_controls::owned(
+            ControlsKey {
+                subject: goal
+                    .map(|goal| (goal.thread_id.clone(), goal.objective.clone(), goal.status)),
+                support: state.support,
+                pending: state.pending,
+                uncertain: state.uncertain,
+                current: state.current,
+                work_ready: state.work_ready,
+                revision: state.observation_revision,
+            },
+            controls,
+        ),
+    ];
     if state.support != Support::Unsupported {
         rows.push(
             design::caption("Change the objective with /goal set <objective> in the composer. Pausing or clearing a goal does not stop the current turn.")
