@@ -1251,10 +1251,10 @@ impl Cagents {
             .source_control
             .as_ref()
             .filter(|source| self.sidebar_state.active_worktree() == Some(&source.key));
-        let source_key = source.map(|source| source.key.clone());
-        if self.pull_request_inspector.source_key != source_key {
+        let source_key = source.map(|source| &source.key);
+        if self.pull_request_inspector.source_key.as_ref() != source_key {
             drop(self.pull_request_inspector.synchronize(None, None));
-            self.pull_request_inspector.source_key = source_key;
+            self.pull_request_inspector.source_key = source_key.cloned();
         }
         let candidate = source
             .filter(|source| source.data_state == SidebarDataState::Ready)
@@ -1300,15 +1300,25 @@ impl Cagents {
                 .map(Message::PullRequestUi)
                 .map(cosmic::Action::App);
         };
+        if self
+            .pull_request_inspector
+            .source_target
+            .as_ref()
+            .is_some_and(|target| {
+                target.worktree == *worktree
+                    && target.branch == branch
+                    && target.head_oid.as_deref() == head_oid
+                    && target.repository == *repository
+            })
+        {
+            return Task::none();
+        }
         let target = Target {
             worktree: worktree.clone(),
             branch: branch.to_owned(),
             head_oid: head_oid.map(str::to_owned),
             repository: repository.clone(),
         };
-        if self.pull_request_inspector.source_target.as_ref() == Some(&target) {
-            return Task::none();
-        }
         let preview = self
             .sidebar_model
             .projects
