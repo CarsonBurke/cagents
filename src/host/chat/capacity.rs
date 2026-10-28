@@ -653,6 +653,31 @@ mod tests {
     }
 
     #[test]
+    fn canonical_reconnect_only_reader_still_closes_through_the_normal_authenticated_receipt() {
+        let host = host();
+        let (_directory, source, handle) = history_reader(&host, false);
+        assert!(source.is_saved_claude_history());
+        assert!(source.requires_native_close_confirmation());
+        assert!(handle.is_read_only_history());
+        assert!(handle.actor_identity().is_none());
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server =
+            thread::spawn(move || super::super::super::client::serve(server, 81, server_host));
+        let mut control = crate::control::ControlClient::from_stream(client).unwrap();
+        control.authenticate(Default::default()).unwrap();
+        control.close_chat(source.clone()).unwrap();
+        drop(control);
+        server.join().unwrap();
+        assert!(handle.is_completed());
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        assert_eq!(
+            source.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        );
+    }
+
+    #[test]
     fn live_writers_are_protected_and_completed_writers_require_full_coverage() {
         struct Idle;
         impl chat::protocol::Adapter for Idle {

@@ -139,7 +139,7 @@ pub(super) fn close_sessions(
 }
 
 pub(super) fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
-    session.owned_codex_listener.is_some() || session.native_continuity.retains_provider()
+    session.requires_native_close_confirmation()
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {

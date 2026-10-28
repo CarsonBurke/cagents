@@ -1088,6 +1088,30 @@ fn verify_close_ownership(
     }
 }
 
+/// A routing hint only: the close path must still authenticate the registered
+/// helper or its retirement receipt and recognize the exact requested source.
+pub(super) fn has_registered_owner(host: &SharedHost, requested: &Session) -> Result<bool, String> {
+    let Ok(registry) = super::super::agent_execution::registry(host) else {
+        return Ok(false);
+    };
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(false);
+        }
+        for owner in page {
+            after = Some(owner.actor());
+            if owner.source().id == requested.id {
+                return Ok(true);
+            }
+        }
+    }
+}
+
 /// Explicit cleanup of an authenticated helper which has no client attachment.
 /// Adoption retains the original reducer and pipes; this path never launches.
 pub(super) fn close_unattached(

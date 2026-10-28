@@ -362,11 +362,15 @@ fn owning_delete(role: &str) {
 }
 
 fn retained_claude_session() -> crate::chat::Session {
+    claude_close_session(crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 })
+}
+
+fn claude_close_session(continuity: crate::chat::NativeContinuity) -> crate::chat::Session {
     let mut session = tests::chat_session();
     session.launch.provider = crate::agent::Provider::Claude;
     session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
     session.proof = Some(proof());
-    session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    session.native_continuity = continuity;
     assert!(session.has_valid_native_continuity());
     session
 }
@@ -375,6 +379,15 @@ fn retained_claude_session() -> crate::chat::Session {
 // actual channel deletion in the already isolated User child, with both a
 // definite refusal and a synthetic Accepted control; no provider is launched.
 fn owning_retained_claude_delete() {
+    for continuity in [
+        crate::chat::NativeContinuity::ReconnectOnly,
+        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+    ] {
+        owning_claude_delete(continuity);
+    }
+}
+
+fn owning_claude_delete(continuity: crate::chat::NativeContinuity) {
     for accepted in [false, true] {
         let (mut app, channel, survivor, card) = tests::channel_with_a_conversation();
         assert!(app.session.is_none());
@@ -382,7 +395,7 @@ fn owning_retained_claude_delete() {
         let registry = uuid::Uuid::new_v4();
         app.workspace_model.identity = registry;
         Arc::make_mut(&mut app.durable).workspace_model_identity = Some(registry);
-        let session = retained_claude_session();
+        let session = claude_close_session(continuity.clone());
         app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
         let drafts = HashMap::from([(card, "Keep this retained Claude draft".into())]);
         app.chat_ui = crate::app::chat_ui::State::with_drafts(drafts.clone());
@@ -407,7 +420,7 @@ fn owning_retained_claude_delete() {
             };
             assert_eq!(request.proof.as_ref(), Some(&proof()));
             assert!(matches!(&request.request,
-                ClientRequest::ChatCloseRetained { session: actual } if actual == &session));
+            ClientRequest::ChatCloseRetained { session: actual } if actual == &session));
             receipt_tx.send(true).unwrap();
             if accepted {
                 connection.response(&request, ServerResponse::Accepted);
@@ -427,8 +440,8 @@ fn owning_retained_claude_delete() {
             "empty actor inventory must demand the exact retained Claude close receipt"
         );
         assert!(matches!(&completion,
-            Message::ChannelUi(Action::SessionsClosed(id, _, result))
-                if *id == channel && result.is_ok() == accepted));
+        Message::ChannelUi(Action::SessionsClosed(id, _, result))
+            if *id == channel && result.is_ok() == accepted));
         drop(app.update(completion));
         assert!(!app.channel_ui.is_deleting(channel));
         assert!(!app.channel_ui.closing.contains_key(&channel));
@@ -453,6 +466,85 @@ fn owning_retained_claude_delete() {
             ));
         }
     }
+}
+
+fn reconnect_only_close_controls(_role: &str) {
+    let canonical = claude_close_session(crate::chat::NativeContinuity::ReconnectOnly);
+    assert!(canonical.is_saved_claude_history());
+    let context = SessionCloseContext::capture(crate::workspace_model::NO_REGISTRY);
+    assert!(close_sessions(vec![CardKind::Chat(canonical.clone())], &context).is_err());
+    let fresh_draft = || {
+        let draft = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            PathBuf::from(std::env::var_os(ROOT).unwrap()).join("fresh-project"),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        assert!(draft.is_unstarted());
+        draft
+    };
+    let draft = fresh_draft();
+    assert!(close_sessions(vec![CardKind::Chat(draft.clone())], &context).is_ok());
+    let expected = canonical.clone();
+    let peer = Peer::new(move |server| {
+        let mut connection = server.connect(&Authority::default(), None, false).unwrap();
+        connection.terminals(vec![]);
+        connection.chats(vec![expected.clone()]);
+        let close = connection.close_chat(&expected);
+        connection.response(
+            &close,
+            ServerResponse::ChatClosed {
+                chat_id: expected.id,
+                snapshot: Default::default(),
+            },
+        );
+        connection.eof(); // A normal reader's close ACK needs no orphan-helper request.
+    });
+    close_sessions(vec![CardKind::Chat(canonical)], &context).unwrap();
+    peer.finished();
+    let peer = Peer::new(move |server| {
+        let mut connection = server.connect(&Authority::default(), None, false).unwrap();
+        connection.terminals(vec![]);
+        connection.chats(vec![]);
+        connection.eof(); // A never-started draft has no retained owner to close.
+    });
+    close_sessions(vec![CardKind::Chat(draft)], &context).unwrap();
+    peer.finished();
+
+    for started in [false, true] {
+        let (mut app, channel, survivor, card) = tests::channel_with_a_conversation();
+        Arc::make_mut(&mut app.durable).active_channel = Some(survivor);
+        let source = if started {
+            claude_close_session(crate::chat::NativeContinuity::ReconnectOnly)
+        } else {
+            fresh_draft()
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(source);
+        let drafts = HashMap::from([(card, "Keep this offline draft".into())]);
+        app.chat_ui = crate::app::chat_ui::State::with_drafts(drafts.clone());
+        Arc::make_mut(&mut app.durable).chat_drafts = drafts.clone();
+        let before = app.card_state(card).unwrap().clone();
+        let focus = app.workspace.focused();
+        let completion = close_message(app.delete_channel(channel));
+        assert!(matches!(&completion,
+            Message::ChannelUi(Action::SessionsClosed(_, _, result)) if result.is_err() == started));
+        drop(app.update(completion));
+        if started {
+            assert_eq!(app.card_state(card), Some(&before));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focus);
+            assert!(app.channel_ui.failed.contains_key(&channel));
+        } else {
+            assert!(app.channel_ui.was_deleted(channel));
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+        }
+    }
+}
+
+#[test]
+fn reconnect_only_close_preserves_unknown_owners_but_accepts_normal_reader_and_unstarted_draft() {
+    isolated(&["user"], reconnect_only_close_controls);
 }
 #[test]
 fn owning_channel_delete_task_preserves_scoped_conversations_and_actorless_channels() {

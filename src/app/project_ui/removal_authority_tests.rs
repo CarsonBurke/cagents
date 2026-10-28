@@ -636,6 +636,22 @@ fn standalone_retained_app(
     crate::chat::Session,
     CardId,
 ) {
+    standalone_claude_app(
+        label,
+        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+    )
+}
+
+fn standalone_claude_app(
+    label: &str,
+    continuity: crate::chat::NativeContinuity,
+) -> (
+    Cagents,
+    ProjectRemoval,
+    WorkspaceModel,
+    crate::chat::Session,
+    CardId,
+) {
     let (removal, model, mut session, _) = fixture();
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let runtime = PathBuf::from(std::env::var_os(ROOT).unwrap()).join(label);
@@ -659,7 +675,7 @@ fn standalone_retained_app(
     Arc::make_mut(&mut app.durable).active_channel = None;
     session.launch.provider = crate::agent::Provider::Claude;
     session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
-    session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    session.native_continuity = continuity;
     assert!(session.has_valid_native_continuity());
     let card = crate::app::chat_ui::tests::restored_chat_with_draft_fixture(
         &mut app,
@@ -695,10 +711,21 @@ fn exact_retained_close(
 }
 
 fn standalone_retained_removal(role: &str) {
+    for continuity in [
+        crate::chat::NativeContinuity::ReconnectOnly,
+        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+    ] {
+        standalone_claude_removal(role, continuity);
+    }
+}
+
+fn standalone_claude_removal(role: &str, continuity: crate::chat::NativeContinuity) {
     let authority = expected_authority(role);
     for accepted in [false, true] {
-        let (mut app, removal, before, session, card) =
-            standalone_retained_app(&format!("standalone-{accepted}"));
+        let (mut app, removal, before, session, card) = standalone_claude_app(
+            &format!("standalone-{continuity:?}-{accepted}"),
+            continuity.clone(),
+        );
         let saved = app.card_state(card).unwrap().clone();
         let drafts = app.persistent_workspace().chat_drafts.clone();
         let focus = app.workspace.focused();
@@ -728,8 +755,8 @@ fn standalone_retained_removal(role: &str) {
             final_connection.model(&before);
             let edit = final_connection.request();
             assert!(matches!(&edit.request,
-                ClientRequest::EditWorkspaceModel { edit: ModelEdit::CloseProject { repository } }
-                    if repository == &before.projects[0].repository));
+            ClientRequest::EditWorkspaceModel { edit: ModelEdit::CloseProject { repository } }
+                if repository == &before.projects[0].repository));
             final_connection.response(
                 &edit,
                 ServerResponse::WorkspaceModel {
@@ -755,7 +782,7 @@ fn standalone_retained_removal(role: &str) {
         assert!(app.project_ui.remove_dialog.is_some());
         let completion = project_completion(app.handle_project_action(Action::ConfirmRemove));
         assert!(matches!(&completion,
-            Message::ProjectUi(Action::RemovedProject { result, .. }) if result.is_ok() == accepted));
+        Message::ProjectUi(Action::RemovedProject { result, .. }) if result.is_ok() == accepted));
         let local = app.update(completion);
         if accepted {
             let completion = project_completion(local);
@@ -915,7 +942,17 @@ fn retained_project_census_preserves_foreign_views_even_with_the_same_directory_
 }
 
 fn retained_project_successor(role: &str) {
-    let (mut app, removal, mut model, source, card) = standalone_retained_app("successor");
+    for continuity in [
+        crate::chat::NativeContinuity::ReconnectOnly,
+        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+    ] {
+        retained_project_successor_kind(role, continuity);
+    }
+}
+
+fn retained_project_successor_kind(role: &str, continuity: crate::chat::NativeContinuity) {
+    let (mut app, removal, mut model, source, card) =
+        standalone_claude_app(&format!("successor-{continuity:?}"), continuity);
     let drafts = app.persistent_workspace().chat_drafts.clone();
     let focused = app.workspace.focused();
     let mut replacement = source.clone();

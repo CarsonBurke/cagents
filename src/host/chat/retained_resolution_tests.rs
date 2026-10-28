@@ -117,6 +117,7 @@ struct Fixture {
     host: SharedHost,
     lease: Option<crate::daemon::HostLease>,
     broker: Option<super::super::notifications::Broker>,
+    issued: Session,
     original: Session,
     identity: chat::runtime::ActorIdentity,
 }
@@ -127,6 +128,10 @@ impl Fixture {
     }
 
     fn with_reset(root: PathBuf, reset: bool) -> Self {
+        Self::with_source(root, reset, false)
+    }
+
+    fn with_source(root: PathBuf, reset: bool, saved: bool) -> Self {
         let provider = root.join("bin/claude");
         retained_actor_tests::install_provider(&provider);
         if reset {
@@ -168,13 +173,41 @@ impl Fixture {
         )
         .unwrap();
         host.lock().unwrap().notifications = Some(broker.handle());
-        let source = chat::fresh_session(
+        let mut source = chat::fresh_session(
             Provider::Claude,
             TerminalId::new(),
             root.join("project"),
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
+        if saved {
+            // A canonical saved descriptor, before this helper publishes its
+            // retained capability. Do not downgrade an Actor2 descriptor or
+            // add an alias to the helper/Registry by hand.
+            let session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            source.launch.session_id = Some(session.into());
+            source.proof = Some(host.lock().unwrap().proof().clone());
+            let cwd = root.join("project").canonicalize().unwrap();
+            let name: String = cwd
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let directory = root.join("home/.claude/projects").join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("{session}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"user","uuid":"saved-user", "sessionId":session,
+                        "cwd":cwd,"message":{"role":"user","content":"Saved fixture history"}})
+                ),
+            )
+            .unwrap();
+            assert!(source.is_saved_claude_history());
+        }
+        let issued = source.clone();
         let id = source.id;
         start_execution(
             &host,
@@ -192,7 +225,7 @@ impl Fixture {
             "helper did not become ready",
         );
         let original = host.lock().unwrap().chats[&id].session.clone();
-        assert!(original.launch.session_id.is_none());
+        assert_eq!(original.launch.session_id.is_some(), saved);
         assert!(matches!(
             original.native_continuity,
             chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
@@ -202,6 +235,7 @@ impl Fixture {
             host,
             lease,
             broker: Some(broker),
+            issued,
             original,
             identity,
         }
@@ -346,6 +380,117 @@ impl Fixture {
             "recovery must not synthesize provider input"
         );
     }
+}
+
+#[test]
+fn canonical_reconnect_only_cleanup_resolves_its_registered_real_helper_without_reclassification() {
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::with_source(root, false, true);
+    let saved: Session =
+        serde_json::from_slice(&serde_json::to_vec(&fixture.issued).unwrap()).unwrap();
+    assert!(saved.is_saved_claude_history());
+    assert_eq!(
+        saved.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    );
+    assert!(saved.requires_native_close_confirmation());
+    let identity = fixture.identity.clone();
+    let inspection = Handle::inspect_remote(
+        &identity.record,
+        fixture.host.lock().unwrap().proof().clone(),
+    )
+    .unwrap();
+    assert!(inspection.source == saved || inspection.previous_sources.contains(&saved));
+    fixture.rotate_host_without_discovery();
+    assert!(fixture.host.lock().unwrap().chats.is_empty());
+    let inventory =
+        super::super::client::process_request(&fixture.host, 11, ClientRequest::ChatList)
+            .unwrap()
+            .0;
+    assert!(matches!(inventory, ServerResponse::ChatListed { sessions } if sessions.is_empty()));
+    // Same allocation is insufficient: neither changed recipe nor changed
+    // captured account may close the helper that acknowledges the saved source.
+    for account in [false, true] {
+        let mut changed = saved.clone();
+        if account {
+            changed.launch.recipe.environment.insert(
+                "CLAUDE_CONFIG_DIR".into(),
+                fixture
+                    .root
+                    .join("other-account")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else {
+            changed.launch.recipe.arguments.push("--different".into());
+        }
+        assert!(
+            super::super::client::process_request(
+                &fixture.host,
+                11,
+                ClientRequest::ChatCloseRetained { session: changed },
+            )
+            .is_err()
+        );
+        assert!(identity.record.holder.is_current() && identity.record.root.is_current());
+        assert!(fixture.host.lock().unwrap().chats.is_empty());
+    }
+    let response = super::super::client::process_request(
+        &fixture.host,
+        11,
+        ClientRequest::ChatCloseRetained {
+            session: saved.clone(),
+        },
+    )
+    .unwrap()
+    .0;
+    assert!(matches!(response, ServerResponse::Accepted));
+    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(fixture.host.lock().unwrap().chats.is_empty());
+    let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+    let retirement = registry
+        .lock()
+        .unwrap()
+        .native_actor_retirement(identity.instance)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retirement.owner(), &identity.record);
+    assert_eq!(retirement.source().id, saved.id);
+    assert_eq!(retirement.source().launch, saved.launch);
+    assert_eq!(
+        retirement.confirmed_session(),
+        saved.launch.session_id.as_deref()
+    );
+    assert_eq!(
+        saved, fixture.issued,
+        "close may not rewrite its captured source"
+    );
+    // A later project/channel completion gate sees neither actor inventory nor
+    // discovery, but must consume this same registered retirement receipt.
+    assert!(
+        !crate::daemon::holder_registry::socket(
+            &crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native
+            )
+            .unwrap(),
+            saved.id,
+        )
+        .with_extension("json")
+        .exists()
+    );
+    assert!(matches!(
+        super::super::client::process_request(
+            &fixture.host,
+            11,
+            ClientRequest::ChatCloseRetained {
+                session: saved.clone()
+            },
+        )
+        .unwrap()
+        .0,
+        ServerResponse::Accepted
+    ));
+    fixture.no_prompt();
 }
 
 impl Drop for Fixture {

@@ -803,6 +803,17 @@ impl Session {
             && self.native_continuity == NativeContinuity::ReconnectOnly
     }
 
+    /// A missing live inventory entry cannot prove this native owner stopped.
+    /// Claude descriptors issued before retained capabilities were published
+    /// can remain ReconnectOnly while their exact registered helper survives.
+    /// This is only a close-confirmation requirement, never authority to adopt
+    /// that helper or to promote the saved descriptor's continuity.
+    pub(crate) fn requires_native_close_confirmation(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || self.native_continuity.retains_provider()
+            || (self.launch.provider == Provider::Claude && !self.is_unstarted())
+    }
+
     /// An endpoint allocated for this exact cagents thread, retained in both views.
     pub fn owns_codex_listener(&self) -> bool {
         self.launch.provider == Provider::Codex
