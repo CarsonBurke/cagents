@@ -811,7 +811,10 @@ impl Snapshot {
         let lines = self.protocol_lines();
         let start = *lines.get(line as usize)? as usize;
         let next = lines.get(line as usize + 1).map(|next| *next as usize);
-        let end = line_end(self.full_text(), next);
+        let end = next.map_or_else(
+            || self.byte_len(),
+            |next| line_end(self.full_text(), Some(next)),
+        );
         Some(start..end)
     }
 

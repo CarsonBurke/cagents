@@ -3508,7 +3508,15 @@ impl RepositoryRuntime {
     /// what materialises the change these edits describe.
     #[must_use]
     pub fn take_lsp_edits(&mut self) -> Vec<LspTextEdit> {
-        if !std::mem::replace(&mut self.lsp_edits_exact, true) {
+        // Completion edits also reach this boundary without protocol_edit.
+        // An inserted CR may pair with an adjacent LF, so its payload alone
+        // cannot safely shift standing diagnostics. Send the native source.
+        if !std::mem::replace(&mut self.lsp_edits_exact, true)
+            || self
+                .lsp_edits
+                .iter()
+                .any(|edit| edit.new_text.contains('\r'))
+        {
             self.lsp_edits.clear();
             return Vec::new();
         }
@@ -18964,6 +18972,38 @@ mod tests {
         }));
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
         assert_eq!(runtime.take_lsp_intents(), Vec::new());
+    }
+
+    #[test]
+    fn a_completion_inserting_cr_before_lf_uses_full_synchronization() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "🌲\nb");
+        drop(runtime.take_lsp_intents());
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(0, 1), LspPosition::new(0, 1)),
+                "\r",
+            ),
+            vec![],
+        );
+        assert!(runtime.apply_completion(&item));
+        assert_eq!(buffer_text(&runtime), "🌲\r\nb");
+        let intents = runtime.take_lsp_intents();
+        let [
+            LspIntent::Change {
+                text: LspChangeText::Snapshot(source),
+                ..
+            },
+        ] = intents.as_slice()
+        else {
+            panic!("the completion publishes its actual native source");
+        };
+        assert_eq!(source.text().as_ref(), "🌲\r\nb");
+        assert!(runtime.take_lsp_edits().is_empty());
+        assert!(runtime.move_cursor_to(LspPosition::new(1, 1)));
+        let cursor = runtime.navigation().unwrap().editor.unwrap().caret;
+        assert_eq!(cursor.column, 1);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 1)));
     }
 
     #[test]
