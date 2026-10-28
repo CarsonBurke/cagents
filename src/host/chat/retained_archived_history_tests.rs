@@ -335,7 +335,7 @@ fn wait_for_read_only_history(client: &chat::client::ClientHandle, reason: &str)
         let snapshot = client.snapshot();
         let connected = client.is_connected();
         let session_matches = snapshot.session_id == client.session().launch.session_id;
-        if connected
+        let settled = connected
             && session_matches
             && !snapshot.history_loading
             && !snapshot.items.is_empty()
@@ -346,10 +346,7 @@ fn wait_for_read_only_history(client: &chat::client::ClientHandle, reason: &str)
             && !snapshot.busy
             && !snapshot.waiting
             && snapshot.requests.is_empty()
-            && snapshot.native_continuity == chat::NativeContinuity::ReconnectOnly
-        {
-            return;
-        }
+            && snapshot.native_continuity == chat::NativeContinuity::ReconnectOnly;
         assert!(
             connected && Instant::now() < deadline,
             "{reason}: connected={connected}, session_matches={session_matches}, generation={}, \
@@ -367,6 +364,9 @@ fn wait_for_read_only_history(client: &chat::client::ClientHandle, reason: &str)
             snapshot.requests.len(),
             snapshot.native_continuity,
         );
+        if settled {
+            return;
+        }
         thread::sleep(
             Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
         );
