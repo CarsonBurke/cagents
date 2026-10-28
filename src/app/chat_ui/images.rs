@@ -120,6 +120,46 @@ struct DecoderInput<'a> {
     orientation_override: Option<image::metadata::Orientation>,
     ico_dimensions: Option<(u16, u16)>,
 }
+fn webp_chunk(bytes: &[u8], offset: usize) -> Option<(&[u8], &[u8], usize)> {
+    let header_end = offset.checked_add(8)?;
+    let header = bytes.get(offset..header_end)?;
+    let length = usize::try_from(u32::from_le_bytes(header[4..8].try_into().ok()?)).ok()?;
+    let payload_end = header_end.checked_add(length)?;
+    let next = payload_end.checked_add(length & 1)?;
+    if next > bytes.len() {
+        return None;
+    }
+    Some((&header[..4], &bytes[header_end..payload_end], next))
+}
+fn webp_vp8_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let header = bytes.get(..10)?;
+    if header[0] & 1 != 0 || &header[3..6] != b"\x9d\x01\x2a" {
+        return None;
+    }
+    Some((
+        u32::from(u16::from_le_bytes([header[6], header[7]]) & 0x3fff),
+        u32::from(u16::from_le_bytes([header[8], header[9]]) & 0x3fff),
+    ))
+}
+fn webp_frame_matches_vp8(frame: &[u8]) -> Option<()> {
+    let header = frame.get(..16)?;
+    let dimension = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) + 1;
+    let expected = (dimension(&header[6..9]), dimension(&header[9..12]));
+    let (kind, payload, next) = webp_chunk(frame, 16)?;
+    let vp8 = match kind {
+        b"VP8 " => payload,
+        b"VP8L" => return Some(()),
+        b"ALPH" => {
+            let (kind, payload, _) = webp_chunk(frame, next)?;
+            if kind != b"VP8 " {
+                return None;
+            }
+            payload
+        }
+        _ => return None,
+    };
+    (webp_vp8_dimensions(vp8)? == expected).then_some(())
+}
 fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
     if bytes.get(..4) == Some(b"\0\0\x01\0") {
         return bounded_ico_input(bytes);
@@ -142,19 +182,39 @@ fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
     let container = bytes.get(..end)?;
     let mut offset = 12usize;
     let mut exif = None;
+    let mut extended = None;
+    let mut vp8 = None;
+    let mut frame = None;
     while offset < end {
-        let header_end = offset.checked_add(8)?;
-        let header = container.get(offset..header_end)?;
-        let length = usize::try_from(u32::from_le_bytes(header[4..8].try_into().ok()?)).ok()?;
-        let payload_end = header_end.checked_add(length)?;
-        let next = payload_end.checked_add(length & 1)?;
-        if next > end {
-            return None;
+        let (kind, payload, next) = webp_chunk(container, offset)?;
+        if offset == 12 && kind == b"VP8X" {
+            let header = payload.get(..10)?;
+            let dimension =
+                |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) + 1;
+            extended = Some((
+                header[0] & 0x02 != 0,
+                (dimension(&header[4..7]), dimension(&header[7..10])),
+            ));
         }
-        if &header[..4] == b"EXIF" && exif.is_none() {
-            exif = Some(&container[header_end..payload_end]);
+        match kind {
+            b"EXIF" if exif.is_none() => exif = Some(payload),
+            b"VP8 " if vp8.is_none() => vp8 = Some(payload),
+            b"ANMF" if frame.is_none() => frame = Some(payload),
+            _ => {}
         }
         offset = next;
+    }
+    if let Some((animated, dimensions)) = extended {
+        // The pinned VP8 decoder allocates YUV from its own keyframe header
+        // before comparing against the admitted canvas/frame. Check only the
+        // first image/frame actually decoded, using its real bounded payload.
+        if animated {
+            webp_frame_matches_vp8(frame?)?;
+        } else if let Some(vp8) = vp8
+            && webp_vp8_dimensions(vp8)? != dimensions
+        {
+            return None;
+        }
     }
     // Never ask the inner WebP decoder to allocate EXIF from its range map:
     // its animation-header scan can also manufacture a range from frame data.
@@ -1929,6 +1989,158 @@ mod tests {
         assert_eq!(budget.encoded.available_permits(), png.len());
         assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
         assert_eq!(budget.pixels.available_permits(), 4);
+    }
+    // The following three WebP fixtures come from web-platform-tests at
+    // Servo revision 5c14ac9428d8d95c2f6c2f0300fe248d3929f282.
+    // # The 3-Clause BSD License
+    //
+    // Copyright © web-platform-tests contributors
+    //
+    // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+    //
+    // 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+    // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+    // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+    //
+    // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+    // html/canvas/element/manual/wide-gamut-canvas/resources/pattern-srgb.webp
+    const LOSSY_WEBP: &str = concat!(
+        "UklGRsgAAABXRUJQVlA4ILwAAAAwBACdASoUABQAAAAAJZAB0gH6gUoC1AP4B7YGQAfoBvAANUF9XYU4RdAA/v//FuB/WH/7",
+        "RB//hsjft7//6A7T/4ySu7/ugLf9Y2/lWz/P//Zj5LbXUocuZerf//5T90WfzRF/L1D8Va//vi8Wt/x7Cf6WH+nFylfluYyr",
+        "Vg+80P//+Hl9gX+g7x/v4oa+uhv/uHivX/h1vq/6Ae35Yr5fI8BkrTPnLz5+rYfedEzUtJ+cy06x8xCadXgAAA==",
+    );
+    // html/canvas/element/manual/wide-gamut-canvas/resources/pattern-srgb-transparent.webp
+    const ALPHA_WEBP: &str = concat!(
+        "UklGRvQAAABXRUJQVlA4WAoAAAAQAAAAEwAAEwAAQUxQSBAAAAABB1DAiAgABOF/3UBE/1MFVlA4IL4AAADwBACdASoUABQA",
+        "AAAAJZgB0gH6gfwDBDlAfgBcAH8AvwD9AN4AIgAM3F9XXxj8GAAA/v/+Iir6gP/n3af+gBffxnP/7lnB/+JyuPZ//PpuVPWv",
+        "/IjxNWapByUeKzquf//+6ivgt/kX9dev6jGv/zv5ytT/nzaP45/t64Vq+lUyGhcMQo/r///8sl90qavx/oaGFd28f/xNNCan",
+        "/Mjf7KrT/hkqs714exbeOwRobPr4ijjHCUdiIXQguaWs+cAA",
+    );
+    // html/semantics/embedded-content/the-img-element/resources/animated.webp
+    const ANIMATED_WEBP: &str = concat!(
+        "UklGRhYBAABXRUJQVlA4WAoAAAACAAAAYwAAYwAAQU5JTQYAAAD/////AQBBTk1GdAAAAAAAAAAAAGMAAGMAAGQAAABWUDgg",
+        "XAAAAFAGAJ0BKmQAZAA+MRiLRCIhoRBUACADBLS3cLn0uA/AD8AAAOMgYi8sA11N7iLywDXU3uIvLANdTeiAAP7/FJ///7GY",
+        "/aM/ySv//4Mx/BmP4Mx/8J8bLcNAAAAAQU5NRm4AAAAAAAAAAABjAABjAAAQJwAAVlA4IFYAAABQBgCdASpkAGQAPjEYi0Qi",
+        "IaEQVAAgAwS0t3C59LgPwA/AAADG11N7iLywDXU3uIvLANdTe4i8sA08AAD+/xvOf/+vRB4g360H//3T0hA0f8lAAAAAAA==",
+    );
+    fn webp_fixture(encoded: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    }
+    fn push_webp_fixture_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        if payload.len() & 1 != 0 {
+            bytes.push(0);
+        }
+    }
+    fn extended_webp_fixture(chunks: &[u8], animated: bool, alpha: bool) -> Vec<u8> {
+        let mut bytes = b"RIFF\0\0\0\0WEBP".to_vec();
+        let mut canvas = [0u8; 10];
+        canvas[0] = u8::from(animated) * 0x02 | u8::from(alpha) * 0x10;
+        canvas[4] = 19; // The fixture's VP8 keyframe is 20x20.
+        canvas[7] = 19;
+        push_webp_fixture_chunk(&mut bytes, b"VP8X", &canvas);
+        if animated {
+            push_webp_fixture_chunk(&mut bytes, b"ANIM", &[0; 6]);
+            let mut frame = vec![0; 16];
+            frame[6] = 19;
+            frame[9] = 19;
+            frame[15] = 0x02; // Replace the canvas, without alpha blending.
+            frame.extend_from_slice(chunks);
+            push_webp_fixture_chunk(&mut bytes, b"ANMF", &frame);
+        } else {
+            bytes.extend_from_slice(chunks);
+        }
+        let length = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        bytes
+    }
+    fn animated_alpha_webp_fixture() -> Vec<u8> {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let mut chunks = Vec::new();
+        // Uncompressed ALPH: one control byte plus 400 opaque alpha values.
+        // Its odd length requires padding before the actual VP8 header.
+        let mut alpha = vec![255; 401];
+        alpha[0] = 0;
+        push_webp_fixture_chunk(&mut chunks, b"ALPH", &alpha);
+        chunks.extend_from_slice(&simple[12..]);
+        extended_webp_fixture(&chunks, true, true)
+    }
+    #[test]
+    fn webp_preview_preserves_actual_lossy_static_animated_and_alpha_pixels() {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let opaque = image::load_from_memory(&simple).unwrap().into_rgba8();
+        let assert_pixels = |bytes: Vec<u8>, expected: &image::RgbaImage| {
+            let budget = Budget::new(bytes.len(), expected.len());
+            let encoded_length = bytes.len();
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(bytes, &budget)
+            else {
+                panic!("valid lossy WebP must retain its pixels");
+            };
+            assert_eq!((width, height), expected.dimensions());
+            assert_eq!(pixels.as_ref(), expected.as_raw());
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), expected.len());
+        };
+        assert_pixels(extended_webp_fixture(&simple[12..], false, false), &opaque);
+        assert_pixels(animated_alpha_webp_fixture(), &opaque);
+        assert_pixels(simple, &opaque);
+        let alpha = webp_fixture(ALPHA_WEBP);
+        let expected = image::load_from_memory(&alpha).unwrap().into_rgba8();
+        assert_pixels(alpha, &expected);
+        let animated = webp_fixture(ANIMATED_WEBP);
+        let expected = image::load_from_memory(&animated).unwrap().into_rgba8();
+        assert_pixels(animated.clone(), &expected);
+        let mut unused_frame = animated;
+        let second = unused_frame
+            .windows(3)
+            .enumerate()
+            .filter(|(_, bytes)| *bytes == b"\x9d\x01\x2a")
+            .nth(1)
+            .unwrap()
+            .0;
+        unused_frame[second + 3..second + 5].copy_from_slice(&101u16.to_le_bytes());
+        assert_pixels(unused_frame, &expected);
+    }
+    #[test]
+    fn webp_preview_refuses_vp8_canvas_and_frame_mismatches_before_decoder_construction() {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let extended = extended_webp_fixture(&simple[12..], false, false);
+        for (mut bytes, height) in [
+            (extended, false),
+            (webp_fixture(ANIMATED_WEBP), true),
+            (animated_alpha_webp_fixture(), false),
+        ] {
+            let magic = bytes
+                .windows(3)
+                .position(|bytes| bytes == b"\x9d\x01\x2a")
+                .unwrap();
+            let offset = magic + if height { 5 } else { 3 };
+            let dimension = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            // Only a one-pixel mismatch: never exercise a large allocation.
+            bytes[offset..offset + 2].copy_from_slice(&(dimension + 1).to_le_bytes());
+            assert!(bounded_decoder_input(&bytes).is_none());
+            let budget = Budget::new(bytes.len(), 100 * 100 * 4);
+            let encoded_length = bytes.len();
+            assert!(matches!(
+                bounded_handle(bytes, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 100 * 100 * 4);
+        }
     }
     fn oriented_webp(orientation: u8) -> Vec<u8> {
         use image::ImageEncoder;
