@@ -134,7 +134,9 @@ fn session(index: usize) -> chat::Session {
             provider: Provider::Claude,
             recipe: LaunchRecipe {
                 program: "/bin/false".into(),
-                arguments: Vec::new(),
+                // The recipe is never executed. An explicit default keeps
+                // draft preview from consulting real Claude account settings.
+                arguments: vec!["--permission-mode=default".into()],
                 working_directory: ROOT.into(),
                 environment: Default::default(),
                 unset_environment: Default::default(),
