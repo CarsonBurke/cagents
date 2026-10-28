@@ -777,17 +777,13 @@ impl Codex {
                 background: None,
             });
         }
-        // A child's errors are its own transcript evidence, not failures of
-        // the parent. Preserve the original diagnostic before generic child
-        // routing drops lifecycle/error events; status still comes exclusively
-        // from the child's independently parsed metadata above.
+        // Client/RPC errors belong to the child too, but do not prove a
+        // provider-marked failure. Genuine provider errors already carry
+        // their provenance from the notification decoder. Preserve other
+        // diagnostics as plain notices without changing lifecycle state.
         for event in &mut content.events {
             if let Event::Error { message, .. } = event {
-                let mut notice = session_notice(std::mem::take(message));
-                if let Event::Item(item) = &mut notice {
-                    chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
-                }
-                *event = notice;
+                *event = session_notice(std::mem::take(message));
             }
         }
         step.events.extend(chat::child_events(id, content.events));
@@ -2948,12 +2944,17 @@ impl Adapter for Codex {
                     });
                 }
                 if turn["error"].is_object() {
-                    step.events.push(Event::Error {
-                        message: turn["error"]["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| turn["error"].to_string()),
-                        fatal: false,
+                    let message = turn["error"]["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| turn["error"].to_string());
+                    step.events.push(if self.is_child {
+                        provider_error_notice(message)
+                    } else {
+                        Event::Error {
+                            message,
+                            fatal: false,
+                        }
                     });
                 }
                 if method == "turn/completed" {
@@ -3182,12 +3183,10 @@ impl Adapter for Codex {
                     .unwrap_or_else(|| params["error"].to_string());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
-                if params["willRetry"] == true {
-                    let mut notice = session_notice(message);
-                    if let Event::Item(item) = &mut notice {
-                        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
-                    }
-                    step.events.push(notice);
+                // Child diagnostics must likewise stay in their own timeline
+                // before generic child routing discards parent error state.
+                if params["willRetry"] == true || self.is_child {
+                    step.events.push(provider_error_notice(message));
                 } else {
                     step.events.push(Event::Error {
                         message,
@@ -3283,6 +3282,17 @@ fn session_notice(text: String) -> Event {
         at: None,
     })
 }
+
+/// Only the provider's explicit error notification/turn field grants this
+/// provenance. Client-generated disconnect or RPC diagnostics remain notices.
+fn provider_error_notice(text: String) -> Event {
+    let mut notice = session_notice(text);
+    if let Event::Item(item) = &mut notice {
+        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+    }
+    notice
+}
+
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
         if matches!(status["type"].as_str(), Some("active" | "systemError")) {
@@ -6266,6 +6276,37 @@ mod tests {
         );
         assert!(chat::failure::provider_error_text(Provider::Claude, error).is_none());
         assert!(error.id.starts_with("codex-notice:"));
+    }
+
+    #[test]
+    fn child_disconnect_diagnostics_remain_unmarked_and_do_not_fail_the_parent() {
+        for method in ["thread/closed", "thread/deleted"] {
+            let (parent, mut frames) = child_error_runtime_fixture();
+            frames.push(json!({"method":method,"params":{"threadId":"child-thread"}}));
+            frames.push(parent_question_after_child_error());
+            let (receipts, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(parent),
+                    frames,
+                    false,
+                );
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+            assert_child_error_parent_and_sibling(&state);
+            let child = state
+                .subagents
+                .iter()
+                .find(|child| child.id == "child-thread")
+                .unwrap();
+            assert_eq!(child.status, ToolStatus::Stopped);
+            assert!(!child.waiting);
+            assert_eq!(child.items.len(), 2);
+            let notice = &child.items[1];
+            assert_eq!(notice.role, Role::System);
+            assert!(matches!(&notice.content, ItemContent::Text {text,..}
+                    if text == &format!("Codex {method}; reconnect explicitly")));
+            assert!(chat::failure::provider_error_text(Provider::Codex, notice).is_none());
+        }
     }
 
     #[test]
