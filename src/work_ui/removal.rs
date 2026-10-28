@@ -95,6 +95,10 @@ pub enum Action {
     Reinspect {
         generation: RemovalGeneration,
     },
+    Details {
+        generation: RemovalGeneration,
+        open: bool,
+    },
     KeepUnresolved {
         generation: RemovalGeneration,
         owner: Uuid,
@@ -129,6 +133,7 @@ impl Action {
             | Self::Confirm { generation }
             | Self::Dismiss { generation }
             | Self::Reinspect { generation }
+            | Self::Details { generation, .. }
             | Self::Finished { generation, .. }
             | Self::KeepUnresolved { generation, .. }
             | Self::ReturnUnresolved { generation, .. }
@@ -203,6 +208,7 @@ pub(super) struct State {
     // Separate input ownership retires new retained-list callbacks on pane
     // reset without invalidating outstanding original worker completions.
     retained_owner: Uuid,
+    details_open: bool,
 }
 
 impl Default for State {
@@ -214,6 +220,7 @@ impl Default for State {
             unresolved: Vec::new(),
             viewing_unresolved: None,
             retained_owner: Uuid::new_v4(),
+            details_open: false,
         }
     }
 }
@@ -300,6 +307,7 @@ impl State {
     fn rotate(&mut self) {
         self.generation = Uuid::new_v4();
         self.retained_owner = Uuid::new_v4();
+        self.details_open = false;
     }
 
     /// `current` means the board still names this exact non-primary worktree,
@@ -334,6 +342,10 @@ impl State {
             return None;
         }
         match &action {
+            Action::Details { open, .. } if self.operation.is_some() => {
+                self.details_open = *open;
+                return None;
+            }
             Action::KeepUnresolved { owner, .. }
                 if *owner == self.retained_owner
                     && self.viewing_unresolved.is_none()
@@ -671,6 +683,9 @@ impl State {
                         generation,
                         self.operation.as_ref().map(|op| op.phase),
                         current,
+                        // Disclosure moves the consent controls. Retire any
+                        // held native input before mounting their new geometry.
+                        self.details_open,
                     ),
                     content,
                 ))
@@ -698,6 +713,42 @@ impl State {
             design::caption(bounded(&crate::app::display_path(&operation.subject.path))).into(),
         ])
         .spacing(space::XS);
+        content = content.push(
+            button::quiet(if self.details_open {
+                "Hide full details"
+            } else {
+                "Show full details"
+            })
+            .on_press(Action::Details {
+                generation,
+                open: !self.details_open,
+            }),
+        );
+        if self.details_open {
+            content = content
+                .push(design::heading("Target path"))
+                .push(selectable_detail(operation.subject.path.to_string_lossy()));
+            if let Some(branch) = &operation.subject.branch {
+                content = content
+                    .push(design::heading("Branch"))
+                    .push(selectable_detail(branch.as_str()));
+            }
+            if let Some(message) = &operation.message {
+                content = content
+                    .push(design::heading("Message"))
+                    .push(selectable_detail(message.as_str()));
+            }
+            if let Some(original) = operation
+                .submitted
+                .as_ref()
+                .and_then(|submitted| submitted.diagnostic.as_deref())
+                .filter(|original| Some(*original) != operation.message.as_deref())
+            {
+                content = content
+                    .push(design::heading("Original removal diagnostic"))
+                    .push(selectable_detail(original));
+            }
+        }
         if self.viewing_unresolved.is_some() {
             content = content.push(design::body("Read-only original. Inspection cannot confirm or settle the original removal. Its full unresolved record remains kept for the current application lifetime."));
         }
@@ -888,6 +939,14 @@ fn bounded(text: &str) -> String {
         shown.push('…');
     }
     shown
+}
+
+fn selectable_detail<'a>(text: impl Into<std::borrow::Cow<'a, str>> + 'a) -> Element<'a, Action> {
+    widget::selectable_text(text)
+        .size(design::TEXT_BODY)
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .into()
 }
 
 #[cfg(test)]
@@ -1784,6 +1843,157 @@ mod tests {
                 )
                 .is_none(),
             "pending requests never resend"
+        );
+    }
+
+    #[test]
+    fn full_details_distinguish_long_targets_and_preserve_original_diagnostics() {
+        let mut state = State::default();
+        let prefix = format!("/work/{}", "common-segment/".repeat(15));
+        let first = subject(&format!("{prefix}first"));
+        let second = subject(&format!("{prefix}second"));
+        assert_eq!(
+            bounded(first.path.to_str().unwrap()),
+            bounded(second.path.to_str().unwrap()),
+            "the compact previews cannot distinguish these valid targets"
+        );
+        review(&mut state, first.clone(), Verdict::Landed);
+        let old_generation = state.generation();
+        assert!(
+            state
+                .update(
+                    Action::Details {
+                        generation: old_generation,
+                        open: true,
+                    },
+                    true,
+                )
+                .is_none(),
+            "disclosure never dispatches backend work"
+        );
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text == first.path.to_str().unwrap())
+        );
+        assert_eq!(state.operation.as_ref().unwrap().keep, Some(Keep::Nothing));
+        assert!(!state.operation.as_ref().unwrap().delete_branch);
+        state.update(
+            Action::Dismiss {
+                generation: state.generation(),
+            },
+            true,
+        );
+        review(&mut state, second.clone(), Verdict::Landed);
+        state.update(
+            Action::Details {
+                generation: old_generation,
+                open: true,
+            },
+            true,
+        );
+        assert!(
+            !state.details_open,
+            "old disclosure cannot act on a new review"
+        );
+        state.update(
+            Action::Details {
+                generation: state.generation(),
+                open: true,
+            },
+            true,
+        );
+        let texts = outline(&state);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == second.path.to_str().unwrap())
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text == first.path.to_str().unwrap())
+        );
+        let Some(Effect::Remove {
+            generation,
+            request,
+            ..
+        }) = state.update(
+            Action::Confirm {
+                generation: state.generation(),
+            },
+            true,
+        )
+        else {
+            panic!("only explicit confirmation dispatches the reviewed removal");
+        };
+        assert_eq!(request.item, second.path.to_str().unwrap());
+        assert_eq!(request.keep, Keep::Nothing);
+        assert!(!request.delete_branch);
+        let diagnostic = format!(
+            "{}Original host did not return a receipt; inspect this same worktree before continuing.",
+            "Connection context. ".repeat(15),
+        );
+        state.update(
+            Action::Finished {
+                generation,
+                result: RemovalOutcome::Uncertain(diagnostic.clone()),
+            },
+            true,
+        );
+        let id = keep_unresolved(&mut state);
+        return_unresolved(&mut state, id);
+        state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            true,
+        );
+        state.update(
+            Action::Planned {
+                generation: state.generation(),
+                result: Ok(prepared(&second, Verdict::Landed)),
+            },
+            true,
+        );
+        state.update(
+            Action::Details {
+                generation: state.generation(),
+                open: true,
+            },
+            true,
+        );
+        let texts = outline(&state);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == second.path.to_str().unwrap())
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Original removal diagnostic")
+        );
+        assert!(texts.iter().any(|text| text == &diagnostic));
+        assert!(!texts.iter().any(|text| text == "Remove worktree"));
+        assert_eq!(
+            state.unresolved[0]
+                .operation
+                .submitted
+                .as_ref()
+                .unwrap()
+                .request,
+            request,
+        );
+        assert_eq!(
+            state.unresolved[0]
+                .operation
+                .submitted
+                .as_ref()
+                .unwrap()
+                .diagnostic
+                .as_deref(),
+            Some(diagnostic.as_str()),
         );
     }
 
