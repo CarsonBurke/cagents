@@ -66,11 +66,68 @@ if [ "$debug" = true ]; then
     export RUST_LOG=${RUST_LOG:-cagents=debug,cagentsd=debug,warn}
 fi
 
-command -v zig >/dev/null 2>&1 || {
-    printf '%s\n' 'required command not found: zig' >&2
+pinned_zig_version=$(sed -n \
+    's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$root/mise.toml")
+[ -n "$pinned_zig_version" ] || {
+    printf '%s\n' 'mise.toml does not pin a Zig version' >&2
     exit 1
 }
-zig_env=$(zig env) || {
+
+if [ -n "${CAGENTS_ZIG:-}" ]; then
+    zig_command=$CAGENTS_ZIG
+    case $zig_command in
+        /*) ;;
+        *)
+            printf '%s\n' 'CAGENTS_ZIG must be an absolute executable path' >&2
+            exit 1
+            ;;
+    esac
+    [ -x "$zig_command" ] || {
+        printf '%s\n' "CAGENTS_ZIG is not executable: $zig_command" >&2
+        exit 1
+    }
+else
+    zig_command=$(command -v zig) || {
+        printf '%s\n' 'required command not found: zig' >&2
+        exit 1
+    }
+fi
+
+# Isolated HOME/XDG_DATA_HOME with a mise shim on PATH can make the shim
+# rediscover itself. Select the pinned installation directly, then give Cargo
+# its real executable on PATH without changing the caller's environment.
+case $zig_command in
+    */mise/shims/zig)
+        if [ -L "$zig_command" ]; then
+            shim_target=$(readlink "$zig_command") || shim_target=
+            case $shim_target in
+                mise|*/mise)
+                    if [ -n "${MISE_DATA_DIR+x}" ]; then
+                        mise_data_dir=$MISE_DATA_DIR
+                    else
+                        mise_data_dir=${zig_command%/shims/zig}
+                    fi
+                    case $mise_data_dir in
+                        /*) ;;
+                        *)
+                            printf '%s\n' 'MISE_DATA_DIR must be an absolute nonempty path for the Zig shim' >&2
+                            exit 1
+                            ;;
+                    esac
+                    zig_command=$mise_data_dir/installs/zig/$pinned_zig_version/zig
+                    if [ ! -x "$zig_command" ]; then
+                        zig_command=$mise_data_dir/installs/zig/$pinned_zig_version/bin/zig
+                    fi
+                    [ -x "$zig_command" ] || {
+                        printf '%s\n' "pinned Zig $pinned_zig_version is not installed in $mise_data_dir" >&2
+                        exit 1
+                    }
+                    ;;
+            esac
+        fi
+        ;;
+esac
+zig_env=$("$zig_command" env) || {
     printf '%s\n' 'could not inspect the Zig installation' >&2
     exit 1
 }
@@ -86,6 +143,13 @@ case $zig_executable in
 esac
 [ -x "$zig_executable" ] || {
     printf '%s\n' "zig executable is not runnable: $zig_executable" >&2
+    exit 1
+}
+zig_version=$(printf '%s\n' "$zig_env" | sed -n \
+    -e 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+    -e 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+[ "$zig_version" = "$pinned_zig_version" ] || {
+    printf '%s\n' "Zig version ${zig_version:-unknown} does not match mise.toml pin ${pinned_zig_version:-unknown}" >&2
     exit 1
 }
 PATH=${zig_executable%/*}:$PATH
