@@ -320,6 +320,17 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         let (target, attempt, result) = checkpoint(save);
         assert!(result.is_err(), "actual writer refusal: {context}");
         match context {
+            "other-control" => {
+                app.sidebar_model.projects.push(SidebarProject::new(
+                    ProjectId::new(),
+                    RepositoryId::new(),
+                    "Search fixture".into(),
+                    PathBuf::from("/synthetic/project/.git"),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                app.sidebar_state.apply(&SidebarAction::ToggleControls);
+            }
             "other-card" => {
                 let other = app.workspace.order().find(|id| *id != card).unwrap();
                 app.workspace.focus(other).unwrap();
@@ -337,7 +348,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
             _ => {}
         }
         let recovery = app.draft_start_checkpointed(target, attempt, result);
-        let chosen = (context == "other-control").then(sidebar::search_toggle_focus_id);
+        let chosen = (context == "other-control").then(sidebar::search_focus_id);
         let task = chosen.as_ref().map_or_else(Task::none, |id| {
             iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
         });
