@@ -1744,13 +1744,25 @@ fn start_with_execution(
             installed_handle.wake_retained_outcomes();
             retained_actor::wake(host, id);
             if let Some(expected) = expected_saved {
-                let confirmation = confirm_saved_conversation(
+                let confirmation = wait_saved_conversation_ready(
                     &installed_handle,
                     expected,
                     Instant::now() + Duration::from_secs(15),
                     || {
                         crate::daemon::termination_requested()
                             || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                    },
+                    || {
+                        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                        if state.proof() != &proof
+                            || state.chats.get(&id).is_none_or(|record| {
+                                record.execution_instance != execution_instance
+                                    || !record.handle.same_attachment(&installed_handle)
+                            })
+                        {
+                            return Err("The resumed conversation changed its owner".into());
+                        }
+                        Ok(())
                     },
                 )
                 .and_then(|()| {
@@ -2410,6 +2422,52 @@ fn recover_account(
         return Err(failure);
     }
     response
+}
+
+/// Named retained starts can confirm identity before initialization publishes
+/// Ready. Poll only their bounded resident metadata, on the captured attachment;
+/// the caller still hydrates and fences its final attachment snapshot once ready.
+fn wait_saved_conversation_ready(
+    handle: &Handle,
+    expected: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+    current: impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    loop {
+        current()?;
+        confirm_saved_conversation(handle, expected, deadline, &cancelled)?;
+        // This helper is used only by the remote named-start path. A local
+        // attachment_snapshot would hydrate history, so keep account recovery
+        // and other local confirmation callers on their existing helper.
+        let snapshot = handle.attachment_snapshot();
+        if let Some(failure) = snapshot.error {
+            return Err(failure);
+        }
+        if snapshot.exited {
+            return Err(
+                "The provider exited before its saved conversation was ready; it remains unchanged"
+                    .into(),
+            );
+        }
+        if snapshot
+            .session_id
+            .as_deref()
+            .is_some_and(|actual| actual != expected)
+        {
+            return Err(
+                "The provider opened a different conversation; the saved conversation is unchanged"
+                    .into(),
+            );
+        }
+        if snapshot.ready && snapshot.session_id.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("The provider confirmed the saved conversation but did not become ready in time; it remains unchanged".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn confirm_saved_conversation(
