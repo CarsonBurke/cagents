@@ -5136,6 +5136,8 @@ pub struct Cagents {
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
+    /// Channel publications already queued for one registry and local owner.
+    workspace_model_publications: HashSet<(uuid::Uuid, ChannelId, ProjectId)>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
@@ -13873,6 +13875,7 @@ impl Application for Cagents {
             shared_views,
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_publications: HashSet::new(),
             workspace_model_rx,
             workspace_model_tx,
             activation_rx,
@@ -28488,6 +28491,7 @@ mod tests {
             shared_views: shared_views::State::default(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_publications: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,
             // Unbounded and unread: a fixture publishes into a queue nobody
             // drains, which is what keeps a test off the daemon entirely.

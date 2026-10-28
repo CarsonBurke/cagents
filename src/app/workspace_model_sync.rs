@@ -920,6 +920,21 @@ impl Cagents {
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
+        // The publisher retains a queued creation through transient transport
+        // failures. An absent channel is not permission to queue that same
+        // creation again, including after a permanent refusal. Keep this fact
+        // separate from `shared`: only acknowledgement authorizes retirement.
+        let unshared = self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| !channel.shared)
+            .map(|channel| (channel.id, channel.project_id))
+            .collect::<HashSet<_>>();
+        self.workspace_model_publications
+            .retain(|(registry, channel, project)| {
+                *registry == model.identity && unshared.contains(&(*channel, *project))
+            });
         let mut tasks = Vec::new();
         let mut changed = false;
         // Projects first, so a channel's owner exists by the time the channel is
@@ -1000,7 +1015,7 @@ impl Cagents {
         // that is the only order two windows can agree on without a clock they
         // share.
         for id in republished {
-            self.publish_shared_channel(id);
+            self.publish_shared_channel(id, model.identity);
         }
         // Admission uses this incoming snapshot, not a blocked flag left by a
         // previous projection. Defer fresh actors while their scope is truly
@@ -1759,10 +1774,16 @@ impl Cagents {
     /// Publishes a channel this window holds and the registry has never heard
     /// of, which is how a window that predates the registry - or that was open
     /// while a replacement one was created - introduces what it already has.
-    fn publish_shared_channel(&mut self, id: ChannelId) {
+    fn publish_shared_channel(&mut self, id: ChannelId, registry: uuid::Uuid) {
         let Some(channel) = self.durable.channels.iter().find(|local| local.id == id) else {
             return;
         };
+        if self
+            .workspace_model_publications
+            .contains(&(registry, id, channel.project_id))
+        {
+            return;
+        }
         let title = channel.title.clone();
         let title_source = channel.title_source;
         let project_id = channel.project_id;
@@ -1783,12 +1804,15 @@ impl Cagents {
         // Carrying the title this window already derived, unlike a fresh
         // creation: a channel being reintroduced has a name the user has seen,
         // and publishing it empty would blank it in every other window.
-        self.publish_model_edit(ModelEdit::CreateChannel {
-            id,
-            repository,
-            title,
-            title_source,
-        });
+        self.publish_model_edit_for_registry(
+            ModelEdit::CreateChannel {
+                id,
+                repository,
+                title,
+                title_source,
+            },
+            registry,
+        );
     }
 
     /// Publishes a project this window opened.
@@ -1824,7 +1848,25 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+        self.publish_model_edit_for_registry(edit, self.workspace_model.identity);
+    }
+
+    fn publish_model_edit_for_registry(&mut self, edit: ModelEdit, registry: uuid::Uuid) {
         self.capture_view_update_source(&edit);
+        let publication = match &edit {
+            ModelEdit::CreateChannel { id, repository, .. } => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == *id)
+                .filter(|channel| {
+                    self.sidebar_model
+                        .project(channel.project_id)
+                        .is_some_and(|project| project.repository == *repository)
+                })
+                .map(|channel| (registry, *id, channel.project_id)),
+            _ => None,
+        };
         let navigation = matches!(
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -1836,6 +1878,8 @@ impl Cagents {
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
+        } else if let Some(publication) = publication {
+            self.workspace_model_publications.insert(publication);
         }
     }
 }
