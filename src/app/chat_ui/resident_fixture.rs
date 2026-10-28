@@ -4,7 +4,7 @@
 //! or evidence of a connected account. The isolation owner mounts this module
 //! only for the interactive fixture; the automatic latency workload stays apart.
 use super::*;
-use crate::model::WorkspaceId;
+use crate::model::{WorkspaceId, WorktreeId};
 use crate::repository::{
     ChangeArea, ChangeKind, ChangedPath, DirtyState, RepoPath, RepositorySnapshot, StatusSnapshot,
     WorkingFiles,

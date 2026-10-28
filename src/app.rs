@@ -15879,11 +15879,13 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCard { card, width } => {
-                // The settings pane lays itself out against its own width, so
-                // dragging its edge is how the user picks rail or stacked.
-                if !self.card_state(card).is_some_and(|state| {
-                    matches!(&state.kind, CardKind::Terminal(_)) || state.kind.is_utility()
-                }) {
+                // The outer splitter resizes the pane independently of its
+                // content, including chat, repository and browser panes.
+                if !self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+                    || self.workspace.card(card).is_none()
+                {
                     return Task::none();
                 }
                 let viewport = self.workspace.viewport_width();
@@ -15944,8 +15946,12 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCardFinished(card) => {
-                self.workspace.finish_card_resize(card);
-                if self.card_state(card).is_some() {
+                if self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+                    && self.workspace.card(card).is_some()
+                {
+                    self.workspace.finish_card_resize(card);
                     self.persist();
                 }
                 Task::none()
@@ -29797,6 +29803,177 @@ mod tests {
             app.card_state(card).unwrap().width_fraction,
             limits.maximum / 1_000.0
         );
+    }
+
+    #[test]
+    fn pane_resize_updates_rendered_and_durable_width_for_every_kind() {
+        let terminal = terminal_card_state().kind;
+        let CardKind::Terminal(session) = &terminal else {
+            unreachable!("the fixture supplies a terminal descriptor");
+        };
+        let chat = CardKind::Chat(crate::chat::Session {
+            id: session.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: session.launch.clone(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        });
+        let url = Url::parse("about:blank").unwrap();
+        let kinds = [
+            ("terminal", terminal),
+            ("chat", chat),
+            (
+                "repository",
+                CardKind::Repository(RepositoryView {
+                    selected_file: None,
+                    project: ProjectId::new(),
+                    repository: "/repo".into(),
+                    worktree: "/repo".into(),
+                }),
+            ),
+            (
+                "browser",
+                CardKind::Browser(crate::model::BrowserSession {
+                    id: crate::model::BrowserId::new(),
+                    current_url: url.clone(),
+                    history: vec![url],
+                    history_index: 0,
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
+                    fidelity: crate::model::BrowserRestoreFidelity::ExactLive,
+                }),
+            ),
+            (
+                "pull requests",
+                CardKind::PullRequests(crate::model::PullRequestView {
+                    repository: "/repo".into(),
+                    selected_number: None,
+                    file_panel_width: None,
+                    file_panel_collapsed: None,
+                }),
+            ),
+            ("settings", CardKind::Settings),
+            ("accounts", CardKind::Accounts),
+            ("automations", CardKind::Automations),
+            ("work", CardKind::Work),
+        ];
+        for (name, kind) in kinds {
+            let mut app = context_inspector_test_app(true);
+            let card = app.workspace.focused().unwrap();
+            app.card_state_mut(card).unwrap().kind = kind;
+            app.workspace.resize_viewport(1_000.0);
+            let neighbor = CardId::new();
+            app.workspace
+                .add_card(
+                    WorkspaceCard::new(neighbor, "Neighbor", CardWidth::Fraction(0.5)).unwrap(),
+                    1,
+                    false,
+                )
+                .unwrap();
+            app.workspace.focus(neighbor).unwrap();
+            let before = app.workspace.geometry().card(card).unwrap().width();
+            let fraction_before = app.card_state(card).unwrap().width_fraction;
+
+            drop(app.update(Message::ResizeCard {
+                card,
+                width: before + 32.0,
+            }));
+
+            let after = app.workspace.geometry().card(card).unwrap().width();
+            let fraction_after = app.card_state(card).unwrap().width_fraction;
+            assert!(after > before + 1.0, "{name}: {before} -> {after}");
+            assert!(fraction_after > fraction_before, "{name}");
+            assert_eq!(app.workspace.focused(), Some(card), "{name}");
+            assert_eq!(
+                app.workspace.card(card).unwrap().width,
+                CardWidth::Fraction(fraction_after),
+                "{name}"
+            );
+            app.focus_save_pending = true;
+            drop(app.update(Message::ResizeCardFinished(card)));
+            assert!(
+                !app.focus_save_pending,
+                "{name}: finish persists the layout"
+            );
+            assert_eq!(app.card_state(card).unwrap().width_fraction, fraction_after);
+            assert_eq!(app.workspace.geometry().card(card).unwrap().width(), after);
+            assert!(app.status.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn pane_resize_ignores_missing_inactive_and_closed_cards_without_mutation() {
+        #[derive(Clone, Copy, Debug)]
+        enum Departure {
+            Missing,
+            Inactive,
+            Closing,
+            Closed,
+        }
+        for departure in [
+            Departure::Missing,
+            Departure::Inactive,
+            Departure::Closing,
+            Departure::Closed,
+        ] {
+            let mut app = context_inspector_test_app(true);
+            let card = app.workspace.focused().unwrap();
+            app.workspace.resize_viewport(1_000.0);
+            let target = match departure {
+                Departure::Missing => CardId::new(),
+                Departure::Inactive => {
+                    app.workspace.request_close(card).unwrap();
+                    app.workspace.commit_close(card).unwrap();
+                    assert!(app.card_state(card).unwrap().existence.is_open());
+                    assert!(app.workspace.card(card).is_none());
+                    card
+                }
+                Departure::Closing => {
+                    app.card_state_mut(card).unwrap().existence = Existence::Closing {
+                        operation_id: crate::model::OperationId::new(),
+                    };
+                    card
+                }
+                Departure::Closed => {
+                    app.card_state_mut(card).unwrap().existence = Existence::Closed {
+                        tombstone: crate::model::Tombstone {
+                            operation_id: None,
+                            closed_at_unix_ms: 0,
+                            reason: None,
+                        },
+                    };
+                    card
+                }
+            };
+            let durable = app.durable.clone();
+            let geometry = app.workspace.geometry().clone();
+            let focused = app.workspace.focused();
+            app.focus_save_pending = true;
+            assert!(app.status.is_none());
+
+            drop(app.update(Message::ResizeCard {
+                card: target,
+                width: 640.0,
+            }));
+            drop(app.update(Message::ResizeCardFinished(target)));
+
+            assert_eq!(app.durable.as_ref(), durable.as_ref(), "{departure:?}");
+            assert_eq!(app.workspace.geometry(), &geometry, "{departure:?}");
+            assert_eq!(app.workspace.focused(), focused, "{departure:?}");
+            assert!(
+                app.focus_save_pending,
+                "{departure:?}: no stale persistence"
+            );
+            assert!(
+                app.status.is_none(),
+                "{departure:?}: no stale resize notice"
+            );
+        }
     }
 
     #[test]
