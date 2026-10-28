@@ -359,7 +359,8 @@ impl Cagents {
             self.workspace.focused(),
             &update.transitions,
         );
-        self.sync_native_fixture_visibility();
+        // Causal control: retain initial/overlay sync but omit exposure updates
+        // when a viewport change reveals the next resident transcript.
         self.chrome_ui.tabs_focus = self.workspace.focused();
         let focus = self
             .workspace
