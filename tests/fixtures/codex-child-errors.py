@@ -17,6 +17,7 @@ import sys
 import threading
 import uuid
 
+sys.dont_write_bytecode = True
 _source = Path(__file__).with_name("terminal-escape-codex.py")
 _spec = importlib.util.spec_from_file_location("codex_fixture_transport", _source)
 transport = importlib.util.module_from_spec(_spec)
