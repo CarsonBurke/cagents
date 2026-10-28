@@ -7908,6 +7908,34 @@ fn append_pathspec_glob_literal(input: &mut Vec<u8>, bytes: &[u8]) {
 /// NUL-delimited exact Changes entries, including opaque directory/gitlinks.
 /// Keep normal `git add` semantics for ignore rules, filters and index flags.
 fn selected_stage_pathspec_input(paths: &[RepoPath]) -> Vec<u8> {
+    if paths.len() >= 2 {
+        let bytes = paths[0].as_bytes();
+        let parent_end = bytes
+            .iter()
+            .rposition(|&byte| byte == b'/')
+            .map_or(0, |index| index + 1);
+        let parent = &bytes[..parent_end];
+        if paths.iter().all(|path| {
+            let bytes = path.as_bytes();
+            bytes.starts_with(parent) && !bytes[parent.len()..].contains(&b'/')
+        }) {
+            // Siblings cannot select each other's descendants. Keep Git's
+            // literal entry semantics, but share their descendant exclusions.
+            let mut input = Vec::new();
+            for path in paths {
+                input.extend_from_slice(b":(top,literal)");
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            for suffix in [b"*/?*".as_slice(), b"*/?*/**".as_slice()] {
+                input.extend_from_slice(b":(top,glob,exclude)");
+                append_pathspec_glob_literal(&mut input, parent);
+                input.extend_from_slice(suffix);
+                input.push(0);
+            }
+            return input;
+        }
+    }
     let mut sorted: Vec<&[u8]> = paths.iter().map(RepoPath::as_bytes).collect();
     sorted.sort_unstable();
     let mut input = Vec::new();
