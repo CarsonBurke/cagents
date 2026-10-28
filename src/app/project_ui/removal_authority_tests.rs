@@ -674,6 +674,10 @@ fn standalone_retained_app(
             .all(|channel| !channel.cards.contains(&card))
     );
     assert_eq!(app.workspace.focused(), Some(card));
+    let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
+        panic!("Ready retained the native conversation")
+    };
+    assert!(session.has_valid_native_continuity());
     (app, removal, model, session, card)
 }
 
