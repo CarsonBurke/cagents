@@ -394,7 +394,7 @@ mod service {
         }
     }
 
-    fn clean_label(text: &str) -> String {
+    pub(crate) fn clean_label(text: &str) -> String {
         let mut label = String::new();
         let head = text.chars().take(LABEL_SCAN_CHARS).collect::<Vec<_>>();
         let chars = if text.chars().nth(LABEL_SCAN_CHARS).is_some() {
@@ -1811,3 +1811,5 @@ pub use service::{
 
 #[cfg(test)]
 pub(crate) use service::waiting_menu_for_test;
+
+pub(crate) use service::clean_label as human_title;

@@ -91,9 +91,7 @@ fn capture(state: &HostState) -> BTreeMap<TerminalId, Candidate> {
         if record.is_running() {
             candidates.entry(id).or_default().terminal = Some(TerminalSample {
                 handle: record.handle.clone(),
-                title: record
-                    .conversation_title()
-                    .map(|title| title.chars().take(256).collect()),
+                title: record.conversation_title().map(crate::tray::human_title),
                 directory: record.current_directory().into(),
             });
         }
