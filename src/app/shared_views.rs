@@ -300,7 +300,9 @@ impl Cagents {
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
-        Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        if !self.durable.local_only_cards.contains(&id) {
+            Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        }
     }
 
     pub(super) fn reserve_terminal_creation(&mut self, id: CardId) {
@@ -2125,12 +2127,30 @@ mod tests {
     fn equal_shared_model_reads_do_not_veto_the_current_final_window_save() {
         use super::super::workspace_model_sync::ModelUpdate;
 
-        for scope in [None, Some(PathBuf::from("/repo"))] {
+        for (retained_chat, scope) in [
+            (false, None),
+            (false, Some(PathBuf::from("/repo"))),
+            (true, None),
+        ] {
             let directory = tempfile::tempdir().unwrap();
-            let (mut app, _, _, pane) = channel_move_fixture();
-            app.workspace_model.views[0].panes[0].scope = scope;
+            let (mut app, _, _, pane) = if retained_chat {
+                retained_chat_move_fixture()
+            } else {
+                channel_move_fixture()
+            };
+            if retained_chat {
+                // A peer omitted this pane while its local unsent work is
+                // retained. Equal reads must preserve that usable draft too.
+                app.workspace_model.views[0].panes.clear();
+                app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+                    pane.id,
+                    "Unsent locally retained draft".into(),
+                )]));
+            } else {
+                app.workspace_model.views[0].panes[0].scope = scope;
+            }
             // Settle the actual shared projection before the close. The
-            // browser descriptor is synthetic; no engine or I/O task is run.
+            // descriptors are synthetic; no engine or provider I/O is run.
             let model = app.workspace_model.clone();
             drop(
                 app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
@@ -2169,6 +2189,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(saved.cards.iter().any(|card| card.id == pane.id));
+            if retained_chat {
+                assert_eq!(saved.chat_drafts[&pane.id], "Unsent locally retained draft");
+            }
             drop(app.update(completed));
             assert!(app.exit.is_some());
             assert!(app.pending_window_close.is_none());
