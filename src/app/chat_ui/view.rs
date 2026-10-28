@@ -3053,6 +3053,7 @@ impl Runtime {
                             .spacing(step::GAP_S as u16)
                             .align_items(Alignment::Center),
                     )
+                    .id(card_control_id(target.card, "chat-footer-surface"))
                     .padding(space::S)
                     .width((content_width - 32.0).max(200.0))
                     .into()
@@ -3314,6 +3315,7 @@ impl Runtime {
             anchor,
             popup.map(|content: Element<'_, Message>| {
                 widget::container(content)
+                    .id(card_control_id(target.card, "chat-actions-surface"))
                     .width(320)
                     .max_height(260.0)
                     .into()
@@ -3398,7 +3400,7 @@ impl Runtime {
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
                 .on_press(action(Action::ReasoningPicker(target, !open)));
-                let choices = open.then(|| {
+                let choices: Option<Element<'a, Message>> = open.then(|| {
                     widget::column::with_children(
                         model
                             .reasoning
@@ -3430,7 +3432,11 @@ impl Runtime {
                 });
                 controls.push(crate::ui_controls::popover(
                     anchor,
-                    choices,
+                    choices.map(|content| {
+                        widget::container(content)
+                            .id(card_control_id(target.card, "chat-reasoning-surface"))
+                            .into()
+                    }),
                     widget::popover::Position::Top,
                     action(Action::ReasoningPicker(target, false)),
                 ));
@@ -3547,7 +3553,7 @@ impl Runtime {
                 shortcuts,
             ),
         );
-        let choices = open.then(|| {
+        let choices: Option<Element<'a, Message>> = open.then(|| {
             widget::column::with_children(
                 accounts
                     .choices
@@ -3614,7 +3620,11 @@ impl Runtime {
         });
         crate::ui_controls::popover(
             anchor,
-            choices,
+            choices.map(|content| {
+                widget::container(content)
+                    .id(card_control_id(target.card, "chat-account-surface"))
+                    .into()
+            }),
             widget::popover::Position::Top,
             action(Action::AccountPicker(target, false)),
         )
@@ -3683,7 +3693,11 @@ impl Runtime {
         );
         crate::ui_controls::popover(
             anchor,
-            self.model_search(offers),
+            self.model_search(offers).map(|content| {
+                widget::container(content)
+                    .id(card_control_id(target.card, "chat-model-surface"))
+                    .into()
+            }),
             widget::popover::Position::Top,
             action(Action::ModelPicker(target, false)),
         )

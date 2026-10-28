@@ -132,7 +132,13 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
-    /// Any other pane, or none.
+    /// The actual focused editable repository buffer.
+    Editor,
+    /// A native text field, including sidebar, inspector, and overlay inputs.
+    TextInput,
+    /// No unambiguous native owner, or a control outside a card.
+    OutsideWorkspace,
+    /// Any other pane, or none (also the legacy synthetic-event default).
     #[default]
     Other,
 }
@@ -692,25 +698,63 @@ where
 
 /// The action a key press triggers while `focused` has focus. A chord whose
 /// action does not apply there triggers nothing, since
-/// [`is_global_shortcut_chord`] left it to the card.
+/// the workspace left it to the card.
 pub fn global_shortcut(
     event: &keyboard::Event,
     shortcuts: &KeyboardShortcuts,
     focused: FocusedPane,
 ) -> Option<GlobalShortcut> {
+    let keyboard::Event::KeyPressed { repeat, .. } = event else {
+        return None;
+    };
+    let descriptor = global_shortcut_event_descriptor(event, shortcuts, focused)?;
+    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
+        .then_some(descriptor.action)
+}
+
+fn global_shortcut_event_descriptor(
+    event: &keyboard::Event,
+    shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
+) -> Option<&'static ShortcutDescriptor> {
     let keyboard::Event::KeyPressed {
         key,
+        modified_key,
         physical_key,
         modifiers,
-        repeat,
         ..
     } = event
     else {
         return None;
     };
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
-        .then_some(descriptor.action)
+    // Preserve the existing action precedence across the whole registry before
+    // considering the symbol produced by Shift (for example 1 versus !).
+    global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused).or_else(|| {
+        (modified_key != key)
+            .then(|| {
+                global_shortcut_descriptor(
+                    modified_key,
+                    *physical_key,
+                    *modifiers,
+                    shortcuts,
+                    focused,
+                )
+            })
+            .flatten()
+    })
+}
+
+fn is_global_shortcut_press(
+    event: &keyboard::Event,
+    shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
+) -> bool {
+    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        return false;
+    };
+    crate::tab_history::is_chord(key, *modifiers)
+        || global_shortcut_event_descriptor(event, shortcuts, focused)
+            .is_some_and(|descriptor| descriptor.scope.applies_to(focused))
 }
 
 /// Whether a chord is withheld from the process inside a card: whether it is
@@ -725,7 +769,7 @@ pub(crate) fn is_global_shortcut_chord(
     focused: FocusedPane,
 ) -> bool {
     crate::tab_history::is_chord(key, modifiers)
-        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts)
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts, focused)
             .is_some_and(|descriptor| descriptor.scope.applies_to(focused))
 }
 
@@ -734,15 +778,104 @@ fn global_shortcut_descriptor(
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
 ) -> Option<&'static ShortcutDescriptor> {
+    if matches!(
+        focused,
+        FocusedPane::Editor | FocusedPane::Chat | FocusedPane::TextInput
+    ) && native_text_editing_chord(key, physical_key, modifiers)
+    {
+        return None;
+    }
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
-        shortcut_keys(descriptor.action, shortcuts)
-            .iter()
-            .any(|chord| {
-                parse_shortcut(chord)
-                    .is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
-            })
+        // A field's captured key must not close/clone a pane behind it, even
+        // when the user binds that command to a nonstandard editing chord.
+        !(matches!(
+            focused,
+            FocusedPane::TextInput | FocusedPane::OutsideWorkspace
+        ) && requires_pane_owner(descriptor.action))
+            && shortcut_keys(descriptor.action, shortcuts)
+                .iter()
+                .any(|chord| {
+                    parse_shortcut(chord).is_ok_and(|binding| {
+                        shortcut_matches(binding, key, physical_key, modifiers)
+                    })
+                })
     })
+}
+
+fn requires_pane_owner(action: GlobalShortcut) -> bool {
+    matches!(
+        action,
+        GlobalShortcut::RenamePane
+            | GlobalShortcut::MovePaneLeft
+            | GlobalShortcut::MovePaneRight
+            | GlobalShortcut::ClonePane
+            | GlobalShortcut::CloseFocusedCard
+            | GlobalShortcut::ReopenPane
+            | GlobalShortcut::FindInPane
+            | GlobalShortcut::CyclePaneWidth
+            | GlobalShortcut::ChatAccount
+            | GlobalShortcut::ChatModel
+            | GlobalShortcut::ChatPermissions
+            | GlobalShortcut::FocusAdjacent(_)
+            | GlobalShortcut::CycleWorkspace(_)
+            | GlobalShortcut::FocusPane1
+            | GlobalShortcut::FocusPane2
+            | GlobalShortcut::FocusPane3
+            | GlobalShortcut::FocusPane4
+            | GlobalShortcut::FocusPane5
+            | GlobalShortcut::FocusPane6
+            | GlobalShortcut::FocusPane7
+            | GlobalShortcut::FocusPane8
+            | GlobalShortcut::FocusPane9
+            | GlobalShortcut::ReviewToggleViewed
+            | GlobalShortcut::ReviewNextFile
+            | GlobalShortcut::ReviewPreviousFile
+            | GlobalShortcut::ReviewNextUnviewed
+            | GlobalShortcut::ReviewNextChange
+            | GlobalShortcut::ReviewPreviousChange
+    )
+}
+
+/// Native editing takes precedence over persisted workspace bindings. Both
+/// reservation and execution consult this same policy, independent of whether
+/// an input happened to capture an unsupported edit command.
+fn native_text_editing_chord(
+    key: &keyboard::Key,
+    physical: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
+    if modifiers.command() && !modifiers.alt() {
+        return match latin_key(key, physical) {
+            Some('z') => true,
+            Some('y') if !modifiers.shift() => true,
+            Some('a' | 'c' | 'v' | 'x') => true,
+            _ => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(
+                    keyboard::key::Named::ArrowLeft
+                        | keyboard::key::Named::ArrowRight
+                        | keyboard::key::Named::Home
+                        | keyboard::key::Named::End
+                        | keyboard::key::Named::Backspace
+                        | keyboard::key::Named::Delete
+                )
+            ),
+        };
+    }
+    modifiers.alt()
+        && !modifiers.control()
+        && !modifiers.logo()
+        && matches!(
+            key.as_ref(),
+            keyboard::Key::Named(
+                keyboard::key::Named::ArrowLeft
+                    | keyboard::key::Named::ArrowRight
+                    | keyboard::key::Named::Backspace
+                    | keyboard::key::Named::Delete
+            )
+        )
 }
 
 fn shortcut_matches(
@@ -812,6 +945,18 @@ fn shortcut_matches(
         }
 }
 
+/// A character chord that this physical event can actually dispatch. Number
+/// bindings use the number row even when Shift changes the logical character.
+pub(crate) fn recordable_shortcut_character(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+) -> Option<char> {
+    physical_digit(physical_key).or_else(|| {
+        // A logical numpad digit cannot trigger a number-row binding.
+        latin_key(key, physical_key).filter(|character| !character.is_ascii_digit())
+    })
+}
+
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
@@ -855,6 +1000,31 @@ fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {
 /// parser accepts never fired at all without the physical-digit fallback.
 #[must_use]
 pub fn shortcut_event_matches(binding: ShortcutBinding, event: &keyboard::Event) -> bool {
+    if shortcut_event_matches_unmodified(binding, event) {
+        return true;
+    }
+    let keyboard::Event::KeyPressed {
+        key,
+        modified_key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    modified_key != key && shortcut_matches(binding, modified_key, *physical_key, *modifiers)
+}
+
+/// Matches the unmodified/native physical form of a pressed chord. Dispatchers
+/// with several actions should prefer these matches across their action list
+/// before trying [`shortcut_event_matches`]'s modified-symbol fallback.
+#[must_use]
+pub fn shortcut_event_matches_unmodified(
+    binding: ShortcutBinding,
+    event: &keyboard::Event,
+) -> bool {
     let keyboard::Event::KeyPressed {
         key,
         physical_key,
@@ -984,6 +1154,7 @@ where
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .with_keyboard_trace(input)
     .with_scroll_input(scroll_input)
     .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
@@ -1790,6 +1961,7 @@ struct WorkspaceSurface<'a, Message> {
     shortcuts: &'a KeyboardShortcuts,
     /// The kind of the focused card; see [`is_global_shortcut_chord`].
     focused_pane: FocusedPane,
+    keyboard_trace: Option<InputTrace>,
     /// The strip viewport width the owner already holds, which is what the
     /// enclosing `view` laid this surface's content out against.
     ///
@@ -1819,11 +1991,17 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             content: content.into(),
             shortcuts,
             focused_pane,
+            keyboard_trace: None,
             reported_width,
             on_resize: Box::new(on_resize),
             initial_scroll: None,
             scroll_input: None,
         }
+    }
+
+    fn with_keyboard_trace(mut self, input: &InputTrace) -> Self {
+        self.keyboard_trace = Some(input.clone());
+        self
     }
 
     fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
@@ -1934,25 +2112,33 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let content_layout = Self::child_layout(layout);
 
         match event {
-            Event::Keyboard(
-                keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }
-                | keyboard::Event::KeyReleased {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                },
-            ) if is_global_shortcut_chord(
+            Event::Keyboard(press @ keyboard::Event::KeyPressed { .. })
+                if is_global_shortcut_press(
+                    press,
+                    self.shortcuts,
+                    self.keyboard_trace
+                        .as_ref()
+                        .and_then(InputTrace::keyboard_owner)
+                        .map_or(self.focused_pane, |owner| owner.pane),
+                ) =>
+            {
+                shell.capture_event();
+                return;
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if is_global_shortcut_chord(
                 key,
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
-                self.focused_pane,
+                self.keyboard_trace
+                    .as_ref()
+                    .and_then(InputTrace::keyboard_owner)
+                    .map_or(self.focused_pane, |owner| owner.pane),
             ) =>
             {
                 shell.capture_event();
@@ -1961,6 +2147,15 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             _ => {}
         }
         if !should_forward_to_raw_children(shell.is_event_captured()) {
+            return;
+        }
+        if matches!(event, Event::Keyboard(_))
+            && self
+                .keyboard_trace
+                .as_ref()
+                .and_then(InputTrace::keyboard_owner)
+                .is_some_and(|owner| owner.card.is_none())
+        {
             return;
         }
 
@@ -3532,6 +3727,126 @@ mod tests {
     }
 
     #[test]
+    fn shifted_native_symbols_preserve_primary_dispatch_and_card_input() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use keyboard::key::{Code, Physical};
+
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        // iced-winit supplies key_without_modifiers as key and logical_key as
+        // modified_key. Setting both to ! hides the native number-row case.
+        let press = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("1".into()),
+            modified_key: keyboard::Key::Character("!".into()),
+            physical_key: Physical::Code(Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_event_matches(
+                parse_shortcut(chord).unwrap(),
+                &press
+            ));
+        }
+        assert!(!shortcut_event_matches_unmodified(
+            parse_shortcut("Ctrl+Shift+!").unwrap(),
+            &press
+        ));
+        let mut shortcuts = KeyboardShortcuts {
+            chat_model: vec!["Ctrl+Shift+!".into()],
+            rename_pane: vec!["Ctrl+Shift+1".into()],
+            ..KeyboardShortcuts::default()
+        };
+        // ChatModel appears earlier in the registry, but its new fallback must
+        // not displace an action that already matched the physical digit.
+        for focused in [FocusedPane::Chat, FocusedPane::Editor, FocusedPane::Other] {
+            assert_eq!(
+                global_shortcut(&press, &shortcuts, focused),
+                Some(GlobalShortcut::RenamePane)
+            );
+            assert!(is_global_shortcut_press(&press, &shortcuts, focused));
+        }
+        for focused in [FocusedPane::TextInput, FocusedPane::OutsideWorkspace] {
+            assert_eq!(global_shortcut(&press, &shortcuts, focused), None);
+            assert!(!is_global_shortcut_press(&press, &shortcuts, focused));
+        }
+        shortcuts.rename_pane.clear();
+        assert_eq!(
+            global_shortcut(&press, &shortcuts, FocusedPane::Chat),
+            Some(GlobalShortcut::ChatModel)
+        );
+        assert_eq!(
+            global_shortcut(&press, &shortcuts, FocusedPane::Other),
+            None
+        );
+        assert!(!is_global_shortcut_press(
+            &press,
+            &shortcuts,
+            FocusedPane::Other
+        ));
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let card = CardId::new();
+        let release = keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("1".into()),
+            modified_key: keyboard::Key::Character("!".into()),
+            physical_key: Physical::Code(Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers,
+        };
+        assert!(!shortcut_event_matches(
+            parse_shortcut("Ctrl+Shift+!").unwrap(),
+            &release
+        ));
+        for (focused, event, captured, delivered) in [
+            (FocusedPane::Chat, press.clone(), true, false),
+            (FocusedPane::Other, press.clone(), false, true),
+            // Adding symbol press support must not introduce release capture.
+            (FocusedPane::Chat, release, false, false),
+        ] {
+            let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
+                Element::new(KeyProbe(card)),
+                &shortcuts,
+                focused,
+                400.0,
+                |_| None,
+            )
+            .into();
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(viewport.size(), viewport.size()),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(event),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert_eq!(shell.is_event_captured(), captured);
+            assert_eq!(messages.contains(&Some(card)), delivered);
+        }
+    }
+
+    #[test]
     fn wheel_scrolls_card_content_without_moving_the_workspace() {
         use cosmic::iced::advanced::{clipboard, renderer::Headless};
         use cosmic::iced::{Font, Pixels};
@@ -4800,5 +5115,82 @@ mod tests {
         let mut moved = projection;
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
+    }
+    #[test]
+    fn workspace_surface_preserves_native_editing_and_reserves_terminal_and_other_reopen() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::{Font, Pixels};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let shortcuts = KeyboardShortcuts::default();
+        let key = key_press(
+            "z",
+            keyboard::key::Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        let bounds = Rectangle::with_size(Size::new(400.0, 200.0));
+        for pane in [
+            FocusedPane::Editor,
+            FocusedPane::Chat,
+            FocusedPane::TextInput,
+            FocusedPane::Terminal,
+            FocusedPane::Other,
+        ] {
+            let card = CardId::new();
+            let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
+                Element::new(KeyProbe(card)),
+                &shortcuts,
+                pane,
+                400.0,
+                |_| None,
+            )
+            .into();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds.size(), bounds.size()),
+            );
+            let mut messages = Vec::new();
+            let captured = {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(key.clone()),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &bounds,
+                );
+                shell.is_event_captured()
+            };
+            let reserved = matches!(pane, FocusedPane::Terminal | FocusedPane::Other);
+            assert_eq!(captured, reserved, "{pane:?}");
+            assert_eq!(
+                messages,
+                if reserved {
+                    Vec::new()
+                } else {
+                    vec![Some(card)]
+                },
+                "real raw child reach for {pane:?}"
+            );
+            assert_eq!(
+                global_shortcut(&key, &shortcuts, pane),
+                reserved.then_some(GlobalShortcut::ReopenPane),
+                "reservation and execution policy agree for {pane:?}"
+            );
+        }
     }
 }

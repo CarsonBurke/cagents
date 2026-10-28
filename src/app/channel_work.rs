@@ -3728,6 +3728,7 @@ mod tests {
                 settings_ui::SettingsContext {
                     feedback: app.settings_feedback.as_ref(),
                     invalid: &app.settings_invalid,
+                    pressed_key: app.palette.pressed_key_filter(),
                     accounts: app.default_account_choices(),
                     updates: app.update_summary(),
                     testing_notification: app.notification_ui.testing,
