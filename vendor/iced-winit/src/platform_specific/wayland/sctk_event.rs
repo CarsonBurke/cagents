@@ -82,6 +82,7 @@ use winit::{
     dpi::{self, PhysicalSize},
     event::WindowEvent,
     event_loop::EventLoopProxy,
+    platform::scancode::PhysicalKeyExtScancode,
     window::WindowId,
 };
 use xkeysym::Keysym;
@@ -89,7 +90,6 @@ use xkeysym::Keysym;
 use super::{
     SubsurfaceInstance,
     event_loop::state::{Common, CommonSurface, SctkState},
-    keymap::raw_keycode_to_physicalkey,
     subsurface_widget::remove_iced_subsurface,
     winit_window::SctkWinitWindow,
 };
@@ -224,6 +224,45 @@ pub enum KeyboardEventVariant {
     Modifiers(Modifiers),
 }
 
+impl KeyboardEventVariant {
+    /// Convert SCTK's raw evdev key transitions without an X11 keycode offset.
+    pub(crate) fn into_key_event(
+        self,
+        modifiers: Modifiers,
+    ) -> Option<keyboard::Event> {
+        let (event, repeat) = match self {
+            Self::Press(event) => (event, Some(false)),
+            Self::Repeat(event) => (event, Some(true)),
+            Self::Release(event) => (event, None),
+            _ => return None,
+        };
+        let (key, location) = keysym_to_vkey_location(event.keysym);
+        // SCTK only adds eight for its XKB lookup; raw_code remains evdev.
+        let physical_key = crate::conversion::physical_key(
+            winit::keyboard::PhysicalKey::from_scancode(event.raw_code),
+        );
+        let modifiers = modifiers_to_native(modifiers);
+        Some(match repeat {
+            Some(repeat) => keyboard::Event::KeyPressed {
+                key: key.clone(),
+                location,
+                text: event.utf8.map(Into::into),
+                modifiers,
+                physical_key,
+                repeat,
+                modified_key: key, // TODO calculate without Ctrl?
+            },
+            None => keyboard::Event::KeyReleased {
+                key: key.clone(),
+                location,
+                modifiers,
+                modified_key: key,
+                physical_key,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum WindowEventVariant {
     Created(WlSurface, SurfaceId),
@@ -343,7 +382,7 @@ impl SctkEvent {
         control_sender: &mut mpsc::UnboundedSender<Control>,
         proxy: &EventLoopProxy,
         user_interfaces: &mut UserInterfaces<'a, P>,
-        events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
+        events: &mut crate::input_source::NativeEvents,
         clipboard: &mut Clipboard,
         subsurface_state: &mut Option<SubsurfaceState>,
         create_compositor_data: CreateCompositor<'b, P>,
@@ -604,73 +643,16 @@ impl SctkEvent {
                             ),
                         ));
                     }
-                    KeyboardEventVariant::Press(ke) => {
-                        let (key, location) =
-                            keysym_to_vkey_location(ke.keysym);
-                        let physical_key =
-                            raw_keycode_to_physicalkey(ke.raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
-                        events.push((
-                            surface_ids.get(&surface.id()).map(|id| id.inner()),
-                            iced_runtime::core::Event::Keyboard(
-                                keyboard::Event::KeyPressed {
-                                    key: key.clone(),
-                                    location: location,
-                                    text: ke.utf8.map(|s| s.into()),
-                                    modifiers: modifiers_to_native(*modifiers),
-                                    physical_key,
-                                    repeat: false,
-                                    modified_key: key, // TODO calculate without Ctrl?
-                                },
-                            ),
-                        ))
-                    }
-                    KeyboardEventVariant::Repeat(KeyEvent {
-                        keysym,
-                        utf8,
-                        raw_code,
-                        ..
-                    }) => {
-                        let (key, location) = keysym_to_vkey_location(keysym);
-                        let physical_key = raw_keycode_to_physicalkey(raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
-
-                        events.push((
-                            surface_ids.get(&surface.id()).map(|id| id.inner()),
-                            iced_runtime::core::Event::Keyboard(
-                                keyboard::Event::KeyPressed {
-                                    key: key.clone(),
-                                    location: location,
-                                    text: utf8.map(|s| s.into()),
-                                    modifiers: modifiers_to_native(*modifiers),
-                                    physical_key,
-                                    repeat: true,
-                                    modified_key: key, // TODO calculate without Ctrl?
-                                },
-                            ),
-                        ))
-                    }
-                    KeyboardEventVariant::Release(ke) => {
-                        let (k, location) = keysym_to_vkey_location(ke.keysym);
-                        let physical_key =
-                            raw_keycode_to_physicalkey(ke.raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
-                        events.push((
-                            surface_ids.get(&surface.id()).map(|id| id.inner()),
-                            iced_runtime::core::Event::Keyboard(
-                                keyboard::Event::KeyReleased {
-                                    key: k.clone(),
-                                    location,
-                                    modifiers: modifiers_to_native(*modifiers),
-                                    modified_key: k,
-                                    physical_key: physical_key,
-                                },
-                            ),
-                        ))
-                    }
+                    variant @ (KeyboardEventVariant::Press(_)
+                    | KeyboardEventVariant::Repeat(_)
+                    | KeyboardEventVariant::Release(_)) => events.push((
+                        surface_ids.get(&surface.id()).map(|id| id.inner()),
+                        iced_runtime::core::Event::Keyboard(
+                            variant
+                                .into_key_event(*modifiers)
+                                .expect("matched a keyboard transition"),
+                        ),
+                    )),
                     KeyboardEventVariant::Modifiers(new_mods) => {
                         *modifiers = new_mods;
                         events.push((

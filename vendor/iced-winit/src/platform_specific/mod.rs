@@ -174,7 +174,7 @@ impl PlatformSpecific {
 
 pub(crate) async fn handle_event<'a, 'b, P>(
     e: Event,
-    events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
+    events: &mut crate::input_source::NativeEvents,
     platform_specific: &mut PlatformSpecific,
     program: &'a crate::program::Instance<P>,
     compositor: &mut Option<
