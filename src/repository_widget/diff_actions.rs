@@ -325,8 +325,15 @@ impl RepositoryRuntime {
                         line: line.saturating_sub(1) as usize,
                     });
                 }
+                let line = self.editor_line_for_diff_source(line);
+                if let DocumentState::Editable(document) = &mut self.document {
+                    document.content.set_cursor(text_editor::Cursor {
+                        position: text_editor::Position { line, column: 0 },
+                        selection: None,
+                    });
+                }
                 self.viewports.editor = text_editor::ScrollPosition {
-                    line: self.editor_line_for_diff_source(line),
+                    line,
                     vertical: 0.0,
                     horizontal: 0.0,
                 };
@@ -873,6 +880,68 @@ mod tests {
         assert!(runtime.diff_working_file_target(&request).is_some());
         runtime.generation += 1;
         assert!(runtime.diff_working_file_target(&request).is_none());
+    }
+
+    #[test]
+    fn opening_a_diff_row_moves_the_editor_caret_and_preserves_unsaved_edits() {
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let (mut runtime, card, _) = fixture(mode);
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+            }));
+            let edited = runtime.editor_text().unwrap();
+            assert!(runtime.is_dirty());
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 0 },
+                selection: Some(text_editor::Position { line: 1, column: 2 }),
+            });
+            runtime.source_surface = SourceSurface::Diff;
+            let row = runtime
+                .diff_model()
+                .unwrap()
+                .row_at_new_line(mode, 101)
+                .unwrap();
+            drop(runtime.copy_diff(
+                card,
+                DiffCommand::OpenInEditor {
+                    row,
+                    side: Side::New,
+                },
+            ));
+            assert!(runtime.editable_surface_visible());
+            let navigation = runtime.navigation().unwrap().editor.unwrap();
+            assert_eq!(
+                navigation.caret,
+                crate::model::EditorPosition {
+                    line: 100,
+                    column: 0
+                }
+            );
+            assert!(navigation.selection.is_none());
+            assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+            assert!(runtime.is_dirty());
+
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('X')),
+            }));
+            assert_eq!(
+                runtime.editor_text(),
+                Some(edited.replacen("Straße needle", "XStraße needle", 1)),
+                "typing after the jump edits the clicked line"
+            );
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+            assert!(
+                runtime.is_dirty(),
+                "the earlier unsaved edit remains undoable"
+            );
+        }
     }
 
     #[test]
