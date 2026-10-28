@@ -1005,9 +1005,9 @@ import json, os, pathlib, select, sys
 root=pathlib.Path(os.environ['HOME']).parent
 with (root/'launches').open('a') as log: log.write('launch\n')
 args=sys.argv[1:]
-session=next((a.split('=',1)[1] for a in args if a.startswith('--session-id=')), None)
+session=next((a.split('=',1)[1] for a in args if a.startswith(('--session-id=', '--resume='))), None)
 if session is None:
-    session=args[args.index('--resume')+1]
+    raise ValueError('fixture requires an exact --session-id= or --resume= conversation')
 initialized=False
 sent=False
 loss_sent=False
