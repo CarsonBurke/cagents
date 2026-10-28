@@ -1279,7 +1279,7 @@ impl Runtime {
                     self.disconnected || self.paging().is_some(),
                 ));
             }
-            if self.turns.is_empty() && self.queued.is_none() {
+            if self.turns.is_empty() && self.queued.is_none() && snapshot.read_only_reason.is_none() {
                 // The empty state says what to do. It used to show whatever the
                 // adapter's last status detail was, which meant an empty
                 // conversation greeted the reader with a connection state instead
@@ -1489,7 +1489,9 @@ impl Runtime {
                         "Agent process exited. The transcript and draft are retained.",
                     )
                 } else {
-                    "Disconnected. The daemon may still be working; your draft is retained."
+                    snapshot.read_only_reason.as_deref().unwrap_or(
+                        "Disconnected. The daemon may still be working; your draft is retained.",
+                    )
                 })
                 .width(Length::Fill)
                 .into(),
@@ -4909,6 +4911,75 @@ mod tests {
         assert!(known.contains("Waiting for your approval"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
+    }
+
+    #[test]
+    fn disconnected_cached_view_shows_its_recovery_reason_and_keeps_reconnect() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let unavailable = "Connection lost; the last cached view is temporarily unavailable: display memory limit. Hide and reopen this pane to retry.";
+        let cached = "Connection lost; showing the last cached view. Reconnect to refresh history or send messages.";
+        let generic = "Disconnected. The daemon may still be working; your draft is retained.";
+        for reason in [Some(unavailable), Some(cached), None] {
+            let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+            runtime.disconnected = true;
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.exited = false;
+            snapshot.read_only_reason = reason.map(str::to_owned);
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "project".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let labels: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect();
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == reason.unwrap_or(generic)),
+                "{labels:?}"
+            );
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == "Reconnect to this session"),
+                "{labels:?}"
+            );
+            if reason.is_some() {
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|label| label.contains("Send a message to begin")),
+                    "{labels:?}"
+                );
+            }
+        }
     }
 
     #[test]

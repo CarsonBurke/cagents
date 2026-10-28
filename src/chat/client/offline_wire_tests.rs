@@ -258,6 +258,284 @@ fn hidden_socket_eof_restores_only_its_cached_readonly_view_and_revocation_fence
 }
 
 #[test]
+fn hidden_final_publication_keeps_authoritative_body_while_restoring_raw_once() {
+    use crate::chat::{
+        Item, ItemContent, Role, Subagent, ToolStatus,
+        cache::{
+            SourceEpoch, SourceKey, SourceMetadata, SourcePart,
+            raw::{RawRepresentation, RawSourceField, RawSourceMetadata, RawSourcePart},
+        },
+        source_owners::{self, ResidentRaw, ResidentRawCalls},
+    };
+    fn item(id: &str, body: &str) -> Arc<Item> {
+        Arc::new(Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+    fn parts(items: &[Arc<Item>], epoch: SourceEpoch) -> Vec<SourcePart> {
+        items
+            .iter()
+            .map(|item| SourcePart {
+                item_id: item.id.clone(),
+                source: SourceKey {
+                    agent_id: None,
+                    source_id: item.id.clone(),
+                },
+                start: 0,
+                end: item.content.byte_len(),
+                source_len: item.content.byte_len(),
+                replacement: false,
+                epoch,
+                metadata: SourceMetadata::from_item(item).unwrap(),
+            })
+            .collect()
+    }
+    fn child(items: Vec<Arc<Item>>) -> Subagent {
+        Subagent {
+            id: "same-child".into(),
+            kind: "fixture".into(),
+            description: "Retained child".into(),
+            status: ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items,
+        }
+    }
+    for empty_final in [false, true] {
+        let epoch = SourceEpoch {
+            incarnation: uuid::Uuid::from_u128(55),
+            revision: 3,
+        };
+        let original: Arc<str> = Arc::from("{  \"command\": \"original unchanged call\" }");
+        let record = ResidentRaw {
+            source: SourceKey {
+                agent_id: None,
+                source_id: "final-raw".into(),
+            },
+            field: RawSourceField::ToolInput,
+            epoch,
+            source_len: original.len(),
+            metadata: RawSourceMetadata {
+                tool_name: "Bash".into(),
+                representation: RawRepresentation::StreamJson,
+                complete_call: true,
+            },
+        };
+        assert_eq!(
+            source_owners::admit_raw(&original, &record, None),
+            source_owners::Admission::Ready
+        );
+        let raw_part = RawSourcePart {
+            item_id: "final-tool".into(),
+            source: record.source.clone(),
+            field: record.field,
+            epoch,
+            source_len: record.source_len,
+            metadata: record.metadata.clone(),
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("authoritative-final");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond =
+                |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                    codec
+                        .write(
+                            server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id,
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = attach.request else {
+                panic!("start");
+            };
+            let chat_id = session.id;
+            let old_items = vec![item("body", "old rendered body")];
+            respond(
+                &mut codec,
+                &mut server,
+                Some(attach.request_id),
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 40,
+                        ready: true,
+                        session_id: Some("same-final-session".into()),
+                        source_incarnation: Some(epoch.incarnation),
+                        source_revision: 11,
+                        source_parts: parts(&old_items, epoch),
+                        items: old_items,
+                        raw_source_parts: vec![raw_part.clone()],
+                        subagents: vec![child(vec![item("child-body", "old child body")])],
+                        ..Default::default()
+                    },
+                },
+            );
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(hidden.request_id),
+                ServerResponse::Accepted,
+            );
+            hidden_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let items = if empty_final {
+                vec![]
+            } else {
+                vec![item("body", "new authoritative final body")]
+            };
+            let child_items = if empty_final {
+                vec![]
+            } else {
+                vec![item("child-body", "new authoritative child body")]
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerResponse::ChatClosed {
+                    chat_id,
+                    snapshot: Snapshot {
+                        generation: 42,
+                        ready: true,
+                        exited: true,
+                        session_id: Some("same-final-session".into()),
+                        finished_at: Some(99),
+                        source_incarnation: Some(epoch.incarnation),
+                        source_revision: 12,
+                        source_parts: parts(
+                            &items,
+                            SourceEpoch {
+                                revision: 12,
+                                ..epoch
+                            },
+                        ),
+                        items,
+                        raw_source_parts: vec![raw_part],
+                        subagents: vec![child(child_items)],
+                        read_only_reason: (!empty_final)
+                            .then(|| "Authoritative closed transcript".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let old_body = Arc::downgrade(&handle.snapshot().items[0]);
+        let old_raw = Arc::downgrade(&original);
+        handle.remember_visible_view_with_sources(
+            handle.snapshot(),
+            None,
+            Default::default(),
+            ResidentRawCalls {
+                calls: vec![(original, record.clone())],
+            },
+        );
+        handle.set_visible(false).unwrap();
+        hidden_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while old_body.upgrade().is_some() || old_raw.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the old rendered view must spill before final publication"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.offline_view_metrics().3 > 0);
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        while handle.inner.alive.load(Ordering::Acquire) {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let authoritative = handle.resident_snapshot_with_clock().unwrap().0;
+        assert_eq!(authoritative.generation, 42);
+        assert!(authoritative.exited);
+        assert_eq!(authoritative.items.is_empty(), empty_final);
+        assert_eq!(authoritative.source_revision, 12);
+        handle.set_visible(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let restored = loop {
+            if let Some(restored) = handle.take_restored_raw_calls() {
+                break restored;
+            }
+            wake_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        };
+        let after = handle.snapshot();
+        assert!(Arc::ptr_eq(&after, &authoritative));
+        assert_eq!(
+            after.as_ref(),
+            authoritative.as_ref(),
+            "cached sidecars must not roll back a final body, descriptors or read-only reason"
+        );
+        for (after, before) in after.items.iter().zip(&authoritative.items) {
+            assert!(Arc::ptr_eq(after, before));
+        }
+        assert_eq!(restored.calls.len(), 1);
+        assert_eq!(
+            restored.calls[0].0.as_ref(),
+            "{  \"command\": \"original unchanged call\" }"
+        );
+        assert_eq!(
+            source_owners::resident_raw(&restored.calls[0].0),
+            Some(record)
+        );
+        assert!(handle.take_restored_raw_calls().is_none());
+        assert!(handle.send(Command::Interrupt).is_err());
+    }
+}
+
+#[test]
 fn hidden_wire_client_releases_history_and_reveals_at_the_same_generation() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
@@ -408,7 +686,14 @@ fn hidden_wire_client_releases_history_and_reveals_at_the_same_generation() {
         handle.snapshot().session_id.as_deref(),
         Some("exact-session")
     );
-    assert!(body.upgrade().is_none());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while body.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the hidden body must finish spilling"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     assert!(handle.resident_snapshot_with_clock().is_none());
     handle.set_visible(true).unwrap();
     while handle.resident_snapshot_with_clock().is_none() {
@@ -422,12 +707,45 @@ fn hidden_wire_client_releases_history_and_reveals_at_the_same_generation() {
         wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         Wake::Disconnected(_)
     ) {}
-    assert!(handle.set_visible(false).is_err());
+    let last_body = Arc::downgrade(&handle.snapshot().items[0]);
+    handle.set_visible(false).unwrap();
+    assert_eq!(handle.snapshot().transcript_bytes(), 0);
+    assert!(handle.resident_snapshot_with_clock().is_none());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while last_body.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the disconnected body must finish spilling"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(handle.offline_view_metrics().3 > 0);
+    // The only socket peer has exited. The first reveal must use the private
+    // cache, without a replacement connection or provider authority.
+    handle.set_visible(true).unwrap();
+    while handle.resident_snapshot_with_clock().is_none() {
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    let restored = handle.snapshot();
+    assert_eq!(restored.generation, 41);
+    assert_eq!(restored.session_id.as_deref(), Some("exact-session"));
     assert_eq!(
-        handle.snapshot().transcript_bytes(),
+        restored.transcript_bytes(),
         256 * 1024,
-        "an unreachable daemon cannot rehydrate the last readable publication yet"
+        "a disconnected reveal restores the last readable publication"
     );
+    let super::super::ItemContent::Text { text, .. } = &restored.items[0].content else {
+        panic!("the restored history must remain text");
+    };
+    assert_eq!(text, &"body".repeat(64 * 1024));
+    assert!(
+        restored
+            .read_only_reason
+            .as_deref()
+            .unwrap()
+            .contains("last cached view")
+    );
+    assert!(handle.send(Command::Interrupt).is_err());
 }
 
 #[test]

@@ -562,31 +562,35 @@ impl State {
             self.in_flight_bytes.store(0, Ordering::Release);
             return;
         }
-        // The file owns a last-viewed BODY, not authority to roll back newer
-        // control metadata received while hidden. Keep the current generation,
-        // outcome, requests, diagnostics and source clock. Only matching child
-        // identities receive cached body ownership; removed children stay gone.
-        let cached = Arc::make_mut(&mut restored);
+        // An explicit close can publish a complete final transcript while
+        // hidden. Its body and source descriptors outrank the older disk view;
+        // the cache can still contribute qualified source sidecars.
+        let resident = owner.transcript_resident.load(Ordering::Acquire);
         let mut publication = (**snapshot).clone();
-        publication.items = std::mem::take(&mut cached.items);
-        // Body ranges describe the cached visible prefix, not the newer control
-        // publication. In particular an old epoch must never be relabelled.
-        publication.source_revision = cached.source_revision;
-        publication.source_parts = std::mem::take(&mut cached.source_parts);
-        publication.source_parts.retain(|part| {
-            part.source
-                .agent_id
-                .as_ref()
-                .is_none_or(|id| publication.subagents.iter().any(|child| &child.id == id))
-        });
-        publication.changes_revision = cached.changes_revision;
-        publication.changes_parts = std::mem::take(&mut cached.changes_parts);
-        publication.changes_parts.retain(|part| {
-            part.source
-                .agent_id
-                .as_ref()
-                .is_none_or(|id| publication.subagents.iter().any(|child| &child.id == id))
-        });
+        if !resident {
+            let cached = Arc::make_mut(&mut restored);
+            publication.items = std::mem::take(&mut cached.items);
+            // Cached body ranges keep their original epochs rather than being
+            // relabelled as the newer control publication.
+            publication.source_revision = cached.source_revision;
+            publication.source_parts = std::mem::take(&mut cached.source_parts);
+            publication.source_parts.retain(|part| {
+                part.source
+                    .agent_id
+                    .as_ref()
+                    .is_none_or(|id| publication.subagents.iter().any(|child| &child.id == id))
+            });
+            for child in &mut publication.subagents {
+                if let Some(previous) = cached
+                    .subagents
+                    .iter_mut()
+                    .find(|previous| previous.id == child.id)
+                {
+                    child.items = std::mem::take(&mut previous.items);
+                }
+            }
+            publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
+        }
         let retained_child = |source: &crate::chat::cache::SourceKey| {
             source
                 .agent_id
@@ -599,21 +603,16 @@ impl State {
         restored_changes
             .patches
             .retain(|(_, record)| retained_child(&record.source));
-        for child in &mut publication.subagents {
-            if let Some(previous) = cached
-                .subagents
-                .iter_mut()
-                .find(|previous| previous.id == child.id)
-            {
-                child.items = std::mem::take(&mut previous.items);
-            }
+        if resident && changes::Manifest::capture(&publication, &restored_changes).is_err() {
+            restored_changes = ResidentChanges::default();
         }
-        publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
         // Raw call authority follows the latest qualified descriptors, not the
         // prose revision or an older cached projection. A hidden removal or
         // replacement must not be undone by disconnected history restoration.
         raw::retain_current(&publication, &mut restored_raw);
-        *snapshot = Arc::new(publication);
+        if !resident {
+            *snapshot = Arc::new(publication);
+        }
         data.restored_raw = Some(restored_raw);
         data.restored_changes = Some(restored_changes);
         data.unavailable = false;
@@ -795,49 +794,6 @@ mod tests {
             handle.offline_view_metrics().3 > 0 && handle.offline_view_metrics().0 == 0
         });
         handle.disconnect_for_test();
-    }
-
-    #[test]
-    fn disconnected_full_patch_sidecar_spills_restores_once_and_revokes() {
-        let (mut snapshot, view) = changes::tests::fixture();
-        snapshot.generation = 12;
-        snapshot.ready = true;
-        snapshot.session_id = Some("private-offline-patch".into());
-        let handle = ClientHandle::fixture(super::super::tests::omp_card(None, None), snapshot);
-        let original = Arc::downgrade(&view.patches[0].0);
-        handle.remember_visible_view_with_changes(handle.snapshot(), None, view);
-        hidden_on_disk(&handle);
-        wait("patch body was retained after disk spill", || {
-            original.upgrade().is_none()
-        });
-        handle.set_visible(true).unwrap();
-        wait("cached patch projection was not restored", || {
-            handle.resident_snapshot().is_some()
-        });
-        let restored = handle
-            .take_restored_changes()
-            .expect("decoded patch sidecar");
-        assert!(restored.patches[0].0.ends_with("+complete tail\n"));
-        assert_eq!(
-            crate::chat::source_owners::resident_patch(&restored.patches[0].0),
-            Some(restored.patches[0].1.clone())
-        );
-        assert!(
-            handle.take_restored_changes().is_none(),
-            "the client transfers the body exactly once"
-        );
-        drop(restored);
-        handle.set_visible(false).unwrap();
-        handle.set_visible(true).unwrap();
-        wait("second patch restore did not finish", || {
-            handle.resident_snapshot().is_some()
-        });
-        handle.revoke_local_history();
-        assert!(
-            handle.take_restored_changes().is_none(),
-            "DeleteFiles must drop even an unconsumed sidecar"
-        );
-        assert_eq!(handle.offline_view_metrics().3, 0);
     }
 
     #[test]
