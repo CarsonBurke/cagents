@@ -467,18 +467,35 @@ fn admit(
     active: ChannelId,
     hidden: ChannelId,
     model: crate::workspace_model::WorkspaceModel,
-) {
+) -> async_channel::Receiver<ModelEdit> {
     use crate::app::workspace_model_sync::ModelUpdate;
+    let (publisher, requests) = async_channel::unbounded();
+    app.workspace_model_tx = publisher;
     let connected = app.apply_workspace_model_update(ModelUpdate::Connected(model.clone()));
     settle(app, connected);
-    for channel in [active, hidden] {
-        let applied = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-            scope: Scope::Channel(channel),
-            operation: None,
-            model: model.clone(),
+    let queued_seeds = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter(|edit| matches!(edit, ModelEdit::SeedView { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued_seeds.len(),
+        2,
+        "Connected queues exactly both initial scopes"
+    );
+    let seeds = [active, hidden].map(|channel| {
+        let mut matching = queued_seeds.iter().filter(|edit| {
+            matches!(edit, ModelEdit::SeedView { scope: Scope::Channel(id), .. } if *id == channel)
         });
-        settle(app, applied);
+        let seed = matching
+            .next()
+            .expect("Connected queued this scope")
+            .clone();
+        assert!(matching.next().is_none(), "one seed per initial scope");
+        seed
+    });
+    for seed in seeds {
+        apply_seed_updates(app, framed_seed(seed, model.clone(), false));
     }
+    requests
 }
 
 #[test]
@@ -496,7 +513,7 @@ fn retired_cached_shared_chat_executes_no_provider_start() {
     );
     let mut view = View::empty(hidden);
     view.retired.push(pane.id);
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
@@ -528,7 +545,7 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
     let expected = canonical.clone();
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
@@ -646,7 +663,7 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
     settle(&mut app, startup);
     let mut view = View::empty(hidden);
     view.retired.push(pane.id);
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
@@ -760,7 +777,7 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     let expected = replacement.clone();
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
@@ -838,7 +855,7 @@ fn history_picker_does_not_focus_retained_unadmitted_cache() {
     settle(&mut app, startup);
     let mut view = View::empty(hidden);
     view.retired.push(pane.id);
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
@@ -977,7 +994,7 @@ fn exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver()
     assert_eq!(app.startup_pane_check(), Ok(false));
     let mut view = View::empty(hidden);
     view.retired.push(pane.id);
-    admit(
+    let _admission = admit(
         &mut app,
         active,
         hidden,
