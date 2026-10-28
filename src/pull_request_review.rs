@@ -429,6 +429,9 @@ pub struct State {
     last_refresh: Option<Instant>,
     cancellation: CancellationToken,
     viewed_cancellation: CancellationToken,
+    // A mutation can settle before an older refresh returns. Keep those
+    // acknowledged marks until a read started after their outcome can verify them.
+    viewed_after_load: BTreeSet<RepoPath>,
     load: LoadState,
     /// True while a refresh runs behind an already listed set of files.
     refreshing: bool,
@@ -640,6 +643,7 @@ impl State {
             last_refresh: None,
             cancellation: CancellationToken::new(),
             viewed_cancellation: CancellationToken::new(),
+            viewed_after_load: BTreeSet::new(),
             load: LoadState::Idle,
             refreshing: false,
             context: None,
@@ -1079,6 +1083,9 @@ impl State {
                     let Some(index) = self.file_index(&path) else {
                         continue;
                     };
+                    if self.refreshing || self.load == LoadState::Loading {
+                        self.viewed_after_load.insert(path.clone());
+                    }
                     let file = &mut self.files[index];
                     match outcome {
                         ViewedOutcome::Applied => {
@@ -1332,6 +1339,7 @@ impl State {
         self.viewed_cancellation = CancellationToken::new();
         self.generation = self.generation.wrapping_add(1);
         self.load_generation = 0;
+        self.viewed_after_load.clear();
         self.last_refresh = None;
         self.target = None;
         self.load = LoadState::Idle;
@@ -1392,6 +1400,7 @@ impl State {
         };
         self.last_refresh = Some(Instant::now());
         self.load_generation = self.load_generation.wrapping_add(1);
+        self.viewed_after_load.clear();
         self.pages.loading = false;
         let generation = self.generation;
         let load = self.load_generation;
@@ -1435,8 +1444,8 @@ impl State {
         )
     }
 
-    /// Installs a load, carrying pending marks across so an in-flight mutation
-    /// is not undone by the older answer a refresh may return.
+    /// Installs a load without undoing mutations which were pending or settled
+    /// after this refresh started. A subsequent read can reconcile those marks.
     fn adopt(&mut self, loaded: &Loaded) {
         if let Some(target) = &mut self.target {
             self.cache_dirty |= *target.pull_request != loaded.pull_request;
@@ -1501,7 +1510,9 @@ impl State {
         for file in &mut self.files {
             if !authority_changed
                 && let Some((viewed, sync)) = previous.get(&file.entry.path)
-                && (*sync == ViewedSync::Pending || file.sync == ViewedSync::Unknown)
+                && (*sync == ViewedSync::Pending
+                    || self.viewed_after_load.contains(&file.entry.path)
+                    || file.sync == ViewedSync::Unknown)
             {
                 file.viewed = *viewed;
                 file.sync = *sync;

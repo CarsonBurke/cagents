@@ -314,7 +314,9 @@ fn execute_current(
     }
     mutation_authority(expected, current, mutation)?;
     if let Mutation::Discard { review_id } = mutation {
-        if current.pending.as_ref().map(|p| &p.id) != Some(review_id) {
+        if current.pending.as_ref().map(|p| &p.id) != Some(review_id)
+            || expected.pending != current.pending
+        {
             return Err(Outcome::Refused(
                 "The pending review changed. Refresh before discarding it.".into(),
             ));
