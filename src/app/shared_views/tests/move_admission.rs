@@ -1,8 +1,9 @@
 use super::*;
 use crate::app::workspace_model_sync::ModelUpdate;
 
-const SAVED_MOVE_NOTICE: &str = "This saved pane has not been reopened. Open the conversation from history before moving it to a channel.";
-const UNNAMED_MOVE_NOTICE: &str = "This saved pane has not been reopened. Copy its saved draft into a new conversation, then move the new pane to a channel.";
+const SAVED_MOVE_NOTICE: &str = "This saved pane has not been reopened. Reconnect the workspace to reopen it, or open the conversation from history. Saved text stays in this pane.";
+const UNNAMED_MOVE_NOTICE: &str = "This saved pane has not been reopened. Reconnect the workspace to reopen it. You can copy saved text into a new conversation.";
+const ATTACHMENT_MOVE_NOTICE: &str = "This saved pane has not been reopened. Reconnect the workspace to reopen this pane with its saved attachments. Copying text or opening conversation history will not include these attachments.";
 const SCOPE_MOVE_NOTICE: &str =
     "Wait for this pane to finish joining the shared workspace before moving it to a channel.";
 const MOVE_CLOSE_NOTICE: &str =
@@ -146,6 +147,64 @@ fn an_unstarted_saved_chat_gets_copy_guidance_instead_of_unavailable_history() {
         Some(&session)
     );
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn an_image_only_unstarted_saved_chat_keeps_its_exact_source_when_move_is_refused() {
+    crate::chat::attachment_assets::with_test_image(|image| {
+        let (mut app, _, destination, pane) = awaiting_fixture();
+        let session = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            PathBuf::from("/repo"),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        assert!(session.is_unstarted());
+        let kind = CardKind::Chat(session.clone());
+        app.card_state_mut(pane.id).unwrap().kind = kind.clone();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .flat_map(|view| &mut view.panes)
+            .find(|candidate| candidate.id == pane.id)
+            .unwrap()
+            .kind = kind.clone();
+        // A referenced image-only saved draft enters the real startup runtime
+        // path. No provider, clipboard or session-writer Task is executed.
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::new(),
+            HashMap::from([(pane.id, vec![image.clone()])]),
+        );
+        drop(app.initialize_runtimes());
+        assert!(app.chat_awaiting_admission(pane.id));
+        assert!(saved_text(&app, pane.id).is_empty());
+        let allocation = runtime_allocation(&app, pane.id);
+        let before = app.persistent_workspace();
+        assert_eq!(before.chat_draft_attachments[&pane.id], [image.clone()]);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::MovePaneToChannel {
+            card: pane.id,
+            channel: destination,
+        }));
+        assert!(has_notice(&app, ATTACHMENT_MOVE_NOTICE));
+        assert!(!has_notice(&app, UNNAMED_MOVE_NOTICE));
+        assert!(app.chat_awaiting_admission(pane.id));
+        assert!(!app.chat_start_pending(pane.id));
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        assert_eq!(runtime_allocation(&app, pane.id), allocation);
+        assert_eq!(app.card_state(pane.id).unwrap().kind, kind);
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&pane.id),
+            Some(&session)
+        );
+        let after = app.persistent_workspace();
+        assert_eq!(after.chat_draft_attachments[&pane.id], [image]);
+        assert_eq!(after.pending_chat_admissions[&pane.id], session);
+        assert!(rx.try_recv().is_err());
+    });
 }
 
 #[test]

@@ -6,37 +6,52 @@ impl Runtime {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
+    pub(in crate::app) fn pending_admission_guidance(&self) -> &'static str {
+        if !self.unsent_attachments().is_empty() {
+            "This saved pane has not been reopened. Reconnect the workspace to reopen this pane with its saved attachments. Copying text or opening conversation history will not include these attachments."
+        } else if self.session.launch.session_id.is_some() {
+            "This saved pane has not been reopened. Reconnect the workspace to reopen it, or open the conversation from history. Saved text stays in this pane."
+        } else {
+            "This saved pane has not been reopened. Reconnect the workspace to reopen it. You can copy saved text into a new conversation."
+        }
+    }
+
     pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
         let text = self.unsent_text();
-        let copy = widget::button::custom(design::body("Copy saved draft"))
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([space::S as u16, space::M as u16])
-            .on_press_maybe(
-                (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
+        let mut actions = vec![design::heading("Saved draft").into()];
+        if !text.is_empty() {
+            actions.push(
+                widget::button::custom(design::body("Copy saved text"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([space::S as u16, space::M as u16])
+                    .on_press(Message::ChatUi(Action::CopyLiteral(text.clone())))
+                    .into(),
             );
-        let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
+        }
+        let header = widget::flex_row(actions)
             .align_items(Alignment::Center)
             .spacing(space::M as u16);
-        let draft = widget::container(view::body(text))
-            .width(Length::Fill)
-            .padding(space::M)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_M; 4],
-                false,
-            ));
-        let recovery = if self.session.launch.session_id.is_some() {
-            "This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history."
-        } else {
-            "This saved pane has not been reopened. Your unsent text is kept here; you can copy it into a new conversation while the workspace reconnects."
-        };
-        let content = widget::column::with_children(vec![
+        let mut content = vec![
             header.into(),
-            design::body(recovery).into(),
-            widget::scrollable(draft).height(Length::Fill).into(),
-        ])
-        .spacing(space::M)
-        .width(Length::Fill);
+            design::body(self.pending_admission_guidance()).into(),
+        ];
+        if !self.unsent_attachments().is_empty() {
+            content.push(design::body("Saved attachments stay in this pane.").into());
+        }
+        if !text.is_empty() {
+            let draft = widget::container(view::body(text))
+                .width(Length::Fill)
+                .padding(space::M)
+                .class(design::surface(
+                    Some(design::sunken),
+                    [design::RADIUS_M; 4],
+                    false,
+                ));
+            content.push(widget::scrollable(draft).height(Length::Fill).into());
+        }
+        let content = widget::column::with_children(content)
+            .spacing(space::M)
+            .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
             .padding(space::L)
             .width(Length::Fill)
@@ -368,6 +383,146 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_and_click_saved_panel(
+        runtime: &Runtime,
+        renderer: &cosmic::Renderer,
+        width: f32,
+    ) -> (Vec<String>, usize, Vec<Message>) {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree},
+        };
+        use iced::{Event, Rectangle, Size};
+
+        #[derive(Default)]
+        struct Panel {
+            texts: Vec<String>,
+            copy: Vec<Rectangle>,
+        }
+        impl Operation for Panel {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                self.texts.push(text.to_owned());
+                if text == "Copy saved text" {
+                    self.copy.push(bounds);
+                }
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.texts.push(prose.plain.to_string());
+                }
+            }
+        }
+        let mut element = runtime.pending_admission_view();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(width, 650.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut panel = Panel::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), renderer, &mut panel);
+        let mut messages = Vec::new();
+        for bounds in &panel.copy {
+            let point = bounds.center();
+            for event in [
+                mouse::Event::CursorMoved { position: point },
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+        }
+        (panel.texts, panel.copy.len(), messages)
+    }
+
+    #[test]
+    fn saved_attachment_panel_copies_only_nonempty_text_and_keeps_its_images() {
+        chat::attachment_assets::with_test_image(|image| {
+            let renderer = crate::app::tests::headless_renderer();
+            for named in [false, true] {
+                for text in ["", "  saved text 🦀\n"] {
+                    let mut app = crate::app::tests::context_inspector_test_app(false);
+                    drop(app.new_native_chat(Provider::Claude, Some("/project".into())));
+                    let card = app.workspace.focused().unwrap();
+                    let mut source = app.chat_return_session(card).unwrap();
+                    if named {
+                        source.launch.session_id = Some("saved-image-panel-fixture".into());
+                    }
+                    app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+                    app.chat_ui = State::with_draft_attachments(
+                        HashMap::from([(card, text.into())]),
+                        HashMap::from([(card, vec![image.clone()])]),
+                    );
+                    app.await_shared_chat_admission(card, source.clone());
+                    for width in [320.0, 900.0] {
+                        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                            panic!("saved draft runtime expected");
+                        };
+                        let (texts, copy_controls, messages) =
+                            render_and_click_saved_panel(runtime, &renderer, width);
+                        assert!(
+                            texts
+                                .iter()
+                                .any(|text| text == "Saved attachments stay in this pane.")
+                        );
+                        assert!(texts.iter().any(|text| {
+                            text.contains("Reconnect the workspace")
+                                && text.contains("history will not include these attachments")
+                        }));
+                        assert!(!texts.iter().any(|text| text == "Copy saved draft"));
+                        if text.is_empty() {
+                            assert_eq!(copy_controls, 0, "image-only content has no empty Copy");
+                            assert!(messages.is_empty());
+                        } else {
+                            assert_eq!(copy_controls, 1);
+                            assert_eq!(messages.len(), 1);
+                            assert!(matches!(
+                                &messages[0],
+                                Message::ChatUi(Action::CopyLiteral(copied)) if copied == text
+                            ));
+                        }
+                        for message in messages {
+                            // The returned clipboard Task is deliberately not
+                            // polled; this is renderer/action contract coverage.
+                            drop(app.update(message));
+                        }
+                        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                            panic!("saved draft runtime expected");
+                        };
+                        assert_eq!(runtime.session, source);
+                        assert_eq!(runtime.unsent_text(), text);
+                        assert_eq!(runtime.unsent_attachments(), [image.clone()]);
+                        assert!(runtime.awaiting_admission());
+                        assert!(!app.chat_start_pending(card));
+                        let saved = app.persistent_workspace();
+                        assert_eq!(saved.chat_draft_attachments[&card], [image.clone()]);
+                        assert_eq!(saved.pending_chat_admissions[&card], source);
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     fn admission_keeps_image_only_draft_and_rehomes_its_exact_source_metadata() {

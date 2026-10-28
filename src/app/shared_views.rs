@@ -754,16 +754,12 @@ impl Cagents {
         if self.workspace_inputs_blocked() {
             return Task::none();
         }
-        if self.chat_awaiting_admission(card) {
-            let message = if self
-                .chat_return_session(card)
-                .is_some_and(|session| session.launch.session_id.is_some())
-            {
-                "This saved pane has not been reopened. Open the conversation from history before moving it to a channel."
-            } else {
-                "This saved pane has not been reopened. Copy its saved draft into a new conversation, then move the new pane to a channel."
-            };
-            self.status = Some(TransientNotice::warning(message));
+        if self.chat_awaiting_admission(card)
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+        {
+            self.status = Some(TransientNotice::warning(
+                runtime.pending_admission_guidance(),
+            ));
             return Task::none();
         }
         if self.pane_move_lifecycle_pending(card) {
