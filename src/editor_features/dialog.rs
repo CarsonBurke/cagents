@@ -5,19 +5,120 @@ use cosmic::{
     Element, Renderer, Theme,
     iced::advanced::{
         Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
-        widget::{Operation, Tree, tree},
+        widget::{Operation, Tree, operation, tree},
     },
-    iced::{Event, Length, Rectangle, Size, Vector, mouse},
+    iced::{Event, Length, Rectangle, Size, Task, Vector, mouse},
 };
 
 struct Ticket(u64);
+struct FocusScope {
+    ticket: u64,
+    active: bool,
+}
+
+/// The ticketed control and its active-source marker must still exist in
+/// the native tree when the task is applied. A canceled/replaced dialog, an
+/// inactive source, or a newer upper modal must not blur another field merely
+/// because the old response already emitted its task.
+pub(super) fn focus(ticket: u64, target: widget::Id) -> Task<Action> {
+    struct MountedTarget {
+        ticket: u64,
+        target: widget::Id,
+        found: bool,
+        active: bool,
+    }
+    impl Operation<Action> for MountedTarget {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Action>)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            _state: &mut dyn operation::Focusable,
+        ) {
+            self.found |= id.is_some_and(|id| iced_accessibility::IdEq::eq(&id.0, &self.target.0));
+        }
+        fn custom(
+            &mut self,
+            _id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            self.active |= state
+                .downcast_ref::<FocusScope>()
+                .is_some_and(|scope| scope.ticket == self.ticket && scope.active);
+        }
+        fn finish(&self) -> operation::Outcome<Action> {
+            if self.active && self.found {
+                operation::Outcome::Chain(Box::new(operation::focusable::focus(
+                    self.target.clone(),
+                )))
+            } else {
+                operation::Outcome::None
+            }
+        }
+    }
+    cosmic::iced::runtime::task::widget(MountedTarget {
+        ticket,
+        target,
+        found: false,
+        active: false,
+    })
+}
+
+pub(super) fn restore(target: widget::Id) -> Task<Action> {
+    struct Restore {
+        target: widget::Id,
+        found: bool,
+        foreign_focus: bool,
+    }
+    impl Operation<Action> for Restore {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Action>)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            let target = id.is_some_and(|id| iced_accessibility::IdEq::eq(&id.0, &self.target.0));
+            self.found |= target;
+            self.foreign_focus |= !target && state.is_focused();
+        }
+        fn finish(&self) -> operation::Outcome<Action> {
+            if self.found && !self.foreign_focus {
+                operation::Outcome::Chain(Box::new(operation::focusable::focus(
+                    self.target.clone(),
+                )))
+            } else {
+                operation::Outcome::None
+            }
+        }
+    }
+    cosmic::iced::runtime::task::widget(Restore {
+        target,
+        found: false,
+        foreign_focus: false,
+    })
+}
 
 struct Dialog<'a> {
     ticket: u64,
+    active: bool,
     content: Element<'a, Action>,
 }
-pub(super) fn scoped(ticket: u64, content: Element<'_, Action>) -> Element<'_, Action> {
-    Element::new(Dialog { ticket, content })
+pub(super) fn scoped(
+    ticket: u64,
+    active: bool,
+    content: Element<'_, Action>,
+) -> Element<'_, Action> {
+    Element::new(Dialog {
+        ticket,
+        active,
+        content,
+    })
 }
 impl Widget<Action, Theme, Renderer> for Dialog<'_> {
     fn tag(&self) -> tree::Tag {
@@ -61,6 +162,16 @@ impl Widget<Action, Theme, Renderer> for Dialog<'_> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        // This fresh view's shell scope is only a focus admission marker. It
+        // never changes the ticket that owns drafts and native widget state.
+        operation.custom(
+            None,
+            layout.bounds(),
+            &mut FocusScope {
+                ticket: self.ticket,
+                active: self.active,
+            },
+        );
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -192,6 +303,7 @@ mod tests {
             .unwrap();
         let mut element = scoped(
             1,
+            true,
             widget::button::standard("Apply")
                 .on_press(Action::Apply(1))
                 .into(),
@@ -229,6 +341,7 @@ mod tests {
         drop(element);
         let mut element = scoped(
             2,
+            true,
             widget::button::standard("Apply")
                 .on_press(Action::Apply(2))
                 .into(),

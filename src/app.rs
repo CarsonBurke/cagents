@@ -17118,7 +17118,10 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(content) = self.editor_features.view() {
+        if let Some(content) = self
+            .editor_features
+            .view(self.feature_admission().choice_card)
+        {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(content.map(Message::EditorFeatures), 1000.0),
                 self.editor_features.escape().map(Message::EditorFeatures),
@@ -28019,7 +28022,70 @@ mod tests {
         app.lsp_contexts.entry(card).or_default().document = Some(LspDocumentId(1));
         app.lsp_documents.insert(LspDocumentId(1), card);
         app.next_lsp_document = 2;
+        app.workspace.resize_viewport(1200.0);
+        app.workspace.take_widget_focus_request();
+        assert_eq!(app.feature_admission().choice_card, Some(card));
         (app, fixture.directory, card)
+    }
+    async fn language_pair_fixture() -> (Cagents, tempfile::TempDir, CardId, CardId) {
+        let (mut app, directory, first) = language_controller_fixture().await;
+        let second = CardId::new();
+        std::fs::write(directory.path().join("second.rs"), "foo();\n").unwrap();
+        let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(second, "second.rs");
+        let CardKind::Repository(view) = &app.card_state(first).unwrap().kind else {
+            unreachable!()
+        };
+        runtime.descriptor = RepositoryView {
+            selected_file: Some("second.rs".into()),
+            ..view.clone()
+        };
+        identity.worktree = directory.path().into();
+        let root = directory.path().to_path_buf();
+        let read = tokio::task::spawn_blocking(move || {
+            crate::editor::read_file_at(
+                &root,
+                Path::new("second.rs"),
+                crate::editor::PdfTone::Original,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        drop(runtime.update(RepositoryAction::FileLoadedAt {
+            identity,
+            result: read,
+        }));
+        runtime.set_auto_save(false);
+        assert!(runtime.editor_feature_writable());
+        let mut state = app.card_state(first).unwrap().clone();
+        state.id = second;
+        state.title = "Second source".into();
+        state.kind = CardKind::Repository(runtime.descriptor.clone());
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(second, "Second source", CardWidth::Fraction(0.5)).unwrap(),
+                app.workspace.cards().len(),
+                false,
+            )
+            .unwrap();
+        app.cards
+            .insert(second, CardRuntime::Repository(Box::new(runtime)));
+        let events = app.lsp.events();
+        drop(app.drain_lsp_intents(second));
+        let second_doc = app.lsp_document(second).unwrap();
+        assert_ne!(app.lsp_document(first), Some(second_doc));
+        // Use the actual Open/discovery path on the first fixture's framed
+        // manager. Both source owners stay registered; no synthetic reused ID.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !app.lsp.capabilities(second_doc).ready {
+                drop(app.update(Message::Lsp(events.recv().await.unwrap())));
+            }
+        })
+        .await
+        .expect("second source joins the existing framed server");
+        assert_eq!(app.feature_admission().choice_card, Some(first));
+        (app, directory, first, second)
     }
     fn language_test(body: impl std::future::Future<Output = ()> + 'static) {
         // Cagents is large; preserve the real reducer without depending on
@@ -28031,12 +28097,87 @@ mod tests {
             .block_on(Box::pin(body));
     }
     #[test]
+    fn pending_language_choices_require_the_active_source_and_newest_interactive_intent() {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| language_test(async {
+            use crate::editor_features::Action;
+            let choice = |card, rename| if rename { Action::Rename(card) } else { Action::CodeActions(card) };
+            for rename in [true, false] {
+                let (mut app, _directory, first, second) = language_pair_fixture().await;
+                let events = app.lsp.events();
+                let doc = app.lsp_document(first).unwrap();
+                let version = app.lsp.document_version(doc);
+                let incarnation = app.lsp.document_incarnation(doc);
+                let (original_root, cursor) = match app.cards.get(&first).unwrap() {
+                    CardRuntime::Repository(runtime) => (runtime.retained_editor_root().unwrap(), runtime.cursor_position()),
+                    _ => unreachable!(),
+                };
+                drop(app.update(Message::EditorFeatures(choice(first, rename))));
+                let old = next_language_event(&events).await;
+                drop(app.update(Message::FocusCard(second)));
+                assert_eq!(app.feature_admission().choice_card, Some(second));
+                let rejected = app.update(Message::Lsp(old));
+                assert_eq!(rejected.units(), 0, "an inactive reply cannot issue a keyboard operation");
+                assert!(!app.editor_features.dialog_open());
+                assert_eq!(app.workspace.focused(), Some(second));
+                assert_eq!(app.lsp_document(first), Some(doc));
+                assert_eq!(app.lsp.document_version(doc), version);
+                assert_eq!(app.lsp.document_incarnation(doc), incarnation);
+                assert!(matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime)) if runtime.editor_feature_writable() && runtime.cursor_position() == cursor && Arc::ptr_eq(&original_root, &runtime.retained_editor_root().unwrap())));
+                // A stale toolbar invocation cannot create a new inactive
+                // request, either. It does not merely fail at response time.
+                assert_eq!(app.update(Message::EditorFeatures(choice(first, rename))).units(), 0);
+                assert!(!app.editor_features.pending());
+                drop(app.update(Message::EditorFeatures(choice(second, rename))));
+                let fresh = next_language_event(&events).await;
+                drop(app.update(Message::Lsp(fresh)));
+                assert!(app.editor_features.dialog_open(), "fresh active source remains usable");
+                app.editor_features.cancel_all(&mut app.lsp);
+                app.lsp.begin_shutdown().await;
+            }
+            for (old_rename, new_rename, same_card) in [
+                (true, true, false), (false, false, false),
+                (true, false, false), (false, true, false),
+                (true, false, true), (false, true, true),
+            ] {
+                let (mut app, _directory, first, second) = language_pair_fixture().await;
+                let events = app.lsp.events();
+                drop(app.update(Message::EditorFeatures(choice(first, old_rename))));
+                let old = next_language_event(&events).await;
+                let current = if same_card { first } else { second };
+                drop(app.update(Message::FocusCard(current)));
+                assert_eq!(app.feature_admission().choice_card, Some(current));
+                drop(app.update(Message::EditorFeatures(choice(current, new_rename))));
+                let fresh = next_language_event(&events).await;
+                assert_eq!(app.update(Message::Lsp(old)).units(), 0);
+                assert!(!app.editor_features.dialog_open(), "an older kind/card cannot win the dialog");
+                assert!(app.editor_features.pending(), "the newer request was not consumed by the old reply");
+                drop(app.update(Message::Lsp(fresh)));
+                let Some(Action::Cancel(ticket)) = app.editor_features.escape() else { panic!("newer source opens its current dialog") };
+                assert!(app.editor_features.view(app.feature_admission().choice_card).is_some());
+                // Submission guards recheck scope before taking the ticketed
+                // state. A stale submit/choice cannot consume the fresh dialog.
+                drop(app.update(Message::FocusCard(if current == first { second } else { first })));
+                let action = if new_rename { Action::RenameSubmit { ticket, value: "renamed".into() } } else { Action::ChooseAction { ticket, index: 0 } };
+                assert_eq!(app.update(Message::EditorFeatures(action)).units(), 0);
+                assert!(matches!(app.editor_features.escape(), Some(Action::Cancel(current)) if current == ticket));
+                drop(app.update(Message::FocusCard(current)));
+                drop(app.update(Message::EditorFeatures(Action::Cancel(ticket))));
+                assert!(!app.editor_features.dialog_open());
+                app.lsp.begin_shutdown().await;
+            }
+        })).unwrap().join().unwrap();
+    }
+
+    #[test]
     fn framed_format_flows_through_app_native_history_and_original_root() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 language_test(async {
-                    let (mut app, directory, card) = language_controller_fixture().await;
+                    let (mut app, directory, card, active) = language_pair_fixture().await;
+                    drop(app.update(Message::FocusCard(active)));
+                    assert_eq!(app.feature_admission().choice_card, Some(active));
+                    assert_ne!(card, active);
                     let events = app.lsp.events();
                     let original = match app.cards.get(&card).unwrap() {
                         CardRuntime::Repository(runtime) => runtime.retained_editor_root().unwrap(),
@@ -28076,6 +28217,7 @@ mod tests {
                         unreachable!()
                     };
                     assert_eq!(runtime.editor_text().as_deref(), Some("bar();\n"));
+                    assert!(matches!(app.editor_format_before_save(&RepositoryAction::Save { card, overwrite: false }), Some(crate::editor_features::Action::Format { card: target, save_after: true, .. }) if target == card), "inactive ordinary Save keeps its format phase");
                     app.lsp.begin_shutdown().await;
                 })
             })
@@ -28105,7 +28247,11 @@ mod tests {
                     let event = next_language_event(&events).await;
                     let task = app.update(Message::Lsp(event));
                     drive_language_tasks(&mut app, task).await;
-                    assert!(app.editor_features.view().is_some());
+                    assert!(
+                        app.editor_features
+                            .view(app.feature_admission().choice_card)
+                            .is_some()
+                    );
                     let Some(Action::Cancel(ticket)) = app.editor_features.escape() else {
                         panic!("actual rename has a preview")
                     };
@@ -28370,6 +28516,233 @@ mod tests {
             &Rectangle::with_size(Size::new(1000.0, 900.0)),
         );
         messages
+    }
+
+    async fn language_focus_receipt(
+        mut element: Element<'_, Message>,
+        renderer: &cosmic::Renderer,
+        initial: impl Into<Option<widget::Id>>,
+        task: Task<Message>,
+    ) -> Option<widget::Id> {
+        use cosmic::iced::advanced::{
+            Layout,
+            widget::{Operation, Tree, operation},
+        };
+        #[derive(Default)]
+        struct Focused(Option<widget::Id>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: cosmic::iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let mut tree = Tree::new(element.as_widget());
+        let (node, _) = language_dialog_frame(&mut element, &mut tree, renderer);
+        let initial = initial.into();
+        if let Some(initial) = &initial {
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                renderer,
+                &mut operation::focusable::focus::<()>(initial.clone()),
+            );
+        }
+        let mut before = Focused::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), renderer, &mut before);
+        assert_eq!(
+            before.0, initial,
+            "the actual tree starts with exactly the expected keyboard owner"
+        );
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    loop {
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            renderer,
+                            &mut operation,
+                        );
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        let mut after = Focused::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), renderer, &mut after);
+        after.0
+    }
+
+    #[test]
+    fn admitted_language_focus_cannot_blur_an_upper_cancelled_or_replacement_tree() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let renderer = headless_renderer();
+                language_test(async move {
+                    use crate::editor_features::Action;
+                    for rename in [true, false] {
+                        for scenario in 0..8 {
+                            let (mut app, _directory, card, other) = language_pair_fixture().await;
+                            let events = app.lsp.events();
+                            let choice = |rename| {
+                                if rename {
+                                    Action::Rename(card)
+                                } else {
+                                    Action::CodeActions(card)
+                                }
+                            };
+                            drop(app.update(Message::EditorFeatures(choice(rename))));
+                            let reply = next_language_event(&events).await;
+                            let held_focus = app.update(Message::Lsp(reply));
+                            let Some(Action::Cancel(old)) = app.editor_features.escape() else {
+                                panic!("accepted framed choice")
+                            };
+                            if scenario == 0 {
+                                app.settings_reset_confirm = true;
+                                let target = widget::Id::new("dialog.reset-settings.cancel");
+                                assert_eq!(
+                                    language_focus_receipt(
+                                        app.dialog().unwrap(),
+                                        &renderer,
+                                        target.clone(),
+                                        held_focus
+                                    )
+                                    .await,
+                                    Some(target)
+                                );
+                            } else if scenario >= 4 {
+                                drop(held_focus);
+                                if scenario == 4 {
+                                    drop(app.update(Message::FocusCard(other)));
+                                }
+                                let restore = app.update(Message::EditorFeatures(Action::Cancel(old)));
+                                assert!(!app.editor_features.dialog_open(), "Cancel always retires its own interactive state");
+                                if scenario == 4 {
+                                    assert_eq!(restore.units(), 0, "inactive Cancel must not request an old-pane restoration");
+                                    let target = repository_widget::editor_focus_id(other);
+                                    assert_eq!(language_focus_receipt(cosmic::Application::view(&app), &renderer, target.clone(), restore).await, Some(target));
+                                } else if scenario == 5 {
+                                    assert!(restore.units() > 0, "active Cancel captures a guarded restoration");
+                                    drop(app.update(Message::FocusCard(other)));
+                                    let target = repository_widget::editor_focus_id(other);
+                                    assert_eq!(language_focus_receipt(cosmic::Application::view(&app), &renderer, target.clone(), restore).await, Some(target), "a newer native keyboard owner wins over the held Cancel task");
+                                } else {
+                                    let target = repository_widget::editor_focus_id(card);
+                                    let initial = (scenario == 7).then(|| target.clone());
+                                    assert_eq!(language_focus_receipt(cosmic::Application::view(&app), &renderer, initial, restore).await, Some(target), "active Cancel may restore an unfocused or already-focused source");
+                                }
+                            } else if scenario == 3 {
+                                if rename {
+                                    drop(app.update(Message::EditorFeatures(Action::RenameDraft { ticket: old, value: "kept draft".into() })));
+                                }
+                                // The real reducer accepts a queued FocusCard
+                                // even after this global dialog was admitted.
+                                // Its old ticket and control are still mounted;
+                                // only the fresh shell-scope marker refuses it.
+                                drop(app.update(Message::FocusCard(other)));
+                                assert_eq!(app.feature_admission().choice_card, Some(other));
+                                let target = widget::Id::new(format!("editor.language.{old}.cancel"));
+                                assert_eq!(language_focus_receipt(app.dialog().unwrap(), &renderer, target.clone(), held_focus).await, Some(target));
+                                assert!(matches!(app.editor_features.escape(), Some(Action::Cancel(ticket)) if ticket == old));
+                                drop(app.update(Message::FocusCard(card)));
+                                assert_eq!(app.feature_admission().choice_card, Some(card));
+                                if rename {
+                                    let mut element = app.dialog().unwrap();
+                                    let mut tree = cosmic::iced::advanced::widget::Tree::new(element.as_widget());
+                                    let (node, _) = language_dialog_frame(&mut element, &mut tree, &renderer);
+                                    let accessible = element.as_widget().a11y_nodes(cosmic::iced::advanced::Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+                                    assert!(accessible.root().iter().chain(accessible.children()).any(|node| node.node().value() == Some("kept draft")), "scope changes preserve the same dialog draft");
+                                }
+                                drop(app.update(Message::EditorFeatures(Action::Cancel(old))));
+                                drop(app.update(Message::EditorFeatures(choice(rename))));
+                                let reply = next_language_event(&events).await;
+                                let fresh_focus = app.update(Message::Lsp(reply));
+                                let Some(Action::Cancel(current)) = app.editor_features.escape() else { panic!("returning active source remains usable") };
+                                let cancel = widget::Id::new(format!("editor.language.{current}.cancel"));
+                                let target = widget::Id::new(format!("editor.language.{current}.{}", if rename { "rename" } else { "action.0" }));
+                                assert_eq!(language_focus_receipt(app.dialog().unwrap(), &renderer, cancel, fresh_focus).await, Some(target));
+                            } else {
+                                drop(app.update(Message::EditorFeatures(Action::Cancel(old))));
+                                if scenario == 1 {
+                                    let target = repository_widget::editor_focus_id(card);
+                                    assert_eq!(
+                                        language_focus_receipt(
+                                            cosmic::Application::view(&app),
+                                            &renderer,
+                                            target.clone(),
+                                            held_focus
+                                        )
+                                        .await,
+                                        Some(target)
+                                    );
+                                } else {
+                                    // A replacement of the other kind shares a
+                                    // frame with cancellation: no empty tree needed.
+                                    drop(app.update(Message::EditorFeatures(choice(!rename))));
+                                    let reply = next_language_event(&events).await;
+                                    let fresh_focus = app.update(Message::Lsp(reply));
+                                    let Some(Action::Cancel(current)) =
+                                        app.editor_features.escape()
+                                    else {
+                                        panic!("fresh framed dialog")
+                                    };
+                                    assert_ne!(old, current);
+                                    let cancel = widget::Id::new(format!(
+                                        "editor.language.{current}.cancel"
+                                    ));
+                                    assert_eq!(
+                                        language_focus_receipt(
+                                            app.dialog().unwrap(),
+                                            &renderer,
+                                            cancel.clone(),
+                                            held_focus
+                                        )
+                                        .await,
+                                        Some(cancel.clone())
+                                    );
+                                    let target = widget::Id::new(format!(
+                                        "editor.language.{current}.{}",
+                                        if rename { "action.0" } else { "rename" }
+                                    ));
+                                    assert_eq!(
+                                        language_focus_receipt(
+                                            app.dialog().unwrap(),
+                                            &renderer,
+                                            cancel,
+                                            fresh_focus
+                                        )
+                                        .await,
+                                        Some(target),
+                                        "fresh mounted ticket still focuses its actual control"
+                                    );
+                                }
+                            }
+                            app.editor_features.cancel_all(&mut app.lsp);
+                            app.lsp.begin_shutdown().await;
+                        }
+                    }
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     async fn open_language_dialog_for_control(

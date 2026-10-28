@@ -5073,7 +5073,10 @@ impl Application for Editor {
                 Message::CancelFileOperation,
             ));
         }
-        if let Some(content) = self.editor_features.view() {
+        if let Some(content) = self
+            .editor_features
+            .view(self.feature_admission().choice_card)
+        {
             return Some(dialog_overlay(
                 dialog_surface(content.map(Message::EditorFeatures), 1000.0),
                 Message::EditorFeatures(self.editor_features.escape()?),
@@ -6179,6 +6182,67 @@ mod tests {
         assert!(
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
+        );
+    }
+
+    #[test]
+    fn language_choice_scope_is_only_the_loaded_active_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        app.settings.language_servers.clear();
+        app.settings.editor_auto_save = false;
+        let mut loaded = Vec::new();
+        for name in ["first.rs", "second.rs"] {
+            std::fs::write(directory.path().join(name), "foo();\n").unwrap();
+            let card = add(&mut app, directory.path().to_str().unwrap(), Some(name));
+            load_selected(&mut app, card);
+            // Drive the actual Reload worker to install its original-root
+            // FileLoadedAt receipt; no private cagents test API is exported.
+            let reload = app.update(Message::Repository(RepositoryAction::Reload { card }));
+            run_tasks(&mut app, reload);
+            assert!(
+                app.tab(card)
+                    .unwrap()
+                    .runtime
+                    .retained_editor_root()
+                    .is_some()
+            );
+            assert!(
+                app.tab(card)
+                    .unwrap()
+                    .runtime
+                    .editor_focus_target(card)
+                    .is_some()
+            );
+            assert_eq!(app.feature_admission().choice_card, Some(card));
+            loaded.push(card);
+        }
+        drop(app.update(Message::Select(loaded[0])));
+        assert_eq!(app.feature_admission().choice_card, Some(loaded[0]));
+        assert!(
+            app.tab(loaded[1])
+                .unwrap()
+                .runtime
+                .retained_editor_root()
+                .is_some(),
+            "the inactive tab remains a valid source owner"
+        );
+        drop(app.update(Message::CloseTab(loaded[0])));
+        assert!(app.tab(loaded[0]).is_none());
+        assert_eq!(app.feature_admission().choice_card, Some(loaded[1]));
+        drop(app.update(Message::Repository(RepositoryAction::Reload {
+            card: loaded[1],
+        })));
+        assert_eq!(
+            app.feature_admission().choice_card,
+            None,
+            "a loading source has no interactive choice scope"
+        );
+        drop(app.update(Message::Select(CardId::new())));
+        assert_eq!(
+            app.feature_admission().choice_card,
+            None,
+            "a stale tab ID cannot admit a choice"
         );
     }
 

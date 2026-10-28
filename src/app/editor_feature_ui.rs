@@ -15,6 +15,11 @@ impl Cagents {
             close_save: (!upper)
                 .then(|| self.dirty_repository_close.as_ref().map(|close| close.card))
                 .flatten(),
+            choice_card: self.workspace.focused().filter(|card| {
+                self.workspace.visibility(*card).is_some_and(VisibilityClass::is_mounted)
+                    && self.workspace.pending_close().is_none_or(|closing| closing.unmounting != *card)
+                    && matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(*card).is_some() && runtime.editor_feature_writable())
+            }),
         }
     }
     pub(super) fn refresh_editor_feature_support(&mut self) {
@@ -81,6 +86,16 @@ impl Cagents {
             && let Some(target) = runtime.editor_focus_target(card)
         {
             tasks.push(iced::widget::operation::focus(target).map(cosmic::Action::App));
+        }
+        if let Some(card) = effects.choice_restore
+            && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+            && let Some(target) = runtime.editor_focus_target(card)
+        {
+            tasks.push(
+                editor_features::restore_choice_focus(target)
+                    .map(Message::EditorFeatures)
+                    .map(cosmic::Action::App),
+            );
         }
         self.editor_features
             .finish_effects(&mut effects, &mut self.lsp);

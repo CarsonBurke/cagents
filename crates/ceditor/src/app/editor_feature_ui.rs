@@ -22,6 +22,12 @@ impl Editor {
                     .any(|tab| tab.mutation == Some(MutationKind::Discard)),
             other_modal: upper || self.closing.is_some(),
             close_save: if upper { None } else { self.closing },
+            // Only the current live tab is mounted in the standalone editor.
+            // Keep this separate from ordinary Save/format admission.
+            choice_card: self.active.filter(|card| {
+                self.tab(*card)
+                    .is_some_and(|tab| tab.runtime.editor_focus_target(*card).is_some())
+            }),
         }
     }
     fn refresh_editor_feature_support(&mut self) {
@@ -84,6 +90,16 @@ impl Editor {
             && let Some(target) = tab.runtime.editor_focus_target(card)
         {
             tasks.push(iced::widget::operation::focus(target).map(cosmic::Action::App));
+        }
+        if let Some(card) = effects.choice_restore
+            && let Some(tab) = self.tab(card)
+            && let Some(target) = tab.runtime.editor_focus_target(card)
+        {
+            tasks.push(
+                editor_features::restore_choice_focus(target)
+                    .map(Message::EditorFeatures)
+                    .map(cosmic::Action::App),
+            );
         }
         self.editor_features
             .finish_effects(&mut effects, &mut self.lsp);

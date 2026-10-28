@@ -194,12 +194,18 @@ pub struct Admission {
     pub writable: bool,
     pub other_modal: bool,
     pub close_save: Option<CardId>,
+    /// The shell's active, mounted source pane. Only interactive choices use
+    /// this scope; an inactive buffer may still finish formatting or Save.
+    pub choice_card: Option<CardId>,
 }
 impl Admission {
     fn permits(self, operation: &Operation) -> bool {
         self.writable
             && (!self.other_modal
                 || (operation.save_after && self.close_save == Some(operation.card)))
+    }
+    fn permits_choice(self, operation: &Operation) -> bool {
+        self.permits(operation) && self.choice_card == Some(operation.card)
     }
 }
 
@@ -211,6 +217,7 @@ pub struct Effects {
     pub repository_tasks: Vec<Task<RepositoryAction>>,
     pub changed: Vec<CardId>,
     pub focus: Option<CardId>,
+    pub choice_restore: Option<CardId>,
     pub save: Vec<CardId>,
     pub notices: Vec<(LspMessageLevel, String)>,
     completion: Option<Completion>,
@@ -223,6 +230,12 @@ impl Effects {
     fn error(&mut self, message: impl Into<String>) {
         self.notices.push((LspMessageLevel::Error, message.into()));
     }
+}
+
+/// Restore the source after an interactive dialog only while the current
+/// native tree has no newer foreign keyboard owner.
+pub fn restore_choice_focus(target: widget::Id) -> Task<Action> {
+    dialog::restore(target)
 }
 
 fn buffer<'a, 'b>(buffers: &'b Buffers<'a>, card: CardId) -> Option<&'b RepositoryRuntime> {
@@ -377,13 +390,20 @@ impl State {
         request: LspRequestId,
         kind: RequestKind,
         operation: Operation,
-        lsp: &LspManager,
+        lsp: &mut LspManager,
     ) {
         let obsolete = self
             .requests
             .iter()
             .filter_map(|(id, (old_kind, old))| {
-                (old.card == operation.card && *old_kind == kind).then_some(*id)
+                // A newer interactive intent owns the next choice dialog,
+                // even when it names a different pane or a different kind of
+                // choice. Submitted edits/commands and background formatting
+                // keep their independent lifetime and publication authority.
+                ((matches!(kind, RequestKind::RenameStart | RequestKind::Actions)
+                    && matches!(old_kind, RequestKind::RenameStart | RequestKind::Actions))
+                    || (old.card == operation.card && *old_kind == kind))
+                    .then_some(*id)
             })
             .collect::<Vec<_>>();
         for id in obsolete {
@@ -717,6 +737,9 @@ impl State {
                 ) else {
                     return effects;
                 };
+                if !admission.permits_choice(&operation) {
+                    return effects;
+                }
                 let request = if rename {
                     lsp.request_prepare_rename(operation.doc, operation.at)
                 } else {
@@ -834,6 +857,11 @@ impl State {
                 {
                     return effects;
                 }
+                if !self.rename.as_ref().is_some_and(|rename| {
+                    rename.ticket == ticket && admission.permits_choice(&rename.operation)
+                }) {
+                    return effects;
+                }
                 let Some(rename) = self.rename.take() else {
                     return effects;
                 };
@@ -850,6 +878,11 @@ impl State {
             }
             Action::ChooseAction { ticket, index } => {
                 if !admission.writable || admission.other_modal {
+                    return effects;
+                }
+                if !self.choices.as_ref().is_some_and(|choices| {
+                    choices.ticket == ticket && admission.permits_choice(&choices.operation)
+                }) {
                     return effects;
                 }
                 let Some(choices) = self.choices.take() else {
@@ -1107,10 +1140,14 @@ impl State {
                     return effects;
                 }
                 if let Some(rename) = self.rename.take_if(|rename| rename.ticket == ticket) {
-                    effects.focus = Some(rename.operation.card);
+                    effects.choice_restore = admission
+                        .choice_card
+                        .filter(|card| *card == rename.operation.card);
                 }
                 if let Some(choices) = self.choices.take_if(|choices| choices.ticket == ticket) {
-                    effects.focus = Some(choices.operation.card);
+                    effects.choice_restore = admission
+                        .choice_card
+                        .filter(|card| *card == choices.operation.card);
                 }
                 if self
                     .preview
@@ -1186,7 +1223,7 @@ impl State {
                 else {
                     return;
                 };
-                if !admission.permits(&operation)
+                if !admission.permits_choice(&operation)
                     || !Self::choice_current(&operation, lsp, buffers)
                     || self.dialog_open()
                 {
@@ -1208,7 +1245,7 @@ impl State {
                         operation,
                         draft,
                     });
-                    effects.task = iced::widget::operation::focus(control_id(ticket, "rename"));
+                    effects.task = dialog::focus(ticket, control_id(ticket, "rename"));
                 }
             }
             LspEvent::WorkspaceEdit {
@@ -1238,7 +1275,7 @@ impl State {
                 let Some(operation) = self.take_request(request, doc, RequestKind::Actions) else {
                     return;
                 };
-                if admission.permits(&operation)
+                if admission.permits_choice(&operation)
                     && Self::choice_current(&operation, lsp, buffers)
                     && !self.dialog_open()
                     && let Some(ticket) = self.ticket()
@@ -1254,8 +1291,7 @@ impl State {
                             operation,
                             items,
                         });
-                        effects.task =
-                            iced::widget::operation::focus(control_id(ticket, "action.0"));
+                        effects.task = dialog::focus(ticket, control_id(ticket, "action.0"));
                     }
                 }
             }
@@ -1336,16 +1372,24 @@ impl State {
 
     /// Only the bounded list is mounted; source comparisons use the ordinary
     /// virtualized diff renderer rather than materializing one row per line.
-    pub fn view(&self) -> Option<Element<'_, Action>> {
-        let ticket = self
+    pub fn view(&self, choice_card: Option<CardId>) -> Option<Element<'_, Action>> {
+        let (ticket, source) = self
             .rename
             .as_ref()
-            .map(|value| value.ticket)
-            .or_else(|| self.choices.as_ref().map(|value| value.ticket))
-            .or_else(|| self.preview.as_ref().map(|value| value.ticket))?;
+            .map(|value| (value.ticket, Some(value.operation.card)))
+            .or_else(|| {
+                self.choices
+                    .as_ref()
+                    .map(|value| (value.ticket, Some(value.operation.card)))
+            })
+            .or_else(|| self.preview.as_ref().map(|value| (value.ticket, None)))?;
         // A queued mouse release must never inherit the pressed state of a
         // different dialog, even when Cancel and replacement share a frame.
-        Some(dialog::scoped(ticket, self.view_unkeyed()?))
+        Some(dialog::scoped(
+            ticket,
+            source.is_none_or(|card| choice_card == Some(card)),
+            self.view_unkeyed()?,
+        ))
     }
     fn view_unkeyed(&self) -> Option<Element<'_, Action>> {
         if let Some(rename) = &self.rename {
