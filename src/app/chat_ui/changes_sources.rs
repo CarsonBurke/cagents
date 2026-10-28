@@ -490,6 +490,9 @@ impl State {
         if !intent.current() {return false;}
         let Some(key)=self.aliases.get(item) else {return false;};let Some(entry)=self.entries.get_mut(key) else {return false;};
         if entry.part.metadata.unavailable.is_some() || entry.pages.values().any(|page|page.omitted_files>0) {return false;}
+        // A fresh explicit copy retries failed reads for this exact source.
+        // Passive demand keeps errors finite until the person asks again.
+        entry.page_errors.clear();entry.patch_errors.clear();
         entry.copy_error=None;entry.copy_intent=Some(intent);entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
     }
     pub(super) fn take_copy_all(&mut self)->Option<(String,Vec<Arc<str>>,clipboard_intent::Intent)> {
