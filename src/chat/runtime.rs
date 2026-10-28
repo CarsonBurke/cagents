@@ -604,6 +604,7 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
+                actor.invalidate_execution_observation();
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -1250,11 +1251,18 @@ impl LocalHandle {
     }
     /// What the conversation is doing, read without loading its transcript.
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .activity()
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.activity_for_snapshot(&state)
+    }
+
+    fn activity_for_snapshot(&self, state: &Snapshot) -> crate::agent::ActivityState {
+        // A stopped actor cannot observe the provider while original process
+        // cleanup is still pending. That pending ownership is not live activity.
+        if self.0.draining.load(Ordering::Acquire) {
+            crate::agent::ActivityState::Unknown
+        } else {
+            state.activity()
+        }
     }
 
     /// Last whole-frame request/activity publication; reads no transcript or
@@ -1262,11 +1270,15 @@ impl LocalHandle {
     pub(crate) fn execution_status(
         &self,
     ) -> Option<crate::agent_execution::directory::ExecutionStatus> {
-        self.0
+        let status = self
+            .0
             .execution_status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .clone();
+        (!self.0.draining.load(Ordering::Acquire))
+            .then_some(status)
+            .flatten()
     }
 
     /// Update preflights need activity without loading the transcript window.
@@ -3023,6 +3035,27 @@ impl Actor {
         }
         if became_available {
             (self.notify)(Update::PromptAvailable);
+        }
+    }
+    fn invalidate_execution_observation(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.execution_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
+        self.dirty = true;
+        drop(state);
+        // Retained readers poll this revision even when a settled parent's
+        // background work means no terminal attention notification is emitted.
+        (self.notify)(Update::Observed { generation });
+        if self.activity != ActivityState::Unknown {
+            self.activity = ActivityState::Unknown;
+            (self.notify)(Update::Activity {
+                state: ActivityState::Unknown,
+                generation,
+            });
         }
     }
     fn touch(&mut self) {
