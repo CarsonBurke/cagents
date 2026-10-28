@@ -5248,15 +5248,19 @@ fn project_list<'a>(
     modal_open: bool,
 ) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
+    let sticky_viewport = row_interaction::StickyViewport::default();
     if projects.is_empty() {
-        return project_scroll(empty(state, compact, modal_open), state.filter);
+        return project_scroll(
+            empty(state, compact, modal_open),
+            state.filter,
+            sticky_viewport,
+        );
     }
 
     // Search results are revealed while their input is available, including
     // the compact popover. Otherwise preserve explicit project collapses.
     let searching = (!compact || state.controls_expanded) && !state.query.trim().is_empty();
     let selection = state.drawn_selection();
-    let sticky_viewport = row_interaction::StickyViewport::default();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
         space::XS
     } else {
@@ -5278,7 +5282,7 @@ fn project_list<'a>(
         column.into(),
         projects.iter().map(|project| project.project.id).collect(),
         !modal_open && !compact,
-        sticky_viewport,
+        sticky_viewport.clone(),
     );
     if lists_kept_attention_rows(&projects) {
         column =
@@ -5292,6 +5296,7 @@ fn project_list<'a>(
             .width(Length::Fill)
             .into(),
         state.filter,
+        sticky_viewport,
     )
 }
 
@@ -5340,6 +5345,7 @@ fn hide_read_attention(compact: bool, modal_open: bool) -> Element<'static, Side
 fn project_scroll(
     content: Element<'_, SidebarAction>,
     filter: SidebarFilter,
+    viewport: row_interaction::StickyViewport,
 ) -> Element<'_, SidebarAction> {
     RowInteraction::filtered_scroll(
         widget::scrollable(content)
@@ -5350,6 +5356,7 @@ fn project_scroll(
             .height(Length::Fill)
             .into(),
         filter,
+        viewport,
     )
 }
 
@@ -11399,7 +11406,36 @@ mod row_interaction {
     /// One coordinate shared by the list and its groups, refreshed on each widget
     /// callback, including operations/accessibility before the next draw.
     #[derive(Clone, Default)]
-    pub(super) struct StickyViewport(Rc<Cell<f32>>);
+    pub(super) struct StickyViewport(Rc<Cell<f32>>, Rc<Cell<Option<f32>>>);
+
+    impl StickyViewport {
+        fn content_top(&self, layout: Layout<'_>) -> f32 {
+            self.1.get().unwrap_or(layout.bounds().y) + layout.virtual_offset().y
+        }
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static PAINTED_HEADERS: std::cell::RefCell<Option<Vec<Rectangle>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture_painted_headers(draw: impl FnOnce()) -> Vec<Rectangle> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PAINTED_HEADERS.with(|headers| {
+                    headers.replace(None);
+                });
+            }
+        }
+        PAINTED_HEADERS.with(|headers| {
+            assert!(headers.replace(Some(Vec::new())).is_none());
+        });
+        let _reset = Reset;
+        draw();
+        PAINTED_HEADERS.with(|headers| headers.take().unwrap())
+    }
 
     /// Widget-operation context is scoped to members of this actual group.
     /// Header targets themselves do not inherit their own sticky obstruction.
@@ -11427,7 +11463,10 @@ mod row_interaction {
             any_selected: bool,
             enabled: bool,
         },
-        FilteredScroll(SidebarFilter),
+        FilteredScroll {
+            filter: SidebarFilter,
+            viewport: StickyViewport,
+        },
         Search {
             enabled: bool,
         },
@@ -11524,10 +11563,11 @@ mod row_interaction {
         pub(super) fn filtered_scroll(
             content: Element<'a, SidebarAction>,
             filter: SidebarFilter,
+            viewport: StickyViewport,
         ) -> Element<'a, SidebarAction> {
             Element::new(Self {
                 children: vec![content],
-                kind: Kind::FilteredScroll(filter),
+                kind: Kind::FilteredScroll { filter, viewport },
             })
         }
 
@@ -11601,6 +11641,14 @@ mod row_interaction {
                 children: vec![base, actions],
                 kind: Kind::Actions { reserve },
             })
+        }
+
+        fn capture_viewport_origin(&self, layout: Layout<'_>) {
+            if let Kind::FilteredScroll { viewport, .. } = &self.kind {
+                // The scrollable is this wrapper's direct child. Its viewport
+                // origin is distinct from the padded project content origin.
+                viewport.1.set(Some(layout.child(0).bounds().y));
+            }
         }
 
         fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
@@ -11714,10 +11762,12 @@ mod row_interaction {
         fn state(&self) -> tree::State {
             tree::State::new(State {
                 scroll: match self.kind {
-                    Kind::FilteredScroll(active) => Some(Box::new(FilterScrollState {
-                        active,
-                        saved: [None, None, None],
-                    })),
+                    Kind::FilteredScroll { filter: active, .. } => {
+                        Some(Box::new(FilterScrollState {
+                            active,
+                            saved: [None, None, None],
+                        }))
+                    }
                     _ => None,
                 },
                 ..State::default()
@@ -11729,7 +11779,7 @@ mod row_interaction {
         }
 
         fn diff(&mut self, tree: &mut Tree) {
-            if let Kind::FilteredScroll(filter) = self.kind {
+            if let Kind::FilteredScroll { filter, .. } = self.kind {
                 let state = tree.state.downcast_mut::<State>();
                 let scroll = state.scroll.as_mut().expect("filtered scroll state");
                 if scroll.active != filter {
@@ -11840,10 +11890,9 @@ mod row_interaction {
             renderer: &Renderer,
             operation: &mut dyn Operation,
         ) {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
             }
             if matches!(self.kind, Kind::Group { .. })
                 && let Some(header) =
@@ -12316,6 +12365,14 @@ mod row_interaction {
                                 cosmic::iced::Color::from(theme.cosmic().primary(false).base),
                             );
                         }
+                        #[cfg(test)]
+                        PAINTED_HEADERS.with(|headers| {
+                            if let Some(headers) = headers.borrow_mut().as_mut() {
+                                // This is the actual header draw layout under
+                                // the scrollable renderer's translation.
+                                headers.push(header.bounds() - header.virtual_offset());
+                            }
+                        });
                         self.children[0].as_widget().draw(
                             &tree.children[0],
                             renderer,
@@ -12438,10 +12495,9 @@ mod row_interaction {
             tree: &Tree,
             cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
             }
             // The outer list translates every descendant together. Strip only
             // its ancestor offset here; nested scrollables add their own offsets.
@@ -12477,9 +12533,9 @@ mod row_interaction {
                 accessible.root_mut().iter_mut().for_each(&mut select);
                 accessible.children_mut().iter_mut().for_each(select);
             }
-            // libcosmic buttons report content-coordinate bounds; its scrollable
-            // forwards a virtual offset without translating their AccessKit nodes.
-            // Translate once at the list boundary, not per nested decorator.
+            // Descendants received zero ancestor offset above, so their bounds
+            // are still in list coordinates even when a button normally applies
+            // its virtual offset. Translate once at this outer list boundary.
             if matches!(self.kind, Kind::Reorder { project: None, .. }) {
                 let offset = layout.virtual_offset();
                 let translate = |node: &mut iced_accessibility::A11yNode| {
@@ -12506,10 +12562,9 @@ mod row_interaction {
             renderer: &Renderer,
             destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
         ) {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
             }
             for ((child, tree), layout) in self.children.iter().zip(&tree.children).zip(
                 child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout),
@@ -14163,6 +14218,7 @@ pub(crate) mod tests {
                     .height(height)
                     .into(),
                 filter,
+                row_interaction::StickyViewport::default(),
             )
         };
         let mut element = make(SidebarFilter::All, 1_000.0);
@@ -16291,10 +16347,19 @@ pub(crate) mod tests {
             1,
         ));
         let label = project.channels[0].accessible_name.clone();
-        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let preceding = SidebarProject::new(
+            project_id(98),
+            RepositoryId::new(),
+            "Preceding project".into(),
+            "/preceding/.git".into(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![preceding, project]);
         let state = SidebarState::default();
         let composer = Id::new("upward-reveal-composer");
         let content = widget::column::with_children(vec![
+            widget::Space::new().height(37).into(),
             widget::container(project_list(&model, &state, false, false))
                 .height(180)
                 .into(),
@@ -16306,7 +16371,7 @@ pub(crate) mod tests {
         let mut renderer = headless_renderer();
         let mut ui = UserInterface::build(
             content,
-            Size::new(280.0, 240.0),
+            Size::new(280.0, 280.0),
             Cache::new(),
             &mut renderer,
         );
@@ -16329,6 +16394,10 @@ pub(crate) mod tests {
             let mut before = Probe::default();
             ui.operate(&renderer, &mut before);
             assert!(before.offset > 0.0);
+            assert!(
+                before.viewport.y > 0.0,
+                "the real scroll viewport is translated below other UI"
+            );
             let task = if focus {
                 focus_and_reveal::<()>(target.clone())
             } else {
@@ -16391,6 +16460,47 @@ pub(crate) mod tests {
                 after.viewport
             );
             assert!(row.y1 <= f64::from(after.viewport.y + after.viewport.height) + 0.01);
+            let raw_row = after.bounds[&target];
+            let raw_header = after.bounds[&selection_row_focus_id(SelectionRow::Project(owner))];
+            assert!((row.y0 - f64::from(raw_row.y - after.offset)).abs() < 0.01);
+            assert!((header.y0 - f64::from(raw_header.y - after.offset)).abs() < 0.01);
+            assert!((header.y0 - f64::from(after.viewport.y)).abs() < 0.01);
+            assert_eq!(after.row_insets[&target], raw_header.height);
+            // Accessibility and operation were checked before any paint. Now
+            // observe the real Group header draw, independent of either report.
+            let painted = row_interaction::capture_painted_headers(|| {
+                ui.draw(
+                    &mut renderer,
+                    &Theme::default(),
+                    &cosmic::iced::advanced::renderer::Style::default(),
+                    cosmic::iced::mouse::Cursor::Unavailable,
+                );
+            });
+            assert!(
+                painted
+                    .iter()
+                    .any(|paint| (f64::from(paint.y) - header.y0).abs() < 0.01
+                        && (f64::from(paint.height) - (header.y1 - header.y0)).abs() < 0.01),
+                "actual painted header must match accessibility: {painted:?} {header:?}"
+            );
+            let _destinations = ui.dnd_rectangles(0, &renderer);
+            let after_drag = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+            let drag_header = after_drag
+                .root()
+                .iter()
+                .chain(after_drag.children())
+                .find(|node| node.node().label() == Some(header_label.as_ref()))
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            assert_eq!(
+                drag_header, header,
+                "drag-destination traversal preserves the viewport origin"
+            );
+            if !focus {
+                ui = ui.relayout(Size::new(240.0, 280.0), &mut renderer);
+            }
         }
         // Project headers themselves need no member inset and keep their
         // displayed sticky position when explicitly focused.
