@@ -768,9 +768,9 @@ fn idle_terminal_has_full_grid_and_no_review_pointer_hotspot() {
         column: 0,
         shape: CursorShape::Block,
         color: Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
+            red: 255,
+            green: 255,
+            blue: 255,
         },
         visible: true,
         blinking: false,
@@ -1078,6 +1078,16 @@ fn command_entry_and_fresh_resize_frame_refence_review_text_without_typing() {
 #[test]
 fn remounted_review_fences_matching_frame_and_identity_or_focus_loss_restores_idle_geometry() {
     let peer = Peer::new();
+    // Attachment wakes its waiter before the hosted worker restores visibility.
+    // Fence that exact lifecycle request before measuring AT-only wire silence.
+    let attached = peer.fence();
+    assert!(
+        matches!(attached.as_slice(), [ClientRequest::SetVisibility {
+            terminal_id,
+            visibility: crate::terminal::ipc::TerminalVisibility::Visible,
+        }] if *terminal_id == peer.handle.terminal_id()),
+        "attachment must restore only the original terminal visibility: {attached:?}"
+    );
     let renderer = renderer();
     let mut widget = widget(
         &peer,

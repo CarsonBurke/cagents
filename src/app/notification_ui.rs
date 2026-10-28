@@ -150,8 +150,9 @@ pub(super) struct State {
     last_workspace: Weak<WorkspaceState>,
     /// What the last published presence was derived from, past the durable
     /// workspace: the focused card, window focus, whether the card's pane is
-    /// active, and which review a focused pull request pane has open.
-    last_focus: Option<(Option<CardId>, bool, bool, Option<u64>)>,
+    /// active, whether its latest result is visible, and which review a
+    /// focused pull request pane has open.
+    last_focus: Option<(Option<CardId>, bool, bool, bool, Option<u64>)>,
     visible_focus: Option<CardId>,
     visible_notices: BTreeSet<uuid::Uuid>,
     visible_acknowledged: bool,
@@ -443,7 +444,7 @@ impl Cagents {
         let visible = self
             .workspace
             .focused()
-            .filter(|card| self.pane_is_active(*card));
+            .filter(|card| self.pane_reads_latest_update(*card));
         if self.notification_ui.visible_focus == visible {
             return Task::none();
         }
@@ -489,13 +490,20 @@ impl Cagents {
     pub(super) fn sync_notification_presence(&mut self) {
         let focused_card = self.workspace.focused();
         let qualified = focused_card.is_some_and(|card| self.pane_is_active(card));
+        let reading = focused_card.is_some_and(|card| self.pane_reads_latest_update(card));
         // A pane can open another review without the durable workspace
         // changing, and the review it shows names the alert it focuses.
         let review = focused_card.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::PullRequests(pane)) => Some(pane.review.selection_generation()),
             _ => None,
         });
-        let focus = (focused_card, self.refresh_ui.focused, qualified, review);
+        let focus = (
+            focused_card,
+            self.refresh_ui.focused,
+            qualified,
+            reading,
+            review,
+        );
         if self.notification_ui.last_focus == Some(focus)
             && self.notification_ui.last_workspace.as_ptr() == Arc::as_ptr(&self.durable)
         {
@@ -556,14 +564,14 @@ impl Cagents {
         let session_read = crate::notifications::focused_notice_ids(
             &self.notification_ui.snapshot,
             None,
-            focused,
+            reading.then_some(focused).flatten(),
             focus_changed,
             self.settings.notifications.while_focused,
         );
         // Delivery presence changes immediately, but implicit Session reads on
         // a visibility return share the sidebar's qualified dwell. Preserve
         // the existing policy for fresh alerts while the parent stays visible.
-        if focused_card == self.notification_ui.visible_focus {
+        if reading && focused_card == self.notification_ui.visible_focus {
             read.extend(session_read.into_iter().filter(|id| {
                 self.notification_ui.visible_acknowledged
                     || (!focus_changed && !self.notification_ui.visible_notices.contains(id))

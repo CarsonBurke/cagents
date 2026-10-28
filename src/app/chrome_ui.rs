@@ -3580,9 +3580,7 @@ impl Cagents {
             }
             _ => None,
         };
-        if let Some((label, busy)) = status
-            && (!compact || attention.state().is_none())
-        {
+        if let Some((label, busy)) = status {
             let indicator: Element<'_, Message> = if busy {
                 crate::ui_controls::activity_spinner(
                     design::TAB_STATUS_ICON_SIZE as f32,
@@ -3600,7 +3598,7 @@ impl Cagents {
         if let Some(indicator) = sidebar::attention_indicator(attention, false) {
             children.push(indicator);
         }
-        if focused && !compact && self.chat_switch_available(id) {
+        if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);
             let ready = blocker.is_none();
             children.push(command(

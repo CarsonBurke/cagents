@@ -3165,6 +3165,16 @@ impl Runtime {
         self.selected_subagent.is_none()
     }
 
+    /// Reading the end of a historical page has not exposed the latest result.
+    /// Use the actual parent viewport, including native observations that have
+    /// arrived before their corresponding App message is reduced.
+    pub(super) fn latest_parent_update_visible(&self) -> bool {
+        self.parent_transcript_selected()
+            && !self.snapshot.has_later
+            && !self.snapshot.history_loading
+            && self.parent_scroll().at_bottom()
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {
@@ -14000,6 +14010,118 @@ mod tests {
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
             Some(view::Page::Latest)
         );
+    }
+
+    #[test]
+    fn history_failed_news_waits_for_the_latest_parent_or_an_explicit_read() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime = executor.enter();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.settings.notifications.while_focused = false;
+        let (card, target, _) = history_fixture(&mut app);
+        let session = chat_runtime(&app, card).session.id;
+        drop(app.sync_visible_attention());
+        let old_epoch = app.attention_focus_epoch;
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: old_epoch,
+        }));
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        drop(app.update(Message::ChatUi(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            false,
+        ))));
+        let failed = |id: uuid::Uuid| crate::notifications::Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event::session(
+                    session,
+                    Provider::Codex,
+                    "/tmp".into(),
+                    crate::notifications::Evidence {
+                        key: id.to_string(),
+                        kind: crate::notifications::Kind::Failed,
+                    },
+                ),
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
+        let notice = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(
+            super::super::notification_ui::Action::Snapshot(failed(notice)),
+        )));
+        assert!(
+            app.pane_is_active(card),
+            "keyboard and delivery presence stay qualified"
+        );
+        assert!(!app.pane_reads_latest_update(card));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.card_attention(card).failed, 1);
+        assert!(app.attention_notices().iter().any(|row| row.id == notice));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: old_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(app.attention_notices().iter().any(|row| row.id == notice));
+
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = false;
+        drop(app.update(Message::ChatUi(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(0.0, 1000.0, 400.0),
+            false,
+        ))));
+        assert!(
+            !app.pane_reads_latest_update(card),
+            "a loaded latest page is still unread above its end"
+        );
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::ChatUi(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            false,
+        ))));
+        assert!(app.pane_reads_latest_update(card));
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "returning to latest still waits for its dwell"
+        );
+        let epoch = app.attention_focus_epoch;
+        assert_ne!(epoch, old_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.card_attention(card).failed, 0);
+        assert!(!app.attention_notices().iter().any(|row| row.id == notice));
+
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        drop(app.update(Message::ChatUi(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            false,
+        ))));
+        let explicit = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(
+            super::super::notification_ui::Action::Snapshot(failed(explicit)),
+        )));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.pane_reads_latest_update(card));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(!app.attention_notices().iter().any(|row| row.id == explicit));
     }
 
     #[test]

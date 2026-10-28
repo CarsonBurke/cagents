@@ -2565,6 +2565,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -7174,8 +7176,11 @@ impl Cagents {
         main.push(design::horizontal_rule());
         if review.selected().is_some() {
             main.push(
-                repository_widget::view_with_review(id, &pane.runtime, Some(review))
-                    .map(Message::Repository),
+                repository_widget::guard_consumed_input(
+                    repository_widget::view_with_review(id, &pane.runtime, Some(review)),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository),
             );
         } else {
             let prompt = if review.is_open() {
@@ -7748,8 +7753,20 @@ impl Cagents {
             && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
+    fn pane_reads_latest_update(&self, card: CardId) -> bool {
+        if !self.pane_is_active(card) {
+            return false;
+        }
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.latest_parent_update_visible(),
+            _ => !self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))),
+        }
+    }
+
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
-        if self.pane_is_active(card)
+        if self.pane_reads_latest_update(card)
             || !self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
@@ -7762,7 +7779,6 @@ impl Cagents {
         } else {
             self.sidebar_state.observe_card_update(card);
         }
-        self.persist();
     }
 
     pub(super) fn observe_agent_activity_for_card(
@@ -7842,12 +7858,21 @@ impl Cagents {
             .next()
             .map(|channel| channel.id);
         let scope = if let Some(channel) = channel {
+            if self.channel_directory(channel).is_none() {
+                return Task::none();
+            }
             self.select_channel(channel)
         } else {
             let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
-            directory.map_or_else(Task::none, |directory| {
-                self.select_worktree(directory, false)
-            })
+            if let Some(directory) = directory {
+                let (selected, scope) = self.select_worktree_checked(directory, false);
+                if !selected {
+                    return scope;
+                }
+                scope
+            } else {
+                Task::none()
+            }
         };
         let focus = self.focus_workspace_card(id);
         // Attention belongs to the native parent. Reveal its transcript before
@@ -7860,7 +7885,12 @@ impl Cagents {
             let transcript = parent.map_or_else(Task::none, |target| {
                 self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
             });
-            (transcript, self.mark_cards_read(vec![id]))
+            let read = if self.pane_reads_latest_update(id) {
+                self.mark_cards_read(vec![id])
+            } else {
+                Task::none()
+            };
+            (transcript, read)
         } else {
             (Task::none(), Task::none())
         };
@@ -7905,8 +7935,24 @@ impl Cagents {
     }
 
     fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
+        if self.exit.is_some()
+            || self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
         let cards = self.ranked_attention_cards();
-        let current = self.workspace.focused();
+        let focused = self.workspace.focused();
+        let current = focused.and_then(|focused| {
+            let resource = self.attention_resource(focused)?;
+            cards
+                .iter()
+                .chain(&self.attention_navigation)
+                .copied()
+                .find(|card| self.attention_resource(*card) == Some(resource))
+                .or(Some(focused))
+        });
         let next = if current.is_some_and(|current| !cards.contains(&current)) {
             current
                 .and_then(|current| {
@@ -7930,8 +7976,35 @@ impl Cagents {
         } else {
             sidebar::cycle_attention(&cards, current, backwards)
         };
-        self.attention_navigation = cards;
-        next.map_or_else(Task::none, |card| self.focus_attention_card(card))
+        self.attention_navigation.clone_from(&cards);
+        let Some(start) = next.and_then(|next| cards.iter().position(|card| *card == next)) else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        // An unavailable scope keeps its unread evidence, but cannot trap
+        // every shortcut at the highest-ranked candidate. Try each once.
+        for step in 0..cards.len() {
+            let index = if backwards {
+                (start + cards.len() - step) % cards.len()
+            } else {
+                (start + step) % cards.len()
+            };
+            let card = cards[index];
+            tasks.push(self.focus_attention_card(card));
+            if self.workspace.focused() == Some(card) {
+                break;
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    fn attention_resource(&self, id: CardId) -> Option<(u8, uuid::Uuid)> {
+        let card = self.card_state(id)?;
+        Some(match &card.kind {
+            CardKind::Chat(session) => (0, session.id.as_uuid()),
+            CardKind::Terminal(session) => (0, session.id.as_uuid()),
+            _ => (1, card.id.as_uuid()),
+        })
     }
 
     /// The user has read `card`'s update.
@@ -8011,7 +8084,7 @@ impl Cagents {
         let Some(card) = self
             .workspace
             .focused()
-            .filter(|&card| self.pane_is_active(card))
+            .filter(|&card| self.pane_reads_latest_update(card))
         else {
             return Task::none();
         };
@@ -10134,7 +10207,11 @@ impl Cagents {
                 })
                 .into(),
             Some(CardRuntime::Repository(runtime)) => {
-                repository_widget::view(id, runtime).map(Message::Repository)
+                repository_widget::guard_consumed_input(
+                    repository_widget::view(id, runtime),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository)
             }
             Some(CardRuntime::PullRequests(pane)) => self.pull_request_card_view(id, pane),
             Some(CardRuntime::Settings) => settings_ui::settings_pane(
@@ -14379,9 +14456,19 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        // Native selection Copy/Cut supersedes pending logical message Copy,
+        // even when this key's owned cycle will stop command routing below.
+        if let Message::KeyEvent { event: keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. }, .. } = &message
+            && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+        {
+            chat_ui::invalidate_copy_intent();
+        }
         if let Message::KeyEvent { event, .. } = &message
-            && matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. })
-            && self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+            // An already owned physical cycle may be reported repeat:false.
+            && (key_source.cycle().is_some()
+                || matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }))
+            && (self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+                || self.terminal_review_input.has_native_action(event, &key_source))
         {
             return Task::none();
         }
@@ -15945,7 +16032,7 @@ impl Application for Cagents {
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
-                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                if epoch == self.attention_focus_epoch && self.pane_reads_latest_update(card) {
                     self.acknowledge_visible_pane()
                 } else { Task::none() }
             }
@@ -17069,11 +17156,6 @@ impl Application for Cagents {
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::TaggedKeyEvent { .. } => unreachable!("normalized at update entry"),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
-                    && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
-                {
-                    chat_ui::invalidate_copy_intent();
-                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -18053,6 +18135,16 @@ impl Application for Cagents {
                 lsp_event_stream,
             )
             .map(Message::Lsp),
+        );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -28086,6 +28178,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
@@ -28226,6 +28319,309 @@ mod tests {
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn fresh_editor_load_returns_keyboard_without_saved_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "fresh source\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        // This is the public action emitted after sidebar navigation resolves
+        // its file list, without saved caret or viewport metadata.
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        let placeholder = app.card_header_widget_id(pane);
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tasks = Vec::new();
+        let mut completed_read = false;
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            completed_read,
+            "the actual file worker must answer the open"
+        );
+        let initial = iced::widget::operation::focus(placeholder).map(cosmic::Action::App);
+        assert_eq!(
+            focused(&app, initial.chain(Task::batch(tasks))),
+            Some(repository_widget::editor_focus_id(pane)),
+            "a freshly opened editor must receive typing without a body click"
+        );
+    }
+
+    #[test]
+    fn native_palette_held_enter_cannot_edit_a_freshly_focused_repository() {
+        use iced::runtime::core::keyboard::input::{PressCycle, Source, Transition};
+        use iced::{
+            Size,
+            advanced::{
+                clipboard,
+                widget::{Operation, operation},
+            },
+            keyboard::key::{Code, Named, Physical},
+            mouse,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = "fresh source\n";
+        std::fs::write(directory.path().join("notes.txt"), original).unwrap();
+        let (mut app, pane) = editing_repository_app();
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        app.window_width = 1900.0;
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        app.card_state_mut(pane).unwrap().kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        let viewport = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(viewport, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        // Preserve the actual loading tree's header focus. Main's completed
+        // file-read focus operation must move it into the newly mounted editor.
+        let mut renderer = headless_renderer();
+        let mut loading = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        loading.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(app.card_header_widget_id(pane)),
+        );
+        let cache = loading.into_cache();
+
+        let worktree = directory.path().to_path_buf();
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Held-key fixture".into(),
+            worktree.clone(),
+            vec![SidebarWorktree::new(
+                WorktreeId::new(),
+                worktree.clone(),
+                Some("fixture/held-enter".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.sidebar_state
+            .sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree });
+        drop(app.update_palette(palette_ui::Action::Open));
+        drop(app.update_palette(palette_ui::Action::Query(">copy branch".into())));
+        let enter = |down, repeat| {
+            if down {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            }
+        };
+        let held = PressCycle::new(Physical::Code(Code::Enter));
+        let held_press = Source::tracked(held.clone(), Transition::Press);
+        let held_release = Source::tracked(held.clone(), Transition::Release);
+        let mut palette = iced::runtime::UserInterface::build(
+            app.palette_surface().expect("open native palette"),
+            Size::new(880.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        palette.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let mut submitted = Vec::new();
+        let (_, statuses) = palette.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[held_press.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut submitted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(
+                submitted.as_slice(),
+                [Message::Palette(palette_ui::Action::SubmitFromNative(_))]
+            ),
+            "the actual palette must consume the activation before the load answers"
+        );
+        drop(palette);
+        for message in submitted {
+            drop(app.update(message));
+        }
+        assert!(!app.palette.is_open());
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(load).unwrap();
+        let mut tasks = Vec::new();
+        let mut read_answered = false;
+        while let Some(action) = executor.block_on(stream.next()) {
+            if let iced::runtime::Action::Output(action) = action {
+                read_answered |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            read_answered,
+            "use the real async file reader, not a loaded model substitute"
+        );
+        let mut editor = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            cache,
+            &mut renderer,
+        );
+        if let Some(mut effects) = iced::runtime::task::into_stream(Task::batch(tasks)) {
+            while let Some(effect) = executor.block_on(effects.next()) {
+                if let iced::runtime::Action::Widget(mut operation) = effect {
+                    loop {
+                        editor.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        let focused = Arc::new(std::sync::Mutex::new(None));
+        let sink = focused.clone();
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().unwrap() = Some(id);
+        });
+        editor.operate(&renderer, &mut probe);
+        let _ = probe.finish();
+        assert_eq!(
+            *focused.lock().unwrap(),
+            Some(repository_widget::editor_focus_id(pane)),
+            "the production completed-load operation, not a test focus call, must focus the editor"
+        );
+
+        held.release(); // ingress can already have queued the release
+        let mut blocked = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[
+                iced::Event::Keyboard(enter(true, true)),
+                iced::Event::Keyboard(enter(false, false)),
+            ],
+            &[held_press.clone(), held_release.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut blocked,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            blocked.is_empty(),
+            "held palette input must emit neither editor Edit nor command"
+        );
+        // A genuinely new physical cycle is admitted even before the delayed
+        // App copy has retired the old key-up. Ownership is cycle-specific.
+        let fresh = PressCycle::new(Physical::Code(Code::Enter));
+        let mut accepted = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[Source::tracked(fresh, Transition::Press)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut accepted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(accepted.as_slice(), [Message::Repository(
+            RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(
+                repository_widget::EditorEdit::Enter
+            ) }
+        )] if *card == pane),
+            "a new native press must emit exactly the ordinary editor Enter"
+        );
+        drop(editor);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some(original));
+        for message in accepted {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::TaggedKeyEvent {
+            event: enter(false, false),
+            source: held_release,
+            captured: true,
+        }));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        let edited = runtime.editor_text().unwrap();
+        assert_eq!(
+            edited.chars().filter(|c| *c == '\n').count(),
+            original.chars().filter(|c| *c == '\n').count() + 1
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
+            original,
+            "a native edit must not execute lazy save effects or write the fixture file"
         );
     }
 
@@ -28926,15 +29322,163 @@ mod tests {
     }
 
     #[test]
+    fn explicit_attention_reads_keep_worktree_scope_and_preserve_live_waiting() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let project = app.sidebar_model.projects[0].id;
+        let roots = app.sidebar_model.projects[0]
+            .worktrees
+            .iter()
+            .take(2)
+            .map(|worktree| (worktree.id, worktree.path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        let mut cards = Vec::new();
+        for (_, path) in &roots {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
+            session.launch.working_directory = path.clone();
+            app.worktree_owners.insert(card.id, path.clone());
+            app.sidebar_state.observe_card_update(card.id);
+            cards.push(card);
+        }
+        let first = cards[0].id;
+        let second = cards[1].id;
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.sidebar_state.set_card_activity(
+            first,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, roots[0].0,
+        ))));
+        assert!(!app.sidebar_state.has_card_update(first));
+        assert!(app.sidebar_state.has_card_update(second));
+        assert_eq!(app.sidebar_state.card_attention(first).waiting, 1);
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(
+            app.sidebar_state.has_card_update(second),
+            "a covering form still owns input"
+        );
+        app.settings_reset_confirm = false;
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(second));
+        assert_eq!(app.sidebar_state.card_attention(first).waiting, 1);
+    }
+
+    #[test]
+    fn attention_navigation_skips_unenterable_scopes_without_reading_their_news() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let waiting = terminal_card_state();
+        let waiting_id = waiting.id;
+        let reachable = terminal_card_state();
+        let reachable_id = reachable.id;
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([waiting, reachable]);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Reachable".into(),
+            "/tmp".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let reachable_channel = crate::model::ChannelId::new();
+        for (card, project_id, id) in [
+            (waiting_id, ProjectId::new(), crate::model::ChannelId::new()),
+            (reachable_id, project, reachable_channel),
+        ] {
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id,
+                    project_id,
+                    title: "Attention destination".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+        }
+        app.sidebar_state.set_card_activity(
+            waiting_id,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Waiting,
+            },
+        );
+        app.sidebar_state.observe_card_update(waiting_id);
+        app.sidebar_state.observe_card_update(reachable_id);
+        assert_eq!(app.ranked_attention_cards()[0], waiting_id);
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.workspace.focused(), Some(reachable_id));
+        assert_eq!(app.durable.active_channel, Some(reachable_channel));
+        assert!(app.sidebar_state.has_card_update(waiting_id));
+        assert_eq!(app.sidebar_state.card_attention(waiting_id).waiting, 1);
+        assert!(!app.sidebar_state.has_card_update(reachable_id));
+
+        // A real protection refusal must not focus a still-mounted candidate
+        // or acknowledge it after the checked worktree selection was refused.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        let blocked = directory.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let _exclusive =
+            crate::worktree_cleanup::fixture_protection(&runtime, &blocked, true).unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.worktree_protections.use_fixture_runtime(runtime);
+        let mut candidate = terminal_card_state();
+        let candidate_id = candidate.id;
+        let CardKind::Terminal(session) = &mut candidate.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = blocked.clone();
+        Arc::make_mut(&mut app.durable).cards.push(candidate);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        app.worktree_owners.insert(candidate_id, blocked);
+        app.sidebar_state.observe_card_update(candidate_id);
+        let focused = app.workspace.focused();
+        let scope = app.active_workspace.clone();
+        let channel = app.durable.active_channel;
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, scope);
+        assert_eq!(app.durable.active_channel, channel);
+        assert!(app.sidebar_state.has_card_update(candidate_id));
+    }
+
+    #[test]
     fn attention_shortcut_switches_projects_focuses_exact_pane_and_acknowledges_it() {
         use crate::model::{ChannelId, ProjectChannel};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         app.refresh_ui.focused = true;
         let first = app.workspace.focused().unwrap();
+        let mut alias = app.card_state(first).unwrap().clone();
+        alias.id = CardId::from_uuid(uuid::Uuid::from_u128(u128::MAX));
+        let alias_id = alias.id;
         let second = terminal_card_state();
         let second_id = second.id;
-        Arc::make_mut(&mut app.durable).cards.push(second);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([second, alias]);
         let projects = [ProjectId::new(), ProjectId::new()];
         let channels = [ChannelId::new(), ChannelId::new()];
         for (index, card) in [first, second_id].into_iter().enumerate() {
@@ -28955,11 +29499,25 @@ mod tests {
                     title: format!("Channel{index}"),
                     ordinal: index as u32,
                     shared: false,
-                    cards: vec![card],
-                    focused: Some(card),
+                    cards: if index == 0 {
+                        vec![card, alias_id]
+                    } else {
+                        vec![card]
+                    },
+                    focused: Some(if index == 0 { alias_id } else { card }),
                 });
         }
         drop(app.select_channel(channels[0]));
+        assert_eq!(app.workspace.focused(), Some(alias_id));
+        for card in [first, alias_id] {
+            app.sidebar_state.set_card_activity(
+                card,
+                crate::agent::Activity {
+                    provider: crate::agent::Provider::Claude,
+                    state: crate::agent::ActivityState::Waiting,
+                },
+            );
+        }
         app.sidebar_state.observe_card_update(first);
         app.sidebar_state.observe_card_update(second_id);
         drop(app.update(Message::RunCommand(
