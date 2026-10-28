@@ -1192,6 +1192,8 @@ mod tests {
             .unwrap();
         assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
         let recovery = &discarded.recovery;
+        assert!(recovery.can_undo());
+        assert!(!recovery.live_recovery.needs_resolution());
         assert_eq!(recovery.entries.len(), 1);
         let entry = &recovery.entries[0];
         assert!(matches!(entry.before, SavedEntry::Blob { .. }));
@@ -1209,6 +1211,8 @@ mod tests {
         .with_worktree_authority(custody.source.clone())
         .unwrap();
         let parent = custody.source.retained_worktree_root();
+        custody.source.validate().unwrap();
+        custody.context.validate_for_source(&parent).unwrap();
         let mut before = None;
         let reason = original_service
             .undo_saved_entry_observing(
