@@ -12802,12 +12802,14 @@ impl Cagents {
         if pending.updater.is_some() {
             self.update_flush_pending = false;
         }
-        // Settings retain their normal acknowledgement/error and same-value
-        // retry behavior even when the final window barrier owns their save.
-        self.receive_settings_save(pending.settings_generation, saved);
         let current_writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let same_writer = matches!((&pending.writer, &current_writer),
             (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+        // Settings retain their normal acknowledgement/error and same-value
+        // retry behavior while this window still owns the original writer.
+        if self.core.main_window_id() == Some(window) && same_writer {
+            self.receive_settings_save(pending.settings_generation, saved);
+        }
         let current = self.persistent_workspace();
         let result = result.and_then(|()| {
             if self.core.main_window_id() != Some(window) || !same_writer {
@@ -20651,6 +20653,8 @@ mod tests {
                 Message::WindowCloseFlushed { result: Ok(()), .. }
             ));
             let stale = completed.clone();
+            let acknowledged = app.settings_ack_generation;
+            let settings_base = app.settings_base.clone();
             match changed {
                 "snapshot" => {
                     // Model/lifecycle completions stay serviceable during a flush.
@@ -20669,6 +20673,10 @@ mod tests {
             assert!(app.exit.is_none(), "{changed}");
             assert!(app.pending_window_close.is_none());
             assert!(app.core.main_window_id().is_some());
+            if matches!(changed, "writer" | "window") {
+                assert_eq!(app.settings_ack_generation, acknowledged);
+                assert_eq!(app.settings_base, settings_base);
+            }
             // A later close is an explicit new attempt, never a replay of old ACK.
             let current_window = app.core.main_window_id().unwrap();
             let task = app.update(Message::WindowCloseRequested(current_window));
