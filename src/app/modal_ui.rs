@@ -650,6 +650,138 @@ mod tests {
     }
 
     #[test]
+    fn discard_prompt_native_cache_cannot_carry_pointer_consent_into_a_replacement() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation},
+        };
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        struct ButtonBounds(Option<iced::Rectangle>);
+        impl Operation for ButtonBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&sidebar::discard_confirm_id()) {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        for replacement in [None, Some("replacement.txt"), Some("original.txt")] {
+            let replace = replacement.is_some();
+            let mut app = app();
+            let key = sidebar::ActiveWorktreeKey {
+                project_id: ProjectId::new(),
+                worktree_id: crate::model::WorktreeId::new(),
+                canonical_path: "/fixture/worktree".into(),
+            };
+            let request = |name: &str| SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: crate::repository::DiscardRequest {
+                    worktree: key.canonical_path.clone(),
+                    tracked: Vec::new(),
+                    untracked: vec![crate::repository::RepoPath::parse(name).unwrap()],
+                    confirmed: false,
+                },
+            };
+            // Production state intake mints the immutable prompt ID. No
+            // repository mutation task is polled by this native-cache fixture.
+            app.sidebar_state.apply(&request("original.txt"));
+            drop(app.finish_modal_update(Task::none()));
+            let original = app.modal_surface_target(Modal::Discard);
+            let mut renderer = super::super::tests::headless_renderer();
+            let bounds = iced::Size::new(1280.0, 900.0);
+            let mut messages = Vec::new();
+            let (cache, point) = {
+                let mut ui = UserInterface::build(
+                    cosmic::ApplicationExt::view_main(&app),
+                    bounds,
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let mut target = ButtonBounds(None);
+                ui.operate(&renderer, &mut target);
+                let point = target.0.expect("actual destructive button bounds").center();
+                let (_, status) = ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    ))],
+                    iced::mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(status, vec![iced::event::Status::Captured]);
+                assert!(
+                    messages.is_empty(),
+                    "consent is emitted on release, not press"
+                );
+                (ui.into_cache(), point)
+            };
+            let task = if let Some(replacement) = replacement {
+                // Process close/reopen without rendering an intermediate
+                // frame: the named widget cache still contains A's press.
+                app.sidebar_state.apply(&request(replacement));
+                app.finish_modal_update(Task::none())
+            } else {
+                app.finish_modal_update(Task::none())
+            };
+            let current = app.modal_surface_target(Modal::Discard);
+            assert_eq!(current == original, !replace);
+            let mut ui = UserInterface::build(
+                cosmic::ApplicationExt::view_main(&app),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            // Apply the replacement's normal initial Cancel focus; unfocusing
+            // a native button by itself does not clear its pressed state.
+            apply_modal_widget_task(&mut ui, &renderer, task);
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let decisions = messages.iter().filter(|message| matches!(message,
+                cosmic::Action::App(Message::ModalSurface { message, .. }) if matches!(&**message, Message::Sidebar(SidebarAction::ConfirmDiscard { .. })))).count();
+            assert_eq!(
+                decisions,
+                usize::from(!replace),
+                "a replaced surface cannot inherit pointer consent"
+            );
+            if replace {
+                messages.clear();
+                ui.update(
+                    &[
+                        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                            iced::mouse::Button::Left,
+                        )),
+                        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                            iced::mouse::Button::Left,
+                        )),
+                    ],
+                    iced::mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(messages.iter().any(|message| matches!(message,
+                    cosmic::Action::App(Message::ModalSurface { target, message }) if *target == current && matches!(&**message, Message::Sidebar(SidebarAction::ConfirmDiscard { .. })))),
+                    "a fresh intentional click still reaches the replacement control");
+            }
+        }
+    }
+
+    #[test]
     fn pointer_press_cannot_carry_consent_into_a_replaced_named_dialog_tree() {
         use iced::advanced::{
             clipboard,
