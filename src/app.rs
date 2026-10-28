@@ -2312,12 +2312,42 @@ pub struct SettingsSaved {
     settings: AppSettings,
 }
 
+// Closing freezes user input, so contention must return control to the same
+// window. This bounds lock acquisition, not filesystem IO after taking a lock.
+const WINDOW_CLOSE_SETTINGS_LOCK_WAIT: Duration = Duration::from_secs(2);
+
 impl SettingsSave {
     fn run(self) -> Result<SettingsSaved, String> {
-        let mut lane = self
-            .lane
-            .lock()
-            .map_err(|_| "settings save lane unavailable")?;
+        self.run_with_lock_deadline(None)
+    }
+
+    fn run_with_lock_deadline(self, deadline: Option<Instant>) -> Result<SettingsSaved, String> {
+        let mut lane = loop {
+            let Some(deadline) = deadline else {
+                break self
+                    .lane
+                    .lock()
+                    .map_err(|_| "settings save lane unavailable")?;
+            };
+            if Instant::now() >= deadline {
+                return Err(
+                    "Settings are still being saved; try closing this window again.".into(),
+                );
+            }
+            match self.lane.try_lock() {
+                Ok(lane) => break lane,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("settings save lane unavailable".into());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("Settings are still being saved; try closing this window again.".into());
+        }
         if let Some(saved) = lane.as_ref()
             && saved.generation > self.generation
         {
@@ -2330,10 +2360,10 @@ impl SettingsSave {
                 .map_err(|error| error.to_string())?;
         }
         if self.reset {
-            settings::save(&self.path, &self.desired)
+            settings::save_with_lock_deadline(&self.path, &self.desired, deadline)
         } else {
             let base = lane.as_ref().map_or(&self.base, |saved| &saved.settings);
-            settings::save_merged(&self.path, base, &self.desired)
+            settings::save_merged_with_lock_deadline(&self.path, base, &self.desired, deadline)
         }
         .map_err(|error| error.to_string())?;
         let saved = SettingsSaved {
@@ -2354,12 +2384,21 @@ struct WorkspaceSave {
 async fn flush_workspace(
     save: Result<WorkspaceSave, String>,
 ) -> (Result<SettingsSaved, String>, Result<(), String>) {
+    flush_workspace_with_lock_deadline(save, None).await
+}
+
+async fn flush_workspace_with_lock_deadline(
+    save: Result<WorkspaceSave, String>,
+    deadline: Option<Instant>,
+) -> (Result<SettingsSaved, String>, Result<(), String>) {
+    // Await the real worker result. A timeout around spawn_blocking would
+    // release the window while that worker could still save older settings.
     let outcome = tokio::task::spawn_blocking(move || {
         let save = match save {
             Ok(save) => save,
             Err(error) => return (Err(error.clone()), Err(error)),
         };
-        let saved = save.settings.run();
+        let saved = save.settings.run_with_lock_deadline(deadline);
         let result = saved
             .as_ref()
             .map(|_| ())
@@ -12723,10 +12762,12 @@ impl Cagents {
                 .map_err(|error| error.to_string()),
             updater,
         });
+        let lock_deadline = Instant::now() + WINDOW_CLOSE_SETTINGS_LOCK_WAIT;
         Task::batch([
             drafts,
             cosmic::task::future(async move {
-                let (saved, result) = flush_workspace(save).await;
+                let (saved, result) =
+                    flush_workspace_with_lock_deadline(save, Some(lock_deadline)).await;
                 Message::WindowCloseFlushed {
                     generation,
                     window,
@@ -20661,6 +20702,149 @@ mod tests {
                 app.persistent_workspace().chat_drafts[&card].trim_end(),
                 "UNSENT before close"
             );
+        }
+    }
+
+    #[test]
+    fn window_close_busy_settings_refuses_without_late_writes_and_retries_retained_draft() {
+        use std::os::fd::AsRawFd;
+
+        for blocker in ["file lock", "save lane"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            let path = app.settings_path.clone().unwrap();
+            let base = app.settings.clone();
+            settings::save(&path, &base).unwrap();
+            let original_bytes = std::fs::read(&path).unwrap();
+            app.settings.chat_expand_tool_groups = !base.chat_expand_tool_groups;
+            let (activations, receiver) = async_channel::unbounded();
+            app.activation_rx = receiver;
+            let store = app.session.as_ref().unwrap().operation_store();
+            let lane = Arc::clone(&app.settings_save_lane);
+            let held_lane = (blocker == "save lane").then(|| lane.lock().unwrap());
+            let held_file = (blocker == "file lock").then(|| {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path.with_extension("toml.lock"))
+                    .unwrap();
+                // SAFETY: this test retains the separate descriptor until the
+                // real close worker has refused its nonblocking acquisition.
+                assert_eq!(
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                file
+            });
+            let started = Instant::now();
+            let task = app.update(Message::WindowCloseRequested(window));
+            assert!(app.pending_window_close.is_some());
+            type_window_close_draft(&mut app, card, " rejected while saving");
+            let failed = window_close_test_message(&mut app, task);
+            assert!(started.elapsed() < WINDOW_CLOSE_SETTINGS_LOCK_WAIT + Duration::from_secs(5));
+            assert!(
+                matches!(
+                    &failed,
+                    Message::WindowCloseFlushed {
+                        saved: Err(_),
+                        result: Err(_),
+                        ..
+                    }
+                ),
+                "{blocker}"
+            );
+            let late = failed.clone();
+            let reveal_task = app.update(failed);
+            for reveal in window_close_test_reveal_messages(reveal_task) {
+                drop(app.update(reveal));
+            }
+            assert!(app.chrome_ui.is_open());
+            assert!(app.pending_window_close.is_none());
+            assert!(app.exit.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+            assert!(!activations.is_closed());
+            assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+            drop(app.update(Message::ChromeUi(chrome_ui::Action::Close)));
+            assert!(!app.shell_inputs_blocked());
+            let retained = app.persistent_workspace().chat_drafts[&card].clone();
+            assert_eq!(retained.trim_end(), "UNSENT before close");
+            // The normal clipboard action is admitted again with exact draft
+            // bytes. Native Ctrl+A/C focus and OS clipboard remain separate.
+            let copy = app.update(Message::ChatUi(chat_ui::Action::CopyLiteral(
+                retained.clone(),
+            )));
+            let copied = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut effects = iced::runtime::task::into_stream(copy).unwrap();
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Clipboard(
+                            iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) = effect
+                        {
+                            return contents;
+                        }
+                    }
+                    panic!("retained draft copy must produce clipboard work");
+                });
+            assert_eq!(copied, retained);
+            let CardRuntime::Chat(runtime) = &app.cards[&card] else {
+                panic!("chat")
+            };
+            let target = runtime.target;
+            drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
+                target,
+                widget::text_editor::Action::SelectAll,
+            ))));
+            let edited = format!("{} edited after refusal", retained.trim_end());
+            type_window_close_draft(&mut app, card, &edited);
+            assert_eq!(
+                app.persistent_workspace().chat_drafts[&card].trim_end(),
+                edited
+            );
+
+            drop(held_file);
+            drop(held_lane);
+            assert!(
+                lane.lock().unwrap().is_none(),
+                "no late successful save after timeout"
+            );
+            assert_eq!(settings::load(&path).unwrap(), base);
+            // An unrelated window's preference still merges under the same
+            // serialization after the refused close releases all its guards.
+            let external = AppSettings {
+                app_theme: settings::AppTheme::Light,
+                ..base.clone()
+            };
+            settings::save(&path, &external).unwrap();
+            let task = app.update(Message::WindowCloseRequested(window));
+            let generation = app.pending_window_close.as_ref().unwrap().generation;
+            drop(app.update(late));
+            assert_eq!(
+                app.pending_window_close.as_ref().unwrap().generation,
+                generation
+            );
+            assert!(app.exit.is_none());
+            assert!(!activations.is_closed());
+            let completed = window_close_test_message(&mut app, task);
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Ok(()), .. }
+            ));
+            let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+            assert_eq!(saved.chat_drafts[&card].trim_end(), edited);
+            let merged = settings::load(&path).unwrap();
+            assert_eq!(merged.app_theme, external.app_theme);
+            assert_eq!(
+                merged.chat_expand_tool_groups,
+                app.settings.chat_expand_tool_groups
+            );
+            drop(app.update(completed));
+            assert!(app.exit.is_some());
+            assert_eq!(app.core.main_window_id(), None);
+            assert!(activations.is_closed());
         }
     }
 
