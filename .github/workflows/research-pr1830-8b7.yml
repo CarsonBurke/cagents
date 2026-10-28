@@ -1,0 +1,165 @@
+name: Research PR 1830 literal 8b7 qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/research-pr1830-8b7.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-pr1830-8b7-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  CARGO_TERM_COLOR: never
+  EXPECTED_PRODUCT_SHA: 8b7df7367bc26f978f6a02afa65920c4e1c7af57
+  EXPECTED_PRODUCT_TREE: 6ff259c87aa6043a0f28e87b6e27c4351516859e
+
+jobs:
+  qualify:
+    if: >-
+      github.event.pull_request.head.ref == 'research/pr1830-8b7-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Literal 8b7 HOST checkout safety and HOST/UI checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Check out the research workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out the literal reviewed product
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 8b7df7367bc26f978f6a02afa65920c4e1c7af57
+          path: product
+          persist-credentials: false
+
+      - name: Verify separate workflow and product sources
+        env:
+          EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          test "$(git rev-parse HEAD:src/repository/complete_inventory.rs)" = 3b99aa955c73b15787043d8be1de8ed2dd93524c
+          test "$(git rev-parse HEAD:src/repository/pr_checkout/tests.rs)" = 381cd531319ac640dfb22da1605987f152836736
+          test "$(git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD)" = "$EXPECTED_RESEARCH_SHA"
+          install -d -m 700 "$RUNNER_TEMP/pr1830-logs"
+          {
+            printf 'product\n'
+            git rev-parse HEAD 'HEAD^{tree}'
+            printf 'research\n'
+            git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
+            sha256sum "$GITHUB_WORKSPACE/research/.github/workflows/research-pr1830-8b7.yml"
+            sha256sum src/repository/complete_inventory.rs src/repository/pr_checkout/tests.rs
+          } | tee "$RUNNER_TEMP/pr1830-logs/source.txt"
+
+      - name: Set up the literal product's pinned Linux build environment
+        uses: ./product/.github/actions/setup-linux-build
+
+      - name: Install the production Git version
+        env:
+          GIT_ARCHIVE_SHA256: 457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357
+        run: |
+          set -euo pipefail
+          sudo apt-get install --yes --no-install-recommends libcurl4-openssl-dev libexpat1-dev zlib1g-dev
+          archive="$RUNNER_TEMP/git-2.55.0.tar.xz"
+          curl --proto '=https' --tlsv1.2 --fail --location \
+            https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz --output "$archive"
+          printf '%s  %s\n' "$GIT_ARCHIVE_SHA256" "$archive" | sha256sum --check --strict
+          tar -xJf "$archive" -C "$RUNNER_TEMP" --no-same-owner
+          make -C "$RUNNER_TEMP/git-2.55.0" -j2 \
+            prefix="$RUNNER_TEMP/pr1830-git" NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+          test "$("$RUNNER_TEMP/pr1830-git/bin/git" --version)" = 'git version 2.55.0'
+          printf '%s\n' "$RUNNER_TEMP/pr1830-git/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare private fixtures and record the owning selectors
+        run: |
+          set -euo pipefail
+          fixture_root=$(mktemp -d /tmp/c1830XXXXXX)
+          install -d -m 700 "$fixture_root/runtime" "$fixture_root/data"
+          printf '%s\n' "TMPDIR=$fixture_root" \
+            "XDG_RUNTIME_DIR=$fixture_root/runtime" "XDG_DATA_HOME=$fixture_root/data" >> "$GITHUB_ENV"
+          {
+            git --version
+            rustc --version
+            cargo --version
+            zig version
+          } | tee "$RUNNER_TEMP/pr1830-logs/toolchain.txt"
+          python3 - <<'PY'
+          import os, pathlib, re
+          source = pathlib.Path('src/repository/pr_checkout/tests.rs').read_text()
+          names = ['repository::pr_checkout::tests::' + name
+                   for name in re.findall(r'#\[test\]\s+fn (\w+)\(', source)]
+          assert len(names) == len(set(names)) == 44, names
+          required = 'repository::pr_checkout::tests::hidden_submodule_edits_refuse_checkout_advance_without_changing_display_preferences'
+          assert required in names
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1830-logs/selectors44.txt'
+          target.write_text('\n'.join(names) + '\n')
+          print('Pinned product defines 44 owning parents; this is not runtime discovery.')
+          PY
+
+      - name: Check the isolated HOST executable
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1830-target-host
+        run: |
+          set -euo pipefail
+          cargo check --locked --no-default-features --features host --bin cagentsd \
+            2>&1 | tee "$RUNNER_TEMP/pr1830-logs/host-check.txt"
+
+      - name: Run the literal product's owning HOST checkout family once
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1830-target-host
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-default-features --features host --lib \
+            repository::pr_checkout::tests:: -- --nocapture --test-threads=2 \
+            2>&1 | tee "$RUNNER_TEMP/pr1830-logs/host-checkout-tests.txt"
+          python3 - <<'PY'
+          import os, pathlib, re
+          logs = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1830-logs'
+          expected = set((logs / 'selectors44.txt').read_text().splitlines())
+          output = (logs / 'host-checkout-tests.txt').read_text()
+          actual = set(re.findall(r'test (repository::pr_checkout::tests::\w+) \.\.\. ok', output))
+          assert actual == expected, {'missing': sorted(expected - actual), 'unexpected': sorted(actual - expected)}
+          assert re.search(r'test result: ok\. 44 passed; 0 failed; 0 ignored;', output), 'Missing successful 44-parent outer summary'
+          print('All 44 owning parents passed; isolated child copies and subcases are nonadditive.')
+          PY
+
+      - name: Check the isolated browserless UI executable
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1830-target-ui
+        run: |
+          set -euo pipefail
+          cargo check --locked --no-default-features --features ui --bin cagents-ui \
+            2>&1 | tee "$RUNNER_TEMP/pr1830-logs/ui-check.txt"
+
+      - name: Verify the literal product remains unchanged
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Retain product and research identities and qualification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: research-pr1830-literal8b7-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr1830-logs/
+          if-no-files-found: warn
+          retention-days: 14
