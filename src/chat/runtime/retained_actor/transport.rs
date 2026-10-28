@@ -1228,6 +1228,9 @@ impl RemoteActor {
             state.waiting = false;
             state.working = false;
             state.activity = crate::agent::ActivityState::Unknown;
+            // The last sample is historical once this attachment loses
+            // authority. Directory readers must fall back to Unknown.
+            state.execution_status = None;
             state.owns_work = true;
             generation = state.generation;
         }
@@ -5553,6 +5556,20 @@ done"#;
     #[test]
     fn unavailable_proxy_settles_pending_input_and_stops_reporting_healthy_metadata() {
         let actor = RemoteActor::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.activity = crate::agent::ActivityState::Working;
+            state.busy = true;
+            state.working = true;
+            state.execution_status = Some(crate::agent_execution::directory::ExecutionStatus {
+                activity: state.activity,
+                generation: state.generation,
+                turn_generation: 1,
+                parent_busy: true,
+                active_run: Some(crate::model::RunId::new()),
+            });
+        }
         let response = actor.enqueue(None, Command::Interrupt).unwrap();
         actor.publish_unavailable("Retained actor attachment was superseded");
         let state = actor.state();
@@ -5560,6 +5577,10 @@ done"#;
         assert!(!state.idle);
         assert!(state.failure.is_some());
         assert_eq!(state.activity, crate::agent::ActivityState::Unknown);
+        assert!(
+            state.execution_status.is_none(),
+            "a lost attachment cannot report an old request as current"
+        );
         assert!(
             state.owns_work,
             "disconnection is not provider cleanup proof"
