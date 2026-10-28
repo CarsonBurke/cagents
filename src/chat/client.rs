@@ -1113,6 +1113,7 @@ fn restore(
     proof: &HostSessionProof,
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
+    retry_explicit_start: bool,
 ) -> Result<ClientRequest, StartFailure> {
     if session.proof.as_ref() == Some(proof) {
         return Ok(ClientRequest::ChatAttach { session });
@@ -1207,7 +1208,7 @@ fn restore(
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
         )));
     }
-    if session.launch.provider == crate::agent::Provider::Claude {
+    if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {
         return Err(StartFailure::from(format!(
             "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
             refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
@@ -1712,6 +1713,18 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
+        if intent == Intent::RetryStart
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some()
+                || session.terminal.is_some()
+                || session.launch.session_id.is_none()
+                || session.native_continuity.retains_provider())
+        {
+            return Err("Only an exact explicit history start can be retried".into());
+        }
         if let Some(expected) = &upgrade_expected
             && (intent != Intent::Restore
                 || source.is_some()
@@ -1828,6 +1841,7 @@ impl ClientHandle {
                 &proof,
                 session,
                 &mut upgrade_recovery,
+                intent == Intent::RetryStart,
             )?
         };
         codec
@@ -3597,6 +3611,7 @@ mod tests {
             live,
             session,
             &mut recovery,
+            false,
         );
         (outcome, worker.join().unwrap(), recovery)
     }

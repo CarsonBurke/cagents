@@ -570,6 +570,9 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    /// Transient user intent, never an execution proof. Automatic restoration
+    /// cannot acquire this permission; an exact failed History start can retry.
+    explicit_starts: HashMap<CardId, chat::Session>,
     /// Starts and restart closes still in flight for a card that has since
     /// been closed, with the conversation each one concerns.
     ///
@@ -615,6 +618,7 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
@@ -6371,6 +6375,17 @@ impl Cagents {
         ])
     }
 
+    /// Preserve only the exact explicit launch the failed pane was trying.
+    pub(super) fn chat_retry_intent(&self, card: CardId, session: &chat::Session) -> chat::Intent {
+        if self.chat_ui.explicit_starts.get(&card) == Some(session)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
+        {
+            chat::Intent::RetryStart
+        } else {
+            chat::Intent::Restore
+        }
+    }
+
     /// Opens the conversation card `card` holds: its draft, when nothing has
     /// ever run it, or else a connection to it.
     ///
@@ -6542,6 +6557,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
@@ -7160,6 +7176,18 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        if intent == chat::Intent::Start
+            && source.is_none()
+            && !terminate_source
+            && upgrade_admission.is_none()
+            && session.terminal.is_none()
+            && session.launch.session_id.is_some()
+            && !session.native_continuity.retains_provider()
+        {
+            self.chat_ui.explicit_starts.insert(card, session.clone());
+        } else if self.chat_ui.explicit_starts.get(&card) != Some(&session) {
+            self.chat_ui.explicit_starts.remove(&card);
+        }
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
@@ -8787,6 +8815,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
+                        self.chat_ui.explicit_starts.remove(&target.card);
                         self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         if account_source.is_some() || attempt.upgrade_admission.is_some() {
                             // Shared projection may already hold the canonical

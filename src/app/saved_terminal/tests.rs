@@ -65,6 +65,73 @@ fn complete(
     }
 }
 
+/// Settle the actual saved-inspection reducer in a UI state fixture. Tasks
+/// are not polled: this models a captured User inspection completion, never a
+/// daemon inventory, authority grant, absence receipt, or provider exit.
+pub(in crate::app) fn complete_inspection(
+    app: &mut Cagents,
+    card: CardId,
+    result: Result<Option<StartedTerminal>, String>,
+) {
+    assert!(app.terminal_start_in_flight(card));
+    let entry = app.saved_terminals.entries.get_mut(&card).unwrap();
+    entry.authority = crate::agent_execution::Authority::default();
+    entry.socket = Ok(Some(crate::terminal::ipc::daemon_socket_path().unwrap()));
+    let source = entry.source.clone();
+    let request = entry.request;
+    assert_eq!(app.saved_terminals.active, Some(request));
+    assert_eq!(app.saved_terminals.outstanding.get(&request), Some(&card));
+    drop(app.update(Message::SavedTerminal(complete(
+        card, source, request, result,
+    ))));
+}
+
+#[test]
+fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_panes() {
+    use crate::terminal_ipc::TerminalVisibility;
+    for (initial, current) in [
+        (Exposure::Offscreen, Exposure::Offscreen),
+        (Exposure::Offscreen, Exposure::Visible),
+        (Exposure::Visible, Exposure::Offscreen),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, source) = fixture();
+        app.card_state_mut(card).unwrap().exposure = initial;
+        assert!(app.prepare_saved_terminal(card, &source));
+        drop(app.inspect_saved_terminal(card));
+        assert!(matches!(
+            app.lifecycle.state(card),
+            Some((_, Residency::Hibernated))
+        ));
+        // Revealing while inspection is pending cannot launch a duplicate.
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        app.card_state_mut(card).unwrap().exposure = current;
+        let surface = crate::app::tests::unconnected_surface(directory.path(), source.id);
+        complete_inspection(
+            &mut app,
+            card,
+            Ok(Some(StartedTerminal {
+                handle: surface.clone(),
+                session: exact_live(&source),
+                spawned: false,
+            })),
+        );
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert!(app.saved_terminal_current(card).is_none());
+        assert_eq!(
+            surface.visibility() == TerminalVisibility::Hibernated,
+            current == Exposure::Offscreen
+        );
+        assert_eq!(
+            matches!(app.lifecycle.state(card), Some((_, Residency::Hibernated))),
+            current == Exposure::Offscreen
+        );
+        assert!(!surface.is_unsized_spawn());
+        surface.stop_for_test();
+    }
+}
+
 #[test]
 fn exact_issued_live_descriptor_wins_over_missing_saved_directory() {
     let (_, _, mut source) = fixture();

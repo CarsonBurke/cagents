@@ -8463,7 +8463,10 @@ impl Cagents {
             }
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
-            CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
+            CardKind::Chat(session) => {
+                let intent = self.chat_retry_intent(card, &session);
+                self.open_chat(card, session, intent)
+            }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes return before a retry registers them")
             }
@@ -24532,70 +24535,49 @@ mod tests {
         card
     }
 
-    /// An agent's row reports what it is doing only through an attached
-    /// terminal, so a restored agent off screen is attached without waiting
-    /// for its card to be opened, while a plain shell stays detached.
+    /// All saved owners, including plain shells, use one metadata-only lane.
     #[test]
     fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
         let mut app = context_inspector_test_app(false);
         let visible = restored_live_terminal("/bin/sh", Exposure::Visible);
-        let agents = [
+        let cards = [
+            visible.clone(),
+            restored_live_terminal("/bin/sh", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/claude", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/codex", Exposure::Offscreen),
         ];
-        let shell = restored_live_terminal("/bin/sh", Exposure::Offscreen);
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: [visible.clone(), shell.clone()]
-                .into_iter()
-                .chain(agents.clone())
-                .collect(),
+            cards: cards.to_vec(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
-        let terminal = |card: &CardState| match &card.kind {
-            CardKind::Terminal(session) => session.id,
-            _ => unreachable!("terminal fixture"),
-        };
+        let focus = app.workspace.focused();
+        let strip = app.workspace.order().collect::<Vec<_>>();
         drop(app.initialize_runtimes());
-        // The card on screen starts first; agents wait for its recovery lease.
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[0].id, agents[1].id]);
-        let _ = app.update(Message::TerminalStarted {
-            card: visible.id,
-            terminal: terminal(&visible),
-            result: Err("fixture".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[1].id]);
         let notices = app.notices.entries.len();
-
-        // A terminal that would have to be launched again stays detached, and
-        // so does one that cannot be attached; neither is a failure anyone
-        // has to see.
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[0].id,
-            terminal: terminal(&agents[0]),
-            result: Ok(None),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert!(app.restored_agent_attaches.is_empty());
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[1].id,
-            terminal: terminal(&agents[1]),
-            result: Err("the daemon is unavailable".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 0);
-        for card in agents.iter().chain([&shell]) {
+        for (index, card) in cards.iter().enumerate() {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+            let result = if index == cards.len() - 1 {
+                Err("the daemon is unavailable".into())
+            } else {
+                Ok(None)
+            };
+            saved_terminal::tests::complete_inspection(&mut app, card.id, result);
+            assert_eq!(app.saved_terminal_ready(card.id), index != cards.len() - 1);
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
             assert!(matches!(
                 app.cards.get(&card.id),
                 Some(CardRuntime::Loading)
             ));
-            assert_eq!(
-                app.lifecycle.state(card.id).map(|(_, residency)| residency),
-                Some(&Residency::Hibernated)
-            );
+            assert!(app.lifecycle.state(card.id).is_none());
+            assert_eq!(app.workspace.focused(), focus);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
         }
+        assert_eq!(app.terminal_starts_in_flight(), 0);
         assert_eq!(app.notices.entries.len(), notices);
     }
 
@@ -24610,49 +24592,21 @@ mod tests {
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.initialize_runtimes());
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            1,
-            "the identified Omp agent already observes background metadata"
-        );
-        assert!(app.terminal_start_in_flight(terminals[1].id));
-        assert!(!app.terminal_start_in_flight(terminals[0].id));
-        assert!(!app.terminal_start_in_flight(terminals[2].id));
-        assert!(app.restored_agent_attaches.is_empty());
-        let CardKind::Terminal(omp) = &terminals[1].kind else {
-            unreachable!()
-        };
-        drop(app.update(Message::RestoredAgentAttached {
-            card: terminals[1].id,
-            terminal: omp.id,
-            result: Ok(None),
-        }));
+        for card in &terminals {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_ne!(
+                app.startup_pane_check(),
+                Ok(true),
+                "pending inspection cannot qualify"
+            );
+            saved_terminal::tests::complete_inspection(&mut app, card.id, Ok(None));
+            assert!(app.saved_terminal_ready(card.id));
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+        }
         assert_eq!(app.terminal_starts_in_flight(), 0);
-        // An unavailable original remains unqualified; the explicit startup
-        // check then uses the same serial attach-only path for every owner.
-        drop(app.qualify_startup_terminals());
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches.len(), 2);
-        assert_eq!(app.startup_pane_check(), Ok(false));
-        let CardKind::Terminal(first) = &terminals[0].kind else {
-            unreachable!()
-        };
-        drop(app.update(Message::RestoredAgentAttached {
-            card: terminals[0].id,
-            terminal: first.id,
-            result: Ok(None),
-        }));
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            1,
-            "one next attach uses the existing bounded queue"
-        );
-        assert_eq!(app.restored_agent_attaches.len(), 1);
-        assert_ne!(
-            app.startup_pane_check(),
-            Ok(true),
-            "unattached owners never qualify"
-        );
+        assert_eq!(app.startup_pane_check(), Ok(true));
     }
 
     #[test]

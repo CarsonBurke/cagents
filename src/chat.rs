@@ -299,6 +299,9 @@ pub enum Intent {
     /// Begin this launch. A conversation the launch names by id is resumed by
     /// the provider's own argv rather than by attaching to a daemon writer.
     Start,
+    /// Retry an exact, explicitly requested named launch. Resolve any existing
+    /// owner first so a lost start reply cannot create a second provider.
+    RetryStart,
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
