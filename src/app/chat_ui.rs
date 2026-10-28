@@ -47,6 +47,8 @@ mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
+#[cfg(test)]
+mod scrollbar_press_tests;
 mod selectable_prose;
 mod selection;
 mod step;

@@ -140,6 +140,9 @@ pub const SCROLLBAR_THUMB_WIDTH: f32 = 4.0;
 /// `width + margin * 2`, which this makes exactly `SCROLLBAR_GUTTER`, so a
 /// native surface and a custom-drawn one reserve the same space.
 pub const SCROLLBAR_MARGIN: f32 = (SCROLLBAR_GUTTER - SCROLLBAR_THUMB_WIDTH) / 2.0;
+/// Keep pane content clear of the window's eight-pixel resize border and
+/// the overlaid pane splitter. The resize targets remain at the outer edge.
+pub const PANE_RESIZE_CLEARANCE: f32 = 8.0;
 pub const BORDER_WIDTH: f32 = 1.0;
 
 pub fn scrollbar() -> iced::widget::scrollable::Scrollbar {
