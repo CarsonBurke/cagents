@@ -415,6 +415,18 @@ for line in sys.stdin:
         assert_eq!(session.launch, requested.launch);
         assert_eq!(snapshot.session_id.as_deref(), Some(expected.as_str()));
         assert!(snapshot.ready && !snapshot.exited && snapshot.error.is_none());
+        let expired = wait_saved_conversation_ready(
+            &handle,
+            &expected,
+            Instant::now() - Duration::from_secs(1),
+            || false,
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            expired.contains("did not become ready in time"),
+            "{expired}"
+        );
         let state = host.lock().unwrap();
         let record = &state.chats[&requested.id];
         assert!(record.handle.same_attachment(&handle));
