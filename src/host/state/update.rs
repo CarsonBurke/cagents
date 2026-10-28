@@ -9,6 +9,10 @@ pub(in crate::host) fn inspect(
     policy: Policy,
     fence_actors: bool,
 ) -> Result<DaemonImpact, ProtocolError> {
+    // A refused close can leave an authenticated cleanup-only attachment.
+    // Reinstall its actual running owner before previewing checkpointability;
+    // never waive a pending handoff or pretend a failed close completed.
+    let cleanup_failures = super::super::chat::retained_actor::recover_cleanup_attachments(host);
     let (registry, handles, migrations) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -29,6 +33,9 @@ pub(in crate::host) fn inspect(
                     }
                     let mut source = record.session.clone();
                     source.native_continuity = record.handle.native_continuity();
+                    if source.native_continuity.retains_provider() {
+                        source.launch.session_id = record.handle.confirmed_session_id();
+                    }
                     let mut launch = source.launch.clone();
                     launch.session_id = record.handle.confirmed_session_id();
                     crate::chat::protocol::align_resume_identity(&mut launch).ok()?;
@@ -42,7 +49,7 @@ pub(in crate::host) fn inspect(
                 .collect::<Vec<_>>(),
         )
     };
-    let mut blockers = Vec::new();
+    let mut blockers = cleanup_failures;
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         blockers.extend(registry.agent_update_blockers().map_err(upgrade_error)?);
@@ -74,7 +81,7 @@ pub(in crate::host) fn inspect(
                 )),
                 crate::chat::runtime::UpdateReadiness::Busy
                     if policy == Policy::WhenIdle
-                        && !matches!(handle.native_continuity(), crate::chat::NativeContinuity::Durable { .. }) => {
+                        && !handle.native_continuity().retains_provider() => {
                     blockers.push(format!("Conversation {id} has accepted work; wait for it to finish."));
                 }
                 _ => {}
@@ -209,10 +216,12 @@ impl HostState {
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
             let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
-            let durable = matches!(
-                record.handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let continuity = record.handle.native_continuity();
+            let durable = continuity.retains_provider();
+            let retained_claude = matches!(
+                continuity,
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            ) && record.handle.actor_identity().is_some();
             let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
                 && self
                     .terminals
@@ -223,7 +232,15 @@ impl HostState {
                 hosted_source,
                 &record.handle,
             );
-            let migration = crate::upgrade::handoff::validate_chat_source(&record.session, &launch);
+            // Preview the same issued source that preparation checkpoints.
+            // A lagging presentation capability is not the installed helper's
+            // ownership; obtain that capability from this exact live handle.
+            let mut source = record.session.clone();
+            source.native_continuity = continuity;
+            if source.native_continuity.retains_provider() {
+                source.launch.session_id = confirmed.clone();
+            }
+            let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
@@ -248,7 +265,7 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
                 )
-            } else if !aligned || launch.terminal_recipe().is_none() {
+            } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
                 (
                     Disposition::Blocked,
                     "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",

@@ -5,7 +5,7 @@ use super::{Handle, Provider, Session, SharedHost};
 use crate::{
     account::scope::LaunchAccountScope,
     daemon::holder_registry::{OriginalRole, Record},
-    host::model::{NativeActorOwnership, NativeActorRetirement},
+    host::model::{ArchivedHistory, NativeActorOwnership, NativeActorRetirement},
     model::HostSessionProof,
 };
 
@@ -29,33 +29,24 @@ fn same_scope(left: &LaunchAccountScope, right: &LaunchAccountScope) -> bool {
 
 // Evidence is projected only from a VerifiedRetirement on the production path.
 // A holder awaiting its parent's wait is not executing provider work.
-fn validate_evidence(
-    source: &Session,
+fn validate_retired_identity(
     ownership: &NativeActorOwnership,
     retirement: &NativeActorRetirement,
     evidence: &Evidence<'_>,
 ) -> Result<(), String> {
-    if ownership.is_pending() || retirement.is_pending() {
-        return Err("Pending cleanup intent never grants disk resume authority".into());
-    }
     let owns_alias =
         |candidate: &Session| candidate == evidence.source || evidence.aliases.contains(candidate);
     if evidence.actor != ownership.actor()
         || evidence.actor != retirement.actor()
         || evidence.owner != ownership.owner()
         || evidence.owner != retirement.owner()
-        || source.id != evidence.owner.terminal
-        || !owns_alias(source)
+        || evidence.source.id != evidence.owner.terminal
         || !owns_alias(ownership.source())
         || !owns_alias(retirement.source())
         || retirement.confirmed_session() != evidence.confirmed
-        || evidence.confirmed != source.launch.session_id.as_deref()
-        || evidence.confirmed.is_none()
         || evidence.owner.root.is_current()
     {
-        return Err(
-            "The exact saved Claude pane has no matching completed actor retirement".into(),
-        );
+        return Err("The saved Claude actor has no matching completed retirement".into());
     }
     let captured = evidence.scope.map_err(|_| {
         "The retired Claude actor has no captured physical account identity".to_owned()
@@ -67,6 +58,70 @@ fn validate_evidence(
         || !same_scope(captured, retired)
     {
         return Err("The Claude retirement changed its captured physical account identity".into());
+    }
+    Ok(())
+}
+
+fn retirement_evidence(verified: &crate::chat::runtime::VerifiedRetirement) -> Evidence<'_> {
+    let receipt = verified.receipt();
+    Evidence {
+        actor: receipt.identity.instance,
+        owner: &receipt.identity.record,
+        proof: &receipt.proof,
+        source: &receipt.source,
+        aliases: &receipt.previous_sources,
+        scope: receipt
+            .launch_account_scope
+            .as_ref()
+            .map_err(String::as_str),
+        confirmed: receipt.confirmed_session.as_deref(),
+        paired_holder: receipt.paired_holder.as_ref(),
+    }
+}
+
+fn unconfirmed_retired_startup(
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    verified: &crate::chat::runtime::VerifiedRetirement,
+) -> Result<bool, String> {
+    // This actor is not resume evidence. A normal Close has already consumed
+    // its semantic journal and authenticated both process and helper teardown.
+    // Keep its census/retirement intact, but do not let a failed initialization
+    // compete with a later provider-confirmed actor using the same allocation.
+    // Pending cleanup intent remains subject to its separate strict witness.
+    if ownership.is_pending()
+        || retirement.is_pending()
+        || verified.receipt().confirmed_session.is_some()
+    {
+        return Ok(false);
+    }
+    validate_retired_identity(ownership, retirement, &retirement_evidence(verified))?;
+    Ok(true)
+}
+
+fn validate_evidence(
+    source: &Session,
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    evidence: &Evidence<'_>,
+    archived: Option<&ArchivedHistory>,
+) -> Result<(), String> {
+    if (ownership.is_pending() || retirement.is_pending())
+        && !archived.is_some_and(|archived| {
+            archived.matches(source, ownership, retirement) && source == evidence.source
+        })
+    {
+        return Err("Pending cleanup intent never grants disk resume authority".into());
+    }
+    validate_retired_identity(ownership, retirement, evidence)?;
+    if source.id != evidence.owner.terminal
+        || (source != evidence.source && !evidence.aliases.contains(source))
+        || evidence.confirmed != source.launch.session_id.as_deref()
+        || evidence.confirmed.is_none()
+    {
+        return Err(
+            "The exact saved Claude pane has no matching completed actor retirement".into(),
+        );
     }
     Ok(())
 }
@@ -148,7 +203,17 @@ pub(super) fn inspect_resume_retirement(
                 continue;
             }
             if ownership.is_pending() {
-                return Err("Pending cleanup intent never grants disk resume authority".into());
+                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let retirement = registry.native_actor_retirement(ownership.actor())?;
+                let archived = match retirement.as_ref() {
+                    Some(retirement) => registry
+                        .archived_history(source, &ownership, retirement, &proof.boot_id)?
+                        .is_some(),
+                    None => false,
+                };
+                if !archived {
+                    return Err("Pending cleanup intent never grants disk resume authority".into());
+                }
             }
             match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
                 crate::chat::runtime::RetirementInspection::Running => running = true,
@@ -156,6 +221,14 @@ pub(super) fn inspect_resume_retirement(
                     return Err("The saved Claude actor exited without verified retirement".into());
                 }
                 crate::chat::runtime::RetirementInspection::Verified(receipt) => {
+                    let retirement = registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_actor_retirement(ownership.actor())?
+                        .ok_or("The saved Claude actor has no committed retirement")?;
+                    if unconfirmed_retired_startup(&ownership, &retirement, &receipt)? {
+                        continue;
+                    }
                     if receipt.receipt().identity.instance != ownership.actor()
                         || verified.replace(receipt).is_some()
                     {
@@ -212,6 +285,7 @@ pub(super) fn prepare_resume_verified(
     let registry = super::super::agent_execution::registry(host)?;
     let mut after = None;
     let mut matched = false;
+    let mut archived_history = None;
     loop {
         let page = registry
             .lock()
@@ -227,7 +301,7 @@ pub(super) fn prepare_resume_verified(
             {
                 continue;
             }
-            if ownership.is_pending() {
+            if ownership.is_pending() && ownership.source().id != source.id {
                 return Err("Pending cleanup intent never grants disk resume authority".into());
             }
             let retirement = registry
@@ -237,6 +311,7 @@ pub(super) fn prepare_resume_verified(
             if retirement
                 .as_ref()
                 .is_some_and(|receipt| receipt.is_pending())
+                && ownership.source().id != source.id
             {
                 return Err("Pending cleanup retirement never grants disk resume authority".into());
             }
@@ -255,6 +330,17 @@ pub(super) fn prepare_resume_verified(
             }
             let retirement =
                 retirement.ok_or("The saved Claude actor has no committed retirement")?;
+            let archived = if ownership.is_pending() || retirement.is_pending() {
+                Some(
+                    registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .archived_history(source, &ownership, &retirement, &proof.boot_id)?
+                        .ok_or("Pending cleanup intent never grants disk resume authority")?,
+                )
+            } else {
+                None
+            };
             let inspection = if verified
                 .as_ref()
                 .is_some_and(|receipt| receipt.receipt().identity.instance == ownership.actor())
@@ -276,21 +362,21 @@ pub(super) fn prepare_resume_verified(
                     );
                 }
             };
+            if unconfirmed_retired_startup(&ownership, &retirement, &verified)? {
+                continue;
+            }
             let receipt = verified.receipt();
-            let evidence = Evidence {
-                actor: receipt.identity.instance,
-                owner: &receipt.identity.record,
-                proof: &receipt.proof,
-                source: &receipt.source,
-                aliases: &receipt.previous_sources,
-                scope: receipt
-                    .launch_account_scope
-                    .as_ref()
-                    .map_err(String::as_str),
-                confirmed: receipt.confirmed_session.as_deref(),
-                paired_holder: receipt.paired_holder.as_ref(),
-            };
-            validate_evidence(source, &ownership, &retirement, &evidence)?;
+            if archived.is_some() && !receipt.installed {
+                return Err("Archived history requires actual installed actor retirement".into());
+            }
+            let evidence = retirement_evidence(&verified);
+            validate_evidence(
+                source,
+                &ownership,
+                &retirement,
+                &evidence,
+                archived.as_ref(),
+            )?;
             if matched {
                 return Err("The saved Claude pane matches more than one retired actor".into());
             }
@@ -343,7 +429,14 @@ pub(super) fn prepare_resume_verified(
                 }
             }
             matched = true;
+            archived_history = archived;
         }
+    }
+    if let Some(archived) = &archived_history {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recheck_archived_history(archived)?;
     }
     current_admission(host, source, &proof)?;
     // This is a fresh current-lease check after all disk and account reads.
@@ -451,29 +544,29 @@ mod tests {
             confirmed: source.launch.session_id.as_deref(),
             paired_holder: None,
         };
-        validate_evidence(&source, &ownership, &retirement, &evidence).unwrap();
+        validate_evidence(&source, &ownership, &retirement, &evidence, None).unwrap();
         let mut changed = source.clone();
         changed
             .launch
             .recipe
             .arguments
             .push("--different-recipe".into());
-        assert!(validate_evidence(&changed, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&changed, &ownership, &retirement, &evidence, None).is_err());
         changed = source.clone();
         changed.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("forged-alias");
-        assert!(validate_evidence(&changed, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&changed, &ownership, &retirement, &evidence, None).is_err());
         evidence.actor = uuid::Uuid::new_v4();
-        assert!(validate_evidence(&source, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&source, &ownership, &retirement, &evidence, None).is_err());
         evidence.actor = actor;
         evidence.confirmed = None;
-        assert!(validate_evidence(&source, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&source, &ownership, &retirement, &evidence, None).is_err());
         evidence.confirmed = source.launch.session_id.as_deref();
         let mut other_scope = scope.clone();
         other_scope.inode += 1;
         evidence.scope = Ok(&other_scope);
-        assert!(validate_evidence(&source, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&source, &ownership, &retirement, &evidence, None).is_err());
         evidence.scope = Err("unconfirmed scope");
-        assert!(validate_evidence(&source, &ownership, &retirement, &evidence).is_err());
+        assert!(validate_evidence(&source, &ownership, &retirement, &evidence, None).is_err());
         // Even an otherwise exact confirmed retirement cannot turn cleanup
         // intent into account/history read or disk-resume permission.
         let pending_actor = uuid::Uuid::new_v4();
@@ -501,9 +594,15 @@ mod tests {
         evidence.actor = pending_actor;
         evidence.scope = Ok(&scope);
         assert!(
-            validate_evidence(&source, &pending_owner, &pending_retirement, &evidence)
-                .unwrap_err()
-                .contains("Pending cleanup intent")
+            validate_evidence(
+                &source,
+                &pending_owner,
+                &pending_retirement,
+                &evidence,
+                None
+            )
+            .unwrap_err()
+            .contains("Pending cleanup intent")
         );
     }
 }
