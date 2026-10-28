@@ -327,7 +327,7 @@ impl RepositoryRuntime {
                 }
                 let line = self.editor_line_for_diff_source(line);
                 if let DocumentState::Editable(document) = &mut self.document {
-                    document.content.set_cursor(text_editor::Cursor {
+                    document.navigate_to(text_editor::Cursor {
                         position: text_editor::Position { line, column: 0 },
                         selection: None,
                     });
@@ -941,6 +941,51 @@ mod tests {
                 runtime.is_dirty(),
                 "the earlier unsaved edit remains undoable"
             );
+        }
+    }
+
+    #[test]
+    fn opening_a_diff_row_ends_the_previous_undo_step() {
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let (mut runtime, card, _) = fixture(mode);
+            let original = runtime.editor_text().unwrap();
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.history_time = Some(Instant::now());
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Delete),
+            }));
+            let first_edit = runtime.editor_text().unwrap();
+            runtime.source_surface = SourceSurface::Diff;
+            let row = runtime
+                .diff_model()
+                .unwrap()
+                .row_at_new_line(mode, 1)
+                .unwrap();
+            drop(runtime.copy_diff(
+                card,
+                DiffCommand::OpenInEditor {
+                    row,
+                    side: Side::New,
+                },
+            ));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Delete),
+            }));
+            assert_ne!(runtime.editor_text().as_deref(), Some(first_edit.as_str()));
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some(first_edit.as_str()),
+                "navigation separates same-position deletions even with no idle delay"
+            );
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(original.as_str()));
+            assert!(!runtime.is_dirty());
         }
     }
 

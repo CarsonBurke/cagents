@@ -992,6 +992,13 @@ impl EditorDocument {
         }
     }
 
+    /// A programmatic location change is an edit-group boundary, including
+    /// a jump back to the same caret position.
+    fn navigate_to(&mut self, cursor: text_editor::Cursor) {
+        self.history.seal();
+        self.content.set_cursor(cursor);
+    }
+
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
@@ -3206,9 +3213,7 @@ impl RepositoryRuntime {
         let Some(position) = caret_for_position(&document.content, at) else {
             return false;
         };
-        // Typing after a jump is a new undo step, like typing after a click.
-        document.history.seal();
-        document.content.set_cursor(text_editor::Cursor {
+        document.navigate_to(text_editor::Cursor {
             position,
             selection: None,
         });
@@ -6698,7 +6703,7 @@ impl RepositoryRuntime {
                             || document.content.line_count().saturating_sub(1),
                             |range| range.start,
                         );
-                    document.content.set_cursor(text_editor::Cursor {
+                    document.navigate_to(text_editor::Cursor {
                         position: text_editor::Position { line, column: 0 },
                         selection: None,
                     });
@@ -6739,7 +6744,7 @@ impl RepositoryRuntime {
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
-            document.content.set_cursor(text_editor::Cursor {
+            document.navigate_to(text_editor::Cursor {
                 position: caret,
                 selection,
             });
