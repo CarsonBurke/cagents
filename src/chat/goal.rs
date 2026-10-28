@@ -321,6 +321,18 @@ impl State {
         self.begin(operation)
     }
 
+    /// A changed execution selection makes queued controls stale without
+    /// changing the last Goal observation. An occupied physical slot already
+    /// rejects controls as busy; its completion advances the revision before
+    /// reopening it, so leave that request and its response truth untouched.
+    pub fn invalidate_idle_controls(&mut self) -> Result<bool, Error> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        self.observation = self.observation.checked_add(1).ok_or(Error::Exhausted)?;
+        Ok(true)
+    }
+
     /// A changed owner/thread invalidates observations without pretending an
     /// already-issued request stopped. Actor teardown remains the owner's job.
     pub fn rebind(&mut self, thread_id: String) -> Result<(), Error> {

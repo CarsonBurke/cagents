@@ -116,6 +116,16 @@ pub(super) fn current_goal(
     runtime: &Runtime,
     handle: &Arc<ClientHandle>,
 ) -> Option<chat::goal::Snapshot> {
+    goal_in_snapshot(runtime, handle, &handle.snapshot())
+}
+
+/// Selection and Goal revision must come from one immutable publication. A
+/// newer publication may invalidate this witness, never upgrade its revision.
+fn goal_in_snapshot(
+    runtime: &Runtime,
+    handle: &Arc<ClientHandle>,
+    latest: &Snapshot,
+) -> Option<chat::goal::Snapshot> {
     if runtime.session.launch.provider != Provider::Codex
         || runtime.selected_subagent.is_some()
         || runtime.disconnected
@@ -127,7 +137,6 @@ pub(super) fn current_goal(
     {
         return None;
     }
-    let latest = handle.snapshot();
     let goal = latest.goal.as_ref()?;
     (!latest.exited
         && latest.session_id.as_deref() == Some(goal.thread_id.as_str())
@@ -767,7 +776,7 @@ impl Cagents {
                 runtime.error = Some("The selected model or reasoning changed before the goal was sent. Your input is kept; choose a model and submit again.".into());
                 return Task::none();
             }
-            let Some(goal) = current_goal(runtime, &handle) else {
+            let Some(goal) = goal_in_snapshot(runtime, &handle, &latest) else {
                 runtime.goal_pending = Some(pending);
                 return Task::none();
             };
@@ -1387,6 +1396,91 @@ mod tests {
     }
 
     #[test]
+    fn model_staging_publication_supplies_the_new_goal_revision_for_set_and_resume() {
+        for input in ["/goal set Keep selected model", "/goal resume"] {
+            let (mut app, card, target) = deferred_goal(true, Some("low"), input);
+            acknowledge(&mut app, card, Ok(()));
+            let before = runtime(&app, card).handle().unwrap().snapshot();
+            let revision = before.goal.as_ref().unwrap().revision + 1;
+            let mut staged = (*before).clone();
+            staged.selected_model = Some("chosen-model".into());
+            // An accepted changed Actor selection publishes Models and the
+            // advanced Goal control revision together, before this UI wake.
+            staged.goal.as_mut().unwrap().revision = revision;
+            publish(&mut app, card, staged);
+            let rt = runtime(&app, card);
+            assert!(matches!(
+                rt.goal_pending.as_ref().unwrap().stage,
+                Stage::Native { revision: actual, .. } if actual == revision
+            ));
+            assert!(rt.pending.as_ref().unwrap().model.is_none());
+            assert_eq!(rt.composer.text().trim(), input);
+            assert!(rt.error.is_none());
+        }
+    }
+
+    #[test]
+    fn selection_and_goal_revision_share_a_publication_and_never_upgrade_at_handoff() {
+        let (mut app, card, target) = live();
+        write(&mut app, target, "/goal set Keep the original selection");
+        let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        selected.selected_model = Some("chosen-model".into());
+        selected.reasoning = Some("low".into());
+        publish(&mut app, card, selected);
+        let handle = runtime(&app, card).handle().unwrap().clone();
+        let captured = handle.snapshot();
+        let original = captured.goal.as_ref().unwrap().clone();
+        let mut changed = (*captured).clone();
+        changed.selected_model = Some("replacement-model".into());
+        changed.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, changed);
+        // Simulate a concurrent Actor selection publication between the UI's
+        // capture and Goal extraction. The production helper reads this exact
+        // immutable capture, rather than loading the newer Goal revision.
+        assert_eq!(captured.selected_model.as_deref(), Some("chosen-model"));
+        assert_eq!(
+            goal_in_snapshot(runtime(&app, card), &handle, &captured),
+            Some(original.clone())
+        );
+        assert_eq!(
+            current_goal(runtime(&app, card), &handle).unwrap().revision,
+            original.revision + 1
+        );
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
+        let next_command = runtime(&app, card).next_command;
+        drop(app.chat_send(
+            target,
+            Command::Goal {
+                thread_id: original.thread_id,
+                revision: original.revision,
+                operation: Operation::SetObjective("Keep the original selection".into()),
+            },
+            false,
+        ));
+        let rt = runtime(&app, card);
+        assert!(rt.pending.is_none());
+        assert_eq!(rt.next_command, next_command);
+        assert!(rt.error.as_deref().unwrap().contains("goal changed"));
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn delayed_model_confirmation_dispatches_once_and_timer_cannot_release_native_or_rebound_work()
     {
         let (mut app, card, target) = deferred_model_goal(true);
@@ -1403,6 +1497,7 @@ mod tests {
         );
         let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
         selected.selected_model = Some("chosen-model".into());
+        selected.goal.as_mut().unwrap().revision += 1;
         publish(&mut app, card, selected);
         let native = runtime(&app, card).pending.as_ref().unwrap().id;
         assert!(matches!(

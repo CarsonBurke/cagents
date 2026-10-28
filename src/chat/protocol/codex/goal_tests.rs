@@ -76,6 +76,222 @@ fn select_goal_model(adapter: &mut Codex) {
 }
 
 #[test]
+fn changed_staged_selection_rejects_queued_goal_work_before_provider_writes() {
+    for operation in [
+        Operation::SetObjective("Keep my captured selection".into()),
+        Operation::Resume,
+    ] {
+        for changed in 0..3 {
+            let mut adapter = adapter();
+            select_goal_model(&mut adapter);
+            adapter.models[1].reasoning.push("high".into());
+            let read = command(&mut adapter, Operation::Get);
+            adapter
+                .receive(json!({"id":read.writes[0]["id"],"result":{"goal":null}}))
+                .unwrap();
+            let captured = snapshot(&mut adapter);
+            let same = adapter
+                .command(Command::SetModel {
+                    model: "explicit-goal-model".into(),
+                    reasoning: Some("low".into()),
+                })
+                .unwrap();
+            assert!(same.writes.is_empty());
+            assert_eq!(snapshot(&mut adapter), captured);
+            assert!(
+                adapter
+                    .command(Command::SetModel {
+                        model: "not-in-catalog".into(),
+                        reasoning: None,
+                    })
+                    .is_err()
+            );
+            assert_eq!(snapshot(&mut adapter), captured);
+            let (model, reasoning) = match changed {
+                0 => ("provider-default", Some("medium")),
+                1 => ("explicit-goal-model", Some("high")),
+                _ => ("explicit-goal-model", None),
+            };
+            // Another attached client reaches this same Actor before the
+            // UI's already-built Goal command. No provider operation is sent.
+            let selected = adapter
+                .command(Command::SetModel {
+                    model: model.into(),
+                    reasoning: reasoning.map(str::to_owned),
+                })
+                .unwrap();
+            assert!(selected.writes.is_empty());
+            let fresh = published(&selected).clone();
+            assert_eq!(fresh.revision, captured.revision + 1);
+            assert_eq!(fresh.read, captured.read);
+            assert_eq!(fresh.support, captured.support);
+            assert!(!fresh.pending && !fresh.uncertain);
+            let next_id = adapter.next_id;
+            let error = adapter
+                .command(Command::Goal {
+                    thread_id: captured.thread_id,
+                    revision: captured.revision,
+                    operation: operation.clone(),
+                })
+                .unwrap_err();
+            assert!(error.contains("goal changed"));
+            assert_eq!(adapter.next_id, next_id);
+            assert!(adapter.pending.is_empty() && adapter.goal_settings.is_none());
+            assert_eq!(snapshot(&mut adapter), fresh);
+            // A NEW explicit intent from the actual new publication remains
+            // usable, including an unspecified effort that keeps actual choice.
+            let work = command(&mut adapter, operation.clone());
+            let native = if work.writes[0]["method"] == "thread/settings/update" {
+                assert!(
+                    adapter
+                        .receive(json!({"id":work.writes[0]["id"],"result":{}}))
+                        .unwrap()
+                        .writes
+                        .is_empty()
+                );
+                adapter
+                    .receive(json!({"method":"thread/settings/updated","params":{
+                        "threadId":"thread-exact","threadSettings":{
+                            "model":model,"effort":reasoning.unwrap_or("low")
+                        }
+                    }}))
+                    .unwrap()
+            } else {
+                work
+            };
+            assert_eq!(native.writes.len(), 1);
+            assert_eq!(native.writes[0]["method"], "thread/goal/set");
+        }
+    }
+}
+
+#[test]
+fn selection_changes_preserve_an_occupied_goal_rpc_and_its_response_truth() {
+    for operation in [
+        Operation::Get,
+        Operation::SetObjective("Actual native response".into()),
+    ] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        adapter
+            .command(Command::SetModel {
+                model: "provider-default".into(),
+                reasoning: Some("medium".into()),
+            })
+            .unwrap();
+        let work = command(&mut adapter, operation.clone());
+        assert_ne!(work.writes[0]["method"], "thread/settings/update");
+        let before = snapshot(&mut adapter);
+        let request = adapter.goal.as_ref().unwrap().pending().unwrap().clone();
+        adapter
+            .command(Command::SetModel {
+                model: "explicit-goal-model".into(),
+                reasoning: Some("low".into()),
+            })
+            .unwrap();
+        assert_eq!(snapshot(&mut adapter), before);
+        assert_eq!(adapter.goal.as_ref().unwrap().pending(), Some(&request));
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id.clone(),
+                    revision: before.revision,
+                    operation: Operation::Get,
+                })
+                .unwrap_err()
+                .contains("awaiting its result")
+        );
+        let response = adapter
+            .receive(json!({"id":work.writes[0]["id"],"result":{
+                "goal":raw_goal("thread-exact","Actual native response","paused")
+            }}))
+            .unwrap();
+        let observed = published(&response);
+        assert!(!observed.pending && !observed.uncertain);
+        assert!(matches!(
+            &observed.read,
+            ReadState::Known(Some(goal)) if goal.objective == "Actual native response"
+        ));
+        assert_eq!(
+            observed.last_result.unwrap().outcome,
+            chat::goal::Outcome::Confirmed
+        );
+        assert!(observed.revision > before.revision);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id,
+                    revision: before.revision,
+                    operation: Operation::Get,
+                })
+                .unwrap_err()
+                .contains("goal changed")
+        );
+    }
+}
+
+#[test]
+fn observed_selection_changes_invalidate_idle_controls_without_inventing_goal_truth() {
+    let mut adapter = adapter();
+    adapter
+        .receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"original","effort":"low"}
+        }}))
+        .unwrap();
+    let read = command(&mut adapter, Operation::Get);
+    adapter
+        .receive(json!({"id":read.writes[0]["id"],"result":{"goal":null}}))
+        .unwrap();
+    let before = snapshot(&mut adapter);
+    for thread in ["foreign-thread", "thread-exact"] {
+        adapter
+            .receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":thread,"threadSettings":{"model":"original","effort":"low"}
+            }}))
+            .unwrap();
+        assert_eq!(snapshot(&mut adapter), before);
+    }
+    let changed = adapter
+        .receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"replacement","effort":"high"}
+        }}))
+        .unwrap();
+    let fresh = published(&changed);
+    assert_eq!(fresh.revision, before.revision + 1);
+    assert_eq!(fresh.read, before.read);
+    assert_eq!(fresh.support, before.support);
+    assert!(!fresh.pending && !fresh.uncertain);
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: before.thread_id,
+                revision: before.revision,
+                operation: Operation::Resume,
+            })
+            .unwrap_err()
+            .contains("goal changed")
+    );
+    let previous = snapshot(&mut adapter);
+    let metadata = adapter
+        .receive(json!({"method":"thread/started","params":{
+            "thread":{"id":"thread-exact","model":"metadata-model",
+                "canAcceptDirectInput":true,"status":{"type":"idle"}}
+        }}))
+        .unwrap();
+    assert_eq!(published(&metadata).revision, previous.revision + 1);
+    assert_eq!(published(&metadata).read, previous.read);
+    assert!(
+        metadata.events.iter().any(|event| matches!(
+            event,
+            Event::Models { selected, reasoning, .. }
+                if selected.as_deref() == Some("metadata-model")
+                    && reasoning.as_deref() == Some("high")
+        )),
+        "selection and its invalidating Goal revision share this same step"
+    );
+}
+
+#[test]
 fn autonomous_goal_work_applies_explicit_model_and_effort_before_the_goal_rpc() {
     for operation in [
         Operation::SetObjective("Use my selected model".into()),
