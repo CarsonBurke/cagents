@@ -296,6 +296,7 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            self.expire_adapter()?;
             if self.stop.load(Ordering::Acquire)
                 && self
                     .native_holder
@@ -464,6 +465,8 @@ impl Actor {
             } else {
                 -1
             };
+            let timeout =
+                super::adapter_poll_timeout(timeout, self.adapter.next_deadline(), Instant::now());
             poll(&socket.get_ref().socket, &mut self.wake, flushing, timeout)?;
         }
     }

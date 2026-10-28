@@ -48,6 +48,9 @@ fn command(adapter: &mut Codex, operation: Operation) -> Step {
 }
 
 fn select_goal_model(adapter: &mut Codex) {
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"provider-default","effort":"medium"}
+    }})).unwrap();
     adapter.models = vec![Model {
         id: "explicit-goal-model".into(),
         label: "Explicit Goal model".into(),
@@ -159,6 +162,25 @@ fn settings_ack_waits_for_actual_application_and_unspecified_effort_preserves_pr
         }})).unwrap();
         assert!(foreign.writes.is_empty());
         assert!(snapshot(&mut adapter).pending);
+        for thread in [None, Some(Value::Null), Some(json!(7))] {
+            let mut params =
+                json!({"threadSettings":{"model":"explicit-goal-model","effort":"low"}});
+            if let Some(thread) = thread {
+                params["threadId"] = thread;
+            }
+            let unbound = adapter
+                .receive(json!({"method":"thread/settings/updated","params":params}))
+                .unwrap();
+            assert!(
+                unbound.writes.is_empty(),
+                "an absent or invalid thread witness cannot authorize Goal work"
+            );
+            assert!(snapshot(&mut adapter).pending);
+            assert_eq!(
+                adapter.applied_selection.as_ref().unwrap().0,
+                "provider-default"
+            );
+        }
         let applied = adapter.receive(json!({"method":"thread/settings/updated","params":{
             "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
         }})).unwrap();
@@ -175,6 +197,63 @@ fn settings_ack_waits_for_actual_application_and_unspecified_effort_preserves_pr
 }
 
 #[test]
+fn already_applied_selection_skips_noop_settings_and_reconnect_drops_that_proof() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    let settings = command(&mut adapter, Operation::SetObjective("Original".into()));
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    let applied = adapter
+        .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+        .unwrap();
+    adapter
+        .receive(json!({"id":applied.writes[0]["id"],"result":{
+            "goal":raw_goal("thread-exact","Original","paused")
+        }}))
+        .unwrap();
+    for reasoning in [Some("low".into()), None] {
+        adapter
+            .command(Command::SetModel {
+                model: "explicit-goal-model".into(),
+                reasoning,
+            })
+            .unwrap();
+        let resume = command(&mut adapter, Operation::Resume);
+        assert_eq!(resume.writes.len(), 1);
+        assert_eq!(
+            resume.writes[0]["method"], "thread/goal/set",
+            "unchanged provider settings do not promise a new applied notification"
+        );
+        assert_eq!(adapter.reasoning.as_deref(), Some("low"));
+        assert!(adapter.goal_settings.is_none());
+        adapter
+            .receive(json!({"id":resume.writes[0]["id"],"result":{
+                "goal":raw_goal("thread-exact","Original","paused")
+            }}))
+            .unwrap();
+    }
+    drop(adapter.initialize().unwrap());
+    assert!(
+        adapter.applied_selection.is_none(),
+        "a reconnect cannot reuse old application proof"
+    );
+    // A malformed attach that omitted provider model settings must refuse
+    // selected Goal work before it reserves a local request or waits forever.
+    adapter.ready = true;
+    let current = snapshot(&mut adapter);
+    let error = adapter
+        .command(Command::Goal {
+            thread_id: current.thread_id,
+            revision: current.revision,
+            operation: Operation::Resume,
+        })
+        .unwrap_err();
+    assert!(error.contains("provider model settings are unconfirmed"));
+    assert!(!snapshot(&mut adapter).pending);
+}
+
+#[test]
 fn core_settings_error_retires_unsent_goal_without_replay_in_either_ack_order() {
     for error_first in [false, true] {
         let mut adapter = adapter();
@@ -188,7 +267,8 @@ fn core_settings_error_retires_unsent_goal_without_replay_in_either_ack_order() 
             assert!(adapter.receive(ack.clone()).unwrap().writes.is_empty());
         }
         let failed = adapter.receive(json!({"method":"error","params":{
-            "threadId":"thread-exact","error":{"message":"Core rejected settings"},"willRetry":false
+            "threadId":"thread-exact","turnId":"opaque-core-settings-submission",
+            "error":{"message":"Core rejected settings","codexErrorInfo":"BadRequest"},"willRetry":false
         }})).unwrap();
         assert!(failed.writes.is_empty());
         if error_first {
@@ -219,6 +299,55 @@ fn core_settings_error_retires_unsent_goal_without_replay_in_either_ack_order() 
             "thread/goal/get"
         );
     }
+}
+
+#[test]
+fn missing_applied_observation_expires_only_after_ack_and_late_notice_cannot_replay() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    let settings = command(
+        &mut adapter,
+        Operation::SetObjective("Keep the original draft".into()),
+    );
+    assert!(
+        adapter.next_deadline().is_none(),
+        "an unresolved physical RPC has no local expiry"
+    );
+    assert!(
+        adapter
+            .on_deadline(Instant::now() + GOAL_SETTINGS_WAIT * 2)
+            .unwrap()
+            .writes
+            .is_empty()
+    );
+    assert!(snapshot(&mut adapter).pending);
+    let acknowledged = adapter
+        .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+        .unwrap();
+    assert!(acknowledged.writes.is_empty());
+    let deadline = adapter
+        .next_deadline()
+        .expect("the now-unsent local Goal wait is bounded");
+    let expired = adapter.on_deadline(deadline).unwrap();
+    assert!(expired.writes.is_empty());
+    assert!(!published(&expired).pending);
+    assert_eq!(
+        published(&expired).last_result.unwrap().outcome,
+        chat::goal::Outcome::Uncertain
+    );
+    assert!(adapter.next_deadline().is_none());
+    let late = adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    assert!(late.writes.is_empty());
+    let check = command(&mut adapter, Operation::Get);
+    assert_eq!(check.writes[0]["method"], "thread/goal/get");
+    assert!(snapshot(&mut adapter).pending);
+    adapter.on_deadline(deadline + GOAL_SETTINGS_WAIT).unwrap();
+    assert!(
+        snapshot(&mut adapter).pending,
+        "an old deadline cannot retire a newer physical Goal RPC"
+    );
 }
 
 #[test]
@@ -328,6 +457,7 @@ fn attach(adapter: &mut Codex) -> Step {
     let attached = adapter
         .receive(json!({"id":resume["id"],"result":{
         "thread":{"id":"thread-exact","canAcceptDirectInput":true,"status":{"type":"idle"}},
+        "model":"provider-default","reasoningEffort":"medium",
         "initialTurnsPage":{"data":[],"nextCursor":null}}}))
         .unwrap();
     let skills = initialized

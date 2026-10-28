@@ -12,7 +12,11 @@ use crate::chat::{
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 mod goal;
 mod images;
@@ -26,6 +30,7 @@ mod goal_tests;
 /// Codex CLI takes it, and a new thread receives it as a `thread/start`
 /// configuration override.
 pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+const GOAL_SETTINGS_WAIT: Duration = Duration::from_secs(10);
 
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.
@@ -428,6 +433,7 @@ fn create_inner(
             thread: launch.session_id.clone(),
             goal: None,
             goal_settings: None,
+            applied_selection: None,
             goal_resume_admission: GoalResumeAdmission::Unavailable,
             goal_resume_pending: false,
             start,
@@ -551,6 +557,7 @@ struct GoalSettings {
     model: Option<String>,
     reasoning: Option<String>,
     acknowledged: bool,
+    deadline: Option<Instant>,
     observed: Option<Option<String>>,
     invalidated: bool,
 }
@@ -593,6 +600,8 @@ struct Codex {
     thread: Option<String>,
     goal: Option<chat::goal::State>,
     goal_settings: Option<GoalSettings>,
+    /// One coherent actual provider selection, never a staged UI choice.
+    applied_selection: Option<(String, Option<String>)>,
     goal_resume_admission: GoalResumeAdmission,
     /// Keep metadata/stop controls usable while legacy restore lacks authority.
     goal_resume_pending: bool,
@@ -723,6 +732,19 @@ impl Codex {
             return Err("The goal control belongs to a different Codex thread".into());
         }
         let (method, params) = goal::request(thread, &operation)?;
+        let selects_work = self.selection_dirty
+            && matches!(
+                operation,
+                chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume
+            );
+        let applied = self.applied_selection.clone();
+        if selects_work && applied.is_none() {
+            return Err("The original provider model settings are unconfirmed. Reconnect before requesting native Goal work; your input is kept.".into());
+        }
+        let already_applied = applied.as_ref().is_some_and(|(model, reasoning)| {
+            self.selected.as_ref() == Some(model)
+                && (self.reasoning.is_none() || &self.reasoning == reasoning)
+        });
         // Check transport capacity before reserving the domain's physical slot.
         // No fallible transport allocation remains after begin_for succeeds.
         if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
@@ -732,12 +754,7 @@ impl Codex {
             .goal_state()?
             .begin_for(thread, revision, operation)
             .map_err(|error| error.to_string())?;
-        if self.selection_dirty
-            && matches!(
-                request.operation(),
-                chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume
-            )
-        {
+        if selects_work && !already_applied {
             // SetModel stages a choice for turn/start. Autonomous Goal work
             // has no turn/start from this client, so apply that explicit choice
             // to this exact provider thread before allowing the Goal mutation.
@@ -749,6 +766,7 @@ impl Codex {
                 model: self.selected.clone(),
                 reasoning: self.reasoning.clone(),
                 acknowledged: false,
+                deadline: None,
                 observed: None,
                 invalidated: false,
             });
@@ -763,6 +781,12 @@ impl Codex {
                 Pending::GoalSettings,
             )?;
         } else {
+            if selects_work {
+                // Providers may suppress unchanged settings notifications. A
+                // previously observed coherent selection needs no no-op RPC.
+                self.reasoning = applied.expect("work selection was checked above").1;
+                self.model_events(step);
+            }
             self.call(step, method, params, Pending::Goal { request, explicit })?;
         }
         self.publish_goal(step);
@@ -770,7 +794,7 @@ impl Codex {
     }
 
     fn finish_goal_settings(&mut self, step: &mut Step) -> Result<(), String> {
-        let Some(settings) = self.goal_settings.take() else {
+        let Some(mut settings) = self.goal_settings.take() else {
             return Ok(());
         };
         // The RPC acknowledgement only means Core received a queued settings
@@ -779,6 +803,9 @@ impl Codex {
             self.goal_settings = Some(settings);
             return Ok(());
         }
+        settings.invalidated |= settings
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now());
         let current = self.ready
             && self.direct_input
             && self.thread.as_deref() == Some(settings.request.thread_id())
@@ -1886,6 +1913,23 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn next_deadline(&self) -> Option<Instant> {
+        self.goal_settings
+            .as_ref()
+            .and_then(|settings| settings.deadline)
+    }
+    fn on_deadline(&mut self, now: Instant) -> Result<Step, String> {
+        let mut step = Step::default();
+        if let Some(settings) = &mut self.goal_settings {
+            if settings.acknowledged && settings.deadline.is_some_and(|deadline| deadline <= now) {
+                // Only the local, still-unsent Goal is retired. Its settings
+                // RPC already resolved; late provider observations cannot replay it.
+                settings.invalidated = true;
+                self.finish_goal_settings(&mut step)?;
+            }
+        }
+        Ok(step)
+    }
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
@@ -1955,6 +1999,7 @@ impl Adapter for Codex {
         let mut step = Step::default();
         self.ready = false;
         self.attached = false;
+        self.applied_selection = None;
         self.goal_resume_pending = false;
         if let Some(state) = &mut self.goal {
             let thread = self
@@ -2176,6 +2221,7 @@ impl Adapter for Codex {
                     && frame.get("result").is_some_and(Value::is_object);
                 if let Some(settings) = &mut self.goal_settings {
                     settings.acknowledged = true;
+                    settings.deadline = Some(Instant::now() + GOAL_SETTINGS_WAIT);
                     settings.invalidated |= !confirmed;
                 }
                 self.finish_goal_settings(&mut step)?;
@@ -2468,6 +2514,10 @@ impl Adapter for Codex {
                     self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
+                    self.applied_selection = self
+                        .selected
+                        .clone()
+                        .map(|model| (model, self.reasoning.clone()));
                     self.busy = thread["status"]["type"] == "active";
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
@@ -3146,18 +3196,27 @@ impl Adapter for Codex {
                 title: params["threadName"].as_str().map(str::to_owned),
             }),
             "thread/settings/updated" => {
+                if thread.is_none() || thread != self.thread.as_deref() {
+                    return Ok(step);
+                }
                 let settings = &params["threadSettings"];
+                let actual_model = settings["model"].as_str().filter(|model| !model.is_empty());
+                let actual_reasoning = settings["effort"].as_str().map(str::to_owned);
+                let valid_reasoning = settings.get("effort").is_none_or(|effort| {
+                    effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
+                });
+                self.applied_selection = actual_model
+                    .filter(|_| valid_reasoning)
+                    .map(|model| (model.to_owned(), actual_reasoning.clone()));
                 if let Some(pending) = &mut self.goal_settings {
-                    let model = settings["model"].as_str();
-                    let reasoning = settings["effort"].as_str().map(str::to_owned);
-                    let valid_reasoning = settings.get("effort").is_none_or(|effort| {
-                        effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
-                    });
                     pending.invalidated |= !valid_reasoning
-                        || (model.is_some() && model != pending.model.as_deref())
-                        || (pending.reasoning.is_some() && reasoning != pending.reasoning);
-                    if model.is_some() && model == pending.model.as_deref() && valid_reasoning {
-                        pending.observed = Some(reasoning);
+                        || (actual_model.is_some() && actual_model != pending.model.as_deref())
+                        || (pending.reasoning.is_some() && actual_reasoning != pending.reasoning);
+                    if actual_model.is_some()
+                        && actual_model == pending.model.as_deref()
+                        && valid_reasoning
+                    {
+                        pending.observed = Some(actual_reasoning);
                     }
                 }
                 if settings.get("model").is_some() {
@@ -6203,6 +6262,7 @@ mod tests {
             thread: Some("thread-exact".into()),
             goal: None,
             goal_settings: None,
+            applied_selection: None,
             goal_resume_admission: GoalResumeAdmission::OriginalScope,
             goal_resume_pending: false,
             start: json!({}),

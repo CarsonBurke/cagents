@@ -415,6 +415,14 @@ pub enum GoalResumeAdmission {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Wake an otherwise idle actor for bounded local intent bookkeeping.
+    /// Expiry must not pretend an unresolved provider RPC stopped executing.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn on_deadline(&mut self, _now: std::time::Instant) -> Result<Step, String> {
+        Ok(Step::default())
+    }
     fn set_goal_resume_admission(&mut self, _admission: GoalResumeAdmission) {}
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.

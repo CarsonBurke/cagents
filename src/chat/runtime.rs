@@ -51,6 +51,21 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+
+fn adapter_poll_timeout(timeout: i32, deadline: Option<Instant>, now: Instant) -> i32 {
+    let Some(deadline) = deadline else {
+        return timeout;
+    };
+    let wait = if deadline <= now {
+        0
+    } else {
+        deadline
+            .duration_since(now)
+            .as_millis()
+            .clamp(1, i32::MAX as u128) as i32
+    };
+    if timeout < 0 { wait } else { timeout.min(wait) }
+}
 enum ActorCommand {
     RetainedProvider {
         run: Option<crate::model::RunId>,
@@ -2204,6 +2219,18 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn expire_adapter(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if self
+            .adapter
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let step = self.adapter.on_deadline(now)?;
+            self.provider_step(step)?;
+        }
+        Ok(())
+    }
     fn goal_resume_admission(&self) -> super::protocol::GoalResumeAdmission {
         goal_resume_admission(
             self.launch_account_scope.as_ref(),
@@ -2320,6 +2347,7 @@ impl Actor {
                 }
             }
             self.drain_commands(closing.is_some())?;
+            self.expire_adapter()?;
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -2447,6 +2475,8 @@ impl Actor {
             } else {
                 -1
             };
+            let timeout =
+                adapter_poll_timeout(timeout, self.adapter.next_deadline(), Instant::now());
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -7339,6 +7369,120 @@ mod tests {
                 detail: String::new(),
             });
             Ok(step)
+        }
+    }
+
+    #[test]
+    fn adapter_deadline_wakes_idle_hidden_pipe_and_websocket_actors() {
+        use std::os::unix::{fs::MetadataExt, net::UnixListener};
+        struct DeadlineFixture {
+            deadline: Option<Instant>,
+            expired: crossbeam_channel::Sender<()>,
+        }
+        impl Adapter for DeadlineFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Echo.initialize()
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("no fixture input".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                self.deadline = Some(Instant::now() + Duration::from_millis(50));
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+            fn next_deadline(&self) -> Option<Instant> {
+                self.deadline
+            }
+            fn on_deadline(&mut self, now: Instant) -> Result<Step, String> {
+                assert!(self.deadline.is_some_and(|deadline| deadline <= now));
+                self.deadline = None;
+                self.expired.try_send(()).unwrap();
+                Ok(Step {
+                    events: vec![Event::Error {
+                        message: "local intent deadline".into(),
+                        fatal: false,
+                    }],
+                    ..Step::default()
+                })
+            }
+        }
+        for websocket in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (transport, server) = if websocket {
+                let path = root.path().join("deadline.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let metadata = std::fs::metadata(&path).unwrap();
+                let server = thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut socket = tungstenite::accept(stream).unwrap();
+                    let message = socket.read().unwrap();
+                    assert!(matches!(message, tungstenite::Message::Text(_)));
+                    socket.send(message).unwrap();
+                    // No periodic provider frames, ping or test commands wake
+                    // the actor while its local deadline expires.
+                    assert!(matches!(
+                        socket.read().unwrap(),
+                        tungstenite::Message::Close(_)
+                    ));
+                });
+                (
+                    TransportSpec::UnixWebSocket {
+                        socket: path,
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                    Some(server),
+                )
+            } else {
+                (TransportSpec::JsonLines, None)
+            };
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport,
+                program: if websocket {
+                    "/nonexistent/deadline-fixture"
+                } else {
+                    "/bin/cat"
+                }
+                .into(),
+                arguments: Vec::new(),
+                working_directory: root.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let (expired, received) = crossbeam_channel::bounded(1);
+            let mut adapter: Box<dyn Adapter> = Box::new(DeadlineFixture {
+                deadline: None,
+                expired,
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            handle.set_visible(false);
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("an idle hidden actor must wake itself for its adapter deadline");
+            until(&handle, |snapshot| {
+                snapshot.error.as_deref() == Some("local intent deadline")
+            });
+            assert!(
+                received.try_recv().is_err(),
+                "the consumed deadline cannot create a repeated poll loop"
+            );
+            handle.close().unwrap();
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
         }
     }
 
