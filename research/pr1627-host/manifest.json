@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "prepared_state": "FROZEN SOURCE-ONLY qualification design; no Cargo, test, helper, native, or public write executed by author",
+  "sources": {
+    "after": {
+      "head": "0e86d6c5e51a261f113165f21051c3da384a7602",
+      "tree": "ea2880ac0fae1061b5982800d99eecf8b0171d66",
+      "product_files_sha256": {
+        "src/chat/native_holder/transport.rs": "441685ed409117f1e7f43e528807600ac325cd185c17360b6ffcc33f31d9a68d",
+        "src/chat/runtime.rs": "e27a945f947132f43d27c1a384b218c84c7bd6b0b2952070b3a58463f0b8a3d5",
+        "src/daemon/holder_registry.rs": "5109b818e18c9541065ecc45524f6645c977a74664483eb4d6ec07da81f9604f"
+      }
+    },
+    "privacy_control": {
+      "head": "b1e4c1c4d713c0b23a8c6807a31612aa8aa4b0af",
+      "tree": "a105dc37535799b9755ba8590150e8cd31ad9997",
+      "product_files_sha256": {
+        "src/chat/native_holder/transport.rs": "238c4f58dc1bf115c8aa42b832e722bcc6c99c753e9598cccdb360c04a3e02e9",
+        "src/chat/runtime.rs": "e27a945f947132f43d27c1a384b218c84c7bd6b0b2952070b3a58463f0b8a3d5",
+        "src/daemon/holder_registry.rs": "5109b818e18c9541065ecc45524f6645c977a74664483eb4d6ec07da81f9604f"
+      }
+    }
+  },
+  "positive_selectors": [
+    "chat::native_holder::transport::tests::stderr_summary_refuses_credential_fragments_after_byte_tail_truncation",
+    "chat::native_holder::transport::tests::original_provider_stderr_survives_flood_and_adoption_without_blocking_close",
+    "chat::native_holder::transport::tests::continuously_writing_provider_keeps_control_close_and_exact_reap_reachable",
+    "chat::native_holder::transport::tests::native_directory_pin_refuses_an_exited_original_before_reap",
+    "chat::native_holder::transport::tests::partial_control_frames_obey_one_deadline_and_reject_oversized_allocation",
+    "chat::native_holder::transport::tests::legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role"
+  ],
+  "privacy_selector": "chat::native_holder::transport::tests::stderr_summary_refuses_credential_fragments_after_byte_tail_truncation",
+  "privacy_control_refusals": [
+    "assertion failed: !summary.contains(CANARY)"
+  ],
+  "owning_tests_sha256": "f93cb73f22718fa3ebeb536e0e68a38ba6807f6b52889e60835c8ce00a60ff6e",
+  "baseline_policy": "Exact0e HOST bincheck and lib artifact plus all six positives must pass before b1 same-test privacy negative. Negative requires actual101, exact owning failure, final0P1F, and specific credential-canary assertion. No timeout/compile failure/generic parent panic accepted.",
+  "observer_sha256": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a",
+  "kernel_contract_sha256": "9c96ff05c61969383dd0781dc2761fb08c15e5e5977a44d20b72edbf3fd8fa53",
+  "harness_sha256": "f310a4bbf2f6f430ecf977e7a9c33c72bec08f6ee6ba787b28536519ee693314",
+  "workflow_sha256": "dcdb1abfa29ec3f4254dae1732fee701d8b9e06ba68a205b81ea47ac48f88ac8",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "qualified_setup_source": {
+    "head": "1633e661dae18dc2faf8c876b4fae00469ad2a8b",
+    "tree": "c26888175fe61c8d9088d874184c74c984afb5d1",
+    "path": ".github/actions/setup-linux-build/action.yml",
+    "git_blob": "f24f0b0a90c31306518ff7253463a52b63a3c0e3",
+    "sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+    "semantics": "Qualified setup bytes only, not whole CI pass evidence"
+  },
+  "supervision_provenance": {
+    "observer_component_review_sha256": "64512aa89482e02c85cbde7240b349af0443821015390e7f0d73252d1e8ae9ca",
+    "observer_kernel_regression_result_sha256": "741d0fe8a6eca6d3c57d52c155211d7445115c89b9fd93d87948e28b3b925bbe",
+    "kernel_contract_origin_r4_sha256": "9032cad0e8a9dba5ce60acabd2539c8b2fd6eaa0cbe203ee0e00bd735317aaf2",
+    "copied_source": "Exact bb1 observer and six-function kernel closure contract from independently reviewed native1881 CI research; no local B admission imported"
+  },
+  "caller_and_helper_contract": {
+    "route": "Dedicated hosted ubuntu22 runner, naturally absent CAGENTS_AGENT_AUTHORITY required; refusal before any Cargo/actor if present",
+    "environment": "Parent/observer/test environment copied unchanged; HOME, authority, no-start and account selections never cleared/rewritten by research code. Production synthetic Spawn.command itself env_clear is existing source under test.",
+    "actor_preflight": "This exact older source has no Authority check in HostLease::acquire or native transport spawn/.init_array; local Agent actor execution is not claimed permissible. Account authorize_command examines only explicit nonsecret provider-home path selections; fixtures supply none.",
+    "helper": "Same freshly compiled HOST libtest /proc/self/exe --cagents-native-holder with .init_array handler, private native protocol3. Not installed helper/cagentsd and not public IPC. Diagnostic capability provider-exit-diagnostics required; absent capability refusal asserted in flood/adoption positive.",
+    "platform": "Linux pidfd/waitid/signalfd/subreaper/proc and Unix domain peer credentials required; /usr/bin/python3 and /bin/sh synthetic children only; private HostLease/runtime proofs; no external provider/network/credential access intended.",
+    "isolation": "Two actor parents use isolated_fixture_case (90s inner cap,0700 XDG runtime/data, GIT-only removals). Directory actor self-exec has no inner deadline; external180s bb1 phase and family closure mandatory."
+  },
+  "budget": "One60m job; first step before checkout/setup fixes absolute50m deadline. All phases serial/jobs2 with residual budget;180s exact tests; mandatory proved cleanup before reuse and nominal10m cleanup/upload reserve.",
+  "limits": [
+    "HOST-only compiler and owning actor/process/format/privacy tests; no UI/native/provider service/auth/matched package claim",
+    "All current0e and b1 qualification remains UNRUN; old2f715 five HOST parents and old boundaries do not qualify new source",
+    "Full raw stderr log direct-stdio issue1584/PR1585 is separate; this bounded native tail does not close1584",
+    "PR1627 body update rejected once and will not be retried through any route",
+    "Fresh native collapsed/expanded error details, copy, narrow layout, exact Close and continued-use evidence still required; no existing native evidence found",
+    "No authority bytes read/logged/hashed; presence check only; no User marker fabricated"
+  ]
+}
