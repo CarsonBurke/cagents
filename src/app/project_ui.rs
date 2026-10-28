@@ -6,6 +6,93 @@ use crate::{
     sidebar::ProjectCommand,
 };
 
+#[cfg(test)]
+mod removal_authority_tests;
+
+/// The caller of a removal, retained through session checks and reconnects.
+struct ProjectRemovalContext {
+    authority: crate::agent_execution::Authority,
+    remote: bool,
+    no_start: bool,
+    expected_registry: Option<uuid::Uuid>,
+}
+
+impl ProjectRemovalContext {
+    fn capture() -> Self {
+        Self {
+            authority: crate::agent_execution::Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
+            expected_registry: None,
+        }
+    }
+
+    fn check_device(&self) -> Result<(), String> {
+        if self.expected_registry == Some(crate::workspace_model::NO_REGISTRY) {
+            return Err(
+                "Wait for the selected device to connect before removing this project.".into(),
+            );
+        }
+        if self.authority.token().is_some() && self.remote {
+            return Err(
+                "An inherited session capability cannot remove projects or worktrees on a remote device"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn existing_socket(&self) -> Result<PathBuf, String> {
+        self.check_device()?;
+        crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())
+    }
+
+    fn final_socket(&self) -> Result<PathBuf, String> {
+        self.check_device()?;
+        if self.authority.token().is_some() || self.no_start {
+            self.existing_socket()
+        } else {
+            crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())
+        }
+    }
+
+    fn connect_at(
+        &self,
+        socket: &Path,
+    ) -> Result<crate::control::ControlClient, crate::control::ControlError> {
+        let mut client = crate::control::ControlClient::connect(socket)?;
+        if self.authority.token().is_some() {
+            client.authenticate(self.authority.clone())?;
+        }
+        Ok(client)
+    }
+
+    fn check_registry(&self, model: &crate::workspace_model::WorkspaceModel) -> Result<(), String> {
+        if self
+            .expected_registry
+            .is_some_and(|expected| model.identity != expected)
+        {
+            return Err(
+                "The selected device's workspace changed. Try removing the project again.".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_registry(&self, client: &mut crate::control::ControlClient) -> Result<(), String> {
+        if self.expected_registry.is_some() {
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            self.check_registry(&model)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AutomaticAttempt {
     project: ProjectId,
@@ -768,10 +855,13 @@ impl Cagents {
             self.project_ui
                 .close_cancellations
                 .insert(project, cancellation.clone());
+            let mut context = ProjectRemovalContext::capture();
+            context.expected_registry = Some(self.workspace_model.identity);
             cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
+                    context.check_device()?;
                     let roots = project_session_roots(&repository, kind, roots);
-                    close_sessions_in_scope(&roots, Some(&repository), &project_sessions, Some(&cancellation))
+                    close_sessions_in_scope_with_context(&roots, Some(&repository), &project_sessions, Some(&cancellation), &context)
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -2277,11 +2367,27 @@ fn close_sessions_in_scope(
     project_sessions: &ProjectSessionOwnership,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ProjectSessionClosure, String> {
+    close_sessions_in_scope_with_context(
+        worktrees,
+        project,
+        project_sessions,
+        cancellation,
+        &ProjectRemovalContext::capture(),
+    )
+}
+
+fn close_sessions_in_scope_with_context(
+    worktrees: &[PathBuf],
+    project: Option<&Path>,
+    project_sessions: &ProjectSessionOwnership,
+    cancellation: Option<&CancellationToken>,
+    context: &ProjectRemovalContext,
+) -> Result<ProjectSessionClosure, String> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err("Project removal was cancelled.".into());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let socket = context.existing_socket()?;
+    let mut client = match context.connect_at(&socket) {
         Ok(client) => client,
         // No daemon means no sessions to close.
         Err(crate::control::ControlError::Connect(error))
@@ -2290,7 +2396,7 @@ fn close_sessions_in_scope(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            return if project.is_some() {
+            return if project.is_some() || context.authority.token().is_some() {
                 Err("Cannot verify project ownership while the daemon is unavailable.".into())
             } else {
                 Ok(ProjectSessionClosure {
@@ -2313,6 +2419,7 @@ fn close_sessions_in_scope(
         let model = client.read_workspace_model().map_err(|error| {
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
+        context.check_registry(&model)?;
         let scope = shared_project_session_scope(worktrees, project, &model)?;
         let paths = crate::instance::window_database_paths().map_err(|error| {
             format!("Could not locate other windows before closing sessions: {error}")
@@ -2339,6 +2446,7 @@ fn close_sessions_in_scope(
         }
         scope
     } else {
+        context.verify_registry(&mut client)?;
         ProjectSessionScope::new(worktrees.to_vec(), Vec::new())
     };
     for session in client
@@ -2354,8 +2462,10 @@ fn close_sessions_in_scope(
         }
         let id = session.id;
         if let Err(error) = client.close_chat(session) {
-            client = crate::control::ControlClient::connect(&socket)
+            client = context
+                .connect_at(&socket)
                 .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
+            context.verify_registry(&mut client)?;
             if client
                 .list_chats()
                 .map_err(|list| format!("Could not verify chat {id}: {list}"))?
@@ -2410,8 +2520,10 @@ fn close_sessions_in_scope(
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
-            client = crate::control::ControlClient::connect(&socket)
+            client = context
+                .connect_at(&socket)
                 .map_err(|reconnect| format!("Could not verify terminal {id}: {reconnect}"))?;
+            context.verify_registry(&mut client)?;
             if client
                 .list()
                 .map_err(|list| format!("Could not verify terminal {id}: {list}"))?
@@ -2575,17 +2687,31 @@ fn project_session_roots(
 /// leaves all Git files and worktree directories untouched.
 fn remove_project_from_cagents(
     removal: &ProjectRemoval,
+    expected_registry: uuid::Uuid,
 ) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    let mut context = ProjectRemovalContext::capture();
+    context.expected_registry = Some(expected_registry);
+    remove_project_from_cagents_with_context(removal, &context)
+}
+
+fn remove_project_from_cagents_with_context(
+    removal: &ProjectRemoval,
+    context: &ProjectRemovalContext,
+) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    context.check_device()?;
     let roots = project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone());
-    close_sessions_in_scope(
+    close_sessions_in_scope_with_context(
         &roots,
         Some(&removal.repository),
         &removal.project_sessions,
         None,
+        context,
     )?;
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let socket = context.final_socket()?;
+    let mut client = context
+        .connect_at(&socket)
+        .map_err(|error| error.to_string())?;
+    context.verify_registry(&mut client)?;
     client
         .edit_workspace_model(crate::workspace_model::ModelEdit::CloseProject {
             repository: removal.repository.clone(),
