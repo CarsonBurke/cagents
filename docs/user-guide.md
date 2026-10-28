@@ -95,8 +95,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Focus pane 1–9 | `Alt+1` through `Alt+9` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
-| Close focused pane | `Ctrl+W` |
-| Find in the focused pane / search projects | `Ctrl+F` |
+| Close focused pane | `Ctrl+Shift+W` |
+| Find in the focused editor/chat, otherwise search projects | `Ctrl+F` |
+| Find live terminal output / focus project search elsewhere | `Ctrl+Shift+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
@@ -115,19 +116,22 @@ to close. The model picker supports search and Enter to select a result. Account
 selection is available before starting a conversation; provider capabilities
 determine which models and permission modes are available.
 
-- Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
-  its pane, **Alt+R** cycles its width, and **Ctrl+T** creates a native thread
-  tab. These chords are withheld from the terminal program. Other shell keys
-  reach the program unless you bind them to workspace actions.
-  **Ctrl+F** finds in the focused terminal,
-  chat transcript or editor, and otherwise searches projects. The
-  review chords act in pull request and local diff panes.
-  `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
-  also belong to the workspace.
-- Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
-  `Ctrl+Shift+R`. Those defaults now return to **Ctrl+W** and **Alt+R**;
-  customized shortcuts are kept. Older navigation and creation defaults also
-  upgrade where they remain unchanged. See
+- With a terminal focused, **Ctrl+F**, **Ctrl+T**, **F2**, **Alt+R** and
+  **Alt+1–9** reach the shell or TUI by default. **Ctrl+Shift+F** opens terminal
+  scrollback find; **Ctrl+Shift+W** closes the pane using the normal process
+  confirmation rules. Settings → Keyboard has a per-action **Terminal** checkbox
+  for sending that action's keys to the terminal. Scoped chat/review actions
+  remain available only in their own panes.
+- Native text controls keep undo, redo, clipboard and word-navigation chords.
+  **Ctrl+Shift+Z** redoes edits in the editor and composer. Other text fields
+  keep the chord in their native editing context. It reopens a closed pane when
+  a terminal or nontext control owns focus.
+  **Ctrl+F** finds in the focused editor or chat transcript and otherwise
+  searches projects. Typing it in a sidebar or inspector field keeps the key in
+  that field instead of opening find in the pane behind it.
+- Unchanged built-in defaults migrate to the current chords; customized,
+  extended and explicitly cleared bindings are kept. The close default is now
+  **Ctrl+Shift+W**. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
@@ -732,8 +736,8 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
-Press Ctrl+F in a terminal to search its output, including scrollback. Completed
-terminals keep read-only search, scrolling, selection and copying without keeping
+Press Ctrl+Shift+F in a live terminal to search its output, including scrollback.
+Completed terminals use Ctrl+F and keep read-only search, scrolling, selection and copying without keeping
 their process alive. Completed history is bounded to 8 MiB per terminal, including
 text, cell coordinates, colors and links. If older rows exceed this limit, a
 notice identifies how many rows were omitted. Closing the terminal releases its
@@ -1161,7 +1165,8 @@ the source for resumed history.
 
 ## Terminals and agent status
 
-- **Ctrl+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
+- **Ctrl+Shift+F** searches live terminal scrollback; completed panes use
+  **Ctrl+F**. **Enter** and **Shift+Enter**
   navigate matches; the search controls can match case. The current match has
   a stronger highlight than the other matches.
 - Right-click for copy, paste, select all, clear scrollback and link actions.
@@ -1185,7 +1190,7 @@ the source for resumed history.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
   focused; Cancel or Escape keeps the pane. The close button and
-  `Ctrl+W` follow the same rule. The decision uses the process tree, not prompt
+  `Ctrl+Shift+W` follow the same rule. The decision uses the process tree, not prompt
   instrumentation, so a shell builtin with no child process closes without
   asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.

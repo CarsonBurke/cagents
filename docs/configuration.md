@@ -96,7 +96,7 @@ show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 6
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -106,11 +106,17 @@ chat_model = ["Ctrl+Shift+M"]
 chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
-close_focused_column = ["Ctrl+W"]
-search_projects = ["Ctrl+F"]
+close_focused_column = ["Ctrl+Shift+W"]
+search_projects = ["Ctrl+Shift+F"]
+find_in_pane = ["Ctrl+F"]
 previous_column = ["Ctrl+PageUp"]
 next_column = ["Ctrl+PageDown"]
 cycle_pane_width = ["Alt+R"]
+terminal_passthrough_actions = [
+  "rename_pane", "new_native_thread", "find_in_pane", "cycle_pane_width",
+  "focus_pane_1", "focus_pane_2", "focus_pane_3", "focus_pane_4", "focus_pane_5",
+  "focus_pane_6", "focus_pane_7", "focus_pane_8", "focus_pane_9",
+]
 previous_workspace = ["Alt+Shift+Tab"]
 next_workspace = ["Alt+Tab"]
 review_toggle_viewed = ["Alt+V"]
@@ -183,8 +189,9 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
-| `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
+| `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `keyboard_shortcuts.*` | array of strings | shown above | Action chord lists; see [Keyboard shortcuts](#keyboard-shortcuts) |
+| `keyboard_shortcuts.terminal_passthrough_actions` | array of strings | shown above | Action names whose keys reach terminal programs instead of invoking workspace commands |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
 | `notifications.failure` | boolean | `true` | Alerts for failures and cancellations |
@@ -204,17 +211,22 @@ modifiers, joined by `+`. Names are case-insensitive.
   `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
   keys, for example `Ctrl+Comma`.
 - No chord can appear twice, even under different actions.
-- A chord you bind here is not passed to the program running in a pane.
-  For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
-  cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
-  be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
-  with a letter or arrow, can be bound but then no longer reach a terminal.
-  The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
-  pane width, and **Ctrl+T** to create a native thread tab.
-- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
-  which opens terminal scrollback find. The same key finds in the focused
-  editor or chat transcript, and otherwise searches projects.
-  File and hunk navigation also works in local diff panes. Viewed-file commands
+- Bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q` cannot be
+  bound. Versions with more modifiers can be bound, but native text controls
+  retain undo, redo, clipboard and word-navigation chords. Keyboard settings
+  show an advisory when a binding overlaps those editing keys.
+- `terminal_passthrough_actions` lists action names whose keys go to the
+  terminal program. The default list is shown above. The **Terminal** checkbox
+  in Settings → Keyboard edits this list; clearing it lets that workspace
+  action intercept its configured chord while a terminal is focused. Chat and
+  review actions retain their pane scope and show **Scoped** instead.
+- **Ctrl+F** reaches the terminal by default. The configured `search_projects`
+  chord (**Ctrl+Shift+F** by default) opens terminal scrollback find when the
+  live terminal owns focus; elsewhere it focuses project search. The configured
+  `find_in_pane` chord (**Ctrl+F**) finds in the focused editor or chat transcript
+  and falls back to project search on panes without find. A focused sidebar or
+  inspector text field keeps its own keys.
+- File and hunk navigation also works in local diff panes. Viewed-file commands
   act only in a pull request pane. The chords reach terminals outside that scope.
 - `chat_account`, `chat_model`, and `chat_permissions` apply only to the
   focused native chat. Account selection is available before the conversation
@@ -364,7 +376,7 @@ them back as version 3 the next time it saves.
   | `new_terminal` | `Ctrl+T` | `Ctrl+Shift+T` |
   | `new_channel` | `Alt+G` | `Ctrl+Shift+G` |
   | `clone_pane` | `Alt+E` | `Ctrl+Shift+D` |
-  | `close_focused_column` | `Ctrl+Shift+W` (revisions 2–3) | `Ctrl+W` |
+  | `close_focused_column` | `Ctrl+W` (revisions 1, 4–5) | `Ctrl+Shift+W` |
   | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
@@ -376,7 +388,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 6`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),

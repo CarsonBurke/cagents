@@ -10322,6 +10322,14 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
+                // Every mounted editor sees the key. Native focus owns zoom
+                // just as it owns history and language-server commands.
+                if !matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return text_editor::default_bindings(press);
+                }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
                     press.physical_key,
@@ -10337,12 +10345,6 @@ fn editable_document_view<'a>(
                         text_editor::HistoryCommand::Undo => RepositoryAction::Undo { card },
                         text_editor::HistoryCommand::Redo => RepositoryAction::Redo { card },
                     }));
-                }
-                if !matches!(
-                    press.status,
-                    iced::widget::text_editor::Status::Focused { .. }
-                ) {
-                    return text_editor::default_bindings(press);
                 }
                 let action = match &press.key {
                     Key::Character(character)

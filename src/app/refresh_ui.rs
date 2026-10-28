@@ -193,6 +193,9 @@ impl Cagents {
     fn main_window_focus_changed(&mut self, focused: bool) -> Task<Message> {
         let regained = focused && !self.refresh_ui.focused;
         if !focused {
+            if self.terminal_review_card.is_some() {
+                self.set_terminal_review_owner(None);
+            }
             self.tab_history.finish(self.workspace.focused());
             // Losing the window is not a choice of workspace, and the
             // release that would have made one never arrives.

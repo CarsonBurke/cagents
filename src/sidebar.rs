@@ -4892,6 +4892,9 @@ fn view_inner<'a>(
         .height(Length::Fill)
         .into(),
     ))
+    // Native keyboard-region registration uses the existing container so
+    // its nontext actions remain outside the pane without another tree node.
+    .id(Id::new("workspace.sidebar-controls"))
     .class(theme::Container::Primary)
     .width(Length::Fixed(width))
     .height(Length::Fill)

@@ -20,7 +20,7 @@ use iced_accessibility::{
 };
 use std::{
     os::unix::net::UnixListener,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
 };
 
@@ -30,16 +30,21 @@ enum Message {
     Focus,
     Shortcut,
     Paste,
+    Edited(String),
 }
-struct Peer {
+pub(crate) struct Peer {
     _directory: tempfile::TempDir,
-    handle: HostedTerminalHandle,
+    handle: Option<HostedTerminalHandle>,
+    release_ready: Arc<AtomicBool>,
+    release_accept: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
+    connections: Arc<AtomicUsize>,
     requests: crossbeam_channel::Receiver<ClientRequest>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Peer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -66,61 +71,100 @@ impl Peer {
         let (tx, requests) = crossbeam_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let release_ready = Arc::new(AtomicBool::new(true));
+        let release_accept = Arc::new(AtomicBool::new(true));
+        let reconnect = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let ready = release_ready.clone();
+        let accepted = release_accept.clone();
+        let reconnecting = reconnect.clone();
+        let connected_count = connections.clone();
         let worker = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "hosted client did not connect");
-                        thread::sleep(Duration::from_millis(1));
+            loop {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopping.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            assert!(Instant::now() < deadline, "hosted client did not connect");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept private peer: {error}"),
                     }
-                    Err(error) => panic!("accept private peer: {error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
-            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
-            let mut connected = false;
-            while !stopping.load(Ordering::Relaxed) {
-                let request: ClientEnvelope = match codec.read(&mut stream) {
-                    Ok(Some(request)) => request,
-                    Ok(None) => break,
-                    Err(FrameError::Io(error))
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                connected_count.fetch_add(1, Ordering::AcqRel);
+                let mut connected = false;
+                let mut retry = false;
+                while !stopping.load(Ordering::Relaxed) {
+                    if reconnecting.swap(false, Ordering::AcqRel) {
+                        retry = true;
+                        break;
+                    }
+                    let request: ClientEnvelope = match codec.read(&mut stream) {
+                        Ok(Some(request)) => request,
+                        Ok(None) => break,
+                        Err(FrameError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!("decode production request: {error}"),
+                    };
+                    let response = if !connected {
+                        assert!(matches!(request.request, ClientRequest::Connect { .. }));
+                        connected = true;
+                        let mut descriptor = descriptor.clone();
+                        descriptor.attached = true;
+                        ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![descriptor],
+                        }
+                    } else {
+                        let release = matches!(&request.request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release);
+                        tx.send(request.request).unwrap();
+                        if release {
+                            let deadline = Instant::now() + Duration::from_secs(3);
+                            while !ready.load(Ordering::Acquire)
+                                && !stopping.load(Ordering::Relaxed)
+                            {
+                                assert!(Instant::now() < deadline, "release ACK gate timed out");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        if release && !accepted.load(Ordering::Acquire) {
+                            ServerResponse::Snapshot {
+                                terminal_id: id,
+                                snapshot: None,
+                            }
+                        } else {
+                            ServerResponse::Accepted
+                        }
+                    };
+                    if write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .is_err()
                     {
-                        continue;
+                        break;
                     }
-                    Err(error) => panic!("decode production request: {error}"),
-                };
-                let response = if !connected {
-                    assert!(matches!(request.request, ClientRequest::Connect { .. }));
-                    connected = true;
-                    let mut descriptor = descriptor.clone();
-                    descriptor.attached = true;
-                    ServerResponse::Connected {
-                        proof: proof.clone(),
-                        resumed: vec![descriptor],
-                    }
-                } else {
-                    tx.send(request.request).unwrap();
-                    ServerResponse::Accepted
-                };
-                if write_frame(
-                    &mut stream,
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(request.request_id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response { response },
-                    },
-                )
-                .is_err()
-                {
+                }
+                if !retry {
                     break;
                 }
             }
@@ -128,15 +172,22 @@ impl Peer {
         handle.wait_until_attached(Duration::from_secs(3)).unwrap();
         Self {
             _directory: directory,
-            handle,
+            handle: Some(handle),
+            release_ready,
+            release_accept,
+            reconnect,
+            connections,
             requests,
             stop,
             worker: Some(worker),
         }
     }
-    fn fence(&self) -> Vec<ClientRequest> {
+    pub(crate) fn handle(&self) -> &HostedTerminalHandle {
+        self.handle.as_ref().unwrap()
+    }
+    pub(crate) fn fence(&self) -> Vec<ClientRequest> {
         let marker = b"accessibility-test-fence".to_vec();
-        self.handle.input(marker.clone()).unwrap();
+        self.handle().input(marker.clone()).unwrap();
         let mut requests = Vec::new();
         loop {
             let request = self
@@ -153,7 +204,9 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        let _ = self.handle.shutdown();
+        if let Some(handle) = &self.handle {
+            let _ = handle.shutdown();
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             worker.join().unwrap();
@@ -179,9 +232,10 @@ fn widget(
     focused: bool,
     suppressed: bool,
 ) -> TerminalWidget<Message> {
-    let mut widget = TerminalWidget::new(peer.handle.clone())
+    let mut widget = TerminalWidget::new(peer.handle().clone())
         .id(Id::new(name.to_owned()))
         .model_focused(focused)
+        .native_activation_allowed(true)
         .review_boundary(
             barrier,
             suppressed,
@@ -294,6 +348,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     let mut new_widget = widget(&new, "new-card", shared.clone(), false, false);
     let mut old_tree = Tree::new(&old_widget as &dyn Widget<Message, Theme, Renderer>);
     let mut new_tree = Tree::new(&new_widget as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut old_widget, &mut old_tree, &renderer);
     let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
@@ -352,6 +407,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     old_widget.review_revision = 1;
     new_widget.review_active = true;
     new_widget.review_revision = 1;
+    // Apply the actual widget diff, which retires per-native-batch activation
+    // once the App's logical owner projection has changed.
+    old_tree.diff(&mut old_widget as &mut dyn Widget<Message, Theme, Renderer>);
+    new_tree.diff(&mut new_widget as &mut dyn Widget<Message, Theme, Renderer>);
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
     let selection = {
@@ -506,6 +565,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     assert_no_pty_input(&old.fence());
     old_widget.on_shortcut = None;
+    native_focus(&mut old_widget, &mut old_tree, &renderer);
     dispatch(
         &mut old_widget,
         &mut old_tree,
@@ -749,4 +809,1149 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     widget.review_revision = 6;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
+}
+
+fn native_focus(widget: &mut TerminalWidget<Message>, tree: &mut Tree, renderer: &Renderer) {
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+    let mut operation = operation::focusable::focus::<()>(widget.id.clone().unwrap());
+    widget.operate(tree, Layout::new(&layout), renderer, &mut operation);
+}
+fn raw_letter(
+    code: keyboard::key::Code,
+    letter: &str,
+    down: bool,
+    modifiers: keyboard::Modifiers,
+) -> Event {
+    let key = keyboard::Key::Character(letter.to_owned().into());
+    let physical_key = keyboard::key::Physical::Code(code);
+    Event::Keyboard(if down {
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key,
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    } else {
+        keyboard::Event::KeyReleased {
+            key: key.clone(),
+            modified_key: key,
+            physical_key,
+            location: keyboard::Location::Standard,
+            modifiers,
+        }
+    })
+}
+
+#[test]
+fn native_field_owns_ignored_keys_and_ime_while_original_terminal_release_stays_paired() {
+    use crate::input_trace::{InputTrace, KeyboardRegion, observe_keyboard_events};
+    use crate::workspace_widget::FocusedPane;
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    for field_first in [false, true] {
+        let peer = Peer::new();
+        let mut renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let trace = InputTrace::default();
+        trace.bind_terminal_keys(barrier.clone());
+        let terminal_id = Id::unique();
+        let field_id = Id::unique();
+        let mut terminal = widget(&peer, "raw-pane", barrier.clone(), true, false);
+        terminal.id = Some(terminal_id.clone());
+        terminal.on_shortcut = None;
+        let terminal: Element<'_, Message> = terminal.into();
+        let field: Element<'_, Message> = cosmic::widget::text_input("Query", "retained")
+            .id(field_id.clone())
+            .on_input(Message::Edited)
+            .width(160.0)
+            .into();
+        let row = cosmic::widget::row::with_children(if field_first {
+            vec![field, terminal]
+        } else {
+            vec![terminal, field]
+        });
+        let element = observe_keyboard_events(
+            row,
+            &trace,
+            vec![
+                (
+                    terminal_id.clone(),
+                    KeyboardRegion {
+                        pane: FocusedPane::Terminal,
+                        card: Some(crate::model::CardId::new()),
+                    },
+                ),
+                (
+                    field_id.clone(),
+                    KeyboardRegion {
+                        pane: FocusedPane::TextInput,
+                        card: None,
+                    },
+                ),
+            ],
+            |_, _, _, _| Message::Shortcut,
+        );
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(800.0, 320.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(terminal_id.clone()),
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[raw_letter(
+                keyboard::key::Code::KeyR,
+                "r",
+                true,
+                keyboard::Modifiers::empty(),
+            )],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let requests = peer.fence();
+        let keys: Vec<_> = requests
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::Key { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "{requests:?}");
+        assert_eq!(keys[0].action, KeyAction::Press);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(field_id.clone()),
+        );
+        messages.clear();
+        // The stock field captures key-up. The observer must still retire the
+        // original transport lease, using the current release modifiers.
+        let _ = ui.update(
+            &[
+                raw_letter(
+                    keyboard::key::Code::KeyR,
+                    "r",
+                    false,
+                    keyboard::Modifiers::CTRL,
+                ),
+                raw_letter(
+                    keyboard::key::Code::KeyF,
+                    "f",
+                    true,
+                    keyboard::Modifiers::CTRL,
+                ),
+                raw_letter(
+                    keyboard::key::Code::KeyT,
+                    "t",
+                    true,
+                    keyboard::Modifiers::CTRL,
+                ),
+                raw_letter(
+                    keyboard::key::Code::KeyZ,
+                    "z",
+                    true,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                ),
+                Event::InputMethod(input_method::Event::Commit("ime".into())),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let requests = peer.fence();
+        let keys: Vec<_> = requests
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::Key { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "{requests:?}");
+        assert_eq!(keys[0].action, KeyAction::Release);
+        assert_eq!(keys[0].key, TerminalKey::Character('r'));
+        assert!(keys[0].modifiers.control);
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ClientRequest::Input { .. } | ClientRequest::Paste { .. })),
+            "{requests:?}"
+        );
+        let edited: Vec<_> = messages
+            .iter()
+            .filter_map(|m| {
+                if let Message::Edited(value) = m {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(edited.len(), 1, "{messages:?}");
+        assert_eq!(edited[0].matches("ime").count(), 1);
+        assert_eq!(edited[0].replacen("ime", "", 1), "retained");
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(terminal_id),
+        );
+        let _ = ui.update(
+            &[
+                raw_letter(
+                    keyboard::key::Code::KeyR,
+                    "r",
+                    false,
+                    keyboard::Modifiers::empty(),
+                ),
+                raw_letter(
+                    keyboard::key::Code::KeyA,
+                    "a",
+                    true,
+                    keyboard::Modifiers::empty(),
+                ),
+                raw_letter(
+                    keyboard::key::Code::KeyA,
+                    "a",
+                    false,
+                    keyboard::Modifiers::empty(),
+                ),
+                Event::InputMethod(input_method::Event::Commit("raw-ime".into())),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        let requests = peer.fence();
+        let actions: Vec<_> = requests
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::Key { input, .. } => Some((input.key, input.action)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                (TerminalKey::Character('a'), KeyAction::Press),
+                (TerminalKey::Character('a'), KeyAction::Release)
+            ],
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, ClientRequest::Input { bytes, .. } if bytes == b"raw-ime")),
+            "{requests:?}"
+        );
+    }
+}
+
+#[test]
+fn native_window_event_overrides_stale_builder_only_until_the_next_widget_diff() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "window-pane", barrier, true, false).window_focused(false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Focused),
+    );
+    for down in [true, false] {
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                down,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+    }
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|r| matches!(r, ClientRequest::Key { .. }))
+            .count(),
+        2
+    );
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Unfocused),
+    );
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        raw_letter(
+            keyboard::key::Code::KeyB,
+            "b",
+            true,
+            keyboard::Modifiers::empty(),
+        ),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+    assert!(
+        tree.state.downcast_ref::<WidgetState>().input_focused,
+        "window blur preserves logical native focus"
+    );
+    // A parked tree can miss Window::Focused: a new authoritative view must
+    // reset the per-native-batch false observation too.
+    terminal.window_focused = true;
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    for down in [true, false] {
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyC,
+                "c",
+                down,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+    }
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|r| matches!(r, ClientRequest::Key { .. }))
+            .count(),
+        2
+    );
+    // Conversely an old in-batch true observation cannot defeat a newer
+    // inactive builder after the tree was parked during blur.
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Focused),
+    );
+    terminal.window_focused = false;
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        raw_letter(
+            keyboard::key::Code::KeyD,
+            "d",
+            true,
+            keyboard::Modifiers::empty(),
+        ),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+}
+
+#[test]
+fn unmounted_owned_key_waits_for_review_exit_and_releases_only_the_original_attachment() {
+    let old = Peer::new();
+    let new = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&old, "original-pane", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        raw_letter(
+            keyboard::key::Code::KeyA,
+            "a",
+            true,
+            keyboard::Modifiers::empty(),
+        ),
+    );
+    assert_eq!(old.fence().iter().filter(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
+    barrier.note_review(old.handle().terminal_id(), true);
+    drop(tree);
+    assert!(
+        !barrier.flush_owned_keys(),
+        "Review suppresses original cleanup input"
+    );
+    assert!(
+        !old.fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+    let up = raw_letter(
+        keyboard::key::Code::KeyA,
+        "a",
+        false,
+        keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+    );
+    let Event::Keyboard(up) = up else {
+        unreachable!()
+    };
+    barrier.observe_key_event(&up);
+    barrier.note_review(old.handle().terminal_id(), false);
+    assert!(barrier.flush_owned_keys());
+    let requests = old.fence();
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            if let ClientRequest::Key { input, .. } = r {
+                Some(input)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(keys.len(), 1, "{requests:?}");
+    assert_eq!(keys[0].key, TerminalKey::Character('a'));
+    assert_eq!(keys[0].action, KeyAction::Release);
+    assert!(keys[0].modifiers.control && keys[0].modifiers.shift);
+    settle_cleanup(&barrier);
+    assert!(
+        !old.fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+    assert!(
+        !new.fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. })),
+        "cleanup cannot retarget another attachment"
+    );
+}
+
+#[test]
+fn observed_window_return_admits_first_fresh_down_when_old_physical_up_was_outside_the_app() {
+    use crate::input_trace::{InputTrace, observe};
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    let peer = Peer::new();
+    let mut renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let trace = InputTrace::default();
+    trace.bind_terminal_keys(barrier.clone());
+    let terminal_id = Id::unique();
+    let mut terminal = widget(&peer, "return-pane", barrier, true, false);
+    terminal.id = Some(terminal_id.clone());
+    terminal.on_shortcut = None;
+    let mut ui = UserInterface::build(
+        observe(terminal, &trace),
+        Size::new(640.0, 320.0),
+        Cache::new(),
+        &mut renderer,
+    );
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(terminal_id),
+    );
+    let _ = ui.update(
+        &[
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            Event::Window(window::Event::Unfocused),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut Vec::new(),
+    );
+    let requests = peer.fence();
+    let actions: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            if let ClientRequest::Key { input, .. } = r {
+                Some(input.action)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        vec![KeyAction::Press, KeyAction::Release],
+        "{requests:?}"
+    );
+    // A held repeat after reactivation must not manufacture a second raw down.
+    let mut repeat = raw_letter(
+        keyboard::key::Code::KeyA,
+        "a",
+        true,
+        keyboard::Modifiers::empty(),
+    );
+    if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat {
+        *repeat = true;
+    }
+    let _ = ui.update(
+        &[Event::Window(window::Event::Focused), repeat],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut Vec::new(),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+    // No old up is delivered. This first actual new press must succeed.
+    let _ = ui.update(
+        &[
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut Vec::new(),
+    );
+    let requests = peer.fence();
+    let actions: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            if let ClientRequest::Key { input, .. } = r {
+                Some((input.key, input.action))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            (TerminalKey::Character('a'), KeyAction::Press),
+            (TerminalKey::Character('a'), KeyAction::Release)
+        ],
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn repeat_keeps_original_release_identity_and_window_blur_ends_review_before_cleanup() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "review-window-pane", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        raw_letter(
+            keyboard::key::Code::KeyA,
+            "a",
+            true,
+            keyboard::Modifiers::empty(),
+        ),
+    );
+    let mut repeat = raw_letter(
+        keyboard::key::Code::KeyA,
+        "b",
+        true,
+        keyboard::Modifiers::SHIFT,
+    );
+    if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat {
+        *repeat = true;
+    }
+    dispatch(&mut terminal, &mut tree, &renderer, repeat);
+    let requests = peer.fence();
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            if let ClientRequest::Key { input, .. } = r {
+                Some(input)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(keys.len(), 2, "{requests:?}");
+    assert_eq!(keys[0].action, KeyAction::Press);
+    assert_eq!(keys[0].unshifted_codepoint, Some('a'));
+    assert_eq!(keys[1].action, KeyAction::Repeat);
+    assert_eq!(
+        keys[1].unshifted_codepoint,
+        Some('b'),
+        "repeat payload itself remains current"
+    );
+    let id = terminal.id.clone().unwrap();
+    assert_eq!(
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            action(id, Action::Focus, None)
+        ),
+        vec![Message::Review(true)]
+    );
+    assert!(reviewing(&tree));
+    let messages = dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Unfocused),
+    );
+    assert!(messages.contains(&Message::Review(false)), "{messages:?}");
+    assert!(!reviewing(&tree));
+    let requests = peer.fence();
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|r| {
+            if let ClientRequest::Key { input, .. } = r {
+                Some(input)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(keys.len(), 1, "{requests:?}");
+    assert_eq!(keys[0].key, TerminalKey::Character('a'));
+    assert_eq!(keys[0].unshifted_codepoint, Some('a'));
+    assert_eq!(keys[0].action, KeyAction::Release);
+    assert!(keys[0].modifiers.shift);
+    settle_cleanup(&barrier);
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. }))
+    );
+}
+
+fn settle_cleanup(barrier: &ReviewInputBarrier) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while barrier.flush_owned_keys() {
+        assert!(
+            Instant::now() < deadline,
+            "original transport cleanup did not settle"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+fn wait_peer_finished(peer: &Peer) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !peer.worker.as_ref().unwrap().is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "original socket attachment did not retire"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+#[test]
+fn last_attachment_is_retained_until_actual_cleanup_response_and_unknown_completion_is_kept() {
+    for accepted in [true, false] {
+        let mut peer = Peer::new();
+        peer.release_ready.store(false, Ordering::Release);
+        peer.release_accept.store(accepted, Ordering::Release);
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut terminal = widget(&peer, "last-owner", barrier.clone(), true, false);
+        terminal.on_shortcut = None;
+        let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+        native_focus(&mut terminal, &mut tree, &renderer);
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(peer.fence().iter().any(
+            |r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)
+        ));
+        // The ledger now owns the LAST actual HostedTerminalHandle, not merely
+        // a clone alongside the test peer or still-mounted TerminalWidget.
+        drop(peer.handle.take());
+        drop(tree);
+        drop(terminal);
+        assert!(barrier.flush_owned_keys());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let request = peer
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("original release must reach the real private socket");
+            if matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release)
+            {
+                break;
+            }
+        }
+        assert!(
+            !peer.worker.as_ref().unwrap().is_finished(),
+            "pending cleanup retains its original transport through dispatch"
+        );
+        peer.release_ready.store(true, Ordering::Release);
+        settle_cleanup(&barrier);
+        if accepted {
+            assert!(barrier.take_key_cleanup_failures().is_empty());
+            wait_peer_finished(&peer);
+        } else {
+            assert!(
+                !barrier.take_key_cleanup_failures().is_empty(),
+                "unexpected response cannot certify cleanup"
+            );
+            assert!(
+                !peer.worker.as_ref().unwrap().is_finished(),
+                "unknown cleanup keeps the original attachment owned"
+            );
+            drop(barrier);
+            wait_peer_finished(&peer);
+        }
+    }
+}
+
+#[test]
+fn same_terminal_id_and_host_proof_after_real_reconnect_cannot_receive_old_cleanup() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "reconnect-owner", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    let proof = peer.handle().proof().unwrap();
+    let original_epoch = peer.handle().cleanup_epoch().unwrap();
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        raw_letter(
+            keyboard::key::Code::KeyA,
+            "a",
+            true,
+            keyboard::Modifiers::empty(),
+        ),
+    );
+    assert!(peer.fence().iter().any(
+        |r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)
+    ));
+    peer.reconnect.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while peer
+        .handle()
+        .cleanup_epoch()
+        .is_none_or(|epoch| epoch == original_epoch)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "production client did not reconnect"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(peer.connections.load(Ordering::Acquire), 2);
+    assert_eq!(
+        peer.handle().proof(),
+        Some(proof),
+        "negative must retain the exact same advertised host proof and TerminalId"
+    );
+    drop(tree);
+    drop(terminal);
+    settle_cleanup(&barrier);
+    assert!(!barrier.take_key_cleanup_failures().is_empty());
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Key { .. })),
+        "old cleanup cannot be replayed into the new same-ID socket attachment"
+    );
+}
+
+#[test]
+fn fresh_owned_input_waits_for_all_prior_cleanup_responses_and_refuses_after_unknown() {
+    for accepted in [true, false] {
+        let peer = Peer::new();
+        peer.release_ready.store(false, Ordering::Release);
+        peer.release_accept.store(accepted, Ordering::Release);
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut terminal = widget(&peer, "cleanup-fence", barrier.clone(), true, false);
+        terminal.on_shortcut = None;
+        let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+        native_focus(&mut terminal, &mut tree, &renderer);
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(peer.fence().iter().any(
+            |r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)
+        ));
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let request = peer
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("gated cleanup frame");
+            if matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release)
+            {
+                break;
+            }
+        }
+        // This is genuinely accepted to the UI queue while the old up has no
+        // response. Its frame may not overtake or presume that response.
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyB,
+                "b",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(barrier.owns_raw_key(
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyB),
+            &terminal.handle
+        ));
+        peer.release_ready.store(true, Ordering::Release);
+        let requests = peer.fence();
+        let new_downs: Vec<_> = requests
+            .iter()
+            .filter_map(|r| {
+                if let ClientRequest::Key { input, .. } = r {
+                    Some(input)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if accepted {
+            assert_eq!(new_downs.len(), 1, "{requests:?}");
+            assert_eq!(new_downs[0].key, TerminalKey::Character('b'));
+            assert_eq!(new_downs[0].action, KeyAction::Press);
+        } else {
+            assert!(
+                new_downs.is_empty(),
+                "failed cleanup cannot authorize a fresh raw down: {requests:?}"
+            );
+        }
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            raw_letter(
+                keyboard::key::Code::KeyB,
+                "b",
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        let requests = peer.fence();
+        let new_ups: Vec<_> = requests
+            .iter()
+            .filter_map(|r| {
+                if let ClientRequest::Key { input, .. } = r {
+                    Some(input)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(new_ups.len(), usize::from(accepted), "{requests:?}");
+        if accepted {
+            assert_eq!(new_ups[0].action, KeyAction::Release);
+        }
+        settle_cleanup(&barrier);
+        assert_eq!(barrier.take_key_cleanup_failures().is_empty(), accepted);
+    }
+}
+
+#[test]
+fn inactive_native_terminal_click_admits_the_first_key_and_ime_before_app_selection_diff() {
+    use crate::input_trace::{InputTrace, KeyboardRegion, observe_keyboard_events};
+    use crate::workspace_widget::FocusedPane;
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    use std::{cell::RefCell, rc::Rc};
+    let peer = Peer::new();
+    let mut renderer = renderer();
+    let trace = InputTrace::default();
+    let barrier = ReviewInputBarrier::default();
+    trace.bind_terminal_keys(barrier.clone());
+    let id = Id::unique();
+    let card = crate::model::CardId::new();
+    let samples = Rc::new(RefCell::new(Vec::new()));
+    let make_view = || {
+        let mut terminal = widget(&peer, "inactive-native", barrier.clone(), false, false);
+        terminal.id = Some(id.clone());
+        terminal.on_shortcut = None;
+        let samples = samples.clone();
+        observe_keyboard_events(
+            terminal,
+            &trace,
+            vec![(
+                id.clone(),
+                KeyboardRegion {
+                    pane: FocusedPane::Terminal,
+                    card: Some(card),
+                },
+            )],
+            move |event, _, region, widget| {
+                if matches!(event, keyboard::Event::KeyPressed { .. }) {
+                    samples.borrow_mut().push((region, widget));
+                }
+                Message::Shortcut
+            },
+        )
+    };
+    let mut ui = UserInterface::build(
+        make_view(),
+        Size::new(640.0, 320.0),
+        Cache::new(),
+        &mut renderer,
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+            Event::InputMethod(input_method::Event::Commit("native-ime".into())),
+        ],
+        mouse::Cursor::Available(Point::new(80.0, 80.0)),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(
+        messages.contains(&Message::Focus),
+        "the real click queued the App focus message, which remains deliberately unapplied"
+    );
+    assert_eq!(
+        samples.borrow().as_slice(),
+        &[(
+            KeyboardRegion {
+                pane: FocusedPane::Terminal,
+                card: Some(card)
+            },
+            Some(id.clone())
+        )]
+    );
+    let requests = peer.fence();
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|request| match request {
+            ClientRequest::Key { input, .. } => Some((input.key, input.action)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (TerminalKey::Character('a'), KeyAction::Press),
+            (TerminalKey::Character('a'), KeyAction::Release)
+        ],
+        "{requests:?}"
+    );
+    assert!(requests.iter().any(|request| matches!(request, ClientRequest::Input { bytes, .. } if bytes == b"native-ime")), "{requests:?}");
+    let cache = ui.into_cache();
+    samples.borrow_mut().clear();
+    // A subsequent diff saying this pane is still inactive supersedes the
+    // observation, including a parked tree remount after another pane won.
+    let mut ui = UserInterface::build(make_view(), Size::new(640.0, 320.0), cache, &mut renderer);
+    let _ = ui.update(
+        &[
+            raw_letter(
+                keyboard::key::Code::KeyB,
+                "b",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            Event::InputMethod(input_method::Event::Commit("must-not-send".into())),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut Vec::new(),
+    );
+    let requests = peer.fence();
+    assert!(
+        !requests.iter().any(|request| matches!(
+            request,
+            ClientRequest::Key { .. } | ClientRequest::Input { .. }
+        )),
+        "stale click authority survived a fresh inactive diff: {requests:?}"
+    );
+    assert_eq!(samples.borrow()[0].0.card, None);
+}
+
+#[test]
+fn inactive_native_terminal_review_survives_a11y_publication_before_the_app_focus_diff() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "inactive-review", barrier.clone(), false, false);
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+
+    // The actual click activates the mounted pane. Deliberately leave the App
+    // focus callback unapplied, so the builder still describes an inactive pane.
+    let messages = dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
+    );
+    assert!(messages.contains(&Message::Focus));
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)),
+    );
+    native_focus(&mut terminal, &mut tree, &renderer);
+    assert!(tree.state.downcast_ref::<WidgetState>().input_focused);
+    assert!(!terminal.model_focused);
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+    let id = published.root()[0].id().clone();
+    assert_eq!(
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            action(id, Action::Focus, None),
+        ),
+        vec![Message::Review(true)]
+    );
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::ArrowRight,
+            keyboard::key::Code::ArrowRight,
+            true,
+        ),
+    );
+    let selection = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .selection
+        .clone()
+        .expect("native Review selection");
+    assert!(reviewing(&tree));
+    peer.fence();
+
+    // Native accessibility publication can occur before the queued App update.
+    // It must use the same observed owner as update(), preserving Review state.
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+    assert!(reviewing(&tree));
+    assert_eq!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection,
+        Some(selection)
+    );
+    assert!(
+        published.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Review mode")
+    );
+    assert!(
+        !published.root()[0]
+            .node()
+            .label()
+            .unwrap()
+            .contains("not focused")
+    );
+    assert_no_pty_input(&peer.fence());
+
+    // An actual subsequent inactive App diff supersedes the native observation.
+    terminal = widget(&peer, "inactive-review", barrier, false, false);
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+    assert!(!reviewing(&tree));
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection
+            .is_none()
+    );
+    assert!(
+        published.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Terminal input")
+    );
+    assert_no_pty_input(&peer.fence());
 }

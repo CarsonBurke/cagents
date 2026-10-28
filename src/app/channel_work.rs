@@ -3235,7 +3235,13 @@ mod tests {
                 .command_palette
                 .contains("Alt+J")
         );
-        assert!(app.settings_pending.contains_key(&field));
+        assert!(
+            app.settings
+                .keyboard_shortcuts
+                .command_palette
+                .contains(&"Alt+J".to_owned())
+        );
+        assert!(!app.settings_pending.contains_key(&field));
 
         drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
         app.settings_reset_confirm = true;
@@ -3246,7 +3252,8 @@ mod tests {
             .keyboard_shortcuts
             .command_palette
             .clone();
-        let pending = app.settings_pending[&field].clone();
+        let accepted = app.settings.keyboard_shortcuts.command_palette.clone();
+        let pending = app.settings_pending.clone();
         drop(app.update(Message::KeyEvent {
             event,
             captured: false,
@@ -3259,7 +3266,8 @@ mod tests {
             app.settings_draft.keyboard_shortcuts.command_palette,
             before
         );
-        assert_eq!(app.settings_pending[&field], pending);
+        assert_eq!(app.settings.keyboard_shortcuts.command_palette, accepted);
+        assert_eq!(app.settings_pending, pending);
         drop(app.update(Message::CancelResetSettings));
         assert!(!app.modal_is_open());
     }
@@ -3728,6 +3736,7 @@ mod tests {
                 settings_ui::SettingsContext {
                     feedback: app.settings_feedback.as_ref(),
                     invalid: &app.settings_invalid,
+                    pressed_key: app.palette.pressed_key_filter(),
                     accounts: app.default_account_choices(),
                     updates: app.update_summary(),
                     testing_notification: app.notification_ui.testing,

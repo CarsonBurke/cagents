@@ -1,3 +1,4 @@
+use crate::ui_controls::field::{EditorHistoryCommand, EditorHistoryOwner};
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
@@ -214,6 +215,7 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    ComposerHistory(Target, EditorHistoryCommand),
     /// Lets the laid-out editor move Up before starting prompt history.
     ComposerUp(Target),
     ComposerCursor(Target, text_editor::Cursor),
@@ -471,6 +473,7 @@ impl Action {
     fn mutation_target(&self) -> Option<Target> {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
+            Self::ComposerHistory(target, command) if command.changes_text() => Some(*target),
             Self::DraftModel(target, _, _)
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
@@ -2100,6 +2103,7 @@ pub(super) struct Runtime {
     opened: HashMap<String, bool>,
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
+    composer_history_owner: EditorHistoryOwner,
     revision: u64,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
@@ -2930,6 +2934,7 @@ impl Runtime {
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
         self.cancel_attachment_jobs();
         self.composer = composer;
+        self.composer_history_owner = EditorHistoryOwner::default();
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.resend = None;
@@ -2997,6 +3002,7 @@ impl Runtime {
             opened: HashMap::new(),
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
+            composer_history_owner: EditorHistoryOwner::default(),
             revision: 0,
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
@@ -9453,6 +9459,39 @@ impl Cagents {
                         return view::completion_scroll(target, 0.0);
                     }
                 }
+            }
+            Action::ComposerHistory(target, command) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if !command.apply(&mut runtime.composer, &runtime.composer_history_owner) {
+                    return Task::none();
+                }
+                // History replaces the whole text outside composer_action's
+                // incremental bookmark mapping. Retire inserts bound to it.
+                runtime.cancel_attachment_jobs();
+                runtime.dismiss_suggestion();
+                runtime.revision = runtime.revision.wrapping_add(1);
+                runtime.history_cursor = None;
+                runtime.history_stash = None;
+                runtime.history_attachment_stash = None;
+                let rescroll = runtime.completion.restart(true);
+                let files = if runtime.files.is_none() && runtime.composer.text().contains('@') {
+                    runtime.files = Some(Arc::new(Vec::new()));
+                    Some(runtime.session.launch.recipe.working_directory.clone())
+                } else {
+                    None
+                };
+                return Task::batch([
+                    if rescroll {
+                        view::completion_scroll(target, 0.0)
+                    } else {
+                        Task::none()
+                    },
+                    files.map_or_else(Task::none, |directory| {
+                        self.load_chat_files(target, directory)
+                    }),
+                ]);
             }
             Action::ComposerUp(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -17746,6 +17785,153 @@ mod tests {
             );
             assert!(runtime.attachments.is_empty());
         }
+    }
+
+    #[test]
+    fn native_composer_undo_retires_pending_paste_without_resetting_redo() {
+        use iced::{
+            Event, Size,
+            advanced::{clipboard, mouse, widget::operation::focusable},
+            keyboard::key::{Code, Physical},
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        fn native_key(
+            app: &Cagents,
+            target: Target,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+            event: Event,
+        ) -> (Cache, Vec<Message>) {
+            let runtime = chat_runtime(app, target.card);
+            let id = card_control_id(target.card, "chat-composer");
+            let editor = crate::ui_controls::field::editor("Message", &runtime.composer)
+                .id(id.clone())
+                .on_action(move |action| Message::ChatUi(Action::Composer(target, action)))
+                .on_cursor(move |cursor| Message::ChatUi(Action::ComposerCursor(target, cursor)))
+                .on_history(&runtime.composer_history_owner, move |command| {
+                    Message::ChatUi(Action::ComposerHistory(target, command))
+                });
+            let mut ui = UserInterface::build(editor, Size::new(400.0, 180.0), cache, renderer);
+            ui.operate(renderer, &mut focusable::focus::<()>(id));
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[event],
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            (ui.into_cache(), messages)
+        }
+        let key = |text: &str, physical, modifiers, input| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(text.into()),
+                modified_key: keyboard::Key::Character(text.into()),
+                physical_key: Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: input,
+                repeat: false,
+            })
+        };
+        let _admission = attachment_draft::test_admission();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("abc"));
+        runtime.composer.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 1 },
+            selection: None,
+        });
+        let ticket = runtime.begin_attachment_insert();
+        runtime.composer.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 0 },
+            selection: None,
+        });
+        let mut renderer = crate::app::tests::headless_renderer();
+        let (cache, messages) = native_key(
+            &app,
+            target,
+            Cache::new(),
+            &mut renderer,
+            key(
+                "X",
+                Code::KeyX,
+                keyboard::Modifiers::SHIFT,
+                Some("X".into()),
+            ),
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "Xabc");
+        assert!(runtime.attachment_bookmarks[&ticket.id].valid);
+        assert_eq!(
+            runtime.attachment_bookmarks[&ticket.id]
+                .cursor
+                .position
+                .column,
+            2
+        );
+        let (cache, messages) = native_key(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            key("z", Code::KeyZ, keyboard::Modifiers::CTRL, None),
+        );
+        assert!(messages.iter().any(|message| matches!(
+            message, Message::ChatUi(Action::ComposerHistory(_, command)) if command.changes_text()
+        )));
+        for message in messages {
+            drop(app.update(message));
+        }
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "abc");
+        assert!(runtime.attachment_jobs.is_empty());
+        assert!(runtime.attachment_bookmarks.is_empty());
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(!ticket.active());
+        drop(app.update(Message::ChatUi(Action::PastedText(
+            target,
+            ticket,
+            Some("Z".into()),
+        ))));
+        assert_eq!(chat_runtime(&app, card).composer.text(), "abc");
+
+        let (_, messages) = native_key(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            key("y", Code::KeyY, keyboard::Modifiers::CTRL, None),
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Xabc",
+            "Redo retains the same history owner"
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.composer.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 2 },
+            selection: None,
+        });
+        let fresh = runtime.begin_attachment_insert();
+        drop(app.update(Message::ChatUi(Action::PastedText(
+            target,
+            fresh,
+            Some("Z".into()),
+        ))));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "XaZbc",
+            "a new current paste remains usable"
+        );
     }
 
     #[test]
