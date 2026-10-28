@@ -31,13 +31,19 @@ fn isolated(name: &str) -> bool {
         )
         .unwrap();
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Preserve inherited delegation while keeping every fixture path private.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
         .args([
             "--exact",
             &format!("app::shared_views::tests::startup_admission::{name}"),
             "--nocapture",
         ])
-        .env_clear()
         .env(CHILD, name)
         .env("HOME", root.path().join("home"))
         .env("XDG_DATA_HOME", root.path().join("data"))
