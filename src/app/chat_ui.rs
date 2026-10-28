@@ -8912,9 +8912,24 @@ impl Cagents {
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
-                            runtime.error = Some(failure.message);
+                            runtime.error = Some(failure.message.clone());
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a conversation".to_owned());
+                            let verb = if attempt.intent == chat::Intent::Start
+                                && attempt.session.launch.session_id.is_none()
+                            {
+                                "start"
+                            } else {
+                                "reopen"
+                            };
+                            self.status = Some(
+                                TransientNotice::error(format!("Could not {verb} {pane}."))
+                                    .with_details(failure.message)
+                                    .with_key(NoticeKey::ChatAttach(target.card)),
+                            );
                         } else if matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Chat(_))
