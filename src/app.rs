@@ -20396,7 +20396,7 @@ mod tests {
         app.settings_write_blocked = false;
     }
 
-    fn window_close_test_message(app: &mut Cagents, task: Task<Message>) -> Message {
+    pub(super) fn window_close_test_message(app: &mut Cagents, task: Task<Message>) -> Message {
         let mut stream = iced::runtime::task::into_stream(task).expect("close task");
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

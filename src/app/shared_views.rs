@@ -1527,8 +1527,15 @@ impl Cagents {
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
                 self.worktree_owners.insert(projected.id, path.clone());
-                for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                    channel.cards.retain(|id| *id != projected.id);
+                if self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&projected.id))
+                {
+                    for channel in &mut Arc::make_mut(&mut self.durable).channels {
+                        channel.cards.retain(|id| *id != projected.id);
+                    }
                 }
             }
 
@@ -1563,9 +1570,10 @@ impl Cagents {
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
-                let explicit = Arc::make_mut(&mut self.durable)
-                    .pending_terminal_creations
-                    .remove(&pane.id);
+                let explicit = self.durable.pending_terminal_creations.contains(&pane.id)
+                    && Arc::make_mut(&mut self.durable)
+                        .pending_terminal_creations
+                        .remove(&pane.id);
                 if automatic.is_some() || explicit {
                     if let CardKind::Terminal(session) = &pane.kind {
                         self.shared_views.attached.insert(pane.id);
@@ -1649,7 +1657,11 @@ impl Cagents {
                     }
                     let mut kind = pane.kind.clone();
                     preserve_observed_terminal_exit(&card, &mut kind);
-                    if let Some(current) = self.card_state_mut(pane.id) {
+                    if (card.title != pane.title
+                        || card.width_fraction != pane.width_fraction
+                        || card.kind != kind)
+                        && let Some(current) = self.card_state_mut(pane.id)
+                    {
                         current.title = pane.title.clone();
                         current.width_fraction = pane.width_fraction;
                         current.kind = kind;
@@ -1685,13 +1697,15 @@ impl Cagents {
                     tasks.push(self.attach_shared_pane(pane));
                 }
             }
-            let durable = Arc::make_mut(&mut self.durable);
-            match &pane.scope {
-                Some(scope) => {
-                    durable.card_scopes.insert(pane.id, scope.clone());
-                }
-                None => {
-                    durable.card_scopes.remove(&pane.id);
+            if self.durable.card_scopes.get(&pane.id) != pane.scope.as_ref() {
+                let durable = Arc::make_mut(&mut self.durable);
+                match &pane.scope {
+                    Some(scope) => {
+                        durable.card_scopes.insert(pane.id, scope.clone());
+                    }
+                    None => {
+                        durable.card_scopes.remove(&pane.id);
+                    }
                 }
             }
         }
@@ -1712,28 +1726,42 @@ impl Cagents {
             .chain(retained)
             .collect::<Vec<_>>();
         if let Some(index) = index {
-            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
-            channel.cards = visible.clone();
-            if !channel
+            let channel = &self.durable.channels[index];
+            let focused = channel
                 .focused
-                .is_some_and(|id| channel.cards.contains(&id))
-            {
-                channel.focused = channel.cards.first().copied();
+                .filter(|id| visible.contains(id))
+                .or_else(|| visible.first().copied());
+            if channel.cards != visible || channel.focused != focused {
+                let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+                channel.cards = visible.clone();
+                channel.focused = focused;
             }
         }
         let members = visible.iter().copied().collect::<HashSet<_>>();
-        let states = self
+        let ordered = self
             .durable
             .cards
             .iter()
             .filter(|card| members.contains(&card.id))
-            .map(|card| (card.id, card.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
-        for card in &mut Arc::make_mut(&mut self.durable).cards {
-            if members.contains(&card.id) {
-                if let Some(next) = ordered.next() {
-                    *card = next;
+            .map(|card| card.id)
+            .eq(visible
+                .iter()
+                .copied()
+                .filter(|id| self.card_state(*id).is_some()));
+        if !ordered {
+            let states = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| members.contains(&card.id))
+                .map(|card| (card.id, card.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
+            for card in &mut Arc::make_mut(&mut self.durable).cards {
+                if members.contains(&card.id) {
+                    if let Some(next) = ordered.next() {
+                        *card = next;
+                    }
                 }
             }
         }
@@ -2088,6 +2116,61 @@ mod tests {
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         channel_move_fixture_with_kind(None)
+    }
+
+    #[test]
+    fn equal_shared_model_reads_do_not_veto_the_current_final_window_save() {
+        use super::super::workspace_model_sync::ModelUpdate;
+
+        for scope in [None, Some(PathBuf::from("/repo"))] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, _, _, pane) = channel_move_fixture();
+            app.workspace_model.views[0].panes[0].scope = scope;
+            // Settle the actual shared projection before the close. The
+            // browser descriptor is synthetic; no engine or I/O task is run.
+            let model = app.workspace_model.clone();
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    model.clone(),
+                ))),
+            );
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            super::super::tests::install_window_close_storage(&mut app, directory.path());
+            let task = app.update(Message::WindowCloseRequested(window));
+            assert!(app.pending_window_close.is_some());
+            let snapshot = app.persistent_workspace();
+            // Equal reads are normal background notifications. They must not
+            // manufacture a changed-model failure or a recurring close stall.
+            for _ in 0..3 {
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                        model.clone(),
+                    ))),
+                );
+                assert_eq!(app.persistent_workspace(), snapshot);
+                assert!(app.exit.is_none());
+                assert_eq!(app.core.main_window_id(), Some(window));
+            }
+            let completed = super::super::tests::window_close_test_message(&mut app, task);
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Ok(()), .. }
+            ));
+            let saved = app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_workspace(app.durable.id, None)
+                .unwrap()
+                .unwrap();
+            assert!(saved.cards.iter().any(|card| card.id == pane.id));
+            drop(app.update(completed));
+            assert!(app.exit.is_some());
+            assert!(app.pending_window_close.is_none());
+            assert_eq!(app.core.main_window_id(), None);
+        }
     }
 
     fn channel_move_fixture_with_kind(
