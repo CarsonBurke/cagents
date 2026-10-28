@@ -1016,9 +1016,9 @@ impl Cagents {
         }
     }
 
-    /// A transfer can commit before a later metadata edit reaches the daemon.
-    /// Keep that edit over the new owner and give its retry a distinct receipt:
-    /// the original old-scope operation can still acknowledge a harmless no-op.
+    /// A transfer in any client can commit before a queued metadata edit reaches
+    /// the daemon. Keep that edit over the new owner and give its retry a distinct
+    /// receipt: the original old-scope operation can still acknowledge a no-op.
     pub(super) fn retarget_transferred_pane_updates(&mut self, acknowledged: Option<CardId>) {
         let moving: HashSet<_> = self
             .shared_views
@@ -1026,6 +1026,18 @@ impl Cagents {
             .values()
             .copied()
             .chain(acknowledged)
+            .chain(
+                self.shared_views
+                    .pending
+                    .iter()
+                    .filter_map(|(_, _, change)| {
+                        if let Change::Update { pane, .. } = change {
+                            Some(pane.id)
+                        } else {
+                            None
+                        }
+                    }),
+            )
             .collect();
         if moving.is_empty() {
             return;
