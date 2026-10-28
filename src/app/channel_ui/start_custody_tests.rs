@@ -267,6 +267,14 @@ fn refused_custody_peer(
 }
 
 fn accepted_custody_peer(registry: uuid::Uuid, owner: crate::chat::Session) -> Peer {
+    accepted_custody_identity_peer(registry, owner, None)
+}
+
+fn accepted_custody_identity_peer(
+    registry: uuid::Uuid,
+    owner: crate::chat::Session,
+    learned: Option<crate::chat::Session>,
+) -> Peer {
     Peer::new(move |server| {
         let mut resolve = server
             .connect(&Authority::default(), Some(registry), false)
@@ -276,6 +284,20 @@ fn accepted_custody_peer(registry: uuid::Uuid, owner: crate::chat::Session) -> P
         let mut close = server
             .connect(&Authority::default(), Some(registry), false)
             .unwrap();
+        if let Some(learned) = learned {
+            close.chats(vec![learned]);
+            close.eof();
+            let mut retained = server
+                .connect(&Authority::default(), Some(registry), false)
+                .unwrap();
+            let request = retained.next();
+            assert!(
+                matches!(&request.request, ClientRequest::ChatCloseRetained { session } if session == &owner)
+            );
+            retained.response(&request, ServerResponse::Accepted);
+            retained.eof();
+            return;
+        }
         close.chats(vec![owner.clone()]);
         let request = close.close_chat(&owner);
         close.response(
@@ -287,6 +309,41 @@ fn accepted_custody_peer(registry: uuid::Uuid, owner: crate::chat::Session) -> P
         );
         close.eof();
     })
+}
+
+fn publish_custody_identity(
+    updates: &std::sync::Mutex<UnixStream>,
+    handle: &crate::chat::client::ClientHandle,
+    learned: &crate::chat::Session,
+) {
+    write_frame(
+        &mut *updates.lock().unwrap(),
+        &ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof: proof(),
+            message: ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot {
+                    chat_id: learned.id,
+                    snapshot: Some(crate::chat::Snapshot {
+                        ready: true,
+                        generation: 1,
+                        session_id: learned.launch.session_id.clone(),
+                        ..Default::default()
+                    }),
+                },
+            },
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while handle.session().launch.session_id != learned.launch.session_id {
+        assert!(
+            Instant::now() < deadline,
+            "framed UUID publication did not arrive"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn user_custody_fixture_launch() {
@@ -429,6 +486,8 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
     for close_pane in [false, true] {
         for change in [
             "learned",
+            "pre-close-unprojected",
+            "post-close-unprojected",
             "descriptor-only",
             "connection",
             "same-descriptor-connection",
@@ -441,6 +500,12 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
                 checkpointed_start_ready_update_fixture(&mut app, target, None);
             let original = handle.session();
             assert!(original.launch.session_id.is_none());
+            let mut learned = original.clone();
+            learned.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
+            let same_owner = matches!(
+                change,
+                "learned" | "pre-close-unprojected" | "post-close-unprojected"
+            );
             let task = chat_ui::tests::deliver_attempted_start_fixture(
                 &mut app,
                 target,
@@ -458,11 +523,21 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
             } else {
                 drop(app.retry_start_custody(card, false));
             }
-            let peer = accepted_custody_peer(registry, original.clone());
+            let peer = accepted_custody_identity_peer(
+                registry,
+                original.clone(),
+                (change == "pre-close-unprojected").then(|| learned.clone()),
+            );
             let task = app.update(ready_ack);
             let resolved = custody_message(task).unwrap();
             let task = app.update(resolved);
             let observed_ack = custody_message(task).unwrap();
+            if change == "pre-close-unprojected" {
+                publish_custody_identity(&updates, &handle, &learned);
+                assert!(
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &original)
+                );
+            }
             let task = app.update(observed_ack); // captures the actual pane owner before Close
             let closed = custody_message(task).unwrap();
             assert!(matches!(
@@ -470,8 +545,6 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
                 Message::ChatUi(chat_ui::Action::StartCleanupFinished(_, requested, Ok(()))) if *requested == close_pane
             ));
             peer.finished();
-            let mut learned = original.clone();
-            learned.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
             if change == "same-descriptor-connection" {
                 learned = original.clone();
                 chat_ui::tests::replace_custody_pane_lifetime_fixture(&mut app, card, true);
@@ -482,41 +555,23 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
             } else {
                 // Real framed metadata publication on the exact original client,
                 // followed by the ordinary Wake projection into durable state.
-                write_frame(
-                    &mut *updates.lock().unwrap(),
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: None,
-                        proof: proof(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::ChatSnapshot {
-                                chat_id: original.id,
-                                snapshot: Some(crate::chat::Snapshot {
-                                    ready: true,
-                                    generation: 1,
-                                    session_id: learned.launch.session_id.clone(),
-                                    ..Default::default()
-                                }),
-                            },
-                        },
-                    },
-                )
-                .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while handle.session().launch.session_id != learned.launch.session_id {
-                    assert!(
-                        Instant::now() < deadline,
-                        "framed UUID publication did not arrive"
-                    );
-                    thread::sleep(Duration::from_millis(2));
+                if change != "pre-close-unprojected" {
+                    publish_custody_identity(&updates, &handle, &learned);
                 }
-                drop(app.update(Message::ChatUi(chat_ui::Action::Wake(
-                    target,
-                    crate::chat::client::Wake::Changed,
-                ))));
-                assert!(
-                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
-                );
+                if !change.ends_with("unprojected") {
+                    drop(app.update(Message::ChatUi(chat_ui::Action::Wake(
+                        target,
+                        crate::chat::client::Wake::Changed,
+                    ))));
+                    assert!(
+                        matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
+                    );
+                } else {
+                    assert!(
+                        matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &original),
+                        "reader publication must not be mistaken for UI projection"
+                    );
+                }
                 if change == "connection" || change == "target" {
                     chat_ui::tests::replace_custody_pane_lifetime_fixture(
                         &mut app,
@@ -530,10 +585,10 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
             assert!(!app.chat_has_unresolved_start_custody(card));
             assert_eq!(
                 app.card_state(card).unwrap().existence.is_open(),
-                !close_pane || change != "learned",
+                !close_pane || !same_owner,
                 "only the captured actor's mounted pane can be retired after UUID learning"
             );
-            if !close_pane && change == "learned" {
+            if !close_pane && same_owner {
                 assert!(
                     matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current.id != original.id && current.is_unstarted())
                 );
@@ -546,7 +601,7 @@ fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
                     "explicit cleanup opens an inert fresh draft, never a Start replay"
                 );
             }
-            if change != "learned" {
+            if !same_owner {
                 assert!(
                     app.notices.entries.iter().any(|entry| entry.notice.message == "The previous conversation stopped. This pane changed while cleanup was pending, so its current conversation was kept."),
                     "a preserved replacement needs an explanation"

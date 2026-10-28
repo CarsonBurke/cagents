@@ -611,12 +611,8 @@ impl Cagents {
         // connection or descriptor-only replacement cannot inherit this pin.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&entry.card)
             && let Some(handle) = runtime.handle()
-            && let Some(observed) = &entry.observed
             && let Some(current) = self.chat_return_session(entry.card)
-            && entry.permits_observed_identity_learning(observed, &current)
-            && self.card_state(entry.card).is_some_and(
-                |card| matches!(&card.kind, CardKind::Chat(source) if source == &current),
-            )
+            && self.mounted_custody_source_current(&entry, runtime, &current)
         {
             self.chat_ui.custody_pane_owners.insert(
                 entry.operation,
@@ -633,6 +629,24 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
             Message::ChatUi(Action::StartCleanupFinished(operation, close_pane, result))
+        })
+    }
+
+    fn mounted_custody_source_current(
+        &self,
+        entry: &StartCustody,
+        runtime: &Runtime,
+        current: &chat::Session,
+    ) -> bool {
+        // The reader can learn an ID before its Wake reaches the UI. The
+        // durable descriptor must still agree exactly with the mounted cache;
+        // only that same connection's monotone metadata may be newer.
+        self.card_state(entry.card).is_some_and(
+            |card| matches!(&card.kind, CardKind::Chat(source) if source == &runtime.session),
+        ) && entry.observed.as_ref().is_some_and(|observed| {
+            entry.permits_observed_identity_learning(observed, &runtime.session)
+                && entry.permits_observed_identity_learning(observed, current)
+                && entry.permits_observed_identity_learning(&runtime.session, current)
         })
     }
 
@@ -851,17 +865,13 @@ impl Cagents {
                     .custody_admissions
                     .retain(|target, _| active.contains(target));
                 let current = self.chat_return_session(entry.card);
-                let pane_lifetime_matches = pane_owner.as_ref().is_none_or(|owner| matches!(self.cards.get(&entry.card), Some(CardRuntime::Chat(runtime)) if runtime.target == owner.target && runtime.handle().is_some_and(|handle| Arc::ptr_eq(handle, &owner.handle))));
                 let pane_matches = current.as_ref().is_some_and(|current| {
-                    self.card_state(entry.card).is_some_and(
-                        |card| matches!(&card.kind, CardKind::Chat(source) if source == current),
-                    ) && pane_lifetime_matches
-                        && (current == &entry.source
-                            || Some(current) == entry.observed.as_ref()
-                            || entry.observed.as_ref().is_some_and(|observed| {
-                                entry.permits_observed_identity_learning(observed, current)
-                                    && pane_owner.is_some()
-                            }))
+                    if let Some(owner) = &pane_owner {
+                        matches!(self.cards.get(&entry.card), Some(CardRuntime::Chat(runtime)) if runtime.target == owner.target && runtime.handle().is_some_and(|handle| Arc::ptr_eq(handle, &owner.handle)) && self.mounted_custody_source_current(&entry, runtime, current))
+                    } else {
+                        self.card_state(entry.card).is_some_and(|card| matches!(&card.kind, CardKind::Chat(source) if source == current))
+                            && (current == &entry.source || Some(current) == entry.observed.as_ref())
+                    }
                 });
                 if ended
                     && !close_pane
