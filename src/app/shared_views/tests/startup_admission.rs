@@ -2377,6 +2377,216 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
 }
 
 #[test]
+fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
+    if isolated("retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots") {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    crate::chat::attachment_assets::with_test_image(|image| {
+        for changed_card in [0, 1] {
+            for changed in ["session", "proof", "recipe", "title", "legacy_unshared"] {
+                for earlier_read in [false, true] {
+                    let case =
+                        format!("card {changed_card}, {changed}, earlier read {earlier_read}");
+                    let (mut app, active, hidden, pane, identity) = cached_chat();
+                    let mut sibling = pane.clone();
+                    sibling.id = CardId::new();
+                    let CardKind::Chat(session) = &mut sibling.kind else {
+                        unreachable!()
+                    };
+                    session.id = TerminalId::new();
+                    session.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+                    let mut state = app.card_state(pane.id).unwrap().clone();
+                    state.id = sibling.id;
+                    state.kind = sibling.kind.clone();
+                    {
+                        let durable = Arc::make_mut(&mut app.durable);
+                        durable.cards.push(state);
+                        durable
+                            .channels
+                            .iter_mut()
+                            .find(|channel| channel.id == hidden)
+                            .unwrap()
+                            .cards
+                            .push(sibling.id);
+                    }
+                    app.workspace = Cagents::rebuild_workspace(&app.durable);
+                    let originals = [pane, sibling];
+                    let drafts = HashMap::from([
+                        (originals[0].id, "Clicked conversation draft  ".to_owned()),
+                        (originals[1].id, "Sibling conversation draft  ".to_owned()),
+                    ]);
+                    app.chat_ui = chat_ui::State::with_draft_attachments(
+                        drafts.clone(),
+                        originals
+                            .iter()
+                            .map(|pane| (pane.id, vec![image.clone()]))
+                            .collect(),
+                    );
+                    let (tx, rx) = async_channel::unbounded();
+                    app.workspace_model_tx = tx;
+                    drop(app.initialize_runtimes());
+                    let scope = Scope::Channel(hidden);
+                    let mut view = View::empty(hidden);
+                    view.panes = originals
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| changed != "legacy_unshared" || *index != changed_card)
+                        .map(|(_, pane)| pane.clone())
+                        .collect();
+                    let canonical = model(identity, active, hidden, view);
+                    drop(
+                        app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone())),
+                    );
+                    let refused = framed_seed(queued_seed(&rx, &scope), canonical.clone(), true);
+                    apply_seed_updates(&mut app, refused);
+                    let retry = app
+                        .shared_chat_admission_failure(originals[0].id)
+                        .unwrap()
+                        .retry()
+                        .unwrap();
+                    let allocations = originals.each_ref().map(|pane| {
+                        let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                            unreachable!()
+                        };
+                        (
+                            &**runtime as *const chat_ui::Runtime as usize,
+                            runtime.target,
+                        )
+                    });
+                    drop(app.retry_shared_chat_admission(retry.clone()));
+                    assert!(app.shared_chat_admission_failure(originals[0].id).is_none());
+                    let next = queued_seed(&rx, &scope);
+                    let mut newer = canonical.clone();
+                    newer.sequence += 1;
+                    let view = newer
+                        .views
+                        .iter_mut()
+                        .find(|view| view.scope == scope)
+                        .unwrap();
+                    if changed == "legacy_unshared" {
+                        view.panes.push(originals[changed_card].clone());
+                    } else {
+                        let successor = view
+                            .panes
+                            .iter_mut()
+                            .find(|pane| pane.id == originals[changed_card].id)
+                            .unwrap();
+                        let CardKind::Chat(session) = &mut successor.kind else {
+                            unreachable!()
+                        };
+                        match changed {
+                            "session" => session.id = TerminalId::new(),
+                            "proof" => {
+                                session.proof.as_mut().unwrap().host_incarnation =
+                                    "new-owner".into()
+                            }
+                            "recipe" => session.launch.recipe.arguments.push("new-source".into()),
+                            "title" => successor.title = "Presentation only".into(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    // Real publisher order is Started then ACK. A watcher can
+                    // supply newer authority in between, or the reply can be
+                    // the first evidence of a successor. An older ACK must not
+                    // erase the newer watcher snapshot before this check.
+                    let accepted = framed_seed(
+                        next,
+                        if earlier_read {
+                            canonical
+                        } else {
+                            newer.clone()
+                        },
+                        false,
+                    );
+                    apply_seed_updates(&mut app, vec![accepted[0].clone()]);
+                    if earlier_read {
+                        let read =
+                            app.apply_workspace_model_update(ModelUpdate::Read(newer.clone()));
+                        settle(&mut app, read);
+                    }
+                    let ack = app.apply_workspace_model_update(accepted[1].clone());
+                    let allowed = matches!(changed, "title" | "legacy_unshared");
+                    if allowed {
+                        // Positive controls inspect synchronous admission; do
+                        // not run provider work for these source-only controls.
+                        drop(ack);
+                        assert!(app.shared_views.initialized.contains(&scope), "{case}");
+                        assert!(!app.shared_views.seeding.contains(&scope), "{case}");
+                        assert!(
+                            !app.shared_views.seed_admissions.contains_key(&scope),
+                            "{case}"
+                        );
+                        for pane in &originals {
+                            assert!(
+                                !app.durable.pending_chat_admissions.contains_key(&pane.id),
+                                "{case}"
+                            );
+                            assert!(app.chat_start_pending(pane.id), "{case}");
+                        }
+                    } else {
+                        settle(&mut app, ack);
+                        assert!(!app.shared_views.initialized.contains(&scope), "{case}");
+                        assert!(app.shared_views.seeding.contains(&scope), "{case}");
+                        let failure = app.shared_chat_admission_failure(originals[0].id).unwrap();
+                        assert!(failure.retry().is_none(), "{case}");
+                        assert!(
+                            failure.message().contains("Close and reopen this window"),
+                            "{case}"
+                        );
+                        assert!(app.startup_pane_check().is_err(), "{case}");
+                        drop(app.retry_shared_chat_admission(retry));
+                        assert!(
+                            rx.is_empty(),
+                            "{case}: old callback cannot release the refused ACK"
+                        );
+                        for (index, pane) in originals.iter().enumerate() {
+                            let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                unreachable!()
+                            };
+                            assert_eq!(
+                                (
+                                    &**runtime as *const chat_ui::Runtime as usize,
+                                    runtime.target
+                                ),
+                                allocations[index],
+                                "{case}"
+                            );
+                            assert_eq!(
+                                CardKind::Chat(runtime.session.clone()),
+                                pane.kind,
+                                "{case}"
+                            );
+                            assert!(runtime.awaiting_admission(), "{case}");
+                            assert!(!app.chat_start_pending(pane.id), "{case}");
+                        }
+                    }
+                    assert_eq!(app.workspace_model, newer, "{case}");
+                    let saved = app.persistent_workspace();
+                    for pane in &originals {
+                        assert_eq!(
+                            saved.chat_drafts.get(&pane.id),
+                            drafts.get(&pane.id),
+                            "{case}"
+                        );
+                        assert_eq!(
+                            saved.chat_draft_attachments[&pane.id],
+                            [image.clone()],
+                            "{case}"
+                        );
+                    }
+                    assert!(
+                        daemon.requests().is_empty(),
+                        "{case}: changed ACK cannot attach a successor"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat() {
     if isolated("closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat") {
         return;
