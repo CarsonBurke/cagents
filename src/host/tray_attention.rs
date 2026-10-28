@@ -246,6 +246,28 @@ impl Source {
         })
     }
 
+    /// Raw records/handles retain preflight custody. Display/focus uses the
+    /// same existing authenticated Live projection issued to ordinary clients.
+    fn presentation_sources(
+        &self,
+        state: &HostState,
+        id: TerminalId,
+    ) -> Result<Vec<crate::agent_execution::HostedSession>, String> {
+        if !self.matches(state, id) {
+            return Err("The waiting agent changed; reopen the tray menu".into());
+        }
+        let mut sources = Vec::new();
+        if let Some((session, _)) = &self.chat {
+            sources.push(crate::agent_execution::HostedSession::Chat(session.clone()));
+        }
+        if (self.chat.is_none() || self.paired) && self.terminal.is_some() {
+            sources.push(crate::agent_execution::HostedSession::Terminal(
+                state.native_terminal_projection(id)?,
+            ));
+        }
+        Ok(sources)
+    }
+
     fn waiting(&self) -> bool {
         let native = self
             .chat
@@ -287,10 +309,13 @@ impl Source {
 }
 
 fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
-    let (source, registry, proof) = {
+    let (source, presentation, registry, proof) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let source = Source::capture(&state, id)?;
+        let presentation = source.presentation_sources(&state, id)?;
         (
-            Source::capture(&state, id)?,
+            source,
+            presentation,
             state
                 .execution_registry
                 .clone()
@@ -306,25 +331,12 @@ fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .identity()?;
-    let mut sources = Vec::new();
-    if let Some((session, _)) = &source.chat {
-        sources.push(
-            crate::instance::tray_source_fingerprint(&crate::agent_execution::HostedSession::Chat(
-                session.clone(),
-            ))
-            .map_err(|error| error.to_string())?,
-        );
-    }
-    if (source.chat.is_none() || source.paired)
-        && let Some((session, _)) = &source.terminal
-    {
-        sources.push(
-            crate::instance::tray_source_fingerprint(
-                &crate::agent_execution::HostedSession::Terminal(session.clone()),
-            )
-            .map_err(|error| error.to_string())?,
-        );
-    }
+    let sources = presentation
+        .iter()
+        .map(|source| {
+            crate::instance::tray_source_fingerprint(source).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let (destination, intent) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !source.matches(&state, id)

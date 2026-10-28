@@ -230,6 +230,87 @@ fn actual_worker_pairing_is_required_and_replacement_retires_captured_source() {
 }
 
 #[test]
+fn raw_relaunch_terminal_fingerprints_issued_live_projection_without_losing_worker_custody() {
+    let host = empty_host();
+    let first = RenderStreamFixture::new(|_| {});
+    let replacement = RenderStreamFixture::new(|_| {});
+    let id = TerminalId::new();
+    let original = terminal(id);
+    let mut state = host.lock().unwrap();
+    state.register_client(1);
+    state
+        .finish_spawn(1, original.clone(), first.handle.clone(), false)
+        .unwrap();
+    let source = Source::capture(&state, id).unwrap();
+    assert!(
+        source
+            .terminal
+            .as_ref()
+            .unwrap()
+            .0
+            .continuity
+            .live_proof()
+            .is_none()
+    );
+    let presentation = source.presentation_sources(&state, id).unwrap();
+    assert_eq!(presentation.len(), 1);
+    assert_eq!(
+        presentation[0],
+        crate::agent_execution::HostedSession::Terminal(
+            state.native_terminal_projection(id).unwrap()
+        )
+    );
+    assert!(presentation[0].has_complete_proof());
+    assert!(crate::instance::tray_source_fingerprint(&presentation[0]).is_ok());
+    assert!(source.matches(&state, id));
+    assert!(
+        state.terminals[&id]
+            .session
+            .continuity
+            .live_proof()
+            .is_none(),
+        "projection cannot rewrite raw source custody"
+    );
+    state
+        .finish_spawn(1, original.clone(), replacement.handle.clone(), false)
+        .unwrap();
+    assert!(
+        source.presentation_sources(&state, id).is_err(),
+        "same raw record cannot substitute another worker"
+    );
+    state
+        .finish_spawn(1, original, first.handle.clone(), false)
+        .unwrap();
+    state
+        .terminals
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .launch
+        .arguments
+        .push("different-process".into());
+    assert!(
+        source.presentation_sources(&state, id).is_err(),
+        "changed raw process cannot borrow an old projection"
+    );
+    drop(state);
+    let mut incomplete = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new(""),
+        boot_id: BootId::new(""),
+        host_incarnation: HostIncarnation::new(""),
+    });
+    incomplete.register_client(1);
+    incomplete
+        .finish_spawn(1, terminal(id), first.handle.clone(), false)
+        .unwrap();
+    let source = Source::capture(&incomplete, id).unwrap();
+    assert!(
+        source.presentation_sources(&incomplete, id).is_err(),
+        "existing authenticated projection refuses an incomplete host proof"
+    );
+}
+
+#[test]
 fn sampled_policy_preserves_pair_fallback_counts_all_waiting_and_omits_ambiguous_rows() {
     let host = empty_host();
     let stream = RenderStreamFixture::new(|_| {});
