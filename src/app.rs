@@ -14845,8 +14845,7 @@ impl Application for Cagents {
                     }
                     Err(error) => {
                         if open_cards {
-                            self.workspace_model_reopens.invalidate(project_id);
-                            self.project_ui.reopening.remove(&project_id);
+                            self.inventory_failed_reopen(project_id);
                         }
                         let unavailable = GitHubAvailability::Failed {
                             detail: error.clone(),

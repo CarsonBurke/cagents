@@ -654,6 +654,20 @@ impl Cagents {
             )
     }
 
+    pub(super) fn inventory_failed_reopen(&mut self, project: ProjectId) {
+        let Some(origin) = self.workspace_model_reopens.active.get(&project) else {
+            return;
+        };
+        if self.project_ui.reopening.get(&project) == Some(&origin.repository)
+            && !self.workspace_model_reopens.queued.contains(&project)
+        {
+            // An inventory failure is not acknowledgement of a close. Keep
+            // local work protected, but let a fresh explicit picker retry an
+            // attempt that has not admitted any physical publication.
+            self.workspace_model_reopens.retryable.insert(project);
+        }
+    }
+
     pub(super) fn finish_removed_project_reopens(&mut self, origins: &[ReopenOrigin]) {
         for origin in origins {
             if self

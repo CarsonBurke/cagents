@@ -2827,15 +2827,15 @@ fn queued_old_reopen_success_and_failure_cannot_settle_new_registry_or_aba_inten
                 framed_reopen_failure(old)
             };
             let old_generation = app.repository_generations[&project];
-            // Its own failed inventory attempt ends the old local intent. The
-            // next explicit retry must receive fresh nonce/generation proof.
-            drop(app.update(Message::RepositoryLoaded {
-                open_cards: true,
-                project_id: project,
-                generation: old_generation,
-                result: Err("Original explicit inventory failed".into()),
-            }));
-            assert!(!app.project_ui.is_reopening(&repository));
+            // Settle the physical request before admitting its replacement:
+            // success completes opening; an actual refusal permits a retry.
+            drop(app.update(Message::WorkspaceModelObserved(old_callback.clone())));
+            if success {
+                assert!(!app.project_ui.is_reopening(&repository));
+            } else {
+                assert!(app.project_ui.is_reopening(&repository));
+                assert!(app.workspace_model_reopens.can_retry(&repository));
+            }
             let mut current = canonical;
             if replacement_registry {
                 current.identity = uuid::Uuid::new_v4();
@@ -2867,6 +2867,9 @@ fn queued_old_reopen_success_and_failure_cannot_settle_new_registry_or_aba_inten
             let focused = app.workspace.focused();
             let pending = app.project_ui.reopening.clone();
             let notices = app.notices.entries.len();
+            // Replay the old reducer outcome to exercise stale-origin defense.
+            // This does not assert the publisher duplicates callbacks in normal
+            // operation or promises exactly-once delivery.
             drop(app.update(Message::WorkspaceModelObserved(old_callback)));
             assert_eq!(
                 app.workspace_model, model_before,
@@ -4252,4 +4255,247 @@ fn retiring_an_unrelated_shared_channel_during_read_keeps_the_real_project_close
     );
     assert!(app.sidebar_model.project(unrelated_project).is_some());
     assert!(app.project_ui.closed.contains(&repository));
+}
+
+#[test]
+fn prepublication_inventory_failure_keeps_loaded_and_provisional_retry_work_protected() {
+    use crate::app::Message;
+    for provisional in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        let create = take_creation_publications(&requests)
+            .into_iter()
+            .find(|edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == channel))
+            .unwrap();
+        let admitted = channel_publication_model(canonical, &create);
+        drop(app.update(Message::WorkspaceModelObserved(
+            framed_channel_publication_ack(create, admitted.clone()),
+        )));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                admitted.clone(),
+            ))),
+        );
+        let old = enqueue_explicit_reopen(&mut app, &requests, project);
+        let old_origin = old.reopen.clone().unwrap();
+        drop(app.update(Message::WorkspaceModelObserved(framed_reopen_failure(old))));
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        let closed = removed_project_model(admitted.clone(), &repository);
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                closed.clone(),
+            ))),
+        );
+        let channels = app.durable.channels.clone();
+        let cards = app.durable.cards.clone();
+        let drafts = app.persistent_workspace().chat_drafts;
+        let focused = app.workspace.focused();
+        // A retry from the picker can use either the loaded project P or a
+        // provisional Q that has no sidebar row until inventory completes.
+        drop(app.project_load_task(
+            repository.clone(),
+            (!provisional).then_some(project),
+            true,
+            Some(ProjectKind::Folder),
+        ));
+        let pending = *app
+            .project_ui
+            .reopening
+            .iter()
+            .find(|(_, path)| **path == repository)
+            .unwrap()
+            .0;
+        if provisional {
+            assert_ne!(pending, project);
+            assert!(app.sidebar_model.project(pending).is_none());
+        } else {
+            assert_eq!(pending, project);
+        }
+        let original = app.workspace_model_reopens.active[&pending].clone();
+        assert_ne!(original.nonce, old_origin.nonce);
+        let generation = app.repository_generations[&pending];
+        assert!(!app.workspace_model_reopens.queued.contains(&pending));
+        assert!(
+            requests.is_empty(),
+            "the fresh inventory has not published a reopen"
+        );
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: true,
+            project_id: pending,
+            generation,
+            result: Err("Private inventory IO failure before publication".into()),
+        }));
+        assert_eq!(
+            app.workspace_model_reopens.active.get(&pending),
+            Some(&original)
+        );
+        assert_eq!(app.project_ui.reopening.get(&pending), Some(&repository));
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        assert!(!app.workspace_model_reopens.queued.contains(&pending));
+        assert!(!app.project_ui.closed.contains(&repository));
+        assert!(!app.project_ui.closing.contains_key(&project));
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert_eq!(app.durable.channels, channels);
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focused);
+        assert!(requests.is_empty());
+        // An equal cached close must remain harmless while the user decides
+        // to retry. Recovery is finite and requires a fresh explicit pick.
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                closed.clone(),
+            ))),
+        );
+        assert_eq!(app.durable.channels, channels);
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert!(
+            requests.is_empty(),
+            "a cached close cannot automatically retry the failed inventory"
+        );
+        drop(app.project_load_task(
+            repository.clone(),
+            Some(project),
+            true,
+            Some(ProjectKind::Folder),
+        ));
+        let retry = app.workspace_model_reopens.active[&project].clone();
+        assert_ne!(retry.nonce, original.nonce);
+        if provisional {
+            assert!(!app.workspace_model_reopens.active.contains_key(&pending));
+        }
+        let generation = app.repository_generations[&project];
+        let loaded = crate::app::load_project(
+            &repository,
+            Some(project),
+            tokio_util::sync::CancellationToken::default(),
+            Some(ProjectKind::Folder),
+        )
+        .unwrap();
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: true,
+            project_id: project,
+            generation,
+            result: Ok(Box::new(loaded)),
+        }));
+        let queued = std::iter::from_fn(|| requests.try_recv().ok()).find(|queued| {
+            matches!(&queued.edit, ModelEdit::ReopenProject { repository: path, .. } if path == &repository)
+        }).expect("successful explicit retry publishes its captured origin");
+        assert_eq!(queued.reopen.as_ref().unwrap().nonce, retry.nonce);
+        // The successful explicit pick can navigate into the worktree and
+        // create its default pane. It must retain the protected conversation;
+        // its later publisher receipt must not change that new selection.
+        for card in &cards {
+            assert_eq!(
+                app.durable
+                    .cards
+                    .iter()
+                    .find(|current| current.id == card.id),
+                Some(card)
+            );
+        }
+        let recovered_cards = app.durable.cards.clone();
+        let recovered_drafts = app.persistent_workspace().chat_drafts;
+        for (target, draft) in &drafts {
+            assert_eq!(recovered_drafts.get(target), Some(draft));
+        }
+        let recovered_focus = app.workspace.focused();
+        let mut opened = admitted;
+        opened.sequence = closed.sequence + 1;
+        drop(app.update(Message::WorkspaceModelObserved(
+            framed_model_publication_callback(queued, opened),
+        )));
+        assert!(!app.project_ui.is_reopening(&repository));
+        assert!(!app.workspace_model_reopens.can_retry(&repository));
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert_eq!(app.durable.channels, channels);
+        assert_eq!(app.durable.cards, recovered_cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, recovered_drafts);
+        assert_eq!(app.workspace.focused(), recovered_focus);
+    }
+}
+
+#[test]
+fn inventory_failure_after_publication_keeps_the_inflight_shield_until_its_real_callback() {
+    use crate::app::Message;
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    let create = take_creation_publications(&requests)
+        .into_iter()
+        .find(|edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == channel))
+        .unwrap();
+    let admitted = channel_publication_model(canonical, &create);
+    drop(app.update(Message::WorkspaceModelObserved(
+        framed_channel_publication_ack(create, admitted.clone()),
+    )));
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            admitted.clone(),
+        ))),
+    );
+    // The ordinary UI publishes after inventory succeeds. This adversarial
+    // ordering invokes its public publication hook first, then delivers an IO
+    // failure for that generation; it makes no claim that normal inventory
+    // emits both outcomes or that production duplicates producer callbacks.
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let original = queued.reopen.clone().unwrap();
+    let generation = app.repository_generations[&project];
+    let closed = removed_project_model(admitted.clone(), &repository);
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            closed.clone(),
+        ))),
+    );
+    let channels = app.durable.channels.clone();
+    let cards = app.durable.cards.clone();
+    let drafts = app.persistent_workspace().chat_drafts;
+    let focused = app.workspace.focused();
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: true,
+        project_id: project,
+        generation,
+        result: Err("Private inventory IO failure while publication is queued".into()),
+    }));
+    assert!(app.current_reopen(&original));
+    assert!(app.workspace_model_reopens.queued.contains(&project));
+    assert!(!app.workspace_model_reopens.can_retry(&repository));
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    assert_eq!(app.repository_generations[&project], generation);
+    assert!(app.current_reopen(&original));
+    assert!(
+        requests.is_empty(),
+        "inventory failure cannot admit overlapping publication"
+    );
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.durable.channels, channels);
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
+    // Only the actual publisher outcome drains this in-flight attempt and
+    // permits a new explicit nonce. An IO failure alone cannot do so.
+    drop(
+        app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+            queued,
+        ))),
+    );
+    assert!(app.current_reopen(&original));
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    let retry = enqueue_explicit_reopen(&mut app, &requests, project);
+    assert_ne!(retry.reopen.as_ref().unwrap().nonce, original.nonce);
+    let mut opened = admitted;
+    opened.sequence = closed.sequence + 1;
+    drop(app.update(Message::WorkspaceModelObserved(
+        framed_model_publication_callback(retry, opened),
+    )));
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert_eq!(app.durable.channels, channels);
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
 }
