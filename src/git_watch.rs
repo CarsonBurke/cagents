@@ -516,6 +516,35 @@ struct Registrations {
 }
 
 impl Registrations {
+    /// A recursive registration owns the lifetime and failures of every path
+    /// it covers. Transfer owners to the outermost surviving watch before
+    /// removing overlaps; a nearer recursive ancestor may itself be covered.
+    fn coalesce_recursive(&mut self) {
+        let recursive = self
+            .desired
+            .iter()
+            .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let covered = self
+            .desired
+            .keys()
+            .filter_map(|path| {
+                path.ancestors()
+                    .skip(1)
+                    .filter(|ancestor| recursive.contains(*ancestor))
+                    .last()
+                    .map(|ancestor| (path.clone(), ancestor.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        for (path, covering) in covered {
+            if let Some(mut owners) = self.owners.remove(&path) {
+                self.owners.entry(covering).or_default().append(&mut owners);
+            }
+            self.desired.remove(&path);
+        }
+    }
+
     /// Metadata gets first claim on the watch and filesystem-work budgets.
     /// Content traversal also has a candidate budget: missing or symlinked
     /// directories cannot make a large census an unbounded planning job.
@@ -756,25 +785,16 @@ impl Monitor {
                         }
                         std::mem::replace(&mut pending.projects, projects.clone())
                     };
-                    let Registrations {
-                        mut desired,
-                        owners,
-                        mut failures,
-                    } = Registrations::within(&projects, MAX_DIRECTORIES);
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
-                    let recursive = desired
-                        .iter()
-                        .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
-                        .map(|(path, _)| path.clone())
-                        .collect::<BTreeSet<_>>();
-                    desired.retain(|path, _| {
-                        !path
-                            .ancestors()
-                            .skip(1)
-                            .any(|ancestor| recursive.contains(ancestor))
-                    });
+                    let mut registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+                    registrations.coalesce_recursive();
+                    let Registrations {
+                        desired,
+                        owners,
+                        mut failures,
+                    } = registrations;
                     let (faulted, retired) = {
                         let mut pending = state.lock().unwrap_or_else(|p| p.into_inner());
                         pending.registrations = desired
@@ -1442,6 +1462,222 @@ mod tests {
     }
 
     #[test]
+    fn recursive_overlap_transfers_every_owner_to_the_outermost_surviving_watch() {
+        let outer = PathBuf::from("/admin/A.git/worktrees");
+        let nested = outer.join("B/custom.git/refs");
+        let leaf = nested.join("heads");
+        let unrelated = PathBuf::from("/admin/unrelated.git/refs");
+        let ids = [
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+        ];
+        let mut registrations = Registrations {
+            desired: BTreeMap::from([
+                (outer.clone(), RecursiveMode::Recursive),
+                (nested.clone(), RecursiveMode::Recursive),
+                (leaf.clone(), RecursiveMode::NonRecursive),
+                (unrelated.clone(), RecursiveMode::Recursive),
+            ]),
+            owners: BTreeMap::from([
+                (outer.clone(), BTreeSet::from([ids[0]])),
+                (nested, BTreeSet::from([ids[1]])),
+                (leaf, BTreeSet::from([ids[2]])),
+                (unrelated.clone(), BTreeSet::from([ids[3]])),
+            ]),
+            ..Registrations::default()
+        };
+        registrations.coalesce_recursive();
+        assert_eq!(
+            registrations.desired,
+            BTreeMap::from([
+                (outer.clone(), RecursiveMode::Recursive),
+                (unrelated.clone(), RecursiveMode::Recursive),
+            ])
+        );
+        assert_eq!(
+            registrations.owners,
+            BTreeMap::from([
+                (outer, BTreeSet::from([ids[0], ids[1], ids[2]])),
+                (unrelated, BTreeSet::from([ids[3]])),
+            ])
+        );
+    }
+
+    #[test]
+    fn native_shared_recursive_retirement_recovers_the_nested_repository_owner() {
+        use notify::event::RemoveKind;
+        let directory = tempfile::tempdir().unwrap();
+        let common_a = directory.path().join("admin/A.git");
+        let covering = common_a.join("worktrees");
+        let common_b = covering.join("B/custom.git");
+        let checkout_a = directory.path().join("checkout/A");
+        let checkout_b = directory.path().join("checkout/B");
+        std::fs::create_dir_all(common_a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&checkout_a).unwrap();
+        std::fs::create_dir_all(&checkout_b).unwrap();
+        git(
+            &checkout_a,
+            &["init", "--separate-git-dir", common_a.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(common_b.parent().unwrap()).unwrap();
+        git(
+            &checkout_b,
+            &["init", "--separate-git-dir", common_b.to_str().unwrap()],
+        );
+        let repository = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            repository.common_dir(&checkout_a, &cancellation).unwrap(),
+            common_a
+        );
+        assert_eq!(
+            repository.common_dir(&checkout_b, &cancellation).unwrap(),
+            common_b
+        );
+        let mut a = project(directory.path());
+        a.worktrees.truncate(1);
+        a.common_dir = common_a.clone();
+        a.worktrees[0].root = checkout_a;
+        a.worktrees[0].git_dir = common_a;
+        a.worktrees[0].census = census(&[]);
+        let mut b = a.clone();
+        b.id = ProjectId::new();
+        b.common_dir = common_b.clone();
+        b.worktrees[0].id = WorktreeId::new();
+        b.worktrees[0].root = checkout_b;
+        b.worktrees[0].git_dir = common_b.clone();
+        let ids = BTreeSet::from([a.id, b.id]);
+        let b_id = b.id;
+        let b_worktree = b.worktrees[0].id;
+        let projects = BTreeMap::from([(a.id, Arc::new(a)), (b.id, Arc::new(b))]);
+        let mut registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(registrations.failures.is_empty());
+        assert_eq!(registrations.owners[&covering].len(), 1);
+        assert!(registrations.owners[&common_b].contains(&b_id));
+        registrations.coalesce_recursive();
+        assert_eq!(registrations.owners[&covering], ids);
+        assert!(!registrations.desired.contains_key(&common_b));
+        assert!(
+            !registrations
+                .desired
+                .contains_key(common_b.parent().unwrap())
+        );
+        let mut pending = Pending {
+            projects: projects.clone(),
+            registrations: registrations.owners.clone(),
+            ..Pending::default()
+        };
+        for (&id, project) in &projects {
+            pending
+                .roots
+                .entry(project.common_dir.clone())
+                .or_default()
+                .insert(id);
+            pending
+                .roots
+                .entry(project.worktrees[0].root.clone())
+                .or_default()
+                .insert(id);
+        }
+        let file = common_b.join("HEAD");
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+            if let Ok(event) = event
+                && !access_only(&event)
+            {
+                sender.send(event).unwrap();
+            }
+        })
+        .unwrap();
+        let mut registered = BTreeMap::new();
+        let mut failures = BTreeMap::new();
+        assert!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &registrations.desired,
+                &registrations.owners,
+                &BTreeSet::new(),
+                &mut failures
+            )
+            .contains(&b_id)
+        );
+        let identity = registered[&covering];
+        watcher.unwatch(&covering).unwrap();
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&file, "ref: refs/heads/while-watch-absent\n").unwrap();
+        let absent_deadline = Instant::now() + Duration::from_millis(50);
+        while let Ok(event) =
+            receiver.recv_timeout(absent_deadline.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                !event.paths.contains(&file)
+                    || !matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))),
+                "the nested repository must actually lose native coverage for this fixture"
+            );
+        }
+        let metadata = std::fs::symlink_metadata(&covering).unwrap();
+        assert_eq!(
+            identity,
+            (RecursiveMode::Recursive, metadata.dev(), metadata.ino())
+        );
+        // This ancestor is outside B's common/root paths. Its surviving watch
+        // must carry B's owner before any later B edit can rescue its routing.
+        assert!(pending.event(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(covering.clone())
+        )));
+        let recovery = &pending.changes[&b_id];
+        assert!(recovery.topology && recovery.membership);
+        assert_eq!(recovery.worktrees, BTreeSet::from([b_worktree]));
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &registrations.desired,
+                &registrations.owners,
+                &pending.retired,
+                &mut failures
+            ),
+            ids
+        );
+        assert!(failures.is_empty());
+        pending.changes.clear();
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&file, "ref: refs/heads/after-owner-recovery\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("nested repository metadata edit after shared watch recovery");
+            if event.paths.contains(&file)
+                && matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+            {
+                assert!(pending.event(Ok(event)));
+                assert!(pending.changes[&b_id].worktrees.contains(&b_worktree));
+                break;
+            }
+        }
+        let unavailable = covering.with_file_name("worktrees-unavailable");
+        std::fs::rename(&covering, &unavailable).unwrap();
+        failures.clear();
+        reconcile(
+            &mut watcher,
+            &mut registered,
+            &registrations.desired,
+            &registrations.owners,
+            &BTreeSet::from([covering]),
+            &mut failures,
+        );
+        assert_eq!(
+            failures.keys().copied().collect::<BTreeSet<_>>(),
+            ids,
+            "a failed surviving recursive watch must report every covered owner"
+        );
+    }
+
+    #[test]
     fn symlink_and_missing_ancestors_are_not_followed_and_can_be_recreated() {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path());
@@ -1629,8 +1865,8 @@ mod tests {
         await_edit("initial live watch");
         watcher.unwatch(&source).unwrap();
         // Explicit native watch loss models DELETE/MOVED_FROM retirement.
-        // Keeping this directory in place makes inode reuse deterministic,
-        // rather than depending on the runner filesystem's allocator.
+        // Keeping this directory in place supplies identical cached metadata
+        // without depending on the runner filesystem's inode allocator.
         let metadata = std::fs::symlink_metadata(&source).unwrap();
         assert_eq!(
             registered[&source],
