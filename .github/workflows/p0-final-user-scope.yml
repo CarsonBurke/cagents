@@ -1,4 +1,4 @@
-name: P0 final439 User-scope qualification
+name: P0 final User-scope qualification
 
 # Temporary supplementary qualification. Retain immutable run/artifact links,
 # then close this control PR without merging; artifacts expire after 14 days.
@@ -19,12 +19,12 @@ env:
   RUSTUP_TOOLCHAIN: 1.93.0
   P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
   P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
-  P0_PRODUCT_HEAD: 439444b44611a1c05997f1b34f88b9d993411926
-  P0_PRODUCT_TREE: 0208332031f8a8499cabf1e5d5b652ab4ab43057
+  P0_PRODUCT_HEAD: 091f030dadb17bec2008786acdb7decaadd90e7c
+  P0_PRODUCT_TREE: 197e4abaeee303c694cc2f04bfc50545cbba95eb
 
 jobs:
-  host-final439:
-    name: Final439 exact HOST parents in natural User scope
+  host-final091f:
+    name: Final091f exact HOST parents in natural User scope
     if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
     runs-on: ubuntu-22.04
     timeout-minutes: 160
@@ -311,8 +311,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  ui-final439:
-    name: Exact439 UI23 and cold12 parents in natural hosted User scope
+  ui-final091f:
+    name: Exact091f UI23 and cold13 parents in natural hosted User scope
     if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
     runs-on: ubuntu-22.04
     timeout-minutes: 210
@@ -323,8 +323,8 @@ jobs:
       P0_EVIDENCE_DIR: /tmp/p0-final-user-scope-ui-${{ github.run_id }}-${{ github.run_attempt }}
       P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
       P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
-      P0_PRODUCT_HEAD: 439444b44611a1c05997f1b34f88b9d993411926
-      P0_PRODUCT_TREE: 0208332031f8a8499cabf1e5d5b652ab4ab43057
+      P0_PRODUCT_HEAD: 091f030dadb17bec2008786acdb7decaadd90e7c
+      P0_PRODUCT_TREE: 197e4abaeee303c694cc2f04bfc50545cbba95eb
     defaults:
       run:
         shell: bash
@@ -368,8 +368,8 @@ jobs:
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
           control_base = '4d18d788d03588621907b423a2df0e129f6e689c'
-          product = '439444b44611a1c05997f1b34f88b9d993411926'
-          tree = '0208332031f8a8499cabf1e5d5b652ab4ab43057'
+          product = '091f030dadb17bec2008786acdb7decaadd90e7c'
+          tree = '197e4abaeee303c694cc2f04bfc50545cbba95eb'
           assert control_base == os.environ['P0_CONTROL_BASE']
           assert product == os.environ['P0_PRODUCT_HEAD'] and tree == os.environ['P0_PRODUCT_TREE']
           workflow = '.github/workflows/p0-final-user-scope.yml'
@@ -407,7 +407,7 @@ jobs:
           def blob(path):
               return subprocess.check_output(['git', 'show', product + ':' + path])
           product_hashes = {p: hashlib.sha256(blob(p)).hexdigest() for p in paths}
-          assert product_hashes['src/app/chat_ui/retained_history_admission_tests.rs'] == '91ca4d1de27dab264bb3a63691b068d3259690dc09d40916dc1a5907a355be3c'
+          assert product_hashes['src/app/chat_ui/retained_history_admission_tests.rs'] == 'af09ce5bdee439ca31ee2bbd6c28233972e35a8b3cc2ff366d4d109b70fbf72c'
           workflow_bytes = pathlib.Path(workflow).read_bytes()
           setup_bytes = pathlib.Path(setup).read_bytes()
           (evidence / 'workflow-control.yml').write_bytes(workflow_bytes)
@@ -421,20 +421,20 @@ jobs:
               'workflow_sha256': hashlib.sha256(workflow_bytes).hexdigest(),
               'setup_blob': setup_blob,
               'setup_sha256': hashlib.sha256(setup_bytes).hexdigest(),
-              'authoritative_439_source_packet_sha256': '9897e3a24aecbfff6db743621cc5778cdf231d0136d45291b3ab7a6754e173fd',
-              'cold12_leaf_sha256': '91ca4d1de27dab264bb3a63691b068d3259690dc09d40916dc1a5907a355be3c',
+              'authoritative_product_source_packet_sha256': '59a6965c0a0457bef6c69853509f96daf386d7e0e88cd7a7459c5d0d8def11a6',
+              'cold13_leaf_sha256': 'af09ce5bdee439ca31ee2bbd6c28233972e35a8b3cc2ff366d4d109b70fbf72c',
               'selector_names_reference_48c_bundle_sha256': 'c6b9e1d9ca37bb134b1b72e57ab3337a5bc2abe6a9706dae50b00caad8f1a83d',
               'source_sha256': product_hashes,
-              'scope': 'Exact439 UI35 parents only; not native, HOST, full CI or recovery acceptance',
+              'scope': 'Exact091f UI36 parents only; not native, HOST, full CI or recovery acceptance',
           }, indent=2) + '\n')
-          (evidence / 'selectors.json').write_text(json.dumps(['app::shared_views::tests::startup_admission::retired_cached_shared_chat_executes_no_provider_start', 'app::shared_views::tests::startup_admission::authoritative_offscreen_chat_executes_exact_descriptor_once', 'app::shared_views::tests::startup_admission::local_only_cached_chat_still_restores_and_preserves_its_draft', 'app::shared_views::tests::startup_admission::retired_cached_draft_stays_readable_and_cannot_start_provider', 'app::shared_views::tests::startup_admission::replacement_admission_keeps_old_draft_beside_exact_canonical_chat', 'app::shared_views::tests::startup_admission::history_picker_does_not_focus_retained_unadmitted_cache', 'app::shared_views::tests::startup_admission::startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment', 'app::shared_views::tests::startup_admission::exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver', 'app::shared_views::tests::startup_admission::canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt', 'app::shared_views::tests::startup_admission::refused_canonical_upgrade_preserves_source_draft_without_provider_activation', 'app::shared_views::tests::startup_admission::canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment', 'app::shared_views::tests::startup_admission::an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission', 'app::shared_views::tests::startup_admission::refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider', 'app::shared_views::tests::startup_admission::failed_seed_retry_rejects_stale_owner_source_registry_and_attempt', 'app::shared_views::tests::startup_admission::failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor', 'app::shared_views::tests::startup_admission::failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts', 'app::shared_views::tests::startup_admission::retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots', 'app::shared_views::tests::startup_admission::closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat', 'app::shared_views::tests::startup_admission::retry_view::saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_all_widths', 'app::shared_views::tests::startup_admission::retry_view::closed_publisher_exposes_this_window_instruction_without_retry_or_keyboard_action', 'app::shared_views::tests::startup_admission::retry_view::native_retry_keyboard_dispatches_exact_attempt_and_queued_old_action_cannot_retry_its_successor', 'app::shared_views::tests::startup_admission::retry_view::retained_retry_press_cannot_cross_attempts_and_unchanged_attempt_keeps_its_native_press', 'app::shared_views::tests::startup_admission::retry_view::disabled_retry_keeps_failure_visible_and_reenabled_retry_requires_a_fresh_press', 'app::chat_ui::tests::cold_retained_copy_opens_history_after_atomic_ack_then_requires_explicit_resume', 'app::chat_ui::tests::retained_history_lost_ack_needs_fresh_explicit_retry_and_keeps_latest_content', 'app::chat_ui::tests::retained_history_coalesced_aba_does_not_rearm_cancelled_snapshot_provenance', 'app::chat_ui::tests::retained_history_stale_context_and_changed_ack_connection_remain_inert', 'app::chat_ui::tests::strict_retained_history_wire_refuses_actor_mismatch_and_unsettled_results', 'app::chat_ui::tests::retained_history_atomic_refusal_preserves_both_copies_and_latest_retry', 'app::chat_ui::tests::retained_history_close_while_ack_pending_persists_only_closed_reader', 'app::chat_ui::tests::cold_image_only_retained_copy_can_open_history_without_a_text_draft', 'app::chat_ui::tests::generic_cached_pending_pane_cannot_spend_a_retained_copy_admission', 'app::chat_ui::tests::admitted_retained_history_detaches_later_actor_frames_and_restores_with_strict_policy', 'app::chat_ui::tests::explicit_same_allocation_resume_spends_only_reader_policy_with_content_ack', 'app::chat_ui::tests::retained_history_full_checkpoint_projects_prior_rebinding_and_unrelated_copy'], indent=2) + '\n')
+          (evidence / 'selectors.json').write_text(json.dumps(['app::shared_views::tests::startup_admission::retired_cached_shared_chat_executes_no_provider_start', 'app::shared_views::tests::startup_admission::authoritative_offscreen_chat_executes_exact_descriptor_once', 'app::shared_views::tests::startup_admission::local_only_cached_chat_still_restores_and_preserves_its_draft', 'app::shared_views::tests::startup_admission::retired_cached_draft_stays_readable_and_cannot_start_provider', 'app::shared_views::tests::startup_admission::replacement_admission_keeps_old_draft_beside_exact_canonical_chat', 'app::shared_views::tests::startup_admission::history_picker_does_not_focus_retained_unadmitted_cache', 'app::shared_views::tests::startup_admission::startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment', 'app::shared_views::tests::startup_admission::exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver', 'app::shared_views::tests::startup_admission::canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt', 'app::shared_views::tests::startup_admission::refused_canonical_upgrade_preserves_source_draft_without_provider_activation', 'app::shared_views::tests::startup_admission::canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment', 'app::shared_views::tests::startup_admission::an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission', 'app::shared_views::tests::startup_admission::refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider', 'app::shared_views::tests::startup_admission::failed_seed_retry_rejects_stale_owner_source_registry_and_attempt', 'app::shared_views::tests::startup_admission::failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor', 'app::shared_views::tests::startup_admission::failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts', 'app::shared_views::tests::startup_admission::retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots', 'app::shared_views::tests::startup_admission::closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat', 'app::shared_views::tests::startup_admission::retry_view::saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_all_widths', 'app::shared_views::tests::startup_admission::retry_view::closed_publisher_exposes_this_window_instruction_without_retry_or_keyboard_action', 'app::shared_views::tests::startup_admission::retry_view::native_retry_keyboard_dispatches_exact_attempt_and_queued_old_action_cannot_retry_its_successor', 'app::shared_views::tests::startup_admission::retry_view::retained_retry_press_cannot_cross_attempts_and_unchanged_attempt_keeps_its_native_press', 'app::shared_views::tests::startup_admission::retry_view::disabled_retry_keeps_failure_visible_and_reenabled_retry_requires_a_fresh_press', 'app::chat_ui::tests::cold_retained_copy_opens_history_after_atomic_ack_then_requires_explicit_resume', 'app::chat_ui::tests::retained_history_lost_ack_needs_fresh_explicit_retry_and_keeps_latest_content', 'app::chat_ui::tests::retained_history_coalesced_aba_does_not_rearm_cancelled_snapshot_provenance', 'app::chat_ui::tests::retained_history_stale_context_and_changed_ack_connection_remain_inert', 'app::chat_ui::tests::strict_retained_history_wire_refuses_actor_mismatch_and_unsettled_results', 'app::chat_ui::tests::retained_history_atomic_refusal_preserves_both_copies_and_latest_retry', 'app::chat_ui::tests::retained_history_close_while_ack_pending_persists_only_closed_reader', 'app::chat_ui::tests::cold_image_only_retained_copy_can_open_history_without_a_text_draft', 'app::chat_ui::tests::generic_cached_pending_pane_cannot_spend_a_retained_copy_admission', 'app::chat_ui::tests::admitted_retained_history_detaches_later_actor_frames_and_restores_with_strict_policy', 'app::chat_ui::tests::explicit_same_allocation_resume_spends_only_reader_policy_with_content_ack', 'app::chat_ui::tests::retained_history_full_checkpoint_projects_prior_rebinding_and_unrelated_copy', 'app::chat_ui::tests::retained_history_enqueue_refusal_keeps_content_and_allows_fresh_writer_retry'], indent=2) + '\n')
           PY
 
       - name: Prepare the unchanged trusted Linux environment before detach
         timeout-minutes: 20
         uses: ./.github/actions/setup-linux-build
 
-      - name: Detach the disposable checkout to exact439 before any Cargo
+      - name: Detach the disposable checkout to exact091f before any Cargo
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -470,12 +470,12 @@ jobs:
           }, indent=2) + '\n')
           PY
 
-      - name: Check only the exact439 browserless UI executable boundary
+      - name: Check only the exact091f browserless UI executable boundary
         timeout-minutes: 35
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 439444b44611a1c05997f1b34f88b9d993411926
-          test "$(git rev-parse 'HEAD^{tree}')" = 0208332031f8a8499cabf1e5d5b652ab4ab43057
+          test "$(git rev-parse HEAD)" = 091f030dadb17bec2008786acdb7decaadd90e7c
+          test "$(git rev-parse 'HEAD^{tree}')" = 197e4abaeee303c694cc2f04bfc50545cbba95eb
           test -z "$(git status --porcelain)"
           python3 - <<'PY'
           import os
@@ -498,8 +498,8 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 439444b44611a1c05997f1b34f88b9d993411926
-          test "$(git rev-parse 'HEAD^{tree}')" = 0208332031f8a8499cabf1e5d5b652ab4ab43057
+          test "$(git rev-parse HEAD)" = 091f030dadb17bec2008786acdb7decaadd90e7c
+          test "$(git rev-parse 'HEAD^{tree}')" = 197e4abaeee303c694cc2f04bfc50545cbba95eb
           test -z "$(git status --porcelain)"
           python3 - <<'PY'
           import os
@@ -573,7 +573,7 @@ jobs:
           (evidence / 'private-paths.json').write_text(json.dumps(paths, indent=2) + '\n')
           PY
 
-      - name: Run all35 exact parents serially and stop at the first failure
+      - name: Run all36 exact parents serially and stop at the first failure
         timeout-minutes: 90
         run: |
           set -euo pipefail
@@ -583,7 +583,7 @@ jobs:
           control = json.loads((evidence / 'control-source.json').read_text())
           identity = json.loads((evidence / 'test-artifact.json').read_text())
           selectors = json.loads((evidence / 'selectors.json').read_text())
-          assert len(selectors) == 35 and len(set(selectors)) == 35
+          assert len(selectors) == 36 and len(set(selectors)) == 36
           executable = pathlib.Path(identity['path'])
           fixture_root = pathlib.Path(os.environ['P0_UI_FIXTURE_ROOT']).resolve(strict=True)
           results = []
@@ -606,50 +606,70 @@ jobs:
               return sorted(n for n in os.environ if n.startswith('CAGENTS')
                             or n in {'AUTH', 'AGENT_TOKEN', 'SESSION_TOKEN'})
           def census():
-              # Read-only candidate census, not ancestry/custody authority.
-              # Never signal processes found through these observations.
-              found, errors = [], []
+              # Authored isolation uses current_exe child modes; expected
+              # scripted peers use threads. Nominate by readable comm/argv
+              # before protected exe/cwd observations. This bounded diagnostic
+              # is not whole-host/family/custody proof or signal authority.
+              found, candidate_errors, diagnostics = [], [], []
+              noncandidates, other_uids = 0, 0
               for entry in pathlib.Path('/proc').iterdir():
                   if not entry.name.isdigit():
                       continue
+                  reasons, comm, started = [], None, None
+                  stage = 'uid'
                   try:
                       if entry.stat().st_uid != os.getuid():
+                          other_uids += 1
                           continue
+                      stage = 'stat_before_nomination'
                       before = (entry / 'stat').read_text()
                       comm = before[before.index('(') + 1:before.rindex(')')]
                       tail = before[before.rindex(')') + 2:].split()
                       started = int(tail[19])
-                      reasons = []
-                      try:
-                          info = (entry / 'exe').stat()
-                          if (info.st_dev, info.st_ino) == (identity['device'], identity['inode']):
-                              reasons.append('exact_test_executable_file_identity')
-                      except FileNotFoundError:
-                          pass
                       if comm == executable.name[:15]:
                           reasons.append('matching_test_comm_candidate')
+                      stage = 'cmdline_nomination'
                       args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      if any(arg == str(executable).encode() for arg in args):
+                          reasons.append('exact_test_executable_argument')
                       prefix = str(fixture_root).encode() + b'/'
                       if any(arg == str(fixture_root).encode() or arg.startswith(prefix) for arg in args):
                           reasons.append('private_fixture_path_argument')
-                      try:
-                          cwd = (entry / 'cwd').resolve(strict=True)
-                          if cwd == fixture_root or fixture_root in cwd.parents:
-                              reasons.append('private_fixture_working_directory')
-                      except FileNotFoundError:
-                          pass
+                      stage = 'stat_after_nomination'
+                      nominated = (entry / 'stat').read_text()
+                      if int(nominated[nominated.rindex(')') + 2:].split()[19]) != started:
+                          raise ValueError('identity_changed_during_nomination')
+                      if not reasons:
+                          noncandidates += 1
+                          continue
+                      # Positively nominated uncertainty fails closed. Do not
+                      # probe these protected details for unrelated processes.
+                      stage = 'candidate_executable'
+                      info = (entry / 'exe').stat()
+                      if (info.st_dev, info.st_ino) == (identity['device'], identity['inode']):
+                          reasons.append('exact_test_executable_file_identity')
+                      stage = 'candidate_working_directory'
+                      cwd = (entry / 'cwd').resolve(strict=True)
+                      if cwd == fixture_root or fixture_root in cwd.parents:
+                          reasons.append('private_fixture_working_directory')
+                      stage = 'candidate_stat_after_details'
                       after = (entry / 'stat').read_text()
                       if int(after[after.rindex(')') + 2:].split()[19]) != started:
-                          errors.append({'pid': int(entry.name), 'error': 'identity_changed_during_observation'})
-                      elif reasons:
-                          found.append({'pid': int(entry.name), 'start_ticks': started,
-                                        'comm': comm, 'state': tail[0], 'candidate_reasons': reasons})
-                  except (FileNotFoundError, ProcessLookupError):
-                      continue
-                  except (PermissionError, OSError, ValueError) as error:
-                      errors.append({'pid': int(entry.name), 'error': type(error).__name__})
-              return {'candidates': found, 'observation_errors': errors,
-                      'scope': 'Exact artifact and private-path candidates only; no PPID custody or signaling'}
+                          raise ValueError('candidate_identity_changed_during_observation')
+                      found.append({'pid': int(entry.name), 'start_ticks': started,
+                                    'comm': comm, 'state': tail[0], 'candidate_reasons': reasons})
+                  except (OSError, ValueError, IndexError) as error:
+                      detail = {'pid': int(entry.name), 'start_ticks': started,
+                                'comm': comm, 'stage': stage, 'error': type(error).__name__,
+                                'candidate_reasons': reasons}
+                      (candidate_errors if reasons else diagnostics).append(detail)
+              return {'candidates': found, 'candidate_observation_errors': candidate_errors,
+                      'unclassified_observation_diagnostics': diagnostics,
+                      'same_uid_readable_noncandidates': noncandidates,
+                      'other_uid_processes_outside_scope': other_uids,
+                      'whole_host_observation_complete': False,
+                      'strict_family_or_custody_proof': False,
+                      'scope': 'Bounded comm/argv-nominated artifact/private-path observations only; unreadable unclassified processes remain incomplete diagnostics. No whole-host/family-zero claim, PPID custody or signaling'}
           for index, selector in enumerate(selectors, 1):
               phase = evidence / f'parent-{index:02d}'
               phase.mkdir(mode=0o700)
@@ -658,7 +678,7 @@ jobs:
                            'forbidden_context_names': names, 'test_sha256': digest(executable)}
               (phase / 'preflight.json').write_text(json.dumps(preflight, indent=2) + '\n')
               assert exact(pre_source) and not names
-              assert not pre_census['candidates'] and not pre_census['observation_errors']
+              assert not pre_census['candidates'] and not pre_census['candidate_observation_errors']
               assert preflight['test_sha256'] == identity['sha256']
               argv = ['timeout', '--signal=TERM', '--kill-after=15s', '150s',
                       str(executable), selector, '--exact', '--nocapture', '--test-threads=1']
@@ -671,7 +691,7 @@ jobs:
               summary = re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;.*$', output, re.M)
               selected = output.count(f'test {selector} ...')
               integrity = (exact(post_source) and not post_names
-                           and not post_census['candidates'] and not post_census['observation_errors']
+                           and not post_census['candidates'] and not post_census['candidate_observation_errors']
                            and hash_after == identity['sha256'])
               passed = (result.returncode == 0 and selected == 1 and len(summary) == 1
                         and len(re.findall(r'^running 1 test$', output, re.M)) == 1 and integrity)
@@ -693,11 +713,11 @@ jobs:
               results.append(record)
               (evidence / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
               assert passed, f'Exact parent {index} failed; stop before another fixture'
-          assert len(results) == 35 and all(row['passed'] for row in results)
+          assert len(results) == 36 and all(row['passed'] for row in results)
           (evidence / 'qualification.json').write_text(json.dumps({
               'source_head': control['product_head'], 'source_tree': control['product_tree'],
               'exact_parents_passed': len(results), 'test_sha256': identity['sha256'],
-              'scope': '35 serial UI parents (23 admission and 12 cold storage/frame contracts); not baseline causal controls, full CI, native UX or installed recovery',
+              'scope': '36 serial UI parents (23 admission and 13 cold storage/frame contracts); not baseline causal controls, full CI, native UX or installed recovery',
           }, indent=2) + '\n')
           PY
 
