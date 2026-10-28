@@ -2092,6 +2092,170 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_status_optional_fields_round_trip_in_framed_agent_response() {
+        use crate::{
+            agent::{ActivityState, Provider},
+            agent_execution::{
+                Lineage, Reply, State,
+                directory::{
+                    Delegation, Directory, Entry, ExecutionStatus, Owner, Relation, RunStatus,
+                    Scope, Status, Surface,
+                },
+            },
+            model::{AgentId, ChannelId, RunId},
+        };
+
+        let sample = |activity, parent_busy, active_run| ExecutionStatus {
+            activity,
+            generation: 19,
+            turn_generation: 7,
+            parent_busy,
+            active_run,
+        };
+        let latest = |diagnostic| RunStatus {
+            id: RunId::new(),
+            state: State::Failed,
+            request_recorded: false,
+            diagnostic,
+        };
+        let variants = [
+            // A plain terminal has no status object. Its following directory
+            // fields must not be mistaken for the absent optional object.
+            (ActivityState::Unknown, None),
+            (
+                ActivityState::Working,
+                Some(Status {
+                    observed: Some(sample(ActivityState::Working, true, Some(RunId::new()))),
+                    latest_run: None,
+                    pending_message: None,
+                }),
+            ),
+            (
+                ActivityState::Idle,
+                Some(Status {
+                    observed: None,
+                    latest_run: Some(latest(None)),
+                    // A redacted diagnostic must not consume the independent
+                    // mailbox option or the fields after this status object.
+                    pending_message: Some(false),
+                }),
+            ),
+            (
+                ActivityState::Waiting,
+                Some(Status {
+                    observed: Some(sample(ActivityState::Waiting, true, None)),
+                    latest_run: Some(RunStatus {
+                        id: RunId::new(),
+                        state: State::Waiting,
+                        request_recorded: true,
+                        diagnostic: None,
+                    }),
+                    pending_message: Some(true),
+                }),
+            ),
+            (
+                ActivityState::Idle,
+                Some(Status {
+                    observed: Some(sample(ActivityState::Idle, false, None)),
+                    latest_run: Some(latest(Some(
+                        "Capacity unavailable: λ / 容量\nretry later".into(),
+                    ))),
+                    pending_message: Some(false),
+                }),
+            ),
+        ];
+        let project = PathBuf::from("/fixture/project");
+        let mut entries = variants
+            .into_iter()
+            .enumerate()
+            .map(|(index, (state, status))| {
+                let channel = ChannelId::new();
+                let run = RunId::new();
+                Entry {
+                    id: TerminalId::new(),
+                    surface: if status.is_none() {
+                        Surface::Terminal
+                    } else {
+                        Surface::Chat
+                    },
+                    provider: Some(Provider::Claude),
+                    title: Some(format!("Session {index}: λ")),
+                    channel: Some(channel),
+                    view_scope: Some(crate::agent_execution::Placement::Channel(channel)),
+                    channel_repository: Some(project.clone()),
+                    state,
+                    status,
+                    directory: Some(project.join(format!("worktree-{index}/nested"))),
+                    worktree: Some(project.join(format!("worktree-{index}"))),
+                    project: Some(project.clone()),
+                    project_name: Some(format!("Project {index}")),
+                    delegation: (index % 2 == 0).then(|| Delegation {
+                        agent: AgentId::new(),
+                        owner: Owner::Session(Lineage(TerminalId::new())),
+                        run: Some(run),
+                        run_state: Some(State::Succeeded),
+                    }),
+                    relation: if index == 0 {
+                        Relation::Myself
+                    } else {
+                        Relation::Peer
+                    },
+                    lineage: Lineage(TerminalId::new()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let directory = Directory {
+            caller: Some(entries.remove(0)),
+            scope: Scope::Project(project),
+            sessions: entries,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("directory-status-wire"),
+            boot_id: BootId::new("fixture"),
+            host_incarnation: HostIncarnation::new("directory-status-wire"),
+        };
+        let expected = ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(47),
+            proof: proof.clone(),
+            message: ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::Directory(directory)),
+            },
+        };
+        let following = ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(48),
+            proof,
+            message: ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &ServerEnvelopeRef {
+                version: expected.version,
+                request_id: expected.request_id,
+                proof: &expected.proof,
+                message: &expected.message,
+            },
+        )
+        .unwrap();
+        write_frame(&mut bytes, &following).unwrap();
+        let mut reader = Cursor::new(bytes);
+        let actual: ServerEnvelope = read_frame(&mut reader).unwrap().unwrap();
+        // Compare the entire envelope, including every entry's trailing
+        // placement, directory, delegation, lineage and private option bits.
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_frame::<ServerEnvelope>(&mut reader).unwrap(),
+            Some(following),
+            "optional directory fields must not corrupt the following frame"
+        );
+        assert_eq!(read_frame::<ServerEnvelope>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
         #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
         struct LegacyOptions {

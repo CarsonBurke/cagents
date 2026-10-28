@@ -93,7 +93,7 @@ pub struct RunStatus {
     pub state: State,
     pub request_recorded: bool,
     /// Owner-only, bounded diagnostic. Never a result body or provider prompt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub diagnostic: Option<String>,
 }
 
@@ -195,7 +195,7 @@ pub struct Entry {
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
     pub state: ActivityState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub status: Option<Status>,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
