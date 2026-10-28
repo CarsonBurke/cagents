@@ -282,14 +282,6 @@ def run():
         os.environ["XDG_RUNTIME_DIR"] = str(runtime)
         os.environ["TMPDIR"] = str(scratch)
         flags = ["--locked", "--no-default-features", "--features", "host"]
-        built, helper_phase = qualifier.observed("helper-build", ["cargo", "build", *flags, "--bin", "cagentsd",
-                                                                   "--message-format=json-render-diagnostics"], 1800, build_only=True)
-        if not built["passed"]:
-            results.append({"pr": product["pr"], "passed": False, "reason": "helper build failed"})
-            write_json(evidence / "results.json", results)
-            continue
-        helper = qualifier.artifact(helper_phase, "cagentsd", False)
-        os.environ[HELPER_ENV] = str(helper)
         compiled, test_phase = qualifier.observed("test-build", ["cargo", "test", *flags, *product["compile_targets"],
                                                                   "--no-run", "--message-format=json-render-diagnostics"], 1800, build_only=True)
         if not compiled["passed"]:
@@ -300,6 +292,18 @@ def run():
         if product["pr"] == 1855:
             # Compile the real ignored target without executing any provider arm.
             qualifier.artifact(test_phase, "codex_continuity_qualification", True)
+        # Integration-test compilation also produces cagentsd. Seal the test
+        # artifacts first, then build and seal the final matched helper. No
+        # later Cargo producer may rewrite a sealed executable before tests.
+        built, helper_phase = qualifier.observed("helper-build", ["cargo", "build", *flags, "--bin", "cagentsd",
+                                                                   "--message-format=json-render-diagnostics"], 1800, build_only=True)
+        if not built["passed"]:
+            results.append({"pr": product["pr"], "passed": False, "reason": "helper build failed"})
+            write_json(evidence / "results.json", results)
+            continue
+        helper = qualifier.artifact(helper_phase, "cagentsd", False)
+        os.environ[HELPER_ENV] = str(helper)
+        if product["pr"] == 1855:
             outer = scratch / "outer"
             outer.mkdir(mode=0o700)
             subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "init", "--quiet", "--template=",
