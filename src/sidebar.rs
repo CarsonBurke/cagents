@@ -1754,12 +1754,57 @@ struct ChangeRowChrome {
     discard_name: Box<str>,
 }
 
+/// Snapshot-owned display indexes. Paths and chrome remain in the original
+/// rows; directory lookup stores only row indices and exclusive subtree ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangeTree {
+    rows: Vec<FileRow>,
+    files: Vec<usize>,
+    directories: Vec<(usize, usize)>,
+}
+
+impl From<Vec<FileRow>> for ChangeTree {
+    fn from(rows: Vec<FileRow>) -> Self {
+        let mut files = Vec::new();
+        let mut directories: Vec<(usize, usize)> = Vec::new();
+        let mut ancestors: Vec<usize> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            while ancestors
+                .last()
+                .is_some_and(|last| rows[directories[*last].0].depth >= row.depth)
+            {
+                directories[ancestors.pop().unwrap()].1 = index;
+            }
+            if row.directory {
+                ancestors.push(directories.len());
+                directories.push((index, rows.len()));
+            } else {
+                files.push(index);
+            }
+        }
+        directories.sort_unstable_by(|left, right| rows[left.0].path.cmp(&rows[right.0].path));
+        Self {
+            rows,
+            files,
+            directories,
+        }
+    }
+}
+
+impl std::ops::Deref for ChangeTree {
+    type Target = [FileRow];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
 /// One `Changes` group: conflicts, staged, unstaged, or untracked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeGroup {
     pub area: ChangeArea,
     rows: Vec<ChangeRow>,
-    tree: Vec<FileRow>,
+    tree: ChangeTree,
     path_order: Vec<usize>,
     chrome: ChangeGroupChrome,
 }
@@ -1903,7 +1948,7 @@ pub struct BranchChangesModel {
     pub head: Oid,
     pub merge_base: Oid,
     pub rows: Vec<BranchChangeRow>,
-    tree: Vec<FileRow>,
+    tree: ChangeTree,
     /// The row count the Branch tab states beside its name.
     count_label: Box<str>,
     base_label: Box<str>,
@@ -2068,7 +2113,7 @@ fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
     file_rows_from_tree(build_file_tree(paths))
 }
 
-fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
+fn change_file_rows(paths: &[RepoPath]) -> ChangeTree {
     crate::change_list::compact_tree(build_file_tree(paths))
         .into_iter()
         .map(|entry| {
@@ -2086,7 +2131,8 @@ fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
                 ignored: false,
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
@@ -3290,7 +3336,7 @@ impl SidebarState {
             .get(&ChangeTreeScope::Area(row.area));
         let mut below = None;
         let mut position = 0;
-        for candidate in &group.tree {
+        for candidate in group.tree.iter() {
             if self.change_list_mode == FileListMode::Flat && candidate.directory {
                 continue;
             }
@@ -9848,52 +9894,103 @@ fn file_row_page<'a>(
 /// without walking a second copy of the tree or allocating hidden rows.
 #[cfg(test)]
 fn visible_change_rows<'a>(
-    rows: &'a [FileRow],
+    tree: &'a ChangeTree,
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
 ) -> (Vec<&'a FileRow>, usize) {
-    change_viewport_rows(rows, collapsed, flat, 0)
+    change_viewport_rows(tree, collapsed, flat, 0)
 }
 
-/// Construct only the rows near this group's scroll position.
+/// Construct only the rows near this group's scroll position. Flat mode
+/// reads O(V) source rows. F folds cost O(F log N + F log F + V), including
+/// stale/nested folds; snapshot construction owns all N-row indexing work.
 fn change_viewport_rows<'a>(
-    rows: &'a [FileRow],
+    tree: &'a ChangeTree,
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
     first: usize,
 ) -> (Vec<&'a FileRow>, usize) {
-    if !flat && collapsed.is_none_or(BTreeSet::is_empty) {
-        let range = crate::change_list::visible_range(rows.len(), first);
-        return (rows[range].iter().collect(), rows.len());
+    change_viewport_rows_observing(tree, collapsed, flat, first, || {})
+}
+
+// The observer counts actual source-row accesses in the owning regressions;
+// production passes a no-op and retains no mutable model state.
+fn change_viewport_rows_observing<'a>(
+    tree: &'a ChangeTree,
+    collapsed: Option<&BTreeSet<RepoPath>>,
+    flat: bool,
+    first: usize,
+    mut visit: impl FnMut(),
+) -> (Vec<&'a FileRow>, usize) {
+    if flat {
+        let range = crate::change_list::visible_range(tree.files.len(), first);
+        return (
+            tree.files[range]
+                .iter()
+                .map(|index| {
+                    visit();
+                    &tree.rows[*index]
+                })
+                .collect(),
+            tree.files.len(),
+        );
     }
-    let mut visible = Vec::with_capacity(MAX_VISIBLE_CHANGE_ROWS);
-    let start = first.saturating_sub(crate::change_list::OVERSCAN);
-    let end = first.saturating_add(crate::change_list::VIEW_ROWS + crate::change_list::OVERSCAN);
-    let mut count = 0;
-    let mut skip_below = None;
-    for row in rows {
-        if flat && row.directory {
-            continue;
-        }
-        if let Some(depth) = skip_below {
-            if row.depth > depth {
-                continue;
-            }
-            skip_below = None;
-        }
-        if (start..end).contains(&count) {
-            visible.push(row);
-        }
-        count += 1;
-        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) {
-            skip_below = Some(row.depth);
+    let mut hidden = collapsed
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            tree.directories
+                .binary_search_by(|(index, _)| {
+                    visit();
+                    tree.rows[*index].path.cmp(path)
+                })
+                .ok()
+                .map(|found| {
+                    let (index, end) = tree.directories[found];
+                    (index + 1, end)
+                })
+        })
+        .filter(|(start, end)| start < end)
+        .collect::<Vec<_>>();
+    hidden.sort_unstable();
+    let mut intervals: Vec<(usize, usize)> = Vec::with_capacity(hidden.len());
+    for (start, end) in hidden {
+        if let Some(last) = intervals.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            intervals.push((start, end));
         }
     }
-    let clamped = first.min(count.saturating_sub(crate::change_list::VIEW_ROWS));
-    if clamped != first {
-        return change_viewport_rows(rows, collapsed, flat, clamped);
+    let total = tree.rows.len()
+        - intervals
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+    let range = crate::change_list::visible_range(total, first);
+    let mut physical = range.start;
+    let mut interval = 0;
+    while let Some((start, end)) = intervals.get(interval) {
+        if *start > physical {
+            break;
+        }
+        physical += end - start;
+        interval += 1;
     }
-    (visible, count)
+    let mut visible = Vec::with_capacity(range.len());
+    while visible.len() < range.len() {
+        if let Some((start, end)) = intervals.get(interval)
+            && physical == *start
+        {
+            physical = *end;
+            interval += 1;
+        }
+        visit();
+        visible.push(&tree.rows[physical]);
+        physical += 1;
+    }
+    (visible, total)
 }
 
 fn change_scroll_id(key: &ActiveWorktreeKey, scope: ChangeTreeScope, epoch: u64) -> Id {
@@ -10642,7 +10739,7 @@ pub fn change_selection_order(
             .collapsed_change_directories
             .get(&ChangeTreeScope::Area(group.area));
         let mut below = None;
-        for row in &group.tree {
+        for row in group.tree.iter() {
             if state.change_list_mode != FileListMode::Flat {
                 if below.is_some_and(|depth| row.depth > depth) {
                     continue;
@@ -21054,7 +21151,7 @@ pub(crate) mod tests {
         let paths: Vec<_> = (0..501)
             .map(|index| repo_path(&format!("file-{index:04}.rs")))
             .collect();
-        let tree = file_rows(&paths);
+        let tree = ChangeTree::from(file_rows(&paths));
         let mut visited = Vec::new();
         for first in (0..501).step_by(crate::change_list::VIEW_ROWS) {
             let (rows, total) = change_viewport_rows(&tree, None, true, first);
@@ -21095,6 +21192,222 @@ pub(crate) mod tests {
         };
         assert_eq!(selection.len(), 501);
         assert_eq!(selection.last().unwrap().path, paths[500]);
+    }
+
+    #[test]
+    fn indexed_flat_change_and_branch_viewports_slice_forty_thousand_files() {
+        let paths = (0..40_000)
+            .map(|index| repo_path(&format!("dir/file-{index:05}.rs")))
+            .collect::<Vec<_>>();
+        let key = main_key();
+        let group = ChangeGroup::new(
+            key.worktree_id,
+            ChangeArea::Unstaged,
+            paths
+                .iter()
+                .map(|path| {
+                    ChangeRow::new(
+                        key.worktree_id,
+                        &changed(
+                            path.clone(),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        );
+        let branch = BranchChangesModel::new(BranchComparison {
+            base_ref: ref_name("refs/heads/trunk"),
+            base_oid: oid_of(0x22),
+            head: oid_of(0x11),
+            merge_base: oid_of(0x22),
+            entries: paths
+                .iter()
+                .map(|path| crate::repository::DiffEntry {
+                    path: path.clone(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    added_lines: None,
+                    removed_lines: None,
+                })
+                .collect(),
+        });
+        let collapsed = BTreeSet::from([repo_path("dir"), repo_path("stale")]);
+        for tree in [&group.tree, &branch.tree] {
+            assert_eq!(tree.files.len(), 40_000);
+            for first in [0, 20_000, 39_999, usize::MAX] {
+                let mut reads = 0;
+                let (rows, total) =
+                    change_viewport_rows_observing(tree, Some(&collapsed), true, first, || {
+                        reads += 1
+                    });
+                let expected = crate::change_list::visible_range(paths.len(), first);
+                assert_eq!(total, paths.len());
+                assert_eq!(
+                    rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+                    paths[expected.clone()]
+                );
+                assert_eq!(
+                    reads,
+                    expected.len(),
+                    "flat view reads only mounted rows, including after clamping"
+                );
+                assert!(reads <= MAX_VISIBLE_CHANGE_ROWS);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_folds_keep_nested_sibling_stale_and_clamped_row_order() {
+        let mut paths = [
+            "a/top.rs",
+            "a/deep/one.rs",
+            "a/deep/two.rs",
+            "a/peer/three.rs",
+            "b/one.rs",
+            "b/two.rs",
+        ]
+        .map(repo_path)
+        .to_vec();
+        paths.extend((0..30).map(|index| repo_path(&format!("tail-{index:02}.rs"))));
+        let tree = change_file_rows(&paths);
+        let tail = (0..30)
+            .map(|index| format!("tail-{index:02}.rs"))
+            .collect::<Vec<_>>();
+        let cases = [
+            (
+                vec![],
+                vec![
+                    "a",
+                    "a/deep",
+                    "a/deep/one.rs",
+                    "a/deep/two.rs",
+                    "a/peer",
+                    "a/peer/three.rs",
+                    "a/top.rs",
+                    "b",
+                    "b/one.rs",
+                    "b/two.rs",
+                ],
+            ),
+            (
+                vec!["a", "a/deep", "missing", "a/top.rs"],
+                vec!["a", "b", "b/one.rs", "b/two.rs"],
+            ),
+            (
+                vec!["a/deep", "b"],
+                vec!["a", "a/deep", "a/peer", "a/peer/three.rs", "a/top.rs", "b"],
+            ),
+        ];
+        for (folds, prefix) in cases {
+            let collapsed = folds.into_iter().map(repo_path).collect::<BTreeSet<_>>();
+            let expected = prefix
+                .into_iter()
+                .map(str::to_owned)
+                .chain(tail.clone())
+                .collect::<Vec<_>>();
+            for first in [0, 4, 19, 500, usize::MAX] {
+                let (rows, total) = change_viewport_rows(&tree, Some(&collapsed), false, first);
+                let range = crate::change_list::visible_range(expected.len(), first);
+                assert_eq!(total, expected.len());
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.path.display().into_owned())
+                        .collect::<Vec<_>>(),
+                    expected[range]
+                );
+            }
+        }
+        let empty = change_file_rows(&[]);
+        let (rows, total) = change_viewport_rows(
+            &empty,
+            Some(&BTreeSet::from([repo_path("stale")])),
+            false,
+            usize::MAX,
+        );
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn indexed_deep_folds_keep_ancestors_and_skip_nested_intervals() {
+        let directories = (0..12)
+            .map(|depth| {
+                (0..=depth)
+                    .map(|level| format!("d{level}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect::<Vec<_>>();
+        let mut paths = directories
+            .iter()
+            .map(|path| repo_path(&format!("{path}/side.rs")))
+            .collect::<Vec<_>>();
+        paths.push(repo_path(&format!("{}/tip.rs", directories[11])));
+        let tail = (0..30)
+            .map(|index| format!("tail-{index:02}.rs"))
+            .collect::<Vec<_>>();
+        paths.extend(tail.iter().map(|path| repo_path(path)));
+        let tree = change_file_rows(&paths);
+        // Each level has its own file, so compaction retains every ancestor.
+        assert_eq!(tree.directories.len(), 12);
+        let collapsed = BTreeSet::from([repo_path(&directories[5]), repo_path(&directories[9])]);
+        let expected = directories[..=5]
+            .iter()
+            .cloned()
+            .chain(
+                directories[..5]
+                    .iter()
+                    .rev()
+                    .map(|path| format!("{path}/side.rs")),
+            )
+            .chain(tail)
+            .collect::<Vec<_>>();
+        for first in [0, 7, 20, usize::MAX] {
+            let (rows, total) = change_viewport_rows(&tree, Some(&collapsed), false, first);
+            assert_eq!(total, expected.len());
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.path.display().into_owned())
+                    .collect::<Vec<_>>(),
+                expected[crate::change_list::visible_range(expected.len(), first)]
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_folded_large_viewport_reads_folds_and_visible_rows_only() {
+        let paths = ["a", "b"]
+            .into_iter()
+            .flat_map(|directory| {
+                (0..20_000).map(move |index| repo_path(&format!("{directory}/file-{index:05}.rs")))
+            })
+            .collect::<Vec<_>>();
+        let tree = change_file_rows(&paths);
+        let collapsed = BTreeSet::from([repo_path("a"), repo_path("stale")]);
+        let expected = [repo_path("a"), repo_path("b")]
+            .into_iter()
+            .chain(paths[20_000..].iter().cloned())
+            .collect::<Vec<_>>();
+        for first in [0, 1, 19_990, usize::MAX] {
+            let mut reads = 0;
+            let (rows, total) =
+                change_viewport_rows_observing(&tree, Some(&collapsed), false, first, || {
+                    reads += 1
+                });
+            let range = crate::change_list::visible_range(expected.len(), first);
+            assert_eq!(total, expected.len());
+            assert_eq!(
+                rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+                expected[range]
+            );
+            assert!(
+                reads <= MAX_VISIBLE_CHANGE_ROWS + 8,
+                "two directory lookups plus mounted rows, never 40k source rows"
+            );
+        }
     }
 
     #[test]
@@ -21328,16 +21641,13 @@ pub(crate) mod tests {
         let source = source_control();
         let mut state = SidebarState::default();
         let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+        let tree = ChangeTree::from(source.files.clone());
         let paths = |state: &SidebarState, scope, flat| {
-            visible_change_rows(
-                &source.files,
-                state.collapsed_change_directories.get(&scope),
-                flat,
-            )
-            .0
-            .iter()
-            .map(|row| row.path.display().into_owned())
-            .collect::<Vec<_>>()
+            visible_change_rows(&tree, state.collapsed_change_directories.get(&scope), flat)
+                .0
+                .iter()
+                .map(|row| row.path.display().into_owned())
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             paths(&state, scope, false),
