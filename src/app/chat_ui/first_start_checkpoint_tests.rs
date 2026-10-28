@@ -879,6 +879,8 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
                 error: "same nonce in the wrong scope".into(),
             }));
             assert!(!app.durable.local_only_cards.contains(&card));
+            assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
+            assert_eq!(runtime(&app, card).session.id, actor);
             drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
                 scope: scope.clone(),
                 operation,
@@ -1008,6 +1010,46 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         );
         assert!(!app.chat_start_pending(card));
         if refuse_creation {
+            // A separate app reads the actual saved workspace. This exercises
+            // only projection/custody; native actor reattachment is not polled.
+            let loaded = app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_workspace(saved.id, None)
+                .unwrap()
+                .unwrap();
+            let mut reopened = crate::app::tests::context_inspector_test_app(false);
+            reopened.durable = Arc::new(loaded);
+            reopened.sidebar_model.projects = app.sidebar_model.projects.clone();
+            reopened.active_workspace = app.active_workspace.clone();
+            reopened.workspace_model = app.workspace_model.clone();
+            reopened.shared_views =
+                crate::app::shared_views::State::for_workspace(&reopened.durable);
+            reopened.acknowledge_view_edit(scope.clone(), None);
+            for _ in 0..3 {
+                drop(
+                    reopened.apply_workspace_model_update(ModelUpdate::Read(
+                        app.workspace_model.clone(),
+                    )),
+                );
+                let state = reopened.card_state(card).unwrap();
+                assert!(state.existence.is_open());
+                assert!(matches!(&state.kind, CardKind::Chat(session) if session.id == actor));
+                assert!(reopened.durable.local_only_cards.contains(&card));
+                assert_eq!(
+                    reopened
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|entry| entry.id == channel)
+                        .unwrap()
+                        .cards,
+                    vec![card]
+                );
+            }
+            assert!(!reopened.chat_start_pending(card));
             // Retaining a refused creation grants no authority to override a
             // later canonical retirement, even while the provider is busy.
             let mut retired = app.workspace_model.clone();
