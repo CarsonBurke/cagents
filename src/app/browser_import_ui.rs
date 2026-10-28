@@ -85,6 +85,204 @@ mod tests {
             "an obscured import must not consume the upper owner's Escape"
         );
         assert!(app.transient_work_close.is_some());
+
+        use cosmic::iced::{
+            Event, Rectangle, Size, Vector,
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{
+                    Operation, Tree,
+                    operation::{Focusable, Scrollable},
+                },
+            },
+            mouse,
+        };
+
+        #[derive(Default)]
+        struct Geometry {
+            controls: std::collections::BTreeMap<String, Rectangle>,
+            scrollables: Vec<(Rectangle, Rectangle, Vector)>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.controls.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn Scrollable,
+            ) {
+                self.scrollables.push((bounds, content, translation));
+            }
+        }
+
+        const CANCEL: &str = "dialog.browser-import.cancel";
+        const SCAN: &str = "dialog.browser-import.scan";
+        const IMPORT: &str = "dialog.browser-import.import";
+        for viewport in [Size::new(600.0, 400.0), Size::new(1000.0, 900.0)] {
+            for case in ["populated", "empty", "filtered empty"] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                drop(app.update_browser_import(Action::Open));
+                // Admit a real generation, but never poll the discovery task.
+                drop(app.update_browser_import(Action::Consent));
+                let generation = app.browser_import.generation;
+                let found = if case == "empty" {
+                    Vec::new()
+                } else {
+                    let sites: Vec<_> = (0..85)
+                        .map(|index| Site {
+                            host: format!("site-{index:03}.example.invalid"),
+                            cookies: index + 1,
+                        })
+                        .collect();
+                    vec![Found {
+                        profile: Profile {
+                            browser: cagents_browser_import::Browser::Firefox,
+                            name: "Private fixture profile with a long display name ".repeat(8),
+                            database: PathBuf::from("/private-browser-import-fixture/Cookies"),
+                        },
+                        selected: sites.iter().map(|site| site.host.clone()).collect(),
+                        sites,
+                        error: Some(
+                            "Private fixture scan detail: source files were not read.\n".repeat(30),
+                        ),
+                    }]
+                };
+                drop(app.update_browser_import(Action::Scanned(generation, Ok(found))));
+                assert!(matches!(app.browser_import.phase, Phase::Selection));
+                if case == "filtered empty" {
+                    drop(app.update_browser_import(Action::Filter(
+                        "no-matching-profile-or-site".into(),
+                    )));
+                    assert!(app.browser_import.rows.is_empty());
+                    assert!(!app.browser_import.found.is_empty());
+                } else if case == "empty" {
+                    assert!(app.browser_import.found.is_empty());
+                } else {
+                    assert!(app.browser_import.rows.len() > PAGE_ROWS);
+                }
+
+                let renderer = super::super::tests::headless_renderer();
+                let mut element = app.browser_import_dialog().unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport),
+                );
+                let mut geometry = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut geometry,
+                );
+                let visible = |bounds: Rectangle| {
+                    bounds.width > 0.0
+                        && bounds.height > 0.0
+                        && bounds.x >= 0.0
+                        && bounds.y >= 0.0
+                        && bounds.x + bounds.width <= viewport.width + 0.01
+                        && bounds.y + bounds.height <= viewport.height + 0.01
+                };
+                let cancel = geometry.controls[CANCEL];
+                assert!(
+                    visible(cancel),
+                    "Cancel must remain reachable for {case} at {viewport:?}: {cancel:?}"
+                );
+                assert_eq!(geometry.scrollables.len(), 1);
+                let (scroll, content, translation) = geometry.scrollables[0];
+                assert!(visible(scroll));
+                let footer = [CANCEL, SCAN, IMPORT].map(|id| {
+                    let bounds = geometry.controls[id];
+                    assert!(
+                        visible(bounds),
+                        "{id} must remain reachable for {case} at {viewport:?}: {bounds:?}"
+                    );
+                    (id, bounds)
+                });
+                {
+                    let mut pointer = |point, event| {
+                        let mut messages = Vec::new();
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            mouse::Cursor::Available(point),
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &Rectangle::with_size(viewport),
+                        );
+                        messages
+                    };
+                    // Offscreen row coordinates can overlap a fixed footer.
+                    // Click only the three named production footer controls;
+                    // never dispatch their scan/import/cancel messages.
+                    for (id, bounds) in &footer {
+                        assert!(
+                            pointer(
+                                bounds.center(),
+                                mouse::Event::ButtonPressed(mouse::Button::Left),
+                            )
+                            .is_empty()
+                        );
+                        let messages = pointer(
+                            bounds.center(),
+                            mouse::Event::ButtonReleased(mouse::Button::Left),
+                        );
+                        assert_eq!(messages.len(), 1, "{id} for {case} at {viewport:?}");
+                        assert!(match &messages[0] {
+                            Message::BrowserImport(Action::Cancel) => *id == CANCEL,
+                            Message::BrowserImport(Action::Consent) => *id == SCAN,
+                            Message::BrowserImport(Action::Import) => *id == IMPORT,
+                            _ => false,
+                        });
+                    }
+                    if case == "populated" {
+                        assert!(content.height > scroll.height);
+                        assert!(
+                            pointer(
+                                scroll.center(),
+                                mouse::Event::WheelScrolled {
+                                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -120.0 },
+                                },
+                            )
+                            .is_empty()
+                        );
+                    }
+                }
+                let mut after_scroll = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after_scroll,
+                );
+                for (id, bounds) in &footer {
+                    assert_eq!(after_scroll.controls[*id], *bounds);
+                }
+                assert_eq!(after_scroll.scrollables[0].0, scroll);
+                if case == "populated" {
+                    assert!(after_scroll.scrollables[0].2.y > translation.y);
+                }
+                assert!(matches!(app.browser_import.phase, Phase::Selection));
+                assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
+            }
+        }
     }
 
     #[test]
@@ -568,17 +766,20 @@ impl Cagents {
         let mut content: Vec<Element<'_, Message>> =
             vec![crate::design::title("Import browser logins").into()];
         let button = |label: &'static str, action| {
-            let cancel = matches!(action, Action::Cancel | Action::KeepWorking);
+            let id = match &action {
+                Action::Cancel | Action::KeepWorking => Some("dialog.browser-import.cancel"),
+                Action::Consent => Some("dialog.browser-import.scan"),
+                Action::Import => Some("dialog.browser-import.import"),
+                _ => None,
+            };
             let button = if matches!(action, Action::ConfirmCancel) {
                 crate::ui_controls::button::destructive(label)
             } else {
                 crate::ui_controls::button::secondary(label)
             };
             let button = button.on_press(message(action));
-            if cancel {
-                button
-                    .id(widget::Id::new("dialog.browser-import.cancel"))
-                    .into()
+            if let Some(id) = id {
+                button.id(widget::Id::new(id)).into()
             } else {
                 button.into()
             }
