@@ -2485,6 +2485,147 @@ mod tests {
         assert_eq!(steps, 1);
     }
 
+    #[test]
+    fn duplicate_saved_descriptors_cannot_redirect_the_retained_rows_catalog_title() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("claude");
+        std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let account = crate::account::Account {
+            provider: Provider::Claude,
+            home: crate::account::AccountHome::Linked {
+                key: uuid::Uuid::new_v4(),
+                path: home,
+            },
+        };
+        let mut seed = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            root.path().into(),
+            &account,
+        )
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        seed.launch.session_id = Some(id.clone());
+        let title = "Recover the preferred saved conversation title";
+        // Two catalog files describe the same conversation. The first title
+        // observation must target the saved winner exactly once, even when
+        // another copy of the transcript is encountered in this same batch.
+        for copy in 0..2 {
+            let project = provider_root(&seed).join(format!("projects/project-{copy}"));
+            std::fs::create_dir_all(&project).unwrap();
+            let path = project.join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type":"user", "sessionId":id, "cwd":root.path(),
+                        "message":{"content":title}
+                    })
+                ),
+            )
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(copy * 60))
+                .unwrap();
+        }
+        for preferred_open in [false, true] {
+            for dropped_untitled in [false, true] {
+                let mut preferred = saved(root.path());
+                preferred.session = seed.clone();
+                preferred.session.proof = Some(crate::model::HostSessionProof {
+                    host_session_id: "preferred-saved-host".into(),
+                    boot_id: "fixture-boot".into(),
+                    host_incarnation: "preferred-incarnation".into(),
+                });
+                preferred.title = chat_ui::chat_card_title(Provider::Claude).into();
+                preferred.open = preferred_open;
+                preferred.updated_at_unix_ms = if preferred_open { 1 } else { 99 };
+                let mut dropped = preferred.clone();
+                dropped.card = CardId::new();
+                dropped.session.id = TerminalId::new();
+                dropped.session.proof = None;
+                dropped.open = false;
+                dropped.updated_at_unix_ms = if preferred_open { 99 } else { 1 };
+                if !dropped_untitled {
+                    dropped.title = "A name belonging to the dropped listing".into();
+                }
+                let mut progress = Vec::new();
+                index(
+                    Ok(vec![dropped.clone(), preferred.clone()]),
+                    vec![seed.clone()],
+                    &catalog::Cache::default(),
+                    &AtomicBool::new(false),
+                    |step| {
+                        progress.push(step);
+                        true
+                    },
+                );
+                let Progress::Saved { entries, .. } = &progress[0] else {
+                    panic!("real indexing lists saved descriptors first")
+                };
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].card, preferred.card);
+                assert_eq!(
+                    entries[0].session, preferred.session,
+                    "catalog discovery must preserve the preferred saved launch and ownership descriptor"
+                );
+                assert!(matches!(progress[1], Progress::Counted(2)));
+                let mut title_updates = Vec::new();
+                for step in &progress {
+                    if let Progress::Found {
+                        conversations,
+                        titles,
+                        ..
+                    } = step
+                    {
+                        assert!(
+                            conversations.is_empty(),
+                            "a catalog duplicate is not a second conversation"
+                        );
+                        title_updates.extend(titles.iter().cloned());
+                    }
+                }
+                assert_eq!(
+                    title_updates,
+                    [(preferred.card, title.to_owned())],
+                    "open={preferred_open}, dropped untitled={dropped_untitled}: the dropped card cannot steal the title recipient or its eligibility flag"
+                );
+
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.resume_ui.open = true;
+                app.resume_ui.limit = PAGE;
+                let generation = app.resume_ui.generation;
+                for step in progress {
+                    drop(app.update_resume(Action::Indexed(generation, step)));
+                }
+                drop(app.update_resume(Action::Query("preferred saved".into())));
+                let state = &app.resume_ui;
+                assert_eq!(state.rows.len(), 1);
+                assert_eq!(
+                    state
+                        .visible
+                        .iter()
+                        .map(|index| state.rows[*index].card)
+                        .collect::<Vec<_>>(),
+                    [preferred.card],
+                    "the retained conversation is searchable by its actual catalog title"
+                );
+                assert_eq!(state.rows[0].title, title);
+                let Source::Saved(entry) = &state.rows[0].source else {
+                    panic!("title enrichment must retain the saved selection source")
+                };
+                assert_eq!(entry.card, preferred.card);
+                assert_eq!(entry.session, preferred.session);
+                assert_ne!(entry.card, dropped.card);
+            }
+        }
+    }
+
     fn provider_root(seed: &chat::Session) -> PathBuf {
         seed.launch
             .provider
