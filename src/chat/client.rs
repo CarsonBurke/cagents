@@ -25,7 +25,63 @@ use std::{
 // Native holder startup can spend 30 seconds sending its control request and
 // another 30 seconds receiving the reply. Leave room for the daemon response
 // and a busy desktop scheduler.
+mod offline;
+#[cfg(test)]
+mod offline_wire_tests;
+
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
+
+// Body eviction leaves the current typed source descriptors and scalar
+// publication intact. These helpers belong only to this client-side cache.
+trait SnapshotBody {
+    fn transcript_bytes(&self) -> usize;
+    fn evict_transcript(&mut self);
+}
+impl SnapshotBody for Snapshot {
+    fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+    fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+}
+
+// A hidden client cannot apply a body delta, but may retain its authenticated
+// metadata under the same generation/retained-summary fences as full apply.
+fn metadata_for(
+    mut update: super::presentation::Presentation,
+    previous: &Snapshot,
+) -> Result<Snapshot, &'static str> {
+    if update.base_generation != previous.generation
+        || update.metadata.generation <= update.base_generation
+        || !update.metadata.items.is_empty()
+    {
+        return Err("Transcript revision mismatch");
+    }
+    if update.file_changes_unchanged {
+        if !update.metadata.file_changes.files.is_empty() {
+            return Err("Retained file summary carries replacement rows");
+        }
+        update.metadata.file_changes = previous.file_changes.clone();
+    }
+    if update
+        .metadata
+        .subagents
+        .iter()
+        .any(|child| !child.items.is_empty())
+    {
+        return Err("Unexpected child transcript body");
+    }
+    Ok(update.metadata)
+}
 
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
@@ -142,6 +198,10 @@ struct Inner {
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    transcript_resident: Arc<AtomicBool>,
+    offline: Arc<offline::State>,
+    body_requested: Arc<AtomicBool>,
+    user_item_seen: Arc<AtomicBool>,
     source_clock: Arc<Mutex<Option<SourceClock>>>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
@@ -517,6 +577,17 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let inner = Self::fixture_unbound(session, snapshot);
+        inner.offline.bind(&inner);
+        Self { inner }
+    }
+
+    #[cfg(test)]
+    fn fixture_unbound(session: Session, snapshot: Snapshot) -> Arc<Inner> {
+        let user_item_seen = snapshot
+            .items
+            .iter()
+            .any(|item| item.role == super::Role::User);
         let (stream, peer) = UnixStream::pair().expect("socket pair");
         let (cancel, cancel_peer) = UnixStream::pair().expect("socket pair");
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
@@ -534,38 +605,40 @@ impl ClientHandle {
             outcome: snapshot.outcome.clone(),
             pending: false,
         };
-        Self {
-            inner: Arc::new(Inner {
-                id: session.id,
-                session,
-                upgrade_recovery: None,
-                proof,
-                wire: Arc::new(Mutex::new(Wire {
-                    stream,
-                    codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
-                })),
-                cancel,
-                source_clock: Arc::new(Mutex::new(SourceClock::from_sample(
-                    snapshot.sampled_at,
-                    Instant::now(),
-                ))),
-                snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
-                activity: Arc::new(Mutex::new(activity)),
-                observed: Arc::new(Mutex::new(OutputObservation::default())),
-                account_usage: Arc::default(),
-                next: Arc::new(AtomicU64::new(1)),
-                alive: Arc::new(AtomicBool::new(true)),
-                visible: Arc::new(AtomicBool::new(true)),
-                wake: Arc::new(|_| {}),
-                reader: Mutex::new(None),
-                pending: Arc::new(Mutex::new(BTreeMap::new())),
-                file_pending: Arc::new(Mutex::new(BTreeMap::new())),
-                source_pending: Arc::default(),
-                raw_source_pending: Arc::default(),
-                visibility_tx,
-                visibility_worker: Mutex::new(None),
-            }),
-        }
+        Arc::new(Inner {
+            id: session.id,
+            session,
+            upgrade_recovery: None,
+            proof,
+            wire: Arc::new(Mutex::new(Wire {
+                stream,
+                codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            })),
+            cancel,
+            source_clock: Arc::new(Mutex::new(SourceClock::from_sample(
+                snapshot.sampled_at,
+                Instant::now(),
+            ))),
+            snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
+            transcript_resident: Arc::new(AtomicBool::new(true)),
+            offline: offline::State::new(),
+            body_requested: Arc::new(AtomicBool::new(true)),
+            user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
+            activity: Arc::new(Mutex::new(activity)),
+            observed: Arc::new(Mutex::new(OutputObservation::default())),
+            account_usage: Arc::default(),
+            next: Arc::new(AtomicU64::new(1)),
+            alive: Arc::new(AtomicBool::new(true)),
+            visible: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new(|_| {}),
+            reader: Mutex::new(None),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+            source_pending: Arc::default(),
+            raw_source_pending: Arc::default(),
+            visibility_tx,
+            visibility_worker: Mutex::new(None),
+        })
     }
 
     #[cfg(test)]
@@ -573,11 +646,12 @@ impl ClientHandle {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
-        let mut handle = Self::fixture(session.clone(), snapshot);
-        let inner = Arc::get_mut(&mut handle.inner).unwrap();
+        let mut owner = Self::fixture_unbound(session.clone(), snapshot);
+        let inner = Arc::get_mut(&mut owner).unwrap();
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
-        handle
+        owner.offline.bind(&owner);
+        Self { inner: owner }
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -1003,6 +1077,10 @@ impl ClientHandle {
             initial.sampled_at,
             Instant::now(),
         )));
+        let user_item_seen = Arc::new(AtomicBool::new(initial.items.iter().any(|item| item.role == super::Role::User)));
+        let transcript_resident = Arc::new(AtomicBool::new(true));
+        let body_requested = Arc::new(AtomicBool::new(true));
+        let offline = offline::State::new();
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -1020,6 +1098,10 @@ impl ClientHandle {
             wire: wire.clone(),
             cancel,
             snapshot: snapshot.clone(),
+            transcript_resident: transcript_resident.clone(),
+            offline: offline.clone(),
+            body_requested: body_requested.clone(),
+            user_item_seen: user_item_seen.clone(),
             source_clock: source_clock.clone(),
             activity: activity.clone(),
             observed: observed.clone(),
@@ -1036,6 +1118,7 @@ impl ClientHandle {
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
+        inner.offline.bind(&inner);
         let visibility_wire = wire.clone();
         let visibility_alive = alive.clone();
         let visibility_value = visible.clone();
@@ -1098,14 +1181,37 @@ impl ClientHandle {
                     if terminal.is_some() && !final_snapshot.exited {
                         // A shared-server CLI is another view, not a closed
                         // native actor. Keep this connection and pending work.
-                        *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                        {
+                            let mut state = snapshot.lock().unwrap_or_else(|p|p.into_inner());
+                            user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                            offline.observe(&state, &final_snapshot);
+                            let resident = body_requested.load(Ordering::Acquire) && !offline.revoked();
+                            let mut final_snapshot = final_snapshot;
+                            if !resident {
+                                let body = Arc::new(final_snapshot);
+                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p|p.into_inner()), false);
+                                final_snapshot = (*body).clone();
+                                final_snapshot.evict_transcript();
+                            }
+                            *state = Arc::new(final_snapshot);
+                            transcript_resident.store(resident, Ordering::Release);
+                        }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
                             let _ = reply.try_send(Ok(terminal));
                         }
                         wake(Wake::Changed);
                         continue;
                     }
-                    *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                    {
+                        let mut state = snapshot.lock().unwrap_or_else(|p|p.into_inner());
+                        user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                        offline.observe(&state, &final_snapshot);
+                        let resident = !offline.revoked();
+                        let mut final_snapshot = final_snapshot;
+                        if !resident { final_snapshot.evict_transcript(); }
+                        *state = Arc::new(final_snapshot);
+                        transcript_resident.store(resident, Ordering::Release);
+                    }
                     {
                         let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
                         activity.state = ActivityState::Unknown;
@@ -1185,23 +1291,70 @@ impl ClientHandle {
                             resync = false;
                             let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                             SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), update.sampled_at, Instant::now());
+                            user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                            offline.observe(&state, &update);
+                            let resident = body_requested.load(Ordering::Acquire) && !offline.revoked();
+                            let mut update = update;
+                            if !resident {
+                                let body = Arc::new(update);
+                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p|p.into_inner()), false);
+                                update = (*body).clone();
+                                update.evict_transcript();
+                            }
+                            transcript_resident.store(resident, Ordering::Release);
                             *state = Arc::new(update);
                             drop(state);
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
+                        } else if body_requested.load(Ordering::Acquire) && !transcript_resident.load(Ordering::Acquire) {
+                            resync = true;
+                            read_again = true;
                         }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
-                        let applied = match update.apply(&state) {
-                            Ok(next) => {
-                                *state = Arc::new(next);
-                                SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
-                                true
-                            },
-                            Err(_) => false,
+                        let observed_user = update.changes.iter().any(|change| {
+                            let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
+                            item.role == super::Role::User
+                        });
+                        let retain_body = body_requested.load(Ordering::Acquire) && !offline.revoked();
+                        let mut accepted_metadata = false;
+                        let applied = if !retain_body || !transcript_resident.load(Ordering::Acquire) {
+                            // Preserve authenticated scalar state/late continuity
+                            // even when the body needed to apply a patch is gone.
+                            // A later reveal still requires an unconditional read.
+                            match metadata_for(update, &state) {
+                                Ok(mut metadata) => {
+                                    offline.observe(&state, &metadata);
+                                    metadata.evict_transcript();
+                                    *state = Arc::new(metadata);
+                                    accepted_metadata = true;
+                                    SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                                    // Hidden control subscribers advance metadata
+                                    // without resyncing a deliberately discarded body.
+                                    !retain_body
+                                },
+                                Err(_) => false,
+                            }
+                        } else {
+                            match update.apply(&state) {
+                                Ok(mut next) => {
+                                    offline.observe(&state, &next);
+                                    accepted_metadata = true;
+                                    let resident = body_requested.load(Ordering::Acquire) && !offline.revoked();
+                                    if !resident { next.evict_transcript(); }
+                                    transcript_resident.store(resident, Ordering::Release);
+                                    *state = Arc::new(next);
+                                    SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                                    true
+                                },
+                                Err(_) => false,
+                            }
                         };
+                        user_item_seen.fetch_or(accepted_metadata && observed_user, Ordering::AcqRel);
+                        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+                            resident_bytes = state.transcript_bytes());
                         drop(state);
                         if !applied {
                             resync = true;
@@ -1220,8 +1373,11 @@ impl ClientHandle {
                 }
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
-                    let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
+                    let after_generation = {
+                        let state = snapshot.lock().unwrap_or_else(|p|p.into_inner());
+                        (!resync && (transcript_resident.load(Ordering::Acquire) || !body_requested.load(Ordering::Acquire))).then_some(state.generation)
+                    };
+                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
                     read_pending = true;
                 }
             };
@@ -1241,6 +1397,7 @@ impl ClientHandle {
             for (_,reply) in std::mem::take(&mut *source_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.send(Err(super::cache::SourceError::Transport(failure.clone())));}
             for (_,reply) in std::mem::take(&mut *raw_source_pending.lock().unwrap_or_else(|p|p.into_inner())){let _=reply.send(Err(super::cache::SourceError::Transport(failure.clone())));}
             wake(Wake::Disconnected(failure));
+            offline.request(body_requested.load(Ordering::Acquire) && !transcript_resident.load(Ordering::Acquire));
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(Self { inner })
@@ -1292,6 +1449,45 @@ impl ClientHandle {
         (snapshot.clone(), *clock)
     }
 
+    /// Control metadata for a hidden runtime, without borrowing its body.
+    /// A disconnected client's final publication must remain readable instead.
+    pub(crate) fn hidden_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let (mut snapshot, clock) = self.snapshot_with_clock();
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        Arc::make_mut(&mut snapshot).evict_transcript();
+        Some((snapshot, clock))
+    }
+
+    pub(crate) fn has_observed_user_item(&self) -> bool {
+        self.inner.user_item_seen.load(Ordering::Acquire)
+    }
+
+    /// A renderable publication, absent until a hidden client's full history
+    /// has been rehydrated. Metadata-only generations must never clear a
+    /// runtime's scroll/disclosure state as if they were empty conversations.
+    pub(crate) fn resident_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !self.inner.transcript_resident.load(Ordering::Acquire) {
+            return None;
+        }
+        let clock = self
+            .inner
+            .source_clock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Some((snapshot.clone(), *clock))
+    }
+
     #[cfg(test)]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         let mut state = self
@@ -1308,7 +1504,44 @@ impl ClientHandle {
             update.sampled_at,
             Instant::now(),
         );
+        self.inner.user_item_seen.fetch_or(
+            update
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+            Ordering::AcqRel,
+        );
+        self.inner.offline.observe(&state, &update);
+        let resident =
+            self.inner.body_requested.load(Ordering::Acquire) && !self.inner.offline.revoked();
+        let mut update = update;
+        if !resident {
+            update.evict_transcript();
+        }
         *state = Arc::new(update);
+        self.inner
+            .transcript_resident
+            .store(resident, Ordering::Release);
+    }
+
+    /// Simulate only the reader's EOF cache transition in Runtime fixtures.
+    #[cfg(test)]
+    pub(crate) fn fixture_disconnect_for_test(&self) {
+        self.inner.alive.store(false, Ordering::Release);
+        self.inner.offline.request(
+            self.inner.body_requested.load(Ordering::Acquire)
+                && !self.inner.transcript_resident.load(Ordering::Acquire),
+        );
+    }
+
+    #[cfg(test)]
+    fn disconnect_for_test(&self) {
+        self.fixture_disconnect_for_test();
+    }
+
+    pub(crate) fn resident_snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.resident_snapshot_with_clock()
+            .map(|(snapshot, _)| snapshot)
     }
 
     /// Drains one coalesced activity edge without touching presentation state.
@@ -1497,24 +1730,68 @@ impl ClientHandle {
         Ok(page)
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
+        if matches!(&command, Command::Slash { command } if matches!(command.split_whitespace().next(), Some("/clear" | "/new" | "/reset" | "clear" | "new" | "reset"))) {
+            self.inner.offline.clear();
+        }
         self.request(ClientRequest::ChatCommand {
             chat_id: self.inner.id,
             command,
         })
     }
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
-        if !self.inner.alive.load(Ordering::Acquire) {
-            return Err("Chat is disconnected".into());
+        self.set_interest(visible, visible)
+    }
+
+    /// Keep control notifications flowing for queued commands without keeping
+    /// renderable history resident in an offscreen UI card.
+    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
+        if self.inner.offline.revoked() {
+            return Err(
+                "Local history was revoked; authenticate a new attachment to read it".into(),
+            );
         }
-        let changed = self.inner.visible.swap(visible, Ordering::AcqRel) != visible;
-        if visible && changed {
-            // An idle daemon may have the same generation as our cached
-            // handshake. Present that cache now; a conditional read can
-            // legitimately return no update when a hidden pane reappears.
+        let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
+        let mut snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let body_changed = self
+            .inner
+            .body_requested
+            .swap(retain_body, Ordering::AcqRel)
+            != retain_body;
+        if !retain_body {
+            if self.inner.transcript_resident.load(Ordering::Acquire) {
+                let clock = *self
+                    .inner
+                    .source_clock
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                self.inner.offline.capture(snapshot.clone(), clock, false);
+            }
+            let bytes = snapshot.transcript_bytes();
+            Arc::make_mut(&mut snapshot).evict_transcript();
+            self.inner
+                .transcript_resident
+                .store(false, Ordering::Release);
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %self.inner.id, resident_bytes = 0usize, evicted_bytes = bytes);
+        }
+        drop(snapshot);
+        let alive = self.inner.alive.load(Ordering::Acquire);
+        if body_changed || !alive {
+            self.inner.offline.request(!alive && retain_body);
+        }
+        if !alive {
+            return if self.inner.offline.available() {
+                Ok(())
+            } else {
+                Err("Chat is disconnected".into())
+            };
+        }
+        if interested && (changed || body_changed) {
             (self.inner.wake)(Wake::Changed);
         }
-        // Visibility is replaceable state, not an ordered provider frame. Coalesce
-        // transitions without socket IO or acknowledgement waits on the UI thread.
         match self.inner.visibility_tx.try_send(()) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(())) => {
@@ -1522,6 +1799,91 @@ impl ClientHandle {
             }
         }
     }
+
+    /// Preserve the actual projected view, including admitted full sources,
+    /// before the runtime drops its hydration/presentation owners on hide.
+    pub(crate) fn remember_visible_view(&self, view: Arc<Snapshot>, clock: Option<SourceClock>) {
+        self.remember_visible_view_with_changes(
+            view,
+            clock,
+            crate::chat::source_owners::ResidentChanges::default(),
+        );
+    }
+
+    pub(crate) fn remember_visible_view_with_changes(
+        &self,
+        view: Arc<Snapshot>,
+        clock: Option<SourceClock>,
+        changes: crate::chat::source_owners::ResidentChanges,
+    ) {
+        self.remember_visible_view_with_sources(
+            view,
+            clock,
+            changes,
+            crate::chat::source_owners::ResidentRawCalls::default(),
+        );
+    }
+
+    pub(crate) fn remember_visible_view_with_sources(
+        &self,
+        view: Arc<Snapshot>,
+        clock: Option<SourceClock>,
+        changes: crate::chat::source_owners::ResidentChanges,
+        raw: crate::chat::source_owners::ResidentRawCalls,
+    ) {
+        let current = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A late UI view must not cross a reset/new native conversation.
+        if current.session_id != view.session_id || self.inner.offline.revoked() {
+            return;
+        }
+        self.inner
+            .offline
+            .capture_sources(view, clock, true, changes, raw);
+    }
+
+    /// Transfer admitted full patches only after installing this handle's
+    /// current typed source projection. The Runtime validates it once more.
+    pub(crate) fn take_restored_changes(
+        &self,
+    ) -> Option<crate::chat::source_owners::ResidentChanges> {
+        self.inner.offline.take_restored_changes()
+    }
+
+    /// Transfer only currently authorized original-call sidecars. Runtime
+    /// revalidates them after syncing actual raw descriptors.
+    pub(crate) fn take_restored_raw_calls(
+        &self,
+    ) -> Option<crate::chat::source_owners::ResidentRawCalls> {
+        self.inner.offline.take_restored_raw_calls()
+    }
+
+    /// Account/history deletion must fence cached plaintext as well as the
+    /// visible publication. This never starts or stops a provider.
+    pub(crate) fn revoke_local_history(&self) {
+        let mut snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.inner.offline.revoke();
+        self.inner.body_requested.store(false, Ordering::Release);
+        self.inner
+            .transcript_resident
+            .store(false, Ordering::Release);
+        Arc::make_mut(&mut snapshot).evict_transcript();
+    }
+
+    pub(crate) fn offline_view_metrics(&self) -> (usize, usize, usize, u64) {
+        self.inner.offline.metrics()
+    }
+    pub(crate) fn global_offline_view_metrics() -> (usize, usize, usize, u64) {
+        offline::global_metrics()
+    }
+
     /// Fence pending wakes and wire frames synchronously, before scheduling IO.
     /// Neither acknowledgement phase changes visibility or reads presentation.
     pub fn begin_acknowledgement(&self) -> u64 {
@@ -2309,7 +2671,7 @@ mod tests {
         assert_eq!(activity.take(), ActivityState::Working);
     }
 
-    fn host_proof(incarnation: &str) -> HostSessionProof {
+    pub(super) fn host_proof(incarnation: &str) -> HostSessionProof {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
         HostSessionProof {
             host_session_id: HostSessionId::new("session"),
@@ -2320,7 +2682,7 @@ mod tests {
 
     /// The live installation's own card: a native OMP conversation whose
     /// persisted launch names its session directory and nothing else.
-    fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
+    pub(super) fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,

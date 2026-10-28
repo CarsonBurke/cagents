@@ -35,6 +35,8 @@ mod step;
 mod thumbnails;
 mod tool_text;
 mod raw_original;
+#[cfg(test)]
+mod raw_original_eof_tests;
 mod disclosure_intent;
 mod clipboard_intent;
 mod turn;
@@ -2272,7 +2274,12 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
+        // An offline restore publishes its body and admitted originals together.
+        // Keep the last readable view until that publication is ready instead
+        // of replacing it with the connection's bodyless metadata.
+        let Some((mut snapshot, source_clock)) = handle.resident_snapshot_with_clock() else {
+            return;
+        };
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -2286,6 +2293,7 @@ impl Runtime {
         }
         if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
         {
+            self.restore_offline_originals();
             return;
         }
         if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
@@ -2552,8 +2560,24 @@ impl Runtime {
         }
         self.snapshot = snapshot;
         raw_original::sync(self);
+        self.restore_offline_originals();
         images::sync(self);
         self.refresh_find();
+    }
+
+    /// Install cached originals only after the current publication's typed
+    /// descriptors have been installed. Taking the sidecar transfers it once;
+    /// raw_original validates its exact admitted owners and selected source.
+    fn restore_offline_originals(&mut self) {
+        if !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        let restored = self
+            .handle()
+            .and_then(|handle| handle.take_restored_raw_calls());
+        if let Some(restored) = restored {
+            raw_original::restore(self, restored);
+        }
     }
 
     /// How many running subagents cancelling the turn would also stop.
@@ -2614,8 +2638,23 @@ impl Runtime {
             });
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
-        self.visible.store(visible, Ordering::Relaxed);
-        if !visible {self.raw_original.evict();}
+        let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        if changed && !visible {
+            // Capture before eviction releases the admitted original Arcs.
+            // Repeated hidden updates must not overwrite this with an empty
+            // sidecar after the UI has already shed those owners.
+            if let Some(handle) = self.handle() {
+                handle.remember_visible_view_with_sources(
+                    self.snapshot.clone(),
+                    self.source_clock,
+                    chat::source_owners::ResidentChanges::default(),
+                    self.raw_original.capture(),
+                );
+            }
+        }
+        if !visible {
+            self.raw_original.evict();
+        }
         images::sync(self);
         self.present()
     }
@@ -2625,11 +2664,11 @@ impl Runtime {
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     fn present(&self) -> Result<(), String> {
-        let visible = self.visible.load(Ordering::Relaxed)
-            || self.queued.is_some()
-            || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        let retain_body = self.visible.load(Ordering::Relaxed);
+        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        self.handle().map_or(Ok(()), |handle| {
+            handle.set_interest(interested, retain_body)
+        })
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -5487,13 +5526,9 @@ impl Cagents {
             (QueuedStep::Prompt, Err(error)) => {
                 // The conversation is new, so a message of the reader's in
                 // it can only be this one.
-                let arrived = runtime.handle().is_some_and(|handle| {
-                    handle
-                        .snapshot()
-                        .items
-                        .iter()
-                        .any(|item| item.role == chat::Role::User)
-                });
+                let arrived = runtime
+                    .handle()
+                    .is_some_and(|handle| handle.has_observed_user_item());
                 if !arrived {
                     return self.revert_chat_draft(target, Some(error));
                 }
@@ -14891,6 +14926,55 @@ mod tests {
             panic!("the card is a chat");
         };
         assert_eq!(saved, &started, "a restore reopens it as a draft");
+    }
+
+    #[test]
+    fn a_hidden_first_message_arrival_survives_body_eviction_and_a_late_send_error() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(false)
+            .unwrap();
+        handle.replace_snapshot_for_test(Snapshot {
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: "accepted-hidden-prompt".into(),
+                role: chat::Role::User,
+                content: text("hello"),
+                started_at: None,
+                at: None,
+            })],
+            ..Default::default()
+        });
+        assert!(
+            handle.snapshot().items.is_empty(),
+            "hidden control updates retain no body"
+        );
+        assert!(
+            handle.has_observed_user_item(),
+            "arrival survives that eviction"
+        );
+        settle(
+            &mut app,
+            card,
+            Err("fixture: acknowledgement timed out".into()),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(
+            !runtime.is_draft(),
+            "an accepted prompt must not become a resendable draft"
+        );
+        assert!(runtime.queued.is_none());
+        assert!(runtime.composer.text().trim().is_empty());
+        assert!(
+            runtime
+                .failures
+                .iter()
+                .any(|(_, notice)| notice.contains("acknowledgement timed out"))
+        );
     }
 
     /// A message the transcript shows arriving was taken, whatever its

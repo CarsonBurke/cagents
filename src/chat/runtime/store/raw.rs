@@ -48,7 +48,7 @@ pub(super) fn initialize(db:&mut Connection)->Result<State,String> {
     let blocked=tx.query_row("SELECT disabled FROM raw_source_schema WHERE singleton=1",[],|row|row.get::<_,Option<String>>(0)).map_err(err)?;
     let mut open=HashMap::new();let mut open_bytes=0usize;
     {
-        let mut query=tx.prepare("SELECT agent,id,input_len FROM raw_tool_sources WHERE state=0 LIMIT 513").map_err(err)?;
+        let mut query=tx.prepare("SELECT agent,id,input_len FROM raw_tool_sources s WHERE state=0 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent=s.agent AND r.id=s.id) LIMIT 513").map_err(err)?;
         let rows=query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,usize>(2)?))).map_err(err)?;
         for row in rows {let (agent,id,len)=row.map_err(err)?;if open.len()==OPEN_KEYS {return Err("Original tool source has too many unfinished captures".into());}open_bytes=open_bytes.saturating_add(len);open.insert(key(&agent,&id),len);}
     }
@@ -116,10 +116,12 @@ impl Store {
         if self.raw_revoked(source)? {return Ok(Some("This original tool source was removed; a replay cannot recreate it".into()));}
         let hash=digest(input.as_bytes());
         let previous:Option<(i64,Option<Vec<u8>>,String,usize,usize)>=self.db.query_row("SELECT state,hash,name,cost,(SELECT count(*) FROM raw_tool_chunks c WHERE c.agent=s.agent AND c.id=s.id) FROM raw_tool_sources s WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(err)?;
-        if let Some((SEALED,old_hash,old_name,..))=&previous {
-            if old_hash.as_deref()==Some(hash.as_slice())&&old_name==name {return Ok(None);}
-            self.raw_fence_identity(source)?;
-            return Ok(Some("A provider reused an original tool identity with different arguments; the ambiguous update was discarded".into()));
+        if let Some((state,old_hash,old_name,..))=&previous {
+            if *state==SEALED&&old_hash.as_deref()==Some(hash.as_slice())&&old_name==name {return Ok(None);}
+            if *state==SEALED||old_name!=name {
+                self.raw_fence_identity(source)?;
+                return Ok(Some("A provider reused an original tool identity with a different name or arguments; the ambiguous update was discarded".into()));
+            }
         }
         let command=command_bytes(command)?;
         if input.len().saturating_add(command.len())>RAW_SOURCE_BYTES {return self.raw_refused("Original tool call exceeds its bounded capture limit".into());}
@@ -150,21 +152,20 @@ impl Store {
         if source.agent_id.is_some(){return Ok(None);}// Child raw arguments are not captured by this lane.
         if !valid_key(source)||name.is_empty()||name.len()>KEY_BYTES{return self.raw_refused("Original tool call identity exceeds the capture limit".into());}
         if self.raw_revoked(source)?{return Ok(Some("Removed original tool call cannot be recreated".into()));}
-        if self.raw_sources.open.contains_key(source){return Ok(None);}
-        if self.raw_sources.open.len()>=OPEN_KEYS{return self.raw_refused("Too many unfinished original tool calls".into());}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         if revoked(&tx,source)?{return Err("Original tool call was removed".into());}
         let old:Option<(String,i64)>=tx.query_row("SELECT name,state FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         if let Some((old,state))=old {
             if state==SEALED||old!=name {
-                // A new stream cannot prove that it owns an already sealed
-                // native ID. Preserve old bodies while fencing every later
-                // placeholder/delta; never replace a patch with an empty call.
+                // A stream must retain its unfinished call's native name and
+                // cannot claim an already sealed ID. Preserve old bodies while
+                // fencing later placeholders and deltas for this identity.
                 drop(tx);self.raw_fence_identity(source)?;
-                return Ok(Some("Provider reused a completed original tool identity; its ambiguous stream was discarded".into()));
+                return Ok(Some("Provider reused an original tool identity; its ambiguous stream was discarded".into()));
             }
             return Ok(None);
         }
+        if self.raw_sources.open.len()>=OPEN_KEYS{drop(tx);return self.raw_refused("Too many unfinished original tool calls".into());}
         let (bytes,keys):(usize,usize)=tx.query_row("SELECT bytes,keys FROM raw_source_schema WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let cost=source_cost(source,name);
         if keys>=KEYS||bytes.saturating_add(cost).saturating_add(self.raw_sources.open_bytes)>DISK_BYTES{drop(tx);return self.raw_refused("Original tool history identity budget reached".into());}
@@ -442,6 +443,232 @@ mod tests {
 #[cfg(test)]
 mod identity_reuse_tests {
     use super::*;
+    #[test]
+    fn an_unfinished_stream_cannot_change_its_original_tool_name() {
+        let mut store = Store::new().unwrap();
+        let source = key("", "open");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: source.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        let original = Item {
+            id: "open".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "Write".into(),
+                input: String::new(),
+                output: String::new(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        store.apply(Event::Item(original.clone())).unwrap();
+        let metadata: Vec<u8> = store
+            .db
+            .query_row("SELECT metadata FROM items WHERE id='open'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // A repeated start for the same native name is harmless. A changed
+        // name cannot inherit its input stream, even before the first delta.
+        let repeated = store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: source.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        assert!(repeated.is_empty());
+        let changed = store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: source.clone(),
+                name: "Bash".into(),
+            }))
+            .unwrap();
+        assert!(
+            changed
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(store.raw_revoked(&source).unwrap());
+
+        let mut ambiguous = original;
+        if let ItemContent::Tool { name, .. } = &mut ambiguous.content {
+            *name = "Bash".into();
+        }
+        store.apply(Event::Item(ambiguous)).unwrap();
+        store
+            .apply(Event::InputDelta {
+                id: "open".into(),
+                offset: 0,
+                delta: "{}".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT metadata FROM items WHERE id='open'", [], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .unwrap(),
+            metadata
+        );
+        assert!(store.raw_original(&source).is_err());
+        assert!(store.raw_parts("open").unwrap().is_empty());
+        assert!(!store.raw_sources.open.contains_key(&source));
+
+        // Fence this identity without disabling unrelated original capture.
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: key("", "unrelated"),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert_eq!(
+            store.raw_original(&key("", "unrelated")).unwrap(),
+            Some(("Write".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn a_full_completion_cannot_rename_an_unfinished_original_call() {
+        let mut store = Store::new().unwrap();
+        let source = key("", "full-open");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: source.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        let warning = store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: source.clone(),
+                name: "Bash".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert!(
+            warning
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(store.raw_revoked(&source).unwrap());
+        assert!(store.raw_original(&source).is_err());
+        assert!(store.raw_parts("full-open").unwrap().is_empty());
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT name FROM raw_tool_sources WHERE id='full-open'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Write"
+        );
+
+        let legitimate = key("", "same-name");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: legitimate.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        assert!(
+            store
+                .apply(Event::RawToolCapture(RawToolCapture::Full {
+                    source: legitimate.clone(),
+                    name: "Write".into(),
+                    input: "{}".into(),
+                    command: None,
+                }))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.raw_revoked(&legitimate).unwrap());
+        assert_eq!(
+            store.raw_original(&legitimate).unwrap(),
+            Some(("Write".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn reopening_raw_capture_recovers_live_streams_without_revoked_open_identities() {
+        let mut store = Store::new().unwrap();
+        for index in 0..=OPEN_KEYS {
+            let source = key("", &format!("revoked-{index}"));
+            for name in ["Write", "Bash"] {
+                store
+                    .apply(Event::RawToolCapture(RawToolCapture::Start {
+                        source: source.clone(),
+                        name: name.into(),
+                    }))
+                    .unwrap();
+            }
+            assert!(store.raw_revoked(&source).unwrap());
+        }
+        assert!(store.raw_sources.open.is_empty());
+        let live = key("", "still-live");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: live.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        let path: String = store
+            .db
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut reopened = Connection::open(path).unwrap();
+        let state = initialize(&mut reopened)
+            .expect("revoked unfinished calls must not consume reopened live capture slots");
+        assert!(guard(&store.db, store.raw_sources.nonce).is_err());
+        store.db = reopened;
+        store.raw_sources = state;
+        assert_eq!(store.raw_sources.open.len(), 1);
+        assert_eq!(store.raw_sources.open.get(&live), Some(&0));
+        assert_eq!(store.raw_sources.open_bytes, 0);
+
+        let removed = key("", "revoked-0");
+        let warning = store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: removed.clone(),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert!(
+            warning
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(store.raw_original(&removed).is_err());
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: live.clone(),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert_eq!(
+            store.raw_original(&live).unwrap(),
+            Some(("Write".into(), "{}".into()))
+        );
+        assert!(store.raw_sources.open.is_empty());
+    }
+
     #[test]
     fn a_new_stream_cannot_replace_an_already_completed_original_item(){
         let mut store=Store::new().unwrap();store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("","old"),name:"Write".into(),input:"null".into(),command:None})).unwrap();
