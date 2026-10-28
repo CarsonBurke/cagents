@@ -283,18 +283,10 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         {
             continue;
         }
-        // Raw terminal records retain launch continuity; the descriptor pins
-        // the currently hosted worker to this daemon's authenticated proof.
-        let Ok(descriptor) = state.descriptor(0, *id) else {
-            continue;
-        };
-        if descriptor.session.continuity.live_proof().is_none() {
-            continue;
-        }
         let activity = record.handle.agent_activity();
         live.push(Live {
             id: *id,
-            source: HostedSession::Terminal(descriptor.session),
+            source: terminal_source(&record.session, state.proof()),
             surface: Surface::Terminal,
             provider: activity.map(|activity| activity.provider),
             title: record.conversation_title().map(str::to_owned),
@@ -303,6 +295,21 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         });
     }
     live
+}
+
+fn terminal_source(
+    session: &crate::model::TerminalSession,
+    proof: &crate::model::HostSessionProof,
+) -> HostedSession {
+    // The caller already excluded completed workers. Project only the current
+    // daemon proof, without descriptor/transcript filesystem work under HostLock.
+    let mut current = session.clone();
+    current.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+        host_session_id: proof.host_session_id.clone(),
+        boot_id: proof.boot_id.clone(),
+        host_incarnation: proof.host_incarnation.clone(),
+    };
+    HostedSession::Terminal(current)
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views

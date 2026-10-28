@@ -266,3 +266,113 @@ fn current_directory_reads_reject_unproved_same_id_panes_but_keep_accepted_alias
         );
     }
 }
+
+#[test]
+fn terminal_directory_source_projects_current_proof_before_binding_saved_scope() {
+    use crate::model::{TerminalContinuity, TerminalSession};
+    use crate::workspace_model::views::{Change, Scope as ViewScope};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut registry = Registry::at(&directory.path().join("terminal-scope.sqlite")).unwrap();
+    let recipe = LaunchRecipe {
+        program: "no-process-directory-fixture".into(),
+        arguments: Vec::new(),
+        working_directory: "/issued-directory".into(),
+        environment: BTreeMap::new(),
+        unset_environment: Default::default(),
+    };
+    let raw = TerminalSession {
+        id: TerminalId::new(),
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe.clone(),
+        transcript_path: Some("/not-opened-by-directory-source".into()),
+        resume_hint: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("terminal-directory-fixture"),
+        boot_id: crate::model::BootId::new("fixture-boot"),
+        host_incarnation: HostIncarnation::new("current"),
+    };
+    // This is the pure projection used after live_sessions' completed-worker
+    // guard. No PTY, terminal worker, provider or transcript file is required.
+    let projected = terminal_source(&raw, &proof);
+    let HostedSession::Terminal(current) = &projected else {
+        unreachable!()
+    };
+    assert_eq!(current.continuity.live_proof(), Some(proof));
+    assert_eq!(current.launch, raw.launch);
+    assert_eq!(current.transcript_path, raw.transcript_path);
+    assert!(raw.continuity.live_proof().is_none());
+    let scope = ViewScope::Worktree {
+        repository: "/logical-project".into(),
+        path: "/logical-project".into(),
+    };
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: "/logical-project".into(),
+            name: "Logical".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let mut pane = Pane {
+        id: CardId::new(),
+        title: "Terminal scope fixture".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: CardKind::Terminal(current.clone()),
+        scope: None,
+    };
+    registry
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: Vec::new(),
+        })
+        .unwrap();
+    for case in ["current", "old-daemon", "raw-launch", "different-recipe"] {
+        let before = pane.clone();
+        let mut cached = current.clone();
+        match case {
+            "current" => {}
+            "old-daemon" => {
+                cached.continuity = TerminalContinuity::DetachedSameBoot {
+                    host_session_id: HostSessionId::new("terminal-directory-fixture"),
+                    boot_id: crate::model::BootId::new("fixture-boot"),
+                    host_incarnation: HostIncarnation::new("previous"),
+                };
+            }
+            "raw-launch" => cached = raw.clone(),
+            "different-recipe" => cached.launch.arguments.push("different-launch".into()),
+            _ => unreachable!(),
+        }
+        pane.kind = CardKind::Terminal(cached);
+        let model = registry.model().unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: model.views[0].revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before,
+                    pane: pane.clone(),
+                },
+            })
+            .unwrap();
+        let scopes = session_scopes(&registry.model().unwrap(), |cached| {
+            registry.authenticated_session_alias(cached, &projected)
+        })
+        .unwrap();
+        assert_eq!(
+            scopes.get(&raw.id).cloned(),
+            (case == "current").then_some(Some(scope.clone())),
+            "{case}: only current proved terminal metadata can supply placement"
+        );
+    }
+}
