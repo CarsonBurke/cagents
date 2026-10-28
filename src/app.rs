@@ -1068,6 +1068,40 @@ struct TerminalWakeup {
     generation: u64,
 }
 
+/// How much of the workspace projection an update has to rebuild. Busy
+/// terminals wake about once per frame each, so a wake that changed nothing a
+/// projection reads must not pay for every card's sidebar, chrome and
+/// protection bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// Nothing any projection reads changed: grid output, repaint ticks.
+    Unchanged,
+    /// Only a runtime-reported card title changed. Card chrome and the window
+    /// title are the only projections that read it.
+    Chrome,
+    /// Anything else, including every user action.
+    Full,
+}
+
+/// Runtime-reported terminal titles can animate several times a second
+/// (spinners, step counters). The durable card follows each one at once, so
+/// chrome stays current, but saving it, and publishing it to shared views,
+/// waits for this window: a burst of reported titles costs at most one save
+/// per window, and the last title is saved within one window of the burst
+/// ending. Any earlier save carries the titles with it.
+const REPORTED_TITLE_SAVE_DELAY: Duration = Duration::from_secs(3);
+
+/// Saving of runtime-reported titles, deferred by [`REPORTED_TITLE_SAVE_DELAY`].
+#[derive(Debug, Default)]
+struct ReportedTitleSave {
+    /// Cards whose reported title changed since the last save that published
+    /// titles. Shared views hold those titles back until that save.
+    cards: HashSet<CardId>,
+    /// A `ReportedTitleSaveDue` timer is outstanding. Kept apart from
+    /// `cards` so a burst interleaved with other saves still arms one timer.
+    scheduled: bool,
+}
+
 #[derive(Clone)]
 struct TerminalWakeSource(async_channel::Receiver<TerminalWakeup>);
 
@@ -2743,6 +2777,17 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     }
 }
 
+/// Timers that exist only to repaint elapsed time or a progress animation.
+/// Their handlers change nothing a workspace projection reads.
+fn repaint_tick(message: &Message) -> bool {
+    match message {
+        Message::ChatUi(chat_ui::Action::Tick) => true,
+        #[cfg(feature = "integrated-browser")]
+        Message::BrowserProgressTick => true,
+        _ => false,
+    }
+}
+
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
         || matches!(
@@ -4391,6 +4436,8 @@ pub enum Message {
     LifecycleSweepElapsed(u64),
     /// The delay on saving a change of focus alone has passed.
     FocusSaveDue,
+    /// The delay on saving runtime-reported card titles has passed.
+    ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
@@ -5082,6 +5129,9 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    /// The workspace `card_indices` was built from. Holding it weakly pins
+    /// its allocation, so a changed workspace always has a different address.
+    card_indices_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
@@ -5112,6 +5162,8 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// See [`REPORTED_TITLE_SAVE_DELAY`].
+    reported_title_save: ReportedTitleSave,
     /// Where the camera was heading when the last sweep found cards on screen
     /// that it was only passing, which that sweep left cold. The camera
     /// coming to rest or heading elsewhere is then a reason to sweep again.
@@ -7433,7 +7485,15 @@ impl Cagents {
         Arc::make_mut(&mut self.durable).focused = focused;
     }
 
+    /// Saves the workspace and publishes its views, reported titles included.
     fn persist(&mut self) {
+        self.reported_title_save.cards.clear();
+        self.save_workspace();
+    }
+
+    /// [`Self::persist`] that leaves reported titles waiting for their
+    /// deferred save held back from shared views.
+    fn save_workspace(&mut self) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7450,6 +7510,8 @@ impl Cagents {
                 .retain(|id| open.contains(id));
         }
         self.focus_save_pending = false;
+        #[cfg(test)]
+        terminal_output_tests::record_persist();
         self.snapshot_workspace_scope();
         self.publish_view_changes();
         let saved = self.persistent_workspace();
@@ -7951,13 +8013,16 @@ impl Cagents {
         false
     }
 
-    /// Builds chrome for cards that appeared or were renamed, drops entries for
-    /// cards the workspace no longer holds, and renames the window.
-    fn sync_chrome(&mut self) -> Task<Message> {
-        self.terminal_working_directories
-            .retain(|card, _| self.cards.contains_key(card));
-        self.terminal_find
-            .retain(|card, _| self.cards.contains_key(card));
+    /// Rebuilds `card_indices` when the durable workspace is not the one it was
+    /// built from. Copy-on-write gives every changed workspace a new address,
+    /// and the weak reference keeps the old address from being reused.
+    fn index_cards(&mut self) {
+        if self.card_indices_source.as_ptr() == Arc::as_ptr(&self.durable) {
+            return;
+        }
+        #[cfg(test)]
+        terminal_output_tests::record_card_index();
+        self.card_indices_source = Arc::downgrade(&self.durable);
         self.card_indices.clear();
         self.card_indices.extend(
             self.durable
@@ -7966,6 +8031,18 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+    }
+
+    /// Builds chrome for cards that appeared or were renamed, drops entries for
+    /// cards the workspace no longer holds, and renames the window.
+    fn sync_chrome(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_chrome();
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.index_cards();
         // A moved worktree keeps its pane numbers. Reconcile its new scope's
         // counter before minting a number, including when insertion precedes
         // an existing pane in the saved order.
@@ -8005,10 +8082,27 @@ impl Cagents {
                 self.chrome_ui.terminal_ordinals.insert(card.id, *next);
             }
         }
+        // The first titled channel holding each card, as `card_display_title`
+        // finds it, in one pass rather than one channel scan per chat.
+        let mut titled_channels = HashMap::new();
+        for channel in self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| !channel.title.is_empty())
+        {
+            for card in &channel.cards {
+                titled_channels.entry(*card).or_insert(channel);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let (title, file_caption) = self.repository_chrome(card);
+            let (title, file_caption) = self.repository_chrome_with(card, || {
+                self.card_display_title_with_chat_title(card, || {
+                    self.chat_channel_title(card, titled_channels.get(&card.id).copied())
+                })
+            });
             if matches!(card.kind, CardKind::Browser(_))
                 && self
                     .workspace
@@ -8082,6 +8176,16 @@ impl Cagents {
         &'a self,
         card: &'a CardState,
     ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+        self.repository_chrome_with(card, || self.card_display_title(card))
+    }
+
+    /// `repository_chrome` with the card's display title supplied, so a pass
+    /// over every card can resolve channel titles once.
+    fn repository_chrome_with<'a>(
+        &'a self,
+        card: &'a CardState,
+        display_title: impl FnOnce() -> &'a str,
+    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
             && let Some(path) = runtime.selected_path()
             && let Some(name) = path.file_name()
@@ -8096,7 +8200,7 @@ impl Cagents {
                 )),
             );
         }
-        let title = self.card_display_title(card);
+        let title = display_title();
         if let CardKind::Terminal(session) = &card.kind
             && !self.chrome_ui.user_titles.contains_key(&card.id)
         {
@@ -8133,18 +8237,32 @@ impl Cagents {
     /// Provider activity belongs in the status icon, including restored titles.
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
         self.card_display_title_with_chat_title(card, || {
-            let CardKind::Chat(session) = &card.kind else {
-                return None;
-            };
-            let channel =
-                self.durable.channels.iter().find(|channel| {
-                    channel.cards.contains(&card.id) && !channel.title.is_empty()
-                })?;
-            (card.title == chat_ui::chat_card_title(session.launch.provider)
-                || (channel.title_source == crate::model::ChannelTitleSource::Manual
-                    && self.channel_primary_chat(channel) == Some(card.id)))
-            .then_some(channel.title.as_str())
+            self.chat_channel_title(
+                card,
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty()),
+            )
         })
+    }
+
+    /// The title a chat card shows from `channel`, the first titled channel
+    /// holding it: a provider-default chat, or the primary chat of a channel
+    /// the user named, is presented by its channel's name.
+    fn chat_channel_title<'a>(
+        &self,
+        card: &CardState,
+        channel: Option<&'a crate::model::ProjectChannel>,
+    ) -> Option<&'a str> {
+        let CardKind::Chat(session) = &card.kind else {
+            return None;
+        };
+        let channel = channel?;
+        (card.title == chat_ui::chat_card_title(session.launch.provider)
+            || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                && self.channel_primary_chat(channel) == Some(card.id)))
+        .then_some(channel.title.as_str())
     }
 
     /// Batch projections can resolve channel membership once while sharing the
@@ -8872,6 +8990,19 @@ impl Cagents {
         })
     }
 
+    /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
+    /// together with whatever else changes by then.
+    fn save_reported_titles_soon(&mut self, card: CardId) -> Task<Message> {
+        self.reported_title_save.cards.insert(card);
+        if std::mem::replace(&mut self.reported_title_save.scheduled, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            tokio::time::sleep(REPORTED_TITLE_SAVE_DELAY).await;
+            Message::ReportedTitleSaveDue
+        })
+    }
+
     /// Arms a timer for `deadline`, superseding any timer already pending.
     fn arm_lifecycle_sweep(&mut self, deadline: Instant) -> Task<Message> {
         self.lifecycle_sweep_deadline = Some(deadline);
@@ -9174,20 +9305,27 @@ impl Cagents {
     }
 
     /// Drain controls and lifecycle events on every wake, independently of grid
-    /// repaint. Only actual metadata changes need the workspace projection tail.
-    fn drain_terminal_update(&mut self, card: CardId, _generation: u64) -> (Task<Message>, bool) {
+    /// repaint. Answers how much of the workspace projection the wake changed.
+    fn drain_terminal_update(
+        &mut self,
+        card: CardId,
+        _generation: u64,
+    ) -> (Task<Message>, Projection) {
         if self.chat_start_pending(card) {
-            return (Task::none(), false);
+            return (Task::none(), Projection::Unchanged);
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return (Task::none(), false);
+                return (Task::none(), Projection::Unchanged);
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
         let mut durable_changed = false;
         let mut metadata_changed = false;
+        // A reported title is durable, but only chrome reads it and its save
+        // can wait; see `REPORTED_TITLE_SAVE_DELAY`.
+        let mut title_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
         if let Some(proof) = proof
@@ -9225,7 +9363,7 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
-                    durable_changed |= self.apply_reported_title(card, title);
+                    title_changed |= self.apply_reported_title(card, title);
                 }
                 TerminalEvent::WorkingDirectoryChanged(path) => {
                     if self.terminal_working_directories.get(&card) != Some(&path) {
@@ -9392,9 +9530,15 @@ impl Cagents {
             }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
-        if durable_changed {
+        // A save now carries any reported title with it.
+        let title_save = if durable_changed {
             self.persist();
-        }
+            Task::none()
+        } else if title_changed {
+            self.save_reported_titles_soon(card)
+        } else {
+            Task::none()
+        };
         if let Some((session, visible, hibernated)) = recovery {
             // A hibernated agent kept attached for its row goes back to
             // waiting for its card: it may be attached again, but launching it
@@ -9409,7 +9553,10 @@ impl Cagents {
                 }
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
-                return (self.attach_next_restored_agent(), true);
+                return (
+                    Task::batch([title_save, self.attach_next_restored_agent()]),
+                    Projection::Full,
+                );
             }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
@@ -9428,11 +9575,28 @@ impl Cagents {
                 Instant::now(),
             );
             self.cards.insert(card, CardRuntime::Loading);
-            return (self.start_terminal(card, session, visible, false), true);
+            return (
+                Task::batch([
+                    title_save,
+                    self.start_terminal(card, session, visible, false),
+                ]),
+                Projection::Full,
+            );
         }
+        let projection = if metadata_changed || durable_changed {
+            Projection::Full
+        } else if title_changed {
+            Projection::Chrome
+        } else {
+            Projection::Unchanged
+        };
         (
-            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
-            metadata_changed || durable_changed,
+            Task::batch([
+                clipboard_task,
+                title_save,
+                self.refresh_live_terminal_find(card),
+            ]),
+            projection,
         )
     }
 
@@ -13923,6 +14087,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -14098,6 +14263,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
@@ -14355,7 +14521,11 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut terminal_metadata_unchanged = false;
+        let mut projection = if repaint_tick(&message) {
+            Projection::Unchanged
+        } else {
+            Projection::Full
+        };
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
@@ -14407,7 +14577,9 @@ impl Application for Cagents {
             }
             Message::WorkspaceModelObserved(update) => {
                 let (task, changed) = self.apply_workspace_model_update_effect(update);
-                terminal_metadata_unchanged = !changed;
+                if !changed {
+                    projection = Projection::Unchanged;
+                }
                 task
             }
             Message::TerminalStarted {
@@ -14442,8 +14614,8 @@ impl Application for Cagents {
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                let (task, metadata_changed) = self.drain_terminal_update(card, generation);
-                terminal_metadata_unchanged = !metadata_changed;
+                let (task, wake_projection) = self.drain_terminal_update(card, generation);
+                projection = wake_projection;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -16416,6 +16588,13 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::ReportedTitleSaveDue => {
+                self.reported_title_save.scheduled = false;
+                if !self.reported_title_save.cards.is_empty() {
+                    self.persist();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -17708,7 +17887,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        if !terminal_metadata_unchanged {
+        if projection == Projection::Full {
             self.sync_worktree_protections();
         }
         self.sync_popup_keyboard_nav();
@@ -17748,12 +17927,27 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        if terminal_metadata_unchanged {
-            return Task::batch([
-                task,
-                self.reconcile_notice_popup(),
-                self.release_deferred_navigation_if_unblocked(),
-            ]);
+        match projection {
+            Projection::Unchanged => {
+                return Task::batch([
+                    task,
+                    self.reconcile_notice_popup(),
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            // A reported title reaches the tabs and window title; nothing in
+            // the sidebar, worktree ownership or protections reads it.
+            Projection::Chrome => {
+                let notices = self.reconcile_notice_popup();
+                let chrome = self.sync_chrome();
+                return Task::batch([
+                    task,
+                    chrome,
+                    notices,
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            Projection::Full => {}
         }
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
@@ -28583,6 +28777,7 @@ mod tests {
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -28599,6 +28794,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
