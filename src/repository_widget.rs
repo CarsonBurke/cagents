@@ -2933,8 +2933,16 @@ impl RepositoryRuntime {
             return Task::none();
         }
         if self.descriptor.worktree != view.worktree {
+            // Retire the departing document before a load in the new root can
+            // retain it under the same relative path and disk hash. Its Undo,
+            // cursor and selection belong to the old worktree.
+            self.push_lsp_close();
+            self.document = DocumentState::None;
+            self.selected = None;
+            self.committed_selection = None;
             self.undo_lru = crate::editor_navigation::UndoLru::default();
             self.locations = crate::editor_navigation::Locations::default();
+            self.pending_jump_origin = None;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
@@ -12805,6 +12813,63 @@ mod tests {
         };
         assert_eq!(document.content.text(), "outside");
         assert!(!document.history.can_undo());
+    }
+
+    #[tokio::test]
+    async fn retargeting_worktrees_never_transfers_same_path_and_hash_undo_or_selection() {
+        let original_root = tempfile::tempdir().unwrap();
+        let next_root = tempfile::tempdir().unwrap();
+        std::fs::write(original_root.path().join("a.rs"), "one").unwrap();
+        std::fs::write(next_root.path().join("a.rs"), "xone").unwrap();
+        let card = CardId::new();
+        let view = |root: &Path| RepositoryView {
+            project: ProjectId::new(),
+            repository: root.to_path_buf(),
+            worktree: root.to_path_buf(),
+            selected_file: Some("a.rs".into()),
+        };
+        let mut runtime = RepositoryRuntime::new(view(original_root.path()));
+        let task = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("the original file is editable");
+        };
+        assert!(document.history.can_undo());
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 3 },
+            selection: Some(text_editor::Position { line: 0, column: 1 }),
+        });
+        let task = runtime.retarget_file(card, view(next_root.path()));
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("the same-named destination loads through its real file task");
+        };
+        assert_eq!(document.content.text(), "xone");
+        assert!(!document.history.can_undo());
+        assert_eq!(
+            document.content.cursor(),
+            text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            }
+        );
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("xone"));
+        assert!(!runtime.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(next_root.path().join("a.rs")).unwrap(),
+            "xone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original_root.path().join("a.rs")).unwrap(),
+            "xone"
+        );
     }
 
     #[tokio::test]

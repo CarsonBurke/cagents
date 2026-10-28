@@ -1339,7 +1339,8 @@ where
                     .and_then(|text| text.chars().next_back())
             })
             .flatten();
-        if matches!(character, '\'' | '"')
+        if cursor.selection.is_none()
+            && matches!(character, '\'' | '"')
             && previous.is_some_and(|previous| previous == '\\' || previous.is_alphanumeric())
         {
             return false;
@@ -1347,7 +1348,32 @@ where
         if cursor.selection.is_none() && next.is_some_and(|next| next.is_alphanumeric()) {
             return false;
         }
-        let selected = self.selection().unwrap_or_default();
+        // Native clipboard text normalizes every line ending to LF. Wrapping
+        // must instead preserve the exact source between the expanded native
+        // selection endpoints, including word/line selections.
+        let (cursor, selected) = if let Some(anchor) = cursor.selection {
+            let first = cursor.position.line.min(anchor.line).saturating_sub(1);
+            let last = (cursor.position.line.max(anchor.line) + 1)
+                .min(self.line_count().saturating_sub(1));
+            let excerpt = self.excerpt(first, last);
+            let cursor = self.selected_span(&excerpt, cursor);
+            let anchor = cursor.selection.unwrap_or(cursor.position);
+            let Some(caret_at) = excerpt.offset(cursor.position) else {
+                return false;
+            };
+            let Some(anchor_at) = excerpt.offset(anchor) else {
+                return false;
+            };
+            let Some(selected) = excerpt
+                .text()
+                .get(caret_at.min(anchor_at)..caret_at.max(anchor_at))
+            else {
+                return false;
+            };
+            (cursor, selected.to_owned())
+        } else {
+            (cursor, String::new())
+        };
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column)
         {
@@ -5798,6 +5824,55 @@ mod tests {
         content.set_auto_close(false);
         content.perform_edit(Edit::Insert('(')).unwrap();
         assert_eq!(content.text(), "(");
+    }
+
+    #[test]
+    fn wrapping_selections_preserves_native_line_endings_and_replays_exactly() {
+        use history::{EditKind, History, Replay};
+        for original in ["α\nβ", "α\rβ", "α\r\nβ", "α\n\rβ", "α\r\nβ\n\rγ\rδ\n🌲"] {
+            for reverse in [false, true] {
+                for (open, close) in [('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')]
+                {
+                    let mut content: Content = Content::with_text(original);
+                    let first = Position { line: 0, column: 0 };
+                    let line = content.line_count() - 1;
+                    let last = Position {
+                        line,
+                        column: content.with_line(line, |text, _| text.len()).unwrap(),
+                    };
+                    let before = if reverse {
+                        Cursor {
+                            position: first,
+                            selection: Some(last),
+                        }
+                    } else {
+                        Cursor {
+                            position: last,
+                            selection: Some(first),
+                        }
+                    };
+                    content.set_cursor(before);
+                    let recorded = content.perform_edit(Edit::Insert(open)).unwrap();
+                    let after = content.cursor();
+                    let wrapped = format!("{open}{original}{close}");
+                    assert_eq!(content.text(), wrapped);
+                    let mut history = History::default();
+                    history.record(
+                        recorded.change,
+                        EditKind::Other,
+                        recorded.before,
+                        after,
+                        Instant::now(),
+                    );
+                    assert_eq!(history.undo(&mut content), Replay::Applied);
+                    assert_eq!(content.text(), original);
+                    assert_eq!(content.cursor(), before);
+                    assert_eq!(history.redo(&mut content), Replay::Applied);
+                    assert_eq!(content.text(), wrapped);
+                    assert_eq!(content.cursor(), after);
+                }
+            }
+        }
     }
 
     #[test]
