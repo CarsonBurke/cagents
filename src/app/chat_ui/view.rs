@@ -2224,9 +2224,11 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
+            let saved_history = self.is_saved_history_snapshot(snapshot);
             let enabled = !transitioning
                 && self.pending.is_none()
-                && self.attachment_chooser_pending.is_none();
+                && self.attachment_chooser_pending.is_none()
+                && (!saved_history || !snapshot.history_loading);
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -2246,7 +2248,12 @@ impl Runtime {
                 })
                 .width(Length::Fill)
                 .into(),
-                icon(
+                if saved_history {
+                    widget::button::custom(design::caption("Resume conversation"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .on_press_maybe(enabled.then(|| action(Action::ResumeSaved(target))))
+                        .into()
+                } else { icon(
                     Icon::Refresh,
                     if unresumable {
                         "Resume this conversation again"
@@ -2255,7 +2262,7 @@ impl Runtime {
                     },
                     enabled,
                     Action::Reconnect(target),
-                ),
+                ) },
             ];
             if unresumable {
                 controls.push(icon(

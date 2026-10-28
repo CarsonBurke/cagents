@@ -199,6 +199,9 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    /// Explicitly continue a settled saved-history reader in this same pane.
+    /// Restoring a pane never acquires this launch permission.
+    ResumeSaved(Target),
     CopyClosedDraft(Target, u64),
     DiscardClosedDraft(Target, u64),
     SignIn(Target, Account),
@@ -455,7 +458,9 @@ impl Action {
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) => Some(target.card),
+            Self::Reconnect(target)
+            | Self::ResumeSaved(target)
+            | Self::ResumeAfterSignIn(target) => Some(target.card),
             Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
                 Some(*card)
             }
@@ -470,6 +475,7 @@ impl Action {
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
+            | Self::ResumeSaved(target)
             | Self::SignIn(target, _)
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
@@ -9292,6 +9298,33 @@ impl Cagents {
                 }
                 let session = runtime.session.clone();
                 return self.start_chat(target.card, session, chat::Intent::Restore, None, false);
+            }
+            Action::ResumeSaved(target) => {
+                if self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(handle) = runtime.handle() else {
+                    return Task::none();
+                };
+                let snapshot = handle.snapshot();
+                if !handle.is_connected()
+                    || !runtime.is_saved_history_snapshot(&snapshot)
+                    || snapshot.history_loading
+                    || runtime.pending.is_some()
+                    || runtime.attachment_chooser_pending.is_some()
+                {
+                    return Task::none();
+                }
+                // Normal authenticated Start already supports replacing this
+                // exact closed reader. Its account, owner, conversation and
+                // admission fences run before any provider starts. Keep the
+                // issued allocation/proof and the Runtime's unsent content;
+                // this action neither sends the draft nor creates a new chat.
+                let session = runtime.session.clone();
+                return self.start_chat(target.card, session, chat::Intent::Start, None, false);
             }
             Action::StartFresh(card) => {
                 let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind)
@@ -19325,6 +19358,137 @@ mod tests {
                 1 => assert_eq!(ready, Ok(false)),
                 _ => assert!(ready.is_err()),
             }
+        }
+    }
+
+    #[test]
+    fn saved_history_explicit_resume_keeps_the_pane_draft_and_image_unsent() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.launch.session_id = Some(KNOWN_THREAD.into());
+            source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            app.replace_chat_conversation(card, source.clone());
+            let snapshot = Snapshot {
+                session_id: source.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history; no provider was started".into()),
+                ..Default::default()
+            };
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            runtime.replace_draft(text_editor::Content::with_text("Keep this draft unsent"));
+            runtime.replace_attachments(vec![image.clone()]);
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+            runtime
+                .composer
+                .perform(text_editor::Action::Select(text_editor::Motion::Right));
+            let cursor = runtime.composer.cursor();
+            let allocation = runtime as *const Runtime as usize;
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "opening history does not start work"
+            );
+
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let attempt = app.chat_ui.attempt(card).unwrap();
+            assert_eq!(attempt.intent, chat::Intent::Start);
+            assert_eq!(
+                attempt.session, source,
+                "use the exact authenticated reader descriptor"
+            );
+            let failed = attempt.target;
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            assert_eq!(
+                app.chat_ui.attempt(card).unwrap().target,
+                failed,
+                "one click owns one admission"
+            );
+            answer_start(
+                &mut app,
+                failed,
+                Err("Project folder is unavailable".into()),
+            );
+            assert!(app.chat_ui.attempt(card).is_none());
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let retry = app.chat_ui.attempt(card).unwrap().target;
+            let mut confirmed = source.clone();
+            confirmed.native_continuity =
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            answer_start(
+                &mut app,
+                retry,
+                Ok(Arc::new(ClientHandle::fixture(
+                    confirmed,
+                    Snapshot {
+                        session_id: source.launch.session_id.clone(),
+                        ready: true,
+                        native_continuity: chat::NativeContinuity::RetainedClaudeActor {
+                            protocol: 2,
+                        },
+                        ..Default::default()
+                    },
+                ))),
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime as *const Runtime as usize, allocation);
+            assert_eq!(runtime.session.id, source.id);
+            assert_eq!(runtime.session.launch, source.launch);
+            assert_eq!(runtime.composer.text(), "Keep this draft unsent");
+            assert_eq!(runtime.composer.cursor(), cursor);
+            assert_eq!(runtime.attachments, [image]);
+            assert!(runtime.queued.is_none() && runtime.pending.is_none());
+            assert!(!runtime.disconnected);
+            assert!(runtime.handle().unwrap().snapshot().ready);
+        });
+    }
+
+    #[test]
+    fn saved_history_explicit_resume_refuses_unsettled_or_executing_attachments() {
+        for mutation in 0..6 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.session_id = Some(KNOWN_THREAD.into());
+            runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            let mut snapshot = Snapshot {
+                session_id: runtime.session.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history; no provider was started".into()),
+                ..Default::default()
+            };
+            match mutation {
+                0 => snapshot.history_loading = true,
+                1 => snapshot.session_id = Some("another-conversation".into()),
+                2 => snapshot.busy = true,
+                3 => snapshot.read_only_reason = None,
+                4 => snapshot.exited = false,
+                5 => {
+                    runtime.session.native_continuity =
+                        chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                }
+                _ => unreachable!(),
+            }
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "mutation {mutation} must not start work"
+            );
         }
     }
 
