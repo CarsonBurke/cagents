@@ -3107,21 +3107,27 @@ impl Runtime {
         let anchor = self
             .notice_anchor(&self.snapshot, &self.turns)
             .map(str::to_owned);
-        self.note_at(anchor, notice);
+        let after = failure::closing_item(&self.snapshot, &self.turns).map(str::to_owned);
+        if self.note_at(anchor, after, notice) {
+            self.refresh_failure_ui();
+        }
     }
     /// Records `notice` for the prompt message `anchor`, drawn after the
-    /// transcript's current last group: work started by a delivery after
-    /// that prompt still precedes the notice.
-    fn note_at(&mut self, anchor: Option<String>, notice: String) {
+    /// group containing the item `after`: work a delivery started after that
+    /// prompt still precedes the notice. Returns whether the notes changed;
+    /// the caller refreshes their presentation once its inputs agree.
+    fn note_at(&mut self, anchor: Option<String>, after: Option<String>, notice: String) -> bool {
         let provider = self.session.launch.provider;
-        let group = self.turns.last().map(|turn| turn.key.clone());
+        let mut changed = false;
         if chat::requires_sign_in(provider, &notice) {
             // An updated verification failure replaces this exchange's active
             // auth warning; other exchanges and tool failures remain history.
+            let before = self.failures.len();
             self.failures.retain(|note| {
                 !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
                     || !chat::requires_sign_in(provider, &note.text)
             });
+            changed = self.failures.len() != before;
         }
         if let Some(note) = self.failures.iter_mut().find(|note| {
             failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
@@ -3129,21 +3135,21 @@ impl Runtime {
         }) {
             // The same failure recurring later in this exchange is still one
             // notice, now after the work that produced it again.
-            if note.group != group {
-                note.group = group;
-                self.refresh_failure_ui();
+            if after.is_some() && note.after != after {
+                note.after = after;
+                changed = true;
             }
-            return;
+            return changed;
         }
         if self.failures.len() == 32 {
             self.failures.remove(0);
         }
         self.failures.push(failure::Note {
             message: anchor,
-            group,
+            after,
             text: notice,
         });
-        self.refresh_failure_ui();
+        true
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
@@ -4308,6 +4314,8 @@ impl Runtime {
             });
         }
         let next_anchor = next_anchor.map(str::to_owned);
+        let next_after = failure::closing_item(&snapshot, turns.as_deref().unwrap_or(&self.turns))
+            .map(str::to_owned);
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
             self.turns = turns;
@@ -4320,7 +4328,8 @@ impl Runtime {
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
-            self.note_at(next_anchor, error.clone());
+            // Presentation refreshes below, once the snapshot is installed.
+            self.note_at(next_anchor, next_after, error.clone());
         }
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
@@ -14366,13 +14375,35 @@ mod tests {
         let (card, target, handle) = history_fixture(&mut app);
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "failed-prompt".into(),
+            role: chat::Role::User,
+            content: text("Investigate"),
+            started_at: None,
+            at: None,
+        }));
         snapshot.error = Some("Provider failure".into());
         handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
         let recorded = chat_runtime(&app, card).failures.clone();
         assert_eq!(recorded.len(), 1);
+        let drawn = chat_runtime(&app, card).failure_ui.incidents[0]
+            .anchor
+            .clone();
+        assert_eq!(
+            drawn.as_deref(),
+            Some("failed-prompt"),
+            "drawn after the work that failed"
+        );
         snapshot.generation += 1;
         snapshot.error = None;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "recovered-reply".into(),
+            role: chat::Role::Assistant,
+            content: text("Signed in again."),
+            started_at: None,
+            at: None,
+        }));
         snapshot.items.push(Arc::new(chat::Item {
             id: "next-prompt".into(),
             role: chat::Role::User,
@@ -14384,8 +14415,15 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().refresh();
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.failures, recorded);
+        let incident = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.summary.contains("Provider failure"))
+            .unwrap();
+        assert_eq!(incident.anchor, drawn);
         assert_ne!(
-            runtime.failures[0].group.as_ref(),
+            incident.anchor.as_ref(),
             runtime.turns.last().map(|turn| &turn.key)
         );
         assert!(runtime.snapshot.error.is_none());
@@ -25450,7 +25488,7 @@ mod tests {
             .map(str::to_owned);
         let older = failure::Note {
             message: Some("older-exchange".into()),
-            group: Some("older-exchange".into()),
+            after: Some("older-exchange".into()),
             text: failure.into(),
         };
         runtime.failures.insert(0, older.clone());

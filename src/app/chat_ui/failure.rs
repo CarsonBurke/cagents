@@ -18,10 +18,11 @@ pub(super) struct Note {
     /// The prompt message it concerns: its identity for deduplication,
     /// incident scope and sign-in recovery.
     pub message: Option<String>,
-    /// The key of the group it is drawn after, which was the transcript's
-    /// last when it was recorded. That can lie past the message's own
-    /// exchange, such as after work a delivery started.
-    pub group: Option<String>,
+    /// The item whose group it is drawn after: the transcript's last when
+    /// it was recorded on the latest page. That can lie past the message's
+    /// own exchange, such as after work a delivery started. An item outlasts
+    /// a group key, which paging can change.
+    pub after: Option<String>,
     pub text: String,
 }
 
@@ -162,18 +163,52 @@ fn typed_prompt<'a>(runtime: &'a Runtime, turn: &'a turn::Turn) -> impl Iterator
     })
 }
 
-/// Where a retained note is drawn: after the group recorded with it, while
-/// that group is visible. Once paging has re-keyed or removed that group, a
-/// visible part of the note's message stands in, and the note goes after
-/// the last visible group before the reader's next prompt. `None` when
-/// neither is visible, so the note never borrows another exchange.
+/// The last item of the transcript's last group, where a notice recorded
+/// now is drawn after. `None` while an earlier page is shown, whose end is
+/// the middle of the conversation rather than its latest work.
+pub(super) fn closing_item<'a>(snapshot: &'a Snapshot, turns: &[turn::Turn]) -> Option<&'a str> {
+    if snapshot.has_later {
+        return None;
+    }
+    let turn = turns.last()?;
+    let last = turn
+        .prompt
+        .iter()
+        .chain(
+            turn.steps
+                .iter()
+                .chain(&turn.prose)
+                .map(|placed| &placed.index),
+        )
+        .max()?;
+    snapshot.items.get(*last).map(|item| item.id.as_str())
+}
+
+/// The failure scope of a prompt the reader typed: its decoder message, so
+/// that text and images sent together are one scope. An opaque ID is its
+/// own scope, which cannot collide with a message of the same spelling.
+fn prompt_scope(provider: Provider, id: &str) -> String {
+    match attachment_draft::message_key(provider, id) {
+        Some(carrier) => format!("message\0{carrier}"),
+        None => format!("item\0{id}"),
+    }
+}
+
+/// Where a retained note is drawn: after the group containing the item it
+/// was recorded after, while that item is visible. Otherwise a visible part
+/// of the note's message stands in, and the note goes after the last visible
+/// group before the reader's next prompt. `None` when neither is visible, so
+/// the note never borrows another exchange.
 fn note_destination<'a>(
     runtime: &'a Runtime,
-    note: &'a Note,
+    note: &Note,
+    item_groups: &HashMap<&str, &'a str>,
     user_carriers: &HashMap<&str, String>,
 ) -> Option<&'a str> {
-    if let Some(group) = note.group.as_deref()
-        && runtime.turns.iter().any(|turn| turn.key == group)
+    if let Some(group) = note
+        .after
+        .as_deref()
+        .and_then(|after| item_groups.get(after))
     {
         return Some(group);
     }
@@ -365,12 +400,10 @@ impl State {
                 if let Some(carrier) = attachment_draft::message_key(provider, &item.id) {
                     let scope = user_carriers
                         .entry(carrier)
-                        .or_insert_with(|| format!("message\0{carrier}"));
+                        .or_insert_with(|| prompt_scope(provider, &item.id));
                     context.clone_from(scope);
                 } else {
-                    // An opaque legacy ID cannot collide with a normalized
-                    // message carrier that happens to have the same spelling.
-                    context = format!("item\0{}", item.id);
+                    context = prompt_scope(provider, &item.id);
                 }
             }
             contexts.insert(item.id.as_str(), context.clone());
@@ -458,6 +491,19 @@ impl State {
             }
         }
 
+        // A note keeps its message's scope after paging removes the message,
+        // so its incident identity, and an expanded notice, stay put.
+        let note_contexts: Vec<String> = runtime
+            .failures
+            .iter()
+            .map(|note| match note.message.as_deref() {
+                Some(id) => contexts
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| prompt_scope(provider, id)),
+                None => String::new(),
+            })
+            .collect();
         for (index, note) in runtime.failures.iter().enumerate() {
             if !runtime.expected_remote_close_error(&note.text) {
                 state.push(
@@ -465,24 +511,18 @@ impl State {
                     &note.text,
                     Source::Note(index),
                     false,
-                    note.message
-                        .as_deref()
-                        .and_then(|id| {
-                            contexts.get(id).or_else(|| {
-                                // Paging may retain an image while the first
-                                // prompt part anchoring this note is absent.
-                                // Only a visible genuine User carrier proves
-                                // this relation; never infer it from prose or
-                                // a tool/group key alone.
-                                attachment_draft::message_key(provider, id)
-                                    .and_then(|carrier| user_carriers.get(carrier))
-                            })
-                        })
-                        .map(String::as_str)
-                        .unwrap_or(""),
+                    &note_contexts[index],
                 );
             }
         }
+        // The current error joins the note recorded for it, wherever paging
+        // has left that note's message.
+        let snapshot_context = runtime
+            .snapshot
+            .error
+            .as_deref()
+            .and_then(|error| runtime.failures.iter().rposition(|note| note.text == error))
+            .map_or(context.as_str(), |index| note_contexts[index].as_str());
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
             runtime.failure_ui.local_error.clone()
@@ -503,9 +543,33 @@ impl State {
                 && let Some(source) = source
                 && !runtime.expected_remote_close_error(text)
             {
-                state.push(provider, text, source, false, &context);
+                let scope = match source {
+                    Source::Snapshot => snapshot_context,
+                    _ => context.as_str(),
+                };
+                state.push(provider, text, source, false, scope);
             }
         }
+        let item_groups: HashMap<&str, &str> = if runtime.failures.is_empty() {
+            HashMap::new()
+        } else {
+            runtime
+                .turns
+                .iter()
+                .flat_map(|turn| {
+                    turn.prompt
+                        .iter()
+                        .chain(
+                            turn.steps
+                                .iter()
+                                .chain(&turn.prose)
+                                .map(|placed| &placed.index),
+                        )
+                        .filter_map(|index| runtime.snapshot.items.get(*index))
+                        .map(|item| (item.id.as_str(), turn.key.as_str()))
+                })
+                .collect()
+        };
         let recovering = runtime.auth_error().is_some();
         for incident in &mut state.incidents {
             incident.active_recovery = recovering
@@ -561,23 +625,25 @@ impl State {
                         .map(|turn| turn.key.clone())
                 })
                 .or_else(|| {
+                    // The latest note places the incident: a cause recurring
+                    // with new wording is drawn after its newest work.
                     incident
                         .sources
                         .iter()
-                        .find_map(|source| match source {
-                            Source::Note(index) => {
-                                let note = &runtime.failures[*index];
-                                // An unresolved note keeps a key no visible
-                                // group has, which hides it; only a note
-                                // with no placement at all leads the transcript.
-                                Some(
-                                    note_destination(runtime, note, &user_carriers)
-                                        .or(note.group.as_deref())
-                                        .or(note.message.as_deref())
-                                        .map(str::to_owned),
-                                )
-                            }
+                        .filter_map(|source| match source {
+                            Source::Note(index) => Some(*index),
                             _ => None,
+                        })
+                        .max()
+                        .map(|index| {
+                            let note = &runtime.failures[index];
+                            // An unresolved note keeps a key no visible
+                            // group has, which hides it; only a note with
+                            // no placement at all leads the transcript.
+                            note_destination(runtime, note, &item_groups, &user_carriers)
+                                .or(note.after.as_deref())
+                                .or(note.message.as_deref())
+                                .map(str::to_owned)
                         })
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
@@ -1205,6 +1271,98 @@ mod tests {
             next.items
                 .push(Arc::new(text("next-message:0", chat::Role::User, "Next")));
         });
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-again")
+        );
+    }
+
+    /// A prompt, its reply, and work a background command's completion
+    /// started, as a Claude transcript carries them.
+    fn delivered_work(provider: Provider, message: &str) -> Vec<chat::Item> {
+        vec![
+            text(
+                &part(provider, message, 0),
+                chat::Role::User,
+                "Run the tests",
+            ),
+            text(
+                "reply",
+                chat::Role::Assistant,
+                "Started them in the background.",
+            ),
+            delivery("finished", "Background command completed"),
+            tool("followup-tool"),
+            text("followup", chat::Role::Assistant, "Reviewing their output."),
+        ]
+    }
+
+    #[test]
+    fn notice_keeps_its_identity_and_place_after_its_prompt_pages_out() {
+        let provider = Provider::Claude;
+        let message = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let raw = "Opaque provider failure";
+        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        publish_error(&mut runtime, &handle, raw);
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.insert(key.clone());
+
+        // The latest page now starts at the delivery, the error still live.
+        publish(&mut runtime, &handle, |page| {
+            page.has_earlier = true;
+            page.items.drain(..2);
+        });
+        assert_eq!(
+            runtime.failure_ui.incidents.len(),
+            1,
+            "the live error joins its note"
+        );
+        let incident = &runtime.failure_ui.incidents[0];
+        assert_eq!(incident.key, key);
+        assert!(incident.sources.contains(&Source::Snapshot));
+        assert_eq!(incident.anchor.as_deref(), Some("finished"));
+        assert!(runtime.failure_ui.expanded.contains(&key));
+        assert!(notice_visible(&mut runtime, &key));
+    }
+
+    #[test]
+    fn notice_recorded_on_an_earlier_page_is_placed_by_its_message() {
+        let provider = Provider::Claude;
+        let message = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        publish(&mut runtime, &handle, |page| {
+            page.has_later = true;
+            page.error = Some("Opaque provider failure".into());
+        });
+        assert_eq!(
+            runtime.failures[0].after, None,
+            "this page's end is not the latest work"
+        );
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished")
+        );
+    }
+
+    #[test]
+    fn a_cause_recurring_with_new_wording_is_drawn_after_its_newest_work() {
+        let provider = Provider::Claude;
+        let message = "abababab-abab-4bab-8bab-abababababab";
+        let first =
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest-id: first";
+        let second = "API Error: rate_limit_error; resets at 1:30pm (America/Los_Angeles)\nrequest-id: second";
+        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        publish_error(&mut runtime, &handle, first);
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-again", "Background command completed")),
+                Arc::new(text("more", chat::Role::Assistant, "Checking again.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, second);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1, "one account limit");
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
             Some("finished-again")

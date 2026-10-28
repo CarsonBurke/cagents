@@ -10841,7 +10841,7 @@ mod tests {
         runtime.failures = [&first, &second]
             .map(|key| failure::Note {
                 message: Some(key.clone()),
-                group: Some(key.clone()),
+                after: Some(key.clone()),
                 text: raw.clone(),
             })
             .into();
