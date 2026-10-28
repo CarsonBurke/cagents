@@ -595,12 +595,12 @@ fn read_local_with_plan(
     snapshot
         .worktrees
         .retain(|(record, _)| !vanished.contains(&record.id));
-    snapshot.heads.retain(|id, _| {
-        snapshot
-            .worktrees
-            .iter()
-            .any(|(record, _)| record.id == *id)
-    });
+    let surviving_ids = snapshot
+        .worktrees
+        .iter()
+        .map(|(record, _)| record.id)
+        .collect::<HashSet<_>>();
+    snapshot.heads.retain(|id, _| surviving_ids.contains(id));
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
@@ -641,10 +641,14 @@ fn records_removed_outside(
     previous: &Snapshot,
     listed: &[(WorktreeRecord, Option<StatusSnapshot>)],
 ) -> Vec<WorktreeState> {
+    let listed_ids = listed
+        .iter()
+        .map(|(record, _)| record.id)
+        .collect::<HashSet<_>>();
     previous
         .worktrees
         .iter()
-        .filter(|(old, _)| !listed.iter().any(|(new, _)| new.id == old.id))
+        .filter(|(old, _)| !listed_ids.contains(&old.id))
         .map(|(record, _)| {
             worktree_ui::worktree_state(project, record, worktree_ui::removed_outside())
         })
@@ -831,6 +835,98 @@ mod tests {
             worktrees,
             heads: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn reordered_catalog_membership_preserves_closure_order_and_surviving_heads() {
+        let project = ProjectId::new();
+        let root = PathBuf::from("/fixture/catalog-membership-only");
+        let records = (0..2048)
+            .map(|index| {
+                (
+                    WorktreeRecord {
+                        id: WorktreeId::new(),
+                        path: root.join(format!("worktree-{index}")),
+                        created_at_unix_ms: None,
+                        head_oid: None,
+                        branch: Some(format!("refs/heads/branch-{index}")),
+                        detached: false,
+                        bare: false,
+                        lock: Default::default(),
+                        prunable_reason: None,
+                    },
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let head = GitHubRepoKey::new("github.com", None, "fixture", "project").unwrap();
+        let previous = Snapshot {
+            repository: RepositoryInfo {
+                id: crate::repository::RepositoryId::new(),
+                selected_path: root.clone(),
+                common_dir: root.join(".git"),
+                git_dir: root.join(".git"),
+                worktree_root: Some(root),
+                is_bare: false,
+            },
+            heads: records
+                .iter()
+                .map(|(record, _)| (record.id, head.clone()))
+                .collect(),
+            worktrees: records,
+        };
+        let mut listed = previous
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .map(|(_, record)| record.clone())
+            .rev()
+            .collect::<Vec<_>>();
+        // Identity survives both a reordered listing and changed durable fields.
+        listed[0].0.path = PathBuf::from("/fixture/moved-checkout");
+        listed[0].0.branch = Some("refs/heads/renamed".into());
+        let removed = records_removed_outside(project, &previous, &listed);
+        assert_eq!(
+            removed.iter().map(|record| record.id).collect::<Vec<_>>(),
+            previous
+                .worktrees
+                .iter()
+                .step_by(3)
+                .map(|(record, _)| record.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(removed.iter().all(|record| {
+            record.project_id == project && matches!(record.existence, Existence::Closed { .. })
+        }));
+        let changes = catalog_changes(project, &previous, &listed, removed.clone(), false);
+        assert_eq!(changes[..removed.len()], removed);
+        assert_eq!(changes.len(), removed.len() + 1);
+        assert_eq!(changes.last().unwrap().id, listed[0].0.id);
+        assert_eq!(changes.last().unwrap().branch.as_deref(), Some("renamed"));
+        assert_eq!(changes.last().unwrap().path, listed[0].0.path);
+
+        // No changed worktree or topology means this read performs no Git or
+        // watch discovery. It still prunes stale heads by surviving identity.
+        let expected_heads = listed
+            .iter()
+            .map(|(record, _)| (record.id, head.clone()))
+            .collect::<HashMap<_, _>>();
+        let (updated, plan) = read_local_with_plan(
+            project,
+            Snapshot {
+                worktrees: listed.clone(),
+                ..previous
+            },
+            Default::default(),
+            CancellationToken::default(),
+            None,
+        )
+        .unwrap();
+        assert!(plan.is_none());
+        assert_eq!(updated.worktrees, listed);
+        assert_eq!(updated.heads, expected_heads);
+        assert!(records_removed_outside(project, &updated, &updated.worktrees).is_empty());
     }
 
     #[test]
