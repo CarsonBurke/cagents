@@ -1104,3 +1104,127 @@ fn terminal_prelaunch_failure_and_dispatch_cancellation_prune_newly_eligible_his
         );
     }
 }
+
+#[test]
+fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
+    use crate::automations::{HISTORY_RETAINED_ROWS, SkipReason, Trigger};
+    use rusqlite::StatementStatus;
+
+    fn seed(tx: &Transaction<'_>, definition: &Definition, count: usize) -> Uuid {
+        let automation =
+            create_automation_in(tx, definition.clone(), 0, test_identity(), None).unwrap();
+        // An unreferenced execution revision makes revision pruning do actual
+        // work, independently of the firing candidate selection.
+        let mut unused = automation.clone();
+        unused.revision = 2;
+        write_revision(tx, &unused).unwrap();
+        for index in 0..count {
+            let request = Uuid::new_v4();
+            let firing = Firing {
+                id: Uuid::new_v4(),
+                automation: automation.id,
+                name: definition.name.clone(),
+                revision: 1,
+                trigger: Trigger::Manual { request },
+                state: FiringState::Skipped,
+                release_pending: false,
+                cancel_requested: false,
+                created_ms: index as u64,
+                started_ms: None,
+                finished_ms: Some(index as u64),
+                agent: None,
+                run: None,
+                skip: Some(SkipReason::Overlap),
+                diagnostic: None,
+                skipped_occurrences: None,
+            };
+            insert_firing(tx, &firing, &occurrence_key(1, &firing.trigger)).unwrap();
+        }
+        automation.id
+    }
+
+    fn scoped_work(registry: &mut Registry, automation: Uuid) -> [i32; 2] {
+        let tx = registry.db.transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS automation_history_prune(id TEXT PRIMARY KEY); DELETE FROM automation_history_prune;")
+            .unwrap();
+        let work = {
+            // These are the production prepared statements, rather than an
+            // EXPLAIN spelling or a second approximation of the query.
+            let mut candidates = tx.prepare(&history::prune_candidates_sql(true)).unwrap();
+            assert_eq!(
+                candidates
+                    .execute(params![
+                        automation.to_string(),
+                        0,
+                        HISTORY_RETAINED_ROWS - 1
+                    ])
+                    .unwrap(),
+                1
+            );
+            let mut revisions = tx.prepare(&history::prune_revisions_sql(true)).unwrap();
+            assert_eq!(
+                revisions
+                    .execute(params![automation.to_string(), 0])
+                    .unwrap(),
+                1
+            );
+            [
+                candidates.get_status(StatementStatus::VmStep),
+                revisions.get_status(StatementStatus::VmStep),
+            ]
+        };
+        tx.rollback().unwrap();
+        work
+    }
+
+    let (mut registry, _directory, definition) = fixture();
+    let tx = registry.db.transaction().unwrap();
+    let target = seed(&tx, &definition, HISTORY_RETAINED_ROWS);
+    tx.commit().unwrap();
+    let before = scoped_work(&mut registry, target);
+
+    let tx = registry.db.transaction().unwrap();
+    let unrelated: Vec<_> = (0..100).map(|_| seed(&tx, &definition, 100)).collect();
+    tx.commit().unwrap();
+    let after = scoped_work(&mut registry, target);
+    for (statement, (before, after)) in ["firing candidates", "revision deletion"]
+        .into_iter()
+        .zip(before.into_iter().zip(after))
+    {
+        assert!(
+            after <= before + 128,
+            "scoped {statement} visited unrelated inventory: {before} -> {after} VM steps"
+        );
+    }
+
+    history_prune_to(&mut registry, target, HISTORY_RETAINED_ROWS - 1, 1_000);
+    assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
+    for &automation in &unrelated {
+        assert_eq!(history_count(&registry, automation), 100);
+        let revisions: usize = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM automation_revisions WHERE automation=?1",
+                [automation.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revisions, 2,
+            "a scoped pass cannot prune another definition"
+        );
+    }
+    // Startup still visits every automation and removes its unused revision.
+    registry.maintain_automation_history(1_001).unwrap();
+    let revisions: usize = registry
+        .db
+        .query_row("SELECT count(*) FROM automation_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revisions, unrelated.len() + 1);
+    assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
+    for automation in unrelated {
+        assert_eq!(history_count(&registry, automation), 100);
+    }
+}

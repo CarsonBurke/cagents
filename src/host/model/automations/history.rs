@@ -235,6 +235,46 @@ fn compact(tx: &Transaction<'_>, firing: &mut Firing) -> Result<(), String> {
     Ok(())
 }
 
+// Keep scoped writes indexable: an optional-filter OR scans unrelated
+// automations even when its bound identity is present. The global startup
+// pass deliberately retains its independent, unscoped query.
+pub(super) fn prune_candidates_sql(scoped: bool) -> String {
+    let (scope, firing_scope) = if scoped {
+        ("automation=?1", "f.automation=?1")
+    } else {
+        ("?1 IS NULL", "?1 IS NULL")
+    };
+    format!(
+        "WITH latest AS (
+          SELECT automation,max(rowid) AS tail FROM automation_firings
+          WHERE {scope} GROUP BY automation
+        ) INSERT INTO automation_history_prune SELECT id FROM (
+          SELECT f.id,a.deleted_ms,row_number() OVER(PARTITION BY f.automation ORDER BY
+            (f.rowid=latest.tail) DESC,
+            coalesce(json_extract(f.record,'$.finished_ms'),f.created_ms) DESC,f.rowid DESC) AS rank
+          FROM automation_firings f JOIN automations a ON a.id=f.automation
+          JOIN latest ON latest.automation=f.automation
+          JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
+          WHERE {firing_scope}
+            AND {ELIGIBLE}
+        ) WHERE rank>?3 OR deleted_ms<?2"
+    )
+}
+
+pub(super) fn prune_revisions_sql(scoped: bool) -> String {
+    let scope = if scoped {
+        "automation=?1"
+    } else {
+        "?1 IS NULL"
+    };
+    format!(
+        "DELETE FROM automation_revisions WHERE {scope}
+        AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=automation_revisions.automation AND f.revision=automation_revisions.revision)
+        AND NOT EXISTS(SELECT 1 FROM automations a WHERE a.id=automation_revisions.automation
+          AND (a.deleted_ms IS NULL OR a.deleted_ms>=?2) AND json_extract(a.record,'$.execution_revision')=automation_revisions.revision)"
+    )
+}
+
 pub(super) fn prune(
     tx: &Transaction<'_>,
     automation: Option<Uuid>,
@@ -250,21 +290,7 @@ pub(super) fn prune(
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS automation_history_prune(id TEXT PRIMARY KEY); DELETE FROM automation_history_prune;")
         .map_err(|error|error.to_string())?;
     tx.execute(
-        &format!(
-            "WITH latest AS (
-          SELECT automation,max(rowid) AS tail FROM automation_firings
-          WHERE (?1 IS NULL OR automation=?1) GROUP BY automation
-        ) INSERT INTO automation_history_prune SELECT id FROM (
-          SELECT f.id,a.deleted_ms,row_number() OVER(PARTITION BY f.automation ORDER BY
-            (f.rowid=latest.tail) DESC,
-            coalesce(json_extract(f.record,'$.finished_ms'),f.created_ms) DESC,f.rowid DESC) AS rank
-          FROM automation_firings f JOIN automations a ON a.id=f.automation
-          JOIN latest ON latest.automation=f.automation
-          JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
-          WHERE (?1 IS NULL OR f.automation=?1)
-            AND {ELIGIBLE}
-        ) WHERE rank>?3 OR deleted_ms<?2"
-        ),
+        &prune_candidates_sql(automation.is_some()),
         params![automation.map(|id| id.to_string()), cutoff, limit],
     )
     .map_err(|error| error.to_string())?;
@@ -277,11 +303,11 @@ pub(super) fn prune(
         [],
     )
     .map_err(|error| error.to_string())?;
-    tx.execute("DELETE FROM automation_revisions WHERE (?1 IS NULL OR automation=?1)
-        AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=automation_revisions.automation AND f.revision=automation_revisions.revision)
-        AND NOT EXISTS(SELECT 1 FROM automations a WHERE a.id=automation_revisions.automation
-          AND (a.deleted_ms IS NULL OR a.deleted_ms>=?2) AND json_extract(a.record,'$.execution_revision')=automation_revisions.revision)",
-        params![automation.map(|id|id.to_string()),cutoff]).map_err(|error|error.to_string())?;
+    tx.execute(
+        &prune_revisions_sql(automation.is_some()),
+        params![automation.map(|id| id.to_string()), cutoff],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
