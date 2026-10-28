@@ -8792,11 +8792,18 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
+        let close_handoff = self.workspace.pending_widget_focus_is_close_handoff();
         if surfaces_visible && let Some(card) = self.workspace.take_widget_focus_request() {
-            tasks.push(
-                iced::widget::operation::focus(self.card_keyboard_focus(card))
-                    .map(cosmic::Action::App),
-            );
+            let target = self.card_keyboard_focus(card);
+            let focus = if close_handoff {
+                // Close first parks focus in the toolbar while its survivor
+                // is unmounted. Complete that handoff without replacing a
+                // different control chosen during the reveal.
+                workspace_widget::focus_after_loading(widget::Id::new(TOOLBAR_FOCUS_ID), target)
+            } else {
+                iced::widget::operation::focus(target)
+            };
+            tasks.push(focus.map(cosmic::Action::App));
         }
         tasks.push(context_overlay_task);
         tasks.push(self.restore_repository_editor_focus());
@@ -28207,6 +28214,122 @@ mod tests {
                 .unwrap_or_else(|| editor.clone());
             assert_eq!(focused(&app, task), Some(expected));
         }
+    }
+
+    #[test]
+    fn deferred_close_focus_preserves_a_later_search_choice_but_explicit_navigation_wins() {
+        for choice in ["toolbar", "search", "navigate"] {
+            let mut app = context_inspector_test_app(false);
+            app.context_inspector_open = false;
+            app.sidebar_model.projects.push(restored_sidebar_project(
+                ProjectId::new(),
+                "Fixture",
+                Path::new("/fixture"),
+            ));
+            let cards = (0..3).map(|_| terminal_card_state()).collect::<Vec<_>>();
+            let ids = cards.iter().map(|card| card.id).collect::<Vec<_>>();
+            Arc::make_mut(&mut app.durable).cards = cards;
+            Arc::make_mut(&mut app.durable).focused = Some(ids[0]);
+            for (index, id) in ids.iter().copied().enumerate() {
+                app.cards.insert(id, CardRuntime::Loading);
+                app.workspace
+                    .add_card(
+                        WorkspaceCard::new(id, "Loading pane", CardWidth::Fixed(1920.0)).unwrap(),
+                        index,
+                        false,
+                    )
+                    .unwrap();
+            }
+            let update = app.workspace.resize_viewport(640.0);
+            drop(app.apply_viewport(update, false, false));
+            assert_eq!(
+                app.workspace.visibility(ids[1]),
+                Some(VisibilityClass::Offscreen)
+            );
+
+            // Use the App's actual close handoff: the toolbar temporarily
+            // owns the keyboard because the surviving pane is not mounted.
+            let handoff = app.workspace.request_close(ids[0]).unwrap();
+            assert_eq!(
+                handoff.target,
+                crate::workspace::FocusTarget::WorkspaceToolbar
+            );
+            let park = app.card_removal(handoff);
+            let close = app.update(Message::CommitClose(ids[0]));
+            assert_eq!(app.workspace.focused(), Some(ids[1]));
+            // Arriving panes mount before their animation finishes. Their
+            // native focus operation is asynchronous, so hold the actual
+            // queued close effect until after the next user choice.
+            assert!(
+                app.workspace
+                    .visibility(ids[1])
+                    .is_some_and(VisibilityClass::is_mounted)
+            );
+            assert!(!app.workspace.pending_widget_focus_is_close_handoff());
+
+            let choose = if choice == "toolbar" {
+                Task::none()
+            } else {
+                app.update(Message::FocusProjectSearch)
+            };
+            let navigate = if choice == "navigate" {
+                // A deliberate pane choice supersedes the close request;
+                // its focus must still replace an earlier search choice.
+                app.focus_workspace_card(ids[1])
+            } else {
+                Task::none()
+            };
+            let update = app.workspace.tick(Duration::from_secs(1));
+            let settle = app.apply_viewport(update, false, false);
+            assert!(
+                app.workspace
+                    .visibility(ids[1])
+                    .is_some_and(VisibilityClass::is_mounted)
+            );
+            assert!(!app.workspace.pending_widget_focus_is_close_handoff());
+            let target = app.card_keyboard_focus(ids[1]);
+            let expected = if choice == "search" {
+                sidebar::search_focus_id()
+            } else {
+                target
+            };
+            assert_eq!(
+                focused(
+                    &app,
+                    park.chain(choose)
+                        .chain(close)
+                        .chain(navigate)
+                        .chain(settle)
+                ),
+                Some(expected),
+                "the real deferred close operations must respect the later {choice} choice"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_the_last_pane_leaves_no_deferred_focus_to_replace_search() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.sidebar_model.projects.push(restored_sidebar_project(
+            ProjectId::new(),
+            "Fixture",
+            Path::new("/fixture"),
+        ));
+        let update = app.workspace.resize_viewport(640.0);
+        drop(app.apply_viewport(update, false, false));
+        let closing = app.workspace.focused().unwrap();
+        let handoff = app.workspace.request_close(closing).unwrap();
+        let park = app.card_removal(handoff);
+        let close = app.update(Message::CommitClose(closing));
+        assert_eq!(app.workspace.focused(), None);
+        assert!(!app.workspace.pending_widget_focus_is_close_handoff());
+        let search = app.update(Message::FocusProjectSearch);
+        let later = app.apply_viewport(ViewportUpdate::unchanged(), false, false);
+        assert_eq!(
+            focused(&app, park.chain(close).chain(search).chain(later)),
+            Some(sidebar::search_focus_id())
+        );
     }
 
     #[test]
