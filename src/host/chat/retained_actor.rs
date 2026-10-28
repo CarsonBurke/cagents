@@ -208,6 +208,10 @@ fn require_execution_owner(
 #[path = "retained_execution_owner_tests.rs"]
 mod execution_owner_tests;
 
+#[cfg(test)]
+#[path = "retained_archived_history_tests.rs"]
+mod archived_history_tests;
+
 struct SemanticTarget {
     handle: Handle,
     source: Session,
