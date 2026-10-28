@@ -8058,6 +8058,128 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_image_refresh_keeps_retained_preview_clicks_and_held_presses_working() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+
+        fn pointer_step(
+            runtime: &Runtime,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            event: mouse::Event,
+        ) -> Vec<Message> {
+            struct PreviewBounds(Option<Rectangle>);
+            impl Operation for PreviewBounds {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    bounds: Rectangle,
+                    _: &mut dyn iced::advanced::widget::operation::Focusable,
+                ) {
+                    if bounds.height >= 200.0 {
+                        assert!(
+                            self.0.replace(bounds).is_none(),
+                            "one rendered image preview"
+                        );
+                    }
+                }
+            }
+            // Exercise the actual retained turn, not a freshly rebuilt preview.
+            let mut element = runtime.find_turn_view_for_test();
+            tree.diff(element.as_widget_mut());
+            let viewport = Rectangle::with_size(Size::new(600.0, 800.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut bounds = PreviewBounds(None);
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), renderer, &mut bounds);
+            let point = bounds
+                .0
+                .expect("the retained preview is an actual button")
+                .center();
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        }
+
+        let items = vec![chat::Item {
+            id: "retained-image".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Image {
+                path: "/fixture/retained-image.png".into(),
+                description: "Unchanged preview".into(),
+                reference: None,
+            },
+            started_at: None,
+            at: None,
+        }];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        runtime.visible.store(true, Ordering::Relaxed);
+        let pixels = iced::widget::image::Handle::from_rgba(1, 1, vec![12, 34, 56, 255]);
+        let cached = runtime.cache.get_mut("retained-image").unwrap();
+        cached.image_source = None;
+        cached.image = Some(pixels.clone());
+        let revision = cached.revision;
+        let fingerprint = runtime.turn_fingerprint(&runtime.turns[0], true);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(runtime.find_turn_view_for_test().as_widget());
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+        assert!(pointer_step(&runtime, &mut tree, &renderer, press).is_empty());
+        let old_snapshot_item = runtime.snapshot.items[0].clone();
+        publish(&mut runtime, &handle, &items, 1);
+        assert!(!Arc::ptr_eq(&old_snapshot_item, &runtime.snapshot.items[0]));
+        assert_eq!(
+            runtime.turn_fingerprint(&runtime.turns[0], true),
+            fingerprint
+        );
+        assert_eq!(runtime.cache["retained-image"].revision, revision);
+        assert_eq!(
+            runtime.cache["retained-image"].image.as_ref().unwrap().id(),
+            pixels.id()
+        );
+        let held = pointer_step(&runtime, &mut tree, &renderer, release);
+        assert!(pointer_step(&runtime, &mut tree, &renderer, press).is_empty());
+        let fresh = pointer_step(&runtime, &mut tree, &renderer, release);
+
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        for (case, mut messages) in [("held", held), ("fresh", fresh)] {
+            assert_eq!(messages.len(), 1, "{case} click emits one action");
+            let Message::ChatUi(open @ Action::OpenImage(_)) = messages.pop().unwrap() else {
+                panic!("{case} click must open the image");
+            };
+            drop(app.handle_chat_ui(open));
+            assert!(
+                app.chat_ui.image_viewer.is_some(),
+                "{case} click after equivalent refresh opens unchanged pixels"
+            );
+            drop(app.handle_chat_ui(Action::CloseImage));
+        }
+    }
+
+    #[test]
     fn tool_heartbeats_do_not_rebuild_the_turn_within_an_elapsed_second() {
         let mut items = vec![chat::Item {
             id: "tool".into(),

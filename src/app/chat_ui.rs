@@ -2917,9 +2917,8 @@ impl Runtime {
                     image_changed = cached.image_item.as_ref().is_none_or(|previous| {
                         !Arc::ptr_eq(previous, item) && previous.content != item.content
                     });
-                    if !image_changed {
-                        cached.image_item = Some(item.clone());
-                    }
+                    // Keep the canonical source for retained preview actions and
+                    // in-flight decoding until the image content actually changes.
                 }
                 let unchanged = cached.item.as_ref().is_some_and(|previous| {
                     Arc::ptr_eq(previous, item) || previous.content == item.content
@@ -10868,7 +10867,7 @@ mod tests {
         let equal = image("new");
         publish(&mut app, equal.clone(), 12);
         let cached = &chat_runtime(&app, card).cache["image"];
-        assert!(Arc::ptr_eq(cached.image_item.as_ref().unwrap(), &equal));
+        assert!(Arc::ptr_eq(cached.image_item.as_ref().unwrap(), &changed));
         assert!(Arc::ptr_eq(cached.image_source.as_ref().unwrap(), &changed));
         drop(app.handle_chat_ui(Action::ImageLoaded(
             target,
