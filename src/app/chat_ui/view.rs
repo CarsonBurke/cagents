@@ -1,6 +1,17 @@
 use super::coordination::Coordinated;
 use super::*;
 
+/// A diagnostic transcript has no account/provider configuration lane. Keep
+/// these controls present but visibly disabled instead of accepting a click
+/// which the fixture's typed dispatcher must refuse.
+fn backend_action(command: Action) -> Option<Message> {
+    #[cfg(feature = "latency-harness")]
+    if crate::latency_fixture::enabled() {
+        return None;
+    }
+    Some(action(command))
+}
+
 /// Bind a link to the surface that rendered it, before another pane, project,
 /// or child conversation can become selected.
 pub(super) fn capture_document_link(
@@ -1001,11 +1012,8 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace
-                        .presentation_geometry()
-                        .card(card)
-                        .map_or(self.workspace.viewport_width(), |card| card.width())
-                        .min(design::READABLE_MEASURE + 2.0 * step::GAP_M),
+                    self.card_content_width(card)
+                        .min(super::layout::READING_COLUMN),
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1646,8 +1654,13 @@ impl Runtime {
             return self.pending_admission_view();
         }
         let target = self.target;
+        #[cfg(feature = "latency-harness")]
+        let backend_available = !crate::latency_fixture::enabled();
+        #[cfg(not(feature = "latency-harness"))]
+        let backend_available = true;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
+        let available = backend_available
+            && !transitioning
             && !self.closed_elsewhere
             && !self.disconnected
             && !self.snapshot.exited
@@ -2071,13 +2084,22 @@ impl Runtime {
                 );
             }
         }
-        // The symmetric inset already exceeds the scrollbar rail. Reserving
-        // the rail a second time would make transcript rows narrower than the
-        // composer even though their outer column is shared.
-        let transcript =
+        // The scroll viewport spans the pane, so its scrollbar follows the
+        // pane edge, while the rows keep the reading column the composer
+        // shares. The symmetric inset reserves the whole scrollbar rail.
+        // Reserving the rail a second time would make transcript rows
+        // narrower than the composer in a pane no wider than the column.
+        let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
-                .width(Length::Fill);
+                .padding(iced::Padding {
+                    left: super::layout::HORIZONTAL_INSET,
+                    right: super::layout::HORIZONTAL_INSET,
+                    ..iced::Padding::new(step::GAP_M)
+                })
+                .width(Length::Fill)
+                .max_width(super::layout::READING_COLUMN),
+        )
+        .center_x(Length::Fill);
         let transcript_index = content.len();
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
@@ -2179,7 +2201,15 @@ impl Runtime {
         // chooser is open, preserving its native scroll and selection state.
         content.push(crate::interaction::exclusive_layer(
             transcript_layer,
-            self.child_picker_view(),
+            self.child_picker_view().map(|picker| {
+                widget::container(
+                    widget::container(picker)
+                        .width(Length::Fill)
+                        .max_width(super::layout::READING_COLUMN),
+                )
+                .center_x(Length::Fill)
+                .into()
+            }),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
@@ -2199,7 +2229,8 @@ impl Runtime {
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
         } else if self.capacity_refused {
-            let enabled = !transitioning
+            let enabled = backend_available
+                && !transitioning
                 && self.pending.is_none()
                 && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
@@ -2225,7 +2256,8 @@ impl Runtime {
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let saved_history = self.has_connected_saved_history(snapshot);
-            let enabled = !transitioning
+            let enabled = backend_available
+                && !transitioning
                 && self.pending.is_none()
                 && self.attachment_chooser_pending.is_none()
                 && self.pastes_pending == 0
@@ -2459,7 +2491,7 @@ impl Runtime {
                 icon(
                     Icon::Delete,
                     "Remove attachment",
-                    !transitioning,
+                    backend_available && !transitioning,
                     Action::RemoveAttachment(target, index),
                 ),
             ])
@@ -2487,22 +2519,25 @@ impl Runtime {
         // Keep the named composer in a fixed sibling slot as provider controls,
         // requests, and attachments arrive. The pinned Iced child reconciler
         // finds named siblings but does not move their trees to new indices.
+        // Only the transcript layer spans the pane; everything around it
+        // keeps the reading column.
         let mut content = vec![
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == transcript_index {
                     child
                 } else {
                     widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
-                        } else {
-                            0.0
-                        }))
+                        .padding(
+                            iced::Padding::from([0.0, super::layout::HORIZONTAL_INSET])
+                                .top(if index == 0 { step::GAP_M } else { 0.0 }),
+                        )
                         .width(Length::Fill)
+                        .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
             .spacing(space::S)
+            .align_x(Alignment::Center)
             .height(Length::Fill)
             .into(),
         ];
@@ -3023,7 +3058,7 @@ impl Runtime {
                     None,
                 ))
                 .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(
+                .on_press_maybe(backend_action(Action::PermissionPicker(
                     target,
                     !self.permission_picker,
                 )))
@@ -3088,19 +3123,22 @@ impl Runtime {
                     child
                 } else {
                     widget::container(child)
-                        .padding([0.0, step::GAP_M])
+                        .padding([0.0, super::layout::HORIZONTAL_INSET])
                         .width(Length::Fill)
+                        .max_width(super::layout::READING_COLUMN)
                         .into()
                 }
             }))
             .spacing(step::GAP_S)
+            .align_x(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill)
             .into(),
             widget::container(footer)
                 .id(card_control_id(target.card, "chat-footer"))
                 .padding(
-                    iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
+                    iced::Padding::from([0.0, super::layout::HORIZONTAL_INSET + COMPOSER_PADDING])
+                        .bottom(step::GAP_M),
                 )
                 .into(),
         ))
@@ -3397,7 +3435,7 @@ impl Runtime {
                 .id(card_control_id(target.card, "chat-reasoning-picker"))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
-                .on_press(action(Action::ReasoningPicker(target, !open)));
+                .on_press_maybe(backend_action(Action::ReasoningPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         model
@@ -3468,7 +3506,7 @@ impl Runtime {
                     .name("Choose permission mode")
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                    .on_press_maybe(backend_action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -3539,7 +3577,7 @@ impl Runtime {
         .name("Choose an account")
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::AccountPicker(target, !open)));
+        .on_press_maybe(backend_action(Action::AccountPicker(target, !open)));
         let anchor = crate::interaction::tooltip(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
@@ -3673,7 +3711,7 @@ impl Runtime {
         .id(card_control_id(target.card, "chat-model-picker"))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::ModelPicker(target, !open)));
+        .on_press_maybe(backend_action(Action::ModelPicker(target, !open)));
         let anchor = crate::interaction::tooltip(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
@@ -10164,11 +10202,33 @@ mod tests {
         };
         struct Probe {
             id: widget::Id,
+            find: widget::Id,
             viewport: Option<iced::Rectangle>,
+            field: Option<iced::Rectangle>,
         }
         impl Operation for Probe {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.find) {
+                    self.field = Some(bounds);
+                }
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::TextInput,
+            ) {
+                if id == Some(&self.find) {
+                    self.field = Some(bounds);
+                }
             }
             fn scrollable(
                 &mut self,
@@ -10184,41 +10244,60 @@ mod tests {
             }
         }
         let items = frame_cost::transcript(1);
-        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        // Controls around the transcript keep the reading column.
+        runtime.find = Some("answer".into());
         let shortcuts = crate::settings::KeyboardShortcuts::default();
-        let mut element = runtime.view(
-            None,
-            false,
-            true,
-            &shortcuts,
-            600.0,
-            Place {
-                channel: None,
-                name: "Fixture".into(),
-                branch: None,
-            },
-            true,
-            None,
-            vec![],
-        );
         let renderer = crate::app::tests::headless_renderer();
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 700.0)),
-        );
-        let mut probe = Probe {
-            id: card_control_id(runtime.target.card, "chat-transcript"),
-            viewport: None,
-        };
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
-        let bounds = probe.viewport.expect("transcript viewport");
-        assert_eq!(bounds.x, 0.0);
-        assert_eq!(bounds.y, 0.0);
-        assert_eq!(bounds.width, 600.0);
+        // Narrower and wider than the reading column, as a split or a
+        // maximized pane.
+        for width in [600.0_f32, 1440.0] {
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                width.min(super::super::layout::READING_COLUMN),
+                Place {
+                    channel: None,
+                    name: "Fixture".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
+            );
+            let mut probe = Probe {
+                id: card_control_id(runtime.target.card, "chat-transcript"),
+                find: card_control_id(runtime.target.card, "chat-find"),
+                viewport: None,
+                field: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            let bounds = probe.viewport.expect("transcript viewport");
+            assert_eq!(bounds.x, 0.0, "width {width}");
+            assert_eq!(bounds.width, width, "width {width}");
+            let column = width.min(super::super::layout::READING_COLUMN);
+            let field = probe.field.expect("find field");
+            assert_eq!(
+                field.x,
+                (width - column) / 2.0 + super::super::layout::HORIZONTAL_INSET,
+                "width {width}"
+            );
+            assert!(
+                field.x + field.width
+                    <= (width + column) / 2.0 - super::super::layout::HORIZONTAL_INSET,
+                "width {width}"
+            );
+        }
     }
 
     #[test]
@@ -10499,8 +10578,11 @@ mod tests {
                     &mut probe,
                 );
                 let bounds = probe.bounds.expect("composer editor");
-                assert_eq!(bounds.x, step::GAP_M);
-                assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
+                assert_eq!(bounds.x, super::super::layout::HORIZONTAL_INSET);
+                assert_eq!(
+                    bounds.width,
+                    width - 2.0 * super::super::layout::HORIZONTAL_INSET
+                );
             }
         }
     }
@@ -10593,7 +10675,7 @@ mod tests {
                     false,
                     true,
                     &shortcuts,
-                    width,
+                    width.min(super::super::layout::READING_COLUMN),
                     Place {
                         channel: None,
                         name: "Fixture".into(),
@@ -10632,13 +10714,19 @@ mod tests {
                         "transcript rows and composer share the same column in state {state}"
                     );
                 }
-                let column_width = width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
+                let column_width = width.min(super::super::layout::READING_COLUMN);
                 let geometry = (viewport.x, viewport.width, editor.x, editor.width);
-                assert_eq!(viewport.width, column_width, "state {state}");
-                assert_eq!(editor.x, viewport.x + step::GAP_M, "state {state}");
+                // The viewport, and so its scrollbar, reaches the pane edges;
+                // the column is centered inside it.
+                assert_eq!((viewport.x, viewport.width), (0.0, width), "state {state}");
+                assert_eq!(
+                    editor.x,
+                    (width - column_width) / 2.0 + super::super::layout::HORIZONTAL_INSET,
+                    "state {state}"
+                );
                 assert_eq!(
                     editor.width,
-                    viewport.width - 2.0 * step::GAP_M,
+                    column_width - 2.0 * super::super::layout::HORIZONTAL_INSET,
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");

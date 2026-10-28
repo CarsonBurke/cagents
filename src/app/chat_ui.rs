@@ -1,3 +1,5 @@
+#[cfg(feature = "latency-harness")]
+pub(super) mod resident_fixture;
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
@@ -45,6 +47,8 @@ mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
+#[cfg(test)]
+mod scrollbar_press_tests;
 mod selectable_prose;
 mod selection;
 mod step;
@@ -401,6 +405,54 @@ impl std::fmt::Debug for Action {
 }
 
 impl Action {
+    #[cfg(feature = "latency-harness")]
+    pub(super) fn fixture_local(&self) -> bool {
+        matches!(
+            self,
+            Self::Composer(..)
+                | Self::ComposerCursor(..)
+                | Self::Scrolled(..)
+                | Self::Latest(..)
+                | Self::Toggle(..)
+                | Self::ToggleTurn(..)
+                | Self::ToggleFailure(..)
+                | Self::Unfold(..)
+                | Self::SubagentPicker(..)
+                | Self::SubagentQuery(..)
+                | Self::SubagentFilter(..)
+                | Self::SubagentPage(..)
+                | Self::SelectSubagent(..)
+                | Self::Find(..)
+                | Self::FindNext(..)
+                | Self::CloseFind(..)
+                | Self::FindFocused(..)
+                | Self::FindRetry(..)
+                | Self::FindAvailable
+                | Self::FindGroups(..)
+                | Self::FindHighlight(..)
+                | Self::FindHighlighted(..)
+                | Self::FindResume(..)
+                | Self::FindExpired(..)
+                | Self::FindIndexed(..)
+                | Self::FindLocated(..)
+                | Self::PreparationAvailable
+                | Self::FlowAvailable
+                | Self::FlowRequest(..)
+                | Self::FlowReady(..)
+                | Self::MarkdownPrepared(..)
+                | Self::LocalPromptPrepared(..)
+                | Self::CompletionDismiss(..)
+                | Self::CompletionMove(..)
+                | Self::CompletionScrolled(..)
+                | Self::Copy(..)
+                | Self::CopyMessage(..)
+                | Self::CopyLiteral(..)
+                | Self::CopySharedCode(..)
+                | Self::ClearCopied(..)
+                | Self::FooterPicker(..)
+        )
+    }
+
     pub(super) fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
@@ -5168,6 +5220,62 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    #[cfg(feature = "latency-harness")]
+    pub(super) fn sync_native_fixture_visibility(&mut self) {
+        if self.latency_fixture.is_none() {
+            return;
+        }
+        let surfaces_visible = self.workspace_surfaces_visible();
+        // Reconcile the initial seed as well as later transitions. The seed
+        // viewport was measured before resident runtimes were installed.
+        for card in &mut Arc::make_mut(&mut self.durable).cards {
+            card.exposure = self
+                .workspace
+                .visibility(card.id)
+                .unwrap_or(VisibilityClass::Offscreen)
+                .into();
+        }
+        for (card, runtime) in &mut self.cards {
+            if let CardRuntime::Chat(runtime) = runtime
+                && runtime.is_draft()
+            {
+                // Draft has no ClientHandle. This updates local presentation
+                // interest without a service, lifecycle or hydration lane.
+                let visible = surfaces_visible
+                    && self.workspace.visibility(*card) == Some(VisibilityClass::Visible);
+                let _ = runtime.set_visible(visible);
+            }
+        }
+    }
+
+    #[cfg(feature = "latency-harness")]
+    pub(super) fn handle_fixture_chat(&mut self, action: Action) -> Task<Message> {
+        if !action.fixture_local()
+            || self
+                .cards
+                .values()
+                .any(|card| matches!(card, CardRuntime::Chat(runtime) if !runtime.is_draft()))
+        {
+            return Task::none();
+        }
+        if let Action::CopyMessage(target, id, _) = action {
+            // Every fixture body is resident. Never ask a daemon for a larger
+            // copy source or manufacture a text-copy proof.
+            return self.handle_chat_ui(Action::Copy(target, id, CopyPart::Text));
+        }
+        if let Action::Composer(target, action) = action {
+            if let Some(runtime) = self.chat_runtime_mut(target) {
+                if action.is_edit() {
+                    runtime.dismiss_suggestion();
+                    runtime.revision = runtime.revision.wrapping_add(1);
+                }
+                // No completion directory scan, provider history or draft save.
+                runtime.composer_action(action);
+            }
+            return Task::none();
+        }
+        self.handle_chat_ui(action)
+    }
     /// Keyboard and palette commands use the same pickers as the composer.
     /// Respect the control's availability before capturing a selection gesture.
     pub(super) fn open_chat_control(
@@ -6535,6 +6643,27 @@ impl Cagents {
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
             );
         }
+        Subscription::batch(subscriptions)
+    }
+
+    #[cfg(feature = "latency-harness")]
+    pub(super) fn fixture_chat_subscription(&self) -> Subscription<Message> {
+        let mut subscriptions = Vec::new();
+        for card in self.cards.values() {
+            if let CardRuntime::Chat(runtime) = card
+                && runtime.is_draft()
+                && runtime.visible.load(Ordering::Relaxed)
+            {
+                subscriptions.extend(runtime.preparation.subscriptions(runtime.target));
+            }
+        }
+        // These are in-process CPU preparation queues, not daemon wakes,
+        // provider streams, filesystem image loaders or account subscriptions.
+        subscriptions.extend([
+            flow_layout::availability(),
+            find_navigation::availability(),
+            preparation::availability(),
+        ]);
         Subscription::batch(subscriptions)
     }
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
@@ -7921,6 +8050,12 @@ impl Cagents {
         step: Option<QueuedStep>,
         latest_reader: LatestReader,
     ) -> Task<Message> {
+        #[cfg(feature = "latency-harness")]
+        if self.latency_fixture.is_some() {
+            // Scrolling/find may normally request a provider history page.
+            // Diagnostic snapshots never have an execution or paging lane.
+            return Task::none();
+        }
         if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
             return Task::none();
         }

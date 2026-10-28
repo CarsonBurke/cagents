@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "prepared_state": "Reviewed-source successor after actual2819 UI lib compile failure; new matching compiler/tests/controls remain UNRUN until one authorized remote qualification.",
+  "sources": {
+    "after": {
+      "head": "b816e5419fe3610c7bb67f87f16533d10443e345",
+      "tree": "93e583ae8b04555a6654081ea3624a0c1d653258"
+    },
+    "before": {
+      "head": "87d17f5767c39c7304f87b6fbf20e2f51930fc53",
+      "tree": "500b8cc5c8bd34eba067d9302fdee3a0c40e32ec"
+    },
+    "publisher": {
+      "head": "078dc43d86b128dfa19fee348f48cbbd1b00c708",
+      "tree": "acf22bccb0e2ea88e62458a07bda82bedd429b5d"
+    },
+    "visibility": {
+      "head": "7e697f3609d932a19ec3ec1b3467ece712cb63eb",
+      "tree": "c795d895f7786f97295e069bda72654f32e5fb78"
+    }
+  },
+  "fixture_selector": "app::latency_ui::isolation_tests::actual_app_fixture_mounts_and_interacts_without_service_attempts",
+  "fixture_test_blob": "c978012e64e6b5ea52c14d477d54d3126cfa4993",
+  "product_selectors": [
+    "app::chat_ui::scrollbar_press_tests::native_app_chat_thumb_drag_clears_the_window_resize_band_at_narrow_and_wide_widths",
+    "app::chat_ui::scrollbar_press_tests::native_app_split_chat_thumb_drag_scrolls_without_resizing_the_pane",
+    "app::chat_ui::scrollbar_press_tests::native_app_chat_keeps_the_outer_pane_resize_gesture",
+    "app::chat_ui::scrollbar_press_tests::native_app_expanded_sidebar_thumb_and_outer_resize_handle_have_distinct_gestures",
+    "app::inspector_resize_clearance_tests::docked_inspector_native_thumb_scrolls_clear_of_right_and_bottom_resize_bands",
+    "app::inspector_resize_clearance_tests::docked_inspector_keeps_its_leading_resize_gesture_and_native_close_control",
+    "app::inspector_resize_clearance_tests::shared_body_bottom_clearance_covers_cards_sidebar_and_inspector_without_a_second_status_gap"
+  ],
+  "control_refusals": {
+    "publisher": [
+      "no publisher may own this queue",
+      "App startup, input or subscriptions attempted service work"
+    ],
+    "visibility": [
+      "newly exposed resident transcript must mount after closing the overlay"
+    ]
+  },
+  "baseline_policy": "After and before must pass; controls require actual101 plus exact owning parent failure and causal assertion, never timeout/compile failure/generic parent panic.",
+  "observer_sha256": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a",
+  "observer_component_review_sha256": "64512aa89482e02c85cbde7240b349af0443821015390e7f0d73252d1e8ae9ca",
+  "observer_kernel_regression_result_sha256": "741d0fe8a6eca6d3c57d52c155211d7445115c89b9fd93d87948e28b3b925bbe",
+  "kernel_contract_sha256": "9c96ff05c61969383dd0781dc2761fb08c15e5e5977a44d20b72edbf3fd8fa53",
+  "kernel_contract_origin_r4_sha256": "9032cad0e8a9dba5ce60acabd2539c8b2fd6eaa0cbe203ee0e00bd735317aaf2",
+  "harness_sha256": "1758cd6905564aa70ee1e34a3e6dd562d31c0da16ca2e0f5c863e5095c1e266e",
+  "workflow_sha256": "e82caf54a6d778bbb698dceb2ccf0eedb681c9df011d04ac6298b65c139d94ae",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "qualified_setup_source": {
+    "head": "1633e661dae18dc2faf8c876b4fae00469ad2a8b",
+    "tree": "c26888175fe61c8d9088d874184c74c984afb5d1",
+    "path": ".github/actions/setup-linux-build/action.yml",
+    "semantics": "Ubuntu22, Rust1.93.0, checksum-pinned Zig0.15.2, original native packages and compiler/libclang setup. Not wholeCI pass evidence.",
+    "git_blob": "f24f0b0a90c31306518ff7253463a52b63a3c0e3",
+    "sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052"
+  },
+  "product_source_reviews": {
+    "before_whole_sha256": "d66597e9a3d9fa6d264302cd95b2115a33919739502cfc1e92953f825ef83c51",
+    "after_original_whole_sha256": "f9284e29f46edb2f9881ea4903409717f69fe94f7d406235ec4f6467e984486b",
+    "after_original_whole_head": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
+    "after_two_import_refresh_sha256": "af06c87af72276584dfa028b445651d96b9b23c0443e9ddd01686efb10cc76e8",
+    "after_two_import_refresh_head": "b816e5419fe3610c7bb67f87f16533d10443e345"
+  },
+  "limits": [
+    "Compiler and headless owning-test evidence only, no actual native window/provider/auth/lease/P0 or screenshot qualification",
+    "UIbincheck, UIlib tests and latencyUIlib tests remain three serial isolated invocations; no HOST/UI union",
+    "Normally built matched CLI/daemon/browserless UI+latency-harness artifact gate through the reviewed diagnostic runner remains required before actual nativeC; no artifacts from this workflow claim matched-set status",
+    "Caller authority/HOME/no-start/account scope inherited unchanged; no User marker constructed or authority removed",
+    "No local B mutex/admission logic and no stale EA154 observer reused"
+  ],
+  "budget": "50 minutes absolute from the earliest workflow step before checkout/setup; all phases consume remaining time; nominal10 minutes of the60-minute job reserved for cleanup/upload. No new phase on exhaustion; owned cleanup remains mandatory.",
+  "prior_actual_run": {
+    "research_head": "2819e7a6bb0723db8bd8abade3cd1eaeb5e8bb91",
+    "run_id": 40782884760,
+    "tested_after": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
+    "result": "UIbincheck0, UIlibcompile101 on two missing Uuid imports; no selectors/latency/before/controls executed. Both owned families closed. Historical result only, not new-source qualification.",
+    "artifact_sha256": "7dcf1357deae2d6fd7a0947a03b9a37bd103d97334d5b00ab210cde3c52ce357"
+  }
+}

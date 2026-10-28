@@ -39,8 +39,32 @@ pub(crate) fn main() -> std::process::ExitCode {
 pub(crate) fn main_with_before_start(
     before_start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> std::process::ExitCode {
-    // SAFETY: first statement of main, before any thread exists.
-    unsafe { cagents::account::detach_inherited_selections() };
+    let fixture_requested = std::env::var_os("CAGENTS_NATIVE_UI_FIXTURE").is_some()
+        || std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+    if !fixture_requested {
+        // SAFETY: startup is still single-threaded. Diagnostic fixtures retain
+        // the caller's complete account/scope environment without using it.
+        unsafe { cagents::account::detach_inherited_selections() };
+    }
+    #[cfg(not(feature = "latency-harness"))]
+    if fixture_requested {
+        return report(Err(
+            "native UI fixtures require a latency-harness build".into()
+        ));
+    }
+    #[cfg(feature = "latency-harness")]
+    if fixture_requested {
+        // Diagnostic entry cannot double as a launch/recovery/helper request.
+        // Check before document helpers, staged replacement or callbacks run.
+        if std::env::args_os().len() != 1
+            || std::env::var_os(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV).is_some()
+            || std::env::var_os(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV).is_some()
+        {
+            return report(Err(
+                "native UI fixtures accept no launch arguments or recovery handshake".into(),
+            ));
+        }
+    }
     // The document render helper answers before anything else exists. Its
     // stdout is a binary page frame, so a tracing subscriber, a panic hook
     // writing a crash record, the window lease or the launcher handshake
@@ -74,8 +98,14 @@ pub(crate) fn main_with_before_start(
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
-    if let Err(error) = before_start() {
-        return report(Err(error));
+    #[cfg(feature = "latency-harness")]
+    let fixture = cagents::latency_fixture::enabled();
+    #[cfg(not(feature = "latency-harness"))]
+    let fixture = false;
+    if !fixture {
+        if let Err(error) = before_start() {
+            return report(Err(error));
+        }
     }
 
     // Diagnostics come before every other statement. The startup sequence
@@ -103,6 +133,10 @@ pub(crate) fn main_with_before_start(
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents::browser::ProcessShutdown;
     let result = run(options);
+    if fixture {
+        // Diagnostics never delegate presentation or recovery to a helper.
+        return report(result);
+    }
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
@@ -301,10 +335,16 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
-    let _device_cleanup = cagents::device::Cleanup;
-    cagents::device::select(device)?;
-    cagents::device::prepare()?;
-    if !cagents::device::is_remote() {
+    #[cfg(feature = "latency-harness")]
+    let fixture = cagents::latency_fixture::enabled();
+    #[cfg(not(feature = "latency-harness"))]
+    let fixture = false;
+    let _device_cleanup = (!fixture).then(|| cagents::device::Cleanup);
+    if !fixture {
+        cagents::device::select(device)?;
+        cagents::device::prepare()?;
+    }
+    if !fixture && !cagents::device::is_remote() {
         if let Some(executable) = cagents::control::staged_ui_executable()? {
             // exec preserves the launcher handshake pipe and window arguments.
             let mut command = std::process::Command::new(executable);
@@ -320,37 +360,43 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         slot
     };
-    let scoped_slot = if device_window_scoped && !remote_new_window {
+    let scoped_slot = if fixture {
+        None
+    } else if device_window_scoped && !remote_new_window {
         slot.map(str::to_owned)
     } else {
         cagents::device::window_slot(slot)?
     };
     let slot = scoped_slot.as_deref();
-    let fixture =
-        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
-        let device_source = if device_window_scoped && source.is_some() {
-            source.map(str::to_owned)
+        let lease = if fixture {
+            None
         } else {
-            cagents::device::window_slot(source)?
+            Some(cagents::instance::WindowLease::acquire(new_window, slot)?)
         };
-        cagents::session::SessionRuntime::initialize_window(
-            device_source
-                .as_deref()
-                .unwrap_or(cagents::instance::PRIMARY_WINDOW),
-        )?;
-        let (activation_tx, activation_rx) = async_channel::unbounded();
-        let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
-        if !fixture {
+        let activation = if fixture {
+            None
+        } else {
+            let device_source = if device_window_scoped && source.is_some() {
+                source.map(str::to_owned)
+            } else {
+                cagents::device::window_slot(source)?
+            };
+            cagents::session::SessionRuntime::initialize_window(
+                device_source
+                    .as_deref()
+                    .unwrap_or(cagents::instance::PRIMARY_WINDOW),
+            )?;
+            let (activation_tx, activation_rx) = async_channel::unbounded();
+            let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
             cagents::terminal::ensure_daemon_ready()?;
-        }
+            Some((listener, activation_rx))
+        };
         let restored = cagents::app::Cagents::load_startup()?;
-        Ok((lease, (listener, activation_rx), restored))
+        Ok((lease, activation, restored))
     })();
     let (_application_lease, activation, restored) = startup?;
     let restored = std::cell::RefCell::new(Some(restored));
-    let activation = Some(activation);
 
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface

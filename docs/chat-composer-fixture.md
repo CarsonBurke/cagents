@@ -75,6 +75,12 @@ Store screenshots under `docs/screenshots/` for PR evidence. Stop the owned
 nested session, close its synthetic agent, and stop only its isolated daemon
 when finished. The fixture directory can then be removed.
 
+To check how an answer renders, copy a Markdown file to
+`$fixture_root/home/.claude/fixture-reply.md`. Each later turn answers with
+that file's contents instead of the default sentence, so replacing the file
+changes the next answer. A few turns with a long file give a transcript long
+enough to scroll.
+
 For tool disclosure checks, set `CAGENTS_FIXTURE_VERBOSITY=1` in the same
 fixture environment before starting the runner and daemon. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a

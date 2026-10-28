@@ -9,10 +9,12 @@ browserless=false
 debug=false
 fresh_daemon=false
 hot=false
+native_fixture=false
 log_file=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --browserless) browserless=true ;;
+        --native-fixture) native_fixture=true; browserless=true ;;
         --debug) debug=true ;;
         --fresh-daemon) fresh_daemon=true ;;
         --hot) hot=true; browserless=true ;;
@@ -35,6 +37,7 @@ Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
 
 Options:
   --browserless    Build without Servo and open saved browser URLs externally
+  --native-fixture  Diagnostic browserless App fixture; no daemon or provider work
   --debug          Enable cagents debug logs and Rust backtraces
   --fresh-daemon   Stop development sessions and background subagents after building
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
@@ -58,6 +61,27 @@ USAGE
     esac
     shift
 done
+
+# A diagnostic environment must never fall through to normal restart/hot
+# controls before the UI can refuse a wrong-feature executable.
+if [ "${CAGENTS_LATENCY_OUTPUT+x}" = x ]; then
+    printf '%s\n' 'CAGENTS_LATENCY_OUTPUT belongs to scripts/run-redraw-latency, not the development runner' >&2
+    exit 2
+fi
+if [ "${CAGENTS_NATIVE_UI_FIXTURE+x}" = x ] && [ "$native_fixture" != true ]; then
+    printf '%s\n' 'CAGENTS_NATIVE_UI_FIXTURE requires --native-fixture' >&2
+    exit 2
+fi
+ui_features=development,ui
+if [ "$native_fixture" = true ]; then
+    if [ "$hot" = true ] || [ "$fresh_daemon" = true ] || [ "$#" -ne 0 ]; then
+        printf '%s\n' '--native-fixture accepts no hot reload, daemon restart or UI arguments' >&2
+        exit 2
+    fi
+    browserless=true
+    ui_features=development,ui,latency-harness
+    export CAGENTS_NATIVE_UI_FIXTURE=1
+fi
 
 if [ "$hot" = true ]; then
     "$root/scripts/hot-development" --check
@@ -193,7 +217,7 @@ if [ "$browserless" = true ]; then
     cargo build --locked --profile dev-runtime --no-default-features \
         --features development,host --bin cagentsd
     cargo build --locked --profile dev-runtime --no-default-features \
-        --features development,ui --bin cagents-ui
+        --features "$ui_features" --bin cagents-ui
 else
     cargo build --locked --profile dev-runtime \
         --features development --bin cagents
@@ -223,7 +247,7 @@ fi
 run_ui() {
     if [ "$browserless" = true ]; then
         exec cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development,ui --bin cagents-ui -- "$@"
+            --features "$ui_features" --bin cagents-ui -- "$@"
     fi
     exec cargo run --quiet --locked --profile dev-runtime \
         --features development,integrated-browser --bin cagents-ui -- "$@"

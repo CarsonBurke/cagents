@@ -996,6 +996,8 @@ impl HostedTerminalHandle {
         expected_host: Option<HostSessionProof>,
         wake: Arc<WakeCallback>,
     ) -> Result<Self, HostedTerminalStartError> {
+        #[cfg(feature = "latency-harness")]
+        crate::latency_fixture::deny_services().map_err(HostedTerminalStartError::SocketPath)?;
         if expected_host
             .as_ref()
             .is_some_and(|proof| !proof.is_complete())
@@ -1343,6 +1345,8 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
+    #[cfg(feature = "latency-harness")]
+    crate::latency_fixture::deny_services().map_err(HostedTerminalStartError::SocketPath)?;
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
     if !crate::device::is_remote() {
         ensure_daemon_ready_at(&socket, application)?;

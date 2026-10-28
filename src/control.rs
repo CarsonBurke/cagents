@@ -563,6 +563,8 @@ pub struct ControlClient {
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
 pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    #[cfg(feature = "latency-harness")]
+    crate::latency_fixture::deny_services()?;
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -2165,6 +2167,9 @@ impl Drop for StartPolicy {
 }
 
 fn control_daemon_socket() -> Result<PathBuf, AppError> {
+    #[cfg(feature = "latency-harness")]
+    crate::latency_fixture::deny_services()
+        .map_err(|error| AppError::new("native_fixture", error))?;
     if !daemon_autostart_disabled() {
         return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
     }

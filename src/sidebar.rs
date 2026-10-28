@@ -4865,6 +4865,16 @@ fn view_inner<'a>(
                 body(model, state, compact, modal_open)
             },
         )
+        // The expanded sidebar's splitter keeps the outer edge. Its hit
+        // region must not cover the project list's scrollbar.
+        .padding(Padding {
+            right: if compact {
+                0.0
+            } else {
+                design::PANE_RESIZE_CLEARANCE
+            },
+            ..Padding::ZERO
+        })
         .width(Length::Fill)
         .height(Length::Fill),
     );
@@ -10419,7 +10429,37 @@ fn slot<'a>(
 /// and paints disabled - and it keeps its place in the layout and in the
 /// accessibility tree, so no index and no name moves while the dialog is up.
 fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
+    #[cfg(feature = "latency-harness")]
+    if crate::latency_fixture::enabled() && !action.fixture_local() {
+        return None;
+    }
     (!modal_open).then_some(action)
+}
+
+#[cfg(feature = "latency-harness")]
+impl SidebarAction {
+    pub(crate) fn fixture_local(&self) -> bool {
+        matches!(
+            self,
+            Self::Resize { .. }
+                | Self::ResizeFinished
+                | Self::ScrollProjects(_)
+                | Self::ToggleProjects
+                | Self::ToggleControls
+                | Self::ToggleProject(_)
+                | Self::SearchChanged(_)
+                | Self::SetFilter(_)
+                | Self::FilesPage { .. }
+                | Self::FilesQueryChanged { .. }
+                | Self::ToggleFilesFilter { .. }
+                | Self::ToggleSection { .. }
+                | Self::ToggleDirectory { .. }
+                | Self::ToggleChangeDirectory { .. }
+                | Self::SetChangeListMode { .. }
+                | Self::SetChangesTab { .. }
+                | Self::ChangePage { .. }
+        )
+    }
 }
 
 /// Neutral text, transparent rows, and restrained pointer/keyboard feedback.
