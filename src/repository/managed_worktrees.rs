@@ -52,6 +52,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if output.exit_code != Some(1) {
             return Err(git_failure(&check, output).into());
         }
+        // A tracked negation can override clone-local info/exclude. Verify
+        // the actual result even when our exact rule was already present.
+        let verify_ignored = || -> Result<(), RepositoryError> {
+            let output = self.run(&check, cancellation)?;
+            if output.success {
+                Ok(())
+            } else if output.exit_code == Some(1) {
+                Err(ValidationError::Io(
+                    "Git still exposes the managed worktree directory after the clone-local exclusion; choose an ignored or external directory, or update higher-priority ignore rules".into(),
+                )
+                .into())
+            } else {
+                Err(git_failure(&check, output).into())
+            }
+        };
         let common = self.common_dir(repository, cancellation)?;
         let info = common.join("info");
         crate::secure_file::reject_symlink_components(&info)
@@ -88,7 +103,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .split(|byte| *byte == b'\n')
             .any(|line| line == pattern)
         {
-            return Ok(());
+            return verify_ignored();
         }
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
@@ -112,7 +127,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         fs::File::open(&info)
             .and_then(|file| file.sync_all())
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        Ok(())
+        verify_ignored()
     }
 
     /// Existing legacy worktrees stay in place while their directory stops
@@ -227,6 +242,32 @@ mod tests {
             .unwrap();
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
         assert!(contents.lines().any(|line| line == "/other-managed/"));
+        // A higher-priority tracked negation must not turn a successful
+        // clone-local write (or its idempotent retry) into false assurance.
+        let negated = root.join("negated-managed");
+        fs::create_dir(&negated).unwrap();
+        let marker = negated.join("user-file");
+        fs::write(&marker, "synthetic user file").unwrap();
+        fs::write(root.join(".gitignore"), "!/negated-managed/\n").unwrap();
+        git(&root, &["add", ".gitignore"]);
+        git(&root, &["commit", "-m", "track managed-directory policy"]);
+        let first = service
+            .ensure_managed_directory_ignored(&root, &negated, &cancel)
+            .unwrap_err();
+        assert!(first.to_string().contains("Git still exposes"));
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "synthetic user file");
+        let after_first = fs::read(root.join(".git/info/exclude")).unwrap();
+        assert!(
+            service
+                .ensure_managed_directory_ignored(&root, &negated, &cancel)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(root.join(".git/info/exclude")).unwrap(),
+            after_first
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "synthetic user file");
+        assert!(!root.join(".git/info/exclude.lock").exists());
         let mut oversized = vec![b'#'; MAX_EXCLUDE_BYTES as usize + 1];
         oversized.extend_from_slice(b"\n/tail-rule/\n");
         fs::write(root.join(".git/info/exclude"), &oversized).unwrap();
