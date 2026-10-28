@@ -13888,11 +13888,13 @@ impl Application for Cagents {
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
         if !fixture {
             workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-            workspace_model_sync::publish_workspace_model(
-                workspace_model_updates,
-                workspace_model_requests,
-            );
         }
+        // Causal control: restore the real startup publisher in fixture mode.
+        // Central diagnostic connect/autostart refusal remains intact.
+        workspace_model_sync::publish_workspace_model(
+            workspace_model_updates,
+            workspace_model_requests,
+        );
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
