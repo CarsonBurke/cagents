@@ -445,6 +445,62 @@ fn captured_native_and_console_scope_reaches_distinguishable_full_menu_without_r
 }
 
 #[test]
+fn proven_pair_menu_scope_keeps_both_surfaces_across_native_readiness_fallback() {
+    let host = empty_host();
+    let (paired_native, _) = Handle::fixture_remote_attachment_pair();
+    let (standalone, _) = Handle::fixture_remote_attachment_pair();
+    let pair_id = paired_native.actor_identity().unwrap().record.terminal;
+    let standalone_id = standalone.actor_identity().unwrap().record.terminal;
+    let console = RenderStreamFixture::new(|_| {});
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        state
+            .finish_spawn(1, terminal(pair_id), console.handle.clone(), false)
+            .unwrap();
+        install_chat(&mut state, pair_id, paired_native);
+        install_chat(&mut state, standalone_id, standalone);
+        let source = state.terminals[&pair_id].session.clone();
+        let chat = state.chats.get_mut(&pair_id).unwrap();
+        chat.session.terminal = Some(source);
+        chat.paired_terminal = Some(console.handle.clone());
+        assert!(paired(&state, pair_id));
+    }
+    for ready in [false, true] {
+        let snapshot = snapshot_with(&host, |id, candidate, snapshot| {
+            candidate.observe_sampled(
+                id,
+                candidate.terminal.as_ref().map(|_| Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Waiting,
+                }),
+                Some(ActivityObservation {
+                    ready: id != pair_id || ready,
+                    activity: ActivityState::Waiting,
+                    title: None,
+                }),
+                snapshot,
+            );
+        });
+        assert_eq!(
+            snapshot.tally,
+            AgentTally {
+                working: 0,
+                waiting: 2
+            }
+        );
+        let menu = crate::tray::waiting_menu_for_test(snapshot)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            menu[&pair_id],
+            "Claude Code · tray-project · Chat + console"
+        );
+        assert_eq!(menu[&standalone_id], "Claude Code · tray-project · Chat");
+    }
+}
+
+#[test]
 fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
     for case in 0..4 {
         let host = empty_host();

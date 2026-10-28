@@ -49,6 +49,7 @@ mod service {
     pub enum WaitingSurface {
         Chat,
         Console,
+        ChatAndConsole,
     }
 
     impl WaitingSurface {
@@ -56,6 +57,7 @@ mod service {
             match self {
                 Self::Chat => "Chat",
                 Self::Console => "Console",
+                Self::ChatAndConsole => "Chat + console",
             }
         }
     }

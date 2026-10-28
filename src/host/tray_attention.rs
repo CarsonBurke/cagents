@@ -166,7 +166,11 @@ impl Candidate {
                     chat.provider,
                     native.as_ref().and_then(|s| s.title.as_deref()),
                     &chat.directory,
-                    WaitingSurface::Chat,
+                    if self.paired {
+                        WaitingSurface::ChatAndConsole
+                    } else {
+                        WaitingSurface::Chat
+                    },
                 );
             }
         }
@@ -178,7 +182,11 @@ impl Candidate {
                 activity.provider,
                 sample.title.as_deref(),
                 &sample.directory,
-                WaitingSurface::Console,
+                if self.paired {
+                    WaitingSurface::ChatAndConsole
+                } else {
+                    WaitingSurface::Console
+                },
             );
         }
     }
