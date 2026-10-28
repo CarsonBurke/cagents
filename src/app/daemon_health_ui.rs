@@ -351,7 +351,8 @@ impl Cagents {
             rows.push(notice_detail(error));
         }
         let available_action = state.available_action();
-        let confirm = if matches!(available_action, Some(Action::CheckAgain { .. })) {
+        let check_again = matches!(&available_action, Some(Action::CheckAgain { .. }));
+        let confirm = if check_again {
             rows.push(notice_detail(
                 "Check again to verify the current daemon. Restarting still requires a separate confirmation.",
             ));
@@ -378,10 +379,7 @@ impl Cagents {
         // action. A held Check again cannot become a Restart press.
         Some(
             iced::widget::keyed::Column::with_children([(
-                (
-                    state.generation,
-                    matches!(available_action, Some(Action::CheckAgain { .. })),
-                ),
+                (state.generation, check_again),
                 widget::container(overlay).id(health_marker(state)).into(),
             )])
             .width(Length::Fill)
