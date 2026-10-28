@@ -1970,8 +1970,12 @@ pub struct SourceControlModel {
     pub tracking: TrackingState,
     /// Configured remote names, in the order Git reported them.
     pub remotes: Vec<String>,
-    /// The mutation currently in flight, which disables every command.
+    /// The mutation currently in flight. Stage/Unstage retain later requests;
+    /// the other mutation controls wait for the queue to drain.
     pub mutation: Option<MutationKind>,
+    pub(crate) queued_index_changes: usize,
+    /// A previous worktree incarnation still owns this pathname's index.
+    pub(crate) index_queue_blocked: bool,
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub staged_count: usize,
@@ -2119,6 +2123,8 @@ impl SourceControlModel {
             tracking: TrackingState::NoUpstream,
             remotes: Vec::new(),
             mutation: None,
+            queued_index_changes: 0,
+            index_queue_blocked: false,
             error: None,
             staged_count: 0,
             files: Vec::new(),
@@ -2239,6 +2245,8 @@ impl SourceControlModel {
             tracking: snapshot.status.tracking.clone(),
             remotes,
             mutation: None,
+            queued_index_changes: 0,
+            index_queue_blocked: false,
             error: None,
             staged_count,
             files,
@@ -2376,6 +2384,8 @@ impl SourceControlModel {
             return;
         }
         next.mutation = self.mutation;
+        next.queued_index_changes = self.queued_index_changes;
+        next.index_queue_blocked = self.index_queue_blocked;
         next.error = self.error.clone();
         next.commit_changes = self.commit_changes.clone();
         // The loading placeholder between two snapshots has not read `HEAD`
@@ -2396,10 +2406,20 @@ impl SourceControlModel {
 
     /// What the panel says is happening, beside a spinner: the mutation it is
     /// running, or the reload it is waiting on.
-    fn progress_label(&self) -> Option<&'static str> {
+    fn progress_label(&self) -> Option<Cow<'static, str>> {
         self.mutation
-            .map(MutationKind::progress_label)
-            .or_else(|| self.reloading.then_some("Refreshing…"))
+            .map(|kind| {
+                if self.queued_index_changes == 0 {
+                    Cow::Borrowed(kind.progress_label())
+                } else {
+                    Cow::Owned(format!(
+                        "{} {} file actions queued",
+                        kind.progress_label(),
+                        self.queued_index_changes
+                    ))
+                }
+            })
+            .or_else(|| self.reloading.then_some(Cow::Borrowed("Refreshing…")))
     }
 
     pub fn groups(&self) -> &[ChangeGroup] {
@@ -2420,8 +2440,8 @@ impl SourceControlModel {
         self.groups.iter().find(|group| group.area == area)
     }
 
-    /// True while a mutation is running, which disables every command so two
-    /// index-touching operations can never be launched from one surface.
+    /// True while a mutation owns the index. Stage/Unstage may enqueue work;
+    /// other commands must wait for this owner and its queue to settle.
     pub fn busy(&self) -> bool {
         self.mutation.is_some()
     }
@@ -8117,14 +8137,14 @@ fn source_control_header<'a>(
     let key = &source.key;
     let activity = source.progress_label().or_else(|| {
         if matches!(source.data_state, SidebarDataState::Loading) {
-            Some("Loading worktree…")
+            Some(Cow::Borrowed("Loading worktree…"))
         } else if matches!(view, PanelView::Files)
             && matches!(source.file_search, FileSearch::Pending { .. })
             && !state.files_query().trim().is_empty()
         {
-            Some("Searching files…")
+            Some(Cow::Borrowed("Searching files…"))
         } else if matches!(view, PanelView::Git(ChangesTab::History)) && source.history_loading {
-            Some("Loading commits…")
+            Some(Cow::Borrowed("Loading commits…"))
         } else {
             None
         }
@@ -8139,7 +8159,7 @@ fn source_control_header<'a>(
                 worktree_icon().icon().size(ROW_ICON_SIZE).into()
             })
             .center(Length::Fixed(ROW_ICON_WIDTH)),
-            activity.unwrap_or("Worktree"),
+            activity.unwrap_or(Cow::Borrowed("Worktree")),
         ),
         widget::container(crate::interaction::tooltip(
             design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
@@ -9492,8 +9512,8 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command disables the actions
-/// in place, because a second mutation against the same index would race the first.
+/// have nothing to unstage from. Stage/Unstage remain available while the
+/// worktree's existing worker retains and sequences their later requests.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
@@ -9515,7 +9535,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Unstage,
                 },
-                modal_open || source.busy(),
+                modal_open || source.index_queue_blocked,
             ),
             id: chrome.unstage_all_id.clone(),
         });
@@ -9529,7 +9549,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Stage,
                 },
-                modal_open || source.busy(),
+                modal_open || source.index_queue_blocked,
             ),
             id: chrome.stage_all_id.clone(),
         });
@@ -9561,7 +9581,10 @@ pub fn resolve_group_command(
     let SidebarAction::ChangeGroup { key, area, command } = action else {
         return None;
     };
-    if key != &source.key || source.busy() {
+    if key != &source.key
+        || source.index_queue_blocked
+        || (source.busy() && *command == ChangeGroupCommand::Discard)
+    {
         return None;
     }
     let group = source.group(*area)?;
@@ -9611,7 +9634,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open || source.busy(),
+                modal_open || source.index_queue_blocked,
             ),
             id: chrome.unstage_id.clone(),
         });
@@ -9624,7 +9647,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open || source.busy(),
+                modal_open || source.index_queue_blocked,
             ),
             id: chrome.stage_id.clone(),
         });
@@ -20304,21 +20327,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_running_mutation_withholds_every_further_command_against_the_same_index() {
+    fn a_running_mutation_keeps_staging_available_and_withholds_discard() {
         let mut source = source_control();
         source.set_mutation(Some(MutationKind::Stage));
         let group = source
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
+        let commands = group_commands(&source, group, false);
+        assert!(matches!(
+            commands[0]
+                .action
+                .as_ref()
+                .and_then(|action| resolve_group_command(&source, action)),
+            Some(SidebarAction::Stage { .. })
+        ));
+        assert!(commands[1].action.is_none());
+        let row = row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false);
+        assert!(matches!(row[0].action, Some(SidebarAction::Stage { .. })));
+        assert!(row[1].action.is_none());
         assert!(
-            group_commands(&source, group, false)
+            group_commands(&source, group, true)
                 .iter()
                 .all(|command| command.action.is_none())
-                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false)
-                    .iter()
-                    .all(|command| command.action.is_none()),
-            "two `git add` runs against one index corrupt each other's lock, so the second is not \
-             enabled"
+        );
+        assert!(
+            row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], true)
+                .iter()
+                .all(|command| command.action.is_none())
+        );
+        assert!(!source.can_commit("commit"));
+        assert!(!source.can_push());
+        assert!(
+            resolve_group_command(
+                &source,
+                &SidebarAction::ChangeGroup {
+                    key: source.key.clone(),
+                    area: ChangeArea::Unstaged,
+                    command: ChangeGroupCommand::Discard,
+                }
+            )
+            .is_none()
         );
     }
 

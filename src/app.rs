@@ -23,6 +23,7 @@ mod browser_host;
 mod file_ui;
 mod git_ui;
 mod history_ui;
+mod index_mutations;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
@@ -5054,11 +5055,13 @@ impl WorkspaceDestination {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct SourceControlMutation {
     id: uuid::Uuid,
+    key: ActiveWorktreeKey,
     kind: MutationKind,
     commit_revision: Option<u64>,
+    pending: index_mutations::Pending,
 }
 
 pub struct Cagents {
@@ -10813,6 +10816,15 @@ impl Cagents {
                 .get(&key.canonical_path)
                 .map(|mutation| mutation.kind),
         );
+        source.queued_index_changes = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|mutation| mutation.key == key)
+            .map_or(0, |mutation| mutation.pending.len());
+        source.index_queue_blocked = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .is_some_and(|mutation| mutation.key != key);
         self.sidebar_model.source_control = Some(source);
         self.source_control_snapshot_task(key)
     }
@@ -11725,7 +11737,11 @@ impl Cagents {
     /// Reloads the bound worktree, keeping whatever mutation is in flight
     /// visible so a refresh cannot make a running command look finished.
     fn reload_source_control(&mut self, key: &ActiveWorktreeKey) -> Task<Message> {
-        if !self.source_control_is_bound(key) {
+        if !self.source_control_is_bound(key)
+            || self
+                .source_control_mutations
+                .contains_key(&key.canonical_path)
+        {
             return Task::none();
         }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
@@ -11872,10 +11888,8 @@ impl Cagents {
 
     /// Starts one mutation against the bound worktree.
     ///
-    /// Refused outright when the panel has moved on or a command is already
-    /// running: two `git add` runs against one index corrupt each other's
-    /// `index.lock`, and the panel's own controls stand down while one is in
-    /// flight, so this is the guard for a press that raced the frame.
+    /// Only one worker owns an index. Stage and Unstage can retain later
+    /// requests in that owner's queue; the other commands require it to drain.
     fn begin_mutation(
         &mut self,
         key: &ActiveWorktreeKey,
@@ -11899,8 +11913,10 @@ impl Cagents {
             key.canonical_path.clone(),
             SourceControlMutation {
                 id,
+                key: key.clone(),
                 kind,
                 commit_revision,
+                pending: index_mutations::Pending::default(),
             },
         );
         source.set_error(None);
@@ -15600,34 +15616,10 @@ impl Application for Cagents {
                         self.open_working_change(key, path, area)
                     }
                     SidebarAction::Stage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
-                            return Task::none();
-                        };
-                        let request = StageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Stage", service.stage(&request, cancel)),
-                                false,
-                            )
-                        })
+                        self.queue_index_mutation(key, index_mutations::Kind::Stage, selection)
                     }
                     SidebarAction::Unstage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Unstage, None) else {
-                            return Task::none();
-                        };
-                        let request = UnstageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Unstage", service.unstage(&request, cancel)),
-                                false,
-                            )
-                        })
+                        self.queue_index_mutation(key, index_mutations::Kind::Unstage, selection)
                     }
                     // The only arm that destroys work, and the only one the
                     // dialog can raise: `RequestDiscard` builds the request
@@ -17608,50 +17600,7 @@ impl Application for Cagents {
                 operation,
                 report,
                 committed,
-            } => {
-                let Some(mutation) = self
-                    .source_control_mutations
-                    .get(&key.canonical_path)
-                    .copied()
-                    .filter(|mutation| mutation.id == operation)
-                else {
-                    return Task::none();
-                };
-                self.source_control_mutations.remove(&key.canonical_path);
-                if committed && let Some(revision) = mutation.commit_revision {
-                    self.sidebar_state.clear_submitted_commit(&key, revision);
-                }
-                let mut refreshes = Vec::new();
-                for (&card, runtime) in &mut self.cards {
-                    if let CardRuntime::Repository(runtime) = runtime
-                        && runtime.descriptor.worktree == key.canonical_path
-                    {
-                        refreshes.push(repository_task(runtime.refresh_after_mutation(card)));
-                    }
-                }
-                let bound = self
-                    .sidebar_model
-                    .source_control
-                    .as_mut()
-                    .filter(|source| source.key.canonical_path == key.canonical_path)
-                    .map(|source| {
-                        source.set_mutation(None);
-                        source.set_error(report.clone());
-                        source.key.clone()
-                    });
-                if let Some(report) = report {
-                    self.status = Some(TransientNotice::error(format!(
-                        "{}: {report}",
-                        display_path(&key.canonical_path)
-                    )));
-                }
-                // Navigation does not cancel Git. Only this exact completion
-                // releases the worktree, then the index is read afresh.
-                if let Some(bound) = bound {
-                    refreshes.push(self.reload_source_control(&bound));
-                }
-                Task::batch(refreshes)
-            }
+            } => self.finish_source_control_mutation(key, operation, report, committed),
         };
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
