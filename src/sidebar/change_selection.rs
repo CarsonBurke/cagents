@@ -61,19 +61,6 @@ impl Selection {
         }
     }
 
-    pub(super) fn reconcile(&mut self, order: &[Row]) {
-        let present = order.iter().collect::<BTreeSet<_>>();
-        self.rows.retain(|row| present.contains(row));
-        if self
-            .anchor
-            .as_ref()
-            .is_some_and(|row| !present.contains(row))
-        {
-            self.anchor = None;
-        }
-        self.update_areas();
-    }
-
     pub(super) fn targets(&self, focused: &Row, order: &[Row]) -> Vec<Row> {
         if !self.contains(focused) {
             return order
@@ -91,7 +78,8 @@ impl Selection {
     }
 
     pub(super) fn select(&mut self, row: Row, intent: SelectionIntent, order: &[Row]) {
-        self.reconcile(order);
+        // Folding changes navigation order, not authoritative membership.
+        // SourceControlLoaded reconciles membership against the full source.
         let Some(end) = order.iter().position(|candidate| *candidate == row) else {
             return;
         };
@@ -110,14 +98,18 @@ impl Selection {
                 let start = self
                     .anchor
                     .as_ref()
-                    .and_then(|anchor| order.iter().position(|candidate| candidate == anchor))
-                    .unwrap_or(end);
+                    .and_then(|anchor| order.iter().position(|candidate| candidate == anchor));
+                if start.is_none() {
+                    // A hidden anchor cannot define a visible range. Rearm
+                    // here so later expansion does not revive that old anchor.
+                    self.anchor = Some(row);
+                }
+                let start = start.unwrap_or(end);
                 if !extend {
                     self.rows.clear();
                 }
                 self.rows
                     .extend(order[start.min(end)..=start.max(end)].iter().cloned());
-                self.anchor.get_or_insert(row);
             }
         }
         self.update_areas();
@@ -170,7 +162,7 @@ mod tests {
         assert!(!selection.contains(&unstaged));
         selection.select(unstaged.clone(), SelectionIntent::Toggle, &order);
         assert_eq!(selection.targets(&staged, &order), order);
-        selection.reconcile(&[unstaged.clone()]);
+        selection.retain(|row| row == &unstaged);
         assert_eq!(
             selection.targets(&unstaged, &[unstaged.clone()]),
             vec![unstaged]
@@ -188,7 +180,7 @@ mod tests {
         let mut selection = Selection::default();
         selection.select(order[0].clone(), SelectionIntent::Toggle, &order);
         selection.select(order[1].clone(), SelectionIntent::Toggle, &order);
-        selection.reconcile(&order[2..]);
+        selection.retain(|row| order[2..].contains(row));
         selection.select(
             order[2].clone(),
             SelectionIntent::Range { extend: false },
@@ -196,5 +188,23 @@ mod tests {
         );
         assert_eq!(selection.targets(&order[2], &order[2..]), order[2..]);
         assert!(selection.targets(&order[0], &order[2..]).is_empty());
+    }
+
+    #[test]
+    fn range_reanchors_when_the_old_anchor_is_folded() {
+        let a = row(1, ChangeArea::Unstaged);
+        let b = row(2, ChangeArea::Unstaged);
+        let c = row(3, ChangeArea::Unstaged);
+        let order = [a.clone(), b.clone(), c.clone()];
+        let mut selection = Selection::default();
+        selection.select(a, SelectionIntent::Navigate, &order);
+        selection.select(
+            c.clone(),
+            SelectionIntent::Range { extend: false },
+            &[b.clone(), c.clone()],
+        );
+        assert_eq!(selection.targets(&c, &order), [c.clone()]);
+        selection.select(b.clone(), SelectionIntent::Range { extend: false }, &order);
+        assert_eq!(selection.targets(&b, &order), [b, c]);
     }
 }

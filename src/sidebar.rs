@@ -9430,21 +9430,26 @@ pub fn resolve_change_command(
     if &source.key != key {
         return None;
     }
-    let order = source
-        .groups()
-        .iter()
-        .flat_map(|group| {
-            group
-                .tree
-                .iter()
-                .filter(|row| !row.directory)
-                .map(move |row| ChangeSelectionRow {
-                    area: group.area,
-                    path: row.path.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
-    let targets = state.change_rows.targets(focused, &order);
+    let targets = if state.change_rows.contains(focused) {
+        let order = source
+            .groups()
+            .iter()
+            .flat_map(|group| {
+                group
+                    .tree
+                    .iter()
+                    .filter(|row| !row.directory)
+                    .map(move |row| ChangeSelectionRow {
+                        area: group.area,
+                        path: row.path.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        state.change_rows.targets(focused, &order)
+    } else {
+        // The indexed lookup below still verifies this exact current path.
+        vec![focused.clone()]
+    };
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
     let mut selection = Vec::new();
@@ -18653,6 +18658,106 @@ pub(crate) mod tests {
 
     /// Every change group discloses the same way. `Unstaged` used to be the
     /// one group with no way to fold a long list away.
+    #[test]
+    fn nonselected_change_command_uses_only_the_focused_current_row() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let order = change_selection_order(source, &state);
+        let target = |area| ChangeSelectionRow {
+            area,
+            path: source.group(area).unwrap().rows()[0].entry.path.clone(),
+        };
+        let a = target(ChangeArea::Unstaged);
+        let b = target(ChangeArea::Untracked);
+        state.select_change_rows(a.clone(), SelectionIntent::Toggle, &order);
+        let stage = |source: &SourceControlModel, state: &SidebarState, focused| {
+            resolve_change_command(
+                source,
+                state,
+                &source.key,
+                focused,
+                ChangeGroupCommand::Stage,
+            )
+        };
+        let Some(SidebarAction::Stage { selection, .. }) = stage(source, &state, &b) else {
+            panic!("nonselected current B must be independently actionable");
+        };
+        assert_eq!(
+            selection,
+            [source
+                .group(b.area)
+                .unwrap()
+                .visible_path(&b.path)
+                .unwrap()
+                .selection()],
+            "the unrelated selection of A must not broaden B's command"
+        );
+
+        // Rebuild the actual model/index without B while A remains selected.
+        // The fastpath must still pass the authoritative indexed path lookup.
+        let mut removed = source.clone();
+        let group = removed
+            .groups
+            .iter_mut()
+            .find(|group| group.area == b.area)
+            .unwrap();
+        *group = ChangeGroup::new(
+            source.key.worktree_id,
+            group.area,
+            group
+                .rows
+                .iter()
+                .filter(|row| row.entry.path != b.path)
+                .cloned()
+                .collect(),
+        );
+        assert!(stage(&removed, &state, &b).is_none());
+
+        state.select_change_rows(b.clone(), SelectionIntent::Toggle, &order);
+        let Some(SidebarAction::Stage { selection, .. }) = stage(source, &state, &a) else {
+            panic!("selected subset must retain its full logical order");
+        };
+        let expected = |rows: Vec<&ChangeSelectionRow>| {
+            rows.into_iter()
+                .map(|row| {
+                    source
+                        .group(row.area)
+                        .unwrap()
+                        .visible_path(&row.path)
+                        .unwrap()
+                        .selection()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selection,
+            expected(
+                order
+                    .iter()
+                    .filter(|row| *row == &a || *row == &b)
+                    .collect()
+            )
+        );
+
+        let mut all = panel_state(&model);
+        for row in &order {
+            all.select_change_rows(row.clone(), SelectionIntent::Toggle, &order);
+        }
+        let Some(SidebarAction::Stage { selection, .. }) = stage(source, &all, &a) else {
+            panic!("a fully selected model must retain its ordinary ordered targets");
+        };
+        assert_eq!(
+            selection,
+            expected(
+                order
+                    .iter()
+                    .filter(|row| row.area != ChangeArea::Staged)
+                    .collect()
+            )
+        );
+    }
+
     #[test]
     fn selected_change_actions_partition_git_areas_and_keep_discard_confirmation() {
         let model = panel_model();

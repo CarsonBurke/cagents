@@ -29117,6 +29117,173 @@ mod tests {
         );
     }
     #[test]
+    fn folded_change_selection_survives_toggle_and_only_current_source_removal_prunes_it() {
+        use crate::repository::{ChangeArea, ChangeKind, ChangedPath, RepoPath};
+
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        app.settings.git_status_limit = 40_000;
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let mut entries = (0..39_999)
+            .map(|index| ChangedPath {
+                path: RepoPath::parse(format!("folded/m{index}.rs")).unwrap(),
+                old_path: None,
+                area: ChangeArea::Unstaged,
+                kind: ChangeKind::Modified,
+                conflict: None,
+                submodule: false,
+                added_lines: Some(1),
+                removed_lines: Some(0),
+            })
+            .collect::<Vec<_>>();
+        entries.push(ChangedPath {
+            path: RepoPath::parse("other/keep.rs").unwrap(),
+            old_path: None,
+            area: ChangeArea::Unstaged,
+            kind: ChangeKind::Modified,
+            conflict: None,
+            submodule: false,
+            added_lines: Some(1),
+            removed_lines: Some(0),
+        });
+        let mut snapshot = crate::repository::RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
+            status: crate::repository::StatusSnapshot {
+                dirty: crate::repository::DirtyState {
+                    unstaged: entries.len() as u32,
+                    ..Default::default()
+                },
+                entries,
+                ..Default::default()
+            },
+            files: crate::repository::WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+        };
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: app.refresh_ui.source_generation,
+            result: Ok(Some(Box::new((snapshot.clone(), model)))),
+        }));
+        let order = sidebar::change_selection_order(
+            app.sidebar_model.source_control.as_ref().unwrap(),
+            &app.sidebar_state,
+        );
+        assert_eq!(order.len(), 40_000);
+        let anchor = order[3].clone();
+        let end = order[35_000].clone();
+        let outside = order.last().unwrap().clone();
+        assert_eq!(outside.path, RepoPath::parse("other/keep.rs").unwrap());
+        for (row, intent) in [
+            (anchor.clone(), sidebar::SelectionIntent::Navigate),
+            (end, sidebar::SelectionIntent::Range { extend: false }),
+        ] {
+            drop(
+                app.update(Message::Sidebar(SidebarAction::SelectChangeRows {
+                    key: key.clone(),
+                    row,
+                    intent,
+                })),
+            );
+        }
+        let selected_range = 35_000 - 3 + 1;
+        assert_eq!(app.sidebar_state.selected_change_count(), selected_range);
+        drop(
+            app.update(Message::Sidebar(SidebarAction::ToggleChangeDirectory {
+                key: key.clone(),
+                scope: sidebar::ChangeTreeScope::Area(ChangeArea::Unstaged),
+                path: RepoPath::parse("folded").unwrap(),
+            })),
+        );
+        assert_eq!(app.sidebar_state.selected_change_count(), selected_range);
+        assert_eq!(
+            sidebar::change_selection_order(
+                app.sidebar_model.source_control.as_ref().unwrap(),
+                &app.sidebar_state,
+            ),
+            [outside.clone()],
+            "folding changes navigation order, not source membership"
+        );
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SelectChangeRows {
+                key: key.clone(),
+                row: outside.clone(),
+                intent: sidebar::SelectionIntent::Toggle,
+            })),
+        );
+        assert_eq!(
+            app.sidebar_state.selected_change_count(),
+            selected_range + 1
+        );
+        let mut expected = order[3..=35_000]
+            .iter()
+            .chain(std::iter::once(&outside))
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>();
+        let selected_stage_paths = |app: &Cagents| {
+            let action = sidebar::resolve_change_command(
+                app.sidebar_model.source_control.as_ref().unwrap(),
+                &app.sidebar_state,
+                &key,
+                &outside,
+                sidebar::ChangeGroupCommand::Stage,
+            );
+            let Some(SidebarAction::Stage { selection, .. }) = action else {
+                panic!("actual selected command must include folded paths");
+            };
+            selection
+                .into_iter()
+                .map(|row| row.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected_stage_paths(&app), expected);
+
+        // A real unchanged publication keeps the folded selection and revision.
+        let revision = app.sidebar_state.change_selection_revision();
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: app.refresh_ui.source_generation,
+            result: Ok(Some(Box::new((snapshot.clone(), model)))),
+        }));
+        assert_eq!(app.sidebar_state.change_selection_revision(), revision);
+        assert_eq!(selected_stage_paths(&app), expected);
+
+        snapshot
+            .status
+            .entries
+            .retain(|entry| entry.path != anchor.path);
+        snapshot.status.dirty.unstaged -= 1;
+        // A stale result cannot remove the selection before current publication.
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: app.refresh_ui.source_generation.wrapping_add(1),
+            result: Ok(Some(Box::new((snapshot.clone(), model)))),
+        }));
+        assert_eq!(app.sidebar_state.change_selection_revision(), revision);
+        assert_eq!(selected_stage_paths(&app), expected);
+
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: app.refresh_ui.source_generation,
+            result: Ok(Some(Box::new((snapshot, model)))),
+        }));
+        expected.retain(|path| path != &anchor.path);
+        assert_eq!(app.sidebar_state.selected_change_count(), selected_range);
+        assert_ne!(app.sidebar_state.change_selection_revision(), revision);
+        assert_eq!(selected_stage_paths(&app), expected);
+    }
+
+    #[test]
     fn partial_discard_keeps_undo_after_rollback_and_rebinding() {
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();
