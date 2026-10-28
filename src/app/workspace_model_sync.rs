@@ -1869,12 +1869,17 @@ mod tests {
         assert_eq!(session.last_error(), None);
         let (mut restored, workspace) =
             crate::session::SessionRuntime::open(&database, boot).unwrap();
-        assert_eq!(
-            workspace
-                .expect("device adoption saved its sidebar rank")
-                .project_order,
-            vec![id]
-        );
+        let workspace = workspace.expect("device adoption saved its sidebar rank");
+        assert_eq!(workspace.project_order, vec![id]);
+        // Restore resets runtime placement, while preserving the existing work.
+        let mut restored_cards = cards;
+        for card in &mut restored_cards {
+            card.exposure = Exposure::Offscreen;
+            card.residency = Residency::Cold;
+        }
+        assert_eq!(workspace.cards, restored_cards);
+        assert_eq!(workspace.focused, focus);
+        assert_eq!(workspace.active_channel, active);
         let (projects, _) = restored.take_catalog();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, id);
@@ -3398,9 +3403,9 @@ mod tests {
             );
             assert_eq!(app.workspace.focused(), None);
         }
-        // No manual persist/snapshot here: the load-completion path must save
-        // each new rank itself. Reopening only after shutdown drains its writer
-        // and distinguishes a remembered in-memory rank from a durable one.
+        // No manual persist/snapshot here: reopen the completed adoption order
+        // after shutdown drains the load-completion path's writer, distinguishing
+        // a remembered in-memory order from a durable one.
         let mut session = app.session.take().unwrap();
         session.shutdown();
         assert_eq!(session.last_error(), None);
