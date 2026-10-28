@@ -5688,13 +5688,13 @@ impl Cagents {
         }) {
             return Task::none();
         }
-        if local_io
-            .is_some_and(|runtime| runtime.pending.is_some() || !runtime.followups.is_empty())
-        {
+        if local_io.is_some_and(|runtime| {
+            runtime.pending.is_some() || runtime.queued.is_some() || !runtime.followups.is_empty()
+        }) {
             // Accepted local work can still be waiting for its send task. An
             // idle actor does not prove that work has reached the source.
             self.status = Some(TransientNotice::warning(
-                "Finish pending commands and send or take back queued follow-ups, then select the account again.",
+                "Finish pending commands and send or take back queued messages, then select the account again.",
             ));
             return Task::none();
         }
@@ -8408,6 +8408,7 @@ impl Cagents {
                 }
                 if result.is_ok()
                     && (runtime.pending.is_some()
+                        || runtime.queued.is_some()
                         || !runtime.followups.is_empty()
                         || runtime.pastes_pending > 0
                         || runtime.attachment_chooser_pending.is_some())
@@ -27244,6 +27245,40 @@ mod tests {
         assert!(!app.chat_ui.removed_accounts.contains(&card));
         assert!(app.chat_ui.retiring.is_empty());
         assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn explicit_switch_keeps_a_first_message_waiting_for_provider_readiness() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 464);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        handle.replace_snapshot_for_test(Snapshot {
+            session_id: Some(KNOWN_THREAD.into()),
+            ..Snapshot::default()
+        });
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.is_draft());
+        assert!(runtime.pending.is_none());
+        assert_eq!(
+            runtime.session.launch.session_id.as_deref(),
+            Some(KNOWN_THREAD)
+        );
+        let source = runtime.session.clone();
+        let queued = runtime.queued.as_ref().unwrap().source.clone();
+        drop(app.update(Message::ChatUi(Action::ChooseAccount(target, alternate))));
+        assert!(!app.chat_start_pending(card));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.session, source);
+        assert_eq!(runtime.target, target);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert!(Arc::ptr_eq(
+            &runtime.queued.as_ref().unwrap().source,
+            &queued
+        ));
+        assert!(runtime.pending_account_switch.is_none());
+        assert!(!runtime.disconnected);
     }
 
     #[test]

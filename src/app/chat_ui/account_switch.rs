@@ -50,6 +50,7 @@ impl Cagents {
             return Task::none();
         }
         if runtime.pending.is_some()
+            || runtime.queued.is_some()
             || !runtime.followups.is_empty()
             || runtime.pastes_pending > 0
             || runtime.attachment_chooser_pending.is_some()
