@@ -160,6 +160,7 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return (Task::none(), None);
         };
+        runtime.revoke_rendered_copy();
         runtime.connection = Connection::AwaitingAdmission;
         self.retain_unresolved_shared_upgrade(&pane)
     }
@@ -206,6 +207,7 @@ impl Cagents {
         // the unsent Content. Returning/closing/account recovery keep ownership.
         self.chat_ui.phases.remove(&pane.id);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&pane.id) {
+            runtime.revoke_rendered_copy();
             runtime.connection = Connection::AwaitingAdmission;
         }
         Arc::make_mut(&mut self.durable)

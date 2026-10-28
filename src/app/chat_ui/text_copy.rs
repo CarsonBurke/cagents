@@ -242,6 +242,17 @@ impl Cagents {
     }
 }
 
+/// An admitted rendered Copy shares the existing global clipboard intent and
+/// rechecks its weak source at the actual effect boundary.
+pub(super) fn write_rendered(
+    text: String,
+    authority_is_current: impl Fn() -> bool + Send + 'static,
+) -> Task<Message> {
+    let context = current_context();
+    let intent = context.advance();
+    clipboard_write(context, intent, text, authority_is_current)
+}
+
 /// A native code button retains immutable raw bytes, never a view-time String.
 /// It supersedes older logical reads and checks newer clipboard intent at the
 /// actual effect boundary before materializing bytes exactly once.

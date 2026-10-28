@@ -4289,7 +4289,7 @@ impl Runtime {
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        let mut controls = vec![small_icon(
+        let mut controls = vec![rendered_copy::icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
                 Icon::Check
             } else {
@@ -4305,8 +4305,14 @@ impl Runtime {
             {
                 Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
             } else {
-                Action::Copy(self.target, item.id.clone(), CopyPart::Text)
+                Action::Copy(
+                    self.target,
+                    item.id.clone(),
+                    CopyPart::Text,
+                    self.rendered_copy_source(item, CopyPart::Text),
+                )
             },
+            rendered_copy::Role::Message,
         )];
         if let Some((at, stamp, full)) = self
             .presentation_cache()
@@ -4673,14 +4679,22 @@ impl Runtime {
             ))
             .class(crate::ui_controls::control_style(false, None))
             .on_press(action(Action::Toggle(self.target, item.id.clone())));
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Copy(
-                    self.target,
-                    item.id.clone(),
-                    CopyPart::Text,
-                )));
+            let copy_action = Action::Copy(
+                self.target,
+                item.id.clone(),
+                CopyPart::Text,
+                self.rendered_copy_source(item, CopyPart::Text),
+            );
+            let copy = rendered_copy::owned(
+                &copy_action,
+                rendered_copy::Role::Report,
+                widget::button::custom(design::caption("Copy report"))
+                    .name(format!("Copy original report: {heading}"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .on_press_maybe(
+                        rendered_copy::enabled(&copy_action).then(|| action(copy_action.clone())),
+                    ),
+            );
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Chat),
@@ -6027,7 +6041,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text, _) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             drop(footer);
             if child_selected {
@@ -6244,6 +6258,7 @@ mod tests {
             },
         };
         let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let item = runtime.active_item(&item.id).unwrap().clone();
         let renderer = crate::app::tests::headless_renderer();
         for width in [160.0, 240.0, 600.0] {
             let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
@@ -6322,7 +6337,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text, _) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             let after = element
                 .as_widget_mut()
@@ -9884,6 +9899,7 @@ mod tests {
                 at: None,
             };
             let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let item = runtime.active_item(&item.id).unwrap().clone();
             assert_eq!(runtime.cache[&item.id].preview.text, target);
             assert_eq!(runtime.turns[0].summary, name);
             for open in [false, true] {
@@ -9979,7 +9995,7 @@ mod tests {
                 let copied = dispatch(event(copy.clone(), A11yAction::Click));
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text, _) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
@@ -10016,7 +10032,7 @@ mod tests {
                 let copied = dispatch(enter.clone());
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text, _) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());

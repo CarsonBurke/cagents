@@ -27,6 +27,7 @@ use std::{
 // another 30 seconds receiving the reply. Leave room for the daemon response
 // and a busy desktop scheduler.
 mod append;
+pub(crate) mod rendered_copy;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
@@ -287,6 +288,7 @@ struct PublicationPayload {
     clock: Option<SourceClock>,
     resident: bool,
     lineage: append::Lineage,
+    copy_owners: Arc<rendered_copy::Owners>,
     // Ready before installation: hide performs no body/metadata derivation.
     // Metadata nodes have no pair and own no body or append authority.
     hidden: Option<Arc<Publication>>,
@@ -357,6 +359,7 @@ impl Publication {
         clock: Option<SourceClock>,
         resident: bool,
         lineage: append::Lineage,
+        copy_owners: Arc<rendered_copy::Owners>,
         hidden: Option<Arc<Publication>>,
         source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
     ) -> Arc<Self> {
@@ -371,6 +374,7 @@ impl Publication {
                     clock,
                     resident,
                     lineage,
+                    copy_owners,
                     hidden,
                     #[cfg(test)]
                     retirement_complete: Mutex::new(None),
@@ -388,6 +392,7 @@ impl Publication {
             snapshot,
             clock,
             append::Lineage::default(),
+            None,
             Arc::new(std::sync::OnceLock::new()),
         )
     }
@@ -396,8 +401,11 @@ impl Publication {
         snapshot: Snapshot,
         clock: Option<SourceClock>,
         lineage: append::Lineage,
+        copy_owners: Option<Arc<rendered_copy::Owners>>,
         source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
     ) -> Arc<Self> {
+        let copy_owners =
+            copy_owners.unwrap_or_else(|| Arc::new(rendered_copy::Owners::fresh(&snapshot)));
         let mut metadata = snapshot.clone();
         metadata.evict_transcript();
         let hidden = Self::owned(
@@ -405,10 +413,19 @@ impl Publication {
             clock,
             false,
             append::Lineage::default(),
+            Arc::default(),
             None,
             source_thread.clone(),
         );
-        Self::owned(snapshot, clock, true, lineage, Some(hidden), source_thread)
+        Self::owned(
+            snapshot,
+            clock,
+            true,
+            lineage,
+            copy_owners,
+            Some(hidden),
+            source_thread,
+        )
     }
 
     fn next(
@@ -416,17 +433,25 @@ impl Publication {
         snapshot: Snapshot,
         resident: bool,
         lineage: append::Lineage,
+        copy_owners: Option<Arc<rendered_copy::Owners>>,
     ) -> Arc<Self> {
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         if resident {
-            Self::resident(snapshot, clock, lineage, base.source_thread.clone())
+            Self::resident(
+                snapshot,
+                clock,
+                lineage,
+                copy_owners,
+                base.source_thread.clone(),
+            )
         } else {
             Self::owned(
                 snapshot,
                 clock,
                 false,
                 append::Lineage::default(),
+                Arc::default(),
                 None,
                 base.source_thread.clone(),
             )
@@ -481,6 +506,7 @@ impl Publications {
             snapshot,
             clock,
             append::Lineage::default(),
+            None,
             base.source_thread.clone(),
         );
         let metadata = full
@@ -1338,11 +1364,17 @@ impl ClientHandle {
         let (base, revision) = self.inner.publication.capture();
         let mut lineage = base.lineage.clone();
         let candidates = append::Lineage::candidates(&update, &base.snapshot);
+        let copy_appends = rendered_copy::Owners::appends(&update);
         let next = update
             .apply(&base.snapshot)
             .expect("fixture publication obeys production fences");
         lineage.record(candidates, &next);
-        let full = Publication::next(&base, next, true, lineage);
+        let copy_owners = Arc::new(rendered_copy::Owners::appended(
+            &base.copy_owners,
+            &next,
+            &copy_appends,
+        ));
+        let full = Publication::next(&base, next, true, lineage, Some(copy_owners));
         let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
@@ -2152,16 +2184,18 @@ impl ClientHandle {
                         // fallback. A failed full patch never publishes just its clock.
                         let derived = if retain_body {
                             let candidates = append::Lineage::candidates(&update, &base.snapshot);
+                            let copy_appends = rendered_copy::Owners::appends(&update);
                             update.apply(&base.snapshot).map(|next| {
                                 let mut lineage = base.lineage.clone(); lineage.record(candidates, &next);
-                                let full = Publication::next(&base, next, true, lineage);
+                                let copy_owners = Arc::new(rendered_copy::Owners::appended(&base.copy_owners, &next, &copy_appends));
+                                let full = Publication::next(&base, next, true, lineage, Some(copy_owners));
                                 let metadata = full.hidden.as_ref().unwrap().clone();
                                 (Some(full), metadata)
                             })
                         } else {
                             update.metadata_for(&base.snapshot).map(|mut metadata| {
                                 metadata.evict_transcript();
-                                (None, Publication::next(&base, metadata, false, append::Lineage::default()))
+                                (None, Publication::next(&base, metadata, false, append::Lineage::default(), None))
                             })
                         };
                         let committed = derived.map(|(full, metadata)| {
@@ -2187,9 +2221,9 @@ impl ClientHandle {
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
                             let mut proposed = Some(if base.resident {
-                                Publication::resident(snapshot, base.clock, base.lineage.clone(), base.source_thread.clone())
+                                Publication::resident(snapshot, base.clock, base.lineage.clone(), Some(base.copy_owners.clone()), base.source_thread.clone())
                             } else {
-                                Publication::owned(snapshot, base.clock, false, append::Lineage::default(), None, base.source_thread.clone())
+                                Publication::owned(snapshot, base.clock, false, append::Lineage::default(), Arc::default(), None, base.source_thread.clone())
                             });
                             let (old, current) = {
                                 let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
@@ -2310,6 +2344,45 @@ impl ClientHandle {
             .then(|| (state.snapshot.clone(), state.clock))
     }
 
+    /// Snapshot and body-free source receipts from one immutable publication.
+    pub(crate) fn resident_copy_view(
+        &self,
+    ) -> Option<(
+        Arc<Snapshot>,
+        Option<SourceClock>,
+        Arc<rendered_copy::Owners>,
+    )> {
+        let state = self.inner.publication.current.load();
+        state.resident.then(|| {
+            (
+                state.snapshot.clone(),
+                state.clock,
+                state.copy_owners.clone(),
+            )
+        })
+    }
+    pub(crate) fn copy_owners_for(
+        &self,
+        snapshot: &Arc<Snapshot>,
+    ) -> Option<Arc<rendered_copy::Owners>> {
+        let state = self.inner.publication.current.load();
+        (state.resident && Arc::ptr_eq(snapshot, &state.snapshot))
+            .then(|| state.copy_owners.clone())
+    }
+    pub(crate) fn rendered_copy_is_current(
+        &self,
+        conversation: Option<&str>,
+        child: Option<&str>,
+        id: &str,
+        part: rendered_copy::Part,
+        token: &std::sync::Weak<()>,
+    ) -> bool {
+        let state = self.inner.publication.current.load();
+        state.resident
+            && state.snapshot.session_id.as_deref() == conversation
+            && state.copy_owners.owns(child, id, part, token)
+    }
+
     #[cfg(test)]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         self.inner.user_item_seen.fetch_or(
@@ -2320,7 +2393,7 @@ impl ClientHandle {
             Ordering::AcqRel,
         );
         let (base, revision) = self.inner.publication.capture();
-        let full = Publication::next(&base, update, true, append::Lineage::default());
+        let full = Publication::next(&base, update, true, append::Lineage::default(), None);
         let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
@@ -3373,6 +3446,268 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new(incarnation),
         }
+    }
+
+    #[test]
+    fn rendered_copy_parts_follow_only_current_verified_publications() {
+        use rendered_copy::Part;
+        let item = Arc::new(super::super::Item {
+            id: "copy-stream".into(),
+            role: super::super::Role::Assistant,
+            content: super::super::ItemContent::Tool {
+                name: "Inspect".into(),
+                input: "stable input".into(),
+                output: "output".into(),
+                status: super::super::ToolStatus::Running,
+            },
+            at: None,
+            started_at: None,
+        });
+        let old = Arc::downgrade(&item);
+        let handle = ClientHandle::fixture(
+            omp_card(Some("conversation"), None),
+            Snapshot {
+                generation: 1,
+                session_id: Some("conversation".into()),
+                items: vec![item.clone()],
+                ..Snapshot::default()
+            },
+        );
+        let installed = handle.inner.publication.current.load_full();
+        let (released, retirement) = std::sync::mpsc::channel();
+        *installed.retirement_complete.lock().unwrap() = Some(released);
+        drop(installed);
+        let (snapshot, _, owners) = handle.resident_copy_view().unwrap();
+        let receipt = owners.receipt(None, &item).unwrap();
+        let input = receipt.token(Part::Input);
+        let output = receipt.token(Part::Output);
+        let text = receipt.token(Part::Text);
+        let strong = Arc::strong_count(&item);
+        assert!(owners.receipt(None, &item).is_some());
+        assert_eq!(
+            Arc::strong_count(&item),
+            strong,
+            "receipts do not own bodies"
+        );
+        drop(snapshot);
+        drop(owners);
+        drop(item);
+        // Exceed the separate Markdown lineage's 256-edge bound. These
+        // current-only identities do not slide when append ancestry is pruned.
+        for _ in 0..300 {
+            let mut next = (*handle.snapshot()).clone();
+            let mut changed = (*next.items[0]).clone();
+            let super::super::ItemContent::Tool { output, .. } = &mut changed.content else {
+                unreachable!()
+            };
+            output.push('!');
+            next.items = vec![Arc::new(changed)];
+            next.generation += 1;
+            handle.publish_delta_snapshot_for_test(next);
+        }
+        for (part, token) in [
+            (Part::Input, &input),
+            (Part::Output, &output),
+            (Part::Text, &text),
+        ] {
+            assert!(handle.rendered_copy_is_current(
+                Some("conversation"),
+                None,
+                "copy-stream",
+                part,
+                token
+            ));
+        }
+        retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            old.upgrade().is_none(),
+            "no copy receipt retains the original Item"
+        );
+        let (current, _, owners) = handle.resident_copy_view().unwrap();
+        assert!(
+            owners
+                .receipt(None, &current.items[0])
+                .unwrap()
+                .continues(&receipt)
+        );
+        assert!(
+            owners
+                .receipt(
+                    None,
+                    &super::super::Item {
+                        id: "copy-stream".into(),
+                        ..(*current.items[0]).clone()
+                    }
+                )
+                .is_none(),
+            "same ID and bytes cannot mint a receipt for another Item"
+        );
+        drop(current);
+        drop(owners);
+        let mut rewritten = (*handle.snapshot()).clone();
+        let mut item = (*rewritten.items[0]).clone();
+        let super::super::ItemContent::Tool {
+            input: changed_input,
+            ..
+        } = &mut item.content
+        else {
+            unreachable!()
+        };
+        *changed_input = "different input".into();
+        rewritten.generation += 1;
+        rewritten.items = vec![Arc::new(item)];
+        // The fixture generates an Append even though nonstreamed input
+        // changed. Production typed identity validation must reject reuse.
+        handle.publish_delta_snapshot_for_test(rewritten);
+        assert!(!handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Input,
+            &input
+        ));
+        assert!(!handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Output,
+            &output
+        ));
+        // The same real fixture publisher exercises Command identity fields
+        // and a cross-variant Append. No per-case actors or processes are made.
+        for changed_field in 0..6 {
+            let command = super::super::Item {
+                id: "copy-stream".into(),
+                role: super::super::Role::Assistant,
+                content: super::super::ItemContent::Command {
+                    label: "Inspect".into(),
+                    command: "printf input".into(),
+                    working_directory: "/workspace".into(),
+                    action: super::super::CommandAction::Run,
+                    output: "initial".into(),
+                    status: super::super::ToolStatus::Running,
+                    exit_code: None,
+                    duration_ms: None,
+                },
+                at: None,
+                started_at: None,
+            };
+            let mut initial = (*handle.snapshot()).clone();
+            initial.generation += 1;
+            initial.items = vec![Arc::new(command.clone())];
+            handle.publish_snapshot_for_test(initial);
+            let (snapshot, _, owners) = handle.resident_copy_view().unwrap();
+            let old = owners.receipt(None, &snapshot.items[0]).unwrap();
+            let mut changed = command;
+            let super::super::ItemContent::Command {
+                label,
+                command,
+                working_directory,
+                action,
+                output,
+                ..
+            } = &mut changed.content
+            else {
+                unreachable!()
+            };
+            output.push_str(" tail");
+            match changed_field {
+                0 => {} // verified append, including all three copy compositions
+                1 => *label = "Another label".into(),
+                2 => *command = "different command".into(),
+                3 => *working_directory = "/elsewhere".into(),
+                4 => *action = super::super::CommandAction::Read,
+                _ => {
+                    changed.content = super::super::ItemContent::Tool {
+                        name: "Inspect".into(),
+                        input: "printf input".into(),
+                        output: "initial tail".into(),
+                        status: super::super::ToolStatus::Running,
+                    }
+                }
+            }
+            let mut next = (*snapshot).clone();
+            next.generation += 1;
+            next.items = vec![Arc::new(changed)];
+            handle.publish_delta_snapshot_for_test(next);
+            for part in [Part::Text, Part::Input, Part::Output] {
+                assert_eq!(
+                    handle.rendered_copy_is_current(
+                        Some("conversation"),
+                        None,
+                        "copy-stream",
+                        part,
+                        &old.token(part)
+                    ),
+                    changed_field == 0
+                );
+            }
+        }
+        let (snapshot, _, owners) = handle.resident_copy_view().unwrap();
+        let replacement = owners
+            .receipt(None, &snapshot.items[0])
+            .unwrap()
+            .token(Part::Input);
+        // Full reset revokes even exactly reused canonical Item allocations.
+        handle.publish_snapshot_for_test((*snapshot).clone());
+        assert!(!handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Input,
+            &replacement
+        ));
+        let (snapshot, _, owners) = handle.resident_copy_view().unwrap();
+        let before_replace = owners
+            .receipt(None, &snapshot.items[0])
+            .unwrap()
+            .token(Part::Input);
+        let mut metadata = (*snapshot).clone();
+        metadata.generation += 1;
+        metadata.items.clear();
+        handle.publish_presentation_for_test(super::super::presentation::Presentation {
+            base_generation: snapshot.generation,
+            file_changes_unchanged: false,
+            metadata,
+            order: vec!["copy-stream".into()],
+            changes: vec![super::super::presentation::ItemChange::Replace(
+                (*snapshot.items[0]).clone(),
+            )],
+            children: vec![],
+        });
+        assert!(
+            !handle.rendered_copy_is_current(
+                Some("conversation"),
+                None,
+                "copy-stream",
+                Part::Input,
+                &before_replace
+            ),
+            "an explicit equal-content Replace still starts a fresh source"
+        );
+        let (snapshot, _, owners) = handle.resident_copy_view().unwrap();
+        let before_hide = owners
+            .receipt(None, &snapshot.items[0])
+            .unwrap()
+            .token(Part::Input);
+        handle.set_interest(false, false).unwrap();
+        assert!(handle.resident_copy_view().is_none());
+        assert!(!handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Input,
+            &before_hide
+        ));
+        handle.set_interest(true, true).unwrap();
+        handle.publish_snapshot_for_test((*snapshot).clone());
+        assert!(!handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Input,
+            &before_hide
+        ));
     }
 
     /// The live installation's own card: a native OMP conversation whose

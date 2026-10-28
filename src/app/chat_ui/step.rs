@@ -195,11 +195,16 @@ pub(super) fn code_frame<'a>(
     match copy {
         Some(copy) => iced::widget::hover(
             block,
-            widget::container(small_icon(Icon::Copy, "Copy this block", copy))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::Start),
+            widget::container(rendered_copy::icon(
+                Icon::Copy,
+                "Copy this block",
+                copy,
+                rendered_copy::Role::Code,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start),
         ),
         None => block.into(),
     }
@@ -255,7 +260,12 @@ impl Runtime {
         };
         let target = self.target;
         let id = item.id.clone();
-        let copy = Action::Copy(target, id.clone(), part.clone());
+        let copy = Action::Copy(
+            target,
+            id.clone(),
+            part.clone(),
+            self.rendered_copy_source(item, part.clone()),
+        );
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
         // top, whether or not the step is still running.

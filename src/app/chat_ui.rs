@@ -42,6 +42,7 @@ mod prompt;
 mod prose;
 mod prose_document;
 mod reader_source;
+mod rendered_copy;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
@@ -112,13 +113,7 @@ fn small_icon<'a>(
     label: impl Into<Cow<'a, str>>,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_button(name, label)
-        .compact()
-        .on_press(action(message))
-        // Muted at rest: these sit at the foot of every answer, and drawn in the
-        // text color they competed with the answer for attention.
-        .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
-        .into()
+    rendered_copy::icon(name, label, message, rendered_copy::Role::Message)
 }
 
 /// One message waiting above the composer.
@@ -144,7 +139,7 @@ impl std::fmt::Debug for Ready {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyPart {
     Text,
     Input,
@@ -268,7 +263,7 @@ pub enum Action {
     SessionLinkOpened(Result<(), String>),
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
-    Copy(Target, String, CopyPart),
+    Copy(Target, String, CopyPart, Option<rendered_copy::Source>),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
@@ -1118,6 +1113,7 @@ struct CachedItem {
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
     item: Option<Arc<chat::Item>>,
+    copy_receipt: Option<chat::client::rendered_copy::Receipt>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
     diagnostic: bool,
@@ -1341,6 +1337,9 @@ impl CachedItem {
             });
         let (retained_coordination, retained_blocks, retained_palettes) =
             retained_coordination.unwrap_or_default();
+        let previous_copy_receipt = previous
+            .as_ref()
+            .and_then(|cached| cached.copy_receipt.clone());
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
         // Weak descriptors survive append publication; only mounted row owners
@@ -1500,6 +1499,7 @@ impl CachedItem {
             tool_output,
             patches,
             token: ChangeToken::of(content),
+            copy_receipt: previous_copy_receipt,
             item,
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
@@ -2015,6 +2015,7 @@ pub(super) struct Runtime {
     find_index: usize,
     find_navigation: find_navigation::State,
     copied: Option<(String, Instant)>,
+    rendered_copy_lease: Arc<()>,
     /// When a cancel that would also stop background subagents was pressed,
     /// until it is pressed again or lapses.
     pub(super) interrupt_armed: Option<Instant>,
@@ -2045,6 +2046,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    copy_owners: Arc<chat::client::rendered_copy::Owners>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
@@ -2915,6 +2917,7 @@ impl Runtime {
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
             self.target = target;
+            self.rendered_copy_lease = Arc::new(());
         }
     }
 
@@ -2947,6 +2950,7 @@ impl Runtime {
             }),
             provider_queue: std::cell::RefCell::default(),
             source_clock: None,
+            copy_owners: Arc::default(),
             finished_stamp: None,
             connection,
             closed_elsewhere: false,
@@ -2970,6 +2974,7 @@ impl Runtime {
             find_index: 0,
             find_navigation: find_navigation::State::default(),
             copied: None,
+            rendered_copy_lease: Arc::new(()),
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
@@ -3045,6 +3050,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.copy_owners = Arc::default();
         self.provider_queue.borrow_mut().clear();
         self.preparation.clear();
         self.cache.clear();
@@ -3053,7 +3059,10 @@ impl Runtime {
         self.presentation_evicted = false;
         self.last_presented_tail = None;
         self.turns.clear();
-        self.selected_subagent = None;
+        if self.selected_subagent.take().is_some() {
+            self.rendered_copy_lease = Arc::new(());
+            self.copied = None;
+        }
         self.subagent_scroll.clear();
         self.page_request = None;
         self.deferred_page = None;
@@ -3418,6 +3427,7 @@ impl Runtime {
         let theme = self.syntax_theme;
         let provider = self.session.launch.provider;
         let handle = self.handle().cloned();
+        let copy_owners = self.copy_owners.clone();
         let reader_proofs = self.scroll_memory.reader_proofs(context.as_deref());
         self.preparation.set_reader_proofs(reader_proofs.clone());
         self.preparation.set_provider(provider);
@@ -3602,16 +3612,22 @@ impl Runtime {
                         previous.role == item.role
                             && ChangeToken::of(&previous.content).shape
                                 == ChangeToken::of(&item.content).shape
-                            && handle
+                            && (handle
                                 .as_ref()
                                 .is_some_and(|handle| handle.known_append(previous, item))
+                                || current
+                                    .and_then(|cached| cached.copy_receipt.as_ref())
+                                    .filter(|receipt| receipt.matches(previous))
+                                    .zip(copy_owners.receipt(context.as_deref(), item))
+                                    .is_some_and(|(old, next)| next.continues(old)))
                     });
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if !metadata_reused && (pending || !exact || report_reveal) {
-                    let replaced = self.preparation.stage(
+                    let replaced = self.preparation.stage_with_copy(
                         item,
+                        copy_owners.receipt(context.as_deref(), item),
                         growing && (!reader_only || coordinated),
                         theme,
                         |old, new| {
@@ -3732,9 +3748,15 @@ impl Runtime {
         for position in start..end {
             let index = if position == 0 { newest } else { position - 1 };
             let item = &items[index];
-            if let Some(cached) = cache.get_mut(&item.id)
-                && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
-            {
+            if let Some(cached) = cache.get_mut(&item.id) {
+                if let Some(shown) = &cached.item
+                    && let Some(receipt) = copy_owners.receipt(context.as_deref(), shown)
+                {
+                    cached.copy_receipt = Some(receipt);
+                }
+                if cached.stamp.as_ref().map(|stamp| stamp.0) == item.at {
+                    continue;
+                }
                 cached.stamp = item
                     .at
                     .and_then(|at| recorded_message_stamp(at, today.as_ref()));
@@ -3833,26 +3855,45 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let publication = handle.resident_snapshot_with_clock().or_else(|| {
+        let publication = handle.resident_copy_view().or_else(|| {
             // A failed hide can leave the client with metadata while this
             // runtime still owns the last readable body. Rebuild only its
             // discarded presentation; a disconnected client cannot hydrate it.
-            (!handle.is_connected() && self.presentation_evicted)
-                .then(|| (self.snapshot.clone(), self.source_clock))
+            (!handle.is_connected() && self.presentation_evicted).then(|| {
+                (
+                    self.snapshot.clone(),
+                    self.source_clock,
+                    self.copy_owners.clone(),
+                )
+            })
         });
-        let Some((snapshot, source_clock)) = publication else {
+        let Some((snapshot, source_clock, copy_owners)) = publication else {
             return;
         };
-        self.install_snapshot(snapshot, source_clock);
+        self.install_copy_snapshot(snapshot, source_clock, copy_owners);
     }
 
     /// Install an authoritative hydrated publication without replacing reader
     /// interaction state. Archived conversations use the same presentation path.
     pub(super) fn install_snapshot(
         &mut self,
-        mut snapshot: Arc<Snapshot>,
+        snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
+        let copy_owners = self
+            .handle()
+            .and_then(|handle| handle.copy_owners_for(&snapshot))
+            .unwrap_or_default();
+        self.install_copy_snapshot(snapshot, source_clock, copy_owners);
+    }
+
+    fn install_copy_snapshot(
+        &mut self,
+        mut snapshot: Arc<Snapshot>,
+        source_clock: Option<chat::client::SourceClock>,
+        copy_owners: Arc<chat::client::rendered_copy::Owners>,
+    ) {
+        self.copy_owners = copy_owners;
         if !self.visible.load(Ordering::Relaxed) {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
@@ -4042,6 +4083,8 @@ impl Runtime {
         {
             self.restore_find_disclosures();
             self.selected_subagent = None;
+            self.rendered_copy_lease = Arc::new(());
+            self.copied = None;
             // The selected identity disappeared even when parent IDs did not
             // change. Its separate prepared owners cannot survive fallback.
             self.child_cache.clear();
@@ -4092,6 +4135,8 @@ impl Runtime {
         {
             self.restore_find_disclosures();
             self.selected_subagent = None;
+            self.rendered_copy_lease = Arc::new(());
+            self.copied = None;
             self.find_matches.clear();
             self.find_index = 0;
         }
@@ -4361,6 +4406,9 @@ impl Runtime {
             }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        if changed && !visible {
+            self.rendered_copy_lease = Arc::new(());
+        }
         images::sync(self);
         let result = self.present();
         if visible {
@@ -4427,6 +4475,7 @@ impl Runtime {
     /// Evict disposable body/presentation owners while keeping the small
     /// interaction state needed by either a live or archived rehydration.
     pub(super) fn release_transcript_presentation(&mut self) {
+        self.copy_owners = Arc::default();
         let bytes = self.snapshot.transcript_bytes();
         let cache_entries = self.cache.len();
         self.release_transcript_caches();
@@ -7743,6 +7792,7 @@ impl Cagents {
             return Task::none();
         };
         snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
+        runtime.rendered_copy_lease = Arc::new(());
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -8592,6 +8642,7 @@ impl Cagents {
                     // canonical actor. Keep it as an inert copy and leave
                     // reconnection explicit; no provider restart is authorized.
                     if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.rendered_copy_lease = Arc::new(());
                         runtime.connection = Connection::AwaitingAdmission;
                     }
                     if let Some(pane) = self
@@ -8749,6 +8800,7 @@ impl Cagents {
                                 queued.presentation = prompt::LocalPresentation::default();
                             }
                             runtime.retarget(target);
+                            runtime.rendered_copy_lease = Arc::new(());
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -10432,6 +10484,8 @@ impl Cagents {
                         runtime.find_matches.clear();
                         runtime.find_index = 0;
                         runtime.selected_subagent = selected;
+                        runtime.rendered_copy_lease = Arc::new(());
+                        runtime.copied = None;
                         runtime.child_cache.clear();
                         runtime.child_cache_context = None;
                         // Selection is a presentation change, including when
@@ -10456,35 +10510,41 @@ impl Cagents {
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
             }
-            Action::Copy(target, id, part) => {
-                text_copy::invalidate();
+            Action::Copy(target, id, part, source) => {
+                let Some(source) = source else {
+                    return Task::none();
+                };
+                if self.workspace.visibility(target.card) != Some(VisibilityClass::Visible)
+                    || !self.workspace_surfaces_visible()
+                {
+                    return Task::none();
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                // The body itself lives in the snapshot; only the extracted
-                // code blocks are the cache's own.
-                let text = match part {
-                    part => runtime.active_item(&id).and_then(|item| {
-                        let card = runtime
-                            .presentation_cache()
-                            .get(&item.id)
-                            .and_then(|cached| cached.coordination.as_deref())
-                            .filter(|coordinated| coordinated.is_card());
-                        match card {
-                            // A message read from a file copies as the
-                            // command that sent it.
-                            Some(card) if matches!(part, CopyPart::Text) => {
-                                card.copy_text().or_else(|| copy_text(part, &item.content))
-                            }
-                            _ => copy_text(part, &item.content),
-                        }
-                    }),
+                // Admission precedes both materialization and the process-wide
+                // clipboard intent change. A queued old button cannot cancel a
+                // newer legitimate copy, even when item IDs are reused.
+                if !source.matches(runtime, &id, &part) {
+                    return Task::none();
+                }
+                let item = runtime.active_item(&id).unwrap();
+                let coordinated = runtime
+                    .presentation_cache()
+                    .get(&id)
+                    .and_then(|cached| cached.coordination.as_deref())
+                    .filter(|card| card.is_card());
+                let text = match coordinated {
+                    Some(card) if matches!(part, CopyPart::Text) => {
+                        card.copy_text().or_else(|| copy_text(part, &item.content))
+                    }
+                    _ => copy_text(part, &item.content),
                 };
                 if let Some(text) = text {
                     let at = Instant::now();
-                    runtime.copied = Some((id, at));
+                    runtime.copied = Some((id.clone(), at));
                     return Task::batch([
-                        iced::clipboard::write(text).map(cosmic::Action::App),
+                        text_copy::write_rendered(text, move || source.is_current(&id)),
                         cosmic::task::future(async move {
                             tokio::time::sleep(Duration::from_millis(1500)).await;
                             Message::ChatUi(Action::ClearCopied(target, at))
@@ -15318,6 +15378,7 @@ mod tests {
     #[test]
     fn selected_presentation_same_item_id_keeps_parent_and_child_copy_independent() {
         use iced::futures::StreamExt;
+        let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture(&mut app);
         let parent = presentation_text("same-id", "Parent source");
@@ -15328,12 +15389,34 @@ mod tests {
         snapshot.subagents = vec![presentation_child("child", child.clone())];
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let capture = |app: &Cagents, part: CopyPart| {
+            let runtime = chat_runtime(app, card);
+            Action::Copy(
+                runtime.target,
+                "same-id".into(),
+                part.clone(),
+                Some(
+                    runtime
+                        .rendered_copy_source(runtime.active_item("same-id").unwrap(), part.clone())
+                        .expect("actual current presentation owns Copy"),
+                ),
+            )
+        };
+        let queued_parent = capture(&app, CopyPart::Text);
+        let admitted_parent = app.handle_chat_ui(queued_parent.clone());
+        assert!(chat_runtime(&app, card).copied.is_some());
         let turns = chat_runtime(&app, card)
             .turns
             .iter()
             .map(|turn| (turn.key.clone(), turn.summary.clone()))
             .collect::<Vec<_>>();
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(
+            chat_runtime(&app, card).copied.is_none(),
+            "parent feedback cannot label a child's same-ID Copy"
+        );
         let runtime = chat_runtime(&app, card);
         assert!(Arc::ptr_eq(
             runtime.cache["same-id"].item.as_ref().unwrap(),
@@ -15351,7 +15434,16 @@ mod tests {
                 .map(|turn| (turn.key.clone(), turn.summary.clone()))
                 .collect::<Vec<_>>()
         );
-        let copy = app.handle_chat_ui(Action::Copy(target, "same-id".into(), CopyPart::Text));
+        let fresh_child = capture(&app, CopyPart::Text);
+        let copy = app.handle_chat_ui(fresh_child);
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(queued_parent.clone()),
+            "a queued parent action must neither copy child bytes nor invalidate its newer Copy intent",
+        );
+        assert_chat_copy_task_has_no_clipboard_write(
+            admitted_parent,
+            "actual child selection revokes an already admitted parent clipboard task",
+        );
         let text = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -15388,6 +15480,349 @@ mod tests {
                 .unwrap(),
             &child
         ));
+
+        assert!(chat_runtime(&app, card).copied.is_some());
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(chat_runtime(&app, card).copied.is_none());
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(queued_parent),
+            "parent -> child -> parent cannot resurrect an old queued source",
+        );
+        let fresh_parent = capture(&app, CopyPart::Text);
+        assert_chat_copy_task_writes(app.handle_chat_ui(fresh_parent.clone()), "Parent source");
+        // A no-op selection retains provenance and feedback; a different
+        // presentation lease is created only for an actual context change.
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        assert!(chat_runtime(&app, card).copied.is_some());
+        assert_chat_copy_task_writes(app.handle_chat_ui(fresh_parent), "Parent source");
+
+        // A real receiver publication precedes UI refresh. The old rendered
+        // cache and canonical ID alone cannot authorize the new item's bytes.
+        let old_source = capture(&app, CopyPart::Text);
+        let held_source = app.handle_chat_ui(old_source.clone());
+        let replacement = presentation_text("same-id", "Replacement source");
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![replacement.clone()];
+        handle.publish_snapshot_for_test(snapshot);
+        assert_chat_copy_task_has_no_clipboard_write(
+            held_source,
+            "replacement before wake fences the effect while its clipboard intent is still current",
+        );
+        let newer = text_copy::write_shared_literal(Arc::from("newer legitimate clipboard intent"));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(old_source),
+            "replacement before wake rejects queued rendered Copy",
+        );
+        assert_chat_copy_task_writes(newer, "newer legitimate clipboard intent");
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let same_canonical = capture(&app, CopyPart::Text);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.busy = !snapshot.busy;
+        handle.publish_delta_snapshot_for_test(snapshot);
+        assert_chat_copy_task_writes(app.handle_chat_ui(same_canonical), "Replacement source");
+        assert!(Arc::ptr_eq(&handle.snapshot().items[0], &replacement));
+
+        // Keep the original Text cases above. Add the affected Tool Input
+        // route with distinct real parent/child items sharing only their ID.
+        let tool = |input: &str| {
+            Arc::new(chat::Item {
+                id: "same-id".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "Inspect".into(),
+                    input: input.into(),
+                    output: "tool output".into(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let parent_tool = tool("parent input");
+        let child_tool = tool("child input");
+        assert!(!Arc::ptr_eq(&parent_tool, &child_tool));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![parent_tool.clone()];
+        snapshot.subagents = vec![presentation_child("child", child_tool.clone())];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        // An admitted effect retains its dispatch-time bytes; a queued
+        // unchanged Input and a fresh Output survive a real output append.
+        let queued_input = capture(&app, CopyPart::Input);
+        let held_output = app.handle_chat_ui(capture(&app, CopyPart::Output));
+        let mut appended = (*parent_tool).clone();
+        let ItemContent::Tool { output, .. } = &mut appended.content else {
+            unreachable!()
+        };
+        output.push_str("\ncontinued output");
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(appended)];
+        handle.publish_delta_snapshot_for_test(snapshot);
+        assert_chat_copy_task_writes(held_output, "tool output");
+        let appended_parent = handle.snapshot().items[0].clone();
+        assert!(!Arc::ptr_eq(&parent_tool, &appended_parent));
+        let parent_tool = appended_parent;
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert_chat_copy_task_writes(app.handle_chat_ui(queued_input), "parent input");
+        assert_chat_copy_task_writes(
+            app.handle_chat_ui(capture(&app, CopyPart::Output)),
+            "tool output\ncontinued output",
+        );
+        let mismatched = match capture(&app, CopyPart::Input) {
+            Action::Copy(target, id, _, source) => {
+                Action::Copy(target, id, CopyPart::Output, source)
+            }
+            _ => unreachable!(),
+        };
+        let legitimate = text_copy::write_shared_literal(Arc::from("newer part intent"));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(mismatched),
+            "captured Input cannot authorize Output or cancel its newer intent",
+        );
+        assert_chat_copy_task_writes(legitimate, "newer part intent");
+        let parent_input = capture(&app, CopyPart::Input);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let child_input = capture(&app, CopyPart::Input);
+        let fresh = app.handle_chat_ui(child_input);
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(parent_input),
+            "queued parent Tool Input cannot retarget to the same-ID child",
+        );
+        assert_chat_copy_task_writes(fresh, "child input");
+        let before_fallback = capture(&app, CopyPart::Input);
+        let held_fallback = app.handle_chat_ui(before_fallback.clone());
+        let returning_child = handle.snapshot().subagents[0].clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.clear();
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(chat_runtime(&app, card).selected_subagent.is_none());
+        assert!(chat_runtime(&app, card).copied.is_none());
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![returning_child];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(Arc::ptr_eq(
+            &handle.snapshot().subagents[0].items[0],
+            &child_tool
+        ));
+        // No intervening Copy or user selection changed the global clipboard
+        // intent, and the receiver again owns the identical child Item Arc.
+        // This covers the combined real fallback and source reset, rather than
+        // isolating the lease from publication-token retirement.
+        assert_chat_copy_task_has_no_clipboard_write(
+            held_fallback,
+            "automatic disappearance fallback cannot revive after the same child source returns",
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let fresh_child = app.handle_chat_ui(capture(&app, CopyPart::Input));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(before_fallback),
+            "automatic fallback and reselect cannot resurrect its old queued callback",
+        );
+        assert_chat_copy_task_writes(fresh_child, "child input");
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert_chat_copy_task_writes(
+            app.handle_chat_ui(capture(&app, CopyPart::Input)),
+            "parent input",
+        );
+
+        // A queued action also belongs to one exact actor, even if a rebound
+        // fixture publishes the same canonical Item Arc. Keep the old handle
+        // alive deliberately so Weak liveness alone is not a false positive.
+        let queued_actor = capture(&app, CopyPart::Input);
+        let retained_actor = chat_runtime(&app, card).handle().unwrap().clone();
+        let same_target_actor = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let handle = Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                (*runtime.snapshot).clone(),
+            ));
+            // Controlled same-target rebind isolates exact handle admission:
+            // deliberately leave the scope lease intact in this fixture.
+            runtime.connection = Connection::Live(handle.clone());
+            handle
+        };
+        let newer = text_copy::write_shared_literal(Arc::from("newer actor clipboard intent"));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(queued_actor),
+            "same Target/item/context cannot transfer an old actor's queued action",
+        );
+        assert_chat_copy_task_writes(newer, "newer actor clipboard intent");
+        app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(Arc::ptr_eq(
+            &retained_actor.snapshot().items[0],
+            &parent_tool
+        ));
+        let old_actor = capture(&app, CopyPart::Input);
+        let held_actor = app.handle_chat_ui(old_actor.clone());
+        let rebound_target = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        let rebound = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let rebound = Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                (*runtime.snapshot).clone(),
+            ));
+            runtime.retarget(rebound_target);
+            runtime.connection = Connection::Live(rebound.clone());
+            rebound
+        };
+        assert!(Arc::ptr_eq(
+            &same_target_actor.snapshot().items[0],
+            &parent_tool
+        ));
+        assert_chat_copy_task_has_no_clipboard_write(
+            held_actor,
+            "retargeting the real runtime revokes a held task despite a retained old actor",
+        );
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(old_actor),
+            "the previous actor's queued callback is no longer admitted",
+        );
+        app.chat_runtime_mut(rebound_target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(rebound_target).unwrap());
+        assert_chat_copy_task_writes(
+            app.handle_chat_ui(capture(&app, CopyPart::Input)),
+            "parent input",
+        );
+        assert!(Arc::ptr_eq(&rebound.snapshot().items[0], &parent_tool));
+        let newer =
+            text_copy::write_shared_literal(Arc::from("missing source cannot cancel this intent"));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(Action::Copy(
+                rebound_target,
+                "same-id".into(),
+                CopyPart::Input,
+                None,
+            )),
+            "a missing source has no legacy alias fallback",
+        );
+        assert_chat_copy_task_writes(newer, "missing source cannot cancel this intent");
+        let queued_hide = capture(&app, CopyPart::Input);
+        let hidden = app.handle_chat_ui(queued_hide.clone());
+        app.chat_runtime_mut(rebound_target)
+            .unwrap()
+            .set_visible(false)
+            .unwrap();
+        assert_chat_copy_task_has_no_clipboard_write(
+            hidden,
+            "actual hide revokes an admitted rendered Copy before its effect is polled",
+        );
+        let newer =
+            text_copy::write_shared_literal(Arc::from("hidden source cannot cancel this intent"));
+        assert_chat_copy_task_has_no_clipboard_write(
+            app.handle_chat_ui(queued_hide),
+            "hidden callback is rejected before changing global clipboard intent",
+        );
+        assert_chat_copy_task_writes(newer, "hidden source cannot cancel this intent");
+    }
+    #[test]
+    fn rendered_copy_held_effects_retire_at_real_shared_admission_exits() {
+        use crate::workspace_model::views::Pane;
+        let _context = text_copy::isolated_context();
+        for retain in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
+            let item = Arc::new(chat::Item {
+                id: "copy-before-shared-admission".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "Inspect".into(),
+                    input: "owned input before admission".into(),
+                    output: "unchanged output".into(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                at: None,
+                started_at: None,
+            });
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.items = vec![item.clone()];
+            handle.publish_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let runtime = chat_runtime(&app, card);
+            let source_session = runtime.session.clone();
+            let source = runtime
+                .rendered_copy_source(&item, CopyPart::Input)
+                .expect("actual visible canonical source");
+            assert!(source.matches(runtime, &item.id, &CopyPart::Input));
+            let copy = Action::Copy(target, item.id.clone(), CopyPart::Input, Some(source));
+            assert_chat_copy_task_writes(
+                app.handle_chat_ui(copy.clone()),
+                "owned input before admission",
+            );
+            let held = app.handle_chat_ui(copy);
+            let lease = Arc::downgrade(&chat_runtime(&app, card).rendered_copy_lease);
+            assert!(lease.upgrade().is_some());
+            if retain {
+                // Exercise the actual open-card/source-retention guards. This
+                // entrypoint also drops or retargets the source downstream;
+                // its post-return oracle does not isolate the immediate hook
+                // from that later retirement or simulate a concurrent poll.
+                let (task, _) = app.retain_shared_upgrade_source(card);
+                drop(task);
+                assert!(
+                    !matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                    if runtime.handle().is_some())
+                );
+            } else {
+                let mut canonical = source_session.clone();
+                canonical
+                    .proof
+                    .as_mut()
+                    .expect("fixture's actual host proof")
+                    .host_incarnation = "copy-upgrade-target".into();
+                assert!(chat::client::UpgradeRecovery::is_candidate(
+                    &source_session,
+                    &canonical
+                ));
+                let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+                pane.kind = CardKind::Chat(canonical);
+                let allocation = chat_runtime(&app, card) as *const Runtime;
+                app.prepare_shared_chat_upgrade(&pane);
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(
+                    runtime as *const Runtime, allocation,
+                    "the real transition leaves the same source Runtime alive"
+                );
+                assert!(runtime.awaiting_admission());
+                assert_eq!(runtime.session, source_session);
+                assert!(Arc::ptr_eq(&runtime.snapshot.items[0], &item));
+                assert_eq!(
+                    app.durable.pending_chat_admissions.get(&card),
+                    Some(&source_session)
+                );
+            }
+            assert!(lease.upgrade().is_none());
+            assert!(
+                Arc::ptr_eq(&handle.snapshot().items[0], &item),
+                "the old actor/source deliberately outlives ownership loss"
+            );
+            assert_chat_copy_task_has_no_clipboard_write(
+                held,
+                "a real shared-admission ownership exit revokes an already admitted Copy effect",
+            );
+        }
     }
     #[test]
     fn selected_presentation_bounds_child_disclosure_history_without_crossing_transcripts() {

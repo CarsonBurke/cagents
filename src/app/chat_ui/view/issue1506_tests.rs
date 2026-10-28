@@ -1316,6 +1316,7 @@ fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
 #[test]
 fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy() {
     use iced::futures::StreamExt;
+    let _context = text_copy::isolated_context();
     let long_name =
         "Review implementation and ownership with a deliberately long task name ".repeat(8);
     for (outcome, body) in [
@@ -1384,10 +1385,36 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .any(|text| text.contains(marker)),
             "even short report bodies stay behind Details"
         );
+        let source = runtime
+            .rendered_copy_source(&original, CopyPart::Text)
+            .expect("the collapsed report owns its exact canonical Copy source");
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        app.workspace
+            .add_card(
+                crate::workspace::WorkspaceCard::new(
+                    target.card,
+                    "Report fixture",
+                    crate::workspace::CardWidth::Fraction(1.0),
+                )
+                .unwrap(),
+                0,
+                true,
+            )
+            .unwrap();
+        app.workspace.resize_viewport(1600.0);
+        assert_eq!(
+            app.workspace.visibility(target.card),
+            Some(VisibilityClass::Visible)
+        );
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        let copy = app.handle_chat_ui(Action::Copy(target, "task-report".into(), CopyPart::Text));
+        let copy = app.handle_chat_ui(Action::Copy(
+            target,
+            "task-report".into(),
+            CopyPart::Text,
+            Some(source),
+        ));
         let copied = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
