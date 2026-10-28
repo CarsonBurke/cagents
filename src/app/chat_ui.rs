@@ -12778,6 +12778,93 @@ mod tests {
     }
 
     #[test]
+    fn failed_resume_keeps_account_bound_sign_in_recovery_after_notice_dismissal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.snapshot.error.is_none());
+        runtime.replace_draft(text_editor::Content::with_text(
+            "Keep this unsent recovery draft",
+        ));
+        runtime.disconnected = true;
+        let launch = runtime.session.launch.clone();
+        drop(app.update(Message::ChatUi(Action::Reconnect(target))));
+        let attempt = chat_runtime_attempt(&app, card);
+        let reason = "Codex RPC error: Not logged in";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(reason)));
+        let target = chat_runtime(&app, card).target;
+        assert_eq!(chat_runtime(&app, card).auth_error(), Some(reason));
+        assert!(app.chat_auth_recovery_enabled(target));
+        assert_eq!(chat_runtime(&app, card).session.launch, launch);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent recovery draft"
+        );
+        let key = format!("chat-resume:{card}");
+        let notice = app
+            .notices
+            .recent()
+            .find(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+            .unwrap();
+        assert_eq!(notice.notice.message, "Couldn’t reopen this conversation");
+        assert_eq!(notice.notice.details.as_deref(), Some(reason));
+        let notice_id = notice.id;
+        drop(app.update(Message::DismissNotice(notice_id)));
+        assert_eq!(chat_runtime(&app, card).auth_error(), Some(reason));
+        assert!(app.chat_auth_recovery_enabled(target));
+        let wrong = app.account_ui.add_managed_fixture(Provider::Codex, 9903);
+        let wrong = app.known_account(&wrong).unwrap();
+        let task = app.handle_chat_ui(Action::SignIn(target, wrong));
+        assert_eq!(task.units(), 0, "recovery must not sign in another account");
+        assert!(app.chat_ui.attempt(card).is_none());
+        assert_eq!(chat_runtime(&app, card).session.launch, launch);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent recovery draft"
+        );
+    }
+
+    #[test]
+    fn failed_resume_notice_targets_the_conversation_even_when_navigation_is_filtered() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().disconnected = true;
+        drop(app.update(Message::ChatUi(Action::Reconnect(target))));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry(
+                "Saved conversation could not be attached",
+            )),
+        );
+        let other = live_chat(&mut app, Some("other-conversation"));
+        assert_eq!(app.workspace.focused(), Some(other));
+        app.sidebar_state.apply(&SidebarAction::SetFilter(
+            sidebar::SidebarFilter::PullRequests,
+        ));
+        let key = format!("chat-resume:{card}");
+        let notice = app
+            .notices
+            .recent()
+            .find(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+            .unwrap();
+        assert_eq!(notice.notice.targets, [card]);
+        let target = notice.notice.targets[0];
+        let notice_id = notice.id;
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices)));
+        drop(app.update(Message::ToggleNoticeDetails(notice_id)));
+        drop(
+            app.update(Message::ChromeUi(chrome_ui::Action::FocusNoticeCard(
+                target,
+            ))),
+        );
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.chrome_ui.popup, None);
+    }
+
+    #[test]
     fn failed_retry_adapter_cannot_acknowledge_retained_native_cleanup() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
