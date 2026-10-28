@@ -12169,7 +12169,7 @@ mod tests {
 
     #[test]
     fn operational_lookup_refusal_does_not_quarantine_unrelated_terminals() {
-        for before_stamp in [true, false] {
+        for (before_stamp, terminal_query) in [(true, false), (false, false), (false, true)] {
             let directory = tempdir().unwrap();
             let boot_id = boot("closure-operational-refusal");
             let store =
@@ -12188,7 +12188,13 @@ mod tests {
                 state.focused = None;
                 SaveLane::default().save(&store, &state).unwrap();
             }
-            let refused = ClosureQuery::Card(CardId::new());
+            let refused = if terminal_query {
+                let mut failed_terminal = terminal.clone();
+                failed_terminal.id = TerminalId::new();
+                ClosureQuery::terminal(&failed_terminal)
+            } else {
+                ClosureQuery::Card(CardId::new())
+            };
             assert_eq!(
                 store.cached_closure(&refused),
                 before_stamp.then_some(false)
@@ -12197,6 +12203,13 @@ mod tests {
                 (
                     "ALTER TABLE closed_cards RENAME TO closed_cards_fault",
                     "ALTER TABLE closed_cards_fault RENAME TO closed_cards",
+                )
+            } else if terminal_query {
+                // A valid stamp does not turn an ordinary terminal query SQL
+                // error into damaged stored attribution.
+                (
+                    "ALTER TABLE closed_terminal_claim_keys RENAME COLUMN terminal_id TO terminal_id_fault",
+                    "ALTER TABLE closed_terminal_claim_keys RENAME COLUMN terminal_id_fault TO terminal_id",
                 )
             } else {
                 // MAX(sequence) remains readable, but the requested Card
@@ -12218,7 +12231,7 @@ mod tests {
             assert_eq!(store.cached_closure_result(&refused), Some(Err(())));
             assert!(
                 !store.has_unknown_closed_claims(),
-                "an operational Card/stamp error is not corrupt terminal attribution"
+                "an operational Card/Terminal/stamp error is not corrupt terminal attribution"
             );
             let unrelated = ClosureQuery::terminal(&terminal);
             assert_eq!(
