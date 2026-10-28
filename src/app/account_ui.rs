@@ -45,6 +45,7 @@ use crate::account::{
     schedule::{self, Millis, Schedule, Trigger},
 };
 use crate::agent::Provider;
+use crate::control::ControlClient;
 use crate::terminal::ipc::TerminalCloseResult;
 
 mod check;
@@ -8702,7 +8703,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginTick));
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key: old,
-            cleanup: app.sign_in_cleanup(key),
+            cleanup: app.sign_in_cleanup(old),
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
