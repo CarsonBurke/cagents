@@ -1,0 +1,75 @@
+name: Device inherited no-start qualification
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/device-no-start-qualification.yml
+      - scripts/qualify-device-no-start-ci.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-no-start-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  DEVICE_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  qualify:
+    name: Literal 833 CLI then HOST
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the reviewed research harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Check out the exact source candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 83377f3faff86c979dc95cf2a7b0df65171f59bf
+          path: device-source
+          persist-credentials: false
+      - name: Check out the preserved causal control
+        # Root must first authorize publishing this existing private control ref.
+        # Failure to fetch it is setup failure, never the expected negative.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 71e6aa844c2f580c631ec6d1146a065589ed289a
+          path: device-control
+          persist-credentials: false
+      - name: Reuse the pinned CLI and HOST build prerequisites
+        uses: ./device-source/.github/actions/setup-linux-build
+      - name: Select physical Rust tools and short fixture paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          device_toolchain_bin=$(dirname "$(rustup which --toolchain 1.93.0 cargo)")
+          fixture_root=$(mktemp -d /tmp/dvXXXXXX)
+          install -d -m 700 "$fixture_root/runtime"
+          printf '%s\n' "DEVICE_TOOLCHAIN_BIN=$device_toolchain_bin" \
+            "TMPDIR=$fixture_root" "XDG_RUNTIME_DIR=$fixture_root/runtime" >> "$GITHUB_ENV"
+      - name: Qualify the unchanged owning fixtures in one serial lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify-device-no-start-ci.py \
+            --source "$GITHUB_WORKSPACE/device-source" \
+            --control "$GITHUB_WORKSPACE/device-control" \
+            --target "$RUNNER_TEMP/pr1844-target" \
+            --output "$RUNNER_TEMP/pr1844-results"
+      - name: Retain logs and exact source and artifact bindings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr1844-device-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr1844-results
+            !${{ runner.temp }}/pr1844-results/artifacts/**
+          if-no-files-found: warn
+          retention-days: 30
