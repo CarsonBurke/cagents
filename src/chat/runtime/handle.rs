@@ -39,6 +39,10 @@ impl Handle {
             responder.settle_input_fixture(outcome)
         })
     }
+    #[cfg(test)]
+    pub(crate) fn fixture_waiting_title(title: String) -> Self {
+        Self(Owner::Remote(RemoteActor::fixture_waiting_title(title)))
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]

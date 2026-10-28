@@ -147,7 +147,26 @@ impl ActivityObservation {
         Self {
             ready,
             activity,
-            title: title.map(|title| title.chars().take(100).collect()),
+            title: title.map(|title| {
+                let head = title.chars().take(100).collect::<Vec<_>>();
+                if title.chars().nth(100).is_some() {
+                    head.into_iter()
+                        .take(49)
+                        .chain(std::iter::once('…'))
+                        .chain(
+                            title
+                                .chars()
+                                .rev()
+                                .take(50)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev(),
+                        )
+                        .collect()
+                } else {
+                    head.into_iter().collect()
+                }
+            }),
         }
     }
 
@@ -4550,7 +4569,14 @@ mod tests {
             assert_eq!(observation.activity, expected_activity);
             assert_eq!(
                 observation.title.as_deref(),
-                Some("界🦀".repeat(50).as_str())
+                Some(
+                    format!(
+                        "{}…{}",
+                        "界🦀".repeat(25).chars().take(49).collect::<String>(),
+                        "界🦀".repeat(25)
+                    )
+                    .as_str()
+                )
             );
             assert_eq!(state.title.as_deref(), Some(title.as_str()));
         }

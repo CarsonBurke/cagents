@@ -200,6 +200,7 @@ mod tests {
                     id,
                     repository: "/repo/project".into(),
                     title: title.into(),
+                    title_source: Default::default(),
                 })
                 .unwrap();
         }
@@ -355,6 +356,7 @@ mod tests {
                         id: channel,
                         repository: repository.into(),
                         title: "Review".into(),
+                        title_source: Default::default(),
                     })
                     .unwrap();
                 let scope = serde_json::to_string(&Scope::Channel(channel)).unwrap();
@@ -489,6 +491,7 @@ mod tests {
                     id: moved,
                     repository: "/other/project".into(),
                     title: "Moved channel".into(),
+                    title_source: Default::default(),
                 })
                 .unwrap();
             // Published legacy cross-project display ownership is intentionally

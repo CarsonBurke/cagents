@@ -547,6 +547,47 @@ fn sampled_policy_preserves_pair_fallback_counts_all_waiting_and_omits_ambiguous
 }
 
 #[test]
+fn native_resident_getter_preserves_long_title_distinctions_through_actual_snapshot_and_menu() {
+    let host = empty_host();
+    let mut ids = Vec::new();
+    for ending in ["alpha", "beta"] {
+        let handle = Handle::fixture_waiting_title(format!(
+            "{} {ending}",
+            "Shared long conversation title ".repeat(30)
+        ));
+        let id = handle.actor_identity().unwrap().record.terminal;
+        let observed = handle.attention_activity().unwrap();
+        assert!(observed.ready);
+        assert_eq!(observed.activity, ActivityState::Waiting);
+        assert!(observed.title.as_deref().unwrap().ends_with(ending));
+        assert!(observed.title.as_ref().unwrap().chars().count() <= 100);
+        install_chat(&mut host.lock().unwrap(), id, handle);
+        ids.push(id);
+    }
+    // No managed Agent.name/user_title exists, and no synthetic sampled
+    // observation bypasses the production native resident getter.
+    let observed = snapshot(&host);
+    assert_eq!(
+        observed.tally,
+        AgentTally {
+            working: 0,
+            waiting: 2
+        }
+    );
+    let menu = crate::tray::waiting_menu_for_test(observed)
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for (id, ending) in ids.into_iter().zip(["alpha", "beta"]) {
+        assert!(menu[&id].contains(ending));
+        assert!(menu[&id].ends_with(" — tray-project"));
+        assert!(
+            !menu[&id].contains(" · Chat "),
+            "real title endings must survive rather than arbitrary ordinal fallback"
+        );
+    }
+}
+
+#[test]
 fn captured_native_and_console_scope_reaches_distinguishable_full_menu_without_recipe_details() {
     let host = empty_host();
     let (left, _) = Handle::fixture_remote_attachment_pair();
