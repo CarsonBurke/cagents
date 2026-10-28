@@ -11071,6 +11071,13 @@ fn diff_model_view<'a>(
             } else {
                 0.0
             };
+            // Resolve the followed target once per pass, rather than scanning
+            // the file list independently for every mounted hunk control.
+            let mutation_offer = if mutation_gutter > 0.0 {
+                runtime.diff_mutation_request(card, 0..0)
+            } else {
+                None
+            };
             let geometry =
                 DiffScrollGeometry::new(size.width - mutation_gutter, gutter, runtime.diff_mode);
             let viewport_width = geometry.viewport_width + mutation_gutter;
@@ -11177,6 +11184,7 @@ fn diff_model_view<'a>(
                         diff_mutations::gutter(
                             card,
                             runtime,
+                            mutation_offer.as_ref(),
                             model,
                             row,
                             runtime.diff_typography().line_height,

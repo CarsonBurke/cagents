@@ -8459,6 +8459,114 @@ mod tests {
         assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_partial_callbacks_reject_changed_selection_before_preparation() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+
+        for kind in [Kind::Stage, Kind::Revert] {
+            let directory = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+            let before_index = git(root, &["diff", "--cached", "--binary"]);
+            let mut app = editor();
+            app.settings.editor_auto_save = false;
+            let id = open_real_git(&mut app, root, None);
+            open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+            let runtime = &app.tab(id).unwrap().runtime;
+            let original_model = runtime.current_diff_model_snapshot().unwrap();
+            let stale = runtime.diff_hunk_mutation_action(id, kind).unwrap();
+            let RepositoryAction::ApplyDiffHunk {
+                request: original, ..
+            } = &stale
+            else {
+                unreachable!()
+            };
+            let original = original.clone();
+            let select_all = runtime.diff_command_action(id, "diff_select_all").unwrap();
+            let task = app.update(Message::Repository(select_all));
+            run_tasks(&mut app, task);
+            let runtime = &app.tab(id).unwrap().runtime;
+            assert!(runtime.has_diff_selection());
+            assert!(Arc::ptr_eq(
+                &original_model,
+                &runtime.current_diff_model_snapshot().unwrap()
+            ));
+            let fresh = runtime.diff_selection_mutation_action(id, kind).unwrap();
+            let RepositoryAction::ApplyDiffHunk {
+                request: current, ..
+            } = &fresh
+            else {
+                unreachable!()
+            };
+            // Only the explicit selection changed: the old row/source/layout
+            // fences alone cannot distinguish the two offers.
+            assert_eq!(original.identity, current.identity);
+            assert_eq!(original.basis, current.basis);
+            assert_eq!(original.mode, current.mode);
+            assert_eq!(original.layout_revision, current.layout_revision);
+            assert_eq!(original.rows, current.rows);
+            let before_buffer = runtime.editor_text().unwrap();
+            let rejected = app.update(Message::Repository(stale));
+            assert!(
+                app.git_groups.is_empty(),
+                "a stale partial offer cannot reserve a preparation turn"
+            );
+            assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+            assert!(
+                !app.tab(id)
+                    .unwrap()
+                    .sidebar
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .busy()
+            );
+            run_tasks(&mut app, rejected);
+            assert_eq!(git(root, &["diff", "--cached", "--binary"]), before_index);
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().unwrap(),
+                before_buffer
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+                "changed\n"
+            );
+
+            let task = app.update(Message::Repository(fresh));
+            run_tasks(&mut app, task);
+            assert!(app.git_groups.is_empty());
+            match kind {
+                Kind::Stage => {
+                    assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+                    assert_eq!(
+                        app.tab(id).unwrap().runtime.editor_text().unwrap(),
+                        before_buffer
+                    );
+                }
+                Kind::Revert => {
+                    assert_eq!(git(root, &["diff", "--cached", "--binary"]), before_index);
+                    assert_eq!(
+                        app.tab(id).unwrap().runtime.editor_text().unwrap(),
+                        "original\n"
+                    );
+                    let undo = app.update(Message::Repository(RepositoryAction::Undo { card: id }));
+                    run_tasks(&mut app, undo);
+                    assert_eq!(
+                        app.tab(id).unwrap().runtime.editor_text().unwrap(),
+                        before_buffer
+                    );
+                    assert!(!app.tab(id).unwrap().runtime.can_step_editor_history(false));
+                }
+                Kind::Unstage => unreachable!(),
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+                "changed\n"
+            );
+        }
+    }
+
     #[test]
     fn standalone_group_discard_confirmation_keeps_its_turn_ahead_of_later_stage() {
         use cagents::repository::ChangeArea;

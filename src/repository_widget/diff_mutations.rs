@@ -3,13 +3,71 @@
 use super::*;
 use crate::git_patch;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Request {
     pub identity: AsyncIdentity,
     pub basis: DiffBasis,
     pub mode: DiffMode,
     pub layout_revision: u64,
     pub rows: Range<usize>,
+    model: Arc<DiffModel>,
+    selection: Option<crate::diff_interaction::Selection>,
+    buffer_revision: Option<u64>,
+    old_path: RepoPath,
+    new_path: RepoPath,
+}
+
+// Retain the source allocation so it cannot be reused while a callback or held
+// gesture names it. Event equality must not traverse the document's diff rows.
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.model, &other.model)
+            && self.identity == other.identity
+            && self.basis == other.basis
+            && self.mode == other.mode
+            && self.layout_revision == other.layout_revision
+            && self.rows == other.rows
+            && self.selection == other.selection
+            && self.buffer_revision == other.buffer_revision
+            && self.old_path == other.old_path
+            && self.new_path == other.new_path
+    }
+}
+
+impl Eq for Request {}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Request")
+            .field("identity", &self.identity)
+            .field("basis", &self.basis)
+            .field("mode", &self.mode)
+            .field("layout_revision", &self.layout_revision)
+            .field("rows", &self.rows)
+            .field("model", &Arc::as_ptr(&self.model))
+            .field("selection", &self.selection)
+            .field("buffer_revision", &self.buffer_revision)
+            .field("old_path", &self.old_path)
+            .field("new_path", &self.new_path)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ControlOwner {
+    kind: git_patch::Kind,
+    request: Arc<Request>,
+}
+
+fn control_owner(action: &Option<RepositoryAction>) -> Option<ControlOwner> {
+    match action {
+        Some(RepositoryAction::ApplyDiffHunk { kind, request, .. }) => Some(ControlOwner {
+            kind: *kind,
+            request: Arc::clone(request),
+        }),
+        _ => None,
+    }
 }
 
 pub struct Capture {
@@ -118,15 +176,37 @@ impl Capture {
 }
 
 impl RepositoryRuntime {
-    /// A gutter action names the exact row coordinates that were rendered.
+    fn diff_mutation_paths(&self) -> Option<(RepoPath, RepoPath)> {
+        let file = self.subject_file()?;
+        let old_path = file
+            .previous_path(&self.diff_basis)
+            .unwrap_or_else(|| file.path.clone());
+        Some((
+            RepoPath::parse(old_path).ok()?,
+            RepoPath::parse(file.path).ok()?,
+        ))
+    }
+
+    /// A gutter action names the exact source and row coordinates rendered.
     pub fn diff_mutation_request(&self, card: CardId, rows: Range<usize>) -> Option<Arc<Request>> {
         let path = self.selected_path()?.to_owned();
+        let model = self.current_diff_model_snapshot()?;
+        let (old_path, new_path) = self.diff_mutation_paths()?;
+        let buffer_revision = match &self.document {
+            DocumentState::Editable(document) => Some(document.revision),
+            _ => None,
+        };
         Some(Arc::new(Request {
             identity: self.current_identity(card, path),
             basis: self.diff_basis.clone(),
             mode: self.diff_mode,
             layout_revision: self.diff_layout_revision,
             rows,
+            model,
+            selection: self.diff_interaction.selection,
+            buffer_revision,
+            old_path,
+            new_path,
         }))
     }
 
@@ -262,16 +342,26 @@ impl RepositoryRuntime {
         if !self.can_mutate_diff(kind) {
             return None;
         }
+        let model = self.current_diff_model_snapshot()?;
+        let (old_path, new_path) = self.diff_mutation_paths()?;
+        let buffer_revision = match &self.document {
+            DocumentState::Editable(document) => Some(document.revision),
+            _ => None,
+        };
         if let Some(request) = request
             && (!self.accepts_selected(&request.identity)
                 || request.identity.card != card
                 || request.basis != self.diff_basis
                 || request.mode != self.diff_mode
-                || request.layout_revision != self.diff_layout_revision)
+                || request.layout_revision != self.diff_layout_revision
+                || !Arc::ptr_eq(&request.model, &model)
+                || request.selection != self.diff_interaction.selection
+                || request.buffer_revision != buffer_revision
+                || request.old_path != old_path
+                || request.new_path != new_path)
         {
             return None;
         }
-        let model = self.current_diff_model_snapshot()?;
         let rows = match request {
             Some(request) => request.rows.clone(),
             None => self.selected_diff_range().or_else(|| {
@@ -290,10 +380,10 @@ impl RepositoryRuntime {
             return None;
         }
         let path = self.selected_path()?.to_owned();
-        let file = self.subject_file()?;
-        let old_path = file
-            .previous_path(&self.diff_basis)
-            .unwrap_or_else(|| file.path.clone());
+        let (old_path, new_path) = match request {
+            Some(request) => (request.old_path.clone(), request.new_path.clone()),
+            None => (old_path, new_path),
+        };
         let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert {
             match &self.document {
                 DocumentState::Editable(document) => (
@@ -311,8 +401,8 @@ impl RepositoryRuntime {
             kind,
             mode: self.diff_mode,
             rows,
-            old_path: RepoPath::parse(old_path).ok()?,
-            new_path: RepoPath::parse(file.path).ok()?,
+            old_path,
+            new_path,
             buffer_revision,
             buffer_snapshot,
             basis: self.diff_basis.clone(),
@@ -502,8 +592,12 @@ pub(super) fn selection_controls<'a>(
         (false, true) => "Stage selected lines",
         (false, false) => "Stage current hunk",
     };
-    let button = crate::ui_controls::button::secondary(label)
-        .on_press_maybe(runtime.diff_mutation_control_action(card, primary));
+    let action = runtime.diff_mutation_control_action(card, primary);
+    let owner = control_owner(&action);
+    let button = crate::ui_controls::owned(
+        owner,
+        crate::ui_controls::button::secondary(label).on_press_maybe(action),
+    );
     let command = crate::workspace_widget::diff_mutation_registry_command(primary, selection);
     let mut controls = vec![crate::interaction::tooltip(
         button,
@@ -515,8 +609,12 @@ pub(super) fn selection_controls<'a>(
         } else {
             "Revert current hunk"
         };
-        let button = crate::ui_controls::button::quiet(label)
-            .on_press_maybe(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert));
+        let action = runtime.diff_mutation_control_action(card, git_patch::Kind::Revert);
+        let owner = control_owner(&action);
+        let button = crate::ui_controls::owned(
+            owner,
+            crate::ui_controls::button::quiet(label).on_press_maybe(action),
+        );
         let command = crate::workspace_widget::diff_mutation_registry_command(
             git_patch::Kind::Revert,
             selection,
@@ -538,6 +636,7 @@ pub(super) fn selection_controls<'a>(
 pub(super) fn gutter<'a>(
     card: CardId,
     runtime: &'a RepositoryRuntime,
+    offer: Option<&Arc<Request>>,
     model: &DiffModel,
     row: usize,
     height: f32,
@@ -553,12 +652,17 @@ pub(super) fn gutter<'a>(
         .get(hunk + 1)
         .copied()
         .unwrap_or_else(|| model.row_count(runtime.diff_mode));
-    let Some(request) = runtime.diff_mutation_request(card, range) else {
+    let Some(offer) = offer.filter(|offer| std::ptr::eq(model, offer.model.as_ref())) else {
         return iced::widget::Space::new()
             .width(GUTTER_WIDTH)
             .height(height)
             .into();
     };
+    // One render-pass offer resolves the followed Git target once. Each
+    // visible hunk only clones bounded metadata and its immutable source Arc.
+    let mut request = (**offer).clone();
+    request.rows = range;
+    let request = Arc::new(request);
     let staged = matches!(runtime.diff_basis, DiffBasis::HeadToIndex);
     let primary = if staged {
         git_patch::Kind::Unstage
@@ -566,19 +670,22 @@ pub(super) fn gutter<'a>(
         git_patch::Kind::Stage
     };
     let button = |kind, icon: Icon, label: &'static str| {
-        let enabled = runtime.can_mutate_diff(kind);
+        let action = runtime
+            .can_mutate_diff(kind)
+            .then(|| RepositoryAction::ApplyDiffHunk {
+                card,
+                kind,
+                request: request.clone(),
+            });
+        let owner = control_owner(&action);
         let control = widget::button::custom(icon.handle().icon().size(12))
             .name(label)
             .class(crate::ui_controls::control_style(false, None))
             .padding(0)
             .width(20.0)
             .height(height.min(20.0))
-            .on_press_maybe(enabled.then(|| RepositoryAction::ApplyDiffHunk {
-                card,
-                kind,
-                request: request.clone(),
-            }));
-        crate::interaction::tooltip(control, label)
+            .on_press_maybe(action);
+        crate::interaction::tooltip(crate::ui_controls::owned(owner, control), label)
     };
     let mut controls = vec![button(
         primary,
@@ -1114,6 +1221,464 @@ mod tests {
         runtime
     }
 
+    fn partial_controls_fixture(
+        card: CardId,
+        mode: DiffMode,
+        kind: git_patch::Kind,
+    ) -> RepositoryRuntime {
+        let before =
+            "old first\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nkeep 5\nkeep 6\nkeep 7\nkeep 8\nold last\n";
+        let after =
+            "new first\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nkeep 5\nkeep 6\nkeep 7\nkeep 8\nnew last\n";
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", after);
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.diff_mode = mode;
+        let mut model = crate::diff_view::build_diff(before, after);
+        model.present = [true; 2];
+        model.modes = [Some(0o100644); 2];
+        if kind == git_patch::Kind::Unstage {
+            model.source_head = Some(crate::repository::GitHeadGuard::Commit(
+                crate::repository::Oid::parse_object("11".repeat(20)).unwrap(),
+            ));
+            runtime.diff_basis = DiffBasis::HeadToIndex;
+        }
+        runtime.set_diff_state(
+            runtime.diff_basis.clone(),
+            DiffState::ready(RenderedDiff::Text {
+                model: Arc::new(model),
+                old_label: "Before".into(),
+                new_label: "After".into(),
+            }),
+        );
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        runtime
+    }
+
+    fn follow_partial_target(runtime: &mut RepositoryRuntime) {
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.source = "target.txt".into();
+        let FileListState::Ready(files) = &mut runtime.files else {
+            unreachable!()
+        };
+        files.push(RepositoryFile {
+            path: "target.txt".into(),
+            staged_old_path: Some("old-a.txt".into()),
+            unstaged_old_path: Some("old-a.txt".into()),
+            staged: true,
+            unstaged: true,
+            status: Some("RR".into()),
+            directory: false,
+        });
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+    }
+
+    fn refresh_partial_target_rename(runtime: &mut RepositoryRuntime, card: CardId) {
+        let mut files = runtime.listed_files().to_vec();
+        let target = files
+            .iter_mut()
+            .find(|file| file.path == Path::new("target.txt"))
+            .unwrap();
+        if runtime.diff_basis == DiffBasis::HeadToIndex {
+            target.staged_old_path = Some("old-b.txt".into());
+        } else {
+            target.unstaged_old_path = Some("old-b.txt".into());
+        }
+        runtime.background_file_refresh = true;
+        let identity = AsyncIdentity {
+            card,
+            worktree: runtime.descriptor.worktree.clone(),
+            path: ".".into(),
+            generation: runtime.file_list_generation,
+        };
+        drop(runtime.update(RepositoryAction::FilesLoaded {
+            identity,
+            result: Ok(files),
+        }));
+    }
+
+    #[test]
+    fn partial_change_requests_refuse_a_followed_target_rename_offer_changed_by_files_loaded() {
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            for kind in [
+                git_patch::Kind::Stage,
+                git_patch::Kind::Unstage,
+                git_patch::Kind::Revert,
+            ] {
+                let card = CardId::new();
+                let mut runtime = partial_controls_fixture(card, mode, kind);
+                follow_partial_target(&mut runtime);
+                let original = runtime.diff_mutation_request(card, 0..1).unwrap();
+                assert_eq!(original.identity.path, Path::new("file.txt"));
+                assert_eq!(original.old_path.as_path(), Path::new("old-a.txt"));
+                assert_eq!(original.new_path.as_path(), Path::new("target.txt"));
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&original))
+                        .is_some()
+                );
+                refresh_partial_target_rename(&mut runtime, card);
+                let fresh = runtime.diff_mutation_request(card, 0..1).unwrap();
+                assert_eq!(fresh.identity, original.identity);
+                assert_eq!(fresh.layout_revision, original.layout_revision);
+                assert_eq!(fresh.selection, original.selection);
+                assert_eq!(fresh.buffer_revision, original.buffer_revision);
+                assert!(
+                    Arc::ptr_eq(&fresh.model, &original.model),
+                    "the actual list update only changed target metadata, leaving the alias and model ready"
+                );
+                assert!(runtime.can_mutate_diff(kind));
+                assert_ne!(
+                    fresh, original,
+                    "native press ownership includes the actual rename target offer"
+                );
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&original))
+                        .is_none()
+                );
+                let capture = runtime
+                    .capture_diff_mutation(card, kind, Some(&fresh))
+                    .expect("a fresh offer remains usable");
+                assert_eq!(capture.identity.path, Path::new("file.txt"));
+                assert_eq!(capture.old_path.as_path(), Path::new("old-b.txt"));
+                assert_eq!(capture.new_path.as_path(), Path::new("target.txt"));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_change_requests_retain_source_identity_selection_and_input_revision() {
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            for kind in [
+                git_patch::Kind::Stage,
+                git_patch::Kind::Unstage,
+                git_patch::Kind::Revert,
+            ] {
+                let card = CardId::new();
+                let mut runtime = partial_controls_fixture(card, mode, kind);
+                let original = runtime.diff_mutation_request(card, 0..1).unwrap();
+                let same = runtime.diff_mutation_request(card, 0..1).unwrap();
+                assert_eq!(
+                    original, same,
+                    "equal source captures keep an ordinary held press"
+                );
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&original))
+                        .is_some()
+                );
+                let retained_source = Arc::downgrade(&original.model);
+                let mut replacement = (*original).clone();
+                replacement.model = Arc::new((*original.model).clone());
+                assert_ne!(
+                    *original, replacement,
+                    "same-content allocations are distinct immutable offers"
+                );
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&replacement))
+                        .is_none()
+                );
+                runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+                    mode,
+                    crate::diff_interaction::Side::New,
+                    0,
+                ));
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&original))
+                        .is_none()
+                );
+                let selected = runtime.diff_mutation_request(card, 0..1).unwrap();
+                assert_ne!(original, selected);
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&selected))
+                        .is_some()
+                );
+                let DocumentState::Editable(document) = &mut runtime.document else {
+                    unreachable!()
+                };
+                document.revision += 1;
+                // Retain a ready, same-content model to isolate the request's
+                // input-revision fence from ordinary annotation invalidation.
+                runtime.working_diff.applied = runtime.wanted_working_diff();
+                runtime.working_diff.desired = runtime.wanted_working_diff();
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&selected))
+                        .is_none()
+                );
+                let fresh = runtime.diff_mutation_request(card, 0..1).unwrap();
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&fresh))
+                        .is_some()
+                );
+                let basis = runtime.diff_basis.clone();
+                runtime.set_diff_state(
+                    basis,
+                    DiffState::ready(RenderedDiff::Text {
+                        model: replacement.model.clone(),
+                        old_label: "Before".into(),
+                        new_label: "After".into(),
+                    }),
+                );
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&fresh))
+                        .is_none()
+                );
+                drop(same);
+                drop(selected);
+                drop(fresh);
+                drop(runtime);
+                assert!(
+                    retained_source.upgrade().is_some(),
+                    "the original request retains its allocation against pointer reuse"
+                );
+                drop(original);
+                assert!(retained_source.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn partial_change_controls_keep_held_native_press_with_the_original_offer() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Size, mouse};
+
+        fn controls(
+            card: CardId,
+            runtime: &RepositoryRuntime,
+            icons: bool,
+        ) -> Element<'_, RepositoryAction> {
+            if icons {
+                let model = runtime.current_diff_model_snapshot().unwrap();
+                let row = model.change_starts(runtime.diff_mode)[runtime.diff_change];
+                let offer = runtime.diff_mutation_request(card, 0..0);
+                gutter(card, runtime, offer.as_ref(), &model, row, 24.0)
+            } else {
+                selection_controls(card, runtime)
+            }
+        }
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let viewport = Size::new(1000.0, 600.0);
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            for icons in [false, true] {
+                for selected in [false, true] {
+                    for kind in [
+                        git_patch::Kind::Stage,
+                        git_patch::Kind::Unstage,
+                        git_patch::Kind::Revert,
+                    ] {
+                        for transition in [
+                            "unchanged",
+                            "file",
+                            "model",
+                            "selection",
+                            "rename_target",
+                            "hunk",
+                            "disabled_then_enabled",
+                        ] {
+                            if selected && transition == "hunk" {
+                                continue;
+                            }
+                            let card = CardId::new();
+                            let mut runtime = partial_controls_fixture(card, mode, kind);
+                            if transition == "rename_target" {
+                                follow_partial_target(&mut runtime);
+                            }
+                            if selected {
+                                runtime.diff_interaction.selection =
+                                    Some(crate::diff_interaction::Selection::new(
+                                        mode,
+                                        crate::diff_interaction::Side::New,
+                                        0,
+                                    ));
+                            }
+                            let before_text = runtime.editor_text().unwrap();
+                            let (mut cache, pointer) = {
+                                let mut ui = UserInterface::build(
+                                    controls(card, &runtime, icons),
+                                    viewport,
+                                    Cache::new(),
+                                    &mut renderer,
+                                );
+                                let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                                let prefix = match kind {
+                                    git_patch::Kind::Stage => "Stage ",
+                                    git_patch::Kind::Unstage => "Unstage ",
+                                    git_patch::Kind::Revert => "Revert ",
+                                };
+                                let bounds = nodes
+                                    .root()
+                                    .iter()
+                                    .chain(nodes.children())
+                                    .find(|node| {
+                                        node.node().role()
+                                            == iced_accessibility::accesskit::Role::Button
+                                            && node
+                                                .node()
+                                                .label()
+                                                .is_some_and(|name| name.starts_with(prefix))
+                                            && !node.node().is_disabled()
+                                    })
+                                    .expect("the actual partial-change control is enabled")
+                                    .node()
+                                    .bounds()
+                                    .unwrap();
+                                let pointer = Point::new(
+                                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                                );
+                                let mut messages = Vec::new();
+                                ui.update(
+                                    &[Event::Mouse(mouse::Event::ButtonPressed(
+                                        mouse::Button::Left,
+                                    ))],
+                                    mouse::Cursor::Available(pointer),
+                                    &mut renderer,
+                                    &mut clipboard::Null,
+                                    &mut messages,
+                                );
+                                assert!(messages.is_empty());
+                                (ui.into_cache(), pointer)
+                            };
+                            match transition {
+                                "unchanged" => {}
+                                "file" => {
+                                    runtime.selected.as_mut().unwrap().path = "other.txt".into();
+                                    let FileListState::Ready(files) = &mut runtime.files else {
+                                        unreachable!()
+                                    };
+                                    files[0].path = "other.txt".into();
+                                    let DocumentState::Editable(document) = &mut runtime.document
+                                    else {
+                                        unreachable!()
+                                    };
+                                    document.path = "other.txt".into();
+                                    document.source = "other.txt".into();
+                                    runtime.generation += 1;
+                                    runtime.working_diff.applied = runtime.wanted_working_diff();
+                                    runtime.working_diff.desired = runtime.wanted_working_diff();
+                                }
+                                "model" => {
+                                    let model = runtime.current_diff_model_snapshot().unwrap();
+                                    runtime.set_diff_state(
+                                        runtime.diff_basis.clone(),
+                                        DiffState::ready(RenderedDiff::Text {
+                                            model: Arc::new((*model).clone()),
+                                            old_label: "Before".into(),
+                                            new_label: "After".into(),
+                                        }),
+                                    );
+                                }
+                                "selection" => {
+                                    let mut selection = crate::diff_interaction::Selection::new(
+                                        mode,
+                                        crate::diff_interaction::Side::New,
+                                        0,
+                                    );
+                                    selection.head = 1;
+                                    runtime.diff_interaction.selection = Some(selection);
+                                }
+                                "rename_target" => {
+                                    refresh_partial_target_rename(&mut runtime, card)
+                                }
+                                "hunk" => runtime.diff_change = 1,
+                                "disabled_then_enabled" => {
+                                    runtime.mutation_refresh_pending = true;
+                                    let ui = UserInterface::build(
+                                        controls(card, &runtime, icons),
+                                        viewport,
+                                        cache,
+                                        &mut renderer,
+                                    );
+                                    cache = ui.into_cache();
+                                    runtime.mutation_refresh_pending = false;
+                                }
+                                _ => unreachable!(),
+                            }
+                            let mut ui = UserInterface::build(
+                                controls(card, &runtime, icons),
+                                viewport,
+                                cache,
+                                &mut renderer,
+                            );
+                            let cursor = mouse::Cursor::Available(pointer);
+                            let mut messages = Vec::new();
+                            ui.update(
+                                &[Event::Mouse(mouse::Event::ButtonReleased(
+                                    mouse::Button::Left,
+                                ))],
+                                cursor,
+                                &mut renderer,
+                                &mut clipboard::Null,
+                                &mut messages,
+                            );
+                            assert_eq!(
+                                messages.len(),
+                                usize::from(transition == "unchanged"),
+                                "held press cannot migrate: {mode:?}, icons={icons}, selected={selected}, {kind:?}, {transition}"
+                            );
+                            assert_eq!(
+                                runtime.editor_text().as_deref(),
+                                Some(before_text.as_str()),
+                                "release on a replacement offer cannot mutate its buffer"
+                            );
+                            messages.clear();
+                            ui.update(
+                                &[
+                                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                                ],
+                                cursor,
+                                &mut renderer,
+                                &mut clipboard::Null,
+                                &mut messages,
+                            );
+                            let [
+                                RepositoryAction::ApplyDiffHunk {
+                                    card: actual_card,
+                                    kind: actual_kind,
+                                    request,
+                                },
+                            ] = &messages[..]
+                            else {
+                                panic!("a fresh native press activates the current partial offer")
+                            };
+                            assert_eq!(*actual_card, card);
+                            assert_eq!(*actual_kind, kind);
+                            let capture = runtime
+                                .capture_diff_mutation(card, kind, Some(request))
+                                .expect(
+                                    "the fresh callback keeps its captured source and selection",
+                                );
+                            let prepared = capture
+                                .prepare()
+                                .expect("the current captured rows prepare a real patch");
+                            drop(ui);
+                            if kind == git_patch::Kind::Revert {
+                                assert!(prepared.apply(&mut runtime).unwrap().is_none());
+                                assert_ne!(runtime.editor_text().unwrap(), before_text);
+                                drop(runtime.update(RepositoryAction::Undo { card }));
+                                assert_eq!(runtime.editor_text().unwrap(), before_text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn read_only_git_runtime_disables_git_writes_but_keeps_buffer_revert_edit_and_undo() {
         let card = CardId::new();
@@ -1204,6 +1769,16 @@ mod tests {
             0..1,
             "later selection changes cannot retarget the action"
         );
+        assert!(
+            runtime
+                .capture_diff_mutation(card, kind, Some(&request))
+                .is_none(),
+            "the consumed callback cannot adopt a newer selection"
+        );
+        let fresh = runtime.diff_selection_mutation_action(card, kind).unwrap();
+        let RepositoryAction::ApplyDiffHunk { request, .. } = fresh else {
+            unreachable!()
+        };
         assert!(
             runtime
                 .capture_diff_mutation(card, kind, Some(&request))

@@ -31137,6 +31137,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_partial_callbacks_refuse_replaced_diff_sources_before_work_or_mutation() {
+        fn runtime(card: CardId, project: ProjectId) -> RepositoryRuntime {
+            let mut runtime = RepositoryRuntime::selected_diff_fixture(card);
+            runtime.descriptor.project = project;
+            runtime.set_auto_save(false);
+            drop(runtime.update(RepositoryAction::MoveDiffSelection {
+                card,
+                delta: 1,
+                extend: true,
+            }));
+            assert_eq!(runtime.selected_diff_range(), Some(0..2));
+            runtime
+        }
+
+        for transition in ["model", "selection"] {
+            let mut app = context_inspector_test_app(true);
+            app.settings.editor_auto_save = false;
+            app.context_inspector_open = false;
+            let card = app.workspace.focused().unwrap();
+            let mut source = sidebar::tests::panel_model().source_control.unwrap();
+            source.key.canonical_path = "/repo".into();
+            let key = source.key.clone();
+            app.sidebar_model = SidebarModel::ready(
+                SidebarMode::Expanded,
+                vec![SidebarProject::new(
+                    key.project_id,
+                    RepositoryId::new(),
+                    "partial change fixture".into(),
+                    key.canonical_path.clone(),
+                    vec![sidebar::SidebarWorktree::from_durable(
+                        key.worktree_id,
+                        key.canonical_path.clone(),
+                        Some("main".into()),
+                    )],
+                    Vec::new(),
+                )],
+            )
+            .with_source_control(Some(source));
+            assert!(app.sidebar_state.sync_active_worktree(
+                &app.sidebar_model,
+                &sidebar::SidebarFocus::Repository {
+                    worktree: key.canonical_path.clone(),
+                },
+            ));
+            let original = runtime(card, key.project_id);
+            app.card_state_mut(card).unwrap().kind =
+                CardKind::Repository(original.descriptor.clone());
+            let old_model = original.current_diff_model_snapshot().unwrap();
+            let held_stage = original
+                .diff_selection_mutation_action(card, crate::git_patch::Kind::Stage)
+                .unwrap();
+            let held_revert = original
+                .diff_selection_mutation_action(card, crate::git_patch::Kind::Revert)
+                .unwrap();
+            let RepositoryAction::ApplyDiffHunk {
+                request: old_request,
+                ..
+            } = &held_stage
+            else {
+                unreachable!()
+            };
+            let old_request = Arc::clone(old_request);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(original)));
+
+            if transition == "model" {
+                app.cards.insert(
+                    card,
+                    CardRuntime::Repository(Box::new(runtime(card, key.project_id))),
+                );
+            } else {
+                let Some(CardRuntime::Repository(current)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                // Reverse the selection's anchor without changing its rows,
+                // model, layout, document revision or selected file identity.
+                for (row, extend) in [(1, false), (0, true)] {
+                    drop(current.update(RepositoryAction::SelectDiffRow {
+                        identity: old_request.identity.clone(),
+                        basis: old_request.basis.clone(),
+                        mode: old_request.mode,
+                        revision: old_request.layout_revision,
+                        row,
+                        side: crate::diff_interaction::Side::New,
+                        extend,
+                        context: false,
+                        drag: false,
+                    }));
+                }
+            }
+            let CardRuntime::Repository(current) = &app.cards[&card] else {
+                unreachable!()
+            };
+            let fresh = current
+                .diff_selection_mutation_action(card, crate::git_patch::Kind::Revert)
+                .unwrap();
+            let RepositoryAction::ApplyDiffHunk {
+                request: fresh_request,
+                ..
+            } = &fresh
+            else {
+                unreachable!()
+            };
+            assert_eq!(fresh_request.identity, old_request.identity);
+            assert_eq!(fresh_request.basis, old_request.basis);
+            assert_eq!(fresh_request.mode, old_request.mode);
+            assert_eq!(fresh_request.layout_revision, old_request.layout_revision);
+            assert_eq!(fresh_request.rows, old_request.rows);
+            assert_ne!(fresh_request.as_ref(), old_request.as_ref());
+            assert_eq!(
+                Arc::ptr_eq(&old_model, &current.current_diff_model_snapshot().unwrap()),
+                transition == "selection"
+            );
+            let before = current.editor_text().unwrap();
+            let groups = app
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .groups()
+                .to_vec();
+
+            for held in [held_stage, held_revert] {
+                let task = app.update(Message::Repository(held));
+                assert!(
+                    iced::runtime::task::into_stream(task).is_none(),
+                    "a stale {transition} callback cannot start patch preparation or Git work"
+                );
+                assert!(app.source_control_mutations.is_empty());
+                assert_eq!(
+                    app.sidebar_model.source_control.as_ref().unwrap().groups(),
+                    groups.as_slice()
+                );
+                let CardRuntime::Repository(current) = &app.cards[&card] else {
+                    unreachable!()
+                };
+                assert_eq!(current.editor_text().unwrap(), before);
+                assert!(!current.can_step_editor_history(false));
+            }
+
+            let preparation = app.update(Message::Repository(fresh));
+            let prepared = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = iced::runtime::task::into_stream(preparation)
+                    .expect("a fresh current callback starts patch preparation");
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                        && matches!(message, Message::DiffPatchPrepared { .. })
+                    {
+                        return message;
+                    }
+                }
+                panic!("patch preparation finished without its completion");
+            })
+            .await
+            .expect("patch preparation must finish");
+            assert!(matches!(
+                &prepared,
+                Message::DiffPatchPrepared {
+                    buffer_revision: Some(_),
+                    result: Ok(Some(_)),
+                    ..
+                }
+            ));
+            drop(app.update(prepared));
+            assert!(app.source_control_mutations.is_empty());
+            let CardRuntime::Repository(current) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert_eq!(current.editor_text().unwrap(), "original\nkeep\n");
+            assert!(current.can_step_editor_history(false));
+            drop(app.update(Message::Repository(RepositoryAction::Undo { card })));
+            let CardRuntime::Repository(current) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert_eq!(current.editor_text().unwrap(), before);
+            assert!(!current.can_step_editor_history(false));
+        }
+    }
+
+    #[tokio::test]
     async fn repository_staging_refuses_departed_selection_before_queue_or_index_changes() {
         async fn completion(task: Task<Message>) -> Message {
             tokio::time::timeout(Duration::from_secs(10), async {
