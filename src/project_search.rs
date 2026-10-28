@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ignore::overrides::OverrideBuilder;
+use ignore::gitignore::GitignoreBuilder;
 use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 
@@ -76,26 +76,6 @@ pub enum Progress {
     Error(String),
 }
 
-/// Preserve gitignore's basename/anchored scope when extending a directory
-/// glob to the files below it. The dependency strips one escape before a final
-/// slash and treats a leading `!` as override negation.
-fn directory_glob_descendants(pattern: &str) -> Option<String> {
-    if !pattern.ends_with('/') || pattern.starts_with('#') {
-        return None;
-    }
-    let (negation, path) = pattern
-        .strip_prefix('!')
-        .map_or(("", pattern), |path| ("!", path));
-    let anchored = path.starts_with('/');
-    let path = path.strip_suffix('/')?;
-    let path = path.strip_suffix('\\').unwrap_or(path);
-    if anchored || path.contains('/') {
-        Some(format!("{negation}{path}/**"))
-    } else {
-        Some(format!("{negation}**/{path}/**"))
-    }
-}
-
 /// Search one local root. Returning false from `publish` cancels delivery.
 /// Symlinks are never followed, binary and oversized files are skipped, and
 /// each line is bounded independently to avoid an unbounded allocation.
@@ -151,7 +131,8 @@ fn search_with_limits(
             return;
         }
     };
-    let mut overrides = OverrideBuilder::new(root);
+    let mut overrides = GitignoreBuilder::new(root);
+    overrides.allow_unclosed_class(false);
     for (patterns, excluded) in [(&options.include, false), (&options.exclude, true)] {
         for glob in patterns
             .split(',')
@@ -163,15 +144,9 @@ fn search_with_limits(
             } else {
                 glob.to_owned()
             };
-            // Override matching does not inherit a directory match when a
-            // file is tested. Keep the directory pattern for pruning and add
-            // the same scope's descendants for include/exclude file matching.
-            let descendants = directory_glob_descendants(&pattern);
-            for pattern in std::iter::once(pattern.as_str()).chain(descendants.as_deref()) {
-                if let Err(error) = overrides.add(pattern) {
-                    publish(Progress::Error(format!("Invalid file glob: {error}")));
-                    return;
-                }
+            if let Err(error) = overrides.add_line(None, &pattern) {
+                publish(Progress::Error(format!("Invalid file glob: {error}")));
+                return;
             }
         }
     }
@@ -182,6 +157,10 @@ fn search_with_limits(
             return;
         }
     };
+    // Like OverrideBuilder, positive globs include and negated globs
+    // exclude. Keep the underlying matcher so directory matches can also
+    // apply to descendant files without rewriting gitignore syntax.
+    let has_includes = overrides.num_ignores() > 0;
     let guarded_root = match crate::fs_safety::Root::open(root) {
         Ok(root) => root,
         Err(error) if traversal::descriptor_exhausted(&error) => {
@@ -268,7 +247,7 @@ fn search_with_limits(
         let traversal::Entry { path, kind } = entry;
         // Excluding a directory also excludes its descendants. Include
         // misses must not prune directories that can contain matching files.
-        if kind.is_dir() && overrides.matched(&path, true).is_ignore() {
+        if kind.is_dir() && overrides.matched(&path, true).invert().is_ignore() {
             continue;
         }
         if !policy
@@ -292,7 +271,8 @@ fn search_with_limits(
         // Apply include/exclude patterns after the ignore-aware walk. A file
         // include must not silently re-include an ignored file or prune a
         // directory that may contain a matching descendant.
-        if overrides.matched(&path, false).is_ignore() {
+        let matched = overrides.matched_path_or_any_parents(&path, false).invert();
+        if matched.is_ignore() || (matched.is_none() && has_includes) {
             continue;
         }
         let Ok(path) = path.strip_prefix(root) else {
@@ -671,6 +651,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         for path in [
             "src/main.rs",
+            "src/child/deep.rs",
             "nested/src/lib.rs",
             "generated/root.rs",
             "nested/generated/nested.rs",
@@ -698,10 +679,17 @@ mod tests {
             paths("src/", "", false),
             [
                 PathBuf::from("nested/src/lib.rs"),
+                PathBuf::from("src/child/deep.rs"),
                 PathBuf::from("src/main.rs")
             ]
         );
-        assert_eq!(paths("/src/", "", false), [PathBuf::from("src/main.rs")]);
+        assert_eq!(
+            paths("/src/", "", false),
+            [
+                PathBuf::from("src/child/deep.rs"),
+                PathBuf::from("src/main.rs")
+            ]
+        );
         assert_eq!(
             paths("nested/src/", "", false),
             [PathBuf::from("nested/src/lib.rs")]
@@ -710,6 +698,7 @@ mod tests {
             paths("*.rs", "generated/", false),
             [
                 PathBuf::from("nested/src/lib.rs"),
+                PathBuf::from("src/child/deep.rs"),
                 PathBuf::from("src/main.rs")
             ]
         );
@@ -721,8 +710,23 @@ mod tests {
             paths("src/", "/src/", false),
             [PathBuf::from("nested/src/lib.rs")]
         );
-        assert_eq!(paths("src/", "", true).len(), 3);
-        assert_eq!(paths("src/**", "", false), [PathBuf::from("src/main.rs")]);
+        assert_eq!(paths("src/", "", true).len(), 4);
+        assert_eq!(
+            paths("src/**", "", false),
+            [
+                PathBuf::from("src/child/deep.rs"),
+                PathBuf::from("src/main.rs")
+            ]
+        );
+        assert_eq!(
+            paths("src/**/", "", false),
+            [PathBuf::from("src/child/deep.rs")]
+        );
+        assert_eq!(
+            paths("/src/**/", "", false),
+            [PathBuf::from("src/child/deep.rs")]
+        );
+        assert_eq!(paths("**/", "generated/", false).len(), 4);
     }
 
     #[test]
