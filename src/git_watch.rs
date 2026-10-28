@@ -1511,11 +1511,13 @@ mod tests {
     fn native_shared_recursive_retirement_recovers_the_nested_repository_owner() {
         use notify::event::RemoveKind;
         let directory = tempfile::tempdir().unwrap();
-        let common_a = directory.path().join("admin/A.git");
+        // Git's identity APIs return canonical paths, including with aliased TMPDIR.
+        let base = directory.path().canonicalize().unwrap();
+        let common_a = base.join("admin/A.git");
         let covering = common_a.join("worktrees");
         let common_b = covering.join("B/custom.git");
-        let checkout_a = directory.path().join("checkout/A");
-        let checkout_b = directory.path().join("checkout/B");
+        let checkout_a = base.join("checkout/A");
+        let checkout_b = base.join("checkout/B");
         std::fs::create_dir_all(common_a.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&checkout_a).unwrap();
         std::fs::create_dir_all(&checkout_b).unwrap();
@@ -1538,7 +1540,7 @@ mod tests {
             repository.common_dir(&checkout_b, &cancellation).unwrap(),
             common_b
         );
-        let mut a = project(directory.path());
+        let mut a = project(&base);
         a.worktrees.truncate(1);
         a.common_dir = common_a.clone();
         a.worktrees[0].root = checkout_a;

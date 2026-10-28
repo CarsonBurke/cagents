@@ -98,9 +98,42 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
+    let id = input.id;
+    let repository = input.repository;
+    let cancellation = input.cancellation;
+    let changed = &input.change.worktrees;
+    let retry_inventory = input
+        .previous
+        .is_some_and(|local| local.plan_error.is_some());
+    scan_with_plan(input, move |records, previous| {
+        // A failed inventory cannot prove any cached worktree census current.
+        let retry_changed = retry_inventory.then(|| {
+            records
+                .iter()
+                .map(|record| record.id)
+                .collect::<BTreeSet<_>>()
+        });
+        git_watch::Project::read_changed(
+            id,
+            repository.to_path_buf(),
+            records,
+            cancellation,
+            previous,
+            retry_changed.as_ref().unwrap_or(changed),
+        )
+    })
+}
+
+pub(super) fn scan_with_plan(
+    input: Input<'_>,
+    read_plan: impl FnOnce(
+        &[WorktreeRecord],
+        Option<&git_watch::Project>,
+    ) -> Result<git_watch::Project, String>,
+) -> Result<Local, String> {
     let git = RepositoryService::system("git");
     let Input {
-        id,
+        id: _,
         repository,
         previous,
         change,
@@ -376,31 +409,28 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             .any(|old| !records.iter().any(|record| record.id == old.id))
     });
     let previous_plan = previous.and_then(|previous| previous.plan.clone());
-    let (plan, plan_error) =
-        if previous_plan.is_none() || change.membership || change.topology || vanished {
-            let listed = records
-                .iter()
-                .filter(|record| worktrees.iter().any(|worktree| worktree.id == record.id))
-                .cloned()
-                .collect::<Vec<_>>();
-            match git_watch::Project::read_changed(
-                id,
-                repository.to_path_buf(),
-                &listed,
-                cancellation,
-                previous_plan.as_deref(),
-                &change.worktrees,
-            ) {
-                Ok(plan) => (Some(Arc::new(plan)), None),
-                // Without a plan the project is polled; its cards still stand.
-                Err(error) => (previous_plan, Some(error)),
-            }
-        } else {
-            (
-                previous_plan,
-                previous.and_then(|previous| previous.plan_error.clone()),
-            )
-        };
+    let (plan, plan_error) = if previous_plan.is_none()
+        || previous.is_some_and(|local| local.plan_error.is_some())
+        || change.membership
+        || change.topology
+        || vanished
+    {
+        let listed = records
+            .iter()
+            .filter(|record| worktrees.iter().any(|worktree| worktree.id == record.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        match read_plan(&listed, previous_plan.as_deref()) {
+            Ok(plan) => (Some(Arc::new(plan)), None),
+            // Without a plan the project is polled; its cards still stand.
+            Err(error) => (previous_plan, Some(error)),
+        }
+    } else {
+        (
+            previous_plan,
+            previous.and_then(|previous| previous.plan_error.clone()),
+        )
+    };
 
     Ok(Local {
         scanned_at_unix_ms: now_unix_ms,
@@ -622,6 +652,44 @@ mod tests {
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_failed_watch_plan_is_retried_without_another_membership_event() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let old_plan = first.plan.as_ref().unwrap();
+        let nested = fixture.root.join("new-watch-scope/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("tracked.rs"), "new tracked file\n").unwrap();
+        git(&fixture.root, &["add", "new-watch-scope/nested/tracked.rs"]);
+        let failed = scan_with_plan(
+            Input {
+                id: old_plan.id,
+                repository: &fixture.root.join(".git"),
+                previous: Some(&first),
+                change: &git_watch::Change {
+                    membership: true,
+                    ..Default::default()
+                },
+                hints: &ForgeHints::default(),
+                now_unix_ms: crate::chat::now_ms().unwrap(),
+                cancellation: &CancellationToken::new(),
+            },
+            |_, _| Err("temporary watch inventory failure".into()),
+        )
+        .unwrap();
+        assert!(failed.plan_error.is_some());
+        assert!(Arc::ptr_eq(failed.plan.as_ref().unwrap(), old_plan));
+
+        let recovered = run(&fixture, Some(&failed), &git_watch::Change::default());
+        assert!(recovered.plan_error.is_none());
+        assert!(!Arc::ptr_eq(recovered.plan.as_ref().unwrap(), old_plan));
+        assert_ne!(
+            recovered.plan.as_ref().unwrap().worktrees,
+            old_plan.worktrees,
+            "retry must read the changed tracked-path census, not only allocate a new Arc"
+        );
     }
 
     #[test]
