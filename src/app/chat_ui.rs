@@ -10797,8 +10797,9 @@ impl Cagents {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.status =
-                        Some(TransientNotice::error("Could not copy the image").with_details(error));
+                    self.status = Some(
+                        TransientNotice::error("Could not copy the image").with_details(error),
+                    );
                 }
             },
             Action::CopyQueued(target, source) => {
@@ -12225,7 +12226,10 @@ mod tests {
         );
         assert_eq!(copied(&mut app, run(press)), ["image/png"]);
         assert_eq!(notice(&app).1, "Copied image");
-        assert!(app.chat_ui.image_viewer.is_some(), "copying keeps the viewer open");
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "copying keeps the viewer open"
+        );
 
         // Escape is the viewer's own rather than the app-wide key handler's,
         // so nothing focused beneath the viewer can claim it first, while the
@@ -12260,25 +12264,24 @@ mod tests {
                 &Limits::new(iced::Size::ZERO, window),
             );
             let pointer = mouse::Cursor::Available(viewport.center());
-            let mut send = |element: &mut Element<'_, Message>,
-                            tree: &mut Tree,
-                            event: iced::Event| {
-                let mut messages = Vec::new();
-                element.as_widget_mut().update(
-                    tree,
-                    &event,
-                    Layout::new(&node),
-                    pointer,
-                    &renderer,
-                    &mut clipboard::Null,
-                    &mut Shell::new(&mut messages),
-                    &viewport,
-                );
-                messages
-                    .iter()
-                    .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
-                    .count()
-            };
+            let mut send =
+                |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        tree,
+                        &event,
+                        Layout::new(&node),
+                        pointer,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
+                        .count()
+                };
             let mut menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
                 element
                     .as_widget_mut()
@@ -12296,12 +12299,22 @@ mod tests {
                 &mut tree,
                 iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
             );
-            assert!(menu_open(&mut element, &mut tree), "the image's menu opened");
+            assert!(
+                menu_open(&mut element, &mut tree),
+                "the image's menu opened"
+            );
             assert_eq!(
-                send(&mut element, &mut tree, iced::Event::Keyboard(escape.clone())),
+                send(
+                    &mut element,
+                    &mut tree,
+                    iced::Event::Keyboard(escape.clone())
+                ),
                 0
             );
-            assert!(!menu_open(&mut element, &mut tree), "Escape closed the menu");
+            assert!(
+                !menu_open(&mut element, &mut tree),
+                "Escape closed the menu"
+            );
             assert_eq!(
                 send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
                 1
@@ -12353,7 +12366,16 @@ mod tests {
             path(&*runtime, image(&cached, None)).is_none(),
             "a provider image decoded into the private transcript cache is ephemeral"
         );
+        assert!(
+            path(&*runtime, image(&format!("file://{cached}"), None)).is_none(),
+            "nor is its file URL"
+        );
         assert!(path(&*runtime, image("/abs/image-0f.png", None)).is_some());
+        assert_eq!(
+            path(&*runtime, image("file:///abs/shot%20one.png", None)).as_deref(),
+            Some("/abs/shot one.png"),
+            "a file URL names the same file the viewer offers"
+        );
         assert!(path(&*runtime, image("relative.png", None)).is_some());
         runtime.selected_subagent = Some("child".into());
         assert!(

@@ -828,17 +828,7 @@ impl Entry {
         if self.managed {
             return None;
         }
-        let path = if Path::new(&self.path).is_absolute() {
-            PathBuf::from(&self.path)
-        } else {
-            Url::parse(&self.path)
-                .ok()
-                .filter(|url| url.scheme() == "file")
-                .and_then(|url| url.to_file_path().ok())?
-        };
-        // See `clipboard::literal_path`: a cached inline image is ephemeral.
-        (!crate::chat::is_cached_inline_image(&path))
-            .then(|| path.to_string_lossy().into_owned())
+        clipboard::local_file(&self.path).map(|path| path.to_string_lossy().into_owned())
     }
 }
 pub(in crate::app) struct Gallery {
@@ -962,7 +952,8 @@ impl Gallery {
         &self,
         image: iced::advanced::image::Id,
     ) -> Option<clipboard::Resolved> {
-        let entry = Some(&self.entries[self.selected]).filter(|entry| entry.handle.id() == image)?;
+        let entry =
+            Some(&self.entries[self.selected]).filter(|entry| entry.handle.id() == image)?;
         Some(clipboard::Resolved {
             item: None,
             handle: entry.handle.clone(),

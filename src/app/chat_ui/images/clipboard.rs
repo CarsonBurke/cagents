@@ -7,8 +7,8 @@
 //! pixels (already oriented, at full decoded size) as PNG on an image worker;
 //! the UI thread only hands the encoded bytes to the clipboard.
 use super::*;
-use iced::clipboard::mime::AsMimeTypes;
 use iced::advanced::image::Id;
+use iced::clipboard::mime::AsMimeTypes;
 use iced::widget::image::Handle;
 
 const PNG: &str = "image/png";
@@ -68,7 +68,7 @@ pub(in crate::app) fn supported() -> bool {
 }
 
 pub(in crate::app) const UNSUPPORTED: &str =
-    "Copying image data needs a Wayland session. Copy the image path or open it externally instead.";
+    "Copying image data needs a Wayland session: the X11 clipboard here accepts only text.";
 
 fn encode(handle: &Handle) -> Result<Png, String> {
     use image::ImageEncoder;
@@ -94,11 +94,10 @@ fn encode(handle: &Handle) -> Result<Png, String> {
 /// copies of large images wait for memory rather than adding to it.
 fn encode_admission(handle: &Handle) -> u32 {
     match handle {
-        Handle::Rgba { pixels, .. } => {
-            u32::try_from(pixels.len()).map_or(DECODE_BUDGET as u32, |bytes| {
+        Handle::Rgba { pixels, .. } => u32::try_from(pixels.len())
+            .map_or(DECODE_BUDGET as u32, |bytes| {
                 bytes.min(DECODE_BUDGET as u32)
-            })
-        }
+            }),
         _ => 0,
     }
 }
@@ -113,10 +112,7 @@ pub(in crate::app) fn copy(handle: Handle) -> Task<Message> {
         let result = match budget().decode.clone().acquire_many_owned(permits).await {
             Ok(memory) => run_worker(move || {
                 let _memory = memory;
-                current
-                    .is_current()
-                    .then(|| encode(&handle))
-                    .transpose()
+                current.is_current().then(|| encode(&handle)).transpose()
             })
             .await
             .and_then(|result| result),
@@ -183,11 +179,12 @@ pub(in crate::app) fn menu(
     widget::menu::items(&key_binds, items)
 }
 
-/// An image's literal path, and whether it is relative to the conversation's
-/// working directory. Managed assets are excluded (their snapshot path is a
-/// non-authority hint), as are inline data, URLs, and a child's relative
-/// path, whose working directory is unknown here.
-fn literal_path<'a>(runtime: &Runtime, content: &'a ItemContent) -> Option<(&'a str, bool)> {
+/// The file an image literally names: an absolute path, a `file://` URL, or a
+/// path relative to the conversation's working directory. Managed assets are
+/// excluded (their snapshot path is a non-authority hint), as are inline data,
+/// other URLs, cached inline images, and a child's relative path, whose
+/// working directory is unknown here.
+fn literal_path(runtime: &Runtime, content: &ItemContent) -> Option<PathBuf> {
     let ItemContent::Image {
         path, reference, ..
     } = content
@@ -197,15 +194,31 @@ fn literal_path<'a>(runtime: &Runtime, content: &'a ItemContent) -> Option<(&'a 
     if reference.is_some() || path.is_empty() || path.starts_with("data:") {
         return None;
     }
-    if Path::new(path).is_absolute() {
-        // A provider's inline image decoded into the private transcript cache
-        // is gone with the conversation; only the pixels are worth copying.
-        return (!crate::chat::is_cached_inline_image(Path::new(path)))
-            .then_some((path, false));
+    if let Some(path) = local_file(path) {
+        return Some(path);
     }
+    // A relative path names a file in the conversation's worktree; a subagent
+    // transcript's worktree is not the one the session launched in.
     (runtime.selected_subagent.is_none()
+        && Path::new(path).is_relative()
         && !Url::parse(path).is_ok_and(|url| !url.scheme().is_empty()))
-    .then_some((path, true))
+    .then(|| runtime.session.launch.recipe.working_directory.join(path))
+}
+
+/// The local file an absolute path or `file://` URL names, if it is one worth
+/// offering. A provider's inline image decoded into the private transcript
+/// cache is gone with the conversation, so only its pixels are worth copying.
+pub(in crate::app) fn local_file(path: &str) -> Option<PathBuf> {
+    let path = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        Url::parse(path)
+            .ok()
+            .filter(|url| url.scheme() == "file")?
+            .to_file_path()
+            .ok()?
+    };
+    (!crate::chat::is_cached_inline_image(&path)).then_some(path)
 }
 
 /// Whether a preview offers Copy image path; checked on every view.
@@ -215,19 +228,7 @@ pub(in crate::app) fn has_copyable_path(runtime: &Runtime, content: &ItemContent
 
 /// The image path Copy image path writes.
 pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) -> Option<String> {
-    let (path, relative) = literal_path(runtime, content)?;
-    Some(if relative {
-        runtime
-            .session
-            .launch
-            .recipe
-            .working_directory
-            .join(path)
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        path.to_owned()
-    })
+    literal_path(runtime, content).map(|path| path.to_string_lossy().into_owned())
 }
 
 /// The transcript preview currently drawn with `image`, if it still is.
