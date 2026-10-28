@@ -3099,85 +3099,268 @@ fn contradicted_deferred_reopen_keeps_work_protected_and_allows_a_new_explicit_r
 }
 
 #[test]
+fn an_exact_completed_reopen_releases_its_shield_for_a_newer_current_project_close() {
+    use crate::app::Message;
+    for reply_before_connection in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        let creation = take_creation_publications(&requests)
+            .into_iter()
+            .find(|edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == channel))
+            .unwrap();
+        let admitted = channel_publication_model(canonical, &creation);
+        let shared = framed_channel_publication_ack(creation, admitted.clone());
+        drop(app.update(Message::WorkspaceModelObserved(shared)));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                admitted.clone(),
+            ))),
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|local| local.id == channel && local.shared)
+        );
+        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+        let origin = queued.reopen.clone().unwrap();
+        let mut opened = admitted;
+        opened.sequence += 1;
+        if reply_before_connection {
+            opened.identity = uuid::Uuid::new_v4();
+        }
+        let ack = framed_model_publication_callback(queued, opened.clone());
+        let close = ModelEdit::CloseProject {
+            repository: repository.clone(),
+        };
+        let close_sequence = opened.sequence + 1;
+        let cards = app.durable.cards.clone();
+        let drafts = app.persistent_workspace().chat_drafts;
+        let focus = app.workspace.focused();
+        if reply_before_connection {
+            // The reply from B cannot itself replace A. A later observer
+            // connection to B already includes the ordered peer close.
+            drop(app.update(Message::WorkspaceModelObserved(ack)));
+            assert!(app.workspace_model_reopens.deferred.contains_key(&project));
+            let mut closed = opened;
+            closed.fold(close_sequence, &close);
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                    closed,
+                ))),
+            );
+        } else {
+            // The current registry's close can outrun our own physical edit
+            // reply. Before that exact ACK, pending work is still protected.
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                    sequence: close_sequence,
+                    edit: close,
+                })),
+            );
+            assert!(app.project_ui.is_reopening(&repository));
+            assert!(!app.project_ui.closed.contains(&repository));
+            assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+            assert!(app.sidebar_model.project(project).is_some());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|local| local.id == channel && local.shared)
+            );
+            assert_eq!(app.durable.cards, cards);
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focus);
+            drop(app.update(Message::WorkspaceModelObserved(ack)));
+        }
+        assert_eq!(app.workspace_model.sequence, close_sequence);
+        assert!(app.workspace_model.project(&repository).is_none());
+        assert!(app.workspace_model.closed_projects.contains(&repository));
+        assert!(!app.project_ui.is_reopening(&repository));
+        assert!(!app.current_reopen(&origin));
+        assert!(app.workspace_model_reopens.active.is_empty());
+        assert!(app.workspace_model_reopens.deferred.is_empty());
+        assert!(!app.workspace_model_reopens.can_retry(&repository));
+        assert!(
+            app.project_ui.closed.contains(&repository),
+            "completion of this exact nonce must permit the newer canonical close"
+        );
+        assert!(
+            app.project_ui.closing.contains_key(&project)
+                || app.sidebar_model.project(project).is_none(),
+            "the normal close flow must start, rather than remain shielded"
+        );
+    }
+}
+
+#[test]
+fn a_provisional_picker_reopen_shields_existing_shared_channels_before_inventory_remaps_it() {
+    use crate::app::Message;
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    let creation = take_creation_publications(&requests)
+        .into_iter()
+        .find(|edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == channel))
+        .unwrap();
+    let admitted = channel_publication_model(canonical, &creation);
+    let shared = framed_channel_publication_ack(creation, admitted.clone());
+    drop(app.update(Message::WorkspaceModelObserved(shared)));
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            admitted.clone(),
+        ))),
+    );
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .any(|local| local.id == channel && local.shared)
+    );
+    // The actual picker admits a fresh provisional ID even when this path
+    // already has a row. Its protection must apply before inventory dedups it.
+    drop(app.project_load_task(repository.clone(), None, true, Some(ProjectKind::Folder)));
+    let provisional = *app
+        .project_ui
+        .reopening
+        .iter()
+        .find(|(_, path)| **path == repository)
+        .unwrap()
+        .0;
+    assert_ne!(provisional, project);
+    let generation = app.repository_generations[&provisional];
+    let original = app.workspace_model_reopens.active[&provisional].clone();
+    let cards = app.durable.cards.clone();
+    let drafts = app.persistent_workspace().chat_drafts;
+    let focus = app.workspace.focused();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+            sequence: admitted.sequence + 1,
+            edit: ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+        })),
+    );
+    assert!(app.project_ui.is_reopening(&repository));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .any(|local| local.id == channel && local.shared)
+    );
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focus);
+    let loaded = crate::app::load_project(
+        &repository,
+        Some(provisional),
+        tokio_util::sync::CancellationToken::default(),
+        Some(ProjectKind::Folder),
+    )
+    .unwrap();
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: true,
+        project_id: provisional,
+        generation,
+        result: Ok(Box::new(loaded)),
+    }));
+    assert!(
+        !app.workspace_model_reopens
+            .active
+            .contains_key(&provisional)
+    );
+    assert_eq!(
+        app.workspace_model_reopens.active[&project].nonce,
+        original.nonce
+    );
+    let queued = std::iter::from_fn(|| requests.try_recv().ok())
+        .find(|queued| matches!(&queued.edit, ModelEdit::ReopenProject { repository: path, .. } if path == &repository))
+        .expect("inventory remapping must publish the original picker intent");
+    let origin = queued.reopen.unwrap();
+    assert_eq!(origin.nonce, original.nonce);
+    assert_eq!(origin.project, project);
+    assert_eq!(origin.repository, repository);
+    assert!(app.project_ui.is_reopening(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
+
+#[test]
 fn contradicted_reopen_proof_cannot_repeat_a_dismissed_warning_or_settle_on_later_presence() {
     use crate::app::Message;
-    for different_connection in [false, true] {
-        let (_directory, mut app, project, channel, repository, requests, _canonical) =
-            publication_reconciliation_fixture();
-        take_creation_publications(&requests);
-        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
-        let original = queued.reopen.clone().unwrap();
-        let receipt = reopened_project_model(
-            WorkspaceModel {
-                identity: uuid::Uuid::new_v4(),
-                sequence: 19,
-                ..WorkspaceModel::default()
-            },
-            &repository,
-        );
-        let callback = framed_model_publication_callback(queued, receipt.clone());
-        drop(app.update(Message::WorkspaceModelObserved(callback.clone())));
-        assert!(app.workspace_model_reopens.deferred.contains_key(&project));
-        let mut closed = receipt.clone();
-        closed.sequence += 1;
-        closed.projects.clear();
-        closed.closed_projects.push(repository.clone());
-        if different_connection {
-            closed.identity = uuid::Uuid::new_v4();
-        }
-        let drafts = app.persistent_workspace().chat_drafts;
-        let cards = app.durable.cards.clone();
-        let focus = app.workspace.focused();
-        drop(
-            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
-                closed.clone(),
-            ))),
-        );
-        assert!(app.workspace_model_reopens.can_retry(&repository));
-        assert!(app.workspace_model_reopens.deferred.is_empty());
-        let warning = app
-            .notices
-            .entries
-            .iter()
-            .find(|entry| {
-                entry
-                    .notice
-                    .message
-                    .contains("reopening could not be confirmed")
-            })
-            .expect("a contradicted receipt must explain the explicit retry")
-            .id;
-        drop(app.update(Message::DismissNotice(warning)));
-        let notices = app.notices.entries.clone();
-        // Neither ordinary activity nor a duplicate physical callback can
-        // rearm completed proof after the user has dismissed its failure.
-        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))));
-        drop(app.update(Message::WorkspaceModelObserved(callback)));
-        assert_eq!(app.notices.entries, notices);
-        assert!(app.workspace_model_reopens.deferred.is_empty());
-        let mut later = receipt;
-        later.sequence += 2;
-        drop(
-            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
-                later.clone(),
-            ))),
-        );
-        assert!(app.current_reopen(&original));
-        assert!(app.project_ui.is_reopening(&repository));
-        assert!(app.workspace_model_reopens.can_retry(&repository));
-        assert_eq!(app.notices.entries, notices);
-        assert_eq!(app.durable.cards, cards);
-        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
-        assert_eq!(app.workspace.focused(), focus);
-        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
-        let retry = enqueue_explicit_reopen(&mut app, &requests, project);
-        assert_ne!(retry.reopen.as_ref().unwrap(), &original);
-        let ack =
-            framed_model_publication_callback(retry, reopened_project_model(later, &repository));
-        drop(app.update(Message::WorkspaceModelObserved(ack)));
-        assert!(!app.project_ui.is_reopening(&repository));
-        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
-    }
+    let (_directory, mut app, project, channel, repository, requests, _canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let original = queued.reopen.clone().unwrap();
+    let receipt = reopened_project_model(
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 19,
+            ..WorkspaceModel::default()
+        },
+        &repository,
+    );
+    let callback = framed_model_publication_callback(queued, receipt.clone());
+    drop(app.update(Message::WorkspaceModelObserved(callback.clone())));
+    assert!(app.workspace_model_reopens.deferred.contains_key(&project));
+    let mut closed = receipt.clone();
+    closed.sequence += 1;
+    closed.projects.clear();
+    closed.closed_projects.push(repository.clone());
+    closed.identity = uuid::Uuid::new_v4();
+    let drafts = app.persistent_workspace().chat_drafts;
+    let cards = app.durable.cards.clone();
+    let focus = app.workspace.focused();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            closed.clone(),
+        ))),
+    );
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    assert!(app.workspace_model_reopens.deferred.is_empty());
+    let warning = app
+        .notices
+        .entries
+        .iter()
+        .find(|entry| {
+            entry
+                .notice
+                .message
+                .contains("reopening could not be confirmed")
+        })
+        .expect("a contradicted receipt must explain the explicit retry")
+        .id;
+    drop(app.update(Message::DismissNotice(warning)));
+    let notices = app.notices.entries.clone();
+    // Neither ordinary activity nor a duplicate physical callback can
+    // rearm completed proof after the user has dismissed its failure.
+    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))));
+    drop(app.update(Message::WorkspaceModelObserved(callback)));
+    assert_eq!(app.notices.entries, notices);
+    assert!(app.workspace_model_reopens.deferred.is_empty());
+    let mut later = receipt;
+    later.sequence += 2;
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            later.clone(),
+        ))),
+    );
+    assert!(app.current_reopen(&original));
+    assert!(app.project_ui.is_reopening(&repository));
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    assert_eq!(app.notices.entries, notices);
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focus);
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    let retry = enqueue_explicit_reopen(&mut app, &requests, project);
+    assert_ne!(retry.reopen.as_ref().unwrap(), &original);
+    let ack = framed_model_publication_callback(retry, reopened_project_model(later, &repository));
+    drop(app.update(Message::WorkspaceModelObserved(ack)));
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
 }
 
 #[test]

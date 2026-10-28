@@ -753,11 +753,16 @@ impl Cagents {
             .collect();
         let mut changed = false;
         for (project, repository, confirmed) in completed {
-            if confirmed && self.workspace_model.project(&repository).is_some() {
+            if confirmed {
                 self.workspace_model_reopens.invalidate(project);
                 self.project_ui.reopening.remove(&project);
-                self.cancel_shared_project_close(&repository);
-                self.project_ui.closed.remove(&repository);
+                if self.workspace_model.project(&repository).is_some() {
+                    self.cancel_shared_project_close(&repository);
+                    self.project_ui.closed.remove(&repository);
+                }
+                // This exact attempt completed even when a later current
+                // close outran its reply. Release only its shield, then apply
+                // the current tombstone rather than resurrecting old state.
                 changed = true;
             } else {
                 // Keep the local-work shield until an explicit new picker
@@ -1334,6 +1339,18 @@ impl Cagents {
             .channels
             .iter()
             .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
+            // Closing a project removes all of its shared channels too. That
+            // absence must honor the same pending-reopen shield as the parent
+            // close; otherwise it retires conversations before our exact ACK.
+            .filter(|local| {
+                !self
+                    .sidebar_model
+                    .project(local.project_id)
+                    .is_some_and(|project| {
+                        model.closed_projects.contains(&project.repository)
+                            && self.project_ui.is_reopening(&project.repository)
+                    })
+            })
             .map(|local| (local.id, local.shared))
             .collect::<Vec<_>>();
         for (id, shared) in retired {
