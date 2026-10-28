@@ -3420,12 +3420,13 @@ mod tests {
             assert_eq!(Some(retry.agent.id), last);
             let before = registry.model().unwrap();
             request.idempotency_key = "delegated-over-limit".into();
-            assert!(
-                registry
-                    .submit_agent_with_limits(&origin, &request, None, limits, 41)
-                    .unwrap_err()
-                    .contains("child limit")
-            );
+            let AcceptanceError::Invalid(error) = registry
+                .submit_agent_with_limits(&origin, &request, None, limits, 41)
+                .unwrap_err()
+            else {
+                panic!("The retained-child cap must refuse independently of run capacity");
+            };
+            assert!(error.contains("child limit"));
             assert_eq!(registry.agents(Some(&origin)).unwrap().len(), MAX_CHILDREN);
             assert_eq!(registry.model().unwrap(), before);
             assert!(
