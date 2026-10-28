@@ -4701,6 +4701,9 @@ struct PendingWindowClose {
     generation: u64,
     window: window::Id,
     writer: Option<Arc<crate::persistence::StateStore>>,
+    // Keep the immutable model allocation too: background changes can return
+    // to equal values after a different snapshot has reached storage.
+    model: Arc<WorkspaceState>,
     snapshot: Arc<WorkspaceState>,
     settings_generation: u64,
     settings: AppSettings,
@@ -12795,6 +12798,7 @@ impl Cagents {
             generation,
             window,
             writer,
+            model: Arc::clone(&self.durable),
             snapshot,
             settings_generation: self.settings_save_generation,
             settings: self.settings.clone(),
@@ -12851,7 +12855,8 @@ impl Cagents {
         let result = result.and_then(|()| {
             if self.core.main_window_id() != Some(window) || !same_writer {
                 Err("The window's storage changed while saving. Close it again to save the current window.".into())
-            } else if pending.snapshot != current
+            } else if !Arc::ptr_eq(&pending.model, &self.durable)
+                || pending.snapshot != current
                 || pending.settings_generation != self.settings_save_generation
                 || pending.settings != self.settings
                 || pending.view != serde_json::to_value(self.capture_window_view()).map_err(|error| error.to_string())
@@ -20525,6 +20530,11 @@ mod tests {
     fn window_close_storage_identity_refusal_keeps_draft_window_and_activation_alive() {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, card, window) = window_close_draft_app(directory.path());
+        let runtime = match &app.cards[&card] {
+            CardRuntime::Chat(runtime) => &**runtime as *const chat_ui::Runtime,
+            _ => panic!("chat runtime"),
+        };
+        let writer = app.session.as_ref().unwrap().operation_store();
         app.persist();
         app.session
             .as_ref()
@@ -20549,6 +20559,12 @@ mod tests {
         assert!(app.pending_window_close.is_none());
         assert_eq!(app.core.main_window_id(), Some(window));
         assert!(!activations.is_closed());
+        assert!(matches!(&app.cards[&card], CardRuntime::Chat(current)
+            if std::ptr::eq(&**current, runtime)));
+        assert!(Arc::ptr_eq(
+            &writer,
+            &app.session.as_ref().unwrap().operation_store()
+        ));
         assert!(
             app.notices.entries.iter().any(|entry| entry
                 .notice
@@ -20598,6 +20614,35 @@ mod tests {
                 .count(),
             1
         );
+
+        // Stand in only for the separately owned identity remediation: return
+        // this fixture to the identity storage already accepted. A deliberate
+        // fresh Close must save the retained, subsequently edited draft, not
+        // blindly rearm the quarantined identity rewrite or reuse its ACK.
+        app.card_state_mut(card).unwrap().kind = original;
+        type_window_close_draft(&mut app, card, " after identity repair");
+        let expected = app.persistent_workspace().chat_drafts[&card].clone();
+        assert!(expected.contains("still editable") && expected.contains("after identity repair"));
+        let recovered_task = app.update(Message::WindowCloseRequested(window));
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+        assert!(!activations.is_closed());
+        let recovered = window_close_test_message(&mut app, recovered_task);
+        assert!(matches!(
+            &recovered,
+            Message::WindowCloseFlushed { result: Ok(()), .. }
+        ));
+        let saved = writer
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.chat_drafts[&card], expected);
+        assert!(matches!(&app.cards[&card], CardRuntime::Chat(current)
+            if std::ptr::eq(&**current, runtime)));
+        drop(app.update(recovered));
+        assert!(app.exit.is_some());
+        assert_eq!(app.core.main_window_id(), None);
+        assert!(activations.is_closed());
     }
 
     #[test]
@@ -20698,7 +20743,14 @@ mod tests {
 
     #[test]
     fn window_close_rejects_changed_snapshot_writer_window_and_stale_acknowledgements() {
-        for changed in ["snapshot", "writer", "window", "settings", "view"] {
+        for changed in [
+            "snapshot",
+            "snapshot restored",
+            "writer",
+            "window",
+            "settings",
+            "view",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let (mut app, card, window) = window_close_draft_app(directory.path());
             let task = app.update(Message::WindowCloseRequested(window));
@@ -20715,6 +20767,34 @@ mod tests {
                     // Model/lifecycle completions stay serviceable during a flush.
                     // Their durable changes cannot be certified by the older ACK.
                     app.card_state_mut(card).unwrap().title = "Arrived while saving".into();
+                }
+                "snapshot restored" => {
+                    let title = app.card_state(card).unwrap().title.clone();
+                    app.card_state_mut(card).unwrap().title = "Newer stored title".into();
+                    app.persist();
+                    let writer = app.session.as_ref().unwrap();
+                    writer.flush(Duration::from_secs(5)).unwrap();
+                    let stored = writer
+                        .operation_store()
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        stored
+                            .cards
+                            .iter()
+                            .find(|row| row.id == card)
+                            .unwrap()
+                            .title,
+                        "Newer stored title"
+                    );
+                    app.card_state_mut(card).unwrap().title = title;
+                    app.persist();
+                    assert_eq!(
+                        app.persistent_workspace(),
+                        app.pending_window_close.as_ref().unwrap().snapshot,
+                        "equal current values do not make the old ACK current again"
+                    );
                 }
                 "writer" => install_window_close_storage(&mut app, directory.path()),
                 "window" => {
