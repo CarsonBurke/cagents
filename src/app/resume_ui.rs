@@ -142,6 +142,11 @@ pub enum Action {
     Unscope,
     Indexed(u64, Progress),
     Resume(CardId),
+    /// A row activation belongs to the picker that rendered it.
+    ResumeRow {
+        generation: u64,
+        card: CardId,
+    },
     More,
     Submit,
     Prepared(u64, SavedConversation, Result<chat::Session, String>),
@@ -574,6 +579,12 @@ impl Cagents {
                 self.resume_indexed(progress);
                 Task::none()
             }
+            Action::ResumeRow { generation, card } => {
+                if !self.resume_ui.open || generation != self.resume_ui.generation {
+                    return Task::none();
+                }
+                self.update_resume(Action::Resume(card))
+            }
             Action::Resume(card) => {
                 if !self.resume_ui.open || self.resume_ui.loading {
                     return Task::none();
@@ -935,15 +946,21 @@ impl Cagents {
             .spacing(space::XS);
             rows.push(
                 widget::button::custom(contents)
+                    .id(widget::Id::new(format!(
+                        "conversation-resume.row.{}.{}.{}",
+                        state.generation, row.card, state.loading,
+                    )))
                     .name(format!("Resume {}", row.title))
                     .width(Length::Fill)
                     .height(Length::Fixed(ROW_HEIGHT))
                     .class(cosmic::theme::Button::ListItem([8.0; 4]))
                     .selected(index == state.selected)
-                    .on_press_maybe(
-                        (!state.loading)
-                            .then_some(Message::ResumeConversation(Action::Resume(row.card))),
-                    )
+                    .on_press_maybe((!state.loading).then_some(Message::ResumeConversation(
+                        Action::ResumeRow {
+                            generation: state.generation,
+                            card: row.card,
+                        },
+                    )))
                     .into(),
             );
         }
@@ -1082,6 +1099,322 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    fn resume_pointer_frame(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        cache: iced::runtime::user_interface::Cache,
+        cursor: iced::mouse::Cursor,
+        events: &[iced::Event],
+        title: &str,
+    ) -> (
+        iced::runtime::user_interface::Cache,
+        Vec<Message>,
+        iced::Point,
+    ) {
+        use iced::{advanced::clipboard, runtime::UserInterface};
+        let mut ui = UserInterface::build(
+            app.resume_dialog().expect("actual open resume dialog"),
+            iced::Size::new(1000.0, 900.0),
+            cache,
+            renderer,
+        );
+        let mut messages = Vec::new();
+        ui.update(&[], cursor, renderer, &mut clipboard::Null, &mut messages);
+        assert!(messages.is_empty());
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            cursor,
+        );
+        let nodes = ui.a11y_nodes(cursor);
+        let label = format!("Resume {title}");
+        let row = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label.as_str())
+            })
+            .expect("the actual conversation row remains mounted");
+        assert!(!row.node().is_hidden());
+        assert_eq!(row.node().is_disabled(), app.resume_ui.loading);
+        let bounds = row.node().bounds().unwrap();
+        let point = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        assert!(point.x > 0.0 && point.x < 1000.0);
+        assert!(point.y > 0.0 && point.y < 900.0);
+        ui.update(
+            events,
+            cursor,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (ui.into_cache(), messages, point)
+    }
+
+    #[test]
+    fn retained_resume_row_press_and_callback_keep_their_picker_and_conversation() {
+        use iced::{mouse, runtime::user_interface::Cache};
+
+        fn row_action(mut messages: Vec<Message>, generation: u64, card: CardId) -> Action {
+            assert_eq!(messages.len(), 1, "one actual row activation");
+            let Message::ResumeConversation(action) = messages.remove(0) else {
+                panic!("actual resume row callback")
+            };
+            assert!(
+                matches!(&action, Action::ResumeRow { generation: current, card: target }
+                if *current == generation && *target == card)
+            );
+            action
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let older = saved(directory.path());
+        let newer = catalog::Found {
+            seed: 0,
+            path: directory.path().join("distinct-newer.jsonl"),
+            id: uuid::Uuid::new_v4().to_string(),
+            directory: directory.path().into(),
+            title: "Distinct newer conversation".into(),
+            titled: true,
+            named: true,
+            updated_at_unix_ms: older.updated_at_unix_ms + 1,
+        };
+        let expected_newer = catalog::session(&older.session, &newer).unwrap();
+        assert!(!same_conversation(&older.session, &expected_newer));
+        assert_ne!(older.session.id, expected_newer.id);
+        // Initialize a picker and deliver genuine typed indexing progress; no
+        // indexer thread, provider, transcript read, or daemon is started here.
+        let saved_progress = |app: &mut Cagents, generation| {
+            drop(app.update_resume(Action::Indexed(
+                generation,
+                Progress::Saved {
+                    entries: vec![older.clone()],
+                    seeds: Arc::from([older.session.clone()]),
+                    error: None,
+                },
+            )));
+        };
+        let found_progress = |app: &mut Cagents, generation| {
+            drop(app.update_resume(Action::Indexed(
+                generation,
+                Progress::Found {
+                    conversations: vec![newer.clone()],
+                    titles: Vec::new(),
+                    read: 1,
+                },
+            )));
+        };
+        app.resume_ui.open = true;
+        app.resume_ui.generation = 7;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        saved_progress(&mut app, generation);
+        let press = iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let (cache, messages, original_point) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            Cache::default(),
+            mouse::Cursor::Unavailable,
+            &[],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(original_point),
+            &[press.clone()],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        found_progress(&mut app, generation);
+        let newer_card = app.resume_ui.rows[app.resume_ui.visible[0]].card;
+        assert_ne!(newer_card, older.card);
+        let (cache, messages, replacement_point) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(original_point),
+            &[release.clone()],
+            &newer.title,
+        );
+        assert_eq!(
+            replacement_point, original_point,
+            "newer B occupies A's old row"
+        );
+        assert!(messages.is_empty(), "releasing A's press cannot resume B");
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(replacement_point),
+            &[press.clone()],
+            &newer.title,
+        );
+        assert!(messages.is_empty());
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(replacement_point),
+            &[release.clone()],
+            &newer.title,
+        );
+        let _fresh_newer = row_action(messages, generation, newer_card);
+
+        // The surviving A row must keep a real press across an unchanged build.
+        let (cache, messages, older_point) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Unavailable,
+            &[],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[press.clone()],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[release.clone()],
+            &older.title,
+        );
+        let queued_older = row_action(messages, generation, older.card);
+
+        // A disabled loading frame retires the old enabled press even when the
+        // same row becomes enabled again in the same picker generation.
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[press.clone()],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        app.resume_ui.loading = true;
+        drop(app.update_resume(queued_older.clone()));
+        assert!(app.durable.cards.is_empty());
+        assert!(app.resume_ui.open && app.resume_ui.loading);
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        app.resume_ui.loading = false;
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[release.clone()],
+            &older.title,
+        );
+        assert!(
+            messages.is_empty(),
+            "loading cannot revive an earlier enabled press"
+        );
+
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[press.clone()],
+            &older.title,
+        );
+        assert!(messages.is_empty());
+        drop(app.update_resume(Action::Close));
+        drop(app.update_resume(queued_older.clone()));
+        assert!(!app.resume_ui.open && app.durable.cards.is_empty());
+        // Reinitialize the next picker without starting its real indexer. A is
+        // deliberately the SAME saved capability, so only the picker changes.
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let reopened_generation = app.resume_ui.generation;
+        assert_ne!(reopened_generation, generation);
+        saved_progress(&mut app, reopened_generation);
+        found_progress(&mut app, reopened_generation);
+        drop(app.update_resume(queued_older));
+        assert!(app.resume_ui.open && !app.resume_ui.loading);
+        assert!(app.resume_ui.error.is_none() && app.durable.cards.is_empty());
+        let (cache, messages, reopened_point) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(older_point),
+            &[release.clone()],
+            &older.title,
+        );
+        assert_eq!(reopened_point, older_point);
+        assert!(
+            messages.is_empty(),
+            "a reopened picker cannot inherit A's old press"
+        );
+
+        let current_newer = app.resume_ui.rows[app.resume_ui.visible[0]].card;
+        let (cache, messages, point) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Unavailable,
+            &[],
+            &newer.title,
+        );
+        assert!(messages.is_empty());
+        let (cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(point),
+            &[press],
+            &newer.title,
+        );
+        assert!(messages.is_empty());
+        let (_cache, messages, _) = resume_pointer_frame(
+            &app,
+            &mut renderer,
+            cache,
+            mouse::Cursor::Available(point),
+            &[release],
+            &newer.title,
+        );
+        let fresh = row_action(messages, reopened_generation, current_newer);
+        drop(app.update_resume(fresh));
+        assert!(!app.resume_ui.open);
+        assert_eq!(app.durable.cards.len(), 1);
+        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        let CardKind::Chat(resumed) = &card.kind else {
+            panic!("actual resumed conversation")
+        };
+        assert_eq!(resumed.launch, expected_newer.launch);
+        assert_ne!(resumed.launch.session_id, older.session.launch.session_id);
     }
 
     #[test]
