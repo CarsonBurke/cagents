@@ -2545,6 +2545,8 @@ impl Cagents {
             Action::LinkCancel => {
                 if !self.account_ui.table.linking {
                     self.account_ui.table.link = None;
+                    // Giving up on the link is an answer to why it failed.
+                    self.resolve_notice(NoticeKey::AccountLink);
                 }
                 Task::none()
             }
@@ -2556,7 +2558,7 @@ impl Cagents {
                         self.account_ui.table.link = None;
                         self.status = Some(
                             TransientNotice::success("Existing account home added.")
-                                .key(format!("account-added:{key:?}")),
+                                .with_key(NoticeKey::AccountLink),
                         );
                         let id = self
                             .account_ui
@@ -2568,9 +2570,11 @@ impl Cagents {
                             .unwrap_or_else(Task::none)
                     }
                     Err(error) => {
-                        self.status = Some(TransientNotice::error(format!(
-                            "Could not use that account home: {error}"
-                        )));
+                        self.status = Some(
+                            TransientNotice::error("Could not use that account home.")
+                                .with_details(error)
+                                .with_key(NoticeKey::AccountLink),
+                        );
                         Task::none()
                     }
                 }
@@ -3787,11 +3791,17 @@ impl Cagents {
                     return Task::none();
                 }
                 let login = self.account_ui.logins.remove(index);
-                if !login.recovered {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "{} could not say which account signed in. cagents will check again the next time it starts.",
-                        probe::cli_name(login.provider)
-                    )));
+                // A sign-in left over from an earlier run is taken up quietly,
+                // unless this run already said something about it: that report
+                // would still claim cagents is trying, so it gives way to this.
+                if !login.recovered || self.notice_stands(NoticeKey::SignIn(key)) {
+                    self.status = Some(
+                        TransientNotice::warning(format!(
+                            "{} could not say which account signed in. cagents will check again the next time it starts.",
+                            probe::cli_name(login.provider)
+                        ))
+                        .with_key(NoticeKey::SignIn(key)),
+                    );
                 }
                 return Task::none();
             }
@@ -3807,6 +3817,8 @@ impl Cagents {
                     < crate::account::home::ORPHAN_AGE.as_millis() as Millis
             {
                 self.account_ui.logins.remove(index);
+                // No longer this window's sign-in, so not its to report on.
+                self.resolve_notice(NoticeKey::SignIn(key));
                 return Task::none();
             }
             login.phase = LoginPhase::Settling;
@@ -3901,10 +3913,16 @@ impl Cagents {
                 // daemon registration is idempotent for this exact key.
                 login.phase = LoginPhase::Waiting;
                 login.next_check = now_ms() + LOGIN_RETRY * Millis::from(login.attempts.max(1));
-                self.status = Some(TransientNotice::warning(format!(
-                    "The new {} account could not be saved yet; cagents will retry: {error}",
-                    login.provider.label()
-                )));
+                // Each retry replaces the warning before it, and the save that
+                // lands replaces it with the outcome.
+                self.status = Some(
+                    TransientNotice::warning(format!(
+                        "The new {} account could not be saved yet. cagents will try again.",
+                        login.provider.label()
+                    ))
+                    .with_details(error.clone())
+                    .with_key(NoticeKey::SignIn(key)),
+                );
                 return Task::none();
             }
         }
@@ -3933,7 +3951,7 @@ impl Cagents {
                 }
                 self.status = Some(
                     TransientNotice::success(format!("{name} was added."))
-                        .key(format!("account-added:{id:?}")),
+                        .with_key(NoticeKey::SignIn(key)),
                 );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
@@ -3946,22 +3964,29 @@ impl Cagents {
                     .account(&existing)
                     .map(|state| self.account_ui.display_name(state))
                     .unwrap_or_else(|| "an account you already have".into());
-                self.status = Some(TransientNotice::warning(format!(
-                    "That login is already added as {name}."
-                )));
+                self.status = Some(
+                    TransientNotice::warning(format!("That login is already added as {name}."))
+                        .with_key(NoticeKey::SignIn(key)),
+                );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Abandoned(registry)) => {
                 if let Some(registry) = registry {
                     self.account_ui.set_registry(registry);
                 }
+                // Nothing is left to save, so an earlier retry warning is moot.
+                self.resolve_notice(NoticeKey::SignIn(key));
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "The new {} account could not be saved: {error}",
-                    login.provider.label()
-                )));
+                self.status = Some(
+                    TransientNotice::error(format!(
+                        "The new {} account could not be saved.",
+                        login.provider.label()
+                    ))
+                    .with_details(error)
+                    .with_key(NoticeKey::SignIn(key)),
+                );
                 Task::none()
             }
         }
@@ -4883,21 +4908,28 @@ impl Cagents {
                     .into(),
             );
         }
-        let mut items: Vec<Element<'a, Message>> = vec![
+        let mut identity: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::provider_icon(account.account.provider))
                 .size(design::ROW_ICON_SIZE)
                 .into(),
             widget::column::with_children(title)
-                .width(Length::Shrink)
+                .width(Length::Fill)
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            items.push(crate::ui_controls::badge(
+            identity.push(crate::ui_controls::badge(
                 plan,
                 design::Tone::Themed(design::accent_color),
             ));
         }
-        items.push(iced::widget::Space::new().width(Length::Fill).into());
+        // Reserve the trailing actions before measuring any identity metadata.
+        let mut items: Vec<Element<'a, Message>> = vec![
+            widget::row::with_children(identity)
+                .width(Length::Fill)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        ];
         if account.present || account.snapshot.is_some() {
             items.push(refresh_control(account, now).into());
         }
@@ -4910,6 +4942,7 @@ impl Cagents {
             );
         }
         widget::row::with_children(items)
+            .width(Length::Fill)
             .spacing(space::S)
             .align_y(Alignment::Center)
             .into()
@@ -4917,8 +4950,15 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self)
+        table::view(self).map(pane_message)
     }
+}
+
+/// Preserve every callback's pane origin, including responsive children and
+/// overlays. Shared global controls and accepted task completions are not
+/// wrapped: only these completed workspace pane views use this boundary.
+pub(super) fn pane_message(message: Message) -> Message {
+    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {
@@ -5198,6 +5238,16 @@ impl State {
             state.present = true;
         }
         id
+    }
+
+    /// Changes only the synthetic in-memory registry; never writes a Store.
+    pub(super) fn set_fixture_label(&mut self, id: &AccountId, label: Option<&str>) {
+        let account = self
+            .account(id)
+            .expect("registered fixture account")
+            .account
+            .clone();
+        self.registry.set_label(&account, label.map(str::to_owned));
     }
 
     pub(super) fn snapshot_for_test(&self, id: &AccountId) -> Option<&UsageSnapshot> {
@@ -7369,7 +7419,7 @@ mod app_tests {
     #[test]
     fn project_choice_routes_new_shells_and_chats_without_changing_other_projects() {
         let directory = tempfile::tempdir().unwrap();
-        let home = directory.path().join("redact-history");
+        let home = directory.path().join("linked-account-history");
         std::fs::create_dir(&home).unwrap();
         let mut app = app_in_repo();
         let key = uuid::Uuid::new_v4();
@@ -7871,6 +7921,132 @@ mod app_tests {
         assert_eq!(app.account_ui.display_name(state), "new@example.com");
     }
 
+    /// A failed link says why, and stops saying it once the reader gives up
+    /// on the link.
+    #[test]
+    fn cancelling_a_failed_link_withdraws_its_error() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Claude)));
+        let _ = app.update(Message::AccountUi(Action::LinkReady {
+            key: uuid::Uuid::new_v4(),
+            result: Err("no credentials in that directory".into()),
+        }));
+        let notices = app
+            .notices
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(notices, ["Could not use that account home."]);
+        let _ = app.update(Message::AccountUi(Action::LinkCancel));
+        assert!(app.notices.is_empty());
+    }
+
+    /// A sign-in recovered from an earlier run is taken up quietly, but once
+    /// this run has reported on it, giving up on it says so rather than
+    /// leaving the report that cagents is still trying.
+    #[test]
+    fn a_recovered_sign_in_given_up_replaces_its_retry_warning() {
+        for reported in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let key = pending_login(&mut app, 15);
+            app.account_ui.logins[0].recovered = true;
+            if reported {
+                app.account_ui.logins[0].phase = LoginPhase::Settling;
+                app.account_ui.logins[0].attempts = 1;
+                let _ = app.update(Message::AccountUi(Action::LoginSettled {
+                    key,
+                    result: Err("reply lost".into()),
+                }));
+                assert_eq!(app.notices.len(), 1);
+            }
+            app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+            let _ = app.update(Message::AccountUi(Action::LoginVerified {
+                key,
+                outcome: Outcome::Failed("not now".into()),
+            }));
+            assert!(app.account_ui.logins.is_empty());
+            let notices = app
+                .notices
+                .recent()
+                .map(|entry| entry.notice.message.as_str())
+                .collect::<Vec<_>>();
+            if reported {
+                let gave_up = "Claude Code could not say which account signed in.";
+                assert!(
+                    matches!(notices.as_slice(), [message] if message.starts_with(gave_up)),
+                    "{notices:?}"
+                );
+            } else {
+                assert!(notices.is_empty(), "{notices:?}");
+            }
+        }
+    }
+
+    /// Each retry of a sign-in's save replaces the warning before it, and the
+    /// save that lands replaces the warning with a confirmation.
+    #[test]
+    fn a_saved_sign_in_replaces_its_retry_warning() {
+        let mut app = context_inspector_test_app(false);
+        // Confirmations count down only in the foreground window.
+        app.refresh_ui.focused = true;
+        let key = pending_login(&mut app, 14);
+        for (attempt, error) in [(1, "auth terminal is still closing"), (2, "reply lost")] {
+            app.account_ui.logins[0].phase = LoginPhase::Settling;
+            app.account_ui.logins[0].attempts = attempt;
+            let _ = app.update(Message::AccountUi(Action::LoginSettled {
+                key,
+                result: Err(error.into()),
+            }));
+        }
+        assert_eq!(
+            app.notices.len(),
+            1,
+            "a retry replaces the warning before it"
+        );
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .register(
+                registry::Registered {
+                    key,
+                    provider: Provider::Claude,
+                    linked_home: None,
+                    label: None,
+                    email: Some("new@example.com".into()),
+                    organization: None,
+                    added_at: NOW,
+                },
+                &[],
+            )
+            .unwrap();
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Registered {
+                registry,
+                identity: None,
+                snapshot: None,
+            }),
+        }));
+        let notices = app
+            .notices
+            .recent()
+            .map(|entry| (entry.notice.severity, entry.notice.message.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            [(
+                crate::app::NoticeSeverity::Success,
+                "A Claude Code account was added."
+            )]
+        );
+        // The confirmation retires on its own.
+        let due = app
+            .notices
+            .next_expiry()
+            .expect("a confirmation has a deadline");
+        app.notices.expire(due);
+        assert!(app.notices.is_empty());
+    }
+
     #[test]
     fn a_duplicate_sign_in_is_reported_and_not_listed() {
         let mut app = context_inspector_test_app(false);
@@ -8073,6 +8249,101 @@ mod app_tests {
             "a read under way is not started again"
         );
     }
+    #[test]
+    fn account_popover_header_reserves_actions_before_long_plan_metadata() {
+        use iced::advanced::{clipboard, mouse};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        let mut renderer = crate::app::tests::headless_renderer();
+        for plan in ["pro".to_owned(), "unrecognized_provider_plan_".repeat(64)] {
+            let mut app = context_inspector_test_app(false);
+            app.window_height = 600.0;
+            let shown = app.account_ui.add_managed_fixture(Provider::Claude, 9913);
+            let mut usage = UsageSnapshot::state(UsageStatus::Ok, "fixture", NOW);
+            usage.plan = Some(plan.clone());
+            app.account_ui.account_mut(&shown).unwrap().snapshot = Some(usage);
+            let account = app.account_ui.account(&shown).unwrap();
+            let content = app.account_popover_body(
+                Provider::Claude,
+                vec![app.account_details(account, NOW, Placement::Popover)],
+            );
+            let mut ui = UserInterface::build(
+                content,
+                iced::Size::new(320.0, 600.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let control = |label: &str| {
+                let found = tree
+                    .root()
+                    .iter()
+                    .chain(tree.children())
+                    .filter(|node| node.node().label() == Some(label))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "one actual {label} control for plan {plan:?}"
+                );
+                let bounds = found[0].node().bounds().expect("control geometry");
+                iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                }
+            };
+            let refresh = control("Check now");
+            let popout = control("Open in the Accounts pane");
+            for bounds in [refresh, popout] {
+                assert!(
+                    bounds.x.is_finite() && bounds.y.is_finite(),
+                    "finite target: {bounds:?}"
+                );
+                assert_eq!(
+                    bounds.width,
+                    design::COMPACT_CONTROL_SIZE,
+                    "full target for {plan:?}"
+                );
+                assert_eq!(bounds.height, design::COMPACT_CONTROL_SIZE);
+                assert!(
+                    bounds.x >= 0.0
+                        && bounds.x + bounds.width <= 320.0
+                        && bounds.y >= 0.0
+                        && bounds.y + bounds.height <= 600.0,
+                    "target stays inside actual320px popup: {bounds:?}"
+                );
+            }
+            assert!(
+                refresh.x + refresh.width <= popout.x,
+                "separate targets: {refresh:?} {popout:?}"
+            );
+            let point = popout.center();
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::AccountUi(Action::OpenPane)]),
+                "actual long-plan popout callbacks: {messages:?}"
+            );
+        }
+    }
+
     #[test]
     fn account_popover_scroll_reaches_last_account_inside_short_window() {
         use iced::advanced::{

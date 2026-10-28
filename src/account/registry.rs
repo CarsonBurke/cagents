@@ -160,6 +160,83 @@ impl Registry {
             .iter()
             .any(|pending| pending.provider == provider && pending.key == key)
     }
+    /// Credential homes affected by an externally proposed preference edit.
+    /// Include physical aliases and both ends of changed routing preferences.
+    #[cfg(feature = "host")]
+    pub(crate) fn changed_account_homes(&self, next: &Self, homes: Option<&Homes>) -> Vec<PathBuf> {
+        let mut keys = std::collections::BTreeSet::new();
+        for account in self.accounts.iter().chain(&next.accounts) {
+            if self.find(account.key) != next.find(account.key)
+                || self.is_archived(account.key) != next.is_archived(account.key)
+            {
+                keys.insert(account.key);
+            }
+        }
+        let mut paths = Vec::new();
+        for registry in [self, next] {
+            paths.extend(
+                registry
+                    .all_accounts(homes)
+                    .into_iter()
+                    .filter(|account| {
+                        account
+                            .registry_key()
+                            .is_some_and(|key| keys.contains(&key))
+                    })
+                    .filter_map(|account| account.resolved_home()),
+            );
+        }
+        for provider in Account::PROVIDERS {
+            let name = provider.executable();
+            if self.defaults.get(name) != next.defaults.get(name)
+                || self.system_labels.get(name) != next.system_labels.get(name)
+            {
+                paths.extend(
+                    [
+                        self.default_account(provider, homes),
+                        next.default_account(provider, homes),
+                    ]
+                    .into_iter()
+                    .filter_map(|account| account.resolved_home()),
+                );
+            }
+            for repository in self
+                .project_defaults
+                .keys()
+                .chain(next.project_defaults.keys())
+            {
+                let old = self
+                    .project_defaults
+                    .get(repository)
+                    .and_then(|choices| choices.get(name));
+                let new = next
+                    .project_defaults
+                    .get(repository)
+                    .and_then(|choices| choices.get(name));
+                if old != new {
+                    for value in [old, new].into_iter().flatten() {
+                        paths.extend(
+                            self.all_accounts(homes)
+                                .into_iter()
+                                .chain(next.all_accounts(homes))
+                                .filter(|account| {
+                                    account.provider == provider
+                                        && (account
+                                            .registry_key()
+                                            .map(|key| key.to_string())
+                                            .as_ref()
+                                            == Some(value)
+                                            || (value == "system" && account.is_system()))
+                                })
+                                .filter_map(|account| account.resolved_home()),
+                        );
+                    }
+                }
+            }
+        }
+        paths
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -796,8 +873,55 @@ impl Store {
         started_at: u64,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
     ) -> io::Result<(Uuid, PathBuf)> {
-        let _lifecycle = homes.lifecycle_lock()?;
-        let _lock = self.lock()?;
+        self.create_pending_with_mode(homes, provider, started_at, create, false, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_create_pending(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_pending_with_mode(homes, provider, started_at, create, true, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_create_pending_reserved(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_pending_with_mode(homes, provider, started_at, create, true, |registry| {
+            reservation
+                .verify_registry(registry)
+                .map_err(io::Error::other)
+        })
+    }
+
+    fn create_pending_with_mode(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        let _lifecycle = if nonblocking {
+            homes.try_lifecycle_lock()?
+        } else {
+            homes.lifecycle_lock()?
+        };
+        let _lock = if nonblocking {
+            self.try_lock()?
+        } else {
+            self.lock()?
+        };
         let mut registry = read(&self.path())?;
         if registry.is_newer() {
             return Err(io::Error::new(
@@ -805,6 +929,7 @@ impl Store {
                 "the accounts were saved by a newer cagents",
             ));
         }
+        validate(&registry)?;
         let (key, home) = create()?;
         registry.begin(provider, key, started_at);
         registry.version = VERSION;
@@ -817,8 +942,10 @@ impl Store {
                 write(&self.directory, &self.path(), &registry)
             });
         if let Err(error) = result {
-            let _ = homes.remove(provider, key);
-            return Err(error);
+            return Err(io::Error::other(format!(
+                "{error}; the new account home was retained at {} for recovery",
+                home.display()
+            )));
         }
         Ok((key, home))
     }
@@ -862,25 +989,67 @@ impl Store {
         account: Registered,
         system: &[(Provider, Identity)],
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        let _lifecycle = homes.lifecycle_lock()?;
-        self.update_checked(|registry| {
-            if registry.find(account.key).is_some_and(|existing| {
-                existing.provider == account.provider && existing.linked_home.is_none()
-            }) {
-                return Ok(Ok(()));
-            }
-            if !registry
-                .pending
-                .iter()
-                .any(|pending| pending.key == account.key && pending.provider == account.provider)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "The pending sign-in was removed before it completed",
-                ));
-            }
-            Ok(registry.register(account, system))
+        self.register_pending_with_mode(homes, account, system, false, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_register_pending(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        self.register_pending_with_mode(homes, account, system, true, |_| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_register_pending_reserved(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        self.register_pending_with_mode(homes, account, system, true, |registry| {
+            reservation
+                .verify_registry(registry)
+                .map_err(io::Error::other)
         })
+    }
+
+    fn register_pending_with_mode(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        let _lifecycle = if nonblocking {
+            homes.try_lifecycle_lock()?
+        } else {
+            homes.lifecycle_lock()?
+        };
+        self.update_checked_with_mode(
+            |registry| {
+                validate(registry)?;
+                if registry.find(account.key).is_some_and(|existing| {
+                    existing.provider == account.provider && existing.linked_home.is_none()
+                }) {
+                    return Ok(Ok(()));
+                }
+                if !registry.pending.iter().any(|pending| {
+                    pending.key == account.key && pending.provider == account.provider
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "The pending sign-in was removed before it completed",
+                    ));
+                }
+                Ok(registry.register(account, system))
+            },
+            nonblocking,
+        )
     }
 
     fn path(&self) -> PathBuf {
@@ -890,6 +1059,52 @@ impl Store {
     fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
+    }
+
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn hold_registry_lock_for_account_test(
+        &self,
+    ) -> io::Result<crate::instance::OwnedLock> {
+        self.lock()
+    }
+
+    fn try_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        crate::instance::owned_lock(
+            &self.directory.join(LOCK_NAME),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_load(&self) -> io::Result<Registry> {
+        let _lock = self.try_lock()?;
+        read(&self.path())
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_update<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> T,
+    ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode(|registry| Ok(change(registry)), true)
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn try_update_reserved<T>(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        change: impl FnOnce(&mut Registry) -> T,
+    ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode(
+            |registry| {
+                reservation
+                    .verify_registry(registry)
+                    .map_err(io::Error::other)?;
+                Ok(change(registry))
+            },
+            true,
+        )
     }
 
     /// The registry as it stands. A missing file is an empty registry; a
@@ -911,7 +1126,19 @@ impl Store {
         &self,
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
     ) -> io::Result<(Registry, T)> {
-        let _lock = self.lock()?;
+        self.update_checked_with_mode(change, false)
+    }
+
+    fn update_checked_with_mode<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+        nonblocking: bool,
+    ) -> io::Result<(Registry, T)> {
+        let _lock = if nonblocking {
+            self.try_lock()?
+        } else {
+            self.lock()?
+        };
         let path = self.path();
         let mut registry = read(&path)?;
         if registry.version > VERSION {
@@ -933,22 +1160,10 @@ impl Store {
         Ok((registry, result))
     }
 
-    /// Loads the registry, then finishes any removal an earlier run was
-    /// interrupted in - outside the lock, since deleting a home can take a
-    /// while and a parked home is no account's any more.
-    pub fn load_and_sweep(&self, homes: &Homes) -> io::Result<Registry> {
-        let registry = {
-            let _lifecycle = homes.lifecycle_lock()?;
-            let _lock = self.lock()?;
-            let exists = self.path().try_exists()?;
-            let registry = read(&self.path())?;
-            if exists && !registry.is_newer() {
-                homes.park_orphans(&registry)?;
-            }
-            registry
-        };
-        homes.finish_removals();
-        Ok(registry)
+    /// Discovery grants no authority to rename or delete orphan/parked homes.
+    /// Explicit cleanup requires the separate complete deletion permit cut.
+    pub fn load_and_sweep(&self, _homes: &Homes) -> io::Result<Registry> {
+        self.load()
     }
 }
 
@@ -1107,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_preserves_pending_registered_linked_and_recent_homes() {
+    fn discovery_preserves_pending_registered_linked_recent_and_unproved_orphan_homes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
@@ -1133,10 +1348,13 @@ mod tests {
             })
             .unwrap();
         store.load_and_sweep(&homes).unwrap();
-        for index in [0, 1, 2, 4] {
+        for index in [0, 1, 2, 3, 4] {
             assert!(homes_created[index].1.is_dir());
         }
-        assert!(!homes_created[3].1.exists());
+        assert!(
+            homes_created[3].1.is_dir(),
+            "orphan status grants no deletion proof"
+        );
         let recipe = account_recipe(&directory.path().join("unmanaged"));
         assert!(
             store
@@ -1147,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_finishes_an_interrupted_removal_and_a_recreated_home() {
+    fn discovery_retains_interrupted_removal_and_recreated_home_without_permit() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
@@ -1161,12 +1379,12 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
             .unwrap();
-        // A supported existing registry authorizes orphan cleanup.
+        // A supported registry still provides no actor/reader retirement proof.
         store.load().unwrap();
         write(&store.directory, &store.path(), &Registry::default()).unwrap();
         store.load_and_sweep(&homes).unwrap();
-        assert!(!home.exists());
-        assert!(!parked.exists());
+        assert_eq!(fs::read(home.join("recreated")).unwrap(), b"fixture");
+        assert_eq!(fs::read(parked.join("old-history")).unwrap(), b"fixture");
     }
 
     #[test]

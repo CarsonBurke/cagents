@@ -7,16 +7,14 @@ use crate::{
     agent_execution::{Agent, HostedSession, Lineage, Origin},
     model::TerminalId,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 /// Keeps an idempotency key that a rewritten origin would make collide out of
 /// reach: requests cannot contain control characters, so no retry matches it.
 const RETIRED_KEY_SEPARATOR: char = '\u{1f}';
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -30,11 +28,9 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
                  ON session_lineages(lineage);",
         )
         .map_err(|error| error.to_string())?;
-        seed(&tx)?;
-        tx.execute_batch("PRAGMA user_version = 4;")
-            .map_err(|error| error.to_string())?;
+        seed(tx)?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Reconstructs lineages from the sessions that were issued authority, whose
@@ -517,7 +513,16 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE session_lineages; PRAGMA user_version = 3;")
+            .execute_batch(
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
+                 DROP TABLE session_lineages; PRAGMA user_version = 3;",
+            )
             .unwrap();
         drop(registry);
 

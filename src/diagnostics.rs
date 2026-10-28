@@ -627,21 +627,68 @@ impl ProductReport {
     }
 }
 #[derive(Debug, Serialize)]
+pub struct HolderReport {
+    pub terminal: crate::model::TerminalId,
+    pub pid: i32,
+    pub kind: String,
+    pub version: Option<String>,
+    pub outdated: bool,
+    /// None means the holder changed or procfs could not be inspected.
+    pub zombie_children: Option<usize>,
+}
+
+fn observe_holders() -> (bool, Vec<HolderReport>) {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let mut readable = true;
+    let mut holders = Vec::new();
+    for kind in [Kind::Terminal, Kind::Native] {
+        match registry::observed(kind) {
+            Ok(records) => holders.extend(records.into_iter().map(|record| {
+                HolderReport {
+                    terminal: record.terminal,
+                    pid: record.holder.pid,
+                    kind: match kind {
+                        Kind::Terminal => "terminal",
+                        Kind::Native => "native",
+                    }
+                    .into(),
+                    version: record.build.as_ref().map(|build| build.version.clone()),
+                    outdated: record.is_outdated(),
+                    zombie_children: record.zombie_children().ok(),
+                }
+            })),
+            Err(_) => readable = false,
+        }
+    }
+    holders.sort_by_key(|holder| holder.pid);
+    (readable, holders)
+}
+
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub schema_version: u16,
     pub cli_version: &'static str,
     pub cli_protocol: u16,
     pub path: PathBuf,
     pub products: Vec<ProductReport>,
+    pub holders_readable: bool,
+    pub holders: Vec<HolderReport>,
 }
 impl Report {
     pub fn human(&self) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |time| time.as_millis().min(u64::MAX as u128) as u64);
+        self.human_at(now)
+    }
+
+    fn human_at(&self, now: u64) -> String {
         let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
             format!("Private diagnostics: {}", self.path.display()),
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
         for product in &self.products {
             match &product.last_observed {
-                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
+                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), {}; lifecycle {}; clean shutdown {}; persistence {}; skipped events {}; run {}", product.product.name(), last.version, last.protocol, relative_time(last.at_unix_ms, now), lifecycle_label(last.lifecycle), match last.clean_shutdown { Some(true) => "yes", Some(false) => "no", None => "unknown" }, persistence_label(last.persistence), last.skipped_events, last.run)),
                 None => lines.push(format!("{}: health unknown ({})", product.product.name(), if product.readable { "no retained evidence" } else { "evidence unavailable or invalid" })),
             }
             if let Some(failure) = product.records.iter().rev().find(|record| {
@@ -661,19 +708,155 @@ impl Report {
                 )
             }) {
                 lines.push(format!(
-                    "{}: latest retained failure at_unix_ms={}, run={}, event={:?} (historical record; may have recovered)",
-                    product.product.name(), failure.at_unix_ms, failure.run, failure.event
+                    "{}: latest retained failure {}, run {}, {} (historical record; may have recovered)",
+                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(failure.event)
                 ));
             }
+        }
+        lines.push(if self.holders_readable {
+            format!("Live holder observations: {}", self.holders.len())
+        } else {
+            "Live holder observations: partially unavailable".into()
+        });
+        for holder in &self.holders {
+            lines.push(format!(
+                "{} holder {}: terminal {}; version {}; build {}; zombie children {}",
+                holder.kind,
+                holder.pid,
+                holder.terminal,
+                holder.version.as_deref().unwrap_or("unknown"),
+                if holder.outdated {
+                    "outdated"
+                } else {
+                    "current"
+                },
+                holder
+                    .zombie_children
+                    .map_or_else(|| "unknown".into(), |count| count.to_string())
+            ));
         }
         lines.join("\n")
     }
 }
 
-/// This intentionally reads only recorded evidence, never runtime sockets,
-/// installation routes or databases. Absence is not proof of a clean shutdown.
+fn relative_time(at: u64, now: u64) -> String {
+    let seconds = at.abs_diff(now) / 1000;
+    if seconds == 0 {
+        return "just now".into();
+    }
+    let (amount, unit) = match seconds {
+        1..=59 => (seconds, "sec"),
+        60..=3599 => (seconds / 60, "min"),
+        3600..=86399 => (seconds / 3600, "hr"),
+        _ => (seconds / 86400, "day"),
+    };
+    let plural = if unit == "day" && amount != 1 {
+        "s"
+    } else {
+        ""
+    };
+    if at > now {
+        format!("in {amount} {unit}{plural}")
+    } else {
+        format!("{amount} {unit}{plural} ago")
+    }
+}
+
+fn lifecycle_label(value: Lifecycle) -> &'static str {
+    match value {
+        Lifecycle::Unknown => "unknown",
+        Lifecycle::Started => "started",
+        Lifecycle::Ready => "ready",
+        Lifecycle::StartupFailed => "startup failed",
+        Lifecycle::Panicked => "panicked",
+        Lifecycle::Exited => "exited",
+    }
+}
+
+fn persistence_label(value: Persistence) -> &'static str {
+    match value {
+        Persistence::Unknown => "unknown",
+        Persistence::Pending => "pending",
+        Persistence::Failed => "failed",
+        Persistence::Recovered => "recovered",
+        Persistence::Complete => "complete",
+    }
+}
+
+fn failure_label(value: Failure) -> &'static str {
+    match value {
+        Failure::Busy => "busy",
+        Failure::ReadOnly => "read only",
+        Failure::DiskFull => "disk full",
+        Failure::PermissionDenied => "permission denied",
+        Failure::StorageUnavailable => "storage unavailable",
+        Failure::Corrupt => "corrupt",
+        Failure::Conflict => "conflict",
+        Failure::Serialization => "serialization",
+        Failure::InvalidData => "invalid data",
+        Failure::Io => "I/O",
+        Failure::Database => "database",
+        Failure::Unknown => "unknown",
+    }
+}
+
+fn event_label(value: Event) -> String {
+    match value {
+        Event::Startup => "startup".into(),
+        Event::Ready => "ready".into(),
+        Event::StartupFailed => "startup failed".into(),
+        Event::Exit { success } => if success { "clean exit" } else { "failed exit" }.into(),
+        Event::Panic { recovered } => if recovered {
+            "panic (recovered)"
+        } else {
+            "panic (unrecovered)"
+        }
+        .into(),
+        Event::PersistenceStarted => "persistence started".into(),
+        Event::PersistenceFailed {
+            category,
+            exhausted,
+        } => format!(
+            "persistence failed: {}{}",
+            failure_label(category),
+            if exhausted {
+                " (retries exhausted)"
+            } else {
+                ""
+            }
+        ),
+        Event::PersistenceRecovered => "persistence recovered".into(),
+        Event::WriterUnavailable => "writer unavailable".into(),
+        Event::FinalFlush {
+            complete,
+            unsaved,
+            refused,
+            category,
+        } => {
+            let mut label = format!(
+                "final flush {}: {unsaved} unsaved, {refused} refused",
+                if complete { "complete" } else { "incomplete" }
+            );
+            if let Some(category) = category {
+                label.push_str(&format!("; {}", failure_label(category)));
+            }
+            label
+        }
+        Event::SettingsFailed { category } => {
+            format!("settings failed: {}", failure_label(category))
+        }
+        Event::ProtocolMismatch => "protocol mismatch".into(),
+        Event::EventsSkipped { count } => format!("{count} skipped events"),
+    }
+}
+
+/// Reads recorded lifecycle evidence and a read-only procfs snapshot of live
+/// holders. It never starts services or connects to runtime sockets. Absence
+/// of recorded evidence is not proof of a clean shutdown.
 pub fn inspect() -> io::Result<Report> {
-    inspect_at(state_path()?)
+    let mut report = inspect_at(state_path()?)?;
+    (report.holders_readable, report.holders) = observe_holders();
+    Ok(report)
 }
 fn inspect_at(path: PathBuf) -> io::Result<Report> {
     let (dir, readable) = match directory(&path, false) {
@@ -697,6 +880,8 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
+        holders_readable: true,
+        holders: Vec::new(),
     })
 }
 
@@ -871,10 +1056,49 @@ mod tests {
             Some(true)
         );
         let human = report.human();
-        assert!(human.contains("event=StartupFailed"));
-        assert!(human.contains(&format!("run={run}")));
+        assert!(human.contains("startup failed"));
+        assert!(human.contains(&format!("run {run}")));
         assert!(human.contains("historical record; may have recovered"));
-        assert!(human.contains("at_unix_ms="));
+        assert!(human.contains("clean shutdown yes"));
+        assert!(!human.contains("at_unix_ms="));
+        assert!(!human.contains("Some("));
+        assert!(!human.contains("None"));
+    }
+
+    #[test]
+    fn human_diagnostics_keep_failure_details_and_exact_json_timestamps() {
+        let (_root, path) = fixture();
+        let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder
+            .append(Event::FinalFlush {
+                complete: false,
+                unsaved: 3,
+                refused: 2,
+                category: Some(Failure::DiskFull),
+            })
+            .unwrap();
+        let report = inspect_at(path).unwrap();
+        let at = report.products[1]
+            .last_observed
+            .as_ref()
+            .unwrap()
+            .at_unix_ms;
+        let human = report.human_at(at + 180_000);
+        assert!(human.contains("3 min ago"), "{human}");
+        assert!(
+            human.contains("final flush incomplete: 3 unsaved, 2 refused; disk full"),
+            "{human}"
+        );
+        for debug in ["Some(", "None", "FinalFlush", "at_unix_ms="] {
+            assert!(!human.contains(debug), "{human}");
+        }
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["products"][1]["last_observed"]["at_unix_ms"], at);
+        assert_eq!(relative_time(at + 120_000, at), "in 2 min");
+        assert_eq!(relative_time(at, at), "just now");
+        assert_eq!(relative_time(0, 86_400_000), "1 day ago");
+        assert_eq!(relative_time(0, 172_800_000), "2 days ago");
     }
 
     #[test]
@@ -1151,6 +1375,11 @@ mod process_tests {
         };
         // The child has a private XDG state root; HOME/authority are untouched.
         crate::instance::install_panic_hook("cagents-ui");
+        #[cfg(all(feature = "ui", target_os = "linux"))]
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("no_a11y_bus")) {
+            missing_accessibility_bus_fixture(PathBuf::from(path));
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("panic")) {
             panic!(
                 "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m"
@@ -1221,6 +1450,123 @@ mod process_tests {
         assert!(!take_failure_notice());
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    fn missing_accessibility_bus_fixture(root: PathBuf) {
+        use iced_accessibility::accesskit::{
+            ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate,
+        };
+        struct Inactive;
+        impl ActivationHandler for Inactive {
+            fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+                None
+            }
+        }
+        impl ActionHandler for Inactive {
+            fn do_action(&mut self, _request: ActionRequest) {}
+        }
+        impl DeactivationHandler for Inactive {
+            fn deactivate_accessibility(&mut self) {}
+        }
+        // A completed retry demonstrates that the real context thread ran
+        // through a failed connection, rather than merely being scheduled.
+        let log_path = root.join("a11y.log");
+        let log = File::create(&log_path).unwrap();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || log.try_clone().unwrap())
+            .try_init()
+            .unwrap();
+        let _adapter = accesskit_unix::Adapter::new(Inactive, Inactive, Inactive);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let logged = std::fs::read_to_string(&log_path).unwrap();
+            if logged.contains("The D-Bus session bus is still unreachable") {
+                assert_eq!(
+                    logged
+                        .matches("The D-Bus session bus is unreachable")
+                        .count(),
+                    1
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "accessibility context did not retry the refused connection: {logged}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        record(Event::Ready);
+        record(Event::Exit { success: true });
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn missing_accessibility_bus_retries_without_recording_a_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_bus = format!("unix:path={}/no-session-bus", root.path().display());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::process_tests::subprocess_fixture",
+                "--nocapture",
+            ])
+            .env(TEST_STATE, root.path())
+            .env(TEST_MODE, "no_a11y_bus")
+            .env("XDG_STATE_HOME", root.path())
+            .env("DBUS_SESSION_BUS_ADDRESS", missing_bus)
+            .env_remove("AT_SPI_BUS_ADDRESS")
+            .env("CAGENTS_LOCAL_DEBUG", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = inspect_at(
+            root.path()
+                .join(crate::instance::STORAGE_NAME)
+                .join("diagnostics"),
+        )
+        .unwrap();
+        let product = report
+            .products
+            .iter()
+            .find(|p| p.product == Product::Ui)
+            .unwrap();
+        // Require a real startup and completed clean run; absent or rejected
+        // diagnostic storage must never count as evidence of no panic.
+        assert!(
+            product.available && product.readable && !product.records.is_empty(),
+            "diagnostic storage unavailable, unreadable, or empty: {product:?}; child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Startup))
+        );
+        assert!(
+            product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Ready))
+        );
+        assert_eq!(
+            product.last_observed.as_ref().unwrap().clean_shutdown,
+            Some(true)
+        );
+        assert!(
+            !product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Panic { .. }))
+        );
+    }
+
     #[test]
     fn sink_failure_is_nonfatal_and_reported_once_without_recursive_logging() {
         for mode in ["unsafe_file", "write_failure"] {

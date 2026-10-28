@@ -9,9 +9,10 @@
 - [Updating](#updating)
 - [Uninstall or purge](#uninstall-or-purge)
 
-The repository is private (`CarsonBurke/cagents`). Every download below needs a
-GitHub CLI account with access to it; tagged release builds stamp the
-repository into the released copy of `install.sh` automatically.
+Releases are public at [CarsonBurke/cagents](https://github.com/CarsonBurke/cagents/releases).
+The installer and the commands below use an authenticated GitHub CLI account.
+You can also download release assets directly from the releases page; tagged
+builds stamp the repository into the released copy of `install.sh` automatically.
 
 ## Requirements
 
@@ -25,7 +26,9 @@ can still be removed on older glibc systems.
 
 The `.deb` declares `git (>= 2.36)`, `libc6 (>= 2.35)`, Fontconfig, FreeType,
 GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The
-portable archive needs equivalent libraries. Git 2.36 or newer is required for
+full package also requires `libegl1` for the integrated browser; the browserless
+package does not add this dependency. The portable archive needs equivalent
+libraries. Git 2.36 or newer is required for
 NUL-delimited worktree discovery, so Ubuntu 22.04's default Git 2.34 must be
 upgraded separately. Hosted terminals need a shell, PTY support, and Linux
 `/proc`.
@@ -34,7 +37,7 @@ Interface text uses the desktop's installed fonts with Fontconfig fallbacks.
 Install Open Sans and Noto Sans Mono if they are not already available.
 
 The GitHub CLI, `gh`, is optional for local-only use but required for GitHub
-and pull-request features and for downloading releases. Install it from your
+and pull-request features and for the release installer. Install it from your
 distribution and authenticate as the same desktop user:
 
 ```sh
@@ -100,8 +103,9 @@ installer according to your own trust requirements.
 
 The installer uses your existing `gh` authentication both to select the latest
 release and to download pinned assets. It never copies tokens into its state,
-URLs, or command arguments. Missing authentication for the private canonical
-repository fails before anything is changed. Supplying both
+URLs, or command arguments. The released installer requires authentication for
+`CarsonBurke/cagents`, even though its releases are public, and fails before
+changing anything if authentication is missing. Supplying both
 `CAGENTS_ARCHIVE` and `CAGENTS_CHECKSUMS` keeps installation offline. Anonymous
 HTTPS downloads are only a fallback for explicitly selected public
 repositories.

@@ -11,16 +11,14 @@ use crate::{
     model::{MessageId, TerminalId},
 };
 use rusqlite::{
-    Connection, Row, Transaction, TransactionBehavior, params,
+    Connection, Row, TransactionBehavior, params,
     types::{ToSql, ToSqlOutput},
 };
 
 /// How many messages `cagents inbox --all` lists.
 const RECENT: usize = 50;
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -50,20 +48,17 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
                  ON messages(recipient_lineage, state, created_ms);
              CREATE INDEX IF NOT EXISTS messages_pending
                  ON messages(created_ms) WHERE state = 'pending';
-             CREATE INDEX IF NOT EXISTS messages_by_reply ON messages(reply_to);
-             PRAGMA user_version = 5;",
+             CREATE INDEX IF NOT EXISTS messages_by_reply ON messages(reply_to);",
         )
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Eligible arrival heads are notification evidence, not read receipts.
 /// Normal posts advance atomically; held replies are admitted only while
 /// still pending after release. Partial reads never manufacture an arrival.
-pub(super) fn migrate_attention(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
+pub(super) fn migrate_attention(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS mailbox_attention_heads(
         lineage TEXT PRIMARY KEY, message TEXT NOT NULL
@@ -78,11 +73,10 @@ pub(super) fn migrate_attention(db: &Connection) -> Result<(), String> {
                        OR (m.state != 'pending' AND m.settled_ms >= asked.wait_until_ms)))
                    OR (asked.id IS NULL AND m.state='pending'))
             GROUP BY m.recipient_lineage
-        );
-    PRAGMA user_version=12;",
+        );",
     )
     .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// A lineage column; NULL stands for the user.
@@ -671,9 +665,20 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -688,7 +693,13 @@ mod tests {
             .db
             .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -890,9 +901,20 @@ mod tests {
         registry.post_message(&last).unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
-        migrate_attention(&registry.db).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             last.id
@@ -1356,6 +1378,128 @@ mod tests {
         assert!(registry.received_message(Some(a), prefix).is_err());
         assert!(registry.received_message(None, prefix).is_err());
         assert!(registry.received_message(Some(b), "%").is_err());
+    }
+
+    #[test]
+    fn exact_receipts_reopen_only_consumed_full_queue_slots_and_retire_courier_candidates() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let senders = [Lineage(TerminalId::new()), Lineage(TerminalId::new())];
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        let mut original = Vec::new();
+        let mut unrelated = Vec::new();
+        for index in 0..MAX_PENDING {
+            let entry = message(party(senders[index % 2]), party(recipient), index as u64);
+            registry.post_message(&entry).unwrap();
+            original.push(entry.id);
+            let entry = message(party(senders[0]), party(other), index as u64);
+            registry.post_message(&entry).unwrap();
+            unrelated.push(entry.id);
+        }
+        let assert_full = |registry: &mut Registry, to| {
+            let refusal = registry
+                .post_message(&message(party(senders[0]), party(to), 10_000))
+                .unwrap_err();
+            assert!(refusal.contains("messages waiting"), "{refusal}");
+        };
+        assert_full(&mut registry, recipient);
+        assert_full(&mut registry, other);
+
+        let peeked = registry.peek_messages(Some(recipient), &query).unwrap();
+        assert_eq!(
+            peeked.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            original
+        );
+        assert!(peeked.iter().all(|entry| entry.state == State::Pending));
+        assert_full(&mut registry, recipient);
+
+        // A received batch can be partial. Noncontiguous exact IDs also make an
+        // accidental count-only or range-based settlement observable below.
+        let receipt = Receipt {
+            ids: vec![
+                original[0],
+                original[MAX_PENDING / 2],
+                original[MAX_PENDING - 1],
+            ],
+        };
+        let session = TerminalId::new();
+        registry
+            .acknowledge_messages(Some(recipient), Some(session), &receipt, 100)
+            .unwrap();
+        for id in &receipt.ids {
+            let settled = registry.message(*id).unwrap().unwrap();
+            assert_eq!(settled.state, State::Read);
+            assert_eq!(settled.to.session, Some(session));
+        }
+        let mut expected: Vec<_> = original
+            .into_iter()
+            .filter(|id| !receipt.ids.contains(id))
+            .collect();
+        assert_eq!(
+            registry
+                .peek_messages(Some(recipient), &query)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for index in 0..receipt.ids.len() {
+            let entry = message(party(senders[1]), party(recipient), 200 + index as u64);
+            registry.post_message(&entry).unwrap();
+            expected.push(entry.id);
+        }
+        assert_full(&mut registry, recipient);
+        assert_full(&mut registry, other);
+
+        // A repeated read receipt cannot buy more capacity or settle newer mail.
+        registry
+            .acknowledge_messages(Some(recipient), Some(session), &receipt, 300)
+            .unwrap();
+        assert_full(&mut registry, recipient);
+
+        // Walk every courier candidate, since selection returns only the oldest
+        // pending message per lineage. No provider or live mailbox is involved.
+        let mut courier_ids = Vec::new();
+        for _ in 0..MAX_PENDING {
+            let next = registry
+                .deliverable_messages(400)
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|entry| entry.to.lineage == Some(recipient))
+                .expect("every unconsumed message remains courier-eligible");
+            assert!(!receipt.ids.contains(&next.id));
+            assert!(registry.deliver_message(next.id, session, 400).unwrap());
+            courier_ids.push(next.id);
+        }
+        assert_eq!(courier_ids, expected);
+        assert!(
+            registry
+                .deliverable_messages(400)
+                .unwrap()
+                .0
+                .iter()
+                .all(|entry| entry.to.lineage != Some(recipient))
+        );
+        let other_pending = registry.peek_messages(Some(other), &query).unwrap();
+        assert_eq!(
+            other_pending
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            unrelated
+        );
+        assert!(
+            other_pending
+                .iter()
+                .all(|entry| entry.state == State::Pending)
+        );
+        assert_full(&mut registry, other);
     }
 
     #[test]
