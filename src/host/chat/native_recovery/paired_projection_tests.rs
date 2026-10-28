@@ -1298,6 +1298,13 @@ fn provider() {
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
+                // Startup now observes Goal state before update readiness can
+                // settle. Answer that read on the same exact fixture thread;
+                // unexpected mutations remain a provider-fixture failure.
+                "thread/goal/get" => {
+                    assert_eq!(frame["params"]["threadId"].as_str(), Some(THREAD));
+                    json!({"goal":null})
+                }
                 "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
                 "thread/turns/list" | "thread/queue/list" | "thread/list" => {
                     json!({"data":[],"nextCursor":null})
