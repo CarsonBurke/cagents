@@ -68,9 +68,16 @@ fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
     Arc::new(values)
 }
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
-struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>,pending_copy:Mutex<Option<std::sync::Weak<CopyInput>>>}
 struct Disclosure {epoch:SourceEpoch,rehydrating:bool}
-impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,loaded:None,restored:None,error:None}}}
+impl Entry {
+    fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,loaded:None,restored:None,error:None,pending_copy:Mutex::new(None)}}
+    fn withdraw_copy(&self) {
+        let previous=self.pending_copy.lock().unwrap_or_else(|error|error.into_inner()).take();
+        if let Some(input)=previous.and_then(|input|input.upgrade()) {clipboard_intent::Pending::withdraw(input.as_ref());}
+    }
+}
+impl Drop for Entry {fn drop(&mut self) {self.withdraw_copy();}}
 #[derive(Default)]
 pub(super) struct State {intents:disclosure_intent::Cache<Key,Disclosure>,entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
@@ -84,6 +91,7 @@ impl State {
     pub(super) fn evict(&mut self) {
         let mut changed=false;
         for entry in self.entries.values_mut() {
+            entry.withdraw_copy();
             let mut entry_changed=entry.attempt.take().is_some();
             if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;entry.error=None;retire_loaded(loaded);entry_changed=true;}
             if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);entry_changed=true;}
@@ -148,7 +156,7 @@ impl State {
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
             match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.rehydrating=false;entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
+        } else {entry.withdraw_copy();entry.rehydrating=false;entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
         entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
@@ -323,6 +331,7 @@ fn retire_loaded(loaded:Loaded) {
     let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record,loaded.prefixes));
 }
 fn retire_entry(mut entry:Entry) {
+    entry.withdraw_copy();
     if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}
     if let Some(text)=entry.restored.take() {retire(text);}
 }
@@ -349,8 +358,11 @@ impl Drop for CopyInput {fn drop(&mut self) {if let Some(text)=self.0.get_mut().
 pub(super) fn copy(runtime:&Runtime,item:&str,field:RawSourceField,intent:clipboard_intent::Intent)->Task<Message> {
     if !intent.current() {return Task::none();}
     let Some(key)=runtime.raw_original.key(item,field) else {return Task::none();};
-    let Some(loaded)=runtime.raw_original.entries.get(&key).and_then(|entry|entry.loaded.as_ref()) else {return Task::none();};
+    let Some(entry)=runtime.raw_original.entries.get(&key) else {return Task::none();};let Some(loaded)=entry.loaded.as_ref() else {return Task::none();};
     let proof=loaded.record.clone();let input=Arc::new(CopyInput(Mutex::new(Some(loaded.view.text.clone()))));intent.register(&input);
+    // Keep only the newest input; release bookkeeping before withdrawal can retire its body.
+    let previous=entry.pending_copy.lock().unwrap_or_else(|error|error.into_inner()).replace(Arc::downgrade(&input));
+    if let Some(previous)=previous.and_then(|input|input.upgrade()) {clipboard_intent::Pending::withdraw(previous.as_ref());}
     let target=runtime.target;let context=runtime.raw_original.context;
     Task::perform(async move {
         let current=intent.clone();
@@ -682,6 +694,72 @@ mod tests {
         let runtime=app.chat_runtime_mut(target).unwrap();assert_eq!(runtime.raw_original.retained_bytes(),0);
         assert!(runtime.raw_original.entries.values().all(|entry|!entry.opened));
         assert!(runtime.copied.is_none(),"a current clipboard intent cannot authorize a revoked source");
+    }
+
+    #[tokio::test]
+    async fn queued_copy_releases_body_on_hide_reset_collapse_omission_replacement_and_drop() {
+        use iced::futures::{FutureExt as _,StreamExt as _};
+        for revoke in 0..7 {
+            let text=r#"{ "secret": "queued original input" }"#;let(mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+            toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+            let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+            complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);flush();
+            let body=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+            let readers=chat::source_owners::readers().clone().acquire_many_owned(2).await.unwrap();
+            let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+            let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+            let mut stream=iced::runtime::task::into_stream(task).unwrap();
+            // Task::stream yields once before polling its copy future. Poll past that yield into the blocked reader acquisition.
+            for _ in 0..2 {assert!(stream.next().now_or_never().is_none());}
+            assert!(body.upgrade().is_some(),"queued copy starts with the current body");
+            if revoke==6 {drop(app.cards.remove(&target.card));} else {
+                let runtime=app.chat_runtime_mut(target).unwrap();
+                match revoke {
+                    0=>{let _=runtime.set_visible(false);},
+                    1=>runtime.forget_transcript(),
+                    2=>toggle(runtime,&part.item_id,part.field,false),
+                    3=>{Arc::make_mut(&mut runtime.snapshot).raw_source_parts.clear();sync(runtime);},
+                    4=>{Arc::make_mut(&mut runtime.snapshot).raw_source_parts[0].epoch.revision+=1;sync(runtime);},
+                    5=>runtime.raw_original=State::default(),
+                    _=>unreachable!(),
+                }
+            }
+            flush();assert!(body.upgrade().is_none(),"revocation {revoke} releases the body while the copy future and both reader permits remain alive");
+            assert!(stream.next().now_or_never().is_none(),"copy still waits for a reader after revocation");drop(readers);
+            let completed=tokio::time::timeout(Duration::from_secs(5),async {
+                while let Some(event)=stream.next().await {if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::RawOriginalCopied(..))))=event {return action;}}
+                panic!("copy task ended without completion")
+            }).await.expect("withdrawn copy completes after reader release");
+            if let Action::RawOriginalCopied(_,_,_,reply)=&completed {assert!(reply.0.value.lock().unwrap().as_ref().unwrap().is_err());}
+            assert_eq!(app.handle_chat_ui(completed).units(),0,"revoked copy cannot write the clipboard");
+            if let Some(runtime)=app.chat_runtime_mut(target) {assert!(runtime.copied.is_none());}
+        }
+    }
+    #[tokio::test]
+    async fn withdrawn_copy_does_not_cancel_reopened_same_source_copy() {
+        use iced::futures::{FutureExt as _,StreamExt as _};
+        let text=r#"{ "exact": "reopened original input" }"#;let(mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);flush();
+        let body=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+        let readers=chat::source_owners::readers().clone().acquire_many_owned(2).await.unwrap();
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+        let mut old=iced::runtime::task::into_stream(task).unwrap();for _ in 0..2 {assert!(old.next().now_or_never().is_none());}
+        let runtime=app.chat_runtime_mut(target).unwrap();toggle(runtime,&part.item_id,part.field,false);flush();assert!(body.upgrade().is_none());drop(readers);
+        toggle(runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);flush();
+        let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+        let mut new=iced::runtime::task::into_stream(task).unwrap();drop(old);flush();
+        let completed=tokio::time::timeout(Duration::from_secs(5),async {
+            while let Some(event)=new.next().await {if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::RawOriginalCopied(..))))=event {return action;}}
+            panic!("reopened copy task ended without completion")
+        }).await.expect("reopened source copy completes");
+        if let Action::RawOriginalCopied(_,_,_,reply)=&completed {assert_eq!(reply.0.value.lock().unwrap().as_ref().unwrap().as_ref().unwrap().text,text);} else {unreachable!()}
+        assert!(app.handle_chat_ui(completed).units()>0,"current reopened source can issue its clipboard write");
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
     }
 
     #[test]
