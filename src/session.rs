@@ -2160,6 +2160,21 @@ impl PendingWrites {
         Ok(())
     }
 
+    /// Every full workspace transaction receives the same ordered projection.
+    /// Enqueue provenance applies first; existing account/upgrade rebindings
+    /// and independently committed retained copies must survive as well.
+    fn project_snapshot(
+        &self,
+        snapshot: &mut Arc<WorkspaceState>,
+        bindings: &[ResumeSnapshotBinding],
+    ) -> Result<(), StoreError> {
+        for binding in bindings {
+            binding.project(snapshot);
+        }
+        self.translate_chat_rebindings(snapshot);
+        self.project_retained_chat_copies(snapshot)
+    }
+
     fn acknowledge_retained_copy_closures(&mut self, snapshot: &WorkspaceState) {
         self.retained_chat_copies.retain(|id, _| {
             !snapshot
@@ -2217,11 +2232,7 @@ impl PendingWrites {
                     recovery,
                     reply,
                 } => {
-                    for binding in bindings {
-                        binding.project(&mut snapshot);
-                    }
-                    self.translate_chat_rebindings(&mut snapshot);
-                    if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
+                    if let Err(error) = self.project_snapshot(&mut snapshot, &bindings) {
                         let _ = reply.send(Err(error.to_string()));
                         continue;
                     }
@@ -2307,8 +2318,9 @@ impl PendingWrites {
                     replacement,
                     reply,
                 } => {
-                    for binding in bindings {
-                        binding.project(&mut snapshot);
+                    if let Err(error) = self.project_snapshot(&mut snapshot, &bindings) {
+                        let _ = reply.send(Err(error.to_string()));
+                        continue;
                     }
                     let result = store.save_chat_resume(
                         &snapshot,
@@ -2386,11 +2398,7 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::Snapshot(mut snapshot) => {
-                    for binding in &bindings {
-                        binding.project(&mut snapshot);
-                    }
-                    self.translate_chat_rebindings(&mut snapshot);
-                    if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
+                    if let Err(error) = self.project_snapshot(&mut snapshot, &bindings) {
                         self.quarantine.refuse_workspace(snapshot, &error);
                         continue;
                     }
@@ -2440,11 +2448,12 @@ impl PendingWrites {
     fn reject_queued_terminal_recoveries(&mut self, error: &StoreError) {
         self.conversions = std::mem::take(&mut self.conversions).into_iter().filter_map(|checkpoint| {
             Some(match checkpoint {
-                ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, reply, .. } => {
+                ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, bindings, reply, .. } => {
                     let _ = reply.send(Err(format!(
                         "Recovery could not begin because an earlier session write failed: {error}. Retry save, then review recovery again."
                     )));
-                    ConversionCheckpoint::Snapshot(snapshot)
+                    if bindings.is_empty() { ConversionCheckpoint::Snapshot(snapshot) }
+                    else { ConversionCheckpoint::ResumeSnapshot { snapshot, bindings } }
                 }
                 ConversionCheckpoint::ChatResume { reply, .. } => {
                     let _ = reply.send(Err(format!(
@@ -4947,7 +4956,13 @@ mod tests {
 
     #[test]
     fn prepared_resume_queue_coalescing_binds_only_its_operation_and_keeps_late_content() {
-        for scenario in ["active", "closed", "failed", "aba"] {
+        for scenario in [
+            "active",
+            "closed",
+            "failed",
+            "aba",
+            "rejected terminal recovery",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let store = StateStore::open(
                 directory.path().join("resume.sqlite3"),
@@ -5053,7 +5068,39 @@ mod tests {
                 // The final deliberateA carries no old operation provenance.
                 queue.offer_snapshot(Arc::new(late.clone()), Vec::new());
             }
-            writes.conversions.push_back(queue.take_latest().unwrap());
+            let latest = queue.take_latest().unwrap();
+            if scenario == "rejected terminal recovery" {
+                // B really commits before an unrelated write error rejects a
+                // queued terminal repair. Its inert full snapshot still owns
+                // the enqueue tag and must retain the latest draft/images.
+                assert!(writes.flush(&store).is_empty());
+                let ConversionCheckpoint::ResumeSnapshot { snapshot, bindings } = latest else {
+                    panic!("tagged snapshot");
+                };
+                let (reply, refusal) = std::sync::mpsc::sync_channel(1);
+                writes
+                    .conversions
+                    .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                        snapshot,
+                        bindings,
+                        recovery: crate::persistence::TerminalPaneAdoption {
+                            canonical: CardId::new(),
+                            alias: CardId::new(),
+                            terminal: TerminalId::new(),
+                        },
+                        reply,
+                    });
+                writes.reject_queued_terminal_recoveries(&StoreError::Io(
+                    std::io::Error::from_raw_os_error(libc::ENOSPC),
+                ));
+                assert!(refusal.recv().unwrap().is_err());
+                assert!(matches!(
+                    writes.conversions.front(),
+                    Some(ConversionCheckpoint::ResumeSnapshot { .. })
+                ));
+            } else {
+                writes.conversions.push_back(latest);
+            }
             let _ = writes.flush(&store);
             assert_eq!(receipt.recv().unwrap().is_ok(), scenario != "failed");
             let stored = store.load_workspace(original.id, None).unwrap().unwrap();
@@ -5195,6 +5242,159 @@ mod tests {
         assert_eq!(stored.chat_drafts, state.chat_drafts);
         drop((first_owner, second_owner));
         writer.shutdown();
+    }
+
+    #[test]
+    fn prepared_resume_projects_earlier_account_recovery_and_retained_copy_before_ack() {
+        for earlier in ["account", "copy", "copy refusal"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut writer, _) = SessionRuntime::open(
+                directory.path().join("mixed.sqlite3"),
+                BootId::new("resume-boot"),
+            )
+            .unwrap();
+            let mut state = workspace();
+            let first = state.cards[0].id;
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: "fixture-host".into(),
+                    boot_id: "resume-boot".into(),
+                    host_incarnation: "fixture-incarnation".into(),
+                }),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: Some("77777777-1111-4111-8111-111111111111".into()),
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: vec![],
+                        working_directory: "/project".into(),
+                        environment: BTreeMap::new(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            state.cards[0].kind = CardKind::Chat(source.clone());
+            let mut other = state.cards[0].clone();
+            other.id = CardId::new();
+            let second = other.id;
+            let mut source2 = source.clone();
+            source2.id = TerminalId::new();
+            source2.launch.provider = crate::agent::Provider::Codex;
+            source2.launch.recipe.program = "codex".into();
+            source2
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), "/accounts/original".into());
+            other.kind = CardKind::Chat(source2.clone());
+            state.cards.push(other);
+            state
+                .chat_drafts
+                .insert(first, "Resume draft stays unsent".into());
+            writer.snapshot(Arc::new(state.clone()));
+            writer.flush(Duration::from_secs(10)).unwrap();
+            let mut recovered = source2.clone();
+            recovered.id = TerminalId::new();
+            recovered
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), "/accounts/recovered".into());
+            let mut copy_card = state.cards[1].clone();
+            copy_card.id = CardId::new();
+            let copy = crate::persistence::RetainedChatCopy {
+                workspace: state.id,
+                source_card: second,
+                source: source2.clone(),
+                copy: copy_card,
+                draft: "Retained exact draft  \nUnicode 🦀".into(),
+                attachments: Vec::new(),
+                scope: None,
+                channel: None,
+            };
+            let earlier_receipt = if earlier == "account" {
+                writer
+                    .rebind_chat_account(second, source2, recovered.clone())
+                    .unwrap()
+            } else {
+                writer.preserve_chat_copy(copy.clone()).unwrap()
+            };
+            // Capture before either UI receipt: C remains in the snapshot and
+            // the separately committed retained copy is not yet present.
+            let mut successor = source.clone();
+            successor.id = TerminalId::new();
+            let mut prepared = state.clone();
+            prepared.cards[0].kind = CardKind::Chat(successor.clone());
+            if earlier == "copy refusal" {
+                let mut wrong = copy.copy.clone();
+                let CardKind::Chat(source) = &mut wrong.kind else {
+                    unreachable!()
+                };
+                source.id = TerminalId::new();
+                prepared.cards.push(wrong);
+            }
+            let (receipt, _, owner) = writer
+                .save_chat_resume(Arc::new(prepared), first, source.clone(), successor.clone())
+                .unwrap();
+            earlier_receipt
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let result = receipt.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(result.is_ok(), earlier != "copy refusal");
+            let stored = writer
+                .operation_store()
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .cards
+                    .iter()
+                    .find(|card| card.id == first)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(if earlier == "copy refusal" {
+                    source
+                } else {
+                    successor
+                })
+            );
+            assert_eq!(
+                stored.chat_drafts.get(&first),
+                state.chat_drafts.get(&first)
+            );
+            if earlier == "account" {
+                assert_eq!(
+                    stored
+                        .cards
+                        .iter()
+                        .find(|card| card.id == second)
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(recovered)
+                );
+            } else {
+                assert!(
+                    stored
+                        .cards
+                        .iter()
+                        .find(|card| card.id == copy.copy.id)
+                        .unwrap()
+                        .existence
+                        .is_open(),
+                    "a later full resume snapshot cannot tombstone an acknowledged local copy"
+                );
+                assert_eq!(stored.chat_drafts.get(&copy.copy.id), Some(&copy.draft));
+                assert!(stored.local_only_cards.contains(&copy.copy.id));
+            }
+            drop(owner);
+            writer.shutdown();
+        }
     }
 
     #[test]
