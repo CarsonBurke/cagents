@@ -1942,7 +1942,7 @@ mod tests {
     fn device_key_listener_preserves_directory_text_and_enter_submission() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.device_ui.open = true;
-        let mut text = super::super::dialog_ui::tests::key_press(keyboard::key::Named::Space);
+        let mut text = super::super::dialog_ui::tests::key_press(keyboard::key::Named::Enter);
         if let keyboard::Event::KeyPressed {
             key,
             modified_key,

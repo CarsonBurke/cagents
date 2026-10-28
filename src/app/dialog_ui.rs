@@ -683,7 +683,7 @@ pub(super) mod tests {
                         "scene={scene}, daemon={daemon}: restored focus {actual:?}"
                     ));
                 }
-                let mut typing = key_press(keyboard::key::Named::Space);
+                let mut typing = key_press(keyboard::key::Named::Enter);
                 if let keyboard::Event::KeyPressed {
                     key,
                     modified_key,
