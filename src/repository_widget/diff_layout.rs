@@ -426,11 +426,17 @@ impl DiffLayout {
     }
 
     pub fn set_row_height(&mut self, height: f32) {
-        if self.row_height == height { return; }
+        if self.row_height == height {
+            return;
+        }
         self.row_height = height;
         for (index, rows) in self.offsets.iter_mut().enumerate() {
             let leading = rows.leading_height();
-            let annotations = rows.annotations().iter().map(|(row, height)| (*row, *height)).collect::<Vec<_>>();
+            let annotations = rows
+                .annotations()
+                .iter()
+                .map(|(row, height)| (*row, *height))
+                .collect::<Vec<_>>();
             *rows = RowOffsets::uniform(self.folded[index].len(), height);
             rows.annotate(leading, &annotations);
         }

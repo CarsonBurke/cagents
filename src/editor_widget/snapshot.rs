@@ -362,15 +362,6 @@ impl TextSnapshot {
             serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
-    pub fn len(&self) -> usize {
-        self.root.as_ref().map_or(0, |root| root.bytes())
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub fn line_count(&self) -> usize {
-        self.root.as_ref().map_or(0, |root| root.lines())
-    }
     /// Shares immutable lines while giving a consumer its own empty text
     /// cache. Protocol history must not retain a full string cached by a diff.
     pub fn without_cached_text(&self) -> Self {
@@ -415,6 +406,15 @@ impl TextSnapshot {
         let mut result = self.clone();
         result.replace_lines(start.line, end.line + 1, lines);
         Some(result)
+    }
+    pub fn len(&self) -> usize {
+        self.root.as_ref().map_or(0, |root| root.bytes())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn line_count(&self) -> usize {
+        self.root.as_ref().map_or(0, |root| root.lines())
     }
     /// A shape-independent, constant-time inequality hint. A matching hint
     /// must be confirmed by same_text; it is deliberately not an identity.

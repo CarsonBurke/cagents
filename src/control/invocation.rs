@@ -206,9 +206,22 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
         return None;
     }
     let data = &envelope["data"];
-    let run = data
+    let run_data = if expected == "agent.wait" {
+        if matches!(kind, Kind::Act(Act::Wait { agents }) if agents.len() == 1) {
+            data.get("results")
+                .and_then(Value::as_array)
+                .filter(|results| results.len() == 1)
+                .and_then(|results| results.first())
+                .unwrap_or(data)
+        } else {
+            data
+        }
+    } else {
+        data
+    };
+    let run = run_data
         .get("agent")
-        .zip(data.get("run"))
+        .zip(run_data.get("run"))
         .and_then(|(agent, run)| {
             let agent: crate::agent_execution::Agent =
                 serde_json::from_value(agent.clone()).ok()?;
@@ -482,6 +495,30 @@ mod tests {
             },
         };
         serde_json::json!({"ok": true, "command": command, "data": {"agent": agent, "run": run, "timed_out": false}})
+    }
+
+    #[test]
+    fn single_handle_wait_reads_the_normalized_results_array() {
+        let wait = parse("cagents --json agent wait reviewer", None).unwrap();
+        let original = json_run("agent.wait", Some("gpt-6-luna"));
+        let output = serde_json::json!({"ok": true, "command": "agent.wait", "data": {
+            "results": [{"agent": original["data"]["agent"], "run": original["data"]["run"], "outcome": "succeeded"}],
+            "timed_out": false, "ended_by": "runs", "outcome": "succeeded", "unresolved_runs": []
+        }});
+        let result = super::outcome(&wait, &output.to_string());
+        let run = result.run.unwrap();
+        assert_eq!(run.result, "Reviewed.");
+        assert_eq!(run.state, Some(crate::agent_execution::State::Succeeded));
+        assert_eq!(run.model, "gpt-6-luna");
+        let multiple = parse("cagents --json agent wait reviewer implementer", None).unwrap();
+        let mut partial = output;
+        partial["data"]["unresolved_runs"] = serde_json::json!(["second-run"]);
+        partial["data"]["timed_out"] = serde_json::json!(true);
+        assert!(
+            super::outcome(&multiple, &partial.to_string())
+                .run
+                .is_none()
+        );
     }
 
     #[test]
