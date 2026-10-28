@@ -2809,6 +2809,9 @@ where
             button @ (mouse::Button::Back | mouse::Button::Forward),
         )) = event
             && cursor.is_over(layout.bounds())
+            && cursor
+                .position()
+                .is_some_and(|point| _viewport.contains(point))
             && state.focus.is_some()
             && let Some(on_navigation) = &self.on_navigation
         {
@@ -5843,6 +5846,75 @@ mod tests {
                     (content.text(), content.cursor(), content.selection()),
                     before
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_history_navigation_belongs_only_to_the_visible_focused_editor() {
+        #[derive(Debug)]
+        enum Message {
+            Edit(Action),
+            Navigate(bool),
+        }
+        let renderer = headless_renderer();
+        let content = Content::with_text("selected text\n");
+        let size = Size::new(600.0, 200.0);
+        let viewport = Rectangle::with_size(Size::new(250.0, 200.0));
+        for focused in [false, true] {
+            for (point, visible) in [
+                (Point::new(400.0, 60.0), false),
+                (Point::new(60.0, 60.0), true),
+            ] {
+                for (button, forward) in
+                    [(mouse::Button::Back, false), (mouse::Button::Forward, true)]
+                {
+                    let mut editor: TextEditor<'_, highlighter::PlainText, Message> =
+                        TextEditor::new(&content)
+                            .height(Length::Fill)
+                            .on_action(Message::Edit)
+                            .on_navigation(Message::Navigate);
+                    let mut tree = widget::Tree::new(
+                        &editor as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>,
+                    );
+                    let node =
+                        editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+                    assert!(node.bounds().contains(point));
+                    tree.state
+                        .downcast_mut::<State<highlighter::PlainText>>()
+                        .focus = focused.then(Focus::now);
+                    let before = (content.text(), content.cursor(), content.selection());
+                    let mut published = Vec::new();
+                    let mut shell = Shell::new(&mut published);
+                    editor.update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(button)),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(point),
+                        &renderer,
+                        &mut cosmic::iced::advanced::clipboard::Null,
+                        &mut shell,
+                        &viewport,
+                    );
+                    let captured = shell.is_event_captured();
+                    drop(shell);
+                    if visible && focused {
+                        assert!(
+                            matches!(published.as_slice(), [Message::Navigate(value)] if *value == forward)
+                        );
+                        assert!(captured);
+                    } else {
+                        assert!(
+                            published.is_empty(),
+                            "clipped/unfocused editor emitted {published:?}"
+                        );
+                        assert!(!captured, "another control owns this history button");
+                    }
+                    assert_eq!(
+                        (content.text(), content.cursor(), content.selection()),
+                        before
+                    );
+                }
             }
         }
     }

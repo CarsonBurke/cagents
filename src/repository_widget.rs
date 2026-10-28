@@ -2258,7 +2258,6 @@ pub struct RepositoryRuntime {
     undo_lru: crate::editor_navigation::UndoLru,
     locations: crate::editor_navigation::Locations,
     navigating_history: bool,
-    pending_jump_origin: Option<crate::editor_navigation::Location>,
     go_to_line: Option<String>,
     pending_scalar_location: Option<(PathBuf, usize, usize)>,
     pending_source_location: Option<(PathBuf, usize)>,
@@ -2518,7 +2517,6 @@ impl RepositoryRuntime {
             undo_lru: crate::editor_navigation::UndoLru::default(),
             locations: crate::editor_navigation::Locations::default(),
             navigating_history: false,
-            pending_jump_origin: None,
             go_to_line: None,
             pending_scalar_location: None,
             pending_source_location: None,
@@ -3420,7 +3418,6 @@ impl RepositoryRuntime {
             self.committed_selection = None;
             self.undo_lru = crate::editor_navigation::UndoLru::default();
             self.locations = crate::editor_navigation::Locations::default();
-            self.pending_jump_origin = None;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
@@ -3758,6 +3755,14 @@ impl RepositoryRuntime {
     /// carries UTF-16 code units, and this runtime has no way to tell the two
     /// apart from an [`LspPosition`] alone.
     pub fn move_cursor_to(&mut self, at: LspPosition) -> bool {
+        self.move_cursor_from(at, None)
+    }
+
+    pub(crate) fn move_cursor_from(
+        &mut self,
+        at: LspPosition,
+        origin: Option<crate::editor_navigation::Location>,
+    ) -> bool {
         let (position, path) = match &self.document {
             DocumentState::Editable(document) => {
                 let Some(position) = caret_for_position(&document.content, at) else {
@@ -3769,18 +3774,21 @@ impl RepositoryRuntime {
         };
         self.language
             .retire_completions(&mut self.completion_intent);
-        self.record_location_jump(crate::editor_navigation::Location {
-            path,
-            cursor: text_editor::Cursor {
-                position,
-                selection: None,
+        self.record_location_jump_from(
+            crate::editor_navigation::Location {
+                path,
+                cursor: text_editor::Cursor {
+                    position,
+                    selection: None,
+                },
+                scroll: text_editor::ScrollPosition {
+                    line: position.line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                },
             },
-            scroll: text_editor::ScrollPosition {
-                line: position.line.saturating_sub(10),
-                vertical: 0.0,
-                horizontal: 0.0,
-            },
-        });
+            origin,
+        );
         if let DocumentState::Editable(document) = &mut self.document {
             document.history.seal();
             document.content.set_cursor(text_editor::Cursor {
@@ -7925,7 +7933,7 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
-    fn current_location(&self) -> Option<crate::editor_navigation::Location> {
+    pub(crate) fn current_location(&self) -> Option<crate::editor_navigation::Location> {
         let DocumentState::Editable(document) = &self.document else {
             return None;
         };
@@ -7945,21 +7953,35 @@ impl RepositoryRuntime {
         })
     }
 
-    pub fn remember_jump_origin(&mut self) {
-        self.pending_jump_origin = self.current_location();
+    fn record_location_jump(&mut self, target: crate::editor_navigation::Location) {
+        self.record_location_jump_from(target, None);
     }
 
-    fn record_location_jump(&mut self, target: crate::editor_navigation::Location) {
+    fn record_location_jump_from(
+        &mut self,
+        target: crate::editor_navigation::Location,
+        origin: Option<crate::editor_navigation::Location>,
+    ) {
         if self.navigating_history {
             return;
         }
-        if let Some(origin) = self
-            .pending_jump_origin
-            .take()
-            .or_else(|| self.current_location())
-        {
+        if let Some(origin) = origin.or_else(|| self.current_location()) {
             self.locations.jump(origin, target);
         }
+    }
+
+    pub(crate) fn selected_read_identity(&self, card: CardId) -> Option<AsyncIdentity> {
+        self.selected
+            .as_ref()
+            .map(|file| self.current_identity(card, file.path.clone()))
+    }
+
+    pub(crate) fn retains_lsp_jump(&self, identity: &AsyncIdentity) -> bool {
+        self.accepts_selected(identity)
+            && matches!(
+                self.document,
+                DocumentState::Loading { .. } | DocumentState::Editable(_)
+            )
     }
 
     fn navigate_location(&mut self, card: CardId, forward: bool) -> Task<RepositoryAction> {
