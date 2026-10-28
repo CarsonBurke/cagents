@@ -18493,7 +18493,13 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    crate::interaction::layer(content, edge.into())
+                    // Keep this foreground slot stable across transition
+                    // frames; only its small window-control leaf comes/goes.
+                    let foreground = crate::interaction::layer(
+                        edge.into(),
+                        self.docked_transition_window_header(),
+                    );
+                    crate::interaction::layer(content, foreground)
                 }
                 InspectorLayout::Overlay => {
                     let inspector_surface = crate::interaction::layer(

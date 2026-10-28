@@ -32,6 +32,8 @@ fn fixture(with_card: bool, width: f32) -> (Cagents, window::Id) {
 
 struct Probe {
     close: Vec<Point>,
+    minimize: Vec<Point>,
+    maximize: Vec<Point>,
     toggle: Vec<Rectangle>,
 }
 
@@ -73,6 +75,8 @@ fn probe(app: &Cagents, renderer: &cosmic::Renderer, window: window::Id) -> Prob
         }
     }
     let mut close = Vec::new();
+    let mut minimize = Vec::new();
+    let mut maximize = Vec::new();
     for point in points {
         let mut element = cosmic::ApplicationExt::view_main(app);
         let mut tree = Tree::new(element.as_widget());
@@ -123,8 +127,29 @@ fn probe(app: &Cagents, renderer: &cosmic::Renderer, window: window::Id) -> Prob
             );
             close.push(point);
         }
+        if messages.iter().any(|message| {
+            matches!(
+                message,
+                cosmic::Action::App(Message::NativeWindowAction(cosmic::app::Action::Minimize))
+            )
+        }) {
+            minimize.push(point);
+        }
+        if messages.iter().any(|message| {
+            matches!(
+                message,
+                cosmic::Action::App(Message::NativeWindowAction(cosmic::app::Action::Maximize))
+            )
+        }) {
+            maximize.push(point);
+        }
     }
-    Probe { close, toggle }
+    Probe {
+        close,
+        minimize,
+        maximize,
+        toggle,
+    }
 }
 
 #[test]
@@ -170,6 +195,19 @@ fn docked_collapsing_and_closed_headers_keep_exactly_one_working_close() {
     assert_eq!(app.context_inspector_mount(), None);
     assert_eq!(probe(&app, &renderer, window).close.len(), 1);
     assert!(app.workspace_header_width() > docked_width);
+
+    // Opening owns the same in-flight header: a saved-open preference or
+    // close-only handoff cannot make the partially revealed copy interactive.
+    drop(app.update(Message::ToggleContextInspector));
+    let opening = app.context_inspector_transition.expect("a real opening");
+    app.frame_clock
+        .start(opening.started_at + opening.duration() / 2);
+    assert!(app.context_inspector_open);
+    assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+    assert_eq!(probe(&app, &renderer, window).close.len(), 1);
+    assert_eq!(app.workspace_header_width(), docked_width);
+    drop(app.advance_context_inspector_transition(opening.started_at + opening.duration()));
+    assert_eq!(probe(&app, &renderer, window).close.len(), 1);
 }
 
 fn assert_overlay_close_is_above_the_inspector(
@@ -234,5 +272,73 @@ fn actual_close_buttons_respect_core_policy_and_the_original_window_identity() {
         assert!(probe(&app, &renderer, window).close.is_empty());
         app.core.set_main_window_id(Some(window));
         assert_eq!(probe(&app, &renderer, window).close.len(), 1);
+    }
+}
+
+#[test]
+fn docked_transition_controls_survive_zero_and_clipped_width_for_both_inspector_headers() {
+    let renderer = crate::app::tests::headless_renderer();
+    for work_header in [false, true] {
+        let (mut app, window) = fixture(true, 1600.0);
+        app.core.window.show_minimize = true;
+        app.core.window.show_maximize = true;
+        if work_header {
+            let home = crate::channel_work::Home {
+                registry: uuid::Uuid::new_v4(),
+                channel: ChannelId::new(),
+                creation_ordinal: 1,
+            };
+            assert!(
+                app.channel_work
+                    .view
+                    .open(home, "Fixture work".into())
+                    .is_some()
+            );
+            assert!(!app.channel_work_is_main());
+        }
+        // Close fully, then reopen through the real production toggle. At
+        // the opening's first frame the revealed inspector has zero width.
+        for opening in [false, true] {
+            drop(app.update(Message::ToggleContextInspector));
+            let transition = app.context_inspector_transition.expect("a real transition");
+            assert_eq!(app.context_inspector_open, opening);
+            for fraction in [0.0, 0.5, 0.99] {
+                app.frame_clock
+                    .start(transition.started_at + transition.duration().mul_f32(fraction));
+                assert_eq!(app.context_inspector_mount(), Some(InspectorLayout::Docked));
+                let controls = probe(&app, &renderer, window);
+                assert_eq!(
+                    controls.close.len(),
+                    1,
+                    "opening={opening}, frame={fraction}"
+                );
+                assert_eq!(
+                    controls.minimize.len(),
+                    usize::from(cosmic::config::show_minimize())
+                );
+                assert_eq!(
+                    controls.maximize.len(),
+                    usize::from(cosmic::config::show_maximize())
+                );
+                assert!(controls.close[0].x > app.window_width - design::WINDOW_CONTROL_SIZE);
+            }
+            // The same foreground owner must honor policy while mounted.
+            app.core.window.show_close = false;
+            app.core.window.show_minimize = false;
+            app.core.window.show_maximize = false;
+            let controls = probe(&app, &renderer, window);
+            assert!(
+                controls.close.is_empty()
+                    && controls.minimize.is_empty()
+                    && controls.maximize.is_empty()
+            );
+            app.core.window.show_close = true;
+            app.core.window.show_minimize = true;
+            app.core.window.show_maximize = true;
+            drop(app.advance_context_inspector_transition(
+                transition.started_at + transition.duration(),
+            ));
+            assert_eq!(probe(&app, &renderer, window).close.len(), 1);
+        }
     }
 }

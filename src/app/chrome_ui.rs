@@ -2564,6 +2564,16 @@ impl Cagents {
         end: Option<Element<'a, Message>>,
         window_controls: bool,
     ) -> Element<'a, Message> {
+        self.native_header_surface(start, end, window_controls, true)
+    }
+
+    fn native_header_surface<'a>(
+        &'a self,
+        start: Element<'a, Message>,
+        end: Option<Element<'a, Message>>,
+        window_controls: bool,
+        background: bool,
+    ) -> Element<'a, Message> {
         let focused = self
             .core
             .focus_chain()
@@ -2601,7 +2611,11 @@ impl Cagents {
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill)
-            .class(cosmic::theme::Container::Background)
+            .class(if background {
+                cosmic::theme::Container::Background
+            } else {
+                cosmic::theme::Container::Transparent
+            })
             .into()
     }
 
@@ -2623,6 +2637,67 @@ impl Cagents {
             self.context_inspector_mount(),
             Some(InspectorLayout::Docked)
         )
+    }
+
+    fn docked_window_controls_are_transitioning(&self) -> bool {
+        self.inspector_owns_window_controls() && self.context_inspector_transition.is_some()
+    }
+
+    fn native_window_controls_width(&self) -> f32 {
+        let count =
+            usize::from(self.core.window.show_close && self.core.main_window_id().is_some())
+                + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
+                + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
+        count as f32 * design::WINDOW_CONTROL_SIZE
+            + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
+    }
+
+    fn inspector_header<'a>(
+        &'a self,
+        start: Element<'a, Message>,
+        end: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let transitioning = self.docked_window_controls_are_transitioning();
+        let end = if transitioning {
+            // Retain the end controls' positions while their window-control
+            // neighbor is owned by the stationary foreground instead.
+            widget::container(end)
+                .padding(Padding::ZERO.right(self.native_window_controls_width()))
+                .into()
+        } else {
+            end
+        };
+        self.native_header(
+            start,
+            Some(end),
+            self.inspector_owns_window_controls() && !transitioning,
+        )
+    }
+
+    pub(super) fn docked_transition_window_header(&self) -> Element<'_, Message> {
+        if !self.docked_window_controls_are_transitioning() {
+            return widget::Space::new().height(0).into();
+        }
+        // Match native_header's compact horizontal padding at the actual
+        // window edge; this owner is never translated, clipped or input-gated.
+        let padding = if self.core.window.is_maximized {
+            8.0
+        } else {
+            7.0
+        };
+        widget::container(
+            widget::container(self.native_header_surface(
+                widget::Space::new().into(),
+                None,
+                true,
+                false,
+            ))
+            .width(self.native_window_controls_width() + 2.0 * padding),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .height(design::HEADER_HEIGHT)
+        .into()
     }
 
     /// The workspace header's window controls stay above an inspector overlay.
@@ -3374,11 +3449,7 @@ impl Cagents {
             .spacing(space::XXS)
             .align_y(Alignment::Center)
             .into();
-            let heading = self.native_header(
-                self.sidebar_toggle(),
-                Some(end),
-                self.inspector_owns_window_controls(),
-            );
+            let heading = self.inspector_header(self.sidebar_toggle(), end);
             return widget::column::with_children(vec![
                 heading,
                 crate::interaction::focused_escape(
@@ -3471,11 +3542,7 @@ impl Cagents {
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(
-            self.sidebar_toggle(),
-            Some(end),
-            self.inspector_owns_window_controls(),
-        );
+        let heading = self.inspector_header(self.sidebar_toggle(), end);
         let tabs = widget::row::with_children(vec![
             tabs.into(),
             crate::ui_controls::button::secondary("Channel work")
