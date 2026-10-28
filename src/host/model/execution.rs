@@ -946,7 +946,7 @@ impl Registry {
                             |row| row.get(0),
                         )
                         .map_err(|error| error.to_string())?;
-                    if children >= MAX_CHILDREN.max(limits.caller) {
+                    if children >= MAX_CHILDREN {
                         return Err(
                             "Agent child limit reached; close an existing child first".into()
                         );
@@ -3392,6 +3392,11 @@ mod tests {
     fn child_and_automation_keep_64_open_conversation_limit_after_completion() {
         for automated in [false, true] {
             let (mut registry, _directory, mut request) = fixture();
+            // Raising active-run capacity must not raise the separate retained-child cap.
+            let limits = ConcurrencyLimits {
+                caller: 65,
+                global: 80,
+            };
             let origin = if automated {
                 Origin::Automation {
                     id: uuid::Uuid::new_v4(),
@@ -3402,18 +3407,22 @@ mod tests {
             let mut last = None;
             for index in 0..MAX_CHILDREN {
                 request.idempotency_key = format!("delegated-{index}");
-                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                let accepted = registry
+                    .submit_agent_with_limits(&origin, &request, None, limits, 10)
+                    .unwrap();
                 finish_capacity_run(&mut registry, &accepted);
                 last = Some(accepted.agent.id);
             }
-            let retry = registry.submit_agent(&origin, &request, 40).unwrap();
+            let retry = registry
+                .submit_agent_with_limits(&origin, &request, None, limits, 40)
+                .unwrap();
             assert!(!retry.created);
             assert_eq!(Some(retry.agent.id), last);
             let before = registry.model().unwrap();
             request.idempotency_key = "delegated-over-limit".into();
             assert!(
                 registry
-                    .submit_agent(&origin, &request, 41)
+                    .submit_agent_with_limits(&origin, &request, None, limits, 41)
                     .unwrap_err()
                     .contains("child limit")
             );
@@ -3429,7 +3438,7 @@ mod tests {
             // A full delegated scope does not consume the user's open quota.
             assert!(
                 registry
-                    .submit_agent(&Origin::User, &request, 42)
+                    .submit_agent_with_limits(&Origin::User, &request, None, limits, 42)
                     .unwrap()
                     .created
             );
@@ -3685,12 +3694,10 @@ mod tests {
     }
 
     #[test]
-    fn configured_caller_budget_above_legacy_open_child_guard_is_reachable() {
+    fn configured_user_caller_budget_above_delegated_child_guard_is_reachable() {
         let (mut registry, _directory, mut request) = fixture();
-        // Exercise delegated fanout; User retained conversations are independently uncapped.
-        let origin = Origin::Automation {
-            id: uuid::Uuid::new_v4(),
-        };
+        // User conversations are exempt from the delegated cap, but still pay run capacity.
+        let origin = Origin::User;
         let limits = ConcurrencyLimits {
             caller: 65,
             global: 80,
@@ -3703,10 +3710,24 @@ mod tests {
         }
         let report = registry.agent_capacity(&origin, limits).unwrap();
         assert_eq!(report.caller.running, 65);
+        assert_eq!(report.global.running, 65);
+        let retry = registry
+            .submit_agent_with_limits(&origin, &request, None, limits, 66)
+            .unwrap();
+        assert!(!retry.created);
+        let before = registry.model().unwrap();
         request.idempotency_key = "large-caller-rejected".into();
-        assert!(
-            matches!(registry.submit_agent_with_limits(&origin, &request, None, limits, 66), Err(AcceptanceError::LimitReached(details)) if details.capacity.scope == CapacityScope::Caller && details.capacity.limit == 65)
-        );
+        let AcceptanceError::LimitReached(details) = registry
+            .submit_agent_with_limits(&origin, &request, None, limits, 67)
+            .unwrap_err()
+        else {
+            panic!("The configured User run budget must remain enforced");
+        };
+        assert_eq!(details.capacity.scope, CapacityScope::Caller);
+        assert_eq!((details.capacity.running, details.capacity.limit), (65, 65));
+        assert_eq!(details.capacity.holders.len(), 65);
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 65);
+        assert_eq!(registry.model().unwrap(), before);
     }
 
     #[test]
