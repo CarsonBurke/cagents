@@ -1,11 +1,34 @@
-/// Mount the real notices overlay, not only its header anchor. COSMIC stores
-/// popover buttons in an overlay tree, so base-widget operations miss them.
+#[derive(Clone, Copy, Debug)]
+struct NoticeScrollViewport {
+    bounds: iced::Rectangle,
+    content: iced::Rectangle,
+    translation: iced::Vector,
+}
+
+struct NoticeOverlayProbe {
+    mounted: Vec<(String, iced::Rectangle)>,
+    focused: Vec<String>,
+    scrolls: Vec<NoticeScrollViewport>,
+}
+
 fn notice_overlay_controls(
     app: &Cagents,
     tree: &mut iced::advanced::widget::Tree,
     renderer: &cosmic::Renderer,
     task: Task<Message>,
 ) -> (Vec<(String, iced::Rectangle)>, Vec<String>) {
+    let probe = notice_overlay_probe(app, tree, renderer, task);
+    (probe.mounted, probe.focused)
+}
+
+/// Mount the real notices overlay, not only its header anchor. COSMIC stores
+/// popover buttons in an overlay tree, so base-widget operations miss them.
+fn notice_overlay_probe(
+    app: &Cagents,
+    tree: &mut iced::advanced::widget::Tree,
+    renderer: &cosmic::Renderer,
+    task: Task<Message>,
+) -> NoticeOverlayProbe {
     use iced::advanced::{
         Layout, layout,
         widget::{
@@ -17,10 +40,28 @@ fn notice_overlay_controls(
     struct Controls {
         mounted: Vec<(String, Rectangle)>,
         focused: Vec<String>,
+        scrolls: Vec<NoticeScrollViewport>,
     }
     impl Operation for Controls {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: Rectangle,
+            content: Rectangle,
+            translation: iced::Vector,
+            _: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            // This fixture mounts one actual popover body scroll. Collect it
+            // before and after the production stable ID exists, so the causal
+            // failure is invisible keyboard focus, not a missing new ID.
+            self.scrolls.push(NoticeScrollViewport {
+                bounds,
+                content,
+                translation,
+            });
         }
         fn focusable(
             &mut self,
@@ -85,29 +126,45 @@ fn notice_overlay_controls(
     let mut controls = Controls {
         mounted: Vec::new(),
         focused: Vec::new(),
+        scrolls: Vec::new(),
     };
     overlay
         .as_overlay_mut()
         .operate(Layout::new(&node), renderer, &mut controls);
-    (controls.mounted, controls.focused)
+    NoticeOverlayProbe {
+        mounted: controls.mounted,
+        focused: controls.focused,
+        scrolls: controls.scrolls,
+    }
 }
 
 #[test]
 fn notices_tab_traversal_reaches_the_mounted_open_details_and_dismiss_controls_in_order() {
     let mut app = super::super::tests::context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
+    let mut extra_older = Vec::new();
+    for index in 0..3 {
+        app.notices
+            .record(TransientNotice::warning(format!("Older warning {index}")));
+        extra_older.push(app.notices.recent().next().unwrap().id);
+    }
     app.notices
         .record(TransientNotice::warning("An unrelated warning"));
     let older = app.notices.recent().next().unwrap().id;
     app.notices.record(
         TransientNotice::error("Could not attach this terminal")
             .with_key(NoticeKey::ChatAttach(card))
-            .with_details("The exact saved chat is unavailable"),
+            .with_details(
+                (0..80)
+                    .map(|line| format!("Exact saved-chat diagnostic line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
     );
     let id = app.notices.recent().next().unwrap().id;
     let open = format!("chrome.notices.open.{id}");
     let details = format!("chrome.notices.details.{id}");
-    let expected = vec![
+    let mut expected = vec![
         NOTICES_DISMISS_ALL_ID.to_owned(),
         NOTICES_CLOSE_ID.to_owned(),
         open,
@@ -115,12 +172,18 @@ fn notices_tab_traversal_reaches_the_mounted_open_details_and_dismiss_controls_i
         notice_dismiss_id(id),
         notice_dismiss_id(older),
     ];
+    expected.extend(extra_older.into_iter().rev().map(notice_dismiss_id));
     let task = app.update_chrome(Action::ToggleNotices);
+    drop(app.update(Message::ToggleNoticeDetails(id)));
     let renderer = super::super::tests::headless_renderer();
     let mut tree = iced::advanced::widget::Tree::new(notice_header(&app).as_widget());
-    let (mounted, focused) = notice_overlay_controls(&app, &mut tree, &renderer, task);
+    let probe = notice_overlay_probe(&app, &mut tree, &renderer, task);
     assert_eq!(
-        mounted.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        probe
+            .mounted
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
         expected
     );
     assert_eq!(
@@ -130,7 +193,13 @@ fn notices_tab_traversal_reaches_the_mounted_open_details_and_dismiss_controls_i
             .collect::<Vec<_>>(),
         expected
     );
-    assert_eq!(focused, [NOTICES_CLOSE_ID]);
+    assert_eq!(probe.focused, [NOTICES_CLOSE_ID]);
+    let [scroll] = probe.scrolls.as_slice() else {
+        panic!("the actual notices overlay has one scrollable body");
+    };
+    assert!(scroll.content.height > scroll.bounds.height + 100.0);
+    let mut previous_offset = scroll.translation.y;
+    let mut saw_scrolled_body = false;
     for backwards in [false, true] {
         let tab = keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::Tab),
@@ -155,10 +224,50 @@ fn notices_tab_traversal_reaches_the_mounted_open_details_and_dismiss_controls_i
             let task = app
                 .chrome_key_event(&tab)
                 .expect("the open popover owns Tab");
-            let (_, focused) = notice_overlay_controls(&app, &mut tree, &renderer, task);
-            assert_eq!(focused, [expected[index].clone()]);
+            let probe = notice_overlay_probe(&app, &mut tree, &renderer, task);
+            assert_eq!(probe.focused, [expected[index].clone()]);
+            let [scroll] = probe.scrolls.as_slice() else {
+                panic!("the actual notices overlay has one scrollable body");
+            };
+            let raw = probe
+                .mounted
+                .iter()
+                .find(|(id, _)| id == &expected[index])
+                .unwrap()
+                .1;
+            if index < 2 {
+                // Header actions are outside the body. Visiting them must not
+                // discard the reader's place in the long diagnostic/history.
+                assert!(
+                    (scroll.translation.y - previous_offset).abs() < 0.1,
+                    "{backwards}: header focus changed reader offset {previous_offset} to {}",
+                    scroll.translation.y
+                );
+                assert!(raw.y >= 0.0 && raw.y + raw.height <= 1600.0);
+            } else {
+                let visible = iced::Rectangle {
+                    x: raw.x - scroll.translation.x,
+                    y: raw.y - scroll.translation.y,
+                    ..raw
+                };
+                assert!(
+                    visible.x >= scroll.bounds.x - 0.5
+                        && visible.x + visible.width <= scroll.bounds.x + scroll.bounds.width + 0.5
+                        && visible.y >= scroll.bounds.y - 0.5
+                        && visible.y + visible.height
+                            <= scroll.bounds.y + scroll.bounds.height + 0.5,
+                    "{} is focused but outside the actual body viewport: raw={raw:?}, visible={visible:?}, scroll={scroll:?}",
+                    expected[index]
+                );
+                saw_scrolled_body |= scroll.translation.y > 1.0;
+            }
+            previous_offset = scroll.translation.y;
         }
     }
+    assert!(
+        saw_scrolled_body,
+        "keyboard traversal must reveal controls below the long diagnostic"
+    );
 }
 
 #[test]
