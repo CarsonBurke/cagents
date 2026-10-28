@@ -1596,6 +1596,19 @@ mod tests {
         })
     }
 
+    fn assert_no_key_effects(task: Task<Message>) {
+        use iced::futures::{FutureExt, StreamExt};
+        // The public dispatch postlude can wrap a no-op in an empty batch.
+        // Require immediate completion without any action; neither pending work
+        // nor a second native traversal is a no-op.
+        if let Some(mut effects) = iced::runtime::task::into_stream(task) {
+            assert!(
+                matches!(effects.next().now_or_never(), Some(None)),
+                "a refused key must emit no raw-subscription effects"
+            );
+        }
+    }
+
     #[test]
     fn native_device_tab_moves_once_inside_its_scope_with_either_global_navigation_state() {
         use iced::advanced::{
@@ -1767,7 +1780,7 @@ mod tests {
                         event,
                         captured: true,
                     });
-                    assert!(iced::runtime::task::into_stream(raw).is_none());
+                    assert_no_key_effects(raw);
                     let task = app.update(published.pop().unwrap());
                     // Rebuild the production view over the retained native
                     // tree, just as message dispatch does in the runtime.
@@ -2009,10 +2022,7 @@ mod tests {
             assert!(app.device_dialog_on_top());
             assert!(!app.form_dialog_on_top());
             for named in [keyboard::key::Named::Tab, keyboard::key::Named::Enter] {
-                assert!(
-                    iced::runtime::task::into_stream(device_key(&mut app, named, captured))
-                        .is_none()
-                );
+                assert_no_key_effects(device_key(&mut app, named, captured));
                 assert!(app.daemon_health_ui.confirmation);
             }
             let task = device_key(&mut app, keyboard::key::Named::Escape, captured);
@@ -2071,7 +2081,7 @@ mod tests {
         ] {
             // Resume navigation produces a reveal operation. No operation may
             // escape from the retained picker while Device files is visible.
-            assert!(iced::runtime::task::into_stream(device_key(&mut app, named, false)).is_none());
+            assert_no_key_effects(device_key(&mut app, named, false));
             assert!(app.resume_ui.open);
         }
         let task = device_key(&mut app, keyboard::key::Named::Escape, true);
@@ -2088,7 +2098,7 @@ mod tests {
         let mut app = loaded_file();
         app.daemon_health_ui.confirmation = true;
         let task = device_key(&mut app, keyboard::key::Named::Escape, true);
-        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_no_key_effects(task);
         assert!(app.device_ui.open && app.device_ui.dirty());
         assert_eq!(app.device_ui.content.text(), "unsaved draft");
         assert!(app.daemon_health_ui.confirmation);
@@ -2106,7 +2116,7 @@ mod tests {
         });
         let generation = app.device_ui.generation;
         let task = device_key(&mut app, keyboard::key::Named::Escape, false);
-        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_no_key_effects(task);
         assert!(app.device_ui.open && app.device_ui.busy);
         assert!(app.device_ui.pending.is_some());
         assert_eq!(app.device_ui.generation, generation);
