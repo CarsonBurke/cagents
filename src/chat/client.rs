@@ -1753,6 +1753,26 @@ impl ClientHandle {
         )
     }
 
+    /// Exercise an explicit Start with the production chat response consumer,
+    /// without discovering or launching any external daemon.
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_start(
+        stream: UnixStream,
+        session: Session,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
     /// Exercise the real restore handshake against an in-process daemon in
     /// host tests, without discovering or launching any external daemon.
     #[cfg(all(test, feature = "host"))]
@@ -3041,6 +3061,195 @@ mod tests {
                 },
             },
         );
+    }
+
+    /// A framed peer isolates the production consumer's notification contract;
+    /// this is not Host, provider, or caller-authority qualification.
+    #[cfg(feature = "host")]
+    #[test]
+    fn explicit_start_accepts_exact_early_notifications_and_refuses_invalid_frames() {
+        for case in [
+            "exact",
+            "other_chat",
+            "correlated_notice",
+            "changed_proof",
+            "changed_version",
+            "wrong_response_id",
+            "permission_refusal",
+            "unknown_notice",
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let session = omp_card(Some(CONVERSATION), Some(handoff_proof()));
+            let expected = session.clone();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                handoff_handshake(&mut server, &mut codec);
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(
+                    &start.request,
+                    ClientRequest::ChatStart {
+                        session,
+                        source: None,
+                        terminate_source: false,
+                        ..
+                    } if session == &expected
+                ));
+                let snapshot = Snapshot {
+                    generation: 4,
+                    ready: true,
+                    session_id: expected.launch.session_id.clone(),
+                    ..Default::default()
+                };
+                let mut response = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(start.request_id),
+                    proof: handoff_proof(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::ChatAttached {
+                            session: expected.clone(),
+                            snapshot,
+                        },
+                    },
+                };
+                if case == "exact" {
+                    for message in [
+                        ServerMessage::ChatObserved {
+                            chat_id: expected.id,
+                            epoch: 0,
+                        },
+                        ServerMessage::ChatActivity {
+                            chat_id: expected.id,
+                            state: ActivityState::Idle,
+                            generation: 5,
+                        },
+                        ServerMessage::ChatAccountUsage {
+                            chat_id: expected.id,
+                            report: LiveReport::Claude(crate::account::claude::LiveUpdate {
+                                windows: Vec::new(),
+                                status: None,
+                            }),
+                            observed_at: 42,
+                        },
+                    ] {
+                        handoff_reply(&mut server, &mut codec, None, &handoff_proof(), message);
+                    }
+                } else {
+                    response.request_id = None;
+                    response.message = ServerMessage::ChatObserved {
+                        chat_id: expected.id,
+                        epoch: 0,
+                    };
+                    match case {
+                        "other_chat" => {
+                            response.message = ServerMessage::ChatObserved {
+                                chat_id: crate::model::TerminalId::new(),
+                                epoch: 0,
+                            };
+                        }
+                        "correlated_notice" => response.request_id = Some(start.request_id),
+                        "changed_proof" => response.proof = host_proof("different"),
+                        "changed_version" => {
+                            response.version = PROTOCOL_VERSION.wrapping_add(1);
+                        }
+                        "wrong_response_id" => {
+                            response.request_id = Some(start.request_id + 1);
+                            response.message = ServerMessage::Response {
+                                response: ServerResponse::ChatAttached {
+                                    session: expected.clone(),
+                                    snapshot: Snapshot::default(),
+                                },
+                            };
+                        }
+                        "permission_refusal" => {
+                            response.request_id = Some(start.request_id);
+                            response.message = ServerMessage::Error(ipc::ProtocolError::new(
+                                ipc::ProtocolErrorCode::PermissionDenied,
+                                "explicit start permission refused",
+                                false,
+                            ));
+                        }
+                        "unknown_notice" => {
+                            response.message = ServerMessage::ChatChanged {
+                                chat_id: expected.id,
+                            };
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                codec.write(&mut server, &response).unwrap();
+                if case != "exact" {
+                    return;
+                }
+                let close: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(
+                    close.request,
+                    ClientRequest::ChatClose {
+                        chat_id: expected.id
+                    }
+                );
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &handoff_proof(),
+                    ServerMessage::ChatObserved {
+                        chat_id: expected.id,
+                        epoch: 0,
+                    },
+                );
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(close.request_id),
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatClosed {
+                            chat_id: expected.id,
+                            snapshot: Snapshot {
+                                exited: true,
+                                session_id: expected.launch.session_id,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                );
+                let end: Option<ClientEnvelope> = codec.read(&mut server).unwrap();
+                assert!(
+                    end.is_none(),
+                    "dropping the closed client must detach its wire"
+                );
+            });
+            let result = ClientHandle::fixture_start(client, session.clone());
+            if case == "exact" {
+                let handle = result.unwrap();
+                assert_eq!(handle.session(), session);
+                assert!(handle.snapshot().ready);
+                assert!(handle.take_observed());
+                assert_eq!(handle.take_activity(), ActivityState::Idle);
+                let usage = handle.take_account_usage();
+                assert_eq!(usage.len(), 1);
+                assert_eq!(usage[0].1, 42);
+                handle.close().unwrap();
+                assert!(handle.snapshot().exited);
+                drop(handle);
+            } else {
+                let error = match result {
+                    Ok(handle) => {
+                        drop(handle);
+                        panic!("invalid {case} frame granted an explicit Start attachment");
+                    }
+                    Err(error) => error,
+                };
+                let expected = match case {
+                    "changed_proof" => "Daemon identity changed during native chat attachment",
+                    "changed_version" => "Daemon version mismatch; use matched cagents executables",
+                    "permission_refusal" => "explicit start permission refused",
+                    _ => "Daemon did not attach the exact native chat",
+                };
+                assert_eq!(error.message, expected, "{case}");
+            }
+            worker.join().unwrap();
+        }
     }
 
     #[test]

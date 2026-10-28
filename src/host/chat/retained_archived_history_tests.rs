@@ -1263,18 +1263,22 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 );
             }
             let id = prepared.id;
-            let started = client
-                .fixture_request(ClientRequest::ChatStart {
-                    session: prepared.clone(),
-                    source: None,
-                    terminate_source: false,
-                    execution_environment: Default::default(),
-                })
-                .unwrap();
+            // Start subscribes this connection before its reply is queued.
+            // Use the production chat consumer for exact early notifications;
+            // the separate preparation ControlClient remains unsubscribed.
+            let (start_wire, start_server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let host = fixture.host.clone();
+            let start_server =
+                thread::spawn(move || crate::host::client::serve(start_server, 66, host));
+            let started =
+                chat::client::ClientHandle::fixture_start(start_wire, prepared.clone()).unwrap();
             let writer = fixture.host.lock().unwrap().chats[&id].handle.clone();
             let _cleanup = OwnedHelperGuard::capture(&root, &writer);
             let identity = writer.actor_identity().unwrap();
-            assert!(matches!(started, ServerResponse::ChatAttached { .. }));
+            assert_eq!(started.session().id, id);
+            assert_eq!(started.session().launch, prepared.launch);
+            assert_eq!(started.session().proof, prepared.proof);
+            assert!(started.snapshot().ready);
             wait(
                 || {
                     writer.attachment_snapshot().ready
@@ -1309,9 +1313,9 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
             assert!(retry.snapshot().ready);
             drop(retry);
             server.join().unwrap();
-            client
-                .fixture_request(ClientRequest::ChatClose { chat_id: id })
-                .unwrap();
+            started.close().unwrap();
+            drop(started);
+            start_server.join().unwrap();
             requested = registry
                 .lock()
                 .unwrap()
