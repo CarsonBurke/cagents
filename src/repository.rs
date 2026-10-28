@@ -7552,6 +7552,59 @@ mod tests {
         }
 
         #[test]
+        fn worktree_base_uses_the_longest_configured_remote_prefix() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(
+                root,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            );
+            for name in ["team", "team/nested"] {
+                let unavailable = root.join(format!("missing-{}.git", name.replace('/', "-")));
+                git(root, &["remote", "add", name, unavailable.to_str().unwrap()]);
+            }
+            // No fetch or symbolic remote HEAD: the configured remote names
+            // must disambiguate this shared remote-tracking namespace.
+            git(root, &["update-ref", "refs/remotes/team/nested/topic", "HEAD"]);
+            let service = service();
+            let cancellation = CancellationToken::new();
+            let input = |base: &str| WorktreeInput {
+                repository: root.into(),
+                input: "from-cached-topic".into(),
+                base: base.into(),
+                managed_directory: ".worktrees/".into(),
+                destination: String::new(),
+                operation_id: OperationId::new(),
+            };
+            let result = service.resolve_worktree_request(&input("nested/topic"), &cancellation);
+            assert!(
+                matches!(
+                    &result,
+                    Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+                ),
+                "topic on team/nested must not masquerade as nested/topic on team: {result:?}"
+            );
+            let expected = BaseRevision::remote_ref("refs/remotes/team/nested/topic").unwrap();
+            for base in ["topic", "team/nested/topic"] {
+                let request = service
+                    .resolve_worktree_request(&input(base), &cancellation)
+                    .unwrap();
+                assert_eq!(request.base, expected, "base {base}");
+                assert!(!request.track, "a base override creates local history");
+            }
+        }
+
+        #[test]
         fn persisted_common_directory_preserves_identity_and_main_worktree() {
             let directory = tempfile::tempdir().unwrap();
             git(directory.path(), &["init", "-b", "main", "checkout"]);
