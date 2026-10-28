@@ -141,7 +141,7 @@ fn style() -> cosmic::theme::TextInput {
             placeholder_color: design::mix(surface, on, 0.5),
             icon_color: Some(design::muted_icon_color(theme)),
             text_color: Some(match status {
-                Status::Disabled => design::mix(surface, on, 0.42),
+                Status::Disabled => design::disabled_color(theme),
                 _ => on,
             }),
             selected_text_color: cosmic.on_accent_color().into(),

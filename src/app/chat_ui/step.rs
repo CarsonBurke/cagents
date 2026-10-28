@@ -12,7 +12,7 @@
 
 use super::coordination::Coordinated;
 use super::*;
-use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
+use crate::chat::{ChangeKind, FileChange, ToolStatus};
 
 /// The surface's spacing rhythm.
 ///
@@ -113,13 +113,13 @@ fn kind_glyph(content: &ItemContent) -> Icon {
 /// rather than floating above it. `copy` puts a copy control on that same
 /// header, which is where a reader looks for it and the only way to take a
 /// command's output without dragging a selection through a scrolling box.
-pub(super) fn code_surface<'a>(
-    text: &'a str,
-    caption: Option<&'a str>,
+pub(super) fn code_surface(
+    text: &str,
+    caption: Option<&str>,
     limit: Option<f32>,
     copy: Option<Action>,
     target: Target,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let body = widget::container(selectable_prose::plain(
         text,
         design::TEXT_BODY,
@@ -199,11 +199,11 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
-fn change_view(change: &FileChange) -> Element<'_, Message> {
+fn change_view(change: &FileChange) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            design::body(change.path.as_str())
+            design::body(change.path.clone())
                 .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
                 .into(),
@@ -221,63 +221,15 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
         .into()
 }
 
-fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Message> {
-    let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    let title = if result.title.is_empty() {
-        result.url.as_str()
-    } else {
-        result.title.as_str()
-    };
-    if result.url.is_empty() {
-        rows.push(selectable_prose::plain(
-            title,
-            design::TEXT_BODY,
-            iced::Font::default(),
-            target,
-        ));
-    } else {
-        rows.push(selectable_prose::text(
-            vec![
-                iced::widget::text::Span::new(title.to_owned())
-                    .link(result.url.clone())
-                    .color(design::accent_color(&cosmic::theme::active())),
-            ]
-            .into(),
-            design::TEXT_BODY.into(),
-            iced::Font::default(),
-            target,
-            None,
-        ));
-        rows.push(selectable_prose::plain(
-            result.url.as_str(),
-            design::TEXT_CAPTION,
-            iced::Font::default(),
-            target,
-        ));
-    }
-    if !result.snippet.is_empty() {
-        rows.push(selectable_prose::plain(
-            result.snippet.as_str(),
-            design::TEXT_BODY,
-            iced::Font::default(),
-            target,
-        ));
-    }
-    widget::column::with_children(rows)
-        .spacing(space::XS)
-        .width(Length::Fill)
-        .into()
-}
-
 impl Runtime {
-    fn tool_code_surface<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    fn tool_code_surface(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         part: CopyPart,
-        caption: &'a str,
+        caption: &str,
         limit: Option<f32>,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let block = match part {
             CopyPart::Input => cached.tool_input.as_ref(),
             CopyPart::Change(index) => cached.patches.get(index),
@@ -303,12 +255,25 @@ impl Runtime {
                 }
             );
         code_frame(
-            match limit {
-                Some(height) if !follows => {
-                    block.view_from_start(self.syntax_theme, height, target, self.find.as_deref())
-                }
-                limit => block.view(self.syntax_theme, limit, target, self.find.as_deref()),
-            },
+            block.view_logical_with_reader(
+                self.syntax_theme,
+                limit.map(|height| (height, follows)),
+                target,
+                self.find.as_deref(),
+                selectable_prose::Logical {
+                    identity: selection::logical_identity(
+                        &item.id,
+                        &match part {
+                            CopyPart::Input => vec![4],
+                            CopyPart::Change(index) => vec![6, index as u32],
+                            _ => vec![5],
+                        },
+                    ),
+                    start: 0,
+                },
+                self.scroll_memory.clone(),
+                self.selected_subagent.clone(),
+            ),
             Some(caption.to_owned()),
             Some(copy),
         )
@@ -329,7 +294,7 @@ impl Runtime {
     pub(super) fn step_strip<'a>(
         &self,
         turn: &turn::Turn,
-        steps: impl FnOnce() -> Vec<Element<'a, Message>>,
+        steps: impl FnOnce() -> Vec<virtualized::Row<'a>>,
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
@@ -412,10 +377,7 @@ impl Runtime {
                         }
                     }))
                     .into(),
-                widget::column::with_children(rows)
-                    .spacing(GAP_XS)
-                    .width(Length::Fill)
-                    .into(),
+                virtualized::column(rows, Default::default()),
             ])
             .spacing(RAIL_INSET)
             .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
@@ -428,13 +390,13 @@ impl Runtime {
     }
 
     /// One step: a summary line that discloses its own detail.
-    pub(super) fn step_view<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_view(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
-        let open = self.expanded.contains(&item.id);
+    ) -> Element<'static, Message> {
+        let open = self.item_expanded(&item.id);
         let header = self.step_header(item, cached, open);
         if !open {
             return header;
@@ -552,13 +514,13 @@ impl Runtime {
     /// steps that follow it.
     const OUTPUT_HEIGHT: f32 = 320.0;
 
-    pub(super) fn step_detail<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_detail(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    ) -> Element<'static, Message> {
+        let mut rows: Vec<Element<'static, Message>> = Vec::new();
         // Messages a coordinating step collected read as messages, ahead of
         // the command and output they were printed in.
         if let Some(coordinated) = cached
@@ -572,19 +534,14 @@ impl Runtime {
             // A notice's body is a log line or a raw result, drawn verbatim.
             ItemContent::Delivery {
                 kind: chat::DeliveryKind::Notice,
-                body,
                 ..
-            } => {
-                if !body.is_empty() {
-                    rows.push(code_surface(
-                        body,
-                        None,
-                        Some(Self::OUTPUT_HEIGHT),
-                        None,
-                        self.target,
-                    ));
-                }
-            }
+            } => rows.push(literal_content::notice_body(
+                self,
+                item,
+                cached,
+                settings,
+                Some(Self::OUTPUT_HEIGHT),
+            )),
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
                 rows.push(prose::view(
                     cached,
@@ -638,21 +595,8 @@ impl Runtime {
                     }
                 }
             }
-            ItemContent::WebSearch { query, results } => {
-                rows.push(selectable_prose::plain(
-                    query.as_str(),
-                    design::TEXT_BODY,
-                    iced::Font::default(),
-                    self.target,
-                ));
-                if results.is_empty() {
-                    rows.push(design::caption("No results were reported.").into());
-                }
-                rows.extend(
-                    results
-                        .iter()
-                        .map(|result| search_result_view(result, self.target)),
-                );
+            ItemContent::WebSearch { .. } => {
+                rows.push(literal_content::search_view(self, item, cached, settings))
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
@@ -676,7 +620,7 @@ impl Runtime {
                     ));
                 }
             }
-            ItemContent::Image { path, description } => {
+            ItemContent::Image { path, .. } => {
                 if let Some(handle) = &cached.image {
                     rows.push(
                         iced::widget::image(handle.clone())
@@ -693,27 +637,26 @@ impl Runtime {
                         .into(),
                     );
                 }
-                if !description.is_empty() {
-                    rows.push(selectable_prose::plain(
-                        description.as_str(),
-                        design::TEXT_BODY,
-                        iced::Font::default(),
-                        self.target,
-                    ));
+                if let Some(description) =
+                    literal_content::image_field(self, item, cached, 0, settings)
+                {
+                    rows.push(description);
                 }
-                if path.starts_with("http://") || path.starts_with("https://") {
+                if let Some(literal_content::Content::Image { url: Some(url), .. }) =
+                    self.prepared_literal(item)
+                {
                     rows.push(
                         widget::button::link("Open image")
-                            .on_press(action(Action::OpenUrl(path.clone())))
+                            .on_press(action(Action::OpenSharedUrl(self.target, url.clone())))
                             .into(),
                     );
-                } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(selectable_prose::plain(
-                        path.as_str(),
-                        design::TEXT_CAPTION,
-                        iced::Font::default(),
-                        self.target,
-                    ));
+                } else {
+                    let mut caption = settings;
+                    caption.text_size = design::TEXT_CAPTION.into();
+                    if let Some(path) = literal_content::image_field(self, item, cached, 1, caption)
+                    {
+                        rows.push(path);
+                    }
                 }
             }
         }

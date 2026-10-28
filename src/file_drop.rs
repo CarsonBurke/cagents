@@ -307,7 +307,10 @@ impl Payload {
 
     pub fn decode(&self) -> Dropped {
         if self.mime == URI_LIST {
-            Dropped::Items(uri_list(&self.data, host_name().as_deref()))
+            Dropped::Items(uri_list(
+                &self.data,
+                crate::file_url::host_name().as_deref(),
+            ))
         } else {
             // A source that NUL-terminates its string, as some X11 clients
             // still do, means nothing by the terminator.
@@ -425,7 +428,7 @@ fn uri_list(data: &[u8], local_host: Option<&str>) -> Vec<Item> {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
         .map(|line| {
-            let Some(uri) = std::str::from_utf8(line)
+            let Some(mut uri) = std::str::from_utf8(line)
                 .ok()
                 .and_then(|line| url::Url::parse(line).ok())
             else {
@@ -435,38 +438,14 @@ fn uri_list(data: &[u8], local_host: Option<&str>) -> Vec<Item> {
                 // The path is percent-decoded to the file name's own bytes,
                 // which need not be UTF-8. A host other than this one names
                 // a file this machine cannot open, so it stays a URI.
-                let path = match (uri.host_str(), local_host) {
-                    (Some(host), Some(local)) if host.eq_ignore_ascii_case(local) => {
-                        // The path is already percent-encoded, so the same
-                        // URI without its host decodes exactly as it would.
-                        url::Url::parse(&format!("file://{}", uri.path()))
-                            .ok()
-                            .and_then(|uri| uri.to_file_path().ok())
-                    }
-                    _ => uri.to_file_path().ok(),
-                };
-                if let Some(path) = path {
+                crate::file_url::localize(&mut uri, || local_host);
+                if let Ok(path) = uri.to_file_path() {
                     return Item::File(path);
                 }
             }
             Item::Uri(uri.into())
         })
         .collect()
-}
-
-/// This machine's name, which a file URI can use as its host.
-fn host_name() -> Option<String> {
-    let mut buffer = [0u8; 256];
-    // SAFETY: the pointer and length describe `buffer`, which outlives the
-    // call; gethostname writes at most that many bytes into it.
-    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
-    if result != 0 {
-        return None;
-    }
-    // POSIX leaves a truncated name unterminated, and a truncated name is
-    // not this machine's, so it matches nothing rather than a prefix.
-    let name = std::ffi::CStr::from_bytes_until_nul(&buffer).ok()?;
-    name.to_str().ok().map(str::to_owned)
 }
 
 /// Escapes `word` so that a POSIX shell, zsh or fish reads it back as one

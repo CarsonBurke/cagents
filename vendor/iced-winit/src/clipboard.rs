@@ -1,5 +1,17 @@
 //! Access the clipboard.
 
+#[cfg(all(
+    feature = "x11",
+    unix,
+    not(any(
+        target_family = "wasm",
+        target_os = "redox",
+        target_os = "android",
+        target_vendor = "apple"
+    ))
+))]
+mod x11;
+
 use std::sync::Mutex;
 use std::{any::Any, borrow::Cow};
 
@@ -44,6 +56,17 @@ enum State {
         #[allow(dead_code)]
         window: Arc<dyn Window>,
         queued_events: Vec<StartDnd>,
+        #[cfg(all(
+            feature = "x11",
+            unix,
+            not(any(
+                target_family = "wasm",
+                target_os = "redox",
+                target_os = "android",
+                target_vendor = "apple"
+            ))
+        ))]
+        x11_reader: Option<x11::Reader>,
     },
     Unavailable,
 }
@@ -80,6 +103,18 @@ impl Clipboard {
         window: Arc<dyn Window>,
         sender: ControlSender,
     ) -> Clipboard {
+        #[cfg(all(
+            feature = "x11",
+            unix,
+            not(any(
+                target_family = "wasm",
+                target_os = "redox",
+                target_os = "android",
+                target_vendor = "apple"
+            ))
+        ))]
+        let x11_reader = x11::Reader::for_window(window.as_ref());
+
         #[allow(unsafe_code)]
         let state =
             unsafe { window_clipboard::Clipboard::connect(window.as_ref()) }
@@ -89,6 +124,17 @@ impl Clipboard {
                     sender: sender.clone(),
                     window,
                     queued_events: Vec::new(),
+                    #[cfg(all(
+                        feature = "x11",
+                        unix,
+                        not(any(
+                            target_family = "wasm",
+                            target_os = "redox",
+                            target_os = "android",
+                            target_vendor = "apple"
+                        ))
+                    ))]
+                    x11_reader,
                 })
                 .unwrap_or(State::Unavailable);
 
@@ -138,6 +184,29 @@ impl Clipboard {
 
     /// Reads the current content of the [`Clipboard`] as text.
     pub fn read(&self, kind: Kind) -> Option<String> {
+        #[cfg(all(
+            feature = "x11",
+            unix,
+            not(any(
+                target_family = "wasm",
+                target_os = "redox",
+                target_os = "android",
+                target_vendor = "apple"
+            ))
+        ))]
+        if let State::Connected {
+            x11_reader: Some(reader),
+            ..
+        } = &self.state
+        {
+            return match reader.read_text(kind) {
+                Ok(text) => text,
+                Err(error) => {
+                    log::warn!("Could not read X11 clipboard text: {error}");
+                    None
+                }
+            };
+        }
         match &self.state {
             State::Connected { clipboard, .. } => match kind {
                 Kind::Standard => clipboard.read().ok(),
@@ -182,15 +251,40 @@ impl Clipboard {
         kind: Kind,
         mimes: Vec<String>,
     ) -> Option<(Vec<u8>, String)> {
-        match (&self.state, kind) {
-            (State::Connected { clipboard, .. }, Kind::Standard) => {
-                clipboard.read_raw(mimes).and_then(|res| res.ok())
-            }
-            (State::Connected { clipboard, .. }, Kind::Primary) => {
-                clipboard.read_primary_raw(mimes).and_then(|res| res.ok())
-            }
-            (State::Unavailable, _) => None,
+        let State::Connected { clipboard, .. } = &self.state else {
+            return None;
+        };
+        let native = match kind {
+            Kind::Standard => clipboard.read_raw(mimes.clone()),
+            Kind::Primary => clipboard.read_primary_raw(mimes.clone()),
+        };
+        if let Some(result) = native {
+            return result.ok();
         }
+        // The pinned window_clipboard backend has no raw X11 reader.
+        #[cfg(all(
+            feature = "x11",
+            unix,
+            not(any(
+                target_family = "wasm",
+                target_os = "redox",
+                target_os = "android",
+                target_vendor = "apple"
+            ))
+        ))]
+        if let State::Connected {
+            x11_reader: Some(reader),
+            ..
+        } = &self.state
+        {
+            match reader.read(kind, &mimes) {
+                Ok(data) => return data,
+                Err(error) => {
+                    log::warn!("error reading X11 clipboard MIME data: {error}")
+                }
+            }
+        }
+        None
     }
 
     pub fn write_data(
@@ -331,15 +425,7 @@ impl Clipboard {
 
 impl crate::core::Clipboard for Clipboard {
     fn read(&self, kind: Kind) -> Option<String> {
-        match (&self.state, kind) {
-            (State::Connected { clipboard, .. }, Kind::Standard) => {
-                clipboard.read().ok()
-            }
-            (State::Connected { clipboard, .. }, Kind::Primary) => {
-                clipboard.read_primary().and_then(|res| res.ok())
-            }
-            (State::Unavailable, _) => None,
-        }
+        Clipboard::read(self, kind)
     }
 
     fn write(&mut self, kind: Kind, contents: String) {
@@ -359,15 +445,7 @@ impl crate::core::Clipboard for Clipboard {
         kind: Kind,
         mimes: Vec<String>,
     ) -> Option<(Vec<u8>, String)> {
-        match (&self.state, kind) {
-            (State::Connected { clipboard, .. }, Kind::Standard) => {
-                clipboard.read_raw(mimes).and_then(|res| res.ok())
-            }
-            (State::Connected { clipboard, .. }, Kind::Primary) => {
-                clipboard.read_primary_raw(mimes).and_then(|res| res.ok())
-            }
-            (State::Unavailable, _) => None,
-        }
+        Clipboard::read_data(self, kind, mimes)
     }
 
     fn write_data(

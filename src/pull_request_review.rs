@@ -44,6 +44,7 @@ type ActionTask = iced::Task<Action>;
 
 pub mod cache;
 pub mod checkout;
+pub mod checkout_ui;
 pub mod discussion;
 pub mod discussion_ui;
 pub mod file_pages;
@@ -78,11 +79,30 @@ pub struct CheckoutTarget {
     pub repository: PathBuf,
     pub number: u64,
     pub head: crate::repository::Oid,
+    pub pull_request: Option<PullRequestKey>,
+    pub head_ref_name: String,
+    pub head_repository: Option<GitHubRepoKey>,
 }
 
 impl CheckoutTarget {
+    /// A caller without a forge identity can still request a local commit checkout.
+    pub fn read_only(repository: PathBuf, number: u64, head: crate::repository::Oid) -> Self {
+        Self {
+            repository,
+            number,
+            head,
+            pull_request: None,
+            head_ref_name: String::new(),
+            head_repository: None,
+        }
+    }
+
     pub fn suggested_branch(&self) -> String {
-        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+        if self.head_ref_name.is_empty() {
+            format!("pr/{}", self.number)
+        } else {
+            self.head_ref_name.clone()
+        }
     }
 }
 
@@ -217,6 +237,7 @@ pub enum Action {
     },
     OpenUrl(Url),
     Checkout,
+    ExistingCheckout(checkout_ui::Action),
     DismissNotice,
 }
 
@@ -226,7 +247,8 @@ impl Action {
     pub fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::FilePage(file_pages::PageAction::Loaded { .. })
+            Self::ExistingCheckout(checkout_ui::Action::Finished { .. })
+                | Self::FilePage(file_pages::PageAction::Loaded { .. })
                 | Self::Loaded { .. }
                 | Self::ListLoaded { .. }
                 | Self::TargetLoaded { .. }
@@ -255,6 +277,7 @@ pub enum Effect {
     PreviousChange,
     OpenUrl(Url),
     Checkout(CheckoutTarget),
+    OpenCheckout(PathBuf),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
     /// A discussion of the whole file opened above the first diff row, so
@@ -381,6 +404,7 @@ impl ReviewSource {
 pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
+    existing_checkout: checkout_ui::Confirmation,
     parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -581,6 +605,7 @@ impl State {
         Self {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
+            existing_checkout: checkout_ui::Confirmation::default(),
             parked_discussions: Vec::new(),
             api,
             cache: None,
@@ -662,6 +687,14 @@ impl State {
 
     pub fn list(&self) -> &ListState {
         &self.list
+    }
+
+    pub fn selection_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn report_checkout_error(&mut self, error: String) {
+        self.notice = Some(format!("Could not prepare PR checkout. {error}"));
     }
 
     pub fn target(&self) -> Option<&ReviewTarget> {
@@ -1038,6 +1071,7 @@ impl State {
             }
             Action::Checkout => {
                 if !self.refreshing
+                    && !self.existing_checkout.busy()
                     && let (Some(target), Some(context), Some(range)) =
                         (&self.target, &self.context, &self.range)
                     && context.head_oid == range.head.as_str()
@@ -1046,10 +1080,20 @@ impl State {
                         repository: target.worktree.clone(),
                         number: target.pull_request.number,
                         head: range.head.clone(),
+                        pull_request: Some(
+                            PullRequestKey::new(
+                                target.repository.clone(),
+                                target.pull_request.number,
+                            )
+                            .expect("validated PR identity"),
+                        ),
+                        head_ref_name: target.pull_request.head_ref_name.clone(),
+                        head_repository: target.pull_request.head_repository_key(),
                     }));
                 }
                 ActionTask::none()
             }
+            Action::ExistingCheckout(action) => self.update_existing_checkout(action),
             Action::DismissNotice => {
                 self.notice = None;
                 ActionTask::none()
@@ -1218,6 +1262,7 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.existing_checkout.reset();
         self.cache_loading = false;
         self.cache_dirty = false;
         self.cached_viewer = None;
@@ -1674,10 +1719,14 @@ impl State {
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_button(Icon::Branch, "Create worktree from reviewed commit")
+            icon_button(Icon::Branch, "Check out pull request")
                 .on_press_maybe(
-                    (!modal_open && !busy && self.context.is_some() && self.range.is_some())
-                        .then(|| self.fenced(Action::Checkout)),
+                    (!modal_open
+                        && !busy
+                        && !self.existing_checkout.busy()
+                        && self.context.is_some()
+                        && self.range.is_some())
+                    .then(|| self.fenced(Action::Checkout)),
                 )
                 .into(),
             icon_button(
@@ -1774,6 +1823,9 @@ impl State {
             })
             .into(),
         );
+        if let Some(confirmation) = self.existing_checkout_view(modal_open) {
+            rows.push(confirmation);
+        }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .padding(Padding::from([space::M, space::M]))
@@ -3052,6 +3104,51 @@ pub(crate) mod tests {
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
 
+    #[test]
+    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+        };
+
+        // Exercise the text engine reexported by the UI, so removing or
+        // bypassing the temporary dependency patch also fails an app test.
+        let mut db = fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+        );
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
+        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        let layout = |ellipsize| {
+            let mut lines = Vec::new();
+            shaped.layout_to_buffer(
+                &mut ShapeBuffer::default(),
+                18.0,
+                Some(110.0),
+                Wrap::WordOrGlyph,
+                ellipsize,
+                None,
+                &mut lines,
+                None,
+                Hinting::Disabled,
+            );
+            lines
+        };
+        let ordinary = layout(Ellipsize::None);
+        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+            SUMMARY_TITLE_LINES,
+        )));
+        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
+        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
+        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        assert_eq!(actual.start, expected.start);
+        assert_eq!(actual.x, expected.x);
+        assert!(!text[actual.start..actual.end].starts_with(' '));
+    }
+
     fn path(value: &str) -> RepoPath {
         RepoPath::parse(value).unwrap()
     }
@@ -3779,7 +3876,7 @@ pub(crate) mod tests {
         };
         assert_eq!(target.repository, PathBuf::from("/repo"));
         assert_eq!(target.head.as_str(), "a".repeat(40));
-        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        assert_eq!(target.suggested_branch(), "feature");
         state.context = None;
         drop(state.update(Action::Checkout));
         assert!(state.take_effects().is_empty());

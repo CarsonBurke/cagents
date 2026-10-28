@@ -130,7 +130,10 @@ impl Home {
 
 /// Walk the actual directory parent chain through descriptors. Lexical
 /// aliases can change when a reserved home/provider parent is renamed.
-fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+pub(super) fn physical_ancestors(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, String> {
     let mut cursor = if let Some(pin) = pin {
         pin.try_clone().map_err(|error| error.to_string())?
     } else {
@@ -145,10 +148,10 @@ fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, 
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     existing = existing
                         .parent()
-                        .ok_or("Account scope has no existing directory ancestor")?;
+                        .ok_or("Directory scope has no existing directory ancestor")?;
                 }
                 Err(error) => {
-                    return Err(format!("Cannot capture account scope ancestry: {error}"));
+                    return Err(format!("Cannot capture directory scope ancestry: {error}"));
                 }
             }
         }
@@ -171,13 +174,13 @@ fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, 
         };
         if parent < 0 {
             return Err(format!(
-                "Cannot capture account scope parent: {}",
+                "Cannot capture directory scope parent: {}",
                 std::io::Error::last_os_error()
             ));
         }
         cursor = unsafe { File::from_raw_fd(parent) };
     }
-    Err("Account scope ancestry exceeds the directory bound".into())
+    Err("Directory scope ancestry exceeds the directory bound".into())
 }
 
 /// Resolve aliases even for a not-yet-created descendant without interpreting
@@ -405,14 +408,15 @@ impl Reservation {
                 .values()
                 .filter(|record| !record.handle.is_completed())
                 .map(|record| {
+                    let launch = record.execution_launch();
                     (
-                        record.session.launch.working_directory.clone(),
+                        launch.working_directory.clone(),
                         record
                             .execution_environment
                             .as_ref()
                             .map(|value| value.0.clone())
-                            .unwrap_or_else(|| record.session.launch.environment.clone()),
-                        crate::account::launch_credential_overrides(&record.session.launch),
+                            .unwrap_or_else(|| launch.environment.clone()),
+                        crate::account::launch_credential_overrides(launch),
                         record.execution_environment.is_none(),
                     )
                 })
@@ -437,7 +441,7 @@ impl Reservation {
         };
         for (cwd, environment, unset, inherit) in owners {
             require_absolute_roots(&environment, &unset, inherit)?;
-            ensure_launch(host, &cwd, &environment, &unset, inherit)?;
+            ensure_credential_roots(host, &cwd, &environment, &unset, inherit)?;
         }
         Ok(())
     }
@@ -743,7 +747,20 @@ pub(super) fn ensure_paths(
     Ok(())
 }
 
+/// Admits a launch at `cwd`: outside any worktree being removed, and with
+/// credential roots clear of pending account operations.
 pub(super) fn ensure_launch(
+    host: &SharedHost,
+    cwd: &Path,
+    environment: &BTreeMap<String, String>,
+    unset: &BTreeSet<String>,
+    inherit: bool,
+) -> Result<(), ProtocolError> {
+    super::worktree_removal::ensure_outside(host, cwd)?;
+    ensure_credential_roots(host, cwd, environment, unset, inherit)
+}
+
+fn ensure_credential_roots(
     host: &SharedHost,
     cwd: &Path,
     environment: &BTreeMap<String, String>,
@@ -819,6 +836,7 @@ pub(super) fn ensure_launch_at_directory(
             ));
         }
         require_absolute_roots(environment, unset, inherit)?;
+        super::worktree_removal::ensure_outside_directory(host, directory)?;
     }
     // Keep the normal admission path,  authoritative for every absolute or unspecified root.
     ensure_launch(host, cwd, environment, unset, inherit)
@@ -921,11 +939,12 @@ pub(super) fn ensure_terminal(
     let selected = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.terminals.get(&id).map(|record| {
+            let launch = record.execution_launch();
             let environment = record
                 .execution_environment
                 .as_ref()
                 .map(|value| &value.0)
-                .unwrap_or(&record.session.launch.environment);
+                .unwrap_or(&launch.environment);
             let environment = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"]
                 .into_iter()
                 .filter_map(|name| {
@@ -935,9 +954,9 @@ pub(super) fn ensure_terminal(
                 })
                 .collect();
             (
-                record.session.launch.working_directory.clone(),
+                launch.working_directory.clone(),
                 environment,
-                crate::account::launch_credential_overrides(&record.session.launch),
+                crate::account::launch_credential_overrides(launch),
                 record.execution_environment.is_none(),
             )
         })
@@ -957,6 +976,8 @@ pub(super) fn admit(
     match request {
         ClientRequest::Attach { terminal_id, .. } => ensure_terminal(host, *terminal_id)?,
         ClientRequest::ChatAttach { .. }
+        | ClientRequest::ChatReleaseInspect { .. }
+        | ClientRequest::ChatRelease { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatRecoverAccount { .. } => ensure_idle(host)?,
         ClientRequest::PrepareUpgrade { .. }

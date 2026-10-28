@@ -19,6 +19,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Instant,
 };
 #[cfg(feature = "tokio")]
 use tokio::task::JoinHandle;
@@ -89,6 +90,15 @@ impl Executor<'_> {
             future.await
         }
     }
+}
+
+/// Waits until `deadline` on the underlying runtime's timer.
+pub(crate) async fn sleep_until(deadline: Instant) {
+    #[cfg(not(feature = "tokio"))]
+    async_io::Timer::at(deadline).await;
+
+    #[cfg(feature = "tokio")]
+    tokio::time::sleep_until(deadline.into()).await;
 }
 
 /// A wrapper around the task API of the underlying runtime/executor.

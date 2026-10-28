@@ -76,6 +76,7 @@ cagents daemon stop --confirm
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
 | `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 
 - An agent handle moves its authenticated main pane and fails if that pane

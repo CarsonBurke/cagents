@@ -1,5 +1,11 @@
 #![cfg(feature = "host")]
 
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
+
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 use serde_json::Value;
 use std::{
     fs,
@@ -15,6 +21,7 @@ use std::{
 struct Fixture {
     root: tempfile::TempDir,
     daemon: Child,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -66,10 +73,14 @@ impl Fixture {
             .stderr(log)
             .spawn()
             .unwrap();
-        let fixture = Self { root, daemon };
+        let fixture = Self {
+            root,
+            daemon,
+            agents: Default::default(),
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = fixture.output(&["daemon", "status"]);
+            let output = fixture.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -83,13 +94,6 @@ impl Fixture {
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
         // Explicit close includes the provider's bounded interrupt/teardown
         // budget, which is deliberately longer than ordinary RPCs.
         let timeout = if arguments.starts_with(&["agent", "close"]) {
@@ -97,16 +101,17 @@ impl Fixture {
         } else {
             20
         };
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        child.wait_with_output().unwrap()
+        self.output_until(arguments, Instant::now() + Duration::from_secs(timeout))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let spec = private_cli_capture::private_cli(self.root.path())
+            .env("TERM", "xterm-256color")
+            .args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
+        self.agents.observe(&output);
+        output
     }
 
     fn wait(&self, arguments: &[&str], expected_code: i32) -> Value {
@@ -133,17 +138,136 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Confirm only this isolated daemon's exact counted inventory. This
-        // also retires the provider if an assertion fails while it is waiting.
-        let preflight = self.output(&["daemon", "preflight"]);
-        if let Ok(value) = serde_json::from_slice::<Value>(&preflight.stdout)
-            && let Some(capability) = value["data"].get("capability")
-        {
-            let _ = self.output(&["daemon", "stop", "--confirm", &capability.to_string()]);
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
         }
-        let _ = self.daemon.kill();
+        // Daemon stop deliberately preserves retained actors. Only after all
+        // assertions, explicitly retire exact agents this private CLI accepted.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
+            }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
+            }
+        }
     }
+}
+
+#[test]
+fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() {
+    let fixture = Fixture::with_provider(include_str!("fixtures/automation-claude.sh"));
+    let project_path = fixture.root.path().join("project");
+    let project = project_path.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let mut completed = std::collections::BTreeMap::new();
+    let mut first = None;
+    for index in 0..100 {
+        let name = format!("capacity-{index}");
+        let accepted = fixture.cli(&[
+            "agent",
+            "spawn",
+            "--provider",
+            "claude",
+            "--repository",
+            project,
+            "--directory",
+            project,
+            "--surface",
+            "chat",
+            "--name",
+            &name,
+            "--prompt",
+            "capacity fixture",
+            "--idempotency-key",
+            &name,
+            "--wait",
+            "--timeout",
+            "10",
+        ]);
+        assert_eq!(accepted["created"], true, "conversation {index}");
+        assert_eq!(accepted["timed_out"], false);
+        assert_eq!(accepted["agent"]["origin"], "User");
+        assert_eq!(accepted["agent"]["closed"], false);
+        assert!(accepted["agent"]["session"]["Chat"].is_object());
+        assert_eq!(accepted["run"]["state"], "Succeeded");
+        assert_eq!(accepted["run"]["result"]["text"], "SCHEDULED_RESULT");
+        let agent = accepted["agent"]["id"].as_str().unwrap().to_owned();
+        let run = accepted["run"]["id"].as_str().unwrap().to_owned();
+        assert!(completed.insert(agent, run).is_none());
+        if index == 0 {
+            first = Some(accepted);
+        }
+    }
+    assert_eq!(completed.len(), 100);
+    // `agent list` currently has no cursor and reads at most 1024 summaries.
+    // Query every exact ID through its documented bounded status command:
+    // this avoids aggregating 100 verbose JSON rows in the fixture's stdout pipe.
+    // All 100 remain open; neither this loop nor setup closes an agent.
+    for (agent, run) in &completed {
+        let retained = fixture.cli(&["agent", "status", agent]);
+        assert_eq!(retained["agent"]["id"].as_str(), Some(agent.as_str()));
+        assert_eq!(retained["run"]["id"].as_str(), Some(run.as_str()));
+        assert_eq!(retained["agent"]["origin"], "User");
+        assert_eq!(retained["agent"]["closed"], false);
+        assert_eq!(retained["run"]["state"], "Succeeded");
+    }
+    let retried = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--directory",
+        project,
+        "--surface",
+        "chat",
+        "--name",
+        "capacity-0",
+        "--prompt",
+        "capacity fixture",
+        "--idempotency-key",
+        "capacity-0",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    let first = first.unwrap();
+    assert_eq!(retried["created"], false);
+    assert_eq!(retried["agent"]["id"], first["agent"]["id"]);
+    assert_eq!(retried["run"]["id"], first["run"]["id"]);
+    assert_eq!(retried["run"]["state"], "Succeeded");
+    assert_eq!(retried["agent"]["closed"], false);
+    let prompts = fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+    assert_eq!(prompts.lines().count(), 100);
+    assert!(prompts.lines().all(|line| line == "prompt"));
+    // Existing fixture Drop retires the private counted inventory only after
+    // all retained-conversation and exactly-once provider assertions above.
 }
 
 #[test]

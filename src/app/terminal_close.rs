@@ -58,7 +58,10 @@ impl Cagents {
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
             {
-                return cosmic::task::message(if unasked {
+                // Acquire the next close's ownership before returning a task.
+                // A delayed CardId-only message would leave Retry free to
+                // replace its terminal between dequeue and dispatch.
+                return self.update(if unasked {
                     Message::CloseCardUnasked(card)
                 } else {
                     Message::CloseCard(card)
@@ -143,10 +146,9 @@ impl Cagents {
         }
         // Read before anything persists the scope, which prunes the closed
         // card from its channel's membership.
-        let emptied = self.channels_emptied_by(&[card]);
+        let emptied = self.close_emptied_channels(&[card]);
         self.retire_lsp_card(card);
-        self.sidebar_state.clear_agent_activity(card);
-        self.sidebar_state.acknowledge_agent_update(card);
+        self.sidebar_state.forget_card_attention(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
@@ -159,12 +161,8 @@ impl Cagents {
                 },
             };
         }
-        let emptied = emptied
-            .into_iter()
-            .filter(|&channel| !self.channel_has_open_card(channel))
-            .collect();
         self.persist();
-        Task::batch([self.delete_channels(emptied), self.sync_chrome()])
+        Task::batch([emptied, self.sync_chrome()])
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
@@ -172,6 +170,10 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
             ));
+            return Task::none();
+        }
+        if let Some(reason) = self.review_checkout_blocker(card) {
+            self.status = Some(TransientNotice::warning(reason));
             return Task::none();
         }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
@@ -301,10 +303,10 @@ impl Cagents {
                     active: true,
                     dont_ask_again: false,
                     detail: None,
-                    focus: 1,
+                    focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -339,6 +341,11 @@ impl Cagents {
     /// Moves focus off a card whose removal the workspace has reserved, then
     /// commits that removal.
     pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
+        if !self.workspace_surfaces_visible() {
+            // The accepted close still commits, but its hidden pane cannot
+            // take native focus from Work or the contextual inspector.
+            return cosmic::task::message(Message::CommitClose(handoff.unmounting));
+        }
         workspace_widget::focus_handoff_then(
             handoff,
             widget::Id::new(TOOLBAR_FOCUS_ID),
@@ -359,6 +366,17 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if let Some(reason) = self.review_checkout_blocker(id) {
+            if self
+                .workspace
+                .pending_close()
+                .is_some_and(|pending| pending.unmounting == id)
+            {
+                let _ = self.workspace.cancel_close(id);
+            }
+            self.status = Some(TransientNotice::warning(reason));
+            return None;
+        }
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
@@ -371,7 +389,11 @@ impl Cagents {
         };
         // Read before anything persists the scope, which prunes the
         // closed card from its channel's membership.
-        let emptied = self.channels_emptied_by(&[id]);
+        let emptied = if replacing {
+            Task::none()
+        } else {
+            self.close_emptied_channels(&[id])
+        };
         if let Some(card) = closed_descriptor {
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
@@ -380,8 +402,7 @@ impl Cagents {
             }
         }
         self.retire_lsp_card(id);
-        self.sidebar_state.clear_agent_activity(id);
-        self.sidebar_state.acknowledge_agent_update(id);
+        self.sidebar_state.forget_card_attention(id);
         self.chat_discard(id);
         // A draft still waiting out its debounce is the last thing
         // typed into the pane; closing it is not discarding it.
@@ -413,6 +434,8 @@ impl Cagents {
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
                 | CardRuntime::Automations => {}
+                // A reopened board starts from the daemon's, not this one.
+                CardRuntime::Work => self.work_ui.reset(),
             }
         }
         self.lifecycle.remove(id);
@@ -437,12 +460,6 @@ impl Cagents {
         let replacement = replacement
             .map(|(launch, slot, succession)| self.open_chat_replacement(launch, slot, succession))
             .unwrap_or_else(Task::none);
-        // The replacement joins the chat's channel, which is then not
-        // empty after all.
-        let emptied = emptied
-            .into_iter()
-            .filter(|&channel| !self.channel_has_open_card(channel))
-            .collect();
         let reopen = match utility {
             Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
                 self.reopen_utility = None;
@@ -450,7 +467,8 @@ impl Cagents {
             }
             _ => Task::none(),
         };
-        let focus = if !replacing
+        let focus = if self.workspace_surfaces_visible()
+            && !replacing
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
@@ -465,15 +483,8 @@ impl Cagents {
             Task::none()
         };
         Some(
-            Task::batch([
-                closed,
-                replacement,
-                settings,
-                self.delete_channels(emptied),
-                reopen,
-                focus,
-            ])
-            .chain(self.next_queued_card_close()),
+            Task::batch([closed, replacement, settings, emptied, reopen, focus])
+                .chain(self.next_queued_card_close()),
         )
     }
 
@@ -626,9 +637,9 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
-                intent.focus = 1;
+                intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -721,18 +732,16 @@ impl Cagents {
                     .into(),
             ]
         } else {
-            vec![
+            vec![super::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
-                    .into(),
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)),
                 crate::ui_controls::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
                         (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
-                    )
-                    .into(),
-            ]
+                    ),
+            )]
         };
         rows.push(widget::row::with_children(buttons).spacing(space::S).into());
         Some(super::dialog_ui::surface(
@@ -755,6 +764,314 @@ fn close_focus(index: usize) -> Task<Message> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    fn channel_close_fixture() -> (Cagents, CardId, crate::channel_work::Home) {
+        use crate::workspace_model::{
+            ModelChannel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let home = crate::channel_work::Home {
+            registry: uuid::Uuid::new_v4(),
+            channel: crate::model::ChannelId::new(),
+            creation_ordinal: 4,
+        };
+        let project = ProjectId::new();
+        app.active_workspace = Some("/tmp".into());
+        app.workspace_model.identity = home.registry;
+        app.workspace_model.channels.push(ModelChannel {
+            id: home.channel,
+            repository: "/tmp".into(),
+            title: "Retained Home".into(),
+            title_source: Default::default(),
+            ordinal: home.creation_ordinal,
+        });
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(home.channel),
+            revision: 7,
+            panes: vec![Pane::from_card(app.card_state(card).unwrap(), None).unwrap()],
+            retired: vec![],
+        });
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(home.channel);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: home.channel,
+            project_id: project,
+            title: "Retained Home".into(),
+            title_source: Default::default(),
+            ordinal: home.creation_ordinal,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        (app, card, home)
+    }
+
+    fn assert_deferred_home_close(
+        app: &mut Cagents,
+        card: CardId,
+        home: crate::channel_work::Home,
+    ) {
+        use crate::workspace_model::ModelEdit;
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == home.channel)
+        );
+        assert!(
+            !app.channel_ui.is_deleting(home.channel),
+            "closing a pane is not explicit Home deletion"
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == home.channel)
+                .unwrap()
+                .cards
+                .is_empty(),
+            "persist prunes closed membership after the original Home was captured"
+        );
+        assert!(app.channel_work.retire_candidates.contains(&home));
+        let (send, received) = async_channel::unbounded();
+        app.workspace_model_tx = send;
+        app.retire_settled_empty_channels();
+        assert!(
+            received.try_recv().is_err(),
+            "the old occupied canonical view is insufficient"
+        );
+        app.workspace_model.views[0].panes.clear();
+        app.workspace_model.views[0].revision = 8;
+        app.retire_settled_empty_channels();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            ModelEdit::RetireEmptyChannel {
+                home,
+                expected_view_revision: 8,
+            }
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn final_pane_commit_defers_home_retirement_to_canonical_work_and_view_proof() {
+        let (mut app, card, home) = channel_close_fixture();
+        app.workspace.request_close(card).unwrap();
+        drop(app.commit_card_removal(card, None).unwrap());
+        assert_deferred_home_close(&mut app, card, home);
+    }
+
+    #[test]
+    fn final_offstrip_pane_close_defers_home_retirement_to_canonical_work_and_view_proof() {
+        let (mut app, card, home) = channel_close_fixture();
+        app.workspace = Cagents::rebuild_workspace(&WorkspaceState::default());
+        drop(app.retire_offstrip_card(card));
+        assert_deferred_home_close(&mut app, card, home);
+    }
+
+    fn retry_close_fixture() -> (Cagents, CardId) {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let state = app.card_state_mut(card).unwrap();
+        state.residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut state.kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        (app, card)
+    }
+
+    fn terminal_source(app: &Cagents, card: CardId) -> TerminalSession {
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+            unreachable!();
+        };
+        session.clone()
+    }
+
+    #[test]
+    fn queued_close_keeps_its_original_terminal_when_completion_offers_retry() {
+        let (mut app, first) = retry_close_fixture();
+        let mut second = super::super::tests::terminal_card_state();
+        let queued = second.id;
+        second.kind = CardKind::Terminal(terminal_source(&app, first));
+        let CardKind::Terminal(session) = &mut second.kind else {
+            unreachable!();
+        };
+        session.id = TerminalId::new();
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.settings.confirm_terminal_close = true;
+
+        // Tasks stay unpolled: the request is owned, but no daemon is used.
+        drop(app.update(Message::CloseCardUnasked(first)));
+        assert!(app.terminal_close_pending(first));
+        assert!(!app.terminal_close_dialog_visible());
+        drop(app.update(Message::CloseCardUnasked(queued)));
+        let queued_intent = QueuedCardClose {
+            card: queued,
+            unasked: true,
+        };
+        assert_eq!(app.queued_card_closes.front(), Some(&queued_intent));
+
+        // This is the same completion transition used by TerminalWake.
+        app.retire_ended_terminal(queued, 0, None, false);
+        app.cards.insert(queued, CardRuntime::Completed);
+        let source = terminal_source(&app, queued);
+        let residency = app.card_state(queued).unwrap().residency.clone();
+        assert!(ended_terminal(app.card_state(queued)).is_some());
+        assert!(app.pane_close_owned(queued));
+        assert!(!app.terminal_start_in_flight(queued));
+        drop(app.update(Message::RetryCard(queued)));
+        assert_eq!(terminal_source(&app, queued), source);
+        assert_eq!(app.card_state(queued).unwrap().residency, residency);
+        assert!(matches!(
+            app.cards.get(&queued),
+            Some(CardRuntime::Completed)
+        ));
+        assert!(!app.terminal_start_in_flight(queued));
+        assert_eq!(app.queued_card_closes.front(), Some(&queued_intent));
+        assert!(app.terminal_close_pending(first));
+
+        // A different completed pane still permits an explicit restart.
+        let unrelated = super::super::tests::terminal_card_state();
+        let other = unrelated.id;
+        Arc::make_mut(&mut app.durable).cards.push(unrelated);
+        app.retire_ended_terminal(other, 0, None, false);
+        let old_other = terminal_source(&app, other).id;
+        drop(app.update(Message::RetryCard(other)));
+        assert_ne!(terminal_source(&app, other).id, old_other);
+        assert!(app.terminal_start_in_flight(other));
+        assert_eq!(terminal_source(&app, queued), source);
+    }
+
+    #[test]
+    fn completed_release_owns_retry_until_its_exact_receipt() {
+        let (mut app, card) = retry_close_fixture();
+        app.retire_ended_terminal(card, 0, None, false);
+        app.cards.insert(card, CardRuntime::Completed);
+        let source = terminal_source(&app, card);
+        drop(app.update(Message::CloseCard(card)));
+        assert!(app.terminal_close_pending(card));
+        assert!(app.pane_close_owned(card));
+        assert!(app.terminal_close.is_none());
+        drop(app.update(Message::CancelTerminalClose));
+        drop(app.update(Message::RetryCard(card)));
+        assert_eq!(terminal_source(&app, card), source);
+        assert!(!app.terminal_start_in_flight(card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
+        assert!(app.terminal_close_pending(card));
+
+        // A reported failure retains the original and releases this attempt.
+        drop(app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            result: Err("fixture release unavailable".into()),
+        }));
+        assert!(!app.pane_close_owned(card));
+        assert_eq!(terminal_source(&app, card), source);
+        drop(app.update(Message::RetryCard(card)));
+        let replacement = terminal_source(&app, card);
+        assert_ne!(replacement.id, source.id);
+        assert_eq!(replacement.predecessor, Some(source.id));
+        assert_eq!(replacement.launch, source.launch);
+        assert!(app.terminal_start_in_flight(card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+    }
+
+    #[test]
+    fn completed_close_confirmation_cancel_allows_a_fresh_explicit_retry() {
+        let (mut app, card) = retry_close_fixture();
+        let proof = terminal_source(&app, card).continuity.live_proof().unwrap();
+        app.retire_ended_terminal(card, 0, None, false);
+        app.cards.insert(card, CardRuntime::Completed);
+        let source = terminal_source(&app, card);
+        drop(app.update(Message::CloseCard(card)));
+        drop(app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            result: Ok(CompletedCloseOutcome::Active(proof)),
+        }));
+        assert!(app.terminal_close_dialog_visible());
+        assert!(app.pane_close_owned(card));
+        assert!(!app.terminal_close_pending(card));
+        drop(app.update(Message::RetryCard(card)));
+        assert_eq!(terminal_source(&app, card), source);
+        assert!(!app.terminal_start_in_flight(card));
+
+        drop(app.update(Message::CancelTerminalClose));
+        assert!(!app.pane_close_owned(card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        drop(app.update(Message::RetryCard(card)));
+        let replacement = terminal_source(&app, card);
+        assert_ne!(replacement.id, source.id);
+        assert_eq!(replacement.predecessor, Some(source.id));
+        assert_eq!(replacement.launch, source.launch);
+        assert!(app.terminal_start_in_flight(card));
+    }
+
+    #[test]
+    fn cancelling_one_close_acquires_the_next_before_a_delayed_retry() {
+        let (mut app, first) = retry_close_fixture();
+        let mut second = super::super::tests::terminal_card_state();
+        let queued = second.id;
+        let CardKind::Terminal(session) = &mut second.kind else {
+            unreachable!();
+        };
+        session.continuity = terminal_source(&app, first).continuity;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.settings.confirm_terminal_close = true;
+        drop(app.update(Message::CloseCardUnasked(first)));
+        drop(app.update(Message::CloseCardUnasked(queued)));
+        assert_eq!(app.queued_card_closes.front().unwrap().card, queued);
+        app.retire_ended_terminal(queued, 0, None, false);
+        app.cards.insert(queued, CardRuntime::Completed);
+        let source = terminal_source(&app, queued);
+
+        // The first owner declines, allowing its normal confirmation/Cancel.
+        let intent = app.terminal_close.as_ref().unwrap().clone();
+        drop(app.update(Message::TerminalCloseFinished {
+            card: first,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Active,
+        }));
+        assert!(app.terminal_close_dialog_visible());
+        drop(app.update(Message::CancelTerminalClose));
+        assert!(app.queued_card_closes.is_empty());
+        assert!(app.terminal_close.is_none());
+        assert!(app.terminal_close_pending(queued));
+        assert!(app.pane_close_owned(queued));
+
+        // The Cancel task is unpolled, so any other input can arrive before
+        // its async release runs. Ownership must already fence this Retry.
+        drop(app.update(Message::RetryCard(queued)));
+        assert_eq!(terminal_source(&app, queued), source);
+        assert!(!app.terminal_start_in_flight(queued));
+        assert!(matches!(
+            app.cards.get(&queued),
+            Some(CardRuntime::Completed)
+        ));
+        drop(app.update(Message::CompletedTerminalClosed {
+            card: queued,
+            session: source.clone(),
+            result: Ok(CompletedCloseOutcome::Closed),
+        }));
+        assert!(app.closed_terminal_cards.contains(&queued));
+        assert_eq!(terminal_source(&app, queued), source);
+        assert!(!app.terminal_start_in_flight(queued));
+        drop(app.update(Message::CommitClose(queued)));
+        assert!(!app.card_state(queued).unwrap().existence.is_open());
+        assert!(app.card_state(first).unwrap().existence.is_open());
+    }
 
     #[test]
     fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {
@@ -818,11 +1135,15 @@ mod tests {
             host_incarnation: HostIncarnation::new("incarnation"),
         };
         let _ = app.begin_card_close(card);
-        let _ = app.update(Message::CompletedTerminalClosed {
+        let opening = app.update(Message::CompletedTerminalClosed {
             card,
             session: source.clone(),
             result: Ok(CompletedCloseOutcome::Active(proof.clone())),
         });
+        assert_eq!(
+            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.terminal-close.cancel"))
+        );
         assert!(app.terminal_close_dialog().is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
         let _ = app.update(Message::ConfirmTerminalClose);
@@ -998,8 +1319,13 @@ mod tests {
         let _ = app.close_card_unasked(first);
         assert!(app.terminal_close_pending(first));
 
-        let login_state = super::super::tests::terminal_card_state();
+        let mut login_state = super::super::tests::terminal_card_state();
         let login = login_state.id;
+        let CardKind::Terminal(session) = &mut login_state.kind else {
+            unreachable!();
+        };
+        session.continuity = terminal_source(&app, first).continuity;
+        let login_terminal = session.id;
         Arc::make_mut(&mut app.durable).cards.push(login_state);
         let _ = app.begin_card_close(login);
         let _ = app.close_card_unasked(login);
@@ -1013,10 +1339,19 @@ mod tests {
             "a later explicit cancellation upgrades a queued ordinary close"
         );
         app.terminal_close = None;
-        assert!(matches!(
-            super::super::tests::task_app_message(app.next_queued_card_close()),
-            Message::CloseCardUnasked(card) if card == login
-        ));
+        drop(app.next_queued_card_close());
+        assert!(app.queued_card_closes.is_empty());
+        let next = app.terminal_close.as_ref().unwrap();
+        assert_eq!((next.card, next.terminal), (login, login_terminal));
+        assert_eq!(
+            next.proof,
+            terminal_source(&app, login)
+                .continuity
+                .live_proof()
+                .unwrap()
+        );
+        assert!(next.pending);
+        assert!(!next.active);
     }
 }
 

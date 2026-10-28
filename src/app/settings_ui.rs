@@ -238,6 +238,11 @@ fn settings_category_controls<'a>(
                     "Notify while focused",
                     "Also notify while you are watching that agent. Off by default.",
                 ),
+                (
+                    Field::MessagePreviews,
+                    "Show message previews",
+                    "Include conversation names and response or request excerpts on the desktop. These may be visible on a shared or locked screen. Off by default.",
+                ),
             ];
             let mut controls: Vec<_> = fields
                 .into_iter()
@@ -248,7 +253,8 @@ fn settings_category_controls<'a>(
                         crate::settings_widgets::toggle_enabled(
                             label,
                             draft.notifications.get(field),
-                            field == Field::Enabled || draft.notifications.get(Field::Enabled),
+                            matches!(field, Field::Enabled | Field::MessagePreviews)
+                                || draft.notifications.get(Field::Enabled),
                             move |enabled| Message::SettingsChanged {
                                 field: SettingsField::Notifications(field),
                                 value: enabled.to_string(),
@@ -275,7 +281,7 @@ fn settings_category_controls<'a>(
             ));
             vec![settings_group(
                 "Agent notifications",
-                "Alerts contain the provider and folder name, never prompts or output.",
+                "Private alerts show the provider and folder. Message previews are available when you choose to enable them.",
                 controls,
             )]
         }
@@ -388,7 +394,7 @@ fn settings_category_controls<'a>(
                     .into(),
             );
             let directory = setting_input(
-                "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
+                "Absolute path, or relative to the repository root. Defaults to .worktrees/. Each new worktree gets its own subdirectory.",
                 &draft.managed_worktree_directory,
                 SettingsField::ManagedWorktreeDirectory,
                 invalid,
@@ -462,11 +468,22 @@ fn settings_category_controls<'a>(
                 SettingsField::HibernationDelayMs,
                 invalid,
             );
+            let stale = setting_input(
+                "A card with no commits, file changes or agent work for this many days moves to Stale.",
+                &draft.work_stale_after_days,
+                SettingsField::WorkStaleAfterDays,
+                invalid,
+            );
             vec![
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
                     vec![directory, worktree_pane, cleanup, order],
+                ),
+                settings_group(
+                    "Work board",
+                    "How the board sorts work that has gone quiet.",
+                    vec![stale],
                 ),
                 settings_group(
                     "Workspace",
@@ -759,9 +776,9 @@ fn settings_category_controls<'a>(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
                 vec![setting_input(
-                    "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
-                    &draft.terminal_scrollback_lines,
-                    SettingsField::TerminalScrollbackLines,
+                    "0–1,024 MiB per newly started terminal, allocated as needed. Existing history is preserved.",
+                    &draft.terminal_scrollback_mib,
+                    SettingsField::TerminalScrollbackMib,
                     invalid,
                 )],
             ),
@@ -988,10 +1005,11 @@ pub(super) fn settings_pane<'a>(
     query: &'a str,
     context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
-    crate::ui_controls::responsive(move |size| {
+    let pane: Element<'a, Message> = crate::ui_controls::responsive(move |size| {
         settings_layout(category, draft, query, &context, size.width)
     })
-    .into()
+    .into();
+    pane.map(account_ui::pane_message)
 }
 
 fn settings_layout<'a>(

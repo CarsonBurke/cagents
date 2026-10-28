@@ -322,6 +322,125 @@ mod tests {
     }
 
     #[test]
+    fn local_clipboard_refusals_report_direct_and_confirmed_pastes_without_losing_focus_or_runtime()
+    {
+        use iced::futures::StreamExt;
+        for full in [false, true] {
+            for confirmed in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                let card = app.workspace.focused().unwrap();
+                let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+                    panic!("terminal fixture");
+                };
+                let terminal = session.id;
+                let directory = tempfile::tempdir().unwrap();
+                let surface = super::super::tests::unconnected_surface(directory.path(), terminal);
+                if full {
+                    // Existing hosted::COMMAND_CAPACITY is 256. A missing
+                    // socket can carry exactly one extra command while it
+                    // retries, so observe all 257 admissions before asserting
+                    // Full. Stopping at the first Full would race that take.
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let mut accepted = 0;
+                    while accepted < 257 {
+                        assert!(Instant::now() < deadline, "one carried command must settle");
+                        match surface.input(b"queued".to_vec()) {
+                            Ok(()) => accepted += 1,
+                            Err(crate::terminal::TerminalSendError::Full) => {
+                                std::thread::yield_now()
+                            }
+                            Err(error) => panic!("unexpected local admission: {error}"),
+                        }
+                    }
+                    assert_eq!(
+                        surface.input(b"still full".to_vec()),
+                        Err(crate::terminal::TerminalSendError::Full)
+                    );
+                }
+                app.cards
+                    .insert(card, CardRuntime::Terminal(surface.clone()));
+                app.settings.confirm_multiline_paste = confirmed;
+                let text = if full {
+                    "queued\npaste".to_owned()
+                } else {
+                    "x".repeat(crate::terminal_ipc::MAX_INPUT_BYTES) + "\n"
+                };
+                let expected = if full {
+                    crate::terminal::TerminalSendError::Full.to_string()
+                } else {
+                    crate::terminal::TerminalSendError::PasteTooLarge(text.len()).to_string()
+                };
+                let task = app.handle_terminal_find(Action::Paste(card, text));
+                let task = if confirmed {
+                    assert!(app.terminal_paste.is_some());
+                    drop(task); // initial modal-focus task; confirmation follows
+                    app.handle_terminal_find(Action::ConfirmPaste(card, true))
+                } else {
+                    task
+                };
+                let mut notices = 0;
+                let mut focus_operations = 0;
+                iced::futures::executor::block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(task)
+                        .expect("refused paste keeps its notice task");
+                    while let Some(action) = stream.next().await {
+                        match action {
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::TerminalError {
+                                    card: target,
+                                    message,
+                                },
+                            )) => {
+                                assert_eq!(target, card);
+                                assert_eq!(message, expected);
+                                notices += 1;
+                                drop(app.update(Message::TerminalError {
+                                    card: target,
+                                    message,
+                                }));
+                            }
+                            iced::runtime::Action::Widget(operation) => {
+                                focus_operations += 1;
+                                let target =
+                                    crate::ui_controls::field::text("Paste focus target", "")
+                                        .id(workspace_widget::card_focus_id(card))
+                                        .on_input(|_| Message::LifecycleSweep)
+                                        .into();
+                                let focused = super::super::tests::focused_element(
+                                    target,
+                                    iced::runtime::task::widget(operation)
+                                        .map(|()| cosmic::Action::App(Message::LifecycleSweep)),
+                                );
+                                assert_eq!(
+                                    focused.map(|id| id.to_string()),
+                                    Some(workspace_widget::card_focus_id(card).to_string()),
+                                    "actual confirmation task must restore its original card target"
+                                );
+                            }
+                            _ => panic!("unexpected paste refusal task action"),
+                        }
+                    }
+                });
+                assert_eq!(notices, 1, "no silent Full/PasteTooLarge");
+                assert_eq!(focus_operations, usize::from(confirmed));
+                assert!(app.terminal_paste.is_none());
+                assert!(
+                    matches!(app.cards.get(&card), Some(CardRuntime::Terminal(current))
+                    if current.terminal_id() == terminal)
+                );
+                assert!(
+                    app.notices
+                        .entries
+                        .iter()
+                        .any(|entry| entry.notice.message == expected)
+                );
+                assert!(ended_terminal(app.card_state(card)).is_none());
+                surface.stop_for_test();
+            }
+        }
+    }
+
+    #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
@@ -424,6 +543,7 @@ impl Cagents {
     pub(super) fn handle_terminal_find(&mut self, action: Action) -> Task<Message> {
         if let Action::ConfirmPaste(card, confirmed) = &action {
             let pending = self.terminal_paste.take();
+            let mut error_notice = Task::none();
             if *confirmed
                 && let Some((target, text)) = pending
                 && target == *card
@@ -431,10 +551,18 @@ impl Cagents {
                 && !self.terminal_close_pending(*card)
                 && let Some(CardRuntime::Terminal(handle)) = self.cards.get(card)
             {
-                let _ = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard);
+                if let Err(error) = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard) {
+                    error_notice = cosmic::task::message(Message::TerminalError {
+                        card: *card,
+                        message: error.to_string(),
+                    });
+                }
             }
-            return iced::widget::operation::focus(workspace_widget::card_focus_id(*card))
-                .map(cosmic::Action::App);
+            return Task::batch([
+                iced::widget::operation::focus(workspace_widget::card_focus_id(*card))
+                    .map(cosmic::Action::App),
+                error_notice,
+            ]);
         }
         let card = match &action {
             Action::Open(card)
@@ -494,6 +622,7 @@ impl Cagents {
             }
             Action::Copy(_, text) => {
                 self.terminal_context = None;
+                chat_ui::invalidate_copy_intent();
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
             Action::CopySelection(_, selection) => {
@@ -531,7 +660,12 @@ impl Cagents {
                     ))
                     .map(cosmic::Action::App);
                 }
-                let _ = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard);
+                if let Err(error) = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard) {
+                    return cosmic::task::message(Message::TerminalError {
+                        card,
+                        message: error.to_string(),
+                    });
+                }
                 return Task::none();
             }
             Action::ConfirmPaste(..) => {

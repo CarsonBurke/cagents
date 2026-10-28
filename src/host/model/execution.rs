@@ -11,6 +11,80 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// The host proves this actor state before inspecting or retiring authority.
+#[derive(Clone, Copy)]
+pub(in crate::host) enum ResidentRelease {
+    ReadOnlyHistory,
+    CompletedWriter,
+}
+
+/// A self capability is not a managed agent binding. A history reader cannot
+/// prove teardown of a former writer, so only a completed writer may retire it.
+fn resident_release_authority(
+    db: &Connection,
+    source: &HostedSession,
+    kind: ResidentRelease,
+) -> Result<Option<(String, String)>, String> {
+    if !source.has_complete_proof() {
+        return Err("Resident release requires a complete process identity".into());
+    }
+    let managed: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE session_id=?1 AND closed=0)
+             OR EXISTS(SELECT 1 FROM agent_launches WHERE session_id=?1)",
+            [source.id().to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if managed {
+        return Err(
+            "The actor belongs to a managed agent; use its supported owned-agent close operation"
+                .into(),
+        );
+    }
+    let lineage: String = db
+        .query_row(
+            "SELECT coalesce((SELECT lineage FROM session_lineages WHERE session_id=?1), ?1)",
+            [source.id().to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let parent = Lineage(
+        lineage
+            .parse()
+            .map_err(|_| "Stored session lineage is invalid")?,
+    );
+    let origin = encode(&Origin::Child { parent })?;
+    let delegated: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE origin=?1 AND closed=0)
+             OR EXISTS(SELECT 1 FROM agent_runs WHERE origin=?1 AND state IN ('accepted','running','waiting'))
+             OR EXISTS(SELECT 1 FROM agent_launches p JOIN agents a ON p.agent=a.id WHERE a.origin=?1)",
+        [&origin], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if delegated {
+        return Err("The session lineage retains delegated agents or unconfirmed work; close its owned agents first".into());
+    }
+    let authority: Option<(String, String)> = db
+        .query_row(
+            "SELECT token,source FROM agent_authorities WHERE session_id=?1",
+            [source.id().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((_, stored)) = &authority {
+        if matches!(kind, ResidentRelease::ReadOnlyHistory) {
+            return Err("A retained provider or managed agent authority remains; a history reader cannot prove its teardown".into());
+        }
+        // Provider-confirmed thread metadata can advance after startup; the
+        // immutable process recipe and daemon proof still must match exactly.
+        if !source.same_process(&decode::<HostedSession>(stored)?) {
+            return Err("The registered provider authority belongs to a different process; its successor was preserved".into());
+        }
+    }
+    Ok(authority)
+}
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
     tx.execute_batch(
@@ -71,6 +145,39 @@ pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String
 }
 
 impl Registry {
+    pub(crate) fn inspect_resident_release(
+        &mut self,
+        source: &HostedSession,
+        kind: ResidentRelease,
+    ) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        resident_release_authority(&tx, source, kind)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// The caller holds the exclusive daemon control gate through removal of
+    /// the exact resident. This drains submissions that authenticated before
+    /// retirement and excludes new acceptance until the capability is revoked.
+    /// Do not hold HostState while acquiring this transaction.
+    pub(crate) fn retire_resident_release(
+        &mut self,
+        source: &HostedSession,
+        kind: ResidentRelease,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some((token, stored)) = resident_release_authority(&tx, source, kind)? {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id=?1 AND token=?2 AND source=?3",
+                params![source.id().to_string(), token, stored],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Automatic removal must also wait for durable work not yet represented
     /// by an actor, including unconfirmed launch ownership after a restart.
     pub(crate) fn cleanup_execution_is_quiescent(&self) -> Result<bool, String> {
@@ -80,6 +187,29 @@ impl Registry {
                 AND NOT EXISTS(SELECT 1 FROM agents WHERE closed = 0 AND session_id IS NOT NULL)",
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())
+    }
+    /// Target directories of durable agent work that is running, or accepted
+    /// and yet to launch. Removing one would pull it out from under that work.
+    pub(crate) fn active_agent_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT a.record FROM agents a WHERE a.closed = 0 AND (
+                 a.session_id IS NOT NULL
+                 OR EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
+                 OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id
+                     AND r.state IN ('accepted', 'running', 'waiting')))",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records
+            .iter()
+            .map(|record| decode::<Agent>(record).map(|agent| agent.spec.target.directory))
+            .collect()
     }
     /// Accepted work can be queued behind the daemon's update write gate before
     /// it owns a hosted actor. Do not lose it from impact merely because there
@@ -172,6 +302,9 @@ impl Registry {
                 }
                 changed = agent.session.as_ref() != Some(successor);
                 agent.session = Some(successor.clone());
+                changed |= super::views::adopt_authenticated_agent_pane(
+                    &tx, agent.id, retained, successor,
+                )?;
                 tx.execute(
                     "UPDATE agents SET record = ?2 WHERE id = ?1",
                     params![agent.id.to_string(), encode(&agent)?],
@@ -758,15 +891,21 @@ impl Registry {
                 // Persist the resolved account for this accepted launch while
                 // keeping the caller's original request as its retry key.
                 let spec = selected.unwrap_or(spec);
-                let children: usize = tx
-                    .query_row(
-                        "SELECT count(*) FROM agents WHERE origin = ?1 AND closed = 0",
-                        [&origin_json],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if children >= MAX_CHILDREN {
-                    return Err("Agent child limit reached; close an existing child first".into());
+                // Fanout bounds delegated work, not the user's retained
+                // conversations. Every origin still pays the run limits above.
+                if !matches!(origin, Origin::User) {
+                    let children: usize = tx
+                        .query_row(
+                            "SELECT count(*) FROM agents WHERE origin = ?1 AND closed = 0",
+                            [&origin_json],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if children >= MAX_CHILDREN {
+                        return Err(
+                            "Agent child limit reached; close an existing child first".into()
+                        );
+                    }
                 }
                 if let Some(name) = &request.name {
                     let used: bool = tx.query_row(
@@ -800,6 +939,7 @@ impl Registry {
                             "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
                             params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
                         ).map_err(|error| error.to_string())?;
+                        super::channel_work::created_in(tx, channel)?;
                         Placement::Channel(channel)
                     }
                 };
@@ -1272,6 +1412,16 @@ impl Registry {
     /// Until exact live prompt evidence can be reconciled, restart records an
     /// uncertain outcome rather than authorizing another delivery of effects.
     pub(crate) fn interrupt_unproven_agent_runs(&mut self, now_ms: u64) -> Result<(), String> {
+        self.interrupt_unproven_agent_runs_except(now_ms, &[])
+    }
+
+    /// Only authenticated retained helpers supply these exact run/session pairs.
+    /// A stale descriptor, a busy flag or an unrelated run ID is not ownership.
+    pub(in crate::host) fn interrupt_unproven_agent_runs_except(
+        &mut self,
+        now_ms: u64,
+        retained: &[(RunId, HostedSession)],
+    ) -> Result<(), String> {
         let records = self
             .db
             .prepare(
@@ -1283,6 +1433,15 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         for record in records {
             let run: Run = decode(&record)?;
+            let agent = self.agent(run.agent)?;
+            if !agent.closed && retained.iter().any(|(id, source)| {
+                *id == run.id && agent.session.as_ref() == Some(source)
+                    && matches!(source, HostedSession::Chat(chat) if
+                        matches!(chat.native_continuity, crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 })
+                        && chat.has_valid_native_continuity())
+            }) {
+                continue;
+            }
             self.update_agent_run(run.id, run.revision, Update::Finished {
                 state: State::Interrupted,
                 result: ResultSummary {
@@ -1312,64 +1471,74 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let record: String = tx
-            .query_row(
-                "SELECT record FROM agent_runs WHERE id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let mut run: Run = decode(&record)?;
-        if run.revision != revision || run.state.is_terminal() {
-            return Err("The agent run has already advanced or finished".into());
-        }
-        match update {
-            Update::Started { provider_key } => {
-                if run.state != State::Accepted
-                    || provider_key.is_empty()
-                    || provider_key.len() > 1024
-                {
-                    return Err("The provider start does not match an accepted run".into());
-                }
-                run.provider_key = Some(provider_key);
-                run.started_ms = Some(now_ms);
-                run.state = State::Running;
-            }
-            Update::Waiting if run.state == State::Running => run.state = State::Waiting,
-            Update::Resumed if run.state == State::Waiting => run.state = State::Running,
-            Update::Finished { state, mut result } if state.is_terminal() => {
-                if state == State::Succeeded && run.provider_key.is_none() {
-                    return Err("An unconfirmed provider turn cannot succeed".into());
-                }
-                result.bound();
-                run.result = result;
-                run.state = state;
-                run.finished_ms = Some(now_ms);
-            }
-            _ => return Err("The provider update does not match the agent run state".into()),
-        }
-        run.revision = run
-            .revision
-            .checked_add(1)
-            .ok_or("Agent run revision exhausted")?;
-        tx.execute(
-            "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
-            params![
-                id.to_string(),
-                state_key(run.state),
-                run.revision,
-                encode(&run)?
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
-            [],
-        )
-        .map_err(|error| error.to_string())?;
+        let run = update_agent_run_in(&tx, id, revision, update, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+}
+
+/// A retained actor's semantic cursor and run transition share this transaction.
+pub(super) fn update_agent_run_in(
+    tx: &Transaction<'_>,
+    id: RunId,
+    revision: u64,
+    update: Update,
+    now_ms: u64,
+) -> Result<Run, String> {
+    let record: String = tx
+        .query_row(
+            "SELECT record FROM agent_runs WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut run: Run = decode(&record)?;
+    if run.revision != revision || run.state.is_terminal() {
+        return Err("The agent run has already advanced or finished".into());
+    }
+    match update {
+        Update::Started { provider_key } => {
+            if run.state != State::Accepted || provider_key.is_empty() || provider_key.len() > 1024
+            {
+                return Err("The provider start does not match an accepted run".into());
+            }
+            run.provider_key = Some(provider_key);
+            run.started_ms = Some(now_ms);
+            run.state = State::Running;
+        }
+        Update::Waiting if run.state == State::Running => run.state = State::Waiting,
+        Update::Resumed if run.state == State::Waiting => run.state = State::Running,
+        Update::Finished { state, mut result } if state.is_terminal() => {
+            if state == State::Succeeded && run.provider_key.is_none() {
+                return Err("An unconfirmed provider turn cannot succeed".into());
+            }
+            result.bound();
+            run.result = result;
+            run.state = state;
+            run.finished_ms = Some(now_ms);
+        }
+        _ => return Err("The provider update does not match the agent run state".into()),
+    }
+    run.revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("Agent run revision exhausted")?;
+    tx.execute(
+        "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
+        params![
+            id.to_string(),
+            state_key(run.state),
+            run.revision,
+            encode(&run)?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(run)
 }
 
 /// Moving a pane changes presentation membership, not execution authority.
@@ -1516,6 +1685,65 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn startup_preserves_only_exact_helper_proven_run_and_session_pairs() {
+        for mismatch in 0..6 {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let mut source = source();
+            let HostedSession::Chat(chat) = &mut source else {
+                unreachable!()
+            };
+            chat.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            assert!(chat.has_valid_native_continuity());
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            let mut retained = source.clone();
+            let HostedSession::Chat(chat) = &mut retained else {
+                unreachable!()
+            };
+            let mut run = accepted.run.id;
+            match mismatch {
+                0 => {}
+                1 => run = RunId::new(),
+                2 => {
+                    chat.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("stale")
+                }
+                3 => {
+                    chat.launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                4 => chat.native_continuity = Default::default(),
+                5 => chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                _ => unreachable!(),
+            }
+            registry
+                .interrupt_unproven_agent_runs_except(2, &[(run, retained)])
+                .unwrap();
+            assert_eq!(
+                registry.agent_run(accepted.run.id).unwrap().state,
+                if mismatch == 0 {
+                    State::Accepted
+                } else {
+                    State::Interrupted
+                },
+                "retained mismatch case {mismatch}"
+            );
+            if mismatch == 0 {
+                registry.interrupt_unproven_agent_runs(3).unwrap();
+                assert_eq!(
+                    registry.agent_run(accepted.run.id).unwrap().state,
+                    State::Interrupted
+                );
+            }
+        }
     }
 
     #[test]
@@ -1789,7 +2017,18 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE shared_view_terminal_sources; PRAGMA user_version=12;",
+                        "DROP TABLE automation_notifications;
+                         DROP TABLE channel_work_placement_epochs;
+                         DROP TABLE channel_work_placement_clock;
+                         DROP TABLE channel_work_operations;
+                         DROP TABLE channel_work_entries;
+                         DROP TABLE channel_work_homes;
+                         DROP TABLE automation_lifecycle;
+                         DROP TABLE native_actor_retirements;
+                         DROP TABLE native_actor_ownerships;
+                         DROP TABLE native_actor_cursors;
+                         DROP TABLE shared_view_terminal_sources;
+                         PRAGMA user_version=12;",
                     )
                     .unwrap();
                 drop(registry);
@@ -2273,6 +2512,100 @@ mod tests {
     }
 
     #[test]
+    fn resident_release_retires_only_its_own_completed_writer_capability() {
+        let (mut registry, _directory, _) = fixture();
+        let source = source();
+        let token = registry.register_agent_authority(&source).unwrap();
+        assert!(
+            registry
+                .inspect_resident_release(&source, ResidentRelease::ReadOnlyHistory)
+                .is_err()
+        );
+        registry
+            .inspect_resident_release(&source, ResidentRelease::CompletedWriter)
+            .unwrap();
+        assert!(
+            registry.execution_origin(&token).is_ok(),
+            "inspection cannot revoke a capability"
+        );
+        let mut confirmed = source.clone();
+        let HostedSession::Chat(session) = &mut confirmed else {
+            unreachable!()
+        };
+        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        registry
+            .retire_resident_release(&confirmed, ResidentRelease::CompletedWriter)
+            .unwrap();
+        assert!(registry.execution_origin(&token).is_err());
+        assert!(
+            registry
+                .retained_agent_authority_source(source.id())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resident_release_preserves_successor_capability() {
+        let (mut registry, _directory, _) = fixture();
+        let source = source();
+        let mut successor = source.clone();
+        let HostedSession::Chat(session) = &mut successor else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("successor");
+        let token = registry.fresh_agent_authority(&successor).unwrap();
+        assert!(
+            registry
+                .retire_resident_release(&source, ResidentRelease::CompletedWriter)
+                .is_err()
+        );
+        assert!(registry.execution_origin(&token).is_ok());
+        assert_eq!(
+            registry
+                .retained_agent_authority_source(source.id())
+                .unwrap(),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn resident_release_preserves_managed_pending_and_delegated_work() {
+        for (delegated, bound) in [(false, false), (false, true), (true, false)] {
+            let (mut registry, _directory, request) = fixture();
+            let source = source();
+            let token = registry.register_agent_authority(&source).unwrap();
+            let origin = if delegated {
+                registry.execution_origin(&token).unwrap()
+            } else {
+                Origin::User
+            };
+            let accepted = registry.submit_agent(&origin, &request, 1).unwrap();
+            if !delegated {
+                registry
+                    .reserve_agent_launch(accepted.agent.id, &source)
+                    .unwrap();
+                if bound {
+                    registry
+                        .bind_agent(accepted.agent.id, None, source.clone())
+                        .unwrap();
+                }
+            }
+            assert!(
+                registry
+                    .retire_resident_release(&source, ResidentRelease::CompletedWriter)
+                    .is_err()
+            );
+            assert!(registry.execution_origin(&token).is_ok());
+            assert_eq!(
+                registry.latest_agent_run(accepted.agent.id).unwrap().state,
+                State::Accepted
+            );
+        }
+    }
+
+    #[test]
     fn authority_retirement_and_proved_successor_are_exact_source_fenced() {
         let (mut registry, _directory, _) = fixture();
         let source = source();
@@ -2455,6 +2788,105 @@ mod tests {
     }
 
     #[test]
+    fn implicit_agent_channel_keeps_one_work_home_through_retry_and_project_close() {
+        use crate::channel_work::{Home, HomeLifecycle};
+
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let model = registry.model().unwrap();
+        let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
+        let home = Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Active
+        );
+        let retried = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent.id, accepted.agent.id);
+        assert_eq!(retried.run.id, accepted.run.id);
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM channel_work_homes", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: directory.path().into(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().channels.is_empty());
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted,
+            "reopening must retain the deleted incarnation without recreating its channel"
+        );
+        let retained: (String, String) = registry.db.query_row(
+            "SELECT repository,title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+            params![home.channel.to_string(), home.creation_ordinal],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                directory.path().to_str().unwrap().into(),
+                channel.title.clone()
+            )
+        );
+    }
+
+    #[test]
+    fn failed_implicit_work_home_creation_rolls_back_agent_channel_and_run() {
+        let (mut registry, _directory, request) = fixture();
+        let before = registry.model().unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_implicit_home BEFORE INSERT ON main.channel_work_homes
+             BEGIN SELECT RAISE(ABORT, 'fixture work home failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .submit_agent(&Origin::User, &request, 1)
+            .unwrap_err();
+        assert!(error.contains("fixture work home failure"));
+        let after = registry.model().unwrap();
+        assert_eq!(after.sequence, before.sequence);
+        assert!(after.channels.is_empty() && after.agents.is_empty());
+        for table in ["channel_work_homes", "agent_runs"] {
+            let count: u64 = registry
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back with implicit creation");
+        }
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_implicit_home;")
+            .unwrap();
+        assert!(
+            registry
+                .submit_agent(&Origin::User, &request, 2)
+                .unwrap()
+                .created
+        );
+    }
+
+    #[test]
     fn worktree_placement_requires_the_exact_open_view_without_creating_a_channel() {
         let (mut registry, directory, mut request) = fixture();
         let scope = Placement::Worktree {
@@ -2556,7 +2988,16 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP INDEX agents_by_name; PRAGMA user_version=9;")
+            .execute_batch(
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
+                 DROP INDEX agents_by_name; PRAGMA user_version=9;",
+            )
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
@@ -2801,6 +3242,321 @@ mod tests {
                 .contains("channel")
         );
         assert_eq!(registry.model().unwrap(), model);
+    }
+
+    fn finish_capacity_run(registry: &mut Registry, accepted: &Accepted) -> Run {
+        let running = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: format!("fixture-turn-{}", accepted.run.id),
+                },
+                20,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                running.id,
+                running.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                30,
+            )
+            .unwrap()
+    }
+
+    fn capacity_child_origin(registry: &mut Registry) -> Origin {
+        let authority = registry.register_agent_authority(&source()).unwrap();
+        let origin = registry.execution_origin(&authority).unwrap();
+        assert!(matches!(origin, Origin::Child { .. }));
+        origin
+    }
+
+    #[test]
+    fn user_retains_100_completed_conversations_with_names_ownership_and_retries() {
+        let (mut registry, directory, mut request) = fixture();
+        let origin = registry.execution_origin(&Authority::default()).unwrap();
+        assert_eq!(origin, Origin::User);
+        let mut completed = Vec::new();
+        let mut first_request = None;
+        for index in 0..100 {
+            request.idempotency_key = format!("user-{index}");
+            request.name = Some(format!("conversation-{index}"));
+            let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+            assert!(accepted.created);
+            let finished = finish_capacity_run(&mut registry, &accepted);
+            if index == 0 {
+                first_request = Some(request.clone());
+            }
+            completed.push((accepted.agent, finished));
+        }
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 100);
+        assert_eq!(registry.model().unwrap().channels.len(), 100);
+        for (agent, run) in &completed {
+            assert!(!agent.closed);
+            assert_eq!(agent.origin, Origin::User);
+            assert_eq!(registry.agent(agent.id).unwrap(), *agent);
+            assert_eq!(registry.agent_run(run.id).unwrap(), *run);
+            assert_eq!(run.state, State::Succeeded);
+        }
+        let first_request = first_request.unwrap();
+        let retried = registry.submit_agent(&origin, &first_request, 40).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent, completed[0].0);
+        assert_eq!(retried.run, completed[0].1);
+        let before = registry.model().unwrap();
+        let mut changed = first_request.clone();
+        changed.prompt = "Different work".into();
+        assert!(
+            registry
+                .submit_agent(&origin, &changed, 41)
+                .unwrap_err()
+                .contains("idempotency")
+        );
+        let mut duplicate_name = first_request;
+        duplicate_name.idempotency_key = "duplicate-name".into();
+        assert!(
+            registry
+                .submit_agent(&origin, &duplicate_name, 42)
+                .unwrap_err()
+                .contains("named conversation-0")
+        );
+        let child = capacity_child_origin(&mut registry);
+        let foreign = Submit {
+            name: None,
+            destination: Destination::Existing(completed[0].0.id),
+            prompt: "Foreign caller".into(),
+            idempotency_key: "foreign".into(),
+        };
+        assert!(
+            registry
+                .submit_agent(&child, &foreign, 43)
+                .unwrap_err()
+                .contains("does not own")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn child_and_automation_keep_64_open_conversation_limit_after_completion() {
+        for automated in [false, true] {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = if automated {
+                Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                }
+            } else {
+                capacity_child_origin(&mut registry)
+            };
+            let mut last = None;
+            for index in 0..MAX_CHILDREN {
+                request.idempotency_key = format!("delegated-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                finish_capacity_run(&mut registry, &accepted);
+                last = Some(accepted.agent.id);
+            }
+            let retry = registry.submit_agent(&origin, &request, 40).unwrap();
+            assert!(!retry.created);
+            assert_eq!(Some(retry.agent.id), last);
+            let before = registry.model().unwrap();
+            request.idempotency_key = "delegated-over-limit".into();
+            assert!(
+                registry
+                    .submit_agent(&origin, &request, 41)
+                    .unwrap_err()
+                    .contains("child limit")
+            );
+            assert_eq!(registry.agents(Some(&origin)).unwrap().len(), MAX_CHILDREN);
+            assert_eq!(registry.model().unwrap(), before);
+            assert!(
+                registry
+                    .agents(Some(&origin))
+                    .unwrap()
+                    .iter()
+                    .all(|agent| !agent.closed)
+            );
+            // A full delegated scope does not consume the user's open quota.
+            assert!(
+                registry
+                    .submit_agent(&Origin::User, &request, 42)
+                    .unwrap()
+                    .created
+            );
+        }
+    }
+
+    #[test]
+    fn every_origin_keeps_eight_concurrent_or_uncertain_runs() {
+        for kind in 0..3 {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = match kind {
+                0 => registry.execution_origin(&Authority::default()).unwrap(),
+                1 => capacity_child_origin(&mut registry),
+                _ => Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                },
+            };
+            for index in 0..MAX_PARENT_RUNNING {
+                request.idempotency_key = format!("active-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                match index % 4 {
+                    0 => {} // Accepted work still has an owner.
+                    1 | 2 => {
+                        let run = registry
+                            .update_agent_run(
+                                accepted.run.id,
+                                1,
+                                Update::Started {
+                                    provider_key: format!("turn-{index}"),
+                                },
+                                11,
+                            )
+                            .unwrap();
+                        if index % 4 == 2 {
+                            registry
+                                .update_agent_run(run.id, run.revision, Update::Waiting, 12)
+                                .unwrap();
+                        }
+                    }
+                    _ => {
+                        registry
+                            .update_agent_run(
+                                accepted.run.id,
+                                1,
+                                Update::Finished {
+                                    state: State::Interrupted,
+                                    result: Default::default(),
+                                },
+                                12,
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            assert!(
+                !registry
+                    .submit_agent(&origin, &request, 15)
+                    .unwrap()
+                    .created
+            );
+            let before = registry.model().unwrap();
+            request.idempotency_key = "ninth".into();
+            assert!(
+                registry
+                    .submit_agent(&origin, &request, 20)
+                    .unwrap_err()
+                    .contains("concurrency limit")
+            );
+            assert_eq!(registry.model().unwrap(), before);
+            assert_eq!(
+                registry.agents(Some(&origin)).unwrap().len(),
+                MAX_PARENT_RUNNING
+            );
+        }
+    }
+
+    #[test]
+    fn global_32_run_limit_spans_user_child_and_automation_origins() {
+        let (mut registry, _directory, mut request) = fixture();
+        let origins = [
+            registry.execution_origin(&Authority::default()).unwrap(),
+            capacity_child_origin(&mut registry),
+            capacity_child_origin(&mut registry),
+            Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+        ];
+        let mut first = None;
+        for (scope, origin) in origins.iter().enumerate() {
+            for index in 0..MAX_PARENT_RUNNING {
+                request.idempotency_key = format!("global-{scope}-{index}");
+                let accepted = registry.submit_agent(origin, &request, 10).unwrap();
+                if first.is_none() {
+                    first = Some(accepted);
+                }
+            }
+        }
+        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING);
+        let other = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        let before = registry.model().unwrap();
+        request.idempotency_key = "global-over-limit".into();
+        assert!(
+            registry
+                .submit_agent(&other, &request, 20)
+                .unwrap_err()
+                .contains("concurrency limit")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        finish_capacity_run(&mut registry, &first.unwrap());
+        assert!(registry.submit_agent(&other, &request, 40).unwrap().created);
+        // Completed conversation remains open alongside the 32 owned runs.
+        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING + 1);
+    }
+
+    #[test]
+    fn competing_transactions_preserve_child_and_user_run_boundaries() {
+        for child_limit in [true, false] {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = if child_limit {
+                capacity_child_origin(&mut registry)
+            } else {
+                Origin::User
+            };
+            let count = if child_limit {
+                MAX_CHILDREN - 1
+            } else {
+                MAX_PARENT_RUNNING - 1
+            };
+            for index in 0..count {
+                request.idempotency_key = format!("before-race-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                if child_limit {
+                    finish_capacity_run(&mut registry, &accepted);
+                }
+            }
+            let before = registry.model().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut workers = Vec::new();
+            for index in 0..2 {
+                let mut connection = registry.execution_connection().unwrap();
+                let mut request = request.clone();
+                request.idempotency_key = format!("race-{index}");
+                let origin = origin.clone();
+                let barrier = barrier.clone();
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    connection.submit_agent(&origin, &request, 40)
+                }));
+            }
+            let results = workers
+                .into_iter()
+                .map(|worker| worker.join())
+                .collect::<Vec<_>>();
+            let results = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            let rejected = results
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap();
+            assert!(rejected.contains(if child_limit {
+                "child limit"
+            } else {
+                "concurrency limit"
+            }));
+            assert_eq!(registry.agents(Some(&origin)).unwrap().len(), count + 1);
+            assert_eq!(
+                registry.model().unwrap().channels.len(),
+                before.channels.len() + 1
+            );
+        }
     }
 
     #[test]
