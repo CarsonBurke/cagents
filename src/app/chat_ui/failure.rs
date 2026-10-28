@@ -102,6 +102,42 @@ pub(super) fn diagnostic_preview_identity(key: &str) -> u64 {
     hash.finish()
 }
 
+// Notice identity follows a decoder message, while Turn keys remain display
+// destinations. Paging can leave a later part of the same message visible.
+pub(super) fn prompt_anchor(provider: Provider, items: &[Arc<chat::Item>]) -> Option<&str> {
+    let last = items
+        .iter()
+        .rev()
+        .find(|item| {
+            item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. })
+        })
+        .map(|item| item.id.as_str())?;
+    let Some(carrier) = attachment_draft::message_key(provider, last) else {
+        return Some(last);
+    };
+    items
+        .iter()
+        .find(|item| {
+            item.role == chat::Role::User
+                && !matches!(item.content, ItemContent::Delivery { .. })
+                && attachment_draft::message_key(provider, &item.id) == Some(carrier)
+        })
+        .map(|item| item.id.as_str())
+}
+
+pub(super) fn same_prompt(provider: Provider, left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => match (
+            attachment_draft::message_key(provider, left),
+            attachment_draft::message_key(provider, right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        },
+        _ => left == right,
+    }
+}
+
 impl State {
     fn metadata(
         provider: Provider,

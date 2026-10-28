@@ -424,3 +424,136 @@ fn adjacent_distinct_message_carriers_do_not_borrow_the_shared_visual_turn_key()
         assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
     }
 }
+
+#[test]
+fn refresh_attributes_adjacent_message_error_to_the_incoming_prompt() {
+    let raw = "Opaque provider failure\nexact original diagnostic";
+    for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+        let a = "77777777-7777-4777-8777-777777777777";
+        let b = "88888888-8888-4888-8888-888888888888";
+        // The incoming publication can contain both prompts and the failure.
+        let (mut runtime, handle) = live_fixture(provider, vec![]);
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.items = vec![
+            Arc::new(text(&part(provider, a, 0), chat::Role::User, "First")),
+            Arc::new(image(&part(provider, a, 1))),
+            Arc::new(text(&part(provider, b, 0), chat::Role::User, "Second")),
+            Arc::new(image(&part(provider, b, 1))),
+        ];
+        next.error = Some(raw.into());
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+        assert_eq!(runtime.turns.len(), 1);
+        assert_eq!(runtime.turns[0].key, part(provider, a, 0));
+        assert_eq!(runtime.failures.len(), 1);
+        assert_eq!(
+            runtime.failures[0].0.as_deref(),
+            Some(part(provider, b, 0).as_str())
+        );
+        assert_eq!(
+            runtime.failure_ui.incidents.len(),
+            1,
+            "note and current error must share B's message: {provider:?}"
+        );
+        let incident = &runtime.failure_ui.incidents[0];
+        assert!(incident.sources.contains(&Source::Note(0)));
+        assert!(incident.sources.contains(&Source::Snapshot));
+        assert_eq!(
+            incident.anchor.as_deref(),
+            Some(part(provider, a, 0).as_str()),
+            "the shared turn remains the display destination"
+        );
+        assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
+
+        // A later, distinct prompt can report the same complete diagnostic.
+        let c = "99999999-9999-4999-8999-999999999999";
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.error = None;
+        next.items.push(Arc::new(text(
+            &part(provider, c, 0),
+            chat::Role::User,
+            "Third",
+        )));
+        next.items.push(Arc::new(image(&part(provider, c, 1))));
+        handle.publish_snapshot_for_test(next);
+        runtime.refresh();
+        publish_error(&mut runtime, &handle, raw);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        assert_ne!(
+            runtime.failure_ui.incidents[0].key,
+            runtime.failure_ui.incidents[1].key
+        );
+        for incident in &runtime.failure_ui.incidents {
+            assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
+        }
+    }
+}
+
+#[test]
+fn paged_adjacent_auth_recovery_removes_only_the_current_message_warning() {
+    let provider = Provider::Claude;
+    let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let raw = "Failed to authenticate: OAuth session expired and could not be refreshed";
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![
+            text(&part(provider, a, 0), chat::Role::User, "First"),
+            image(&part(provider, a, 1)),
+        ],
+    );
+    publish_error(&mut runtime, &handle, raw);
+    let first_note = runtime.failures[0].clone();
+    let mut next = (*handle.snapshot()).clone();
+    next.generation += 1;
+    next.items.push(Arc::new(text(
+        &part(provider, b, 0),
+        chat::Role::User,
+        "Second",
+    )));
+    next.items.push(Arc::new(image(&part(provider, b, 1))));
+    // A changed current error on the same visual turn must not replace A.
+    next.error = Some(chat::sign_in_verification_failure(
+        raw,
+        "Synthetic verification failure",
+    ));
+    handle.publish_snapshot_for_test(next);
+    runtime.refresh();
+    assert_eq!(runtime.turns.len(), 1);
+    assert_eq!(runtime.failures.len(), 2);
+    assert_eq!(runtime.failures[0], first_note);
+    assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &runtime.failures[0].1));
+    assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
+    let current_note = runtime.failures[1].clone();
+
+    let mut page = (*handle.snapshot()).clone();
+    page.generation += 1;
+    page.has_earlier = true;
+    page.items.retain(|item| item.id == part(provider, b, 1));
+    handle.publish_snapshot_for_test(page);
+    runtime.refresh();
+    assert!(runtime.active_auth_notice(&runtime.failures[1].0, &runtime.failures[1].1));
+    runtime.note(current_note.1.clone());
+    assert_eq!(
+        runtime.failures.len(),
+        2,
+        "paging must not create another auth scope"
+    );
+    assert_eq!(runtime.failures[0], first_note);
+
+    let mut recovered = (*handle.snapshot()).clone();
+    recovered.generation += 1;
+    recovered.error = None;
+    recovered.ready = true;
+    recovered.busy = false;
+    handle.publish_snapshot_for_test(recovered);
+    runtime.refresh();
+    assert_eq!(
+        runtime.failures,
+        vec![first_note],
+        "idle recovery must remove B only, even after its first part was paged out"
+    );
+}

@@ -3094,22 +3094,35 @@ impl Runtime {
         self.earlier_asked = None;
         self.later_asked = None;
     }
-    /// Records a notice in the transcript, after the exchange it concerns.
+    fn notice_anchor<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+        turns: &'a [turn::Turn],
+    ) -> Option<&'a str> {
+        failure::prompt_anchor(self.session.launch.provider, &snapshot.items)
+            .or_else(|| turns.last().map(|turn| turn.key.as_str()))
+    }
+    /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
-        let anchor = self.turns.last().map(|turn| turn.key.clone());
+        let anchor = self
+            .notice_anchor(&self.snapshot, &self.turns)
+            .map(str::to_owned);
+        self.note_at(anchor, notice);
+    }
+    fn note_at(&mut self, anchor: Option<String>, notice: String) {
         let provider = self.session.launch.provider;
         if chat::requires_sign_in(provider, &notice) {
             // An updated verification failure replaces this exchange's active
             // auth warning; other exchanges and tool failures remain history.
             self.failures.retain(|(previous, message)| {
-                previous != &anchor || !chat::requires_sign_in(provider, message)
+                !failure::same_prompt(provider, previous.as_deref(), anchor.as_deref())
+                    || !chat::requires_sign_in(provider, message)
             });
         }
-        if self
-            .failures
-            .iter()
-            .any(|(previous, message)| previous == &anchor && message == &notice)
-        {
+        if self.failures.iter().any(|(previous, message)| {
+            failure::same_prompt(provider, previous.as_deref(), anchor.as_deref())
+                && message == &notice
+        }) {
             return;
         }
         if self.failures.len() == 32 {
@@ -4258,7 +4271,8 @@ impl Runtime {
                 &snapshot.items,
             );
         }
-        let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
+        let current_anchor = self.notice_anchor(&self.snapshot, &self.turns);
+        let next_anchor = self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns));
         if self
             .snapshot
             .error
@@ -4271,18 +4285,15 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && current_anchor
-                == turns
-                    .as_deref()
-                    .unwrap_or(&self.turns)
-                    .last()
-                    .map(|turn| turn.key.as_str())
+            && failure::same_prompt(self.session.launch.provider, current_anchor, next_anchor)
         {
             let provider = self.session.launch.provider;
             self.failures.retain(|(anchor, message)| {
-                anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
+                !failure::same_prompt(provider, anchor.as_deref(), current_anchor)
+                    || !chat::requires_sign_in(provider, message)
             });
         }
+        let next_anchor = next_anchor.map(str::to_owned);
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
             self.turns = turns;
@@ -4295,7 +4306,7 @@ impl Runtime {
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
-            self.note(error.clone());
+            self.note_at(next_anchor, error.clone());
         }
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
@@ -25217,7 +25228,10 @@ mod tests {
             at: None,
             started_at: None,
         };
-        runtime.turns = turn::group(&[next], &HashSet::new(), |_| None);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(next)];
+        runtime.install_snapshot(Arc::new(snapshot), None);
         runtime.note(message.clone());
         assert_eq!(runtime.failures.len(), 2);
         assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &message));
@@ -25417,7 +25431,9 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot.clone());
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
-        let current = runtime.turns.last().map(|turn| turn.key.clone());
+        let current = runtime
+            .notice_anchor(&runtime.snapshot, &runtime.turns)
+            .map(str::to_owned);
         runtime
             .failures
             .insert(0, (Some("older-exchange".into()), failure.into()));
