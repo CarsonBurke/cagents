@@ -827,7 +827,8 @@ fn native_text_editing_chord(
     if modifiers.command() && !modifiers.alt() {
         return match latin_key(key, physical) {
             Some('z') => true,
-            Some('y' | 'a' | 'c' | 'v' | 'x') if !modifiers.shift() => true,
+            Some('y') if !modifiers.shift() => true,
+            Some('a' | 'c' | 'v' | 'x') => true,
             _ => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(

@@ -26917,4 +26917,79 @@ mod tests {
             "an old account wake must not drain the replacement connection's report queue"
         );
     }
+
+    #[test]
+    fn native_account_and_permissions_popup_arrows_keep_card_ownership_at_both_widths() {
+        use crate::app::keyboard_focus_tests::{native, prepare};
+        use crate::input_trace::KeyboardOwner;
+        use crate::workspace_widget::{FocusedPane, GlobalShortcut};
+        use cosmic::iced::runtime::user_interface::Cache;
+        use cosmic::iced::{Event, keyboard};
+
+        for width in [320.0, 960.0] {
+            for account in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.account_ui.add_managed_fixture(Provider::Codex, 22);
+                let card = draft_chat(&mut app);
+                prepare(&mut app);
+                app.workspace
+                    .set_card_width(card, crate::workspace::CardWidth::Fixed(width))
+                    .unwrap();
+                drop(app.open_chat_control(if account {
+                    GlobalShortcut::ChatAccount
+                } else {
+                    GlobalShortcut::ChatPermissions
+                }));
+                let runtime = chat_runtime(&app, card);
+                let before = runtime.picker_focus;
+                let (focus, count) = if account {
+                    let choices = app
+                        .chat_accounts(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .unwrap()
+                        .choices
+                        .len();
+                    (card_control_id(card, "chat-account-choice-0"), choices + 1)
+                } else {
+                    let controls = runtime.permission_controls(true);
+                    (controls[before].clone(), controls.len())
+                };
+                assert!(count > 1, "picker must have a different next choice");
+                let down = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut renderer = crate::app::tests::headless_renderer();
+                let (_, messages) = native(&app, &mut renderer, Cache::new(), Some(focus), &[down]);
+                assert!(
+                    messages.iter().any(|message| matches!(message,
+                        Message::NativeKeyEvent {
+                            owner: KeyboardOwner { pane: FocusedPane::Chat, card: Some(found), .. },
+                            ..
+                        } if *found == card
+                    )),
+                    "the actual popup must retain its chat owner at width {width}"
+                );
+                for message in messages {
+                    drop(app.update(message));
+                }
+                assert_eq!(
+                    chat_runtime(&app, card).picker_focus,
+                    (before + 1) % count,
+                    "native popup arrow must reach App at width {width}, account={account}"
+                );
+                assert!(
+                    !app.chat_start_pending(card),
+                    "navigation never starts a provider"
+                );
+            }
+        }
+    }
 }

@@ -6874,6 +6874,19 @@ impl Cagents {
             }
             if matches!(runtime, CardRuntime::Chat(_)) {
                 regions.push((card_control_id(card, "chat-composer"), owner));
+                // Each popup is traversed separately from the card body,
+                // including popups nested inside the compact footer. Keep
+                // their actual focused controls tied to this card's owner.
+                for surface in [
+                    "chat-account-surface",
+                    "chat-permissions-surface",
+                    "chat-footer-surface",
+                    "chat-reasoning-surface",
+                    "chat-model-surface",
+                    "chat-actions-surface",
+                ] {
+                    regions.push((card_control_id(card, surface), owner));
+                }
             }
         }
         regions

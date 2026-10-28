@@ -45,7 +45,7 @@ fn release(event: &iced::Event) -> iced::Event {
         modifiers: *modifiers,
     })
 }
-fn native(
+pub(super) fn native(
     app: &Cagents,
     renderer: &mut cosmic::Renderer,
     cache: Cache,
@@ -83,7 +83,7 @@ fn dispatch(app: &mut Cagents, messages: Vec<Message>) {
         drop(app.update(message));
     }
 }
-fn prepare(app: &mut Cagents) {
+pub(super) fn prepare(app: &mut Cagents) {
     app.window_width = 1600.0;
     app.window_height = 1000.0;
     app.context_inspector_open = false;
@@ -221,6 +221,42 @@ fn native_editor_undo_shift_redo_and_persisted_collisions_reach_the_real_editor(
             "Clone callback must not execute"
         );
     }
+}
+
+#[test]
+fn native_editor_shifted_select_all_and_cut_keep_persisted_workspace_collisions() {
+    use keyboard::key::Code;
+    let (mut app, card) = editor_app();
+    let before = editor_text(&app, card);
+    assert!(!before.trim().is_empty(), "positive cut control has text");
+    app.settings.keyboard_shortcuts.clone_pane = vec!["Ctrl+Shift+A".into()];
+    app.settings.keyboard_shortcuts.close_focused_column = vec!["Ctrl+Shift+X".into()];
+    let mut renderer = super::tests::headless_renderer();
+    let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    let select_all = key("a", Code::KeyA, modifiers, None);
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(repository_widget::editor_focus_id(card)),
+        &[select_all.clone(), release(&select_all)],
+    );
+    dispatch(&mut app, messages);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
+    let cut = key("x", Code::KeyX, modifiers, None);
+    let (_, messages) = native(
+        &app,
+        &mut renderer,
+        cache,
+        None,
+        &[cut.clone(), release(&cut)],
+    );
+    dispatch(&mut app, messages);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
+    assert!(
+        editor_text(&app, card).trim().is_empty(),
+        "the real editor must select and cut its text instead of cloning or closing the pane"
+    );
 }
 
 #[test]
