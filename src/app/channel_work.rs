@@ -6,6 +6,9 @@ use crate::{
     model::WorktreeId,
 };
 
+#[cfg(test)]
+mod authority_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
     Conversations,
