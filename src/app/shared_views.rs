@@ -1408,34 +1408,7 @@ impl Cagents {
             else {
                 continue;
             };
-            for change in views::changes(&previous.panes, &target.panes) {
-                let (change, source_basis) = match change {
-                    Change::Move { .. } => (change, None),
-                    Change::Update { before, pane } => {
-                        let Some(basis) = update_sources.get(&(target.scope.clone(), pane.id))
-                        else {
-                            continue;
-                        };
-                        // Later queued edits may supersede individual fields.
-                        // Copy only the final shadow's presentation delta; no
-                        // source, proof or pending-start field is republished.
-                        let mut presentation = before.clone();
-                        presentation.title = pane.title;
-                        presentation.user_title = pane.user_title;
-                        presentation.width_fraction = pane.width_fraction;
-                        if presentation == before {
-                            continue;
-                        }
-                        (
-                            Change::Update {
-                                before,
-                                pane: presentation,
-                            },
-                            Some(basis.clone()),
-                        )
-                    }
-                    _ => continue,
-                };
+            let mut append = |change, source_basis| {
                 corrections.push((
                     ModelEdit::ChangeView {
                         scope: target.scope.clone(),
@@ -1445,6 +1418,86 @@ impl Cagents {
                     },
                     source_basis,
                 ));
+            };
+            if previous
+                .panes
+                .iter()
+                .map(|pane| pane.id)
+                .ne(target.panes.iter().map(|pane| pane.id))
+            {
+                // A pending Insert can be refused if a peer places that ID in
+                // another view. Never make a surviving reorder depend on such
+                // an optimistic anchor: first order the raw owner's members,
+                // then place pending-only members against those stable anchors.
+                let base = owner
+                    .panes
+                    .iter()
+                    .map(|pane| pane.id)
+                    .filter(|id| target_ids.contains(id))
+                    .collect::<HashSet<_>>();
+                let existing = previous
+                    .panes
+                    .iter()
+                    .filter(|pane| base.contains(&pane.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let desired = target
+                    .panes
+                    .iter()
+                    .filter(|pane| base.contains(&pane.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut ordered = previous.clone();
+                for change in views::changes(&existing, &desired) {
+                    if matches!(change, Change::Move { .. }) {
+                        let _ = ordered.apply(&change);
+                        append(change, None);
+                    }
+                }
+                let mut anchor = None;
+                let mut anchors = HashMap::new();
+                for pane in target.panes.iter().rev() {
+                    if base.contains(&pane.id) {
+                        anchor = Some(pane.id);
+                    } else {
+                        anchors.insert(pane.id, anchor);
+                    }
+                }
+                for pane in &target.panes {
+                    if let Some(before) = anchors.get(&pane.id) {
+                        let change = Change::Move {
+                            id: pane.id,
+                            before: *before,
+                        };
+                        if ordered.apply(&change).unwrap_or(false) {
+                            append(change, None);
+                        }
+                    }
+                }
+            }
+            for change in views::changes(&previous.panes, &target.panes) {
+                let Change::Update { before, pane } = change else {
+                    continue;
+                };
+                let Some(basis) = update_sources.get(&(target.scope.clone(), pane.id)) else {
+                    continue;
+                };
+                // Later queued edits may supersede individual fields. Copy
+                // only the final shadow's presentation delta; no source,
+                // proof or pending-start field is republished.
+                let mut presentation = before.clone();
+                presentation.title = pane.title;
+                presentation.user_title = pane.user_title;
+                presentation.width_fraction = pane.width_fraction;
+                if presentation != before {
+                    append(
+                        Change::Update {
+                            before,
+                            pane: presentation,
+                        },
+                        Some(basis.clone()),
+                    );
+                }
             }
         }
         let changed = !corrections.is_empty();

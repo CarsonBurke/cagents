@@ -130,6 +130,40 @@ fn rename(app: &mut Cagents, card: CardId) {
     drop(app.update_chrome(Action::RenameSubmit));
 }
 
+fn insert_inert_browser_d(fixture: &mut SeedFixture, template: CardId) -> Pane {
+    // Typed inert browser inventory at the normal persist boundary. No browser
+    // opening/integration is claimed, and no pending operation is fabricated.
+    let mut d = fixture.app.card_state(template).unwrap().clone();
+    d.id = CardId::new();
+    d.title = "D".into();
+    let CardKind::Browser(browser) = &mut d.kind else {
+        panic!("browser fixture");
+    };
+    browser.id = BrowserId::new();
+    let durable = Arc::make_mut(&mut fixture.app.durable);
+    durable.cards.push(d.clone());
+    durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == fixture.source)
+        .unwrap()
+        .cards
+        .insert(1, d.id);
+    drop(
+        fixture
+            .app
+            .workspace
+            .add_card(
+                WorkspaceCard::new(d.id, "D", CardWidth::Fraction(d.width_fraction)).unwrap(),
+                1,
+                false,
+            )
+            .unwrap(),
+    );
+    fixture.app.persist();
+    Pane::from_card(&d, None).unwrap()
+}
+
 fn publications(rx: &async_channel::Receiver<ModelEdit>) -> Vec<Publication> {
     std::iter::from_fn(|| rx.try_recv().ok())
         .map(|edit| match edit {
@@ -314,6 +348,7 @@ fn settle_fifo(fixture: &mut SeedFixture, issued: &[Publication], expected: &[Ca
     // publisher's revision refresh, retaining its UUID and FIFO position. This
     // is App receipt coverage, not transport/registry integration coverage.
     for (index, publication) in issued.iter().enumerate() {
+        assert_eq!(publication.scope, Scope::Channel(fixture.source));
         assert!(acknowledged.insert(publication.operation));
         let view = fixture
             .model
@@ -336,6 +371,24 @@ fn settle_fifo(fixture: &mut SeedFixture, issued: &[Publication], expected: &[Ca
         );
         assert_eq!(fixture.app.workspace_model.views, fixture.model.views);
         assert_projection(&fixture.app, fixture.source, expected);
+        for view in &fixture.model.views {
+            if let Scope::Channel(channel) = &view.scope
+                && *channel != fixture.source
+            {
+                assert_eq!(
+                    channel_order(&fixture.app, *channel),
+                    view.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+                    "a source-order receipt must preserve the peer's pane ownership"
+                );
+                for pane in &view.panes {
+                    assert_eq!(fixture.app.card_state(pane.id).unwrap().kind, pane.kind);
+                    assert_eq!(
+                        fixture.app.durable.card_scopes.get(&pane.id),
+                        pane.scope.as_ref()
+                    );
+                }
+            }
+        }
         assert_eq!(
             fixture.app.shared_views.pending,
             issued[index + 1..]
@@ -420,6 +473,75 @@ fn public_reorder_during_seed_follows_the_adopted_pane_with_a_fresh_receipt() {
             .is_some_and(|card| card.existence.is_open())
     );
     settle_retry(&mut fixture, original, retry, &expected);
+}
+
+#[test]
+fn a_prepared_alias_correction_preserves_an_unseen_peer_pane() {
+    let mut fixture = seed_fixture(false);
+    let [a, b, c] = fixture.panes.clone();
+    reorder(&mut fixture.app, a.id, c.id);
+    assert!(fixture.app.shared_views.pending.is_empty());
+    assert!(publications(&fixture.rx).is_empty());
+    seed_ack(&mut fixture);
+    let issued = publications(&fixture.rx);
+    assert_eq!(issued.len(), 2);
+    assert_eq!(
+        issued[0].change,
+        Change::Move {
+            id: a.id,
+            before: Some(c.id),
+        }
+    );
+    assert_eq!(
+        issued[1].change,
+        Change::Move {
+            id: fixture.canonical.id,
+            before: Some(c.id),
+        }
+    );
+
+    // Explicit peer inventory fixture, arriving after the correction was
+    // prepared. X has its own native browser identity and is inserted between
+    // B and C; no local producer or prior correction ever observed it.
+    let mut x = c.clone();
+    x.id = CardId::new();
+    x.title = "X".into();
+    let CardKind::Browser(browser) = &mut x.kind else {
+        panic!("browser fixture");
+    };
+    browser.id = BrowserId::new();
+    let view = fixture
+        .model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(fixture.source))
+        .unwrap();
+    assert!(
+        view.apply(&Change::Insert {
+            pane: x.clone(),
+            before: Some(c.id),
+        })
+        .unwrap()
+    );
+    view.revision += 1;
+    fixture.model.sequence += 1;
+    observe(&mut fixture.app, ModelUpdate::Read(fixture.model.clone()));
+    let expected = [b.id, x.id, fixture.canonical.id, c.id];
+    assert_projection(&fixture.app, fixture.source, &expected);
+    assert!(publications(&fixture.rx).is_empty());
+    settle_fifo(&mut fixture, &issued, &expected);
+    assert_eq!(
+        fixture
+            .app
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == x.id),
+        Some(&x)
+    );
+    assert_eq!(fixture.app.card_state(x.id).unwrap().kind, x.kind);
+    assert_eq!(fixture.app.durable.card_scopes.get(&x.id), x.scope.as_ref());
 }
 
 #[test]
@@ -565,37 +687,7 @@ fn a_later_insert_keeps_its_position_when_the_seed_alias_is_adopted() {
     let [a, b, c] = fixture.panes.clone();
     reorder(&mut fixture.app, a.id, b.id);
     reorder(&mut fixture.app, c.id, b.id);
-
-    // Typed inert browser inventory at the normal persist boundary. No browser
-    // opening/integration is claimed, and no pending operation is fabricated.
-    let mut d = fixture.app.card_state(b.id).unwrap().clone();
-    d.id = CardId::new();
-    d.title = "D".into();
-    let CardKind::Browser(browser) = &mut d.kind else {
-        panic!("browser fixture");
-    };
-    browser.id = BrowserId::new();
-    let durable = Arc::make_mut(&mut fixture.app.durable);
-    durable.cards.push(d.clone());
-    durable
-        .channels
-        .iter_mut()
-        .find(|channel| channel.id == fixture.source)
-        .unwrap()
-        .cards
-        .insert(1, d.id);
-    drop(
-        fixture
-            .app
-            .workspace
-            .add_card(
-                WorkspaceCard::new(d.id, "D", CardWidth::Fraction(d.width_fraction)).unwrap(),
-                1,
-                false,
-            )
-            .unwrap(),
-    );
-    fixture.app.persist();
+    let d = insert_inert_browser_d(&mut fixture, b.id);
     assert_eq!(
         channel_order(&fixture.app, fixture.source),
         [a.id, d.id, c.id, b.id]
@@ -628,6 +720,21 @@ fn a_later_insert_keeps_its_position_when_the_seed_alias_is_adopted() {
     let expected = [fixture.canonical.id, d.id, c.id, b.id];
     assert_projection(&fixture.app, fixture.source, &expected);
     settle_fifo(&mut fixture, &issued, &expected);
+    assert_eq!(issued.len(), 5);
+    assert_eq!(
+        issued[3].change,
+        Change::Move {
+            id: fixture.canonical.id,
+            before: Some(c.id),
+        }
+    );
+    assert_eq!(
+        issued[4].change,
+        Change::Move {
+            id: d.id,
+            before: Some(c.id),
+        }
+    );
     assert_eq!(
         issued
             .iter()
@@ -635,6 +742,185 @@ fn a_later_insert_keeps_its_position_when_the_seed_alias_is_adopted() {
             .count(),
         1,
         "the original insertion must not be republished after adoption"
+    );
+}
+
+#[test]
+fn refusing_an_insert_owned_by_a_peer_keeps_the_surviving_canonical_reorder() {
+    let mut fixture = seed_fixture(false);
+    let [a, b, c] = fixture.panes.clone();
+    reorder(&mut fixture.app, a.id, b.id);
+    reorder(&mut fixture.app, c.id, b.id);
+    let d = insert_inert_browser_d(&mut fixture, b.id);
+    assert!(fixture.app.shared_views.pending.is_empty());
+    assert!(publications(&fixture.rx).is_empty());
+    seed_ack(&mut fixture);
+    let issued = publications(&fixture.rx);
+    assert!(issued.len() >= 3);
+    assert!(
+        issued
+            .iter()
+            .all(|publication| publication.scope == Scope::Channel(fixture.source))
+    );
+    assert_eq!(
+        fixture.app.shared_views.pending,
+        issued.iter().map(Publication::pending).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        issued[0].change,
+        Change::Move {
+            id: a.id,
+            before: Some(b.id),
+        }
+    );
+    let Change::Insert { pane, before } = &issued[1].change else {
+        panic!("the refused operation must come from the real persist producer");
+    };
+    assert_eq!(pane, &d);
+    assert_eq!(*before, Some(b.id));
+    assert!(
+        issued[2..]
+            .iter()
+            .all(|publication| matches!(publication.change, Change::Move { .. })),
+        "order repair may not publish membership, source or start changes"
+    );
+    assert_projection(
+        &fixture.app,
+        fixture.source,
+        &[fixture.canonical.id, d.id, c.id, b.id],
+    );
+
+    // ACK the earlier wire request before handling Insert's refusal. No future
+    // request is committed before its predecessor's receipt reaches the App.
+    let source = Scope::Channel(fixture.source);
+    let destination = Scope::Channel(fixture.destination);
+    let view = fixture
+        .model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == source)
+        .unwrap();
+    assert_eq!(issued[0].expected_revision, view.revision);
+    assert!(!view.apply(&issued[0].change).unwrap());
+    fixture.model.sequence += 1;
+    observe(
+        &mut fixture.app,
+        ModelUpdate::ViewApplied {
+            scope: source.clone(),
+            operation: Some(issued[0].operation),
+            model: fixture.model.clone(),
+        },
+    );
+    assert!(publications(&fixture.rx).is_empty());
+
+    // Explicit peer inventory fixture: the same stable D is inserted, then
+    // atomically moved to T before our queued Insert is handled. This retains
+    // S's retirement tombstone and T's exact descriptor. It does not exercise
+    // a host registry, managed-agent adoption, transport or transfer custody.
+    let view = fixture
+        .model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == source)
+        .unwrap();
+    assert!(
+        view.apply(&Change::Insert {
+            pane: d.clone(),
+            before: Some(b.id),
+        })
+        .unwrap()
+    );
+    view.revision += 1;
+    views::transfer(&mut fixture.model.views, &source, d.id, &destination, None).unwrap();
+    for view in &mut fixture.model.views {
+        if view.scope == source || view.scope == destination {
+            view.revision += 1;
+        }
+    }
+    fixture.model.sequence += 2;
+    observe(&mut fixture.app, ModelUpdate::Read(fixture.model.clone()));
+    assert!(publications(&fixture.rx).is_empty());
+    let expected = [fixture.canonical.id, c.id, b.id];
+    assert_projection(&fixture.app, fixture.source, &expected);
+    assert_eq!(channel_order(&fixture.app, fixture.destination), [d.id]);
+
+    // The host permanently refuses the exact old Insert UUID because D now
+    // belongs to T. Drive the actual App refusal reducer rather than pretending
+    // the Insert was applied or acknowledged as a successful no-op.
+    let refusal = "pane already belongs to another view; use an atomic transfer";
+    observe(
+        &mut fixture.app,
+        ModelUpdate::ViewRefused {
+            scope: source.clone(),
+            operation: issued[1].operation,
+            error: refusal.into(),
+        },
+    );
+    let expected_notice = format!("The pane change was not applied: {refusal}");
+    assert!(
+        fixture
+            .app
+            .status
+            .as_ref()
+            .is_some_and(|notice| notice.message == expected_notice)
+            || fixture
+                .app
+                .notices
+                .recent()
+                .any(|entry| entry.notice.message == expected_notice)
+    );
+    assert_projection(&fixture.app, fixture.source, &expected);
+    assert_eq!(
+        fixture.app.shared_views.pending,
+        issued[2..]
+            .iter()
+            .map(Publication::pending)
+            .collect::<Vec<_>>()
+    );
+    assert!(publications(&fixture.rx).is_empty());
+    assert_eq!(
+        fixture
+            .model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .filter(|pane| pane.id == d.id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .model
+            .views
+            .iter()
+            .find(|view| view.scope == destination)
+            .unwrap()
+            .panes,
+        [d.clone()]
+    );
+    assert_eq!(channel_order(&fixture.app, fixture.destination), [d.id]);
+    assert_eq!(fixture.app.card_state(d.id).unwrap().kind, d.kind);
+    assert_eq!(fixture.app.durable.card_scopes.get(&d.id), d.scope.as_ref());
+    assert!(fixture.app.shared_views.requested_transfers.is_empty());
+    assert!(fixture.app.durable.pending_terminal_creations.is_empty());
+    assert!(fixture.app.shared_views.adoptions.is_empty());
+    assert!(fixture.app.shared_views.restorations.is_empty());
+    settle_fifo(&mut fixture, &issued[2..], &expected);
+    assert_eq!(channel_order(&fixture.app, fixture.destination), [d.id]);
+    assert!(fixture.app.shared_views.requested_transfers.is_empty());
+    assert!(fixture.app.durable.pending_terminal_creations.is_empty());
+    assert!(fixture.app.shared_views.adoptions.is_empty());
+    assert!(fixture.app.shared_views.restorations.is_empty());
+    assert_eq!(
+        fixture
+            .app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == destination)
+            .unwrap()
+            .panes,
+        [d]
     );
 }
 
