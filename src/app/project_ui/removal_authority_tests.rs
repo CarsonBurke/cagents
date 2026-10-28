@@ -1,7 +1,8 @@
 //! Real removal helpers against private framed peers in env-cleared children.
 //! Synthetic authentication proves client custody, not Host authorization.
 //! Recovery deliberately permits otherwise forbidden scoped inventories to
-//! reach every reconnect; no daemon, provider or filesystem removal runs.
+//! reach every reconnect. Manual deletion removes only private linked Git
+//! worktrees; no daemon or provider runs.
 use super::*;
 use crate::{
     agent_execution::Authority,
@@ -1114,11 +1115,31 @@ fn manual_retained_app(
         .into_iter()
         .map(|record| SidebarWorktree::from_durable(record.id, record.path, record.branch))
         .collect();
+    let (writer, _) = SessionRuntime::open(
+        root.join(format!("manual-{label}.sqlite3")),
+        BootId::new("manual-retained-removal"),
+    )
+    .unwrap();
+    writer.save_project(ProjectState {
+        id: removal.project,
+        kind: ProjectKind::Git,
+        generation: 0,
+        name: removal.name.clone(),
+        repository: repository.clone(),
+        existence: Existence::Open,
+    });
+    app.session = Some(writer);
     app.known_worktree_roots.insert(linked.clone());
     // Filing a pane under the checkout does not move its actual process.
     Arc::make_mut(&mut app.durable)
         .card_scopes
         .insert(card, linked.clone());
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
     let target = Target {
         project: removal.project,
         worktree: Some(id),
