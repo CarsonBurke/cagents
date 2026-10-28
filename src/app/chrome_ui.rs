@@ -2632,15 +2632,11 @@ impl Cagents {
         .into()
     }
 
-    pub(super) fn inspector_owns_window_controls(&self) -> bool {
+    pub(super) fn inspector_reserves_window_controls(&self) -> bool {
         matches!(
             self.context_inspector_mount(),
             Some(InspectorLayout::Docked)
         )
-    }
-
-    fn docked_window_controls_are_transitioning(&self) -> bool {
-        self.inspector_owns_window_controls() && self.context_inspector_transition.is_some()
     }
 
     fn native_window_controls_width(&self) -> f32 {
@@ -2652,32 +2648,39 @@ impl Cagents {
             + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
     }
 
+    fn workspace_window_controls_overlap(&self) -> f32 {
+        let controls = self.native_window_controls_width();
+        match self.context_inspector_mount() {
+            Some(InspectorLayout::Docked) => {
+                let inspector = self
+                    .settings
+                    .inspector_width
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                (controls - inspector * self.context_inspector_progress()).max(0.0)
+            }
+            Some(InspectorLayout::Overlay) => 0.0,
+            None => controls,
+        }
+    }
+
     fn inspector_header<'a>(
         &'a self,
         start: Element<'a, Message>,
         end: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let transitioning = self.docked_window_controls_are_transitioning();
-        let end = if transitioning {
-            // Retain the end controls' positions while their window-control
-            // neighbor is owned by the stationary foreground instead.
+        let end = if self.inspector_reserves_window_controls() {
+            // Retain the end controls' positions beside the one stationary
+            // window-control owner, including while this pane is clipped.
             widget::container(end)
                 .padding(Padding::ZERO.right(self.native_window_controls_width()))
                 .into()
         } else {
             end
         };
-        self.native_header(
-            start,
-            Some(end),
-            self.inspector_owns_window_controls() && !transitioning,
-        )
+        self.native_header(start, Some(end), false)
     }
 
-    pub(super) fn docked_transition_window_header(&self) -> Element<'_, Message> {
-        if !self.docked_window_controls_are_transitioning() {
-            return widget::Space::new().height(0).into();
-        }
+    pub(super) fn foreground_window_header(&self) -> Element<'_, Message> {
         // Match native_header's compact horizontal padding at the actual
         // window edge; this owner is never translated, clipped or input-gated.
         let padding = if self.core.window.is_maximized {
@@ -2700,13 +2703,13 @@ impl Cagents {
         .into()
     }
 
-    /// The workspace header's window controls stay above an inspector overlay.
-    /// Mount them in the modal foreground so they remain visible, clickable,
-    /// and available to accessibility without exposing the obscured workbench.
-    pub(super) fn overlay_window_header(&self) -> Element<'_, Message> {
+    // Preserve the modal header's material and vertical space. Its buttons
+    // live in the permanent foreground, so this backdrop has no input state.
+    pub(super) fn overlay_window_header_background(&self) -> Element<'_, Message> {
         widget::container(
-            widget::container(self.native_header(widget::Space::new().into(), None, true))
-                .width(160),
+            widget::container(widget::Space::new().height(design::HEADER_CONTENT_HEIGHT))
+                .width(160)
+                .class(cosmic::theme::Container::Background),
         )
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -2720,8 +2723,10 @@ impl Cagents {
         } else {
             0.0
         };
-        let controls = if self.inspector_owns_window_controls() {
-            0.0
+        let controls = if self.inspector_reserves_window_controls() {
+            // The stationary controls can extend over the workspace while
+            // the inspector is only a few pixels wide. Keep tabs out of it.
+            self.workspace_window_controls_overlap()
         } else {
             let count = usize::from(self.core.window.show_close)
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
@@ -2858,8 +2863,12 @@ impl Cagents {
             let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
             self.native_header(
                 iced::widget::Space::new().into(),
-                Some(actions.into()),
-                true,
+                Some(
+                    widget::container(actions)
+                        .padding(Padding::ZERO.right(self.workspace_window_controls_overlap()))
+                        .into(),
+                ),
+                false,
             )
         } else {
             let (_, tab_width) = self.tab_strip_geometry();
@@ -2894,8 +2903,12 @@ impl Cagents {
                 .align_y(Alignment::Center);
             self.native_header(
                 tabs.into(),
-                Some(actions.into()),
-                !self.inspector_owns_window_controls() && !self.context_inspector_is_overlay(),
+                Some(
+                    widget::container(actions)
+                        .padding(Padding::ZERO.right(self.workspace_window_controls_overlap()))
+                        .into(),
+                ),
+                false,
             )
         };
         let mut rows = vec![header];

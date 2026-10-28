@@ -342,3 +342,142 @@ fn docked_transition_controls_survive_zero_and_clipped_width_for_both_inspector_
         }
     }
 }
+
+/// Rebuild with the actual runtime's named-state handoff while retaining the
+/// same unnamed widget state too. Splitting Down and Up across this helper is
+/// intentional: a fresh Tree for either event would lose the button's press.
+fn retained_pointer_event(
+    app: &Cagents,
+    renderer: &cosmic::Renderer,
+    tree: &mut Tree,
+    point: Point,
+    event: Event,
+) -> Vec<cosmic::Action<Message>> {
+    use cosmic::iced::advanced::widget::tree::NAMED;
+
+    let viewport = Rectangle::with_size(Size::new(app.window_width, app.window_height));
+    let mut element = cosmic::ApplicationExt::view_main(app);
+    NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+    tree.diff(element.as_widget_mut());
+    iced::runtime::user_interface::restore_cached_named_states(tree);
+    let node = element.as_widget_mut().layout(
+        tree,
+        renderer,
+        &layout::Limits::new(Size::ZERO, viewport.size()),
+    );
+    NAMED.with(|named| named.borrow_mut().clear());
+    let mut messages = Vec::new();
+    element.as_widget_mut().update(
+        tree,
+        &event,
+        Layout::new(&node),
+        mouse::Cursor::Available(point),
+        renderer,
+        &mut clipboard::Null,
+        &mut Shell::new(&mut messages),
+        &viewport,
+    );
+    messages
+}
+
+#[test]
+fn window_close_press_survives_docked_transition_start_and_settle() {
+    let renderer = crate::app::tests::headless_renderer();
+    for work_header in [false, true] {
+        for opening in [false, true] {
+            for crossing_settle in [false, true] {
+                let (mut app, window) = fixture(true, 1600.0);
+                if work_header {
+                    let home = crate::channel_work::Home {
+                        registry: uuid::Uuid::new_v4(),
+                        channel: ChannelId::new(),
+                        creation_ordinal: 1,
+                    };
+                    assert!(
+                        app.channel_work
+                            .view
+                            .open(home, "Fixture work".into())
+                            .is_some()
+                    );
+                    assert!(!app.channel_work_is_main());
+                }
+                if opening {
+                    drop(app.update(Message::ToggleContextInspector));
+                    let preparation = app.context_inspector_transition.unwrap();
+                    drop(app.advance_context_inspector_transition(
+                        preparation.started_at + preparation.duration(),
+                    ));
+                    assert!(!app.context_inspector_visible());
+                }
+                if crossing_settle {
+                    drop(app.update(Message::ToggleContextInspector));
+                    let transition = app.context_inspector_transition.unwrap();
+                    app.frame_clock
+                        .start(transition.started_at + transition.duration().mul_f32(0.99));
+                }
+
+                // Discover the actual Close hit region, then press it on the
+                // carried Tree. No application close message is reduced.
+                let controls = probe(&app, &renderer, window);
+                assert_eq!(controls.close.len(), 1);
+                let point = controls.close[0];
+                let mut tree = Tree::empty();
+                let down = retained_pointer_event(
+                    &app,
+                    &renderer,
+                    &mut tree,
+                    point,
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                );
+                assert!(
+                    !down.iter().any(|message| matches!(
+                        message,
+                        cosmic::Action::App(Message::WindowCloseRequested(_))
+                    )),
+                    "Close acts on release, not on Down"
+                );
+
+                if crossing_settle {
+                    let transition = app.context_inspector_transition.unwrap();
+                    drop(app.advance_context_inspector_transition(
+                        transition.started_at + transition.duration(),
+                    ));
+                    assert!(app.context_inspector_transition.is_none());
+                } else {
+                    drop(app.update(Message::ToggleContextInspector));
+                    let transition = app.context_inspector_transition.unwrap();
+                    app.frame_clock.start(transition.started_at);
+                    assert!(app.context_inspector_transition.is_some());
+                }
+                assert_eq!(app.context_inspector_open, opening);
+
+                let up = retained_pointer_event(
+                    &app,
+                    &renderer,
+                    &mut tree,
+                    point,
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                );
+                let closes: Vec<_> = up
+                    .iter()
+                    .filter_map(|message| match message {
+                        cosmic::Action::App(Message::WindowCloseRequested(actual)) => Some(*actual),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    closes,
+                    [window],
+                    "work={work_header}, opening={opening}, settle={crossing_settle}"
+                );
+                assert!(!up.iter().any(|message| matches!(
+                    message,
+                    cosmic::Action::App(
+                        Message::ToggleContextInspector
+                            | Message::ContextInspector(InspectorAction::Close)
+                    )
+                )));
+            }
+        }
+    }
+}

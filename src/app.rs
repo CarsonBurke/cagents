@@ -18493,13 +18493,7 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    // Keep this foreground slot stable across transition
-                    // frames; only its small window-control leaf comes/goes.
-                    let foreground = crate::interaction::layer(
-                        edge.into(),
-                        self.docked_transition_window_header(),
-                    );
-                    crate::interaction::layer(content, foreground)
+                    crate::interaction::layer(content, edge.into())
                 }
                 InspectorLayout::Overlay => {
                     let inspector_surface = crate::interaction::layer(
@@ -18539,7 +18533,7 @@ impl Application for Cagents {
                         .width(Length::Fill)
                         .height(Length::Fill);
                     let overlay_content = widget::column::with_children(vec![
-                        self.overlay_window_header(),
+                        self.overlay_window_header_background(),
                         aligned.into(),
                     ])
                     .width(Length::Fill)
@@ -18564,6 +18558,10 @@ impl Application for Cagents {
                 .height(Length::Fill);
             crate::interaction::layer(content.into(), edge.into())
         };
+        // A single physical owner survives opening, closing and changing the
+        // inspector mount. Replacing its button tree between Down and Up
+        // would lose a window action even when both frames draw a Close.
+        let surface = crate::interaction::layer(surface, self.foreground_window_header());
         // The bar comes and goes, but the tree around the workspace must not:
         // iced matches widget state by position, so wrapping the surface only
         // while the bar shows would reset every scroll offset and focus in it.
