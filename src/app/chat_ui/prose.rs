@@ -2225,8 +2225,6 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
-        // iced::widget::hover forwards native operations to its two real
-        // children, but currently does not forward their accessibility nodes.
         // This isolated fence has exactly one focusable native control: Copy.
         // Obtain its actual layout bounds, then click that button through the
         // production event path rather than constructing its Action in a test.

@@ -193,7 +193,7 @@ pub(super) fn code_frame<'a>(
     .spacing(GAP_XS)
     .width(Length::Fill);
     match copy {
-        Some(copy) => iced::widget::hover(
+        Some(copy) => hover::overlay(
             block,
             widget::container(rendered_copy::icon(
                 Icon::Copy,

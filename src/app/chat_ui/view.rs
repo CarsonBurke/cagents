@@ -167,7 +167,7 @@ pub(super) fn message_actions<'a>(
     actions: Element<'a, Message>,
     alignment: Alignment,
 ) -> Element<'a, Message> {
-    iced::widget::hover(
+    hover::overlay(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
@@ -9863,6 +9863,138 @@ mod tests {
                 !expanded
             );
         }
+        // The actual message overlay exposes both its base disclosure and its
+        // footer action. Targeting either one cannot activate the other.
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{Action as A11yAction, ActionRequest, Role, TreeId},
+        };
+        let event = |id: A11yId, action| {
+            let A11yId::Widget(widget) = id.clone() else {
+                panic!("native thinking control")
+            };
+            iced::Event::A11y(
+                widget,
+                ActionRequest {
+                    action,
+                    target_tree: TreeId::ROOT,
+                    target_node: id.into(),
+                    data: None,
+                },
+            )
+        };
+        let mut element = view(&app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let control = |label| {
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == Role::Button && node.node().label() == Some(label)
+                })
+                .expect("the actual thinking control is accessible")
+                .id()
+                .clone()
+        };
+        let disclosure_id = control("Thinking…");
+        let copy_id = control("Copy this message");
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event(disclosure_id, A11yAction::Click),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Toggle(actual, id))] if *actual == target && id == "keyboard-thought")
+        );
+        drop(element);
+        drop(app.handle_chat_ui(Action::Toggle(target, "keyboard-thought".into())));
+        let mut element = view(&app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|node| node.node().role() == Role::Label
+                    && node.node().value() == Some("Keyboard reasoning body")),
+            "expanded real reasoning body is exposed with its Copy footer"
+        );
+        let mut dispatch = |event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        let messages = dispatch(event(copy_id.clone(), A11yAction::Click));
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::CopyMessage(actual, id, _))] if *actual == target && id == "keyboard-thought"),
+            "footer Copy never toggles the base disclosure"
+        );
+        assert!(runtime(&app, target).expanded.contains("keyboard-thought"));
+        // This verifies actual targeted control dispatch, not a full-message
+        // read or clipboard delivery from this fixture's source catalog.
+        assert!(dispatch(event(copy_id, A11yAction::Focus)).is_empty());
+        drop(dispatch);
+        tree.diff(element.as_widget_mut());
+        let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &enter,
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::CopyMessage(actual, id, _))] if *actual == target && id == "keyboard-thought"),
+            "AT focus stays on the footer through diff, instead of toggling the disclosure"
+        );
     }
 
     #[test]

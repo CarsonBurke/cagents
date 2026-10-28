@@ -219,9 +219,46 @@ fn retained_code_caption_fits_its_line_box_and_keeps_tooltip_body_and_copy() {
                     "retained typography must preserve the selectable body owner"
                 );
 
-                // The pinned outer Hover has no a11y forwarding. The same
-                // production caption without Copy does: verify the full label
-                // there without claiming to repair that inherited wrapper.
+                // Inspect the actual Copy-present production frame. Hover
+                // hides paint only: caption, selectable body and native action
+                // remain discoverable without a pointer.
+                let nodes = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                for label in [caption, "Copy this block"] {
+                    assert!(
+                        nodes
+                            .root()
+                            .iter()
+                            .chain(nodes.children())
+                            .any(|entry| entry.node().label() == Some(label)),
+                        "Copy-present frame exposes {label}"
+                    );
+                }
+                assert!(
+                    nodes
+                        .root()
+                        .iter()
+                        .chain(nodes.children())
+                        .any(|entry| entry.node().role()
+                            == iced_accessibility::accesskit::Role::Label
+                            && entry.node().value() == Some(body)),
+                    "Copy-present frame exposes its actual selectable source"
+                );
+                assert!(
+                    nodes
+                        .root()
+                        .iter()
+                        .chain(nodes.children())
+                        .any(|entry| entry.node().role()
+                            == iced_accessibility::accesskit::Role::Button
+                            && entry.node().label() == Some("Copy this block")),
+                    "Copy remains a native accessible button"
+                );
+
+                // Preserve the original caption-without-Copy positive too.
                 let mut accessible = code_surface(body, Some(caption), None, None, target);
                 let mut accessible_tree = Tree::new(accessible.as_widget());
                 let accessible_node =
@@ -447,6 +484,70 @@ fn retained_tool_copy_press_keeps_its_rendered_source_and_part() {
         *cache = ui.into_cache();
         (messages, point)
     }
+    fn at_event(
+        id: iced_accessibility::A11yId,
+        action: iced_accessibility::accesskit::Action,
+    ) -> Event {
+        let iced_accessibility::A11yId::Widget(widget) = id.clone() else {
+            panic!("native Copy widget identity")
+        };
+        Event::A11y(
+            widget,
+            iced_accessibility::accesskit::ActionRequest {
+                action,
+                target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                target_node: id.into(),
+                data: None,
+            },
+        )
+    }
+    fn at_frame(
+        runtime: &Runtime,
+        cache: &mut Cache,
+        renderer: &mut cosmic::Renderer,
+        events: &[Event],
+    ) -> (Vec<Message>, iced_accessibility::A11yId) {
+        let item = runtime.active_item("same-id").unwrap();
+        let element = runtime.tool_code_surface(
+            item,
+            &runtime.cache[&item.id],
+            CopyPart::Input,
+            "Input",
+            None,
+        );
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(480.0, 320.0),
+            std::mem::replace(cache, Cache::new()),
+            renderer,
+        );
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let copies = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some("Copy this block")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copies.len(),
+            1,
+            "one actual accessible native Copy without a pointer"
+        );
+        let id = copies[0].id().clone();
+        let mut messages = Vec::new();
+        ui.update(
+            events,
+            mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        *cache = ui.into_cache();
+        (messages, id)
+    }
     fn assert_copy(messages: &[Message], runtime: &Runtime, part: CopyPart) {
         assert_eq!(messages.len(), 1);
         let Message::ChatUi(Action::Copy(target, id, actual_part, Some(source))) = &messages[0]
@@ -492,6 +593,82 @@ fn retained_tool_copy_press_keeps_its_rendered_source_and_part() {
         "capturing a callback must not retain the canonical payload"
     );
     let mut renderer = crate::app::tests::headless_renderer();
+    // The real production code surface is discoverable and actionable through
+    // AT without hover. Rebuild elements against this same native UI cache.
+    use iced_accessibility::{
+        A11yId, IdEq,
+        accesskit::{Action as A11yAction, TreeId},
+    };
+    let mut at_cache = Cache::new();
+    let (messages, copy_id) = at_frame(&runtime, &mut at_cache, &mut renderer, &[]);
+    assert!(messages.is_empty());
+    let unknown = A11yId::from(widget::Id::unique());
+    let mut mismatched = at_event(copy_id.clone(), A11yAction::Click);
+    if let Event::A11y(_, request) = &mut mismatched {
+        request.target_node = unknown.clone().into();
+    }
+    let mut foreign_tree = at_event(copy_id.clone(), A11yAction::Click);
+    if let Event::A11y(_, request) = &mut foreign_tree {
+        request.target_tree = TreeId(uuid::Uuid::new_v4());
+    }
+    for event in [
+        at_event(unknown.clone(), A11yAction::Click),
+        at_event(unknown, A11yAction::Focus),
+        mismatched,
+        foreign_tree,
+    ] {
+        assert!(
+            at_frame(&runtime, &mut at_cache, &mut renderer, &[event])
+                .0
+                .is_empty(),
+            "foreign accessibility requests cannot activate Copy"
+        );
+    }
+    let (messages, retained_id) = at_frame(
+        &runtime,
+        &mut at_cache,
+        &mut renderer,
+        &[at_event(copy_id.clone(), A11yAction::Click)],
+    );
+    assert!(IdEq::eq(&copy_id, &retained_id));
+    assert_copy(&messages, &runtime, CopyPart::Input);
+    let (messages, _) = at_frame(
+        &runtime,
+        &mut at_cache,
+        &mut renderer,
+        &[at_event(copy_id.clone(), A11yAction::Focus)],
+    );
+    assert!(messages.is_empty());
+    let enter = Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    });
+    let (messages, retained_id) =
+        at_frame(&runtime, &mut at_cache, &mut renderer, &[enter.clone()]);
+    assert!(IdEq::eq(&copy_id, &retained_id));
+    assert_copy(&messages, &runtime, CopyPart::Input);
+    assert!(
+        at_frame(
+            &runtime,
+            &mut at_cache,
+            &mut renderer,
+            &[at_event(copy_id, A11yAction::Blur)]
+        )
+        .0
+        .is_empty()
+    );
+    assert!(
+        at_frame(&runtime, &mut at_cache, &mut renderer, &[enter])
+            .0
+            .is_empty(),
+        "blurred hidden Copy cannot consume Enter"
+    );
+
     let mut cache = Cache::new();
     let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
     let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
