@@ -194,9 +194,12 @@ jobs:
                       if entry.stat().st_uid != os.getuid():
                           continue
                       before = (entry / 'stat').read_text()
+                      comm = before[before.index('(') + 1:before.rindex(')')]
                       fields = before[before.rindex(')') + 2:].split()
                       started = fields[19]
                       reasons = []
+                      if comm == pathlib.Path(identity['path']).name[:15]:
+                          reasons.append('test_executable_comm_candidate')
                       try:
                           info = (entry / 'exe').stat()
                           if [info.st_dev, info.st_ino] == identity['file_id']:
@@ -217,7 +220,7 @@ jobs:
                           errors.append({'pid': int(entry.name), 'reason': 'identity_changed'})
                       elif reasons:
                           found.append({'pid': int(entry.name), 'start_ticks': started,
-                                        'state': fields[0], 'candidate_reasons': reasons})
+                                        'comm': comm, 'state': fields[0], 'candidate_reasons': reasons})
                   except (FileNotFoundError, ProcessLookupError):
                       continue
                   except (PermissionError, OSError, ValueError) as error:
