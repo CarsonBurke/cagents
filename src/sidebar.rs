@@ -16222,6 +16222,9 @@ pub(crate) mod tests {
             offset: f32,
             viewport: Rectangle,
             focused: Option<Id>,
+            bounds: std::collections::HashMap<Id, Rectangle>,
+            member_insets: Vec<f32>,
+            row_insets: std::collections::HashMap<Id, f32>,
         }
         impl Operation for Probe {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -16230,11 +16233,29 @@ pub(crate) mod tests {
             fn focusable(
                 &mut self,
                 id: Option<&Id>,
-                _: Rectangle,
+                bounds: Rectangle,
                 state: &mut dyn operation::Focusable,
             ) {
+                if let Some(id) = id {
+                    self.bounds.insert(id.clone(), bounds);
+                    self.row_insets.insert(
+                        id.clone(),
+                        self.member_insets.last().copied().unwrap_or_default(),
+                    );
+                }
                 if state.is_focused() {
                     self.focused = id.cloned();
+                }
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                match state.downcast_ref::<row_interaction::RevealInset>() {
+                    Some(row_interaction::RevealInset::Enter(height)) => {
+                        self.member_insets.push(*height)
+                    }
+                    Some(row_interaction::RevealInset::Exit) => {
+                        self.member_insets.pop();
+                    }
+                    None => {}
                 }
             }
             fn scrollable(
@@ -16360,7 +16381,14 @@ pub(crate) mod tests {
             assert!(header.y1 > header.y0);
             assert!(
                 row.y0 >= header.y1 - 0.01,
-                "the sticky header must not cover the revealed channel: {header:?} {row:?}"
+                "the sticky header must not cover the revealed channel: {header:?} {row:?}; raw row={:?}, raw header={:?}, inset={:?}, offset={}, viewport={:?}, focus={focus}",
+                after.bounds.get(&target),
+                after
+                    .bounds
+                    .get(&selection_row_focus_id(SelectionRow::Project(owner))),
+                after.row_insets.get(&target),
+                after.offset,
+                after.viewport
             );
             assert!(row.y1 <= f64::from(after.viewport.y + after.viewport.height) + 0.01);
         }
