@@ -269,15 +269,24 @@ fn exercise_remote() {
     let devices = crate::device::configuration_path().unwrap();
     fs::create_dir_all(devices.parent().unwrap()).unwrap();
     fs::write(devices, br#"{"devices":[{"name":"fixture-remote","host":"scope-fixture.invalid","executable":"cagents"}]}"#).unwrap();
-    for business in [Business::Proposal, Business::Pin, Business::List] {
+    for (index, business) in [Business::Proposal, Business::Pin, Business::List]
+        .into_iter()
+        .enumerate()
+    {
         let mut args = arguments(business, uuid::Uuid::new_v4(), &private.join("project"));
-        args.splice(1..1, ["--device".into(), "fixture-remote".into()]);
+        // Device selection is immutable for this process. Later commands use
+        // the already selected device rather than failing a second selection.
+        if index == 0 {
+            args.splice(1..1, ["--device".into(), "fixture-remote".into()]);
+        }
         let staged = Cell::new(0);
         let result = run_from_with_staged_lookup(args, |_, _| {
             staged.set(staged.get() + 1);
             Ok(None)
         });
         assert_eq!(result, ExitCode::FAILURE);
+        assert!(crate::device::is_remote());
+        assert_eq!(crate::device::selected().unwrap().name, "fixture-remote");
         assert_eq!(staged.get(), 0);
         assert!(
             !Path::new(&std::env::var_os(SSH_MARKER).unwrap()).exists(),
