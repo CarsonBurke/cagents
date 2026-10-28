@@ -6489,10 +6489,13 @@ while time.monotonic() < end:
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
-                    events: vec![Event::Session {
-                        id: value["id"].as_str().unwrap().to_owned(),
-                        title: None,
-                    }],
+                    events: vec![
+                        Event::Session {
+                            id: value["id"].as_str().unwrap().to_owned(),
+                            title: None,
+                        },
+                        Event::Ready(true),
+                    ],
                 })
             }
         }
