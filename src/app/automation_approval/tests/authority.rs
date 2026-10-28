@@ -91,6 +91,11 @@ impl Peer {
         }
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
+        // Derive the oracle from the synthetic role, independently of the
+        // production environment parser. Ordinary User still probes readiness.
+        let expected_probes = usize::from(
+            authority.token().is_none() && std::env::var(ROLE).as_deref() != Ok("user-no-start"),
+        );
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut probes = 0;
@@ -198,9 +203,8 @@ impl Peer {
                 "no request or User retry after the expected completion"
             );
             assert_eq!(
-                probes,
-                usize::from(authority.token().is_none()),
-                "scoped effects must not run readiness or autostart"
+                probes, expected_probes,
+                "scoped or no-start effects must not run readiness or autostart"
             );
             listener
         });
@@ -327,12 +331,15 @@ fn exercise_app() {
 #[test]
 fn owning_app_approval_tasks_preserve_inherited_authority_and_user_flow() {
     if let Some(role) = std::env::var_os(ROLE) {
-        assert!(["user", "present", "empty", "non-unicode"].contains(&role.to_str().unwrap()));
+        assert!(
+            ["user", "user-no-start", "present", "empty", "non-unicode"]
+                .contains(&role.to_str().unwrap())
+        );
         exercise_app();
         return;
     }
     let selector = thread::current().name().unwrap().to_owned();
-    for role in ["user", "present", "empty", "non-unicode"] {
+    for role in ["user", "user-no-start", "present", "empty", "non-unicode"] {
         let private = tempfile::Builder::new()
             .prefix("approval-")
             .tempdir()
@@ -361,7 +368,10 @@ fn owning_app_approval_tasks_preserve_inherited_authority_and_user_flow() {
             .stdin(Stdio::null())
             .stdout(File::create(&stdout).unwrap())
             .stderr(File::create(&stderr).unwrap());
-        if role != "user" {
+        if role == "user-no-start" {
+            command.env("CAGENTS_NO_START", "YeS");
+        }
+        if !matches!(role, "user" | "user-no-start") {
             command.env(
                 crate::agent_execution::AUTHORITY_ENV,
                 match role {
