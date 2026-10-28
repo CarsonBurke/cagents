@@ -526,13 +526,10 @@ fn purge_deleted_account_annotations_with(
         Ok(_) => {
             crate::secure_file::reject_symlink_components(&home)
                 .map_err(|error| error.to_string())?;
-            let variable = super::home_variable(account.provider).ok_or_else(|| {
-                "This provider has no attested credential-directory scope".to_owned()
-            })?;
-            let scope =
-                super::scope::LaunchAccountScope::resolve(account.provider, &home, |name| {
-                    (name == variable).then(|| home.as_os_str().to_owned())
-                })?;
+            // This callback holds the lifecycle and registry write locks.
+            // Resolve only physical identity: the general launch resolver loads
+            // the installation registry and would reacquire our own lock.
+            let scope = capture_purge_scope(account.provider, &home)?;
             Ok((None, purge_account(&scope)?))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -543,6 +540,38 @@ fn purge_deleted_account_annotations_with(
         }
         Err(error) => Err(error.to_string().into()),
     }
+}
+
+/// Called only by the checked removal callback while lifecycle custody protects
+/// the managed home. Purge needs the physical namespace, not registry aliases or
+/// a launch/read capability. Storage revalidates this tuple before any marker.
+#[cfg(feature = "host")]
+fn capture_purge_scope(
+    provider: Provider,
+    home: &std::path::Path,
+) -> Result<super::scope::LaunchAccountScope, String> {
+    use std::os::unix::fs::MetadataExt;
+    if !home.is_absolute() {
+        return Err("The account home must be absolute".into());
+    }
+    if super::home_variable(provider).is_none() {
+        return Err("This provider has no attested credential-directory scope".into());
+    }
+    let canonical_home = home.canonicalize().map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&canonical_home).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() {
+        return Err("The selected provider home is not a directory".into());
+    }
+    let scope = super::scope::LaunchAccountScope {
+        provider,
+        canonical_home,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        registered_id: None,
+        purge_ids: Vec::new(),
+    };
+    scope.revalidate()?;
+    Ok(scope)
 }
 
 #[cfg(feature = "host")]
@@ -848,6 +877,175 @@ mod tests {
                 .is_some()
         );
         assert!(account.resolved_home().unwrap().exists());
+        assert!(matches!(
+            originals.original(Some("user"), 0, 4),
+            Err(crate::chat::annotations::OriginalError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_registry_publication_failure_retains_completed_purge_receipt() {
+        use crate::chat::annotations::storage;
+        let fixture = PurgeFixture::new();
+        let account = fixture.managed();
+        let originals = fixture.originals(&account);
+        let lineage = originals.original_lineage();
+        let registry_path = fixture._directory.path().join("config/accounts.toml");
+        let retained_registry = fixture._directory.path().join("retained-accounts.toml");
+        let failure = remove_account_with_purge(
+            Operation::DeleteFiles { id: account.id() },
+            &fixture.store,
+            &fixture.homes,
+            &fixture.cache,
+            |_| Ok(()),
+            |account| {
+                let result = purge_deleted_account_annotations_with(
+                    account,
+                    |scope| storage::purge_account_receipt_at(&fixture.annotations, scope),
+                    |id| storage::purge_registered_receipt_at(&fixture.annotations, id),
+                )?;
+                // A completed real purge precedes registry publication. An
+                // owned directory collision deterministically refuses persist.
+                std::fs::rename(&registry_path, &retained_registry).unwrap();
+                std::fs::create_dir(&registry_path).unwrap();
+                Ok(result)
+            },
+        )
+        .unwrap_err();
+        assert!(!failure.message.is_empty());
+        assert!(
+            registry_path.is_dir(),
+            "failure followed the injected publication collision"
+        );
+        assert_eq!(failure.purge_receipt.revoked, vec![lineage]);
+        assert_eq!(failure.purge_receipt.removed_namespaces, 1);
+        assert!(
+            account.resolved_home().unwrap().exists(),
+            "parking never ran"
+        );
+        std::fs::remove_dir(&registry_path).unwrap();
+        std::fs::rename(&retained_registry, &registry_path).unwrap();
+        assert!(
+            fixture
+                .store
+                .load()
+                .unwrap()
+                .find(account.registry_key().unwrap())
+                .is_some()
+        );
+        assert!(matches!(
+            originals.original(Some("user"), 0, 4),
+            Err(crate::chat::annotations::OriginalError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_installation_store_delete_does_not_reenter_its_registry_lock() {
+        const CHILD: &str = "CAGENTS_PURGE_INSTALLATION_LOCK_TEST";
+        const SELECTOR: &str = "account::remote::tests::lifecycle_installation_store_delete_does_not_reenter_its_registry_lock";
+        if std::env::var_os(CHILD).is_none() {
+            use std::{
+                io::Read,
+                process::{Command, Stdio},
+                time::{Duration, Instant},
+            };
+            let directory = tempfile::tempdir().unwrap();
+            for name in ["home", "config", "data", "cache", "runtime"] {
+                std::fs::create_dir(directory.path().join(name)).unwrap();
+            }
+            // Only the same-ELF child gets these variables. The parent process
+            // and its installation state are never redirected or mutated.
+            struct ChildGuard(std::process::Child);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = ChildGuard(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", SELECTOR, "--nocapture", "--test-threads=1"])
+                    .env_clear()
+                    .env(CHILD, directory.path())
+                    .env("HOME", directory.path().join("home"))
+                    .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                    .env("XDG_DATA_HOME", directory.path().join("data"))
+                    .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                    .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                    .current_dir(directory.path())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.0.kill().unwrap();
+                    child.0.wait().unwrap();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "same-store DeleteFiles must finish without registry recursion within 5s; status={status:?}\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        // The actual installation constructors select exactly the same store
+        // a general LaunchAccountScope::resolve would try to lock recursively.
+        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let fixture = PurgeFixture {
+            _directory: tempfile::tempdir_in(&root).unwrap(),
+            homes: crate::account::home::Homes::installation().unwrap(),
+            store: crate::account::registry::Store::installation().unwrap(),
+            cache: crate::account::cache::Cache::installation().unwrap(),
+            annotations: crate::instance::project_dirs()
+                .unwrap()
+                .data_dir()
+                .join("conversation-annotations"),
+        };
+        let account = fixture.managed();
+        let originals = fixture.originals(&account);
+        let lineage = originals.original_lineage();
+        let result = remove_account_with_receipt(
+            Operation::DeleteFiles { id: account.id() },
+            &fixture.store,
+            &fixture.homes,
+            &fixture.cache,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.purge_receipt.revoked, vec![lineage]);
+        assert_eq!(result.purge_receipt.removed_namespaces, 1);
+        assert!(result.warning.is_none());
+        assert!(
+            result
+                .registry
+                .find(account.registry_key().unwrap())
+                .is_none()
+        );
+        assert!(!account.resolved_home().unwrap().exists());
         assert!(matches!(
             originals.original(Some("user"), 0, 4),
             Err(crate::chat::annotations::OriginalError::Unavailable(_))
