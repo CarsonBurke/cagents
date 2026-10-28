@@ -59,8 +59,16 @@ def guard_vendor_hooks():
 
 
 def run(*arguments, cwd, env=None):
+    # Fixture Git and Git invoked by Cargo build scripts must use the fixture's
+    # own repository, index and objects, never a caller-selected location.
+    environment = dict(os.environ if env is None else env)
+    for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        environment.pop(name, None)
     result = subprocess.run(
-        arguments, cwd=cwd, env=env, text=True, capture_output=True
+        arguments, cwd=cwd, env=environment, text=True, capture_output=True
     )
     if result.returncode:
         raise RuntimeError(f"{arguments[0]} failed in {cwd}:\n{result.stdout}\n{result.stderr}")
