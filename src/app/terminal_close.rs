@@ -844,7 +844,7 @@ mod tests {
         app.workspace_model.views[0].revision = 8;
         app.retire_settled_empty_channels();
         assert_eq!(
-            received.try_recv().unwrap(),
+            received.try_recv().unwrap().edit,
             ModelEdit::RetireEmptyChannel {
                 home,
                 expected_view_revision: 8,
