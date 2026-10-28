@@ -658,18 +658,7 @@ impl Cagents {
         // a passive read is still pending. Closing the repository retires both
         // identities, so that old read cannot adopt a pre-close listing or
         // release the reservation belonging to a later reopen.
-        let loads = self
-            .workspace_model_loads
-            .iter()
-            .filter(|(_, (path, _))| path == repository)
-            .map(|(&project, (_, generation))| (project, *generation))
-            .collect::<Vec<_>>();
-        for (project, generation) in loads {
-            if let Some(cancellation) = self.refresh_ui.projects.remove(&project) {
-                cancellation.cancel();
-            }
-            self.finish_workspace_model_load(project, generation, true);
-        }
+        self.retire_workspace_model_loads(Some(repository));
         self.project_ui.removing.remove(repository);
         if !self.project_ui.closed.insert(repository.to_path_buf()) {
             return self.complete_closed_projects();
@@ -759,6 +748,9 @@ impl Cagents {
 
     pub(super) fn retire_foreign_project_operations(&mut self, registry: uuid::Uuid) {
         if registry != self.workspace_model.identity {
+            // Passive discovery belongs to the model which admitted it. Its
+            // queued Git completion cannot introduce projects into a new one.
+            self.retire_workspace_model_loads(None);
             // These closes were admitted by the previous registry. Even an
             // already completed helper's queued callback must lose its local
             // generation before the new registry can adopt the same path.

@@ -2132,6 +2132,23 @@ impl Cagents {
         }
     }
 
+    /// Retire only passive admissions. Independent picker/refresh loads and
+    /// explicit reopen intents retain their own generations and caller custody.
+    pub(super) fn retire_workspace_model_loads(&mut self, repository: Option<&Path>) {
+        let loads = self
+            .workspace_model_loads
+            .iter()
+            .filter(|(_, (path, _))| repository.is_none_or(|repository| path == repository))
+            .map(|(&project, (_, generation))| (project, *generation))
+            .collect::<Vec<_>>();
+        for (project, generation) in loads {
+            if let Some(cancellation) = self.refresh_ui.projects.remove(&project) {
+                cancellation.cancel();
+            }
+            self.finish_workspace_model_load(project, generation, true);
+        }
+    }
+
     /// The local project that is the face of `repository`.
     ///
     /// Compared canonically, because the shared key is canonical and a window
