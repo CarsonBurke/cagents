@@ -44,6 +44,7 @@ impl Receipt {
 /// Only resident items own tokens. No item body or append history is retained.
 #[derive(Default)]
 pub(crate) struct Owners {
+    conversation: Option<String>,
     parent: HashMap<String, Receipt>,
     children: HashMap<String, HashMap<String, Receipt>>,
 }
@@ -93,6 +94,9 @@ impl Owners {
         snapshot: &Snapshot,
         appends: Option<&HashSet<(Option<String>, String)>>,
     ) -> Self {
+        // A legal metadata transition must not revive an earlier conversation's
+        // capabilities when its ID later returns, even with reused Item Arcs.
+        let previous = previous.filter(|owners| owners.conversation == snapshot.session_id);
         let entries = |child: Option<&str>, items: &[Arc<Item>]| {
             items
                 .iter()
@@ -151,6 +155,7 @@ impl Owners {
                 .collect()
         };
         Self {
+            conversation: snapshot.session_id.clone(),
             parent: entries(None, &snapshot.items),
             children: snapshot
                 .subagents

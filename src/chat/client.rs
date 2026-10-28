@@ -3708,6 +3708,43 @@ mod tests {
             Part::Input,
             &before_hide
         ));
+        // Actual legal metadata-only A→B→A updates preserve the exact Item
+        // allocation. The conversation boundary alone must retire old A.
+        let (before, _, owners) = handle.resident_copy_view().unwrap();
+        let original_item = before.items[0].clone();
+        let old_a = owners
+            .receipt(None, &original_item)
+            .unwrap()
+            .token(Part::Input);
+        for conversation in ["other-conversation", "conversation"] {
+            let mut metadata = (*handle.snapshot()).clone();
+            metadata.generation += 1;
+            metadata.session_id = Some(conversation.into());
+            handle.publish_delta_snapshot_for_test(metadata);
+            assert!(Arc::ptr_eq(&handle.snapshot().items[0], &original_item));
+        }
+        assert!(
+            !handle.rendered_copy_is_current(
+                Some("conversation"),
+                None,
+                "copy-stream",
+                Part::Input,
+                &old_a
+            ),
+            "returning to A must not resurrect its old queued source"
+        );
+        let (current, _, owners) = handle.resident_copy_view().unwrap();
+        let fresh_a = owners
+            .receipt(None, &current.items[0])
+            .unwrap()
+            .token(Part::Input);
+        assert!(handle.rendered_copy_is_current(
+            Some("conversation"),
+            None,
+            "copy-stream",
+            Part::Input,
+            &fresh_a
+        ));
     }
 
     /// The live installation's own card: a native OMP conversation whose
