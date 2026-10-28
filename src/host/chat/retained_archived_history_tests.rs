@@ -326,6 +326,53 @@ fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
     }
 }
 
+fn wait_for_read_only_history(client: &chat::client::ClientHandle, reason: &str) {
+    // Match the visible native pane: hidden clients intentionally ignore
+    // presentation wakes and do not request the resident history body.
+    client.set_visible(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = client.snapshot();
+        let connected = client.is_connected();
+        let session_matches = snapshot.session_id == client.session().launch.session_id;
+        if connected
+            && session_matches
+            && !snapshot.history_loading
+            && !snapshot.items.is_empty()
+            && snapshot.exited
+            && snapshot.read_only_reason.is_some()
+            && snapshot.error.is_none()
+            && !snapshot.ready
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && snapshot.native_continuity == chat::NativeContinuity::ReconnectOnly
+        {
+            return;
+        }
+        assert!(
+            connected && Instant::now() < deadline,
+            "{reason}: connected={connected}, session_matches={session_matches}, generation={}, \
+             items={}, history_loading={}, exited={}, read_only_reason={:?}, error={:?}, \
+             ready={}, busy={}, waiting={}, requests={}, continuity={:?}",
+            snapshot.generation,
+            snapshot.items.len(),
+            snapshot.history_loading,
+            snapshot.exited,
+            snapshot.read_only_reason,
+            snapshot.error,
+            snapshot.ready,
+            snapshot.busy,
+            snapshot.waiting,
+            snapshot.requests.len(),
+            snapshot.native_continuity,
+        );
+        thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 macro_rules! inspect {
     ($fixture:expr) => {{
         let proof = $fixture.host.lock().unwrap().proof().clone();
@@ -1046,11 +1093,8 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
         let host = fixture.host.clone();
         let server = thread::spawn(move || crate::host::client::serve(server, 61, host));
         let reader = chat::client::ClientHandle::fixture_restore(client, visual.clone()).unwrap();
-        wait(
-            || {
-                let snapshot = reader.snapshot();
-                !snapshot.history_loading && !snapshot.items.is_empty()
-            },
+        wait_for_read_only_history(
+            &reader,
             "original old-boot visual did not load real read-only history",
         );
         let restored = reader.session();
@@ -1138,11 +1182,8 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 let history =
                     chat::client::ClientHandle::fixture_restore(restore, requested.clone())
                         .unwrap();
-                wait(
-                    || {
-                        let snapshot = history.snapshot();
-                        !snapshot.history_loading && !snapshot.items.is_empty()
-                    },
+                wait_for_read_only_history(
+                    &history,
                     "lost preparation could not restore original history without a provider",
                 );
                 assert!(history.session().is_saved_claude_history());
@@ -1192,11 +1233,8 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 let server = thread::spawn(move || crate::host::client::serve(server, 63, host));
                 let history =
                     chat::client::ClientHandle::fixture_restore(reopen, prepared.clone()).unwrap();
-                wait(
-                    || {
-                        let snapshot = history.snapshot();
-                        !snapshot.history_loading && !snapshot.items.is_empty()
-                    },
+                wait_for_read_only_history(
+                    &history,
                     "prepared successor could not reopen history before Start",
                 );
                 assert_eq!(history.session(), prepared);

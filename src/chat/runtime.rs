@@ -541,10 +541,16 @@ impl LocalHandle {
                             }
                             Ok(child)
                         });
-                        let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
+                        // History has no provider startup handshake. Its
+                        // preflight Store already contains the transcript, so
+                        // do not expose a handle until the complete initial
+                        // read-only metadata has been applied as well.
+                        if !matches!(spec.transport, TransportSpec::History) || child.is_err() {
+                            let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
+                        }
                         actor.child = child?;
                         match spec.transport {
-                            TransportSpec::History => actor.run_history(initial),
+                            TransportSpec::History => actor.run_history(initial, started),
                             TransportSpec::JsonLines => actor.run(initial),
                             TransportSpec::UnixWebSocket {
                                 socket,
@@ -665,11 +671,21 @@ impl LocalHandle {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 use super::protocol::LaunchCleanup;
-                if handle.cleanup().is_ok() || launch_context.is_some() {
+                if handle.cleanup().is_ok() || launch_context.is_some() || handle.0.history_only {
                     return Err(error);
                 }
                 // Interactive launches have no execution journal. Preserve
                 // their exact actor for host publication if cleanup is unknown.
+            }
+            Err(error) if handle.0.history_only => {
+                use super::protocol::LaunchCleanup;
+                let cleanup = handle.cleanup();
+                return Err(match cleanup {
+                    Ok(_) => format!("History initialization did not finish: {error}"),
+                    Err(cleanup) => format!(
+                        "History initialization did not finish: {error}; cleanup failed: {cleanup}"
+                    ),
+                });
             }
             Err(error) if launch_context.is_some() => {
                 return Err(format!(
@@ -1974,11 +1990,18 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 impl Actor {
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
-    fn run_history(&mut self, initial: Step) -> Result<(), String> {
-        if !initial.writes.is_empty() {
-            return Err("History initialization attempted a provider write".into());
-        }
-        self.step(initial)?;
+    fn run_history(
+        &mut self,
+        initial: Step,
+        started: crossbeam_channel::Sender<Result<(), String>>,
+    ) -> Result<(), String> {
+        let initialized = if initial.writes.is_empty() {
+            self.step(initial)
+        } else {
+            Err("History initialization attempted a provider write".into())
+        };
+        let _ = started.send(initialized.clone());
+        initialized?;
         while !self.stop.load(Ordering::Acquire) {
             self.drain_commands(false)?;
             if !self.pending.is_empty() {
@@ -5960,6 +5983,131 @@ mod tests {
     }
 
     struct Echo;
+    #[test]
+    fn history_constructor_waits_for_complete_initial_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            // A history reader must not execute this nonexistent program.
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step {
+            events: vec![
+                Event::History {
+                    items: vec![text("saved", "saved history body")],
+                    has_earlier: false,
+                },
+                // The account callback gives this test an exact barrier
+                // inside the initial metadata step, before read-only/exited.
+                Event::AccountUsage(LiveReport::Claude(crate::account::claude::LiveUpdate {
+                    windows: Vec::new(),
+                    status: None,
+                })),
+                Event::ReadOnlyHistory {
+                    reason: "saved conversation".into(),
+                },
+                Event::Status {
+                    busy: false,
+                    detail: String::new(),
+                },
+                Event::Exited { code: None },
+            ],
+            ..Step::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (entered, entered_rx) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let (returned, returned_rx) = crossbeam_channel::bounded(1);
+        let constructor = thread::spawn(move || {
+            let result = LocalHandle::start(
+                spec,
+                Box::new(Echo),
+                initial,
+                store,
+                Some("saved-conversation".into()),
+                move |update| {
+                    if matches!(update, Update::AccountUsage { .. }) {
+                        entered.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                },
+            );
+            returned.send(result).unwrap();
+        });
+        let reached_initial_step = entered_rx.recv_timeout(Duration::from_secs(2));
+        let premature = returned_rx.recv_timeout(Duration::from_millis(200));
+        let returned_before_metadata = premature.is_ok();
+        // Always release and join before asserting so the failing control
+        // cannot strand either the constructor or its reader worker.
+        let _ = release.send(());
+        let result = match premature {
+            Ok(result) => result,
+            Err(_) => returned_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        };
+        constructor.join().unwrap();
+        let handle = result.unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        let no_provider = handle.provider_process().is_none();
+        let history_only = handle.is_read_only_history();
+        handle.close().unwrap();
+        assert!(reached_initial_step.is_ok());
+        assert!(
+            !returned_before_metadata,
+            "History exposed its preflight transcript before initial read-only metadata"
+        );
+        assert!(history_only && no_provider);
+        assert_eq!(snapshot.session_id.as_deref(), Some("saved-conversation"));
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].id, "saved");
+        assert!(snapshot.exited && !snapshot.ready && !snapshot.busy && !snapshot.waiting);
+        assert_eq!(
+            snapshot.read_only_reason.as_deref(),
+            Some("saved conversation")
+        );
+        assert!(snapshot.requests.is_empty() && snapshot.error.is_none());
+        assert!(!snapshot.history_loading);
+        assert_eq!(
+            snapshot.native_continuity,
+            super::super::NativeContinuity::ReconnectOnly
+        );
+    }
+
+    #[test]
+    fn history_initialization_refusal_is_returned_without_exposing_a_handle() {
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step {
+            // A malformed history adapter may not turn initialization into
+            // a queued provider write or a partially initialized handle.
+            writes: vec![json!({"forbidden": "provider input"})],
+            ..Step::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let result = LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {});
+        let error = match result {
+            Ok(handle) => {
+                handle.close().unwrap();
+                panic!("History initialization refusal exposed a handle");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error, "History initialization attempted a provider write");
+    }
+
     #[test]
     fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
         struct HistoryFixture {
