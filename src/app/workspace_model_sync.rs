@@ -425,6 +425,24 @@ enum Adoption {
     Retained,
 }
 
+/// Absence candidates only; the caller retains deletion/republish policy.
+/// Shared IDs include rows skipped during adoption. Local order and duplicate
+/// entries remain authoritative for the later action loop.
+fn channels_absent_from_model(
+    local: &[ProjectChannel],
+    shared: &[ModelChannel],
+) -> Vec<(ChannelId, bool)> {
+    let shared_ids = shared
+        .iter()
+        .map(|channel| channel.id)
+        .collect::<HashSet<_>>();
+    local
+        .iter()
+        .filter(|channel| !shared_ids.contains(&channel.id))
+        .map(|channel| (channel.id, channel.shared))
+        .collect()
+}
+
 impl Cagents {
     pub(super) fn reorder_sidebar_member(
         &mut self,
@@ -865,13 +883,7 @@ impl Cagents {
             }
         }
         let mut republished = Vec::new();
-        let retired = self
-            .durable
-            .channels
-            .iter()
-            .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
-            .map(|local| (local.id, local.shared))
-            .collect::<Vec<_>>();
+        let retired = channels_absent_from_model(&self.durable.channels, &model.channels);
         for (id, shared) in retired {
             if self.channel_ui.is_deleting(id) {
                 continue;
@@ -1551,6 +1563,91 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_channel_candidates_preserve_local_order_duplicates_and_shared_flags() {
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        let mut locals = (0..2_046)
+            .map(|index| {
+                let mut channel = local(ChannelId::new(), project, "local", index);
+                channel.shared = index % 2 == 0;
+                let card = CardId::new();
+                channel.cards.push(card);
+                channel.focused = Some(card);
+                channel
+            })
+            .collect::<Vec<_>>();
+        let missing = locals[0].id;
+        let present = locals[1].id;
+        let skipped_adoption = locals[3].id;
+        let mut incoming = locals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .rev()
+            .map(|(_, channel)| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        // Even a model row the caller skips while adopting is still present for
+        // absence authority. The selector must consume the complete model list.
+        incoming.push(shared(skipped_adoption, &repository, "skipped adoption", 0));
+        incoming.push(incoming[0].clone());
+        incoming.push(shared(ChannelId::new(), &repository, "not local", 1));
+        let mut duplicate_missing = locals[0].clone();
+        duplicate_missing.shared = false;
+        duplicate_missing.title = "unshared duplicate".into();
+        locals.insert(9, duplicate_missing);
+        let mut duplicate_present = locals[2].clone();
+        // After the insertion, original row1 is still at index1.
+        duplicate_present.id = present;
+        duplicate_present.shared = true;
+        locals.push(duplicate_present);
+        assert_eq!(locals.len(), 2_048);
+        let before = locals.clone();
+
+        // Independent old nested membership is the semantic oracle, not an
+        // assertion about HashSet iteration or measured runtime.
+        let expected = locals
+            .iter()
+            .filter(|local| !incoming.iter().any(|shared| shared.id == local.id))
+            .map(|local| (local.id, local.shared))
+            .collect::<Vec<_>>();
+        let absent = channels_absent_from_model(&locals, &incoming);
+        assert_eq!(absent, expected);
+        assert_eq!(absent.len(), 682);
+        assert_eq!(
+            absent
+                .iter()
+                .copied()
+                .filter(|(id, _)| *id == missing)
+                .collect::<Vec<_>>(),
+            [(missing, true), (missing, false)],
+            "local duplicates retain order and their distinct retirement authority"
+        );
+        assert!(
+            !absent
+                .iter()
+                .any(|(id, _)| *id == present || *id == skipped_adoption)
+        );
+        assert_eq!(
+            locals, before,
+            "titles, conversations and focus are untouched"
+        );
+
+        assert_eq!(
+            channels_absent_from_model(&locals, &[]),
+            locals
+                .iter()
+                .map(|local| (local.id, local.shared))
+                .collect::<Vec<_>>()
+        );
+        let all_present = locals
+            .iter()
+            .rev()
+            .map(|channel| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        assert!(channels_absent_from_model(&locals, &all_present).is_empty());
+    }
 
     #[test]
     fn agent_invalidation_reads_once_without_reconciling_a_stale_inventory_edge() {
