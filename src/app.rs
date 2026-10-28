@@ -12740,7 +12740,9 @@ impl Cagents {
         // Apply pending settings through their ordinary live-effects path: a
         // refused/cancelled close must leave a usable, synchronized window.
         // Capture the latest composer/editor state before the writer barrier.
-        let drafts = self.flush_settings_drafts();
+        // The final bounded save owns these drafts. A redundant ordinary save
+        // could otherwise outlive a refused close while waiting on the lock.
+        let drafts = self.flush_settings_drafts_with_save(false);
         self.persist();
         let snapshot = self.persistent_workspace();
         let writer = self.session.as_ref().map(SessionRuntime::operation_store);
@@ -13640,12 +13642,18 @@ impl Cagents {
     }
 
     fn flush_settings_drafts(&mut self) -> Task<Message> {
+        self.flush_settings_drafts_with_save(true)
+    }
+
+    fn flush_settings_drafts_with_save(&mut self, schedule_save: bool) -> Task<Message> {
         let mut pending: Vec<_> = self.settings_pending.drain().collect();
         pending.sort_by_key(|(_, (generation, _))| *generation);
         Task::batch(
             pending
                 .into_iter()
-                .map(|(field, (_, value))| self.apply_setting_input(field, value))
+                .map(|(field, (_, value))| {
+                    self.apply_setting_input_with_save(field, value, schedule_save)
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -13667,6 +13675,15 @@ impl Cagents {
     }
 
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        self.apply_setting_input_with_save(field, value, true)
+    }
+
+    fn apply_setting_input_with_save(
+        &mut self,
+        field: SettingsField,
+        value: String,
+        schedule_save: bool,
+    ) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
         match settings_update(&self.settings, field, &value) {
@@ -13677,7 +13694,7 @@ impl Cagents {
             }
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
-                if self.settings_save_error.is_some() {
+                if schedule_save && self.settings_save_error.is_some() {
                     return self.save_settings_task(false);
                 }
                 self.refresh_settings_feedback();
@@ -13686,7 +13703,11 @@ impl Cagents {
             SettingsDecision::Persist(settings) => {
                 let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
-                let save = self.save_settings_task(false);
+                let save = if schedule_save {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
                 let effect = self.synchronize_settings(&previous);
                 Task::batch([save, effect])
@@ -20708,19 +20729,53 @@ mod tests {
     #[test]
     fn window_close_busy_settings_refuses_without_late_writes_and_retries_retained_draft() {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
 
-        for blocker in ["file lock", "save lane"] {
+        for (blocker, unchanged_retry) in [
+            ("file lock", false),
+            ("save lane", false),
+            ("file lock", true),
+            ("save lane", true),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let (mut app, card, window) = window_close_draft_app(directory.path());
             let path = app.settings_path.clone().unwrap();
             let base = app.settings.clone();
             settings::save(&path, &base).unwrap();
             let original_bytes = std::fs::read(&path).unwrap();
-            app.settings.chat_expand_tool_groups = !base.chat_expand_tool_groups;
+            // Keep the original inode alive so an identical late atomic write
+            // cannot hide behind inode reuse in the unchanged-value case.
+            let original_file = std::fs::File::open(&path).unwrap();
+            let original_metadata = original_file.metadata().unwrap();
+            let desired = if unchanged_retry {
+                app.settings_save_error = Some("prior settings refusal".into());
+                base.chat_expand_tool_groups
+            } else {
+                !base.chat_expand_tool_groups
+            };
+            drop(app.update(Message::SettingsDraftChanged {
+                field: SettingsField::ChatExpandToolGroups,
+                value: desired.to_string(),
+            }));
+            assert!(
+                app.settings_pending
+                    .contains_key(&SettingsField::ChatExpandToolGroups)
+            );
+            assert_eq!(
+                app.settings.chat_expand_tool_groups,
+                base.chat_expand_tool_groups
+            );
             let (activations, receiver) = async_channel::unbounded();
             app.activation_rx = receiver;
             let store = app.session.as_ref().unwrap().operation_store();
             let lane = Arc::clone(&app.settings_save_lane);
+            // Retain the runtime and stream until locks are released and all
+            // original effects settle. The old unbounded sibling must not
+            // hang Runtime::drop while this test still holds its file lock.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let held_lane = (blocker == "save lane").then(|| lane.lock().unwrap());
             let held_file = (blocker == "file lock").then(|| {
                 let file = std::fs::OpenOptions::new()
@@ -20739,8 +20794,33 @@ mod tests {
             let started = Instant::now();
             let task = app.update(Message::WindowCloseRequested(window));
             assert!(app.pending_window_close.is_some());
+            assert!(app.settings_pending.is_empty());
+            assert_eq!(app.settings.chat_expand_tool_groups, desired);
+            assert!(matches!(&app.cards[&card], CardRuntime::Chat(runtime)
+                if runtime.tool_groups_expanded == desired));
             type_window_close_draft(&mut app, card, " rejected while saving");
-            let failed = window_close_test_message(&mut app, task);
+            let mut close_effects = iced::runtime::task::into_stream(task).expect("close task");
+            let failed = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        WINDOW_CLOSE_SETTINGS_LOCK_WAIT + Duration::from_secs(5),
+                        async {
+                            while let Some(action) = close_effects.next().await {
+                                if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                                    action
+                                {
+                                    if matches!(message, Message::WindowCloseFlushed { .. }) {
+                                        return message;
+                                    }
+                                    drop(app.update(message));
+                                }
+                            }
+                            panic!("close task did not acknowledge final save");
+                        },
+                    )
+                    .await
+                })
+                .expect("contended close must refuse while authority remains held");
             assert!(started.elapsed() < WINDOW_CLOSE_SETTINGS_LOCK_WAIT + Duration::from_secs(5));
             assert!(
                 matches!(
@@ -20773,27 +20853,23 @@ mod tests {
             let copy = app.update(Message::ChatUi(chat_ui::Action::CopyLiteral(
                 retained.clone(),
             )));
-            let copied = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    let mut effects = iced::runtime::task::into_stream(copy).unwrap();
-                    while let Some(effect) = effects.next().await {
-                        if let iced::runtime::Action::Clipboard(
-                            iced::runtime::clipboard::Action::Write { contents, .. },
-                        ) = effect
-                        {
-                            return contents;
-                        }
+            let copied = runtime.block_on(async {
+                let mut effects = iced::runtime::task::into_stream(copy).unwrap();
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    ) = effect
+                    {
+                        return contents;
                     }
-                    panic!("retained draft copy must produce clipboard work");
-                });
+                }
+                panic!("retained draft copy must produce clipboard work");
+            });
             assert_eq!(copied, retained);
-            let CardRuntime::Chat(runtime) = &app.cards[&card] else {
+            let CardRuntime::Chat(chat) = &app.cards[&card] else {
                 panic!("chat")
             };
-            let target = runtime.target;
+            let target = chat.target;
             drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
                 target,
                 widget::text_editor::Action::SelectAll,
@@ -20807,6 +20883,31 @@ mod tests {
 
             drop(held_file);
             drop(held_lane);
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while let Some(action) = close_effects.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                                action
+                            {
+                                drop(app.update(message));
+                            }
+                        }
+                    })
+                    .await
+                })
+                .expect("all original close effects must settle after lock release");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original_bytes,
+                "no close-triggered sibling may write after refusal"
+            );
+            let current_metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (current_metadata.dev(), current_metadata.ino()),
+                (original_metadata.dev(), original_metadata.ino()),
+                "even unchanged drafts must not replace settings after refusal"
+            );
             assert!(
                 lane.lock().unwrap().is_none(),
                 "no late successful save after timeout"
