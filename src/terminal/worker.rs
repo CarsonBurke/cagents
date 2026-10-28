@@ -1561,6 +1561,19 @@ impl TerminalHandle {
             })
     }
 
+    /// Check only this exact worker's immutable cleanup capability. This does
+    /// not reserve admission or publish teardown; the stop fence checks again.
+    pub(crate) fn check_session_stop_capability(&self, instance: uuid::Uuid) -> Result<(), String> {
+        let published = &self.inner.published;
+        if published.execution_instance != instance {
+            return Err("The terminal worker was replaced; its replacement was preserved".into());
+        }
+        if published.family_cleanup_capable.get() != Some(&true) {
+            return Err("This terminal holder cannot confirm whole-session cleanup; reattach or recover its original owner before stopping it".into());
+        }
+        Ok(())
+    }
+
     /// Atomically fence input, priority interrupts and ownership changes on
     /// this exact worker, then publish its internal stop control. No cleanup
     /// wait or process inspection occurs while the caller holds admission.

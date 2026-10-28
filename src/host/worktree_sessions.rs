@@ -696,6 +696,17 @@ fn prepare_stop_checked(
     if actors.iter().any(|actor| actor.starting) {
         return Err("A session is starting or changing ownership; wait for it to settle before stopping sessions".into());
     }
+    // An unsupported holder is a predictable roster-wide refusal. Discover
+    // it before stopping any earlier actor; later transient admission/cleanup
+    // failures still retain their existing non-atomic retry semantics.
+    for actor in &actors {
+        source_matches(host, actor)?;
+        if let Some(terminal) = &actor.terminal {
+            terminal
+                .handle
+                .check_session_stop_capability(terminal.instance)?;
+        }
+    }
     before_effect()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut terminals = Vec::new();
