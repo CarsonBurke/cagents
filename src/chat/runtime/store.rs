@@ -2617,6 +2617,7 @@ mod tests {
                 path, description, ..
             } => {
                 assert!(path.starts_with(store.directory.to_str().unwrap()));
+                assert!(crate::chat::is_cached_inline_image(std::path::Path::new(path)));
                 assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
             }

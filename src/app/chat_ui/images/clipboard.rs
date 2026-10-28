@@ -40,10 +40,11 @@ pub(in crate::app) struct Resolved {
     pub(in crate::app) url: Option<Url>,
 }
 
-/// Encoded PNG offered to the clipboard. Each paste request receives its own
-/// copy on the clipboard worker thread.
+/// Encoded PNG offered to the clipboard, shared rather than copied as it moves
+/// through messages. Each paste request receives its own copy on the clipboard
+/// worker thread.
 #[derive(Clone)]
-pub(in crate::app) struct Png(Vec<u8>);
+pub(in crate::app) struct Png(std::sync::Arc<[u8]>);
 
 impl AsMimeTypes for Png {
     fn available(&self) -> Cow<'static, [String]> {
@@ -51,7 +52,7 @@ impl AsMimeTypes for Png {
     }
 
     fn as_bytes(&self, mime_type: &str) -> Option<Cow<'static, [u8]>> {
-        (mime_type == PNG).then(|| Cow::Owned(self.0.clone()))
+        (mime_type == PNG).then(|| Cow::Owned(self.0.to_vec()))
     }
 }
 
@@ -85,7 +86,7 @@ fn encode(handle: &Handle) -> Result<Png, String> {
     PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
         .write_image(pixels, *width, *height, image::ExtendedColorType::Rgba8)
         .map_err(|error| format!("Could not encode the image as PNG: {error}"))?;
-    Ok(Png(png))
+    Ok(Png(png.into()))
 }
 
 /// Encoder scratch and output are admitted against the decode budget at the
@@ -136,22 +137,24 @@ impl widget::menu::Action for MenuCommand {
     }
 }
 
-/// One context menu entry: its label, command, and whether it is enabled.
-type MenuEntry = (&'static str, ImageCommand, bool);
+/// One context menu entry: its label and command.
+type MenuEntry = (&'static str, ImageCommand);
 
 /// The image context menu's entries. `path` and `external` say whether those
-/// actions apply to this image; `copy` whether the clipboard can hold images.
-fn entries(image: ImageRef, path: bool, external: bool, copy: bool) -> Vec<MenuEntry> {
+/// actions apply to this image. Copy image is always offered: where the
+/// clipboard cannot hold image data, choosing it says why, which a disabled
+/// item cannot.
+fn entries(image: ImageRef, path: bool, external: bool) -> Vec<MenuEntry> {
     let mut entries = Vec::with_capacity(4);
     if matches!(image, ImageRef::Transcript(..)) {
-        entries.push(("Open image", ImageCommand::Open, true));
+        entries.push(("Open image", ImageCommand::Open));
     }
-    entries.push(("Copy image", ImageCommand::Copy, copy));
+    entries.push(("Copy image", ImageCommand::Copy));
     if path {
-        entries.push(("Copy image path", ImageCommand::CopyPath, true));
+        entries.push(("Copy image path", ImageCommand::CopyPath));
     }
     if external {
-        entries.push(("Open externally", ImageCommand::OpenExternally, true));
+        entries.push(("Open externally", ImageCommand::OpenExternally));
     }
     entries
 }
@@ -163,16 +166,9 @@ pub(in crate::app) fn menu(
     external: bool,
 ) -> Vec<widget::menu::Tree<Message>> {
     use widget::menu::{Item, KeyBind, key_bind::Modifier};
-    let items = entries(image, path, external, supported())
+    let items = entries(image, path, external)
         .into_iter()
-        .map(|(label, command, enabled)| {
-            let command = MenuCommand(image, command);
-            if enabled {
-                Item::Button(label, None, command)
-            } else {
-                Item::ButtonDisabled(label, None, command)
-            }
-        })
+        .map(|(label, command)| Item::Button(label, None, MenuCommand(image, command)))
         .collect();
     let mut key_binds = HashMap::new();
     if matches!(image, ImageRef::Viewer(_)) {
@@ -202,7 +198,10 @@ fn literal_path<'a>(runtime: &Runtime, content: &'a ItemContent) -> Option<(&'a 
         return None;
     }
     if Path::new(path).is_absolute() {
-        return Some((path, false));
+        // A provider's inline image decoded into the private transcript cache
+        // is gone with the conversation; only the pixels are worth copying.
+        return (!crate::chat::is_cached_inline_image(Path::new(path)))
+            .then_some((path, false));
     }
     (runtime.selected_subagent.is_none()
         && !Url::parse(path).is_ok_and(|url| !url.scheme().is_empty()))
@@ -413,24 +412,19 @@ mod tests {
         let preview = ImageRef::Transcript(target, id);
         let viewer = ImageRef::Viewer(id);
         assert_eq!(
-            entries(preview, true, false, true),
+            entries(preview, true, false),
             [
-                ("Open image", Open, true),
-                ("Copy image", Copy, true),
-                ("Copy image path", CopyPath, true),
+                ("Open image", Open),
+                ("Copy image", Copy),
+                ("Copy image path", CopyPath),
             ]
         );
         assert_eq!(
-            entries(viewer, false, true, true),
-            [("Copy image", Copy, true), ("Open externally", OpenExternally, true)]
-        );
-        // Where the clipboard cannot hold image data, Copy stays visible but disabled.
-        assert_eq!(
-            entries(preview, false, false, false),
-            [("Open image", Open, true), ("Copy image", Copy, false)]
+            entries(viewer, false, true),
+            [("Copy image", Copy), ("Open externally", OpenExternally)]
         );
         // Each menu item sends its own command for the same exact image.
-        for (_, command, _) in entries(viewer, true, true, true) {
+        for (_, command) in entries(viewer, true, true) {
             assert!(matches!(
                 MenuCommand(viewer, command).message(),
                 Message::ChatUi(Action::Image(image, sent)) if image == viewer && sent == command
@@ -449,7 +443,7 @@ mod tests {
     fn a_copy_superseded_after_encoding_never_reaches_the_clipboard() {
         let _context = text_copy::isolated_context();
         let intent = text_copy::Intent::begin();
-        let task = intent.write_data(Png(vec![1, 2, 3]));
+        let task = intent.write_data(Png(vec![1, 2, 3].into()));
         text_copy::invalidate();
         let effects = iced::futures::executor::block_on(async {
             use iced::futures::StreamExt;

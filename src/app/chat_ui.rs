@@ -12210,6 +12210,12 @@ mod tests {
             text: None,
             repeat,
         };
+        let press = app.update(Message::KeyEvent {
+            event: control_c(false),
+            captured: false,
+        });
+        // The chord's repeats, arriving while the press is still encoding,
+        // neither copy again nor cancel the copy the press started.
         assert!(
             run(app.update(Message::KeyEvent {
                 event: control_c(true),
@@ -12217,15 +12223,13 @@ mod tests {
             }))
             .is_empty()
         );
-        let effects = run(app.update(Message::KeyEvent {
-            event: control_c(false),
-            captured: false,
-        }));
-        assert_eq!(copied(&mut app, effects), ["image/png"]);
+        assert_eq!(copied(&mut app, run(press)), ["image/png"]);
         assert_eq!(notice(&app).1, "Copied image");
         assert!(app.chat_ui.image_viewer.is_some(), "copying keeps the viewer open");
 
-        // Escape that its context menu claimed closes only the menu.
+        // Escape is the viewer's own rather than the app-wide key handler's,
+        // so nothing focused beneath the viewer can claim it first, while the
+        // Escape that its open context menu claims closes only that menu.
         let escape = keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::Escape),
             modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -12240,11 +12244,69 @@ mod tests {
             captured: true,
         }));
         assert!(app.chat_ui.image_viewer.is_some());
-        drop(app.update(Message::KeyEvent {
-            event: escape,
-            captured: false,
-        }));
-        assert!(app.chat_ui.image_viewer.is_none());
+        {
+            use iced::advanced::layout::{Layout, Limits};
+            use iced::advanced::widget::Tree;
+            use iced::advanced::{Shell, clipboard, mouse};
+            let renderer = crate::app::tests::headless_renderer();
+            let window = iced::Size::new(1000.0, 800.0);
+            let viewport = iced::Rectangle::with_size(window);
+            let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+            let mut element = gallery.view();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, window),
+            );
+            let pointer = mouse::Cursor::Available(viewport.center());
+            let mut send = |element: &mut Element<'_, Message>,
+                            tree: &mut Tree,
+                            event: iced::Event| {
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    tree,
+                    &event,
+                    Layout::new(&node),
+                    pointer,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
+                    .count()
+            };
+            let mut menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+                element
+                    .as_widget_mut()
+                    .overlay(
+                        tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        iced::Vector::ZERO,
+                    )
+                    .is_some()
+            };
+            send(
+                &mut element,
+                &mut tree,
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            );
+            assert!(menu_open(&mut element, &mut tree), "the image's menu opened");
+            assert_eq!(
+                send(&mut element, &mut tree, iced::Event::Keyboard(escape.clone())),
+                0
+            );
+            assert!(!menu_open(&mut element, &mut tree), "Escape closed the menu");
+            assert_eq!(
+                send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
+                1
+            );
+        }
     }
 
     #[test]
@@ -12282,6 +12344,16 @@ mod tests {
             path(&*runtime, image("/private/asset-digest.png", Some(managed))).is_none(),
             "a managed asset's snapshot path is not an authority to expose"
         );
+        let cached = format!(
+            "/run/user/1000/cagents/chat-{}/image-{}.png",
+            uuid::Uuid::new_v4(),
+            "0f".repeat(32)
+        );
+        assert!(
+            path(&*runtime, image(&cached, None)).is_none(),
+            "a provider image decoded into the private transcript cache is ephemeral"
+        );
+        assert!(path(&*runtime, image("/abs/image-0f.png", None)).is_some());
         assert!(path(&*runtime, image("relative.png", None)).is_some());
         runtime.selected_subagent = Some("child".into());
         assert!(

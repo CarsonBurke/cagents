@@ -828,14 +828,17 @@ impl Entry {
         if self.managed {
             return None;
         }
-        if Path::new(&self.path).is_absolute() {
-            return Some(self.path.clone());
-        }
-        Url::parse(&self.path)
-            .ok()
-            .filter(|url| url.scheme() == "file")
-            .and_then(|url| url.to_file_path().ok())
-            .map(|path| path.to_string_lossy().into_owned())
+        let path = if Path::new(&self.path).is_absolute() {
+            PathBuf::from(&self.path)
+        } else {
+            Url::parse(&self.path)
+                .ok()
+                .filter(|url| url.scheme() == "file")
+                .and_then(|url| url.to_file_path().ok())?
+        };
+        // See `clipboard::literal_path`: a cached inline image is ephemeral.
+        (!crate::chat::is_cached_inline_image(&path))
+            .then(|| path.to_string_lossy().into_owned())
     }
 }
 pub(in crate::app) struct Gallery {
@@ -986,15 +989,10 @@ impl Gallery {
                 Action::ImageNext(true),
             ),
             iced::widget::Space::new().width(Length::Fill).into(),
-            icon(
-                Icon::Copy,
-                if clipboard::supported() {
-                    "Copy image (Ctrl+C)"
-                } else {
-                    clipboard::UNSUPPORTED
-                },
-                clipboard::supported(),
-                Action::Image(image, ImageCommand::Copy),
+            crate::interaction::tooltip(
+                crate::ui_controls::button::secondary("Copy")
+                    .on_press(action(Action::Image(image, ImageCommand::Copy))),
+                "Copy image (Ctrl+C)",
             ),
             crate::ui_controls::button::secondary("Fit")
                 .on_press(action(Action::ImageFit))
@@ -1021,17 +1019,16 @@ impl Gallery {
                 self.entry_url(entry).is_some(),
             ),
         );
-        dialog_ui::overlay(
+        // Escape that an open context menu claims closes only the menu.
+        let dialog = dialog_ui::overlay(
             dialog_ui::surface(
                 widget::column::with_children(vec![
                     toolbar.into(),
                     design::caption(entry.label.as_str()).into(),
                     canvas.into(),
-                    design::caption(if clipboard::supported() {
-                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
-                    } else {
-                        "Scroll to zoom · Drag to pan · Left / Right to browse"
-                    })
+                    design::caption(
+                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
+                    )
                     .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -1040,7 +1037,17 @@ impl Gallery {
             ),
             Some(action(Action::CloseImage)),
             1.0,
-        )
+        );
+        crate::interaction::unclaimed_key(dialog, |event| {
+            matches!(
+                event,
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }
+            )
+            .then(|| action(Action::CloseImage))
+        })
     }
 }
 impl Runtime {

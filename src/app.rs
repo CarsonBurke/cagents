@@ -16863,7 +16863,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
+                // A held chord copies once, so its repeats must not cancel the
+                // copy its first press started.
+                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
                     chat_ui::invalidate_copy_intent();
@@ -16914,11 +16916,8 @@ impl Application for Cagents {
                                     chat_ui::images::ImageCommand::Copy,
                                 ));
                             }
-                            // Escape that dismissed the viewer's context menu
-                            // arrives captured and leaves the viewer open.
-                            keyboard::Key::Named(keyboard::key::Named::Escape) if !captured => {
-                                self.chat_ui.image_viewer = None
-                            }
+                            // Escape is the viewer's own (`Gallery::view`), so that
+                            // one an open context menu claims closes only the menu.
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                                 self.chat_ui.image_viewer.as_mut().unwrap().next(false);
                             }

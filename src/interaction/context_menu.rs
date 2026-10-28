@@ -371,7 +371,7 @@ mod tests {
             text: None,
             repeat: false,
         });
-        let mut send = |widget: &mut dyn Widget<(), Theme, Renderer>,
+        let send = |widget: &mut dyn Widget<(), Theme, Renderer>,
                         tree: &mut Tree,
                         event: &Event| {
             let mut messages = Vec::new();
