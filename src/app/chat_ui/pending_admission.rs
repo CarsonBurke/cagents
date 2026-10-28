@@ -2,7 +2,7 @@
 use super::*;
 
 impl Runtime {
-    pub(super) fn awaiting_admission(&self) -> bool {
+    pub(in crate::app) fn awaiting_admission(&self) -> bool {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
