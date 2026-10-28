@@ -10,6 +10,7 @@ use crate::{
 mod removal_authority_tests;
 
 /// The caller of a removal, retained through session checks and reconnects.
+#[derive(Debug, Clone)]
 struct ProjectRemovalContext {
     authority: crate::agent_execution::Authority,
     remote: bool,
@@ -106,6 +107,7 @@ pub struct WorktreeRemovalCapture {
     cards: Vec<RemovalCard>,
     inventory: Option<u64>,
     device: Option<(String, String, String)>,
+    context: ProjectRemovalContext,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +368,8 @@ pub enum Action {
 impl Cagents {
     /// Capture the original registrations before selection, waiting or worker I/O.
     pub(super) fn capture_worktree_removal(&self, target: &Target) -> WorktreeRemovalCapture {
+        let mut context = ProjectRemovalContext::capture();
+        context.expected_registry = Some(self.workspace_model.identity);
         let channels = self.removal_card_channels();
         let cards = self
             .durable
@@ -392,6 +396,7 @@ impl Cagents {
             cards,
             inventory: self.repository_generations.get(&target.project).copied(),
             device: removal_device_key(),
+            context,
         }
     }
 
@@ -2003,10 +2008,30 @@ impl Cagents {
             });
         }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        // Keep descriptors, not ID-based ownership: a pane filed here may
+        // run elsewhere. The close worker checks the actual process scope.
+        let project_sessions = ProjectSessionOwnership {
+            retained_chats: capture
+                .cards
+                .iter()
+                .filter_map(|owner| match &owner.state.kind {
+                    CardKind::Chat(session)
+                        if super::channel_ui::may_have_retained_owner(session) =>
+                    {
+                        Some(session.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let context = capture.context.clone();
+        let device = capture.device.clone();
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let removed = delete_worktree(&request)?;
+                let removed =
+                    delete_worktree_with_context(&request, &project_sessions, &context, &device)?;
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -2402,8 +2427,19 @@ fn card_belongs_to(card: &CardState, path: &Path) -> bool {
 /// which is the same request the close dialog sends once the user has
 /// confirmed. A close the daemon cannot confirm stops the deletion: the
 /// directory is not removed from under a process whose fate is unknown.
-fn close_worktree_sessions(target: &Target) -> Result<(), String> {
-    close_sessions_in_worktrees(std::slice::from_ref(&target.path))
+fn close_worktree_sessions(
+    target: &Target,
+    project_sessions: &ProjectSessionOwnership,
+    context: &ProjectRemovalContext,
+) -> Result<(), String> {
+    close_sessions_in_scope_with_context(
+        std::slice::from_ref(&target.path),
+        None,
+        project_sessions,
+        None,
+        context,
+    )
+    .map(|_| ())
 }
 
 fn close_sessions_in_worktrees(worktrees: &[PathBuf]) -> Result<(), String> {
@@ -2448,8 +2484,22 @@ fn close_sessions_in_scope_with_context(
             return if project.is_some() || context.authority.token().is_some() {
                 Err("Cannot verify project ownership while the daemon is unavailable.".into())
             } else {
+                let scope = ProjectSessionScope::new(worktrees.to_vec(), Vec::new());
+                if project_sessions.retained_chats.iter().any(|session| {
+                    !project_sessions.chat_closed(session)
+                        && project_sessions.contains(
+                            session.id,
+                            &session.launch.recipe.working_directory,
+                            &scope,
+                        )
+                }) {
+                    return Err(
+                        "Cannot confirm the worktree's retained conversations while the daemon is unavailable. Retry after reconnecting."
+                            .into(),
+                    );
+                }
                 Ok(ProjectSessionClosure {
-                    scope: ProjectSessionScope::new(worktrees.to_vec(), Vec::new()),
+                    scope,
                     ownership: project_sessions.clone(),
                 })
             };
@@ -2822,7 +2872,25 @@ fn remove_project_from_cagents_with_context(
 ///
 /// Returns what was removed, by which its creation is released, or `None`
 /// when Git could not say where the worktree's administrative files were.
+#[cfg(test)]
 fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
+    delete_worktree_with_context(
+        target,
+        &ProjectSessionOwnership::default(),
+        &ProjectRemovalContext::capture(),
+        &removal_device_key(),
+    )
+}
+
+fn delete_worktree_with_context(
+    target: &Target,
+    project_sessions: &ProjectSessionOwnership,
+    context: &ProjectRemovalContext,
+    device: &Option<(String, String, String)>,
+) -> Result<Option<RemovedWorktree>, String> {
+    if device != &removal_device_key() {
+        return Err("The selected device changed. Confirm worktree deletion again.".into());
+    }
     let id = target
         .worktree
         .ok_or("The primary repository cannot be deleted.")?;
@@ -2859,7 +2927,10 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
             );
         })
         .ok();
-    close_worktree_sessions(target)?;
+    close_worktree_sessions(target, project_sessions, context)?;
+    if device != &removal_device_key() {
+        return Err("The selected device changed. Confirm worktree deletion again.".into());
+    }
     // Confirmation authorizes discarding this worktree's changes. Git owns
     // directory removal and still refuses locked worktrees with one --force.
     let command = worktree_removal_command(target);

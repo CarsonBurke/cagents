@@ -616,7 +616,9 @@ fn project_completion(task: Task<Message>) -> Message {
             while let Some(action) = stream.next().await {
                 if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
                     message @ Message::ProjectUi(
-                        Action::RemovedProject { .. } | Action::ProjectSessionsClosed(..),
+                        Action::RemovedProject { .. }
+                        | Action::ProjectSessionsClosed(..)
+                        | Action::Deleted { .. },
                     ),
                 )) = action
                 {
@@ -629,6 +631,19 @@ fn project_completion(task: Task<Message>) -> Message {
 
 fn standalone_retained_app(
     label: &str,
+) -> (
+    Cagents,
+    ProjectRemoval,
+    WorkspaceModel,
+    crate::chat::Session,
+    CardId,
+) {
+    standalone_retained_app_in(label, None)
+}
+
+fn standalone_retained_app_in(
+    label: &str,
+    directory: Option<&Path>,
 ) -> (
     Cagents,
     ProjectRemoval,
@@ -658,6 +673,9 @@ fn standalone_retained_app(
     app.active_workspace = Some(removal.repository.clone());
     Arc::make_mut(&mut app.durable).active_channel = None;
     session.launch.provider = crate::agent::Provider::Claude;
+    if let Some(directory) = directory {
+        session.launch.recipe.working_directory = directory.to_path_buf();
+    }
     session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
     session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
     assert!(session.has_valid_native_continuity());
@@ -1028,7 +1046,330 @@ fn completed_project_close_cannot_retire_a_replacement_retained_conversation() {
     isolated(&["user-no-start", "present"], retained_project_successor);
 }
 
+fn manual_git(directory: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args([
+            "-c",
+            "user.name=Removal Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn manual_retained_app(
+    label: &str,
+    inside: bool,
+) -> (
+    Cagents,
+    Target,
+    WorkspaceModel,
+    crate::chat::Session,
+    CardId,
+) {
+    let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+    let repository = root.join("project");
+    fs::create_dir_all(&repository).unwrap();
+    if !repository.join(".git").exists() {
+        manual_git(&repository, &["init", "-b", "main"]);
+        manual_git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+    }
+    let linked = root.join(format!("worktree-{label}"));
+    manual_git(
+        &repository,
+        &["worktree", "add", "-b", label, linked.to_str().unwrap()],
+    );
+    let (mut app, removal, mut model, session, card) =
+        standalone_retained_app_in(&format!("ui-{label}"), inside.then_some(linked.as_path()));
+    model.projects[0].kind = ProjectKind::Git;
+    app.workspace_model = model.clone();
+    let records = RepositoryService::system("git")
+        .list_worktrees(&repository, &CancellationToken::default())
+        .unwrap();
+    let id = records
+        .iter()
+        .find(|record| record.path == linked)
+        .unwrap()
+        .id;
+    let project = app
+        .sidebar_model
+        .projects
+        .iter_mut()
+        .find(|p| p.id == removal.project)
+        .unwrap();
+    project.kind = ProjectKind::Git;
+    project.worktrees = records
+        .into_iter()
+        .map(|record| SidebarWorktree::from_durable(record.id, record.path, record.branch))
+        .collect();
+    app.known_worktree_roots.insert(linked.clone());
+    // Filing a pane under the checkout does not move its actual process.
+    Arc::make_mut(&mut app.durable)
+        .card_scopes
+        .insert(card, linked.clone());
+    let target = Target {
+        project: removal.project,
+        worktree: Some(id),
+        repository,
+        path: linked,
+        label: label.into(),
+    };
+    (app, target, model, session, card)
+}
+
+fn confirm_manual_deletion(app: &mut Cagents, target: &Target) -> Message {
+    drop(app.handle_project_action(Action::Command {
+        project_id: target.project,
+        worktree_id: target.worktree,
+        command: ProjectCommand::Delete,
+    }));
+    assert!(app.project_ui.dialog.is_some());
+    project_completion(app.handle_project_action(Action::ConfirmDelete))
+}
+
+fn manual_retained_absence(role: &str) {
+    let (mut app, target, model, source, card) = manual_retained_app("absent", true);
+    let saved = app.card_state(card).unwrap().clone();
+    let drafts = app.persistent_workspace().chat_drafts.clone();
+    let focus = app.workspace.focused();
+    let expected = expected_authority(role);
+    let peer = Peer::new(move |server| {
+        for accepted in [false, true] {
+            let mut connection = server.connect(&expected, false).unwrap();
+            connection.model(&model);
+            connection.chats(vec![]);
+            let close = exact_retained_close(&mut connection, &source);
+            if accepted {
+                connection.response(&close, ServerResponse::Accepted);
+                connection.terminals(vec![]);
+            } else {
+                connection.refuse(&close);
+            }
+            connection.eof();
+        }
+    });
+    let failed = confirm_manual_deletion(&mut app, &target);
+    assert!(matches!(
+        &failed,
+        Message::ProjectUi(Action::Deleted { result: Err(_), .. })
+    ));
+    assert!(target.path.is_dir());
+    assert!(
+        manual_git(&target.repository, &["worktree", "list", "--porcelain"])
+            .contains(target.path.to_str().unwrap())
+    );
+    drop(app.update(failed));
+    assert_eq!(app.card_state(card), Some(&saved));
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focus);
+    assert!(
+        app.project_ui.deletions[&target.worktree.unwrap()]
+            .failure
+            .as_ref()
+            .unwrap()
+            .contains(REFUSAL)
+    );
+    assert!(
+        app.notices
+            .entries
+            .iter()
+            .any(|entry| entry.notice.message.contains(REFUSAL))
+    );
+    let succeeded = project_completion(
+        app.handle_project_action(Action::RetryDelete(target.worktree.unwrap())),
+    );
+    assert!(matches!(
+        &succeeded,
+        Message::ProjectUi(Action::Deleted { result: Ok(()), .. })
+    ));
+    assert!(!target.path.exists());
+    manual_git(
+        &target.repository,
+        &["show-ref", "--verify", "refs/heads/absent"],
+    );
+    drop(app.update(succeeded));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert!(!app.persistent_workspace().chat_drafts.contains_key(&card));
+    peer.finished(0);
+}
+
+#[test]
+fn manual_worktree_retained_absence_requires_receipt_before_git_and_explicit_retry() {
+    isolated_with_tools(
+        &["user", "user-no-start", "present"],
+        manual_retained_absence,
+        true,
+    );
+}
+
+fn manual_retained_recovery(role: &str) {
+    for outcome in ["refused", "accepted", "registry-changed"] {
+        let (mut app, target, model, source, card) =
+            manual_retained_app(&format!("recovery-{outcome}"), true);
+        let saved = app.card_state(card).unwrap().clone();
+        let drafts = app.persistent_workspace().chat_drafts.clone();
+        let expected = expected_authority(role);
+        let peer = Peer::new(move |server| {
+            let mut initial = server.connect(&expected, false).unwrap();
+            initial.model(&model);
+            initial.chats(vec![source.clone()]);
+            let close = initial.chat_close(&source);
+            initial.refuse(&close);
+            let detach = initial.request();
+            assert!(
+                matches!(detach.request, ClientRequest::ChatDetach { chat_id } if chat_id == source.id)
+            );
+            initial.response(&detach, ServerResponse::Detached);
+            initial.eof();
+            let mut recovery = server.connect(&expected, false).unwrap();
+            let mut recovered_model = model;
+            if outcome == "registry-changed" {
+                recovered_model.identity = uuid::Uuid::new_v4();
+            }
+            recovery.model(&recovered_model);
+            if outcome != "registry-changed" {
+                recovery.chats(vec![]);
+                let close = exact_retained_close(&mut recovery, &source);
+                if outcome == "accepted" {
+                    recovery.response(&close, ServerResponse::Accepted);
+                    recovery.terminals(vec![]);
+                } else {
+                    recovery.refuse(&close);
+                }
+            }
+            recovery.eof();
+        });
+        let completion = confirm_manual_deletion(&mut app, &target);
+        assert!(
+            matches!(&completion, Message::ProjectUi(Action::Deleted { result, .. })
+            if result.is_ok() == (outcome == "accepted"))
+        );
+        assert_eq!(target.path.exists(), outcome != "accepted");
+        drop(app.update(completion));
+        if outcome != "accepted" {
+            assert_eq!(app.card_state(card), Some(&saved));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        }
+        peer.finished(0);
+    }
+}
+
+#[test]
+fn manual_worktree_retained_recovery_preserves_authority_and_registry() {
+    isolated_with_tools(
+        &["user-no-start", "present"],
+        manual_retained_recovery,
+        true,
+    );
+}
+
+fn manual_retained_offline(role: &str) {
+    for inside in [true, false] {
+        for stale_socket in [false, true] {
+            let (mut app, target, _, _, card) =
+                manual_retained_app(&format!("offline-{inside}-{stale_socket}"), inside);
+            let saved = app.card_state(card).unwrap().clone();
+            let drafts = app.persistent_workspace().chat_drafts.clone();
+            let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
+            fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            if socket.exists() {
+                fs::remove_file(&socket).unwrap();
+            }
+            if stale_socket {
+                drop(UnixListener::bind(&socket).unwrap());
+            }
+            let accepted = !inside && role == "user-no-start";
+            let completion = confirm_manual_deletion(&mut app, &target);
+            assert!(
+                matches!(&completion, Message::ProjectUi(Action::Deleted { result, .. }) if result.is_ok() == accepted)
+            );
+            assert_eq!(target.path.exists(), !accepted);
+            drop(app.update(completion));
+            assert_eq!(app.card_state(card), Some(&saved));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(
+                socket.exists(),
+                stale_socket,
+                "no daemon autostart or socket replacement"
+            );
+        }
+    }
+}
+
+#[test]
+fn manual_worktree_retained_offline_refuses_but_empty_user_scope_stays_removable() {
+    isolated_with_tools(&["user-no-start", "present"], manual_retained_offline, true);
+}
+
+fn manual_retained_neighbors(role: &str) {
+    for replacement in [false, true] {
+        let (mut app, target, model, original, card) =
+            manual_retained_app(&format!("neighbor-{replacement}"), replacement);
+        let drafts = app.persistent_workspace().chat_drafts.clone();
+        let mut neighbor = original.clone();
+        neighbor.launch.recipe.working_directory = target.repository.clone();
+        neighbor.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let expected = expected_authority(role);
+        let listed = neighbor.clone();
+        let source = original.clone();
+        let peer = Peer::new(move |server| {
+            let mut connection = server.connect(&expected, false).unwrap();
+            connection.model(&model);
+            connection.chats(if replacement { vec![listed] } else { vec![] });
+            if replacement {
+                let close = exact_retained_close(&mut connection, &source);
+                connection.response(&close, ServerResponse::Accepted);
+            }
+            connection.terminals(vec![]);
+            connection.eof();
+        });
+        let completion = confirm_manual_deletion(&mut app, &target);
+        assert!(matches!(
+            &completion,
+            Message::ProjectUi(Action::Deleted { result: Ok(()), .. })
+        ));
+        assert!(!target.path.exists());
+        if replacement {
+            // The same allocation acquired a different outside-root source
+            // after the original worker completed but before its UI callback.
+            assert_eq!(neighbor.id, original.id);
+            app.install_chat_session(card, neighbor.clone());
+        }
+        let saved = app.card_state(card).unwrap().clone();
+        drop(app.update(completion));
+        assert_eq!(app.card_state(card), Some(&saved));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        peer.finished(0);
+    }
+}
+
+#[test]
+fn manual_worktree_retained_close_does_not_own_outside_or_replacement_sources() {
+    isolated_with_tools(
+        &["user-no-start", "present"],
+        manual_retained_neighbors,
+        true,
+    );
+}
+
 fn isolated(roles: &[&str], exercise: fn(&str)) {
+    isolated_with_tools(roles, exercise, false);
+}
+
+fn isolated_with_tools(roles: &[&str], exercise: fn(&str), with_git: bool) {
     if let Some(role) = std::env::var_os(ROLE) {
         let role = role.to_str().unwrap();
         assert!(roles.contains(&role));
@@ -1054,6 +1395,16 @@ fn isolated(roles: &[&str], exercise: fn(&str)) {
         )
         .unwrap();
         fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        if with_git {
+            let path = std::env::var_os("PATH").expect("Git is available to the parent test");
+            let git = std::env::split_paths(&path)
+                .map(|directory| directory.join("git"))
+                .find(|candidate| candidate.is_file())
+                .expect("a real Git executable is required for linked-worktree fixtures")
+                .canonicalize()
+                .unwrap();
+            std::os::unix::fs::symlink(git, root.join("bin/git")).unwrap();
+        }
         let stdout = root.join("stdout");
         let stderr = root.join("stderr");
         let mut command = Command::new(std::env::current_exe().unwrap());
