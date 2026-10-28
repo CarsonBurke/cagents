@@ -314,6 +314,50 @@ pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool
     prepare_resume_verified(host, source, None)
 }
 
+/// A read-only visual is not an actor alias. Before leaving a retired managed
+/// allocation, independently qualify its exact final actor source through the
+/// ordinary private-retirement/history/account join. Never restart from the
+/// reader's descriptor or from a closed Agent row alone.
+pub(super) fn prepare_history_successor(host: &SharedHost, reader: &Session) -> Result<(), String> {
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut after = None;
+    let mut final_source = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            break;
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if ownership.source().id != reader.id {
+                continue;
+            }
+            let retirement = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_actor_retirement(ownership.actor())?
+                .ok_or("The saved-history allocation has an owner without completed retirement")?;
+            let source = retirement.source();
+            if source.launch != reader.launch
+                || source.terminal.is_some()
+                || source.owned_codex_listener.is_some()
+                || final_source.replace(source.clone()).is_some()
+            {
+                return Err("The saved-history allocation has ambiguous retired ownership".into());
+            }
+        }
+    }
+    let source = final_source
+        .ok_or("The retired saved-history allocation has no authenticated actor retirement")?;
+    if !prepare_resume(host, &source)? {
+        return Err("The retired saved-history allocation has no matching completed actor".into());
+    }
+    Ok(())
+}
+
 pub(super) fn prepare_resume_verified(
     host: &SharedHost,
     source: &Session,

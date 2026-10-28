@@ -2534,29 +2534,7 @@ fn process_inner(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
-            let predecessor = source.id;
-            let root = source
-                .terminal
-                .as_ref()
-                .and_then(|terminal| terminal.recovery_origin);
-            let mut session = source;
-            session.reset_owned_codex_listener();
-            session.id = TerminalId::new();
-            session.proof = None;
-            session.terminal = None;
-            // The old owner's close is proved, so the reopened conversation
-            // takes over its lineage, unless another of its sessions runs.
-            if let Ok(registry) = super::agent_execution::registry(host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .succeed(session.id, predecessor, root, |members| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .any_other_live(members, predecessor)
-                    })
-                    .map_err(unavailable)?;
-            }
+            let session = prepare_resume_successor(host, source)?;
             Ok(ServerResponse::ChatResumePrepared { session })
         }
         ClientRequest::ChatRecoverAccount {
@@ -3132,6 +3110,33 @@ fn process_inner(
         }
         _ => Err(error("Not a native chat request")),
     }
+}
+
+fn prepare_resume_successor(
+    host: &SharedHost,
+    mut session: Session,
+) -> Result<Session, ProtocolError> {
+    let predecessor = session.id;
+    let root = session
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.recovery_origin);
+    session.reset_owned_codex_listener();
+    session.id = TerminalId::new();
+    session.proof = None;
+    session.terminal = None;
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .succeed(session.id, predecessor, root, |members| {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .any_other_live(members, predecessor)
+            })
+            .map_err(unavailable)?;
+    }
+    Ok(session)
 }
 
 /// Borrow the complete native transition only while its closing reservation is

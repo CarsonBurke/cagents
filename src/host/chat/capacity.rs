@@ -1971,7 +1971,25 @@ pub(super) fn prepare_saved_history(
             "The exact saved-history reader changed; no provider was started",
         ));
     }
-    Ok(Some(source.clone()))
+    let target = super::CloseTarget::capture(&state, record)?;
+    drop(state);
+    let registry = super::super::agent_execution::registry(host).map_err(unavailable)?;
+    let retired = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_retired_agent_allocation(source.id)
+        .map_err(unavailable)?;
+    if !retired {
+        return Ok(Some(source.clone()));
+    }
+    require_unmanaged(host, source.id).map_err(unavailable)?;
+    super::check_launch_account(&source.launch)?;
+    super::retained_resume::prepare_history_successor(host, source).map_err(unavailable)?;
+    // Explicit preparation closes only this exact paging reader through the
+    // normal reservation/close path. This frees its slot without resurrecting
+    // the canonical Agent or starting a provider, even at capacity one.
+    super::close_captured(host, target)?;
+    Ok(Some(super::prepare_resume_successor(host, source.clone())?))
 }
 
 /// An inactive window may retain a different former proof for this same

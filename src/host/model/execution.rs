@@ -451,6 +451,21 @@ impl Registry {
             .transpose()
     }
 
+    /// A historical Agent allocation must never be reused for a new process.
+    /// This is a refusal fence, not retirement or successor authority.
+    pub(in crate::host) fn has_retired_agent_allocation(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE session_id=?1 AND closed=1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Archive a completed execution reference from a kernel boot that cannot
     /// still own a process. The caller separately authenticates the current
     /// cleanup actor; this never binds the historical source to that actor.
