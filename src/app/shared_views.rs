@@ -1616,6 +1616,9 @@ impl Cagents {
             }
             match &pane.user_title {
                 Some(title) => {
+                    // A user's name takes precedence over a reported title,
+                    // which must not be published back with it.
+                    self.reported_title_save.cards.remove(&pane.id);
                     self.chrome_ui.user_titles.insert(pane.id, title.clone());
                 }
                 None => {
@@ -1939,15 +1942,18 @@ impl Cagents {
                     }
                 }
             } else {
-                let _ = self.workspace.rename_card(
-                    pane.id,
-                    pane.user_title
-                        .as_deref()
-                        .unwrap_or_else(|| {
-                            browser_host::presentation_title(&pane.kind, &pane.title)
-                        })
-                        .to_owned(),
-                );
+                // A held reported title is newer than the shared one.
+                if pane.user_title.is_some() || !self.reported_title_save.cards.contains(&pane.id) {
+                    let _ = self.workspace.rename_card(
+                        pane.id,
+                        pane.user_title
+                            .as_deref()
+                            .unwrap_or_else(|| {
+                                browser_host::presentation_title(&pane.kind, &pane.title)
+                            })
+                            .to_owned(),
+                    );
+                }
                 if self
                     .workspace
                     .card(pane.id)
@@ -4380,6 +4386,11 @@ mod tests {
             state.width_fraction, 0.75,
             "the other window's edit applies"
         );
+        assert_eq!(
+            app.workspace.card(card).unwrap().accessible_name,
+            "build done",
+            "the pane keeps its newer name"
+        );
         assert!(
             !publishes_title(&app),
             "an acknowledgment does not publish it"
@@ -4390,6 +4401,48 @@ mod tests {
         assert!(publishes_title(&app), "its save publishes it");
         assert!(app.reported_title_save.cards.is_empty());
         assert_eq!(app.card_state(card).unwrap().title, "build done");
+    }
+
+    /// A name given in another window replaces a held reported title, which
+    /// must then not be published back over that window's rename.
+    #[test]
+    fn a_shared_rename_releases_a_held_reported_title() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let card = app.workspace.focused().unwrap();
+        let shared = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.panes.push(shared.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        app.shared_views.pending.clear();
+
+        assert!(app.apply_reported_title(card, "build done".into()));
+        drop(app.save_reported_titles_soon(card));
+        let mut renamed = shared.clone();
+        renamed.user_title = Some("Release".into());
+        renamed.title = "Release".into();
+        view.apply(&Change::Update {
+            before: shared,
+            pane: renamed,
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+
+        assert!(app.reported_title_save.cards.is_empty());
+        assert_eq!(app.card_state(card).unwrap().title, "Release");
+        assert_eq!(app.workspace.card(card).unwrap().accessible_name, "Release");
+        app.shared_views.pending.clear();
+        drop(app.update(Message::ReportedTitleSaveDue));
+        assert!(
+            !app.shared_views.pending.iter().any(|(_, _, change)| {
+                matches!(change, Change::Update { pane, .. } if pane.title == "build done")
+            }),
+            "the replaced reported title is not published"
+        );
     }
 
     /// A pane moving between views in the save that captures it is still in

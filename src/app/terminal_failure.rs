@@ -234,11 +234,22 @@ pub(super) enum Action {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     },
+    /// An unavailable probe's retry time has come. Handling it runs the full
+    /// update tail, which probes again.
+    ProbeRetryDue,
 }
 impl Action {
     pub(super) fn is_user_action(&self) -> bool {
         matches!(self, Self::Copy(_) | Self::Reveal(_))
     }
+}
+/// Probes are retried by the update tail, which runs only for messages that
+/// may change what it reads; this message brings it at the retry time.
+fn probe_retry_timer(at: Instant) -> Task<Message> {
+    cosmic::task::future(async move {
+        tokio::time::sleep_until(at.into()).await;
+        Message::TerminalFailure(Action::ProbeRetryDue)
+    })
 }
 fn fresh_transcript(
     session: &TerminalSession,
@@ -405,6 +416,9 @@ impl Cagents {
                 },
             );
             if crate::device::is_remote() {
+                tasks.push(probe_retry_timer(
+                    self.terminal_failure.probes[&card].retry_at,
+                ));
                 continue;
             }
             tasks.push(cosmic::task::future(async move {
@@ -570,9 +584,13 @@ impl Cagents {
                 {
                     probe.available = available;
                     probe.pending = false;
+                    if !available {
+                        return probe_retry_timer(probe.retry_at);
+                    }
                 }
                 Task::none()
             }
+            Action::ProbeRetryDue => Task::none(),
             Action::Reveal(card) => {
                 if self
                     .terminal_failure
@@ -1063,6 +1081,34 @@ mod tests {
             available: true,
         }));
         assert!(!app.terminal_failure.probes[&card].available);
+    }
+    /// The update tail retries an unavailable probe, but nothing else may run
+    /// that tail by then, so the reply arms its own retry.
+    #[test]
+    fn an_unavailable_probe_arms_its_retry_and_an_available_one_does_not() {
+        let (mut app, card, session) = app_and_session();
+        let mut probe = |app: &mut Cagents, available| {
+            let operation = uuid::Uuid::new_v4();
+            app.terminal_failure.probes.insert(
+                card,
+                Probe {
+                    operation,
+                    session: session.clone(),
+                    saved_context: None,
+                    available: false,
+                    pending: true,
+                    retry_at: Instant::now() + Duration::from_secs(10),
+                },
+            );
+            app.update_terminal_failure(Action::Probed {
+                card,
+                operation,
+                available,
+            })
+            .units()
+        };
+        assert_eq!(probe(&mut app, false), 1);
+        assert_eq!(probe(&mut app, true), 0);
     }
 }
 
