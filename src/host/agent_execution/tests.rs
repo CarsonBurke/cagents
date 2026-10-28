@@ -4574,8 +4574,8 @@ fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
     if isolated("saved_concurrency_settings_change_admission_without_a_daemon_restart").is_some() {
         return;
     }
-    use crate::agent_execution::{AcceptanceError, ConcurrencyLimits};
-    let (host, mut request, _) = fixture();
+    use crate::agent_execution::{AcceptanceError, CapacityScope, ConcurrencyLimits};
+    let (host, mut request, fixture_path) = fixture();
     let first = registry(&host)
         .unwrap()
         .lock()
@@ -4610,9 +4610,12 @@ fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
         global: 3,
     };
     crate::settings::save(&path, &settings).unwrap();
-    let Reply::Accepted(second) =
-        process_request(&host, Authority::default(), Operation::Submit(request)).unwrap()
-    else {
+    let Reply::Accepted(second) = process_request(
+        &host,
+        Authority::default(),
+        Operation::Submit(request.clone()),
+    )
+    .unwrap() else {
         panic!("raised saved cap must allow acceptance immediately");
     };
     assert_eq!(settled(&host, second.run.id).state, State::Succeeded);
@@ -4623,7 +4626,191 @@ fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
     };
     assert_eq!(report.caller.limit, 2);
     assert_eq!(report.global.limit, 3);
-    close(&host, &Authority::default(), first.agent.id).unwrap();
+    // This is the existing synthetic User fixture, resolved by the real Host
+    // caller path; it does not establish any deployed caller's authority.
+    assert_eq!(origin(&host, &Authority::default()).unwrap(), Origin::User);
+    settings.agent_concurrency = ConcurrencyLimits {
+        caller: 50,
+        global: 50,
+    };
+    crate::settings::save(&path, &settings).unwrap();
+    let store = registry(&host).unwrap();
+    let mut holders = vec![first];
+    for index in 0..48 {
+        request.idempotency_key = format!("saved-fifty-holder-{index}");
+        holders.push(
+            store
+                .lock()
+                .unwrap()
+                .submit_agent_with_limits(
+                    &Origin::User,
+                    &request,
+                    None,
+                    settings.agent_concurrency,
+                    now(),
+                )
+                .unwrap(),
+        );
+    }
+    // Forty-nine reservations have no dispatched provider. The fiftieth uses
+    // the one already-running local actor, not fifty provider processes.
+    let root = fixture_path.parent().unwrap();
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let release = ReleaseOnDrop(root.join("cleanup-release"));
+    let followup = Submit {
+        name: None,
+        destination: Destination::Existing(second.agent.id),
+        prompt: "HOLD_CLEANUP_BUSY".into(),
+        idempotency_key: "saved-fifty-live-followup".into(),
+    };
+    let Reply::Accepted(fiftieth) = process_request(
+        &host,
+        Authority::default(),
+        Operation::Submit(followup.clone()),
+    )
+    .unwrap() else {
+        panic!("saved fifty-slot policy must admit the fiftieth run");
+    };
+    assert!(fiftieth.created);
+    assert_eq!(fiftieth.agent.id, second.agent.id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("cleanup-busy").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not hold the followup"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Provider receipt delivery is asynchronous to the shell's barrier. Wait
+    // for the corresponding durable Started event before comparing snapshots.
+    let run = loop {
+        let run = store.lock().unwrap().agent_run(fiftieth.run.id).unwrap();
+        if run.state == State::Running {
+            break run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "held turn never became Running: {run:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut expected: Vec<_> = holders
+        .iter()
+        .map(|accepted| crate::agent_execution::CapacityHolder {
+            id: accepted.agent.id,
+            run: accepted.run.id,
+            state: State::Accepted,
+        })
+        .collect();
+    expected.push(crate::agent_execution::CapacityHolder {
+        id: fiftieth.agent.id,
+        run: fiftieth.run.id,
+        state: run.state,
+    });
+    expected.sort_by_key(|holder| holder.run.to_string());
+    assert_eq!(expected.len(), 50);
+    assert_eq!(std::fs::read(root.join("spawns")).unwrap(), b"spawn\n");
+    assert_eq!(
+        std::fs::read(root.join("prompts")).unwrap(),
+        b"prompt\nprompt\n"
+    );
+    for (limits, scope) in [
+        (
+            ConcurrencyLimits {
+                caller: 50,
+                global: 50,
+            },
+            CapacityScope::Global,
+        ),
+        (
+            ConcurrencyLimits {
+                caller: 50,
+                global: 51,
+            },
+            CapacityScope::Caller,
+        ),
+        (
+            ConcurrencyLimits {
+                caller: 10,
+                global: 10,
+            },
+            CapacityScope::Global,
+        ),
+    ] {
+        settings.agent_concurrency = limits;
+        crate::settings::save(&path, &settings).unwrap();
+        let before = store.lock().unwrap().model().unwrap();
+        let Reply::Capacity(report) =
+            process(&host, Authority::default(), Operation::Capacity).unwrap()
+        else {
+            panic!("capacity report must retain all fifty reservations");
+        };
+        assert_eq!((report.caller.running, report.global.running), (50, 50));
+        assert_eq!(
+            (report.caller.limit, report.global.limit),
+            (limits.caller, limits.global)
+        );
+        assert_eq!(report.caller.holders, expected);
+        assert_eq!(report.global.holders, expected);
+        request.idempotency_key =
+            format!("saved-fifty-refused-{}-{}", limits.caller, limits.global);
+        let error = process_request(
+            &host,
+            Authority::default(),
+            Operation::Submit(request.clone()),
+        )
+        .unwrap_err();
+        let AcceptanceError::LimitReached(details) = error else {
+            panic!("the fifty-first reservation must be a typed capacity refusal");
+        };
+        assert!(details.retryable);
+        assert_eq!(details.capacity.scope, scope);
+        assert_eq!(details.capacity.running, 50);
+        assert_eq!(
+            details.capacity.limit,
+            if scope == CapacityScope::Caller {
+                limits.caller
+            } else {
+                limits.global
+            }
+        );
+        assert_eq!(details.capacity.holders, expected);
+        let Reply::Accepted(retry) = process_request(
+            &host,
+            Authority::default(),
+            Operation::Submit(followup.clone()),
+        )
+        .unwrap() else {
+            panic!("exact accepted retry must survive full and lowered limits");
+        };
+        assert!(!retry.created);
+        assert_eq!(
+            (retry.agent.id, retry.run.id),
+            (fiftieth.agent.id, fiftieth.run.id)
+        );
+        assert_eq!(store.lock().unwrap().model().unwrap(), before);
+        assert_eq!(std::fs::read(root.join("spawns")).unwrap(), b"spawn\n");
+        assert_eq!(
+            std::fs::read(root.join("prompts")).unwrap(),
+            b"prompt\nprompt\n"
+        );
+    }
+    drop(release);
+    assert_eq!(settled(&host, fiftieth.run.id).state, State::Succeeded);
+    let Reply::Capacity(report) =
+        process(&host, Authority::default(), Operation::Capacity).unwrap()
+    else {
+        panic!("capacity report after the held turn finishes");
+    };
+    assert_eq!((report.caller.running, report.global.running), (49, 49));
+    for holder in holders {
+        close(&host, &Authority::default(), holder.agent.id).unwrap();
+    }
     close(&host, &Authority::default(), second.agent.id).unwrap();
     super::super::finish_chat_shutdown(&host).unwrap();
 }
