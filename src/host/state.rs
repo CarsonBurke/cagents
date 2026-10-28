@@ -6394,7 +6394,10 @@ for line in sys.stdin:
         let live = retain(Instant::now() + Duration::from_secs(3600));
         let failure =
             prepare_upgrade_with(&host, live, || Store::open(directory.path())).unwrap_err();
-        assert!(failure.message.contains("not durably acknowledged"));
+        assert!(
+            failure.message.contains("not durably acknowledged"),
+            "expected the live handoff's durable-save refusal, got {failure:?}"
+        );
         // Nothing is destroyed by a refused upgrade: the window this receipt
         // belongs to can still replay its replacement afterwards.
         assert!(
@@ -6801,6 +6804,25 @@ for line in sys.stdin:
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
         restored.observe_agent().unwrap();
+        // The command FIFO barrier does not wait for the shell's startup
+        // processes. Check the actual reversible process census before asking
+        // this fixture's idle shell to checkpoint again. Keep every production
+        // refusal intact: each active snapshot is thawed before the next probe,
+        // and a shell that keeps real work remains a test failure.
+        let idle_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = restored.prepare_upgrade().unwrap();
+            let active = snapshot.active;
+            drop(snapshot);
+            if !active {
+                break;
+            }
+            assert!(
+                Instant::now() < idle_deadline,
+                "restored shell still owns active work before the next checkpoint"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
