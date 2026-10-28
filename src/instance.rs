@@ -602,8 +602,14 @@ pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
 /// An older independent editor has no interpretable directory inventory.
 /// Preserve all candidates while any local editor cannot prove readiness.
 /// Never inspect its buffers, environment, cwd or command arguments.
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
+    Err(unsupported_process_observation())
 }
 
 pub(crate) fn editor_executable(
@@ -655,6 +661,7 @@ pub(crate) fn editor_executable(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
@@ -720,6 +727,11 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         editors.push(editor);
     }
     Ok(editors)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verified_editors_in(_runtime: &Path, _proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
+    Err(unsupported_process_observation())
 }
 
 pub(crate) fn window_is_initialized() -> bool {
@@ -806,21 +818,34 @@ impl VerifiedWindow {
 /// Contention alone is not ownership: require the exact exclusive flock in the
 /// process's fdinfo, then pin its lifetime before trusting its executable.
 /// The caller must hold the update launch fence throughout use of this proof.
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
     verified_windows_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
+    Err(unsupported_process_observation())
+}
+
 /// A staged installer itself holds the shared legacy fence. Its validated
 /// exclusive launch guard already rules out a legacy exclusive UI owner.
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
     validate_stage_guard()?;
     verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
+    Err(unsupported_process_observation())
 }
 
 /// A candidate whose exact daemon already owns the runtime may reopen while an
 /// older coordinator retains its shared legacy fence. Keep legacy exclusive UI
 /// owners excluded, and authenticate every modern window before routing.
 /// The caller must hold the launch fence and retain the returned legacy guard.
+#[cfg(target_os = "linux")]
 pub(crate) fn verified_windows_for_daemon(
     executable: &Path,
 ) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
@@ -840,6 +865,13 @@ pub(crate) fn verified_windows_for_daemon(
         ));
     }
     Ok((windows, legacy))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verified_windows_for_daemon(
+    _executable: &Path,
+) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
+    Err(unsupported_process_observation())
 }
 
 fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
@@ -881,6 +913,7 @@ fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
     Ok(owners)
 }
 
+#[cfg(target_os = "linux")]
 fn verified_window_lease_owners_in(
     runtime: &Path,
     proc_root: &Path,
@@ -946,6 +979,22 @@ fn verified_window_lease_owners_in(
         owners.push(matches.pop().unwrap());
     }
     Ok(owners)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verified_window_lease_owners_in(
+    _runtime: &Path,
+    _proc_root: &Path,
+) -> io::Result<Vec<VerifiedWindow>> {
+    Err(unsupported_process_observation())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported_process_observation() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Authenticating windows and editors requires Linux process and lease ownership",
+    )
 }
 
 fn process_owns_slot(process: &Path, pid: u32, expected: &fs::Metadata) -> io::Result<bool> {
@@ -2069,6 +2118,27 @@ pub fn settings_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unsupported_process_census_never_reports_an_empty_owned_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        for result in [
+            verified_editors_in(root.path(), root.path()),
+            verified_window_lease_owners_in(root.path(), root.path()),
+            verified_running_editors(),
+            verified_running_windows(),
+            verified_staged_windows(),
+            verified_windows_for_daemon(Path::new("missing-daemon"))
+                .map(|(windows, _guard)| windows),
+        ] {
+            let Err(error) = result else {
+                panic!("unsupported ownership must not be reported as an empty inventory");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
