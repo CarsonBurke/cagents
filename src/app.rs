@@ -14268,6 +14268,10 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        let queued_lsp_open = match &message {
+            Message::OpenLspFile { card, request } => Some((*card, request.clone())),
+            _ => None,
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -17927,6 +17931,18 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        // Every early guard consumes this queued message too. An admitted
+        // open has already cleared `queued`; a superseding request has a
+        // different identity and must keep its own origin.
+        if let Some((card, request)) = queued_lsp_open
+            && self.lsp_pending_jumps.get(&card).is_some_and(|jump| {
+                jump.queued
+                    .as_ref()
+                    .is_some_and(|queued| Arc::ptr_eq(queued, &request))
+            })
+        {
+            self.lsp_pending_jumps.remove(&card);
+        }
         self.reconcile_chat_failure_presentations();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
@@ -28645,6 +28661,97 @@ mod tests {
             "alpha\nβeta😀\n"
         );
         app.lsp.begin_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn early_refused_lsp_queue_retires_only_its_request_under_modal_chrome_and_update_guards()
+    {
+        for guard in ["modal", "chrome", "update"] {
+            let root = tempfile::tempdir().unwrap();
+            lsp_history_files(root.path());
+            let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+            let (mut app, card) = lsp_history_app(manager, root.path()).await;
+            let before = lsp_history_runtime(&app, card).current_location().unwrap();
+            let source = lsp_history_runtime(&app, card).editor_text().unwrap();
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("b.rs"),
+                LspPosition::new(1, 1),
+                LspCoordinates::Scalar,
+            );
+            let obsolete = queued_lsp_history_open(task).await;
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("d.rs"),
+                LspPosition::new(1, 2),
+                LspCoordinates::Scalar,
+            );
+            let current = queued_lsp_history_open(task).await;
+            let request = app.lsp_pending_jumps[&card]
+                .queued
+                .as_ref()
+                .unwrap()
+                .clone();
+            match guard {
+                "modal" => {
+                    drop(app.update(Message::ResetSettings));
+                    assert!(app.modal_is_open());
+                    assert!(cosmic::Application::dialog(&app).is_some());
+                }
+                "chrome" => {
+                    drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNewTab)));
+                    assert!(app.chrome_ui.is_open());
+                }
+                "update" => app.update_prepared = true,
+                _ => unreachable!(),
+            }
+            // Both messages reach the real global refusal, before the
+            // OpenLspFile match arm. Refusing stale B cannot retire newer D.
+            let task = app.update(obsolete);
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert!(Arc::ptr_eq(
+                app.lsp_pending_jumps[&card].queued.as_ref().unwrap(),
+                &request
+            ));
+            let task = app.update(current);
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert!(
+                !app.lsp_pending_jumps.contains_key(&card),
+                "{guard} consumed its own queued open"
+            );
+            let after = lsp_history_runtime(&app, card).current_location().unwrap();
+            assert_eq!(after.path, before.path);
+            assert_eq!(after.cursor, before.cursor);
+            assert_eq!(
+                lsp_history_runtime(&app, card).editor_text().as_deref(),
+                Some(source.as_str())
+            );
+            match guard {
+                "modal" => {
+                    assert!(app.modal_is_open());
+                    assert!(cosmic::Application::dialog(&app).is_some());
+                    assert!(app.settings_reset_confirm);
+                    assert!(!app.settings_reset_focus_confirm);
+                    drop(app.update(Message::CancelResetSettings));
+                }
+                "chrome" => {
+                    assert!(app.chrome_ui.is_open());
+                    drop(app.update(Message::ChromeUi(chrome_ui::Action::Close)));
+                }
+                "update" => {
+                    assert!(app.update_prepared);
+                    app.update_prepared = false;
+                }
+                _ => unreachable!(),
+            }
+            let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+                card,
+                path: "c.rs".into(),
+            }));
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert_current_file_goto_returns_to_its_own_origin(&mut app, card).await;
+            app.lsp.begin_shutdown().await;
+        }
     }
 
     #[tokio::test]
