@@ -13059,7 +13059,10 @@ mod tests {
                 assert_eq!(snapshot.serialization_count(), 0);
             } else {
                 let model = result.as_ref().unwrap().as_ref().unwrap();
-                assert_eq!(model.after.as_ref(), after);
+                let expected = crate::diff_view::build_diff("original\n", after);
+                assert_eq!(model.line_counts, expected.line_counts);
+                assert_eq!(model.inline_rows, expected.inline_rows);
+                assert_eq!(model.split_rows, expected.split_rows);
                 assert_eq!(snapshot.serialization_count(), 1);
                 drop(runtime.update(completion));
                 assert!(runtime.working_annotations_current());
