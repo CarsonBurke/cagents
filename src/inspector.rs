@@ -2022,6 +2022,38 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn modal_keeps_only_foreground_native_bounds_and_action_anchors_in_scroll_coordinates() {
+        use crate::workspace_widget::forwarding_test::{native_button, native_controls, renderer};
+        use cosmic::iced::{Point, Vector};
+        use iced_accessibility::accesskit::Rect;
+
+        let renderer = renderer();
+        let size = Size::new(100.0, 60.0);
+        let mut widget = Element::new(ModalOverlay::new(
+            native_button("Background", size),
+            native_button("Foreground", size),
+        ));
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size))
+            .move_to(Point::new(20.0, 30.0));
+        let offset = Vector::new(4.0, -20.0);
+        assert_eq!(
+            native_controls(&mut widget, &mut tree, &node, offset, &renderer),
+            vec![(
+                "Foreground".to_owned(),
+                Rect::new(16.0, 50.0, 116.0, 110.0),
+                vec![(
+                    "Foreground",
+                    offset,
+                    Rectangle::new(Point::new(20.0, 30.0), size)
+                )],
+            )]
+        );
+    }
+
+    #[test]
     fn modal_forwards_drop_targets_only_from_the_foreground() {
         use crate::workspace_widget::forwarding_test::{leaf, renderer};
         use cosmic::iced::{Point, Vector, advanced::clipboard::DndDestinationRectangles};

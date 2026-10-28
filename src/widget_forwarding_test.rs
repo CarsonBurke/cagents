@@ -137,3 +137,70 @@ pub(crate) fn renderer() -> Renderer {
         ))
         .expect("headless renderer")
 }
+
+pub(crate) type Press = (&'static str, Vector, Rectangle);
+
+pub(crate) fn native_button(label: &'static str, size: Size) -> Element<'static, Press> {
+    cosmic::widget::button::custom(cosmic::widget::text(label))
+        .name(label)
+        .width(size.width)
+        .height(size.height)
+        .padding(0)
+        .on_press_with_rectangle(move |offset, bounds| (label, offset, bounds))
+        .into()
+}
+
+/// Inspect actual advertised controls and dispatch their native Click actions.
+/// This exercises widget routing, not the compositor or accessibility bridge.
+pub(crate) fn native_controls(
+    element: &mut Element<'_, Press>,
+    tree: &mut Tree,
+    node: &layout::Node,
+    offset: Vector,
+    renderer: &Renderer,
+) -> Vec<(String, iced_accessibility::accesskit::Rect, Vec<Press>)> {
+    use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+
+    let layout = Layout::new(node).with_virtual_offset(offset);
+    let nodes = element
+        .as_widget()
+        .a11y_nodes(layout, tree, mouse::Cursor::Unavailable);
+    let targets: Vec<_> = nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .filter(|node| node.node().role() == Role::Button)
+        .map(|node| {
+            (
+                node.node().label().unwrap().to_owned(),
+                node.node().bounds().unwrap(),
+                NodeId::from(node.id().clone()),
+            )
+        })
+        .collect();
+    targets
+        .into_iter()
+        .map(|(label, bounds, target)| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &cosmic::iced::Event::A11y(
+                    cosmic::widget::Id::from(target.0),
+                    ActionRequest {
+                        action: Action::Click,
+                        target_tree: TreeId::ROOT,
+                        target_node: target,
+                        data: None,
+                    },
+                ),
+                layout,
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut cosmic::iced::advanced::Shell::new(&mut messages),
+                &node.bounds(),
+            );
+            (label, bounds, messages)
+        })
+        .collect()
+}

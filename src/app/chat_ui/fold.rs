@@ -438,6 +438,62 @@ mod tests {
     use cosmic::iced::advanced::clipboard::DndDestinationRectangles;
 
     #[test]
+    fn fold_keeps_native_control_bounds_and_action_anchors_in_scroll_coordinates() {
+        use crate::workspace_widget::forwarding_test::{native_button, native_controls};
+        use iced_accessibility::accesskit::Rect;
+
+        let renderer = renderer();
+        let offset = Vector::new(7.0, -35.0);
+        for (height, folded, toggle_y) in [
+            (200.0, true, Some(130.0)),
+            (200.0, false, Some(250.0)),
+            (60.0, true, None),
+        ] {
+            let mut widget = fold(
+                native_button("Content", Size::new(100.0, height)),
+                native_button("Show more", Size::new(100.0, 20.0)),
+                folded,
+                80.0,
+                10.0,
+                |_| Color::BLACK,
+            );
+            let mut tree = Tree::new(&widget);
+            let node = widget
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let mut expected = vec![(
+                "Content".to_owned(),
+                Rect::new(23.0, 75.0, 123.0, f64::from(75.0 + height)),
+                vec![(
+                    "Content",
+                    offset,
+                    Rectangle::new(Point::new(30.0, 40.0), Size::new(100.0, height)),
+                )],
+            )];
+            if let Some(y) = toggle_y {
+                expected.push((
+                    "Show more".to_owned(),
+                    Rect::new(23.0, f64::from(y + 35.0), 123.0, f64::from(y + 55.0)),
+                    vec![(
+                        "Show more",
+                        offset,
+                        Rectangle::new(Point::new(30.0, y), Size::new(100.0, 20.0)),
+                    )],
+                ));
+            }
+            assert_eq!(
+                native_controls(&mut widget, &mut tree, &node, offset, &renderer),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn fold_forwards_virtual_offsets_and_only_visible_drop_targets() {
         let renderer = renderer();
         let offset = Vector::new(7.0, -35.0);
