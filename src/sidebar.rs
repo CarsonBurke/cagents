@@ -11415,26 +11415,44 @@ mod row_interaction {
     }
 
     #[cfg(test)]
-    std::thread_local! {
-        static PAINTED_HEADERS: std::cell::RefCell<Option<Vec<Rectangle>>> = const { std::cell::RefCell::new(None) };
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum HeaderPass {
+        Draw,
+        Drag,
     }
 
     #[cfg(test)]
-    pub(super) fn capture_painted_headers(draw: impl FnOnce()) -> Vec<Rectangle> {
+    std::thread_local! {
+        static HEADER_GEOMETRY: std::cell::RefCell<Option<(HeaderPass, Vec<Rectangle>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture_headers(pass: HeaderPass, collect: impl FnOnce()) -> Vec<Rectangle> {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                PAINTED_HEADERS.with(|headers| {
+                HEADER_GEOMETRY.with(|headers| {
                     headers.replace(None);
                 });
             }
         }
-        PAINTED_HEADERS.with(|headers| {
-            assert!(headers.replace(Some(Vec::new())).is_none());
+        HEADER_GEOMETRY.with(|headers| {
+            assert!(headers.replace(Some((pass, Vec::new()))).is_none());
         });
         let _reset = Reset;
-        draw();
-        PAINTED_HEADERS.with(|headers| headers.take().unwrap())
+        collect();
+        HEADER_GEOMETRY.with(|headers| headers.take().unwrap().1)
+    }
+
+    #[cfg(test)]
+    fn record_header(pass: HeaderPass, layout: Layout<'_>) {
+        HEADER_GEOMETRY.with(|headers| {
+            if let Some((current, headers)) = headers.borrow_mut().as_mut()
+                && *current == pass
+            {
+                headers.push(layout.bounds() - layout.virtual_offset());
+            }
+        });
     }
 
     /// Widget-operation context is scoped to members of this actual group.
@@ -12365,14 +12383,9 @@ mod row_interaction {
                                 cosmic::iced::Color::from(theme.cosmic().primary(false).base),
                             );
                         }
+                        // Witness the actual header draw under the scrollable's translation.
                         #[cfg(test)]
-                        PAINTED_HEADERS.with(|headers| {
-                            if let Some(headers) = headers.borrow_mut().as_mut() {
-                                // This is the actual header draw layout under
-                                // the scrollable renderer's translation.
-                                headers.push(header.bounds() - header.virtual_offset());
-                            }
-                        });
+                        record_header(HeaderPass::Draw, header);
                         self.children[0].as_widget().draw(
                             &tree.children[0],
                             renderer,
@@ -12565,6 +12578,13 @@ mod row_interaction {
             self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
                 viewport.0.set(viewport.content_top(layout));
+            }
+            #[cfg(test)]
+            if matches!(self.kind, Kind::Group { .. })
+                && let Some(header) =
+                    child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout).next()
+            {
+                record_header(HeaderPass::Drag, header);
             }
             for ((child, tree), layout) in self.children.iter().zip(&tree.children).zip(
                 child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout),
@@ -16468,14 +16488,15 @@ pub(crate) mod tests {
             assert_eq!(after.row_insets[&target], raw_header.height);
             // Accessibility and operation were checked before any paint. Now
             // observe the real Group header draw, independent of either report.
-            let painted = row_interaction::capture_painted_headers(|| {
-                ui.draw(
-                    &mut renderer,
-                    &Theme::default(),
-                    &cosmic::iced::advanced::renderer::Style::default(),
-                    cosmic::iced::mouse::Cursor::Unavailable,
-                );
-            });
+            let painted =
+                row_interaction::capture_headers(row_interaction::HeaderPass::Draw, || {
+                    ui.draw(
+                        &mut renderer,
+                        &Theme::default(),
+                        &cosmic::iced::advanced::renderer::Style::default(),
+                        cosmic::iced::mouse::Cursor::Unavailable,
+                    );
+                });
             assert!(
                 painted
                     .iter()
@@ -16483,7 +16504,17 @@ pub(crate) mod tests {
                         && (f64::from(paint.height) - (header.y1 - header.y0)).abs() < 0.01),
                 "actual painted header must match accessibility: {painted:?} {header:?}"
             );
-            let _destinations = ui.dnd_rectangles(0, &renderer);
+            let dragged =
+                row_interaction::capture_headers(row_interaction::HeaderPass::Drag, || {
+                    drop(ui.dnd_rectangles(0, &renderer));
+                });
+            assert!(
+                dragged
+                    .iter()
+                    .any(|drag| (f64::from(drag.y) - header.y0).abs() < 0.01
+                        && (f64::from(drag.height) - (header.y1 - header.y0)).abs() < 0.01),
+                "actual drag-destination header must retain the viewport before AX refresh: {dragged:?} {header:?}"
+            );
             let after_drag = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
             let drag_header = after_drag
                 .root()
