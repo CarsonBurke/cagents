@@ -41,6 +41,9 @@ pub enum Action {
     Page {
         key: Key,
         after: Option<uuid::Uuid>,
+        // Capture the position with the rendered cursor. A delayed action may
+        // outlive the page which established this rank in the same snapshot.
+        start: Option<u64>,
     },
     Open {
         key: Key,
@@ -404,7 +407,7 @@ impl Cagents {
                 self.automation_approval.global.expanded = !self.automation_approval.global.expanded
             }
             Action::Refresh => self.automation_approval.global.dirty = true,
-            Action::Page { key, after } => {
+            Action::Page { key, after, start } => {
                 if self.update_prepared || self.modal_is_open() {
                     return Task::none();
                 }
@@ -412,13 +415,6 @@ impl Cagents {
                 if state.key != Some(key) || key.identity != self.workspace_model.identity {
                     return Task::none();
                 }
-                let start = if after.is_none() {
-                    Some(0)
-                } else if after == state.pending.last().map(|row| row.id) {
-                    state.page_end
-                } else {
-                    None
-                };
                 state.wanted = Some(Read::Page { key, after, start });
             }
             Action::Open { key, id, revision } => {
@@ -814,19 +810,28 @@ impl Cagents {
                 && state.page_end.is_none_or(|end| end < total);
             let controls: Element<'_, Message> = widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("First requests")
-                    .on_press_maybe(
-                        state
-                            .key
-                            .filter(|_| !busy && !self.modal_is_open())
-                            .map(|key| message(Action::Page { key, after: None })),
-                    )
+                    .on_press_maybe(state.key.filter(|_| !busy && !self.modal_is_open()).map(
+                        |key| {
+                            message(Action::Page {
+                                key,
+                                after: None,
+                                start: Some(0),
+                            })
+                        },
+                    ))
                     .into(),
                 crate::ui_controls::button::secondary("Next requests")
                     .on_press_maybe(
                         state
                             .key
                             .filter(|_| !busy && can_next && !self.modal_is_open())
-                            .map(|key| message(Action::Page { key, after: next })),
+                            .map(|key| {
+                                message(Action::Page {
+                                    key,
+                                    after: next,
+                                    start: state.page_end,
+                                })
+                            }),
                     )
                     .into(),
             ])

@@ -455,7 +455,14 @@ fn foreign_page_identity_clock_or_cursor_preserves_rows_and_schedules_one_refres
         let a = proposal(1);
         let key = install(&mut app, &[a.clone()]);
         let after = Some(a.id);
-        drop(global(&mut app, Action::Page { key, after }));
+        drop(global(
+            &mut app,
+            Action::Page {
+                key,
+                after,
+                start: None,
+            },
+        ));
         let held = flight(&app);
         assert!(matches!(held.2, Read::Page { after: observed, .. } if observed == after));
         let b = proposal(2);
@@ -668,7 +675,14 @@ fn same_clock_recovery_clears_transport_error_without_resetting_the_later_page()
     let key = app.automation_approval.global.key.unwrap();
     let after = first.last().map(|row| row.id);
     drop(global(&mut app, Action::Toggle));
-    drop(global(&mut app, Action::Page { key, after }));
+    drop(global(
+        &mut app,
+        Action::Page {
+            key,
+            after,
+            start: Some(PROPOSAL_PAGE_SIZE as u64),
+        },
+    ));
     let page_read = flight(&app);
     drop(complete(
         &mut app,
@@ -1440,6 +1454,32 @@ fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
         }
         (enabled, messages)
     }
+    fn complete_page(app: &mut Cagents, rows: &[Proposal]) {
+        let held = flight(app);
+        let Read::Page { key, after, .. } = held.2.clone() else {
+            panic!("actual page read")
+        };
+        drop(complete(
+            app,
+            held,
+            Ok(Response::ProposalPage(ProposalPage {
+                identity: key.identity,
+                automation_proposal_sequence: key.sequence,
+                after,
+                proposals: rows.iter().map(ProposalSummary::from).collect(),
+            })),
+        ));
+    }
+    fn next_page(app: &mut Cagents, rows: &[Proposal]) {
+        let (enabled, messages) = click(app, "Next requests");
+        assert!(enabled, "the selected next page is reachable");
+        assert_eq!(messages.len(), 1);
+        for message in messages {
+            drop(app.update(message));
+        }
+        complete_page(app, rows);
+    }
+    let mut failures = Vec::new();
     for total in [PROPOSAL_PAGE_SIZE * 2, PROPOSAL_PAGE_SIZE * 2 + 1] {
         let mut app = app();
         let rows: Vec<_> = (1..=total).map(|number| proposal(number as u128)).collect();
@@ -1459,6 +1499,11 @@ fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
         let (enabled, messages) = click(&app, "Next requests");
         assert!(enabled);
         assert_eq!(messages.len(), 1);
+        // Both actions come from the first rendered page. The second can be
+        // delivered after the first read has already installed its result.
+        let (enabled, delayed_next) = click(&app, "Next requests");
+        assert!(enabled);
+        assert_eq!(delayed_next.len(), 1);
         for message in messages {
             drop(app.update(message));
         }
@@ -1477,13 +1522,20 @@ fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
                 proposals: last_full.iter().map(ProposalSummary::from).collect(),
             })),
         ));
+        assert_eq!(
+            click(&app, "Next requests").0,
+            total > PROPOSAL_PAGE_SIZE * 2,
+            "the ordinary final-page boundary is correct before the replay"
+        );
+        for message in delayed_next {
+            drop(app.update(message));
+        }
+        complete_page(&mut app, last_full);
         let (enabled, messages) = click(&app, "Next requests");
         if total == PROPOSAL_PAGE_SIZE * 2 {
-            assert!(!enabled, "the final full page has no next request");
-            assert!(
-                messages.is_empty(),
-                "disabled Next cannot open an empty page"
-            );
+            if enabled || !messages.is_empty() {
+                failures.push("a delayed current-page Next must not expose an empty page");
+            }
         } else {
             assert!(enabled, "the final partial page remains reachable");
             assert_eq!(messages.len(), 1);
@@ -1521,8 +1573,9 @@ fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
             )),
         ));
         let (enabled, messages) = click(&app, "Next requests");
-        assert!(!enabled, "same snapshot preserves the final page");
-        assert!(messages.is_empty());
+        if enabled || !messages.is_empty() {
+            failures.push("same-snapshot Refresh must preserve the final-page boundary");
+        }
         let (enabled, messages) = click(&app, "First requests");
         assert!(enabled);
         assert_eq!(messages.len(), 1);
@@ -1552,4 +1605,51 @@ fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
             "First restores forward navigation"
         );
     }
+
+    // Replaying a cursor from an older page must also retain its proven rank.
+    // Recovering only the current page's start would miss this four-page case.
+    let mut app = app();
+    let rows: Vec<_> = (1..=PROPOSAL_PAGE_SIZE * 4)
+        .map(|number| proposal(number as u128))
+        .collect();
+    let identity = app.workspace_model.identity;
+    let held = flight(&app);
+    drop(complete(
+        &mut app,
+        held,
+        Ok(delivery(
+            identity,
+            9,
+            rows.len() as u64,
+            &rows[..PROPOSAL_PAGE_SIZE],
+        )),
+    ));
+    drop(global(&mut app, Action::Toggle));
+    let (enabled, delayed_next) = click(&app, "Next requests");
+    assert!(enabled);
+    assert_eq!(delayed_next.len(), 1);
+    for page in 1..4 {
+        next_page(
+            &mut app,
+            &rows[PROPOSAL_PAGE_SIZE * page..PROPOSAL_PAGE_SIZE * (page + 1)],
+        );
+    }
+    let (enabled, messages) = click(&app, "Next requests");
+    assert!(!enabled, "the ordinary four-page boundary is correct");
+    assert!(messages.is_empty());
+    for message in delayed_next {
+        drop(app.update(message));
+    }
+    complete_page(&mut app, &rows[PROPOSAL_PAGE_SIZE..PROPOSAL_PAGE_SIZE * 2]);
+    for page in 2..4 {
+        next_page(
+            &mut app,
+            &rows[PROPOSAL_PAGE_SIZE * page..PROPOSAL_PAGE_SIZE * (page + 1)],
+        );
+    }
+    let (enabled, messages) = click(&app, "Next requests");
+    if enabled || !messages.is_empty() {
+        failures.push("a delayed older-page Next must not expose an empty page");
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
