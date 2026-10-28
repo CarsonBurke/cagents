@@ -675,6 +675,18 @@ mod tests {
         index: usize,
         event: iced::mouse::Event,
     ) -> Vec<Message> {
+        control_pointer_at(view, tree, renderer, label, index, event, None).0
+    }
+
+    fn control_pointer_at(
+        view: &mut Element<'_, Message>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        label: &str,
+        index: usize,
+        event: iced::mouse::Event,
+        original_point: Option<iced::Point>,
+    ) -> (Vec<Message>, iced::Point) {
         use iced::advanced::{Layout, Shell, layout, mouse};
         let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0));
         let node = view.as_widget_mut().layout(
@@ -702,6 +714,13 @@ mod tests {
             viewport.contains(point),
             "the control must be in the viewport"
         );
+        let point = original_point.map_or(point, |original| {
+            assert_eq!(
+                point, original,
+                "the replacement occupies the original press coordinate"
+            );
+            original
+        });
         let mut messages = Vec::new();
         view.as_widget_mut().update(
             tree,
@@ -713,7 +732,7 @@ mod tests {
             &mut Shell::new(&mut messages),
             &viewport,
         );
-        messages
+        (messages, point)
     }
 
     fn check_history_press_ownership(
@@ -753,10 +772,16 @@ mod tests {
         assert!(app.checkout_history_open);
         let mut before = app.checkout_view().unwrap();
         let mut tree = Tree::new(before.as_widget());
-        assert!(
-            control_pointer(&mut before, &mut tree, &renderer, "Open worktree", 0, press)
-                .is_empty()
+        let (messages, original_point) = control_pointer_at(
+            &mut before,
+            &mut tree,
+            &renderer,
+            "Open worktree",
+            0,
+            press,
+            None,
         );
+        assert!(messages.is_empty());
         drop(before);
         app.checkout_history[0].created_at_unix_ms = 0;
         app.trim_checkout_history();
@@ -764,14 +789,16 @@ mod tests {
         let mut after = app.checkout_view().unwrap();
         tree.diff(after.as_widget_mut());
         assert!(
-            control_pointer(
+            control_pointer_at(
                 &mut after,
                 &mut tree,
                 &renderer,
                 "Open worktree",
                 0,
-                release
+                release,
+                Some(original_point),
             )
+            .0
             .is_empty(),
             "an A press cannot become B's Open action after a retained-tree rebuild"
         );
