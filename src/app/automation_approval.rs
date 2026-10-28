@@ -548,14 +548,19 @@ impl Cagents {
             .spacing(space::S),
         );
         let surface = widget::column::with_children(vec![
-            widget::scrollable(content)
-                .height(Length::Fixed(440.0))
-                .into(),
+            widget::scrollable(content).height(Length::Fill).into(),
             controls,
         ])
-        .spacing(space::M);
+        .spacing(space::M)
+        .height(Length::Fill);
+        // Reserve the decision row before assigning the remaining height to
+        // the request. Cap the surface before flex allocation to retain the
+        // ordinary 440-pixel body without squeezing controls on scaled views.
         let overlay = dialog_ui::overlay(
-            dialog_ui::surface(surface, 680.0),
+            widget::container(dialog_ui::surface(surface, 680.0))
+                .max_width(680.0)
+                .max_height(440.0 + space::M + design::DENSE_ROW_HEIGHT + 2.0 * space::L)
+                .into(),
             (!state.deciding).then_some(dismiss),
             1.0,
         );
