@@ -1061,7 +1061,7 @@ mod presentation_tests {
 
         let renderer = crate::app::tests::headless_renderer();
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 500.0));
-        for (directory, path, display, absolute) in [
+        for ((directory, path, display, absolute), (status, suffix)) in [
             (
                 "/repo/subdir",
                 "file.rs",
@@ -1082,7 +1082,20 @@ mod presentation_tests {
             ),
             ("", "file.rs", "file.rs", "/repo/file.rs"),
             ("/outside", "/repo/src.rs", "src.rs", "/repo/src.rs"),
-        ] {
+            ("/repo/subdir", "a", "subdir/a", "/repo/subdir/a"),
+            ("/repo/subdir", "Read", "subdir/Read", "/repo/subdir/Read"),
+            ("/repo/subdir", "d", "subdir/d", "/repo/subdir/d"),
+        ]
+        .into_iter()
+        .flat_map(|case| {
+            [
+                (ToolStatus::Succeeded, ""),
+                (ToolStatus::Running, " · working"),
+                (ToolStatus::AwaitingApproval, " · Awaiting approval"),
+            ]
+            .into_iter()
+            .map(move |state| (case, state))
+        }) {
             let item = chat::Item {
                 id: "read".into(),
                 role: chat::Role::Assistant,
@@ -1090,10 +1103,10 @@ mod presentation_tests {
                 at: None,
                 content: ItemContent::Command {
                     label: path.into(),
-                    command: format!("cat {path}"),
+                    command: path.into(),
                     working_directory: directory.into(),
                     action: chat::CommandAction::Read,
-                    status: ToolStatus::Succeeded,
+                    status,
                     exit_code: Some(0),
                     duration_ms: None,
                     output: String::new(),
@@ -1186,13 +1199,14 @@ mod presentation_tests {
                 &tree,
                 iced::mouse::Cursor::Unavailable,
             );
+            let summary = format!("{name}{suffix}");
             assert!(
                 nodes
                     .root()
                     .iter()
                     .chain(nodes.children())
-                    .any(|node| node.node().label() == Some(name.as_str())),
-                "the single-step group and row name the same file"
+                    .any(|node| node.node().label() == Some(summary.as_str())),
+                "the single-step group names the same file and retains its status"
             );
         }
     }
