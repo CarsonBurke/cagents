@@ -1,5 +1,5 @@
 use super::*;
-use crate::work_ui::{Action, Effect, Watch};
+use crate::work_ui::{Action, Effect, Watch, WatchOwner};
 use cosmic::iced::futures::SinkExt;
 
 /// How often relative times on the board are redrawn.
@@ -17,7 +17,8 @@ impl Cagents {
         if !open {
             return Subscription::none();
         }
-        let watch = Subscription::run(watch_board).map(Message::WorkUi);
+        let watch =
+            Subscription::run_with(self.work_ui.watch_owner(), watch_board).map(Message::WorkUi);
         if self.refresh_ui.focused {
             Subscription::batch([
                 watch,
@@ -33,17 +34,18 @@ impl Cagents {
             return Task::none();
         };
         match effect {
-            Effect::Refresh => control(
+            Effect::Refresh { ticket } => control(
                 |client| client.refresh_work_board(),
-                |result| Action::Refreshed(result),
+                move |result| Action::Refreshed { ticket, result },
             ),
             Effect::Pin {
+                ticket,
                 project,
                 item,
                 column,
             } => control(
                 move |client| client.pin_work_card(project, item, column),
-                |result| Action::Pinned(result),
+                move |result| Action::Pinned { ticket, result },
             ),
             Effect::OpenWorktree { project, path } => {
                 let opened = self
@@ -134,8 +136,9 @@ fn control(
 /// Dropping the stream, which iced does when the last Work pane closes, hangs
 /// up the connection: the thread's blocking read then fails, it finds no one
 /// listening, and the daemon forgets the watcher.
-fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
-    cosmic::iced::stream::channel(4, async |mut output| {
+fn watch_board(owner: &WatchOwner) -> impl cosmic::iced::futures::Stream<Item = Action> + use<> {
+    let owner = *owner;
+    cosmic::iced::stream::channel(4, async move |mut output| {
         let (sender, receiver) = async_channel::bounded(1);
         let hangup = Arc::new(Mutex::new(None));
         let held = hangup.clone();
@@ -160,15 +163,16 @@ fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
             });
         if let Err(error) = spawned {
             let _ = output
-                .send(Action::Watched(Watch::Lost(format!(
-                    "the board could not be watched: {error}"
-                ))))
+                .send(Action::Watched {
+                    owner,
+                    watch: Watch::Lost(format!("the board could not be watched: {error}")),
+                })
                 .await;
             return;
         }
         let _hangup = HangUpOnDrop(hangup);
         while let Ok(watch) = receiver.recv().await {
-            if output.send(Action::Watched(watch)).await.is_err() {
+            if output.send(Action::Watched { owner, watch }).await.is_err() {
                 break;
             }
         }
@@ -220,5 +224,56 @@ impl Drop for HangUpOnDrop {
         if let Some(hangup) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             hangup.hang_up();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::Hasher;
+
+    fn watch_recipes(app: &Cagents) -> Vec<u64> {
+        iced::advanced::subscription::into_recipes(app.work_subscription())
+            .into_iter()
+            .map(|recipe| {
+                let mut hash = iced::advanced::subscription::Hasher::default();
+                recipe.hash(&mut hash);
+                hash.finish()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn work_watch_subscription_retires_with_the_closed_pane_before_reopen() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.refresh_ui.focused = false;
+        assert!(watch_recipes(&app).is_empty());
+        drop(app.open_utility_card(CardKind::Work));
+        let work = app.workspace.focused().unwrap();
+        let owner = app.work_ui.watch_owner();
+        let before = watch_recipes(&app);
+        assert_eq!(before.len(), 1, "inspect exactly the Work watch recipe");
+        assert_eq!(before, watch_recipes(&app), "redraw retains its producer");
+        drop(app.update_work_ui(Action::Query("retained query".into())));
+        drop(app.update_work_ui(Action::Watched {
+            owner,
+            watch: Watch::Lost("current connection lost".into()),
+        }));
+        assert_eq!(before, watch_recipes(&app), "reconnect stays in this pane");
+
+        // No subscription tracking occurs between these real close/reopen
+        // transitions, as when Iced drains both from one message batch.
+        app.workspace.request_close(work).unwrap();
+        drop(app.commit_card_removal(work, None).unwrap());
+        assert!(watch_recipes(&app).is_empty());
+        drop(app.open_utility_card(CardKind::Work));
+        let after = watch_recipes(&app);
+        assert_eq!(after.len(), 1);
+        assert_ne!(owner, app.work_ui.watch_owner());
+        assert_ne!(
+            before, after,
+            "the prior producer must be cancelled even when no empty recipe was tracked"
+        );
+        assert_eq!(after, watch_recipes(&app));
     }
 }
