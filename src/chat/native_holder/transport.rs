@@ -22,7 +22,7 @@ use std::{
             process::CommandExt,
         },
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -603,14 +603,21 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
 
 fn connect(record: &Record) -> Result<UnixStream, String> {
     let directory = registry::directory(Kind::Native)?;
-    let socket = registry::socket(&directory, record.terminal);
+    connect_at(record, &directory, registry::connect)
+}
+
+fn connect_at(
+    record: &Record,
+    directory: &Path,
+    connector: impl FnOnce(&Path) -> io::Result<UnixStream>,
+) -> Result<UnixStream, String> {
+    let socket = registry::socket(directory, record.terminal);
     if registry::recovery_candidate(&socket, Kind::Native)?.as_ref() != Some(record)
         || !record.holder.is_current()
     {
         return Err("Native holder discovery evidence changed".into());
     }
-    let control =
-        crate::daemon::holder_registry::connect(&socket).map_err(|error| error.to_string())?;
+    let control = connector(&socket).map_err(|error| error.to_string())?;
     let credentials = peer(&control)?;
     if credentials.uid != crate::daemon::current_uid()
         || credentials.pid != record.holder.pid
@@ -626,6 +633,59 @@ pub(crate) fn inspect(
     proof: &HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
     inspect_with_directory_pin(record, proof).map(|(recovery, exited, _)| (recovery, exited))
+}
+
+/// Read-only inspection shares one absolute budget across connect and framing.
+pub(crate) fn inspect_until(
+    record: &Record,
+    proof: &HostSessionProof,
+    deadline: Instant,
+) -> Result<(Recovery, bool), String> {
+    let directory = registry::directory(Kind::Native)?;
+    inspect_at_until(&directory, record, proof, deadline)
+}
+
+fn inspect_at_until(
+    directory: &Path,
+    record: &Record,
+    proof: &HostSessionProof,
+    deadline: Instant,
+) -> Result<(Recovery, bool), String> {
+    let control = connect_at(record, directory, |socket| {
+        registry::connect_until(socket, deadline)
+    })?;
+    crate::descriptor_frame::send_json_with_fds_until(
+        &control,
+        &Request::Inspect {
+            proof: proof.clone(),
+        },
+        &[],
+        deadline,
+        MAX_FRAME,
+        0,
+        crate::descriptor_frame::FrameByteOrder::BigEndian,
+    )?;
+    let (report, _) = crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+        &control,
+        deadline,
+        MAX_FRAME,
+        0,
+        crate::descriptor_frame::FrameByteOrder::BigEndian,
+    )?;
+    match report {
+        Report::Inspected {
+            protocol,
+            record: actual,
+            recovery,
+            exited,
+            ..
+        } if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
+            recovery.validate_original_role(&record.boot, &record.application)?;
+            Ok((recovery, exited))
+        }
+        Report::Failed(error) => Err(error),
+        _ => Err("Native holder did not return its exact discovery evidence".into()),
+    }
 }
 
 fn inspect_with_directory_pin(
@@ -1450,6 +1510,92 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspection_deadline_covers_expired_connect_stalled_and_partial_responses() {
+        for partial in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let process = Process::read(std::process::id() as i32).unwrap();
+            let record = Record {
+                version: 4,
+                build: None,
+                kind: Kind::Native,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: crate::daemon::read_boot_id().unwrap(),
+                terminal: crate::model::TerminalId::new(),
+                holder: process.clone(),
+                root: process,
+            };
+            record.create(directory.path()).unwrap();
+            let evidence = directory.path().join(format!("{}.json", record.terminal));
+            let original = std::fs::read(&evidence).unwrap();
+            let socket = registry::socket(directory.path(), record.terminal);
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+            let proof = HostSessionProof {
+                host_session_id: "private-inspection".into(),
+                boot_id: record.boot.clone(),
+                host_incarnation: "private-incarnation".into(),
+            };
+            assert!(
+                inspect_at_until(directory.path(), &record, &proof, Instant::now())
+                    .err()
+                    .unwrap()
+                    .contains("deadline")
+            );
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            let (release, wait) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let peer = scope.spawn(move || {
+                    let until = Instant::now() + Duration::from_secs(1);
+                    let mut control = loop {
+                        match listener.accept() {
+                            Ok((control, _)) => break control,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < until, "inspection never connected");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("private listener: {error}"),
+                        }
+                    };
+                    assert!(matches!(
+                        receive::<Request>(&control, Duration::from_secs(1)).unwrap(),
+                        Some(Request::Inspect { .. })
+                    ));
+                    if partial {
+                        control.write_all(&1024u32.to_be_bytes()).unwrap();
+                    }
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < until {
+                        if wait.recv_timeout(Duration::from_millis(5)).is_ok() {
+                            break;
+                        }
+                        if partial && control.write_all(b" ").is_err() {
+                            break;
+                        }
+                    }
+                });
+                let started = Instant::now();
+                let result = inspect_at_until(
+                    directory.path(),
+                    &record,
+                    &proof,
+                    started + Duration::from_millis(40),
+                );
+                let elapsed = started.elapsed();
+                let _ = release.send(());
+                peer.join().unwrap();
+                assert!(result.err().unwrap().contains("deadline"));
+                assert!(elapsed < Duration::from_millis(500));
+            });
+            assert!(record.holder.is_current());
+            assert_eq!(std::fs::read(&evidence).unwrap(), original);
+            assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+        }
+    }
+
     #[test]
     fn legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role() {
         let source = super::super::tests::recovery().source;

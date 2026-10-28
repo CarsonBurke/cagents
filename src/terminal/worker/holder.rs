@@ -1850,6 +1850,55 @@ pub(crate) fn inspect(
     Ok((recovery, screen_lost))
 }
 
+/// Read-only inspection shares one absolute budget across connect and framing.
+pub(crate) fn inspect_until(
+    socket: &Path,
+    expected: &Record,
+    proof: &crate::model::HostSessionProof,
+    deadline: Instant,
+) -> Result<(Recovery, bool), String> {
+    let control = crate::daemon::holder_registry::connect_until(socket, deadline)
+        .map_err(|error| error.to_string())?;
+    let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
+    if peer.uid != crate::daemon::current_uid()
+        || peer.pid != expected.holder.pid
+        || !expected.holder.is_current()
+    {
+        return Err("holder socket does not belong to the recorded process".into());
+    }
+    crate::descriptor_frame::send_json_with_fds_until(
+        &control,
+        &Request::Inspect {
+            proof: proof.clone(),
+        },
+        &[],
+        deadline,
+        MAX_FRAME as usize,
+        0,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )?;
+    let (report, _) = crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+        &control,
+        deadline,
+        MAX_FRAME as usize,
+        0,
+        crate::descriptor_frame::FrameByteOrder::LittleEndian,
+    )?;
+    let Report::Inspected {
+        record,
+        recovery,
+        screen_lost,
+    } = report
+    else {
+        return Err("holder did not return discovery evidence".into());
+    };
+    if record != *expected {
+        return Err("holder discovery evidence changed".into());
+    }
+    recovery.validate(&record.boot, record.terminal)?;
+    Ok((recovery, screen_lost))
+}
+
 fn authorize_successor(pid: i32, proof: &crate::model::HostSessionProof) -> io::Result<()> {
     let paths = crate::daemon::RuntimePaths::discover().map_err(io::Error::other)?;
     let owner = crate::daemon::lease_owner(&paths.lock, proof).map_err(io::Error::other)?;
@@ -2015,6 +2064,98 @@ fn receive_with_descriptors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_deadline_covers_expired_connect_stalled_and_partial_responses() {
+        use std::io::Write;
+
+        for partial in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let process =
+                crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
+            let record = Record {
+                version: PROTOCOL,
+                build: None,
+                kind: crate::daemon::holder_registry::Kind::Terminal,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: crate::daemon::read_boot_id().unwrap(),
+                terminal: crate::model::TerminalId::new(),
+                holder: process.clone(),
+                root: process,
+            };
+            record.create(directory.path()).unwrap();
+            let evidence = directory.path().join(format!("{}.json", record.terminal));
+            let original = std::fs::read(&evidence).unwrap();
+            let socket = directory.path().join(record.terminal.to_string());
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "private-inspection".into(),
+                boot_id: record.boot.clone(),
+                host_incarnation: "private-incarnation".into(),
+            };
+            assert!(
+                inspect_until(&socket, &record, &proof, Instant::now())
+                    .err()
+                    .unwrap()
+                    .contains("deadline")
+            );
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            let (release, wait) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let peer = scope.spawn(move || {
+                    let until = Instant::now() + Duration::from_secs(1);
+                    let mut control = loop {
+                        match listener.accept() {
+                            Ok((control, _)) => break control,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < until, "inspection never connected");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("private listener: {error}"),
+                        }
+                    };
+                    control
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    assert!(matches!(
+                        receive::<Request>(&control).unwrap(),
+                        Some((Request::Inspect { .. }, descriptors)) if descriptors.is_empty()
+                    ));
+                    if partial {
+                        control.write_all(&1024u32.to_le_bytes()).unwrap();
+                    }
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < until {
+                        if wait.recv_timeout(Duration::from_millis(5)).is_ok() {
+                            break;
+                        }
+                        if partial && control.write_all(b" ").is_err() {
+                            break;
+                        }
+                    }
+                });
+                let started = Instant::now();
+                let result = inspect_until(
+                    &socket,
+                    &record,
+                    &proof,
+                    started + Duration::from_millis(40),
+                );
+                let elapsed = started.elapsed();
+                let _ = release.send(());
+                peer.join().unwrap();
+                assert!(result.err().unwrap().contains("deadline"));
+                assert!(elapsed < Duration::from_millis(500));
+            });
+            assert!(record.holder.is_current());
+            assert_eq!(std::fs::read(&evidence).unwrap(), original);
+            assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+        }
+    }
 
     #[test]
     fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
