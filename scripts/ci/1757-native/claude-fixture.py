@@ -9,6 +9,7 @@ is one text-only FIRST_SEND_1757 and one UNSENT_SAVE_RECOVERY_1757_FOCUS_RETURNE
 with exactly one image. Each is accepted once, in its own SDK process, with at
 most two SDK starts. A failed first save must consume no provider start.
 """
+import base64
 import hashlib
 import json
 import os
@@ -160,8 +161,30 @@ for line in sys.stdin:
         assert body == command["token"], "undeclared text is outside the synthetic prompt budget"
         assert not accepted_in_process, "each SDK process accepts only one declared command"
         assert start_slot == command["slot"], "SDK start does not match the declared command order"
-        images = sum(item.get("type") == "image" for item in content if isinstance(item, dict))
+        image_blocks = [item for item in content if isinstance(item, dict) and item.get("type") == "image"]
+        images = len(image_blocks)
         assert images == command["images"], "the declared synthetic image count changed"
+        image_sha256 = None
+        if name == "recovery":
+            source = image_blocks[0].get("source")
+            assert isinstance(source, dict) and source.get("type") == "base64"
+            assert source.get("media_type") == "image/png", "recovery must preserve the synthetic PNG"
+            data = source.get("data")
+            maximum_bytes = 64 * 1024
+            maximum_encoded = 4 * ((maximum_bytes + 2) // 3)
+            assert isinstance(data, str) and 0 < len(data) <= maximum_encoded
+            decoded = base64.b64decode(data.encode("ascii"), validate=True)
+            assert 0 < len(decoded) <= maximum_bytes
+            expected_path = root / "synthetic-image.png"
+            assert expected_path.resolve(strict=True) == expected_path
+            with os.fdopen(os.open(expected_path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as expected:
+                info = os.fstat(expected.fileno())
+                assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                assert 0 < info.st_size <= maximum_bytes
+                expected_bytes = expected.read(maximum_bytes + 1)
+            assert 0 < len(expected_bytes) <= maximum_bytes and expected_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            image_sha256 = hashlib.sha256(decoded).hexdigest()
+            assert image_sha256 == hashlib.sha256(expected_bytes).hexdigest(), "recovery image bytes changed"
         count = root / command["receipt"]
         with count.open("x") as output:
             output.write(json.dumps({
@@ -170,6 +193,7 @@ for line in sys.stdin:
                 "command": frame["uuid"],
                 "message_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
                 "images": images,
+                "image_sha256": image_sha256,
             }))
         accepted_in_process = True
         received = frame["uuid"]

@@ -361,13 +361,24 @@ def main():
         capture('first-send-completed')
         key('ctrl+t')
         wait(lambda: entry('second-draft').get('text') == '', 'second native draft')
+        click('Choose a model', 'recovery-model-open')
+        click('Claude default model', 'recovery-model-claude')
+        click('Message', 'recovery-compose-before-failure')
         # Copy an actual synthetic PNG onto this X server's image clipboard.
         from PIL import Image
         image = root / 'synthetic-image.png'
         Image.new('RGB', (64, 64), (24, 160, 96)).save(image)
-        clipboard = spawn(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-i', image, '-loops', '1', '-quiet'], 'image-clipboard')
+        # Keep the foreground owner through the completed image insertion,
+        # independent of version-specific TARGETS/request loop accounting.
+        clipboard = spawn(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-i', image, '-loops', '0', '-quiet'], 'image-clipboard')
+        wait(lambda: 'Waiting for selection requests' in (logs / 'image-clipboard.log').read_text(), 'owned image selection ready')
         key('ctrl+v')
         wait(lambda: '[Image 1]' in entry('image-inserted').get('text', ''), 'normal image paste and inline reference')
+        clipboard_fd = next(fd for child, fd, name in children if child is clipboard)
+        if clipboard.poll() is None:
+            signal.pidfd_send_signal(clipboard_fd, signal.SIGTERM)
+        clipboard.wait(timeout=5)
+        event('owned-image-selection-released-after-paste', png_sha256=digest(image), exit=clipboard.returncode)
         type_text('UNSENT_SAVE_RECOVERY_1757')
         draft_before = entry('draft-before-failure')['text']
         assert '[Image 1]' in draft_before and 'UNSENT_SAVE_RECOVERY_1757' in draft_before
@@ -431,7 +442,7 @@ def main():
         key('Return')  # Explicit same-draft retry, after real transaction release.
         accepted = wait(lambda: (root / 'accepted-recovery.json').exists(), 'recovered SDK acceptance')
         receipt = json.loads((root / 'accepted-recovery.json').read_text())
-        assert receipt['images'] == 1 and len(starts()) == 2
+        assert receipt['images'] == 1 and receipt['image_sha256'] == digest(image) and len(starts()) == 2
         assert receipt['session'] != json.loads((root / 'accepted-first-send.json').read_text())['session']
         capture('retry-accepted')
         identities('retry-accepted-before-late-id')

@@ -89,7 +89,7 @@ or fabricated actor/proof. Its entire accepted turn budget is:
 1. One text-only `FIRST_SEND_1757`, one SDK start, ordinary acceptance before
    delayed native identity, then completion after an explicit first gate.
 2. One `UNSENT_SAVE_RECOVERY_1757_FOCUS_RETURNED` with one synthetic64px PNG and
-   its preserved inline image reference, in the second SDK start. It has its own
+   its preserved inline image reference and exact PNG-byte hash, in the second SDK start. It has its own
    late-identity gate and exclusive accepted receipt.
 
 Every non-probe invocation is counted before resume/session/order rejection.
@@ -100,7 +100,7 @@ refused as unavailable and excluded from turn starts; extra flags do not match.
 No commercial provider, login or LLM model is invoked. Existing normal SDK
 initialize/user/acceptance/native-ID/result/history behavior is retained.
 
-The second draft receives its PNG through normal X11 clipboard Ctrl+V; its inline
+The second draft receives its PNG through normal X11 clipboard Ctrl+V. Its owned foreground selection survives TARGETS negotiation, then is stopped through its own pidfd after the actual image insertion. The fixture verifies the exact decoded PNG hash, not only the image count. Its inline
 reference is kept while typing. A helper validates a fresh0700 root/0600 nonce
 marker and the actual app-created canonical Store path/owner/device/inode. It
 opens existing mode=rw and issues only `BEGIN IMMEDIATE`, then `ROLLBACK`, capped
