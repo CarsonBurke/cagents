@@ -467,9 +467,9 @@ impl Cagents {
             settings: AppSettings::default(),
             settings_path: None,
             settings_write_blocked: true,
-            status: Some(
-                "Offline native UI fixture; daemon and provider actions are unavailable".into(),
-            ),
+            status: std::env::var_os(crate::latency_fixture::INTERACTIVE_ENV).map(|_| {
+                "Offline native UI fixture; daemon and provider actions are unavailable".into()
+            }),
             save_health: None,
             restore_warnings: Vec::new(),
             settings_warnings: Vec::new(),

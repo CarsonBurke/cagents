@@ -39,18 +39,21 @@ pub(crate) fn main() -> std::process::ExitCode {
 pub(crate) fn main_with_before_start(
     before_start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> std::process::ExitCode {
-    // SAFETY: first statement of main, before any thread exists.
-    unsafe { cagents::account::detach_inherited_selections() };
+    let fixture_requested = std::env::var_os("CAGENTS_NATIVE_UI_FIXTURE").is_some()
+        || std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+    if !fixture_requested {
+        // SAFETY: startup is still single-threaded. Diagnostic fixtures retain
+        // the caller's complete account/scope environment without using it.
+        unsafe { cagents::account::detach_inherited_selections() };
+    }
     #[cfg(not(feature = "latency-harness"))]
-    if std::env::var_os("CAGENTS_NATIVE_UI_FIXTURE").is_some()
-        || std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some()
-    {
+    if fixture_requested {
         return report(Err(
             "native UI fixtures require a latency-harness build".into()
         ));
     }
     #[cfg(feature = "latency-harness")]
-    if cagents::latency_fixture::enabled() {
+    if fixture_requested {
         // Diagnostic entry cannot double as a launch/recovery/helper request.
         // Check before document helpers, staged replacement or callbacks run.
         if std::env::args_os().len() != 1
