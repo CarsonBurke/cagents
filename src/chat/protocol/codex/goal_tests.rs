@@ -268,7 +268,7 @@ fn core_settings_error_retires_unsent_goal_without_replay_in_either_ack_order() 
         }
         let failed = adapter.receive(json!({"method":"error","params":{
             "threadId":"thread-exact","turnId":"opaque-core-settings-submission",
-            "error":{"message":"Core rejected settings","codexErrorInfo":"BadRequest"},"willRetry":false
+            "error":{"message":"Core rejected settings","codexErrorInfo":"badRequest"},"willRetry":false
         }})).unwrap();
         assert!(failed.writes.is_empty());
         if error_first {
