@@ -8837,6 +8837,17 @@ mod tests {
                     matches!(&items(&call)[..], [ItemContent::Tool { name, input, status: ToolStatus::Running, .. }]
                     if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example")
                 );
+                let call_id = call
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(call_id, "skill-1");
 
                 let mut frame = json!({"type":"user","uuid":"internal","message":{"role":"user","content":content}});
                 frame[marker] = json!(true);
@@ -8866,6 +8877,17 @@ mod tests {
                     matches!(&items(&result)[..], [ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }]
                     if name == "Skill" && output == "Launching skill: example")
                 );
+                let result_id = result
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(result_id, call_id);
                 let replacement = adapter.receive(json!({"type":"user","uuid":"replacement","supersedes":["internal"],"message":{"content":"Continue"}})).unwrap();
                 assert!(
                     !replacement
@@ -8890,11 +8912,37 @@ mod tests {
             json!({"type":"user","uuid":"wire","parentUuid":"legacy","sessionId":id,"isSynthetic":true,"message":{"content":[{"type":"text","text":body}]}}),
             json!({"type":"user","uuid":"result","parentUuid":"wire","sessionId":id,"message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}}),
             json!({"type":"assistant","uuid":"answer","parentUuid":"result","sessionId":id,"message":{"content":"Skill completed"}}),
-            json!({"type":"user","uuid":"quoted","parentUuid":"answer","sessionId":id,"isSynthetic":false,"message":{"content":body}}),
-            json!({"type":"user","uuid":"tail","parentUuid":"quoted","sessionId":id,"isSynthetic":true,"message":{"content":body}}),
         ] {
             writeln!(file, "{frame}").unwrap();
         }
+        let mut expected = vec![
+            "root".to_owned(),
+            "call".into(),
+            "result".into(),
+            "answer".into(),
+        ];
+        let mut parent = "answer".to_owned();
+        for marker in ["isMeta", "isSynthetic"] {
+            for (index, flag) in [
+                None,
+                Some(json!(false)),
+                Some(Value::Null),
+                Some(json!("true")),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let uuid = format!("quoted-{marker}-{index}");
+                let mut frame = json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"content":body}});
+                if let Some(flag) = flag {
+                    frame[marker] = flag;
+                }
+                writeln!(file, "{frame}").unwrap();
+                parent = uuid.clone();
+                expected.push(uuid);
+            }
+        }
+        writeln!(file, "{}", json!({"type":"user","uuid":"tail","parentUuid":parent,"sessionId":id,"isSynthetic":true,"message":{"content":body}})).unwrap();
         source.rewind().unwrap();
         let mut before = String::new();
         source.read_to_string(&mut before).unwrap();
@@ -8906,7 +8954,7 @@ mod tests {
                 .iter()
                 .map(|frame| frame["uuid"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["root", "call", "result", "answer", "quoted"]
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
         );
         let mut adapter = Claude::default();
         let mut replay = Step::default();
@@ -8919,9 +8967,14 @@ mod tests {
                 .filter(|(role, content)| *role == Role::User
                     && matches!(content, ItemContent::Text { text, .. } if text == body))
                 .count(),
-            1
+            8
         );
         assert!(items(&replay).iter().any(|content| matches!(content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. } if name == "Skill" && output == "Launching skill: example")));
+        let skill_ids = replay.events.iter().filter_map(|event| match event {
+            Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item.id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(skill_ids, vec!["skill-1", "skill-1"]);
         source.rewind().unwrap();
         let mut after = String::new();
         source.read_to_string(&mut after).unwrap();
