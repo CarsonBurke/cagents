@@ -910,6 +910,150 @@ mod tests {
     }
 
     #[test]
+    fn touch_tap_uses_its_own_position_without_prior_menu_motion() {
+        use cosmic::iced::{
+            keyboard::{self, key::Named},
+            touch,
+        };
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let window = Size::new(400.0, 300.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = Point::new(390.0, 250.0);
+        for keyboard_first in [false, true] {
+            for stale_mouse in [false, true] {
+                for release_outside in [false, true] {
+                    let mut element = surface(widget::menu::items(
+                        &std::collections::HashMap::new(),
+                        (0..3)
+                            .map(|index| {
+                                widget::menu::Item::Button(
+                                    format!("Action {index}"),
+                                    None,
+                                    RowAction(index),
+                                )
+                            })
+                            .collect(),
+                    ));
+                    let widget = element.as_widget_mut();
+                    let mut tree = Tree::new(&*widget);
+                    widget.diff(&mut tree);
+                    let row =
+                        widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                    let mut messages = Vec::new();
+                    widget.update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                        Layout::new(&row),
+                        mouse::Cursor::Available(anchor),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    let mut popup = widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .expect("opened context menu");
+                    let node = popup.as_overlay_mut().layout(&renderer, window);
+                    popup.as_overlay_mut().update(
+                        &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(anchor),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
+                    let mut node = popup.as_overlay_mut().layout(&renderer, window);
+                    if keyboard_first {
+                        popup.as_overlay_mut().update(
+                            &Event::Keyboard(keyboard::Event::KeyPressed {
+                                key: keyboard::Key::Named(Named::ArrowDown),
+                                modified_key: keyboard::Key::Named(Named::ArrowDown),
+                                physical_key: keyboard::key::Physical::Unidentified(
+                                    keyboard::key::NativeCode::Unidentified,
+                                ),
+                                location: keyboard::Location::Standard,
+                                modifiers: keyboard::Modifiers::empty(),
+                                text: None,
+                                repeat: false,
+                            }),
+                            Layout::new(&node),
+                            mouse::Cursor::Unavailable,
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                        );
+                        node = popup.as_overlay_mut().layout(&renderer, window);
+                    }
+                    let menu = Layout::new(&node).children().next().expect("measured menu");
+                    let target = menu
+                        .children()
+                        .nth(2)
+                        .expect("third action")
+                        .bounds()
+                        .center();
+                    let mouse = if stale_mouse {
+                        mouse::Cursor::Available(menu.children().next().unwrap().bounds().center())
+                    } else {
+                        mouse::Cursor::Unavailable
+                    };
+                    let release = if release_outside {
+                        Point::new(1.0, 1.0)
+                    } else {
+                        target
+                    };
+                    // No FingerMoved or mouse motion precedes this tap. The
+                    // keyboard selection and mouse position may name another row.
+                    for event in [
+                        touch::Event::FingerPressed {
+                            id: touch::Finger(7),
+                            position: target,
+                        },
+                        touch::Event::FingerLifted {
+                            id: touch::Finger(7),
+                            position: release,
+                        },
+                    ] {
+                        popup.as_overlay_mut().update(
+                            &Event::Touch(event),
+                            Layout::new(&node),
+                            mouse,
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                        );
+                    }
+                    drop(popup);
+                    assert_eq!(
+                        messages,
+                        if release_outside { vec![] } else { vec![2] },
+                        "touch must dispatch only its own released row; keyboard={keyboard_first}, stale_mouse={stale_mouse}, outside={release_outside}"
+                    );
+                    assert_eq!(
+                        widget
+                            .overlay(
+                                &mut tree,
+                                Layout::new(&row),
+                                &renderer,
+                                &viewport,
+                                Vector::ZERO,
+                            )
+                            .is_none(),
+                        !release_outside,
+                        "activation dismisses; a release dragged outside keeps the menu"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_width_rows_keep_popups_inside_the_window() {
         let renderer = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1029,11 +1173,25 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        // Touch coordinates belong to the finger, independently of the last
+        // mouse position. Native menu buttons use this cursor for hit tests.
+        let cursor = match event {
+            Event::Touch(
+                cosmic::iced::touch::Event::FingerPressed { position, .. }
+                | cosmic::iced::touch::Event::FingerMoved { position, .. }
+                | cosmic::iced::touch::Event::FingerLifted { position, .. }
+                | cosmic::iced::touch::Event::FingerLost { position, .. },
+            ) => mouse::Cursor::Available(*position),
+            _ => cursor,
+        };
         let press = match event {
             Event::Mouse(
                 mouse::Event::ButtonPressed(mouse::Button::Left)
                 | mouse::Event::WheelScrolled { .. },
             ) => cursor.position(),
+            Event::Touch(cosmic::iced::touch::Event::FingerPressed { position, .. }) => {
+                Some(*position)
+            }
             _ => None,
         };
         let mut messages = Vec::new();
