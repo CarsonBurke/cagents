@@ -93,6 +93,24 @@ impl PaneDestination {
 struct Route {
     socket: PathBuf,
     proof: Arc<Mutex<Option<crate::model::HostSessionProof>>>,
+    authority: crate::agent_execution::Authority,
+}
+
+impl Route {
+    fn capture() -> Option<Self> {
+        let authority = crate::agent_execution::Authority::from_environment();
+        // Socket resolution can establish a remote bridge. Keep inherited
+        // capabilities on their original device before invoking the resolver.
+        if authority.token().is_some() && crate::device::is_remote() {
+            return None;
+        }
+        let socket = crate::terminal::ipc::daemon_socket_path().ok()?;
+        Some(Self {
+            socket,
+            proof: Arc::new(Mutex::new(None)),
+            authority,
+        })
+    }
 }
 
 impl Cagents {
@@ -636,15 +654,9 @@ impl Cagents {
             Task::none()
         };
         if !self.channel_work.routes.contains_key(&home)
-            && let Ok(socket) = crate::terminal::ipc::daemon_socket_path()
+            && let Some(route) = Route::capture()
         {
-            self.channel_work.routes.insert(
-                home,
-                Route {
-                    socket,
-                    proof: Arc::new(Mutex::new(None)),
-                },
-            );
+            self.channel_work.routes.insert(home, route);
         }
         let keep = self
             .channel_work
@@ -695,8 +707,13 @@ impl Cagents {
                 operation,
             } => cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut client = connect(route.as_ref(), home, true)?;
-                    match send(&mut client, api::Request::Receipt { home, operation })? {
+                    let route = route.as_ref().ok_or(Failure::Unavailable)?;
+                    let mut client = connect(Some(route), home, true)?;
+                    match send(
+                        &mut client,
+                        &route.authority,
+                        api::Request::Receipt { home, operation },
+                    )? {
                         api::Response::Receipt(receipt) => Ok(receipt),
                         _ => Err(Failure::Unavailable),
                     }
@@ -815,50 +832,45 @@ fn connect(
             if !reconcile {
                 return Err(Failure::Unavailable);
             }
-            // Only the user's explicit Check result can reconcile a restarted
-            // endpoint. Prove the original durable home using read-only calls
-            // before updating its transport proof; never resend a mutation.
-            let model = client
-                .read_workspace_model()
-                .map_err(|_| Failure::Unavailable)?;
-            if model.identity != home.registry {
-                return Err(Failure::Unavailable);
-            }
-            let api::Response::Home { home: current, .. } =
-                send(&mut client, api::Request::ReadHome { home })?
-            else {
-                return Err(Failure::Unavailable);
-            };
-            current.validate().map_err(|_| Failure::Unavailable)?;
-            if current != home {
-                return Err(Failure::Unavailable);
-            }
+            // Only explicit Check result can reconcile a restarted endpoint.
+            // Prove the full original Home with the original caller before
+            // updating the transport proof; never resend a mutation.
+            verify_home(&mut client, &route.authority, home)?;
             *proof = Some(client.proof().clone());
         }
     } else {
-        let model = client
-            .read_workspace_model()
-            .map_err(|_| Failure::Unavailable)?;
-        if model.identity != home.registry {
-            return Err(Failure::Unavailable);
-        }
+        verify_home(&mut client, &route.authority, home)?;
         *proof = Some(client.proof().clone());
     }
     Ok(client)
 }
 
+fn verify_home(
+    client: &mut crate::control::ControlClient,
+    authority: &crate::agent_execution::Authority,
+    home: Home,
+) -> Result<(), Failure> {
+    let api::Response::Home { home: current, .. } =
+        send(client, authority, api::Request::ReadHome { home })?
+    else {
+        return Err(Failure::Unavailable);
+    };
+    current.validate().map_err(|_| Failure::Unavailable)?;
+    if current != home {
+        return Err(Failure::Unavailable);
+    }
+    Ok(())
+}
+
 fn send(
     client: &mut crate::control::ControlClient,
+    authority: &crate::agent_execution::Authority,
     request: api::Request,
 ) -> Result<api::Response, Failure> {
-    // This is the interactive user's UI. Provider/SDK authority never travels
-    // through this adapter; the session CLI preserves its injected authority.
+    // Channel work carries authority in each business envelope. Retain the
+    // original caller for reads, recovery and mutations without a User retry.
     match client
-        .channel_work(
-            crate::agent_execution::Authority::default(),
-            request,
-            Duration::from_secs(160),
-        )
+        .channel_work(authority.clone(), request, Duration::from_secs(160))
         .map_err(|_| Failure::Unavailable)?
     {
         api::Response::Failed(api::Failure::Refused(reason)) => Err(Failure::Refused(reason)),
@@ -875,7 +887,12 @@ fn request(
 ) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            send(&mut connect(route.as_ref(), home, false)?, request)
+            let route = route.as_ref().ok_or(Failure::Unavailable)?;
+            send(
+                &mut connect(Some(route), home, false)?,
+                &route.authority,
+                request,
+            )
         })
         .await
         .unwrap_or(Err(Failure::Unavailable));
@@ -2458,6 +2475,7 @@ mod tests {
             Route {
                 socket: "/fixture/never-connected.sock".into(),
                 proof: Arc::new(Mutex::new(None)),
+                authority: crate::agent_execution::Authority::default(),
             },
         );
         (app, home)
