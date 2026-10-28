@@ -51,7 +51,8 @@ pub(crate) fn replace_linked_metadata(plan: &Project) -> Change {
 
 /// All fixture Git/filesystem mutations precede this fresh watcher. Register
 /// the old inventory first, then require the new inventory's linked ACK before
-/// an edit in a newly tracked directory. No old watcher callbacks can survive.
+/// an edit in a newly tracked directory. Old callbacks retain separate state
+/// and cannot satisfy this fresh Monitor's observations.
 pub(crate) fn reconfigure_then_observe(
     old: Arc<Project>,
     new: Arc<Project>,
@@ -95,7 +96,12 @@ pub(crate) fn reconfigure_then_observe(
         &monitor,
         id,
         "edit in recovered linked inventory",
-        |change| change.worktrees.contains(&linked),
+        |change| {
+            change.worktrees.contains(&linked)
+                && change.error.is_none()
+                && change.coverage != Some(false)
+                && !change.topology
+        },
     );
 }
 
