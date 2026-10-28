@@ -68,6 +68,8 @@ mod service {
         title: Option<String>,
         directory: std::path::PathBuf,
         surface: WaitingSurface,
+        named_scope: Option<Vec<String>>,
+        scope_directory: Option<std::path::PathBuf>,
     }
 
     impl WaitingAgent {
@@ -83,11 +85,15 @@ mod service {
                 title: title.map(clean_label).filter(|title| !title.is_empty()),
                 directory: directory.into(),
                 surface,
+                named_scope: None,
+                scope_directory: None,
             };
-            let scope = scope_components(&context)
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "/".into());
+            let scope = vec![
+                scope_components(&context)
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "/".into()),
+            ];
             let mut row = Self {
                 session,
                 label: String::new(),
@@ -97,12 +103,33 @@ mod service {
             row
         }
 
-        fn prepared_label(&self, scope: &str, extra: Option<&str>) -> String {
+        pub(crate) fn set_named_scope(
+            &mut self,
+            name: Option<&str>,
+            scope: &[String],
+            directory: &std::path::Path,
+        ) {
+            let Some(context) = &mut self.context else {
+                return;
+            };
+            if let Some(name) = name.map(clean_label).filter(|name| !name.is_empty()) {
+                context.title = Some(name);
+            }
+            let scope = scope
+                .iter()
+                .map(|part| clean_label(part))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            context.named_scope = (!scope.is_empty()).then_some(scope);
+            context.scope_directory = Some(directory.into());
+        }
+
+        fn prepared_label(&self, scope: &[String], extra: Option<&str>) -> String {
             let extra = extra.map(|extra| format!(" · {extra}")).unwrap_or_default();
             let budget = LABEL_CHARS - extra.chars().count();
             let label = if let Some(context) = &self.context {
                 let prefix = format!("{} · ", context.provider.label());
-                let scope = compact_label(scope, 44.min(budget - prefix.chars().count()));
+                let scope = compact_scope(scope, 44.min(budget - prefix.chars().count()));
                 if let Some(title) = &context.title {
                     if title == &scope {
                         format!("{prefix}{scope}")
@@ -127,8 +154,16 @@ mod service {
     /// Only human display metadata enters label preparation. Keep the last
     /// eight path components; recipes, environment and runtime IDs never do.
     fn scope_components(context: &WaitingContext) -> Vec<String> {
-        let mut parts = context
-            .directory
+        path_components(
+            context
+                .scope_directory
+                .as_deref()
+                .unwrap_or(&context.directory),
+        )
+    }
+
+    fn path_components(directory: &std::path::Path) -> Vec<String> {
+        let mut parts = directory
             .components()
             .rev()
             .take(8)
@@ -140,6 +175,64 @@ mod service {
             .collect::<Vec<_>>();
         parts.reverse();
         parts
+    }
+
+    fn path_scope(parts: &[String]) -> Vec<String> {
+        if parts.len() > 2 {
+            vec![parts[0].clone(), "…".into(), parts.last().unwrap().clone()]
+        } else if parts.is_empty() {
+            vec!["/".into()]
+        } else {
+            parts.to_vec()
+        }
+    }
+
+    fn distinguishing_scopes(paths: &[Vec<String>]) -> Vec<Vec<String>> {
+        let suffix =
+            |path: &[String], depth: usize| path[path.len().saturating_sub(depth)..].to_vec();
+        paths
+            .iter()
+            .map(|path| {
+                let mut depth = 1;
+                while depth < path.len()
+                    && paths
+                        .iter()
+                        .any(|other| other != path && suffix(other, depth) == suffix(path, depth))
+                {
+                    depth += 1;
+                }
+                path_scope(&suffix(path, depth))
+            })
+            .collect()
+    }
+
+    fn compact_scope(parts: &[String], limit: usize) -> String {
+        let available = limit.saturating_sub(parts.len().saturating_sub(1));
+        let mut sizes = vec![0; parts.len()];
+        let lengths = parts
+            .iter()
+            .map(|part| part.chars().count())
+            .collect::<Vec<_>>();
+        let mut remaining = available;
+        while remaining > 0 {
+            let mut changed = false;
+            for (size, length) in sizes.iter_mut().zip(&lengths) {
+                if remaining > 0 && *size < *length {
+                    *size += 1;
+                    remaining -= 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        parts
+            .iter()
+            .zip(sizes)
+            .map(|(part, size)| compact_label(part, size))
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn duplicate_labels(labels: &[String]) -> BTreeSet<usize> {
@@ -179,25 +272,51 @@ mod service {
                     .unwrap_or_default()
             })
             .collect::<Vec<_>>();
-        let suffix =
-            |path: &[String], depth: usize| path[path.len().saturating_sub(depth)..].join("/");
-        let scopes = paths
+        let path_scopes = distinguishing_scopes(&paths);
+        let working_paths = rows
             .iter()
-            .map(|path| {
-                if path.is_empty() {
-                    return "/".into();
-                }
-                let mut depth = 1;
-                while depth < path.len()
-                    && paths
-                        .iter()
-                        .any(|other| other != path && suffix(other, depth) == suffix(path, depth))
-                {
-                    depth += 1;
-                }
-                suffix(path, depth)
+            .map(|row| {
+                row.context
+                    .as_ref()
+                    .map(|context| path_components(&context.directory))
+                    .unwrap_or_default()
             })
-            .collect::<Vec<String>>();
+            .collect::<Vec<_>>();
+        let working_scopes = distinguishing_scopes(&working_paths);
+        let mut scopes = rows
+            .iter()
+            .zip(&path_scopes)
+            .map(|(row, path)| {
+                row.context
+                    .as_ref()
+                    .and_then(|context| context.named_scope.clone())
+                    .unwrap_or_else(|| path.clone())
+            })
+            .collect::<Vec<_>>();
+        let named_labels = rows
+            .iter()
+            .zip(&scopes)
+            .map(|(row, scope)| row.prepared_label(scope, None))
+            .collect::<Vec<_>>();
+        for index in duplicate_labels(&named_labels) {
+            if !rows[index]
+                .context
+                .as_ref()
+                .is_some_and(|context| context.named_scope.is_some())
+            {
+                continue;
+            }
+            let has_different = |paths: &[Vec<String>]| {
+                paths.iter().enumerate().any(|(other, path)| {
+                    named_labels[other] == named_labels[index] && path != &paths[index]
+                })
+            };
+            if has_different(&paths) {
+                scopes[index].extend(path_scopes[index].clone());
+            } else if has_different(&working_paths) {
+                scopes[index].extend(working_scopes[index].clone());
+            }
+        }
         let plain = rows
             .iter()
             .zip(&scopes)
@@ -301,6 +420,9 @@ mod service {
     }
 
     fn compact_label(text: &str, limit: usize) -> String {
+        if limit == 0 {
+            return String::new();
+        }
         let chars = text.chars().collect::<Vec<_>>();
         if chars.len() <= limit {
             return text.into();
@@ -1017,6 +1139,35 @@ mod service {
                 );
                 assert!(!label.contains("private"));
                 assert!(!label.contains(&session.to_string()));
+            }
+        }
+
+        #[test]
+        fn waiting_full_menu_retains_distinguishing_worktree_component_before_elision() {
+            let rows = vec![
+                scoped_row(
+                    1,
+                    Some("Review"),
+                    "/private/worktree-long-common-prefix-ONE/very-long-common-intermediate/project",
+                    WaitingSurface::Chat,
+                ),
+                scoped_row(
+                    2,
+                    Some("Review"),
+                    "/private/worktree-long-common-prefix-TWO/very-long-common-intermediate/project",
+                    WaitingSurface::Chat,
+                ),
+            ];
+            let menu = waiting_menu_for_test(snapshot_rows(rows));
+            assert!(menu[0].1.contains("ONE"));
+            assert!(menu[1].1.contains("TWO"));
+            for (_, label) in menu {
+                assert!(label.ends_with("/…/project"));
+                assert!(
+                    !label.contains(" · Chat"),
+                    "distinct worktrees need meaningful scope, not arbitrary ordinal"
+                );
+                assert!(label.chars().count() <= LABEL_CHARS);
             }
         }
 

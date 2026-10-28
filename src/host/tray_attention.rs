@@ -213,7 +213,76 @@ fn snapshot_with(
     for (id, candidate) in candidates {
         observe(id, &candidate, &mut snapshot);
     }
+    enrich_labels(host, &mut snapshot);
     snapshot
+}
+
+fn enrich_labels(host: &SharedHost, snapshot: &mut TraySnapshot) {
+    let (registry, proof, captured) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(registry) = state.execution_registry.clone() else {
+            return;
+        };
+        let captured = snapshot
+            .waiting_agents
+            .iter()
+            .filter_map(|row| {
+                let source = Source::capture(&state, row.session).ok()?;
+                let presentation = source.presentation_sources(&state, row.session).ok()?;
+                Some((row.session, source, presentation))
+            })
+            .collect::<Vec<_>>();
+        (registry, state.proof().clone(), captured)
+    };
+    let labels = {
+        // Release registry transaction/mutex before reacquiring Host below.
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let sources = captured
+            .iter()
+            .map(|(id, _, sources)| (*id, sources.clone()))
+            .collect::<Vec<_>>();
+        registry.tray_labels(&sources)
+    };
+    let Ok(labels) = labels else {
+        return;
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.proof() != &proof
+        || !state
+            .execution_registry
+            .as_ref()
+            .is_some_and(|now| Arc::ptr_eq(now, &registry))
+    {
+        return;
+    }
+    for row in &mut snapshot.waiting_agents {
+        if let Some(label) = labels.get(&row.session)
+            && captured
+                .iter()
+                .any(|(id, source, _)| *id == row.session && source.matches(&state, *id))
+        {
+            row.set_named_scope(label.name.as_deref(), &label.scope, &label.directory);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn waiting_snapshot_for_test(host: &SharedHost) -> TraySnapshot {
+    snapshot_with(host, |id, candidate, snapshot| {
+        candidate.observe_sampled(
+            id,
+            candidate.terminal.as_ref().map(|_| crate::agent::Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Waiting,
+            }),
+            candidate.chat.as_ref().map(|_| ActivityObservation {
+                ready: true,
+                activity: ActivityState::Waiting,
+                title: Some("Review".into()),
+            }),
+            snapshot,
+        )
+    })
 }
 
 struct Source {
@@ -309,6 +378,21 @@ impl Source {
 }
 
 fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
+    focus_with(host, id, Source::waiting, navigate)
+}
+
+fn focus_with(
+    host: &SharedHost,
+    id: TerminalId,
+    waiting: impl FnOnce(&Source) -> bool,
+    deliver: impl FnOnce(
+        &SharedHost,
+        &Destination,
+        &crate::instance::TrayActivation,
+        &Source,
+        &Arc<std::sync::Mutex<super::model::Registry>>,
+    ) -> Result<String, String>,
+) -> Result<String, String> {
     let (source, presentation, registry, proof) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let source = Source::capture(&state, id)?;
@@ -323,7 +407,7 @@ fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
             state.proof().clone(),
         )
     };
-    if !source.waiting() {
+    if !waiting(&source) {
         return Err("This agent no longer needs attention".into());
     }
     // Read only the immutable registry identity, outside the global Host lock.
@@ -360,7 +444,7 @@ fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
         state.queue_tray_session(destination.clone(), intent.clone())?;
         (destination, intent)
     };
-    navigate(host, &destination, &intent, &source, &registry)
+    deliver(host, &destination, &intent, &source, &registry)
 }
 
 fn navigate(

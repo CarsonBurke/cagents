@@ -45,6 +45,7 @@ pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetire
 mod navigation;
 mod schema;
 mod terminal_owners;
+mod tray_labels;
 mod views;
 
 const SCHEMA_VERSION: u32 = 19;

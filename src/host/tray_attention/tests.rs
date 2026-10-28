@@ -311,6 +311,80 @@ fn raw_relaunch_terminal_fingerprints_issued_live_projection_without_losing_work
 }
 
 #[test]
+fn raw_terminal_focus_preparation_queues_actual_issued_fingerprint_and_refuses_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let registry =
+        super::super::model::Registry::at(&directory.path().join("tray-focus.sqlite3")).unwrap();
+    let identity = registry.identity().unwrap();
+    let host = empty_host();
+    let first = RenderStreamFixture::new(|_| {});
+    let replacement = RenderStreamFixture::new(|_| {});
+    let id = TerminalId::new();
+    let raw = terminal(id);
+    {
+        let mut state = host.lock().unwrap();
+        state.install_model(registry);
+        state.register_client(1);
+        state
+            .finish_spawn(1, raw.clone(), first.handle.clone(), false)
+            .unwrap();
+    }
+    let delivered = std::cell::RefCell::new(None);
+    // The fixture supplies only Waiting observation and suppresses delivery;
+    // actual focus production preparation owns projection/hash/payload/queue.
+    focus_with(
+        &host,
+        id,
+        |_| true,
+        |host, destination, intent, source, _| {
+            let state = host.lock().unwrap();
+            assert!(source.matches(&state, id));
+            assert_eq!(state.pending_tray_session(destination), Some(intent));
+            assert_eq!(intent.registry, identity);
+            assert_eq!(intent.host, *state.proof());
+            assert!(
+                intent.source_matches(&crate::agent_execution::HostedSession::Terminal(
+                    state.native_terminal_projection(id).unwrap()
+                ))
+            );
+            assert!(
+                state.terminals[&id]
+                    .session
+                    .continuity
+                    .live_proof()
+                    .is_none()
+            );
+            *delivered.borrow_mut() = Some((destination.clone(), intent.clone()));
+            Ok("prepared exact intent".into())
+        },
+    )
+    .unwrap();
+    let (destination, old) = delivered.into_inner().unwrap();
+    host.lock()
+        .unwrap()
+        .acknowledge_tray_session(&destination, &old);
+    let outcome = focus_with(
+        &host,
+        id,
+        |_| {
+            host.lock()
+                .unwrap()
+                .finish_spawn(1, raw, replacement.handle.clone(), false)
+                .unwrap();
+            true
+        },
+        |_, _, _, _, _| panic!("changed worker must not queue or dispatch"),
+    );
+    assert!(outcome.unwrap_err().contains("changed"));
+    assert!(
+        host.lock()
+            .unwrap()
+            .pending_tray_session(&destination)
+            .is_none()
+    );
+}
+
+#[test]
 fn sampled_policy_preserves_pair_fallback_counts_all_waiting_and_omits_ambiguous_rows() {
     let host = empty_host();
     let stream = RenderStreamFixture::new(|_| {});
