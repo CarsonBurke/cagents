@@ -95,6 +95,14 @@ impl ReopenTracking {
         }
     }
 
+    pub(super) fn for_repository(&self, repository: &Path) -> Vec<ReopenOrigin> {
+        self.active
+            .values()
+            .filter(|origin| origin.repository == repository)
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn can_retry(&self, repository: &Path) -> bool {
         self.active.values().any(|origin| {
             origin.repository == repository
@@ -557,6 +565,40 @@ impl Cagents {
             )
     }
 
+    pub(super) fn inventory_failed_reopen(&mut self, project: ProjectId) {
+        let Some(origin) = self.workspace_model_reopens.active.get(&project) else {
+            return;
+        };
+        if self.project_ui.reopening.get(&project) == Some(&origin.repository)
+            && !self.workspace_model_reopens.queued.contains(&project)
+        {
+            // An inventory failure is not acknowledgement of a close. Keep
+            // local work protected, but let a fresh explicit picker retry an
+            // attempt that has not admitted any physical publication.
+            self.workspace_model_reopens.retryable.insert(project);
+        }
+    }
+
+    pub(super) fn finish_removed_project_reopens(&mut self, origins: &[ReopenOrigin]) {
+        for origin in origins {
+            if self
+                .workspace_model_reopens
+                .active
+                .get(&origin.project)
+                .is_some_and(|current| {
+                    current.nonce == origin.nonce
+                        && current.project == origin.project
+                        && current.repository == origin.repository
+                })
+            {
+                self.workspace_model_reopens.invalidate(origin.project);
+                if self.project_ui.reopening.get(&origin.project) == Some(&origin.repository) {
+                    self.project_ui.reopening.remove(&origin.project);
+                }
+            }
+        }
+    }
+
     fn current_reopen(&self, origin: &ReopenOrigin) -> bool {
         self.live_reopen_intent(origin)
             && self
@@ -913,6 +955,7 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.retire_foreign_project_operations(model.identity);
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
@@ -1100,6 +1143,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        self.retire_stale_shared_project_closes();
         let closed = self
             .workspace_model
             .closed_projects
@@ -1318,6 +1362,9 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        // Channel retirement may have drained a project while the model was
+        // taken. Admit its close only after restoring canonical authority.
+        tasks.push(self.complete_closed_projects());
         Task::batch(tasks)
     }
 
