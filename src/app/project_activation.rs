@@ -50,6 +50,9 @@ impl Cagents {
             return Task::none();
         }
         let repository = pending.repository.clone();
+        if let Some(task) = self.defer_project_activation_for_work(repository.clone()) {
+            return task;
+        }
         if self
             .project_ui
             .closing
