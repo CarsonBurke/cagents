@@ -1183,6 +1183,21 @@ fn restore(
                     }
                 };
                 if prepared == hosted {
+                    if hosted.is_saved_claude_history() {
+                        if hosted != session {
+                            return Err(
+                                "The saved-history reader changed the explicit retry request"
+                                    .into(),
+                            );
+                        }
+                        let execution_environment = native_environment(&hosted, true);
+                        return Ok(ClientRequest::ChatStart {
+                            session: hosted,
+                            source: None,
+                            terminate_source: false,
+                            execution_environment,
+                        });
+                    }
                     return Ok(ClientRequest::ChatAttach { session: hosted });
                 }
                 if prepared == session {
@@ -3612,6 +3627,83 @@ mod tests {
         );
         assert!(result.is_err());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
+        for state in 0..3 {
+            let proof = host_proof("current");
+            let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.launch.recipe.arguments.clear();
+            let mut hosted = source.clone();
+            if state == 1 {
+                hosted.native_continuity =
+                    super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            } else if state == 2 {
+                source.proof = Some(host_proof("previous"));
+            }
+            let expected = hosted.clone();
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let server_proof = proof.clone();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                for step in 0..2 {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    let response = match (step, request.request) {
+                        (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
+                            sessions: vec![expected.clone()],
+                        },
+                        (1, ClientRequest::ChatPrepareResume { source }) if source == expected => {
+                            ServerResponse::ChatResumePrepared {
+                                session: expected.clone(),
+                            }
+                        }
+                        other => panic!("unexpected explicit retry request: {other:?}"),
+                    };
+                    codec
+                        .write(
+                            &mut server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: server_proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                }
+            });
+            let result = restore(
+                &mut client,
+                &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                &mut 1,
+                &proof,
+                source,
+                &mut None,
+                true,
+            );
+            worker.join().unwrap();
+            match state {
+                0 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatStart { session, source: None, terminate_source: false, .. }) if session == hosted)
+                ),
+                1 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                ),
+                2 => assert!(
+                    result
+                        .unwrap_err()
+                        .message
+                        .contains("changed the explicit retry request")
+                ),
+                _ => unreachable!(),
+            }
+        }
     }
 
     fn negotiate_with_recovery(

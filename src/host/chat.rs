@@ -2497,6 +2497,9 @@ fn process_inner(
             {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            if let Some(session) = capacity::prepare_saved_history(host, &source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             // Classify retained Claude execution before generic discovery:
             // an exited helper may still await its original parent's wait.
             // Errors/unproved exit never fall back to treating it as live.

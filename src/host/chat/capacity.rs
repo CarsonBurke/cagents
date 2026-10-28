@@ -1278,6 +1278,48 @@ mod tests {
                     .is_read_only_history()
             );
             assert!(!host.lock().unwrap().chats[&source.id].handle.owns_work());
+            // Explicit continuation uses the exact currently authenticated
+            // reader descriptor, not a fabricated retirement or new source.
+            let ServerResponse::ChatResumePrepared { session: prepared } = process_inner(
+                &host,
+                0,
+                ClientRequest::ChatPrepareResume {
+                    source: source.clone(),
+                },
+            )
+            .unwrap() else {
+                panic!("exact history preparation expected")
+            };
+            assert_eq!(prepared, source);
+            let mut changed = source.clone();
+            changed.launch.recipe.working_directory = directory.path().join("another-project");
+            assert!(
+                process_inner(
+                    &host,
+                    0,
+                    ClientRequest::ChatPrepareResume { source: changed }
+                )
+                .is_err()
+            );
+            host.lock()
+                .unwrap()
+                .chat_spawning
+                .insert(source.id, source.clone());
+            assert!(
+                process_inner(
+                    &host,
+                    0,
+                    ClientRequest::ChatPrepareResume {
+                        source: source.clone()
+                    }
+                )
+                .is_err()
+            );
+            host.lock().unwrap().chat_spawning.remove(&source.id);
+            assert!(
+                !marker.exists(),
+                "preparation must never execute the provider"
+            );
             drop(restored);
             server.join().unwrap();
             // Join the owned reader before dropping its host; a final callback
@@ -1899,6 +1941,37 @@ pub(super) fn recover_saved_history(
     );
     restore_saved_history(host, 0, session.clone())?;
     register_saved_history_alias(host, source)
+}
+
+/// Classify an already authenticated paging reader for an explicit Retry.
+/// This returns its unchanged descriptor, never retirement or launch authority;
+/// normal Start repeats the execution/account/admission checks if requested.
+pub(super) fn prepare_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(record) = state.chats.get(&source.id) else {
+        return Ok(None);
+    };
+    if !source.is_saved_claude_history() || !record.handle.is_read_only_history() {
+        return Ok(None);
+    }
+    validate_proof(source.proof.as_ref(), state.proof())?;
+    if record.session != *source
+        || record.handle.session_id() != source.launch.session_id
+        || record.handle.owns_work()
+        || record.returning_terminal
+        || state.shutting_down
+        || state.chat_spawning.contains_key(&source.id)
+        || state.native_closing.contains_key(&source.id)
+        || state.native_actor_startups.contains_key(&source.id)
+    {
+        return Err(unavailable(
+            "The exact saved-history reader changed; no provider was started",
+        ));
+    }
+    Ok(Some(source.clone()))
 }
 
 /// An inactive window may retain a different former proof for this same

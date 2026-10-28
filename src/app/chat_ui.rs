@@ -6404,7 +6404,13 @@ impl Cagents {
     /// Preserve only the exact explicit launch the failed pane was trying.
     pub(super) fn chat_retry_intent(&self, card: CardId, session: &chat::Session) -> chat::Intent {
         if self.chat_ui.explicit_starts.get(&card) == Some(session)
-            && matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
+            && match self.cards.get(&card) {
+                Some(CardRuntime::Failed(_)) => true,
+                Some(CardRuntime::Chat(runtime)) => {
+                    runtime.disconnected && &runtime.session == session
+                }
+                _ => false,
+            }
         {
             chat::Intent::RetryStart
         } else {
@@ -9297,11 +9303,28 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
-                return self.start_chat(target.card, session, chat::Intent::Restore, None, false);
+                let intent = self.chat_retry_intent(target.card, &session);
+                return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
                 if self.chat_start_pending(target.card) {
                     return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let session = runtime.session.clone();
+                if runtime.pending.is_some() || runtime.attachment_chooser_pending.is_some() {
+                    return Task::none();
+                }
+                if self.chat_retry_intent(target.card, &session) == chat::Intent::RetryStart {
+                    return self.start_chat(
+                        target.card,
+                        session,
+                        chat::Intent::RetryStart,
+                        None,
+                        false,
+                    );
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -19416,11 +19439,20 @@ mod tests {
             answer_start(
                 &mut app,
                 failed,
-                Err("Project folder is unavailable".into()),
+                Err("Named SDK initialization failed: exit 75".into()),
             );
             assert!(app.chat_ui.attempt(card).is_none());
-            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            drop(app.handle_chat_ui(Action::Wake(
+                target,
+                Wake::Disconnected("Old history reader was replaced".into()),
+            )));
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
             let retry = app.chat_ui.attempt(card).unwrap().target;
+            assert_eq!(
+                app.chat_ui.attempt(card).unwrap().intent,
+                chat::Intent::RetryStart
+            );
+            assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
             let mut confirmed = source.clone();
             confirmed.native_continuity =
                 chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
