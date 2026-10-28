@@ -44,6 +44,27 @@ pub fn selected_content(
     let old: Vec<_> = model.before.split_inclusive('\n').collect();
     let new: Vec<_> = after.split_inclusive('\n').collect();
     let mut result = String::new();
+    if mode == DiffMode::Split {
+        // Split replacements pair old/new coordinates in display order. The
+        // inline representation groups every deletion before every addition,
+        // which would move retained lines ahead of a selected replacement.
+        for (index, row) in model.split_rows.iter().enumerate() {
+            let use_new = if row.kind == DiffRowKind::Context {
+                undo
+            } else {
+                selected.contains(&index) != undo
+            };
+            let (lines, line) = if use_new {
+                (&new, row.new_line)
+            } else {
+                (&old, row.old_line)
+            };
+            if let Some(line) = line {
+                result.push_str(lines.get(line.checked_sub(1)? as usize)?);
+            }
+        }
+        return Some(result);
+    }
     for row in &model.inline_rows {
         match row.kind {
             DiffRowKind::Context => {
@@ -336,6 +357,88 @@ mod tests {
             "first\nkeep\nTHIRD\n"
         );
     }
+
+    #[test]
+    fn partial_split_replacement_keeps_unselected_lines_in_place() {
+        for ending in ["\n", "\r\n"] {
+            for final_newline in [false, true] {
+                let text = |alpha, beta| {
+                    let mut text = format!(
+                        "keep{ending}let alpha = {alpha};{ending}let beta = {beta};{ending}tail"
+                    );
+                    if final_newline {
+                        text.push_str(ending);
+                    }
+                    text
+                };
+                let before = text(1, 2);
+                let after = text(3, 4);
+                let model = crate::diff_view::build_diff(&before, &after);
+                let start = model.split_change_starts[0];
+                assert_eq!(model.split_rows[start].old_line, Some(2));
+                assert_eq!(model.split_rows[start].new_line, Some(2));
+                assert_eq!(model.split_rows[start + 1].old_line, Some(3));
+                assert_eq!(model.split_rows[start + 1].new_line, Some(3));
+                for (row, applied, undone) in [
+                    (start, text(3, 2), text(1, 4)),
+                    (start + 1, text(1, 4), text(3, 2)),
+                ] {
+                    assert_eq!(
+                        selected_content(&model, &after, DiffMode::Split, row..row + 1, false),
+                        Some(applied)
+                    );
+                    assert_eq!(
+                        selected_content(&model, &after, DiffMode::Split, row..row + 1, true),
+                        Some(undone)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_split_patch_preserves_unpaired_lines_and_round_trips() {
+        for (before, after, applied, undone) in [
+            (
+                "let alpha = 1;\nlet beta = 2;\nlet gamma = 5;\n",
+                "let alpha = 3;\nlet beta = 4;\n",
+                "let alpha = 3;\nlet beta = 2;\nlet gamma = 5;\n",
+                "let alpha = 1;\nlet beta = 4;\n",
+            ),
+            (
+                "let alpha = 1;\nlet beta = 2;\n",
+                "let alpha = 3;\nlet beta = 4;\nlet gamma = 5;\n",
+                "let alpha = 3;\nlet beta = 2;\n",
+                "let alpha = 1;\nlet beta = 4;\nlet gamma = 5;\n",
+            ),
+        ] {
+            let model = crate::diff_view::build_diff(before, after);
+            let row = model.split_change_starts[0];
+            assert_eq!(model.split_rows[row].old_line, Some(1));
+            assert_eq!(model.split_rows[row].new_line, Some(1));
+            for (undo, source, expected) in [(false, before, applied), (true, after, undone)] {
+                let selected =
+                    selected_content(&model, after, DiffMode::Split, row..row + 1, undo).unwrap();
+                assert_eq!(selected, expected);
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let path = RepoPath::parse("partial.rs").unwrap();
+                git(root, &["init", "-q"], None);
+                fs::write(root.join(path.as_path()), source).unwrap();
+                git(root, &["add", "partial.rs"], None);
+                let patch = unified_patch(&path, Some(source), Some(&selected));
+                git(root, &["apply", "--cached", "--check", "-"], Some(&patch));
+                git(root, &["apply", "--cached", "-"], Some(&patch));
+                assert_eq!(
+                    git(root, &["show", ":partial.rs"], None),
+                    expected.as_bytes()
+                );
+                git(root, &["apply", "--cached", "-R", "-"], Some(&patch));
+                assert_eq!(git(root, &["show", ":partial.rs"], None), source.as_bytes());
+            }
+        }
+    }
+
     #[test]
     fn undoing_selected_hunk_preserves_unselected_ignored_whitespace() {
         let before = (0..80)
