@@ -976,6 +976,29 @@ impl State {
         });
     }
 
+    fn note_missing_settled_history(
+        &mut self,
+        before: Option<HistoryKey>,
+        page: &crate::automations::HistoryPage,
+    ) {
+        let returned: std::collections::HashSet<_> =
+            page.firings.iter().map(|firing| firing.id).collect();
+        let through = page
+            .next
+            .as_ref()
+            .map(|cursor| (cursor.created_ms, cursor.id));
+        // A complete, validated page can reveal compaction or expiry inside
+        // its cursor range. Preserve the reader's snapshot until explicit
+        // refresh; missing active ownership never becomes terminal evidence.
+        self.history_newer |= self.history.iter().any(|firing| {
+            !firing.state.is_active()
+                && !firing.release_pending
+                && before.is_none_or(|before| history_key(firing) < before)
+                && through.is_none_or(|through| history_key(firing) >= through)
+                && !returned.contains(&firing.id)
+        });
+    }
+
     fn merge_history_rows(&mut self, rows: Vec<Firing>) {
         // Build once per bounded page, rather than re-finding every loaded
         // row for every full RunDetail response. No insertion or reordering.
@@ -1020,7 +1043,18 @@ impl State {
         let next = self
             .history
             .iter()
-            .filter(|firing| firing.state.is_active() || firing.release_pending)
+            .filter(|firing| {
+                firing.state.is_active()
+                    || firing.release_pending
+                    || firing.skipped_occurrences.is_some()
+                    || (firing.state == crate::automations::FiringState::Skipped
+                        && matches!(
+                            firing.trigger,
+                            crate::automations::Trigger::Scheduled { .. }
+                        )
+                        && firing.skip.is_some()
+                        && firing.skip != Some(crate::automations::SkipReason::MissedDeadline))
+            })
             .map(history_key)
             .filter(|key| *key < refresh.before && *key >= refresh.through)
             .max();
@@ -1110,6 +1144,7 @@ impl State {
             return;
         }
         self.history_status = HistoryStatus::Loaded;
+        self.note_missing_settled_history(before, &page);
         // A valid response replaces the failure fallback with its actual
         // strict cursor. Empty/exhausted/past-horizon responses end this pass;
         // absent loaded rows never become terminal or disappear.
@@ -1335,6 +1370,7 @@ impl State {
                         // and create gaps between its newest and older pages.
                         let newest = page.firings.iter().map(history_key).min();
                         let more = page.next.is_some();
+                        self.note_missing_settled_history(None, &page);
                         if self.history.is_empty() {
                             self.history = page.firings;
                             self.history_next = page.next;
@@ -2499,8 +2535,9 @@ impl State {
                     }
                     if self.history_newer {
                         content = content.push(crate::design::body(
-                            "Newer runs are available. Refresh to show the latest page.",
+                            "Run history changed. Displayed rows may be out of date.",
                         ));
+                        content = content.push(button("Refresh history", Action::History, !busy));
                     }
                     let empty = match &self.history_status {
                         HistoryStatus::Loading if self.history.is_empty() => {
