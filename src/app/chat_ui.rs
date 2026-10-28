@@ -7891,7 +7891,7 @@ impl Cagents {
         self.chat_ui.phases.remove(&target.card);
         if !source_matches || !context_matches {
             self.release_draft_start_capture(target.card);
-            return Task::none();
+            return self.restore_failed_draft_start_focus(target);
         }
         if creation_revoked {
             self.release_draft_start_capture(target.card);

@@ -301,6 +301,11 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         "other-window",
         "modal",
         "stale",
+        "registry",
+        "writer",
+        "scope",
+        "runtime-replaced",
+        "source-replaced",
     ] {
         let (mut app, _directory, card, target) = fixture();
         app.context_inspector_open = false;
@@ -338,6 +343,35 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
             }
             "other-window" => app.refresh_ui.focused = false,
             "modal" => app.settings_reset_confirm = true,
+            "registry" => app.workspace_model.identity = uuid::Uuid::new_v4(),
+            "writer" => app.session = None,
+            "scope" => {
+                Arc::make_mut(&mut app.durable)
+                    .channels
+                    .push(crate::model::ProjectChannel {
+                        id: crate::model::ChannelId::new(),
+                        project_id: ProjectId::new(),
+                        title: "Moved scope".into(),
+                        title_source: Default::default(),
+                        ordinal: 1,
+                        shared: false,
+                        cards: vec![card],
+                        focused: Some(card),
+                    });
+            }
+            "runtime-replaced" => {
+                let newer = app.chat_ui.next_target(card);
+                match app.cards.get_mut(&card).unwrap() {
+                    CardRuntime::Chat(runtime) => runtime.retarget(newer),
+                    _ => unreachable!(),
+                }
+            }
+            "source-replaced" => {
+                let CardKind::Chat(source) = &mut app.card_state_mut(card).unwrap().kind else {
+                    unreachable!()
+                };
+                source.launch.recipe.arguments.push("changed source".into());
+            }
             "stale" => {
                 app.chat_ui
                     .draft_checkpoints
@@ -352,7 +386,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         let task = chosen.as_ref().map_or_else(Task::none, |id| {
             iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
         });
-        let expected = if context == "current" {
+        let expected = if matches!(context, "current" | "registry" | "writer" | "scope") {
             Some(card_control_id(card, "chat-composer"))
         } else {
             chosen
