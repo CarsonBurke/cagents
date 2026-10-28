@@ -10,7 +10,7 @@
 //! both whichever way they went: ahead of the content when they reach it, and
 //! from within the overlays when those take them first.
 
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use crate::{model::CardId, workspace_widget::FocusedPane};
 
@@ -60,7 +60,7 @@ type KeyCallback<'a, Message> = Rc<dyn Fn(keyboard::Event, bool, KeyboardOwner) 
 
 #[derive(Default)]
 struct KeyboardFocus {
-    regions: Rc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>,
+    regions: Arc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>,
     region: Option<KeyboardOwner>,
     pending: Option<KeyboardOwner>,
     focused: Vec<(Option<cosmic::iced::widget::Id>, Rectangle, KeyboardOwner)>,
@@ -245,7 +245,7 @@ pub(crate) fn observe_keyboard<'a, Message: 'a>(
     Element::new(Observed {
         content: content.into(),
         trace: trace.clone(),
-        regions: Some(Rc::new(regions.into_iter().collect())),
+        regions: Some(Arc::new(regions.into_iter().collect())),
         raw_fallback,
         on_key: enabled.then(|| Rc::new(on_key) as KeyCallback<'a, Message>),
     })
@@ -254,7 +254,7 @@ pub(crate) fn observe_keyboard<'a, Message: 'a>(
 struct Observed<'a, Message> {
     content: Element<'a, Message>,
     trace: InputTrace,
-    regions: Option<Rc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
+    regions: Option<Arc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
     raw_fallback: Option<KeyboardOwner>,
     on_key: Option<KeyCallback<'a, Message>>,
 }
@@ -468,7 +468,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
 struct ObservedOverlay<'a, Message> {
     content: overlay::Element<'a, Message, Theme, Renderer>,
     trace: InputTrace,
-    regions: Option<Rc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
+    regions: Option<Arc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
     on_key: Option<KeyCallback<'a, Message>>,
 }
 
@@ -476,7 +476,7 @@ impl<'a, Message: 'a> ObservedOverlay<'a, Message> {
     fn wrap(
         content: overlay::Element<'a, Message, Theme, Renderer>,
         trace: &InputTrace,
-        regions: Option<Rc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
+        regions: Option<Arc<HashMap<cosmic::iced::widget::Id, KeyboardOwner>>>,
         on_key: Option<KeyCallback<'a, Message>>,
     ) -> overlay::Element<'a, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Self {

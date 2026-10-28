@@ -997,12 +997,12 @@ fn an_earlier_mounted_inactive_editor_does_not_capture_the_terminal_font_chord()
     let (editor, repository) = editor_app();
     let second_repository = CardId::new();
     let mut first = editor.card_state(repository).unwrap().clone();
-    first.width = CardWidth::Fraction(0.25);
+    first.width_fraction = 0.25;
     let mut second = first.clone();
     second.id = second_repository;
     {
         let durable = Arc::make_mut(&mut app.durable);
-        durable.cards[0].width = CardWidth::Fraction(0.5);
+        durable.cards[0].width_fraction = 0.5;
         durable.cards.splice(0..0, [first, second]);
     }
     for card in [repository, second_repository] {
