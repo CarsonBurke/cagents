@@ -5293,7 +5293,7 @@ pub struct Cagents {
     settings_pending: HashMap<SettingsField, (u64, String)>,
     settings_generation: u64,
     settings_invalid: HashMap<SettingsField, String>,
-    settings_save_error: Option<String>,
+    settings_save_error: Option<(u64, String)>,
     status: Option<TransientNotice>,
 }
 
@@ -13353,7 +13353,7 @@ impl Cagents {
     }
 
     fn refresh_settings_feedback(&mut self) {
-        self.settings_feedback = if let Some(error) = &self.settings_save_error {
+        self.settings_feedback = if let Some((_, error)) = &self.settings_save_error {
             Some(SettingsFeedback::Error(error.clone()))
         } else if !self.settings_invalid.is_empty() {
             Some(SettingsFeedback::Invalid)
@@ -15891,16 +15891,27 @@ impl Application for Cagents {
             Message::SettingsSaved { generation, result } => {
                 match result {
                     Ok(saved) => {
-                        if saved.generation >= self.settings_ack_generation {
+                        if saved.generation >= self.settings_ack_generation
+                            && self
+                                .settings_save_error
+                                .as_ref()
+                                .is_none_or(|(failed, _)| saved.generation >= *failed)
+                        {
                             self.settings_save_error = None;
                         }
                         self.acknowledge_settings_save(saved);
                     }
-                    Err(error) if generation >= self.settings_ack_generation => {
+                    Err(error)
+                        if generation >= self.settings_ack_generation
+                            && self
+                                .settings_save_error
+                                .as_ref()
+                                .is_none_or(|(failed, _)| generation >= *failed) =>
+                    {
                         self.status = Some(TransientNotice::warning(format!(
                             "Could not save settings: {error}"
                         )));
-                        self.settings_save_error = Some(error);
+                        self.settings_save_error = Some((generation, error));
                     }
                     Err(_) => {}
                 }
