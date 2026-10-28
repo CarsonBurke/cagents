@@ -2577,6 +2577,23 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
     }
 }
 
+/// Whether the compositor tiles a window's right edge, which decides whether
+/// the shell offers a resize border along it.
+fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
+    use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+    use iced::event::{PlatformSpecific, wayland};
+
+    match event {
+        iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+            wayland::WindowEvent::WindowState(state),
+        ))) => Some(Message::WindowRightEdgeTiled(
+            window,
+            state.contains(WindowState::TILED_RIGHT),
+        )),
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -4464,6 +4481,7 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowRightEdgeTiled(window::Id, bool),
     ActivateUi {
         token: Option<String>,
     },
@@ -5239,6 +5257,9 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// Whether the compositor reports the main window's right edge as tiled,
+    /// so the shell offers no resize border there.
+    right_edge_tiled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -6123,6 +6144,22 @@ impl Cagents {
             max_scrollback_bytes: self.settings.terminal_scrollback_mib * 1024 * 1024,
             theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
+        }
+    }
+
+    /// The trailing inset that keeps the interface out of the window's resize
+    /// border.
+    ///
+    /// While the right window edge is free, the shell starts a resize from any
+    /// press within [`design::WINDOW_RESIZE_BORDER`] of it, before the press
+    /// reaches a widget. Panes put their scrollbars at their right edge, so the
+    /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
+    /// fullscreen and right-tiled windows have no border there and stay flush.
+    fn window_edge_inset(&self) -> f32 {
+        if self.core.window.is_maximized || self.right_edge_tiled {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
         }
     }
 
@@ -14107,6 +14144,7 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -16577,6 +16615,12 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowRightEdgeTiled(window, tiled) => {
+                if self.core.main_window_id() == Some(window) {
+                    self.right_edge_tiled = tiled;
+                }
+                Task::none()
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -18028,6 +18072,9 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(event_window, false),
                 )),
                 iced::Event::Window(event) => window_geometry_message(&event),
+                event @ iced::Event::PlatformSpecific(_) => {
+                    window_edge_message(&event, event_window)
+                }
                 _ => None,
             }),
         ];
@@ -18821,6 +18868,11 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        // Only the inset changes with the window state, so the tree, and
+        // every scroll offset and focus in it, survives a maximize.
+        let surface: Element<'_, Message> = widget::container(surface)
+            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -23231,6 +23283,53 @@ mod tests {
             let _ = app.update(Message::CancelDialog);
             assert!(app.pull_request_dialog.is_none());
         }
+    }
+
+    #[test]
+    fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let state = |state| {
+            iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+                wayland::WindowEvent::WindowState(state),
+            )))
+        };
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        // The border is in compositor pixels; the interface scale enlarges
+        // every interface pixel.
+        app.settings.ui_scale = 1.25;
+        assert_eq!(
+            app.window_edge_inset(),
+            design::WINDOW_RESIZE_BORDER / 1.25
+        );
+        app.settings.ui_scale = 1.0;
+
+        // Another window's state does not move the main window's content.
+        let other = window_edge_message(&state(WindowState::TILED), window::Id::unique())
+            .expect("window state event");
+        let _ = app.update(other);
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+
+        // A tiled right edge has no border, so content returns to the edge.
+        // Other tiled edges leave the right border in place.
+        for (flags, inset) in [
+            (WindowState::TILED_LEFT | WindowState::TILED_TOP, design::WINDOW_RESIZE_BORDER),
+            (WindowState::TILED_RIGHT | WindowState::ACTIVATED, 0.0),
+            (WindowState::ACTIVATED, design::WINDOW_RESIZE_BORDER),
+        ] {
+            let message = window_edge_message(&state(flags), main).expect("window state event");
+            let _ = app.update(message);
+            assert_eq!(app.window_edge_inset(), inset, "{flags:?}");
+        }
+
+        app.core.window.is_maximized = true;
+        assert_eq!(app.window_edge_inset(), 0.0);
+        assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
     }
 
     #[test]
@@ -28805,6 +28904,7 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            right_edge_tiled: false,
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
