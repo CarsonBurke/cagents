@@ -1918,6 +1918,50 @@ mod tests {
     }
 
     #[test]
+    fn attention_terminal_relaunch_does_not_read_its_predecessors_captured_notice() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let previous = card_session(app.card_state(card).unwrap()).unwrap();
+        let snapshot = attention_snapshot(previous);
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        let previous_epoch = app.attention_focus_epoch;
+
+        // Drop the launch task: exercise the real accepted relaunch and its
+        // update tail without starting a terminal or contacting the daemon.
+        drop(app.update(Message::RetryCard(card)));
+        let CardKind::Terminal(replacement) = &app.card_state(card).unwrap().kind else {
+            panic!("relaunch keeps the terminal card");
+        };
+        assert_ne!(replacement.id, previous);
+        assert_eq!(replacement.predecessor, Some(previous));
+        assert_eq!(app.workspace.focused(), Some(card));
+        let replacement_epoch = app.attention_focus_epoch;
+        assert_ne!(replacement_epoch, previous_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: previous_epoch,
+        }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: replacement_epoch,
+        }));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn attention_same_conversation_descriptor_enrichment_preserves_its_pending_dwell() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.new_native_chat(Provider::Claude, Some("/tmp".into())));
