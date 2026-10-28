@@ -2514,33 +2514,40 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         seed.launch.session_id = Some(id.clone());
         let title = "Recover the preferred saved conversation title";
-        // Two catalog files describe the same conversation. The first title
-        // observation must target the saved winner exactly once, even when
-        // another copy of the transcript is encountered in this same batch.
-        for copy in 0..2 {
-            let project = provider_root(&seed).join(format!("projects/project-{copy}"));
-            std::fs::create_dir_all(&project).unwrap();
-            let path = project.join(format!("{id}.jsonl"));
-            std::fs::write(
-                &path,
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "type":"user", "sessionId":id, "cwd":root.path(),
-                        "message":{"content":title}
-                    })
-                ),
-            )
-            .unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(copy * 60))
+        // Two catalog files describe the same conversation. An untitled newest
+        // copy must leave the saved winner eligible for an older useful title;
+        // two useful copies must still enrich that winner only once.
+        for first_untitled in [false, true] {
+            for copy in 0..2 {
+                let project = provider_root(&seed).join(format!("projects/project-{copy}"));
+                std::fs::create_dir_all(&project).unwrap();
+                let path = project.join(format!("{id}.jsonl"));
+                let content = if first_untitled && copy == 0 {
+                    "<command-name>/clear</command-name>"
+                } else {
+                    title
+                };
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "type":"user", "sessionId":id, "cwd":root.path(),
+                            "message":{"content":content}
+                        })
+                    ),
+                )
                 .unwrap();
-        }
-        for preferred_open in [false, true] {
-            for dropped_untitled in [false, true] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(copy * 60))
+                    .unwrap();
+            }
+            for (preferred_open, dropped_untitled) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let mut preferred = saved(root.path());
                 preferred.session = seed.clone();
                 preferred.session.proof = Some(crate::model::HostSessionProof {
@@ -2599,7 +2606,7 @@ mod tests {
                 assert_eq!(
                     title_updates,
                     [(preferred.card, title.to_owned())],
-                    "open={preferred_open}, dropped untitled={dropped_untitled}: the dropped card cannot steal the title recipient or its eligibility flag"
+                    "first untitled={first_untitled}, open={preferred_open}, dropped untitled={dropped_untitled}: the dropped card cannot steal the title recipient or its eligibility flag"
                 );
 
                 let mut app = crate::app::tests::context_inspector_test_app(false);
