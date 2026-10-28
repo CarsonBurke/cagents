@@ -514,7 +514,13 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
                  DROP TABLE session_lineages; PRAGMA user_version = 3;",
             )
             .unwrap();

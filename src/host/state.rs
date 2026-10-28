@@ -292,7 +292,9 @@ pub(crate) struct HostState {
     /// Seals the messages the courier delivers and recognizes them in
     /// transcripts. Absent without the registry that keeps its key.
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
-    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
+    /// Operations own their gates, including while waiting to acquire them.
+    /// Weak entries let later lookups reclaim gates after every caller leaves.
+    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -640,8 +642,11 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
-                    || (matches!(target, crate::notifications::Target::AgentRun(_))
-                        && presence.application == Application::Cagents)
+                    || (matches!(
+                        target,
+                        crate::notifications::Target::AgentRun(_)
+                            | crate::notifications::Target::Automation { .. }
+                    ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
@@ -4307,7 +4312,7 @@ fn start_terminal_view_owned_reserved(
         rows: options.rows,
         cell_width_px: options.cell_width_px,
         cell_height_px: options.cell_height_px,
-        max_scrollback: options.max_scrollback,
+        max_scrollback_bytes: options.max_scrollback_bytes,
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
@@ -4636,7 +4641,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         || !(1..=500).contains(&options.rows)
         || !(1..=4096).contains(&options.cell_width_px)
         || !(1..=4096).contains(&options.cell_height_px)
-        || options.max_scrollback > 1_000_000
+        || options.max_scrollback_bytes > TerminalConfig::MAX_SCROLLBACK_BYTES
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
@@ -4988,6 +4993,36 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
+        assert_eq!(
+            TerminalSpawnOptions::default().max_scrollback_bytes,
+            16 * 1024 * 1024
+        );
+        for bytes in [0, 16 * 1024 * 1024, TerminalConfig::MAX_SCROLLBACK_BYTES] {
+            let options = TerminalSpawnOptions {
+                max_scrollback_bytes: bytes,
+                ..Default::default()
+            };
+            validate_spawn_options(&options).unwrap();
+        }
+        let error = validate_spawn_options(&TerminalSpawnOptions {
+            max_scrollback_bytes: TerminalConfig::MAX_SCROLLBACK_BYTES + 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        // A byte budget does not relax any independent dimension guard.
+        assert!(
+            validate_spawn_options(&TerminalSpawnOptions {
+                columns: 0,
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -5546,6 +5581,60 @@ mod tests {
         assert!(matches!(delivery.pop().unwrap().message,
             ServerMessage::NotificationActivated { target: actual } if actual == target));
         assert!(editor.pop().is_none());
+    }
+
+    #[test]
+    fn automation_notification_routes_to_cagents_without_a_provider_and_reconnects_once() {
+        use crate::notifications::{Application, Presence, Target};
+        let mut host = test_host();
+        let agents = host.register_client(1);
+        host.watch_notifications(
+            1,
+            Presence {
+                window: "primary".into(),
+                ..Default::default()
+            },
+        );
+        let editor = host.register_client(2);
+        host.watch_notifications(
+            2,
+            Presence {
+                window: "primary".into(),
+                application: Application::Ceditor,
+                ..Default::default()
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        let first = Target::Automation { id, sequence: 41 };
+        let destination = host.activate_notification_destination(first.clone(), None, None, None);
+        assert_eq!(destination.application, Application::Cagents);
+        assert_eq!(destination.window, "primary");
+        assert!(matches!(agents.pop().unwrap().message,
+            ServerMessage::NotificationActivated { target } if target == first));
+        drop(host.unregister_client(1));
+        let replacement = Target::Automation { id, sequence: 42 };
+        let cold = host.activate_notification_destination(replacement.clone(), None, None, None);
+        assert_eq!(cold.application, Application::Cagents);
+        assert_eq!(cold.window, "primary");
+        // A same-window editor does not receive or consume Cagents attention.
+        let editor_presence = Presence {
+            window: "primary".into(),
+            application: Application::Ceditor,
+            ..Default::default()
+        };
+        assert_eq!(host.watch_notifications(2, editor_presence), None);
+        editor.close_after_drain();
+        assert!(editor.pop().is_none());
+        host.register_client(3);
+        let returned = Presence {
+            window: "primary".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.watch_notifications(3, returned.clone()),
+            Some(replacement)
+        );
+        assert_eq!(host.watch_notifications(3, returned), None);
     }
 
     #[test]

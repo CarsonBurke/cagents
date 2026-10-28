@@ -657,6 +657,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::host::descriptor_limit::inherit(&mut holder);
     unsafe {
         holder.pre_exec(move || {
             crate::daemon::seal_inherited_descriptors()?;
@@ -1479,12 +1480,33 @@ fn wait_for_control_with_stderr(
     child_events: &ChildEvents,
     stderr: &mut StderrCapture,
 ) -> io::Result<()> {
+    wait_for_control_with_reaper(fd, child_events, stderr, || {
+        children.reap_exited_descendants()
+    })
+}
+
+fn wait_for_control_with_reaper(
+    fd: RawFd,
+    child_events: &ChildEvents,
+    stderr: &mut StderrCapture,
+    mut reap: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut reported = false;
+    let mut inspect_children = || match reap() {
+        Ok(()) => reported = false,
+        Err(error) => {
+            // Inspection grants no release authority. Treat the same transient
+            // failure identically before poll and after a child wakeup, and
+            // report a continuing failure only once until inspection recovers.
+            if !reported {
+                eprintln!("Native holder could not reap exited tools: {error}");
+                reported = true;
+            }
+        }
+    };
     loop {
         stderr.drain_turn();
-        if let Err(error) = children.reap_exited_descendants() {
-            // A transient inspection failure must not tear down a durable server.
-            eprintln!("Native holder could not reap exited tools: {error}");
-        }
+        inspect_children();
         let mut poll = [
             libc::pollfd {
                 fd,
@@ -1509,7 +1531,7 @@ fn wait_for_control_with_stderr(
                 if poll[1].revents != 0 {
                     child_events.drain()?;
                     // A simultaneous control event must not postpone reaping.
-                    children.reap_exited_descendants()?;
+                    inspect_children();
                 }
                 if poll[0].revents != 0 {
                     return Ok(());
@@ -1759,7 +1781,20 @@ extern "C" fn serve_if_requested() {
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
         let _ = crate::daemon::process_scope::enroll_holder();
-        let mut residence = Residence::start(spawn)?;
+        let mut residence = match Residence::start(spawn) {
+            Ok(residence) => residence,
+            Err(error) => {
+                // Only startup has no Started response yet. Preserve the
+                // original failure on its existing control channel; sending
+                // diagnostics grants no ownership or cleanup authority.
+                let _ = send(
+                    &control,
+                    &Report::Failed(format!("Native holder startup failed: {error}")),
+                    START_TIMEOUT,
+                );
+                return Err(error);
+            }
+        };
         send(
             &control,
             &Report::Started {
@@ -1782,7 +1817,6 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn stderr_summary_refuses_credential_fragments_after_byte_tail_truncation() {
         const CANARY: &str = "CAPACITY_CREDENTIAL_CANARY_7A2D";
@@ -2240,6 +2274,413 @@ while True:
     }
 
     #[test]
+    fn idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LIVE_REAPER_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let mut fixture = Command::new(std::env::current_exe().unwrap());
+            fixture
+                .args([
+                    "--exact",
+                    "chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(STAGE, "1");
+            // Isolate subreaper/wait ownership and block SIGCHLD in every
+            // libtest thread, as in the existing idle-reaper fixture.
+            unsafe {
+                fixture.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = fixture.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let child_events = ChildEvents::new().unwrap();
+        for orphan in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            // The intermediate shell exits, adopting both tools into this
+            // holder. The actual provider leader stays alive. Only the short
+            // tool reads the test-owned pipe; no duration determines its exit.
+            let script = r#"
+while IFS=: read -r field value; do
+    if [ "$field" = SigBlk ]; then printf '%s\n' "$value" > "$1/provider-mask"; fi
+done < "/proc/$$/status"
+/bin/sh -c '
+    /bin/sleep 60 </dev/null &
+    echo $! > "$1/live"
+    /bin/sh -c "read -r token" <&0 &
+    echo $! > "$1/tool"
+' fixture "$1"
+echo ready > "$1/ready"
+exec /bin/sleep 60
+"#;
+            // Exercise the production pre-exec mask restoration, not a second
+            // test-only unblocking implementation. Other Spawn fields are not
+            // consulted by command(); no native registry/provider is opened.
+            let spawn = Spawn {
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    script.into(),
+                    "fixture".into(),
+                    directory.path().to_str().unwrap().into(),
+                ],
+                directory: directory.path().to_owned(),
+                environment: BTreeMap::new(),
+                recovery: super::super::tests::recovery(),
+                directory_fd: None,
+            };
+            let mut child = spawn.command().stdin(Stdio::piped()).spawn().unwrap();
+            let mut tool_gate = child.stdin.take().unwrap();
+            let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+            let provider = Process::read(server.id()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !directory.path().join("ready").exists() {
+                assert!(!server.exited(), "provider exited during fixture startup");
+                assert!(Instant::now() < deadline, "provider fixture did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let read_pid = |name| {
+                std::fs::read_to_string(directory.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap()
+            };
+            let tool = Process::read(read_pid("tool")).unwrap();
+            let live = Process::read(read_pid("live")).unwrap();
+            for process in [&tool, &live] {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
+                let parent = stat
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                assert_eq!(parent.parse::<u32>().unwrap(), std::process::id());
+            }
+            let mask = std::fs::read_to_string(directory.path().join("provider-mask")).unwrap();
+            let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+            assert_eq!(mask & (1_u64 << (libc::SIGCHLD - 1)), 0);
+            assert!(!server.exited(), "provider must be live before idle wait");
+
+            let observed_tool = tool.clone();
+            let release_and_observe = move || {
+                let released = tool_gate.write_all(b"exit\n").is_ok();
+                drop(tool_gate);
+                if !released {
+                    return false;
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while observed_tool.is_current() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                !observed_tool.is_current()
+            };
+            let reaped = if orphan {
+                let path = directory.path().join("control.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let connector = std::thread::spawn(move || {
+                    let reaped = release_and_observe();
+                    // Always wake the real wait path, even on a failed oracle.
+                    let stream = UnixStream::connect(path).unwrap();
+                    (stream, reaped)
+                });
+                wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
+                let (_peer, reaped) = connector.join().unwrap();
+                let _accepted = listener.accept().unwrap();
+                reaped
+            } else {
+                let (reader, mut writer) = UnixStream::pair().unwrap();
+                let sender = std::thread::spawn(move || {
+                    let reaped = release_and_observe();
+                    writer.write_all(b"x").unwrap();
+                    reaped
+                });
+                wait_for_control(reader.as_raw_fd(), &server, &child_events).unwrap();
+                sender.join().unwrap()
+            };
+            assert!(
+                reaped,
+                "adopted tool was not reaped before control activity"
+            );
+            assert!(!server.exited(), "idle wait consumed the live provider");
+            for process in [&provider, &live] {
+                assert!(process.is_current(), "idle reaping changed a live process");
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            process.pid as u32,
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(unsafe { status.si_pid() }, 0, "live process exited");
+            }
+            assert_eq!(
+                unsafe { libc::waitpid(tool.pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(server.terminate(Duration::from_secs(2)).unwrap());
+            assert!(!provider.is_current());
+            assert!(!live.is_current());
+            assert_eq!(
+                unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[test]
+    fn post_child_census_failure_preserves_live_ownership_and_services_control() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_CENSUS_FAILURE_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let mut fixture = Command::new(std::env::current_exe().unwrap());
+            fixture
+                .args([
+                    "--exact",
+                    "chat::native_holder::transport::tests::post_child_census_failure_preserves_live_ownership_and_services_control",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(STAGE, "1");
+            unsafe {
+                fixture.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = fixture.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let child_events = ChildEvents::new().unwrap();
+        for orphan in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let spawn = Spawn {
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"/bin/sh -c '
+                        /bin/sleep 60 </dev/null & echo $! > "$1/live"
+                        /bin/sh -c "read -r token" <&0 & echo $! > "$1/tool"
+                    ' fixture "$1"
+                    printf 'native census diagnostic\n' >&2
+                    echo ready > "$1/ready"
+                    exec /bin/sleep 60"#
+                        .into(),
+                    "fixture".into(),
+                    directory.path().to_str().unwrap().into(),
+                ],
+                directory: directory.path().to_owned(),
+                environment: BTreeMap::new(),
+                recovery: super::super::tests::recovery(),
+                directory_fd: None,
+            };
+            let mut child = spawn.command().stdin(Stdio::piped()).spawn().unwrap();
+            let gate = child.stdin.take().unwrap();
+            let mut stderr = StderrCapture::new(child.stderr.take()).unwrap();
+            let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+            let provider = Process::read(server.id()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !directory.path().join("ready").exists() {
+                assert!(!server.exited());
+                assert!(Instant::now() < deadline, "provider fixture did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let identity = |name| {
+                let pid = std::fs::read_to_string(directory.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap();
+                Process::read(pid).unwrap()
+            };
+            let tool = identity("tool");
+            let live = identity("live");
+            // Clear setup notifications before inducing the exact child-exit
+            // boundary. The short tool still waits for this original pipe.
+            child_events.drain().unwrap();
+            let listener =
+                orphan.then(|| UnixListener::bind(directory.path().join("control.sock")).unwrap());
+            let (reader, peer) = if let Some(listener) = &listener {
+                (
+                    None,
+                    UnixStream::connect(listener.local_addr().unwrap().as_pathname().unwrap())
+                        .unwrap(),
+                )
+            } else {
+                let (reader, peer) = UnixStream::pair().unwrap();
+                (Some(reader), peer)
+            };
+            let fd = listener
+                .as_ref()
+                .map_or_else(|| reader.as_ref().unwrap().as_raw_fd(), AsRawFd::as_raw_fd);
+            let proof = spawn.recovery.source.proof.clone().unwrap();
+            send(
+                &peer,
+                &Request::Inspect {
+                    proof: proof.clone(),
+                },
+                TIMEOUT,
+            )
+            .unwrap();
+            let mut calls = 0;
+            let mut released = false;
+            let mut observed_exit = false;
+            let mut gate = Some(gate);
+            let waited = wait_for_control_with_reaper(fd, &child_events, &mut stderr, || {
+                calls += 1;
+                if calls == 1 {
+                    server.reap_exited_descendants()?;
+                    let mut original = gate.take().unwrap();
+                    released = original.write_all(b"exit\n").is_ok();
+                    drop(original);
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while released && Instant::now() < deadline {
+                        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        let result = unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                tool.pid as u32,
+                                &mut status,
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        };
+                        if result != 0 {
+                            break;
+                        }
+                        if unsafe { status.si_pid() } == tool.pid {
+                            observed_exit = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return Ok(());
+                }
+                if calls == 2 {
+                    // This is the post-SIGCHLD census, never a control,
+                    // authentication, child-event FD or teardown failure.
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                server.reap_exited_descendants()
+            });
+            assert!(
+                waited.is_ok(),
+                "inspection failure abandoned control: {waited:?}"
+            );
+            assert!(released && observed_exit);
+            assert_eq!(calls, 2, "fault must occur after the real SIGCHLD wake");
+            assert!(
+                stderr
+                    .tail
+                    .iter()
+                    .copied()
+                    .eq(b"native census diagnostic\n".iter().copied())
+            );
+            let control = if let Some(listener) = listener {
+                listener.accept().unwrap().0
+            } else {
+                reader.unwrap()
+            };
+            let Some(Request::Inspect { proof: actual }) = receive(&control, TIMEOUT).unwrap()
+            else {
+                panic!("the original framed control request was lost");
+            };
+            assert_eq!(actual, proof);
+            let mut stopped: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        tool.pid as u32,
+                        &mut stopped,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { stopped.si_pid() }, tool.pid);
+            assert!(!server.exited(), "inspection failure consumed the provider");
+            for process in [&provider, &live] {
+                assert!(
+                    process.is_current(),
+                    "inspection failure changed a live owner"
+                );
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            process.pid as u32,
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(unsafe { status.si_pid() }, 0);
+            }
+            // The next genuine control wake retries ordinary reaping, without
+            // replacing any owner or manufacturing a completion receipt.
+            send(&peer, &Request::Inspect { proof }, TIMEOUT).unwrap();
+            wait_for_control(control.as_raw_fd(), &server, &child_events).unwrap();
+            assert!(matches!(
+                receive(&control, TIMEOUT).unwrap(),
+                Some(Request::Inspect { .. })
+            ));
+            assert_eq!(
+                unsafe { libc::waitpid(tool.pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(!tool.is_current());
+            assert!(provider.is_current() && live.is_current());
+            assert!(server.terminate(Duration::from_secs(2)).unwrap());
+            assert!(!provider.is_current() && !live.is_current());
+            assert_eq!(
+                unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
         if std::env::var_os(STAGE).is_none() {
@@ -2283,6 +2724,7 @@ while True:
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         let mut holder = spawn(spec.clone(), source.clone()).unwrap();
         assert!(
             context.outcome() == LaunchOutcome::Uncertain,
@@ -2296,6 +2738,12 @@ while True:
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            record.holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
             record.root.pid as u32,
@@ -2803,7 +3251,9 @@ while True:
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        assert!(spawn(spec, source).is_err());
+        let startup_error = spawn(spec, source)
+            .err()
+            .expect("the missing provider must fail in the actual helper");
         let deadline = Instant::now() + Duration::from_secs(3);
         while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
             assert!(
@@ -2825,6 +3275,14 @@ while True:
             )
             .unwrap()
             .is_empty()
+        );
+        assert_eq!(
+            startup_error,
+            format!(
+                "Native holder startup failed: {}",
+                io::Error::from_raw_os_error(libc::ENOENT)
+            ),
+            "the real helper must expose its original spawn failure, not an EOF acknowledgement"
         );
     }
 

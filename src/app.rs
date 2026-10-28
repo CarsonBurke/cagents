@@ -6,6 +6,7 @@ mod branch_ui;
 #[cfg(feature = "integrated-browser")]
 mod browser_import_ui;
 mod channel_ui;
+mod channel_work;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_health_ui;
@@ -35,6 +36,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod saved_terminal;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -100,10 +102,10 @@ use crate::{
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
-        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
-        WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof,
+        LaunchRecipe, ProjectId, ProjectKind, ProjectState, RepositoryView, Residency,
+        RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        WorkspaceDestination, WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -2561,6 +2563,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -2673,6 +2677,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
+        Message::SavedTerminal(action) => action.is_user_action(),
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -2717,6 +2722,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
+        Message::ChannelWork(action) => !action.background(),
+        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2805,6 +2812,9 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    if let Message::SavedTerminal(action) = message {
+        return action.is_user_action();
+    }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -2834,6 +2844,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 ..
             }
             | Message::ToggleContextInspector
+            | Message::OpenChannelWork(_)
+            | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -2944,7 +2956,7 @@ pub enum SettingsField {
     BrowserSearchUrl,
     EditorFontFamily,
     EditorFontSize,
-    TerminalScrollbackLines,
+    TerminalScrollbackMib,
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
@@ -3076,7 +3088,7 @@ impl SettingsField {
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
-            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
@@ -3163,7 +3175,7 @@ impl SettingsField {
             | Self::TerminalTheme
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
-            | Self::TerminalScrollbackLines
+            | Self::TerminalScrollbackMib
             | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
@@ -3355,7 +3367,7 @@ struct SettingsDraft {
     editor_font_size: String,
     confirm_multiline_paste: bool,
     browser_search_url: String,
-    terminal_scrollback_lines: String,
+    terminal_scrollback_mib: String,
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
@@ -3411,7 +3423,7 @@ impl SettingsDraft {
                 .editor_font_size
                 .map(|size| size.to_string())
                 .unwrap_or_default(),
-            terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
+            terminal_scrollback_mib: settings.terminal_scrollback_mib.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             auto_delete_merged_worktrees: settings.auto_delete_merged_worktrees,
             worktree_sort: match settings.worktree_sort {
@@ -3466,7 +3478,7 @@ impl SettingsDraft {
             SettingsField::BrowserSearchUrl => self.browser_search_url = value,
             SettingsField::EditorFontFamily => self.editor_font_family = value,
             SettingsField::EditorFontSize => self.editor_font_size = value,
-            SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
+            SettingsField::TerminalScrollbackMib => self.terminal_scrollback_mib = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::AutoDeleteMergedWorktrees => {
                 self.auto_delete_merged_worktrees = value == "true"
@@ -3888,9 +3900,9 @@ fn settings_update(
             next.terminal_font_family = value.to_owned();
             Ok(())
         }
-        SettingsField::TerminalScrollbackLines => value
+        SettingsField::TerminalScrollbackMib => value
             .parse::<usize>()
-            .map(|value| next.terminal_scrollback_lines = value)
+            .map(|value| next.terminal_scrollback_mib = value)
             .map_err(|_| "Terminal scrollback must be a whole number.".to_owned()),
         SettingsField::ManagedWorktreeDirectory => {
             next.managed_worktree_directory = value.to_owned();
@@ -4041,9 +4053,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
         ),
-        SettingsField::TerminalScrollbackLines => format!(
-            "Scrollback must be 0–{} lines.",
-            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        SettingsField::TerminalScrollbackMib => format!(
+            "Scrollback must be 0–{} MiB.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_MIB)
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
@@ -4211,6 +4223,7 @@ pub enum Message {
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
+    SavedTerminal(saved_terminal::Action),
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -4580,8 +4593,14 @@ pub enum Message {
     DaemonHealth(crate::daemon_health::State),
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
+    UtilityPaneUi(Box<Message>),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
+    ChannelWork(crate::channel_work_ui::Action),
+    OpenChannelWork(ChannelId),
+    ChannelWorkNavigation(channel_work::Navigation),
+    ChannelWorkPoll,
+    ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -5107,6 +5126,7 @@ pub struct Cagents {
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     terminal_failure: terminal_failure::State,
+    saved_terminals: saved_terminal::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
     /// Restored agent terminals that are not on screen, attached one at a
@@ -5188,6 +5208,7 @@ pub struct Cagents {
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
+    channel_work: channel_work::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -5615,6 +5636,10 @@ impl Cagents {
                 restored_runtime_residency(&card.kind, card.exposure, &card.residency);
             match card.kind {
                 CardKind::Terminal(session) => {
+                    if self.prepare_saved_terminal(card.id, &session) {
+                        repository_tasks.push(self.inspect_saved_terminal(card.id));
+                        continue;
+                    }
                     let terminal_residency =
                         terminal_residency.expect("terminal restore has lifecycle residency");
                     self.lifecycle.register(
@@ -5730,6 +5755,11 @@ impl Cagents {
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
                 && !explicit_retry)
         {
+            return Task::none();
+        }
+        // A restored recipe is presentation until its exact attachment has
+        // been resolved; visibility alone must never execute it.
+        if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
         // Recovery can replace the identity this start ends up with, so
@@ -6038,7 +6068,7 @@ impl Cagents {
     fn terminal_config(&self, visible: bool) -> TerminalConfig {
         TerminalConfig {
             initially_visible: visible,
-            max_scrollback: self.settings.terminal_scrollback_lines,
+            max_scrollback_bytes: self.settings.terminal_scrollback_mib * 1024 * 1024,
             theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
@@ -6048,10 +6078,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
@@ -7434,6 +7462,12 @@ impl Cagents {
         if unchanged {
             return None;
         }
+        if self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current.id != session.id),
+        ) {
+            // An accepted identity replacement retires attribution, not journal news.
+            self.sidebar_state.forget_card_attention(card);
+        }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
@@ -7561,6 +7595,8 @@ impl Cagents {
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
+        #[cfg(test)]
+        terminal_output_tests::record_owner_resolution();
         let state = self
             .card_state(card)
             .filter(|state| state.existence.is_open())?;
@@ -8302,6 +8338,7 @@ impl Cagents {
         if self
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
+            || self.pane_close_owned(card)
             || self.chat_start_pending(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
@@ -8343,6 +8380,10 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::utility(&state.kind));
             return Task::none();
         }
+        if self.saved_terminal_current(card).is_some() {
+            return self.inspect_saved_terminal(card);
+        }
+        self.saved_terminals.entries.remove(&card);
         let retry_details = self.terminal_details(card);
         let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
             && session.continuity.live_proof().is_none()
@@ -8364,6 +8405,9 @@ impl Cagents {
         }
         self.status = None;
         if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // A fresh actor must not inherit its predecessor's sidebar news.
+            // Retiring that attribution does not acknowledge the old journal.
+            self.sidebar_state.forget_card_attention(card);
             // The ended identity's final-screen outcome is spent.
             self.retained_outputs.remove(expected_terminal_id);
         }
@@ -8419,7 +8463,10 @@ impl Cagents {
             }
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
-            CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
+            CardKind::Chat(session) => {
+                let intent = self.chat_retry_intent(card, &session);
+                self.open_chat(card, session, intent)
+            }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes return before a retry registers them")
             }
@@ -8745,9 +8792,7 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if !self.context_inspector_overlay_active
-            && let Some(card) = self.workspace.take_widget_focus_request()
-        {
+        if surfaces_visible && let Some(card) = self.workspace.take_widget_focus_request() {
             tasks.push(
                 iced::widget::operation::focus(self.card_keyboard_focus(card))
                     .map(cosmic::Action::App),
@@ -9131,8 +9176,10 @@ impl Cagents {
                 // the end replays the activity it once reported, which must
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    if ended_terminal(self.card_state(card)).is_none() {
-                        metadata_changed |= self.sidebar_state.card_activity(card) != activity;
+                    if ended_terminal(self.card_state(card)).is_none()
+                        && self.sidebar_state.card_activity(card) != activity
+                    {
+                        metadata_changed = true;
                         self.observe_agent_activity_for_card(card, activity);
                     }
                 }
@@ -9298,8 +9345,10 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            metadata_changed |= self.sidebar_state.card_activity(card) != activity;
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                metadata_changed = true;
+                self.observe_agent_activity_for_card(card, activity);
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
@@ -9743,7 +9792,10 @@ impl Cagents {
         } else {
             "Retry"
         };
-        let content: Element<'a, Message> = match self.cards.get(&id) {
+        let content: Element<'a, Message> = if let Some(view) = self.saved_terminal_view(id) {
+            view
+        } else {
+            match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id).map(move |message| match message {
                 Message::ChatUi(chat_ui::Action::OpenUrl(uri)) => {
                     Message::OpenDocumentLink(id, uri)
@@ -10042,6 +10094,7 @@ impl Cagents {
             .center(Length::Fill)
             .padding(space::XL)
             .into(),
+        }
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
@@ -12147,7 +12200,8 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+        !self.channel_work_is_main()
+            && (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
             && (self.context_inspector_open || self.context_inspector_transition.is_some())
     }
 
@@ -12252,6 +12306,12 @@ impl Cagents {
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
+        self.channel_work_is_main() || self.shell_inputs_blocked()
+    }
+
+    // Shell navigation remains usable over main Work without admitting input
+    // to the conversation panes it replaces.
+    fn shell_inputs_blocked(&self) -> bool {
         self.modal_is_open()
             || self.context_inspector_is_overlay()
             || self.chrome_ui.is_open()
@@ -12259,7 +12319,7 @@ impl Cagents {
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
-        !self.context_inspector_is_overlay()
+        !self.channel_work_is_main() && !self.context_inspector_is_overlay()
     }
 
     fn enter_context_overlay(&mut self) -> Task<Message> {
@@ -12333,6 +12393,16 @@ impl Cagents {
     }
 
     fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
+        if self.saved_terminal_current(card).is_some() {
+            return if self
+                .saved_terminal_status(card)
+                .is_some_and(|(_, busy)| busy)
+            {
+                InspectorRuntimeStatus::Starting
+            } else {
+                InspectorRuntimeStatus::Unavailable
+            };
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
             Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
@@ -12351,7 +12421,7 @@ impl Cagents {
                     InspectorRuntimeStatus::Ready
                 }
             },
-            Some(CardRuntime::Chat(_)) => InspectorRuntimeStatus::Ready,
+            Some(CardRuntime::Chat(runtime)) => runtime.inspector_runtime_status(),
             Some(CardRuntime::Completed)
             | Some(CardRuntime::Terminal(_))
             | Some(CardRuntime::PullRequests(_))
@@ -13829,6 +13899,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -13892,6 +13963,7 @@ impl Application for Cagents {
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -14101,6 +14173,12 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Pane callbacks retain their rendering origin while queued. Unwrap
+        // once before all message-dependent policy and completion bookkeeping.
+        let (message, pane_origin) = match message {
+            Message::UtilityPaneUi(message) => (*message, true),
+            message => (message, false),
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14113,6 +14191,9 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if pane_origin && self.channel_work_is_main() {
+            return Task::none();
+        }
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -14192,6 +14273,9 @@ impl Application for Cagents {
             self.deferred_navigation.push_back(message);
             return Task::none();
         }
+        if let Some(task) = self.intercept_channel_work_navigation(&message) {
+            return task;
+        }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
             // frame then moves it by the time since the input that began it,
@@ -14230,6 +14314,7 @@ impl Application for Cagents {
         let mut terminal_metadata_unchanged = false;
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
@@ -14276,7 +14361,11 @@ impl Application for Cagents {
             Message::HostedTerminalsObserved(terminals) => {
                 self.observe_hosted_descriptors(terminals)
             }
-            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
+            Message::WorkspaceModelObserved(update) => {
+                let (task, changed) = self.apply_workspace_model_update_effect(update);
+                terminal_metadata_unchanged = !changed;
+                task
+            }
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -15383,6 +15472,7 @@ impl Application for Cagents {
                     SidebarAction::OpenChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Open(channel_id))
                     }
+                    SidebarAction::OpenChannelWork { channel_id } => self.open_channel_work(channel_id),
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
@@ -17009,6 +17099,22 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
+                // The inspector's advertised toggle closes this foreground
+                // surface; it must not be blocked with the workspace behind it.
+                if self.context_inspector_is_overlay()
+                    && !self.modal_is_open()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) == Some(workspace_widget::GlobalShortcut::ToggleInspector)
+                    && let keyboard::Event::KeyPressed { modifiers, .. } = &event
+                {
+                    return self.run_workspace_command(
+                        workspace_widget::GlobalShortcut::ToggleInspector,
+                        *modifiers,
+                    );
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -17234,9 +17340,15 @@ impl Application for Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
+            Message::UtilityPaneUi(_) => Task::none(),
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
+            Message::ChannelWork(action) => self.update_channel_work(action),
+            Message::OpenChannelWork(channel) => self.open_channel_work(channel),
+            Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
+            Message::ChannelWorkEscape => self.escape_channel_work(),
+            Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -17663,6 +17775,7 @@ impl Application for Cagents {
             self.account_subscription(),
             self.automation_subscription(),
             self.work_subscription(),
+            self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
@@ -17739,6 +17852,16 @@ impl Application for Cagents {
                 lsp_event_stream,
             )
             .map(Message::Lsp),
+        );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -18163,7 +18286,20 @@ impl Application for Cagents {
             .flatten();
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
-        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+        let workspace: Element<'_, Message> = if self.channel_work_is_main() {
+            // Do not build terminal/chat/browser widgets under an invisible
+            // Conversations layer. Their runtimes remain hosted and hidden.
+            crate::ui_controls::responsive(move |size| {
+                crate::interaction::focused_escape(
+                    self.channel_work
+                        .view
+                        .view(size.width, size.height)
+                        .map(Message::ChannelWork),
+                    || Message::ChannelWorkEscape,
+                )
+            })
+            .into()
+        } else if self.workspace.cards().is_empty() {
             let directory = self
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());
@@ -18944,6 +19080,37 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
+        let mut app = context_inspector_test_app(false);
+        assert_eq!(app.settings.terminal_scrollback_mib, 16);
+        for mib in [0, 16, 32, settings::MAX_TERMINAL_SCROLLBACK_MIB] {
+            let SettingsDecision::Persist(next) = settings_update(
+                &app.settings,
+                SettingsField::TerminalScrollbackMib,
+                &mib.to_string(),
+            ) else {
+                panic!("valid MiB setting must persist")
+            };
+            let draft = SettingsDraft::from_settings(&next);
+            assert_eq!(draft.terminal_scrollback_mib, mib.to_string());
+            app.settings = next;
+            let config = app.terminal_config(false);
+            assert!(!config.initially_visible);
+            assert_eq!(config.max_scrollback_bytes, mib * 1024 * 1024);
+            assert_eq!(
+                crate::terminal::TerminalSpawnOptions::from(config).max_scrollback_bytes,
+                mib * 1024 * 1024
+            );
+        }
+        for invalid in ["-1", "1025", "18446744073709551615"] {
+            assert!(matches!(
+                settings_update(&app.settings, SettingsField::TerminalScrollbackMib, invalid),
+                SettingsDecision::Invalid(_)
+            ));
+        }
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -20520,7 +20687,7 @@ mod tests {
     /// Shared rather than written per surface, because every surface that
     /// mounts ids from a list is exposed to the same invariant and a per-test
     /// copy of the walk would drift from the runtime it is modelling.
-    fn widget_id_counts(element: &mut Element<'_, Message>) -> HashMap<String, usize> {
+    pub(super) fn widget_id_counts(element: &mut Element<'_, Message>) -> HashMap<String, usize> {
         use cosmic::iced::advanced::widget::Tree;
         use iced_accessibility::id::Internal;
 
@@ -24007,6 +24174,82 @@ mod tests {
     }
 
     #[test]
+    fn context_overlay_toggle_shortcut_honors_bindings_capture_and_modal_priority() {
+        let press = |key: &str, modifiers, repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key.into()),
+            modified_key: keyboard::Key::Character(key.into()),
+            physical_key: keyboard::key::Physical::Code(if key == "t" {
+                keyboard::key::Code::KeyT
+            } else {
+                keyboard::key::Code::KeyI
+            }),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        };
+        let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for captured in [false, true] {
+            for custom in [false, true] {
+                let mut app = context_inspector_test_app(true);
+                let modifiers = if custom {
+                    app.settings.keyboard_shortcuts.toggle_inspector = vec!["Ctrl+Alt+I".into()];
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT
+                } else {
+                    default
+                };
+                let _ = app.update(Message::WindowResized(902.0, 800.0));
+                assert!(app.context_inspector_is_overlay());
+                assert!(app.workspace_inputs_blocked());
+                let focused = app.workspace.focused();
+                let count = app.workspace.order().count();
+
+                // Other workspace commands and retired/default bindings do not
+                // escape through the inspector's one permitted close action.
+                let _ = app.update(Message::KeyEvent {
+                    event: press("t", keyboard::Modifiers::CTRL, false),
+                    captured,
+                });
+                assert_eq!(app.workspace.order().count(), count);
+                if custom {
+                    let _ = app.update(Message::KeyEvent {
+                        event: press("i", default, false),
+                        captured,
+                    });
+                    assert!(app.context_inspector_open);
+                }
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, true),
+                    captured,
+                });
+                assert!(app.context_inspector_open, "repeat must not toggle twice");
+
+                // A real form dialog above the inspector owns keyboard input.
+                app.device_ui.open = true;
+                assert!(app.modal_is_open());
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(app.device_ui.open);
+                assert!(app.context_inspector_open);
+                app.device_ui.open = false;
+
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(!app.context_inspector_open);
+                settle_context_inspector_transition(&mut app);
+                assert!(!app.context_inspector_is_overlay());
+                assert!(!app.workspace_inputs_blocked());
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.workspace.order().count(), count);
+            }
+        }
+    }
+
+    #[test]
     fn context_inspector_resize_persists_only_when_the_gesture_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -24384,70 +24627,49 @@ mod tests {
         card
     }
 
-    /// An agent's row reports what it is doing only through an attached
-    /// terminal, so a restored agent off screen is attached without waiting
-    /// for its card to be opened, while a plain shell stays detached.
+    /// All saved owners, including plain shells, use one metadata-only lane.
     #[test]
     fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
         let mut app = context_inspector_test_app(false);
         let visible = restored_live_terminal("/bin/sh", Exposure::Visible);
-        let agents = [
+        let cards = [
+            visible.clone(),
+            restored_live_terminal("/bin/sh", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/claude", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/codex", Exposure::Offscreen),
         ];
-        let shell = restored_live_terminal("/bin/sh", Exposure::Offscreen);
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: [visible.clone(), shell.clone()]
-                .into_iter()
-                .chain(agents.clone())
-                .collect(),
+            cards: cards.to_vec(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
-        let terminal = |card: &CardState| match &card.kind {
-            CardKind::Terminal(session) => session.id,
-            _ => unreachable!("terminal fixture"),
-        };
+        let focus = app.workspace.focused();
+        let strip = app.workspace.order().collect::<Vec<_>>();
         drop(app.initialize_runtimes());
-        // The card on screen starts first; agents wait for its recovery lease.
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[0].id, agents[1].id]);
-        let _ = app.update(Message::TerminalStarted {
-            card: visible.id,
-            terminal: terminal(&visible),
-            result: Err("fixture".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[1].id]);
         let notices = app.notices.entries.len();
-
-        // A terminal that would have to be launched again stays detached, and
-        // so does one that cannot be attached; neither is a failure anyone
-        // has to see.
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[0].id,
-            terminal: terminal(&agents[0]),
-            result: Ok(None),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert!(app.restored_agent_attaches.is_empty());
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[1].id,
-            terminal: terminal(&agents[1]),
-            result: Err("the daemon is unavailable".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 0);
-        for card in agents.iter().chain([&shell]) {
+        for (index, card) in cards.iter().enumerate() {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+            let result = if index == cards.len() - 1 {
+                Err("the daemon is unavailable".into())
+            } else {
+                Ok(None)
+            };
+            saved_terminal::tests::complete_inspection(&mut app, card.id, result);
+            assert_eq!(app.saved_terminal_ready(card.id), index != cards.len() - 1);
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
             assert!(matches!(
                 app.cards.get(&card.id),
                 Some(CardRuntime::Loading)
             ));
-            assert_eq!(
-                app.lifecycle.state(card.id).map(|(_, residency)| residency),
-                Some(&Residency::Hibernated)
-            );
+            assert!(app.lifecycle.state(card.id).is_none());
+            assert_eq!(app.workspace.focused(), focus);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
         }
+        assert_eq!(app.terminal_starts_in_flight(), 0);
         assert_eq!(app.notices.entries.len(), notices);
     }
 
@@ -24462,35 +24684,21 @@ mod tests {
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.initialize_runtimes());
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            0,
-            "ordinary offscreen lifecycle stays deferred"
-        );
-        assert!(app.restored_agent_attaches.is_empty());
-        drop(app.qualify_startup_terminals());
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches.len(), 2);
-        assert_eq!(app.startup_pane_check(), Ok(false));
-        let CardKind::Terminal(first) = &terminals[0].kind else {
-            unreachable!()
-        };
-        drop(app.update(Message::RestoredAgentAttached {
-            card: terminals[0].id,
-            terminal: first.id,
-            result: Ok(None),
-        }));
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            1,
-            "one next attach uses the existing bounded queue"
-        );
-        assert_eq!(app.restored_agent_attaches.len(), 1);
-        assert_ne!(
-            app.startup_pane_check(),
-            Ok(true),
-            "unattached owners never qualify"
-        );
+        for card in &terminals {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_ne!(
+                app.startup_pane_check(),
+                Ok(true),
+                "pending inspection cannot qualify"
+            );
+            saved_terminal::tests::complete_inspection(&mut app, card.id, Ok(None));
+            assert!(app.saved_terminal_ready(card.id));
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+        }
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert_eq!(app.startup_pane_check(), Ok(true));
     }
 
     #[test]
@@ -27708,6 +27916,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
@@ -27848,6 +28057,62 @@ mod tests {
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn fresh_editor_load_returns_keyboard_without_saved_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "fresh source\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        // This is the public action emitted after sidebar navigation resolves
+        // its file list, without saved caret or viewport metadata.
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        let placeholder = app.card_header_widget_id(pane);
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tasks = Vec::new();
+        let mut completed_read = false;
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            completed_read,
+            "the actual file worker must answer the open"
+        );
+        let initial = iced::widget::operation::focus(placeholder).map(cosmic::Action::App);
+        assert_eq!(
+            focused(&app, initial.chain(Task::batch(tasks))),
+            Some(repository_widget::editor_focus_id(pane)),
+            "a freshly opened editor must receive typing without a body click"
         );
     }
 
@@ -28294,6 +28559,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -28372,6 +28638,7 @@ mod tests {
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -30236,8 +30503,8 @@ mod tests {
             "Scroll size must be 1–10 lines."
         );
         assert_eq!(
-            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
-            "Scrollback must be 0–1,000,000 lines."
+            refusal(SettingsField::TerminalScrollbackMib, "1025"),
+            "Scrollback must be 0–1,024 MiB."
         );
         assert_eq!(
             refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),

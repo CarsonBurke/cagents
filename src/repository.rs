@@ -7390,7 +7390,11 @@ mod tests {
                     cancellation: &CancellationToken,
                 ) -> Result<ProcessOutput, ProcessFailure> {
                     let output = IsolatedExecutor.execute(command, cancellation)?;
-                    if command.arguments.iter().any(|argument| argument == "ls-files") {
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "ls-files")
+                    {
                         assert!(output.success);
                         assert!(output.stdout.is_empty(), "the original index is empty");
                         fs::rename(&self.root, &self.parked).unwrap();
@@ -10594,7 +10598,8 @@ mod tests {
         let index = parse_index_paths(index.as_bytes()).unwrap();
         assert_eq!(
             index.paths,
-            ["conflict.rs", "src/main.rs", "vendor/library"].map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
+            ["conflict.rs", "src/main.rs", "vendor/library"]
+                .map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
         );
         assert!(index.gitlinks);
         assert!(!parse_index_paths(b"").unwrap().gitlinks);
