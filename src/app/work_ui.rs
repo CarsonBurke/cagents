@@ -234,6 +234,7 @@ mod tests {
 
     fn watch_recipes(app: &Cagents) -> Vec<u64> {
         iced::advanced::subscription::into_recipes(app.work_subscription())
+            .into_iter()
             .map(|recipe| {
                 let mut hash = iced::advanced::subscription::Hasher::default();
                 recipe.hash(&mut hash);
@@ -262,6 +263,7 @@ mod tests {
 
         // No subscription tracking occurs between these real close/reopen
         // transitions, as when Iced drains both from one message batch.
+        app.workspace.request_close(work).unwrap();
         drop(app.commit_card_removal(work, None).unwrap());
         assert!(watch_recipes(&app).is_empty());
         drop(app.open_utility_card(CardKind::Work));
