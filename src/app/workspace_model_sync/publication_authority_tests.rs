@@ -2560,3 +2560,114 @@ fn current_or_bootstrap_model_reply_preserves_read_and_reopen_acknowledgement_be
         assert!(take_creation_publications(&requests).is_empty());
     }
 }
+
+#[test]
+fn bootstrap_channel_ack_binds_registry_before_saved_registry_reconnect_and_keeps_terminal_choice()
+{
+    use crate::app::{CardRuntime, Message};
+    let (_directory, mut app, _project, channel, repository, requests) = creation_fixture();
+    assert_eq!(
+        app.workspace_model.identity,
+        crate::workspace_model::NO_REGISTRY
+    );
+    let saved_registry = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 1,
+        ..WorkspaceModel::default()
+    };
+    let durable = std::sync::Arc::make_mut(&mut app.durable);
+    durable.workspace_model_identity = Some(saved_registry.identity);
+    let local = durable
+        .channels
+        .iter_mut()
+        .find(|local| local.id == channel)
+        .unwrap();
+    local.shared = true;
+    let card = local.cards[0];
+    write_creation_draft(&mut app, card, "Keep the saved-registry bootstrap draft");
+    let queued = take_creation_publications(&requests);
+    let create = queued
+        .into_iter()
+        .find(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+        .unwrap();
+    let acknowledged = channel_publication_model(
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 7,
+            ..WorkspaceModel::default()
+        },
+        &create,
+    );
+    assert_ne!(acknowledged.identity, saved_registry.identity);
+    let ack = framed_channel_publication_ack(create, acknowledged.clone());
+    let deferred_terminal = repository.join("pre-registry-terminal-choice");
+    assert_ne!(app.active_workspace.as_ref(), Some(&deferred_terminal));
+    app.shared_views.deferred_default = Some(deferred_terminal.clone());
+    let cards = app.durable.cards.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    let focused = app.workspace.focused();
+    let runtime_before = match &app.cards[&card] {
+        CardRuntime::Chat(runtime) => (
+            std::ptr::from_ref(&**runtime) as usize,
+            runtime.session.clone(),
+            runtime.target,
+        ),
+        _ => panic!("saved conversation runtime missing"),
+    };
+    // This ACK precedes the observer's first connection. It must replace saved
+    // registry custody, so a later Connected(saved B) really performs a join
+    // rather than retaining the sharing claim just established by A.
+    drop(app.update(Message::WorkspaceModelObserved(ack)));
+    let registry_after_ack = app.durable.workspace_model_identity;
+    let shared_after_ack = app
+        .durable
+        .channels
+        .iter()
+        .any(|local| local.id == channel && local.shared);
+    // Capture this before Connected/reconciliation can legitimately consume it.
+    let terminal_choice_after_ack = app.shared_views.deferred_default.clone();
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            saved_registry.clone(),
+        ))),
+    );
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            saved_registry.clone(),
+        ))),
+    );
+    assert_eq!(registry_after_ack, Some(acknowledged.identity));
+    assert!(shared_after_ack);
+    assert_eq!(
+        terminal_choice_after_ack,
+        Some(deferred_terminal),
+        "bootstrap admission must preserve the real deferred terminal choice until ordinary reconciliation"
+    );
+    assert_eq!(app.workspace_model, saved_registry);
+    assert_eq!(
+        app.durable.workspace_model_identity,
+        Some(app.workspace_model.identity)
+    );
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    let local = app
+        .durable
+        .channels
+        .iter()
+        .find(|local| local.id == channel)
+        .expect("the current registry has never admitted this local channel");
+    assert!(!local.shared && local.cards.contains(&card));
+    assert_eq!(app.durable.active_channel, Some(channel));
+    assert_eq!(app.workspace.focused(), focused);
+    assert_eq!(app.durable.cards, cards);
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    let runtime_after = match &app.cards[&card] {
+        CardRuntime::Chat(runtime) => (
+            std::ptr::from_ref(&**runtime) as usize,
+            runtime.session.clone(),
+            runtime.target,
+        ),
+        _ => panic!("the original saved conversation runtime must survive"),
+    };
+    assert_eq!(runtime_after, runtime_before);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+}
