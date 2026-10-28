@@ -525,8 +525,10 @@ pub fn layer<'a, Message: 'a>(
     })
 }
 
-/// Retain the base tree while a pane-local chooser owns input and accessibility.
-/// A stable second slot prevents opening/closing it from replacing the transcript.
+/// Retain the base tree while a pane-local chooser owns input, accessibility
+/// and drawing. A stable second slot prevents opening/closing it from replacing
+/// the transcript, and nothing of the base, such as a scrollbar beside a
+/// narrower chooser, shows or answers the pointer while it is covered.
 pub fn exclusive_layer<'a, Message: 'a>(
     base: Element<'a, Message>,
     front: Option<Element<'a, Message>>,
@@ -670,6 +672,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                     .rev()
                     .map(|child| child.with_virtual_offset(layout.virtual_offset())),
             )
+            .take(if self.front_exclusive { 1 } else { 2 })
             .map(|((child, tree), layout)| {
                 child
                     .as_widget()
@@ -696,26 +699,28 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             .map(|child| child.with_virtual_offset(layout.virtual_offset()));
         let base = layouts.next().expect("base layer");
         let front = layouts.next().expect("front layer");
-        let front_active = self.children[1].as_widget().mouse_interaction(
-            &tree.children[1],
-            front,
-            cursor,
-            viewport,
-            renderer,
-        ) != mouse::Interaction::None;
-        self.children[0].as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            base,
-            if front_active {
-                mouse::Cursor::Unavailable
-            } else {
-                cursor
-            },
-            viewport,
-        );
+        if !self.front_exclusive {
+            let front_active = self.children[1].as_widget().mouse_interaction(
+                &tree.children[1],
+                front,
+                cursor,
+                viewport,
+                renderer,
+            ) != mouse::Interaction::None;
+            self.children[0].as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                base,
+                if front_active {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                },
+                viewport,
+            );
+        }
         let front_viewport = if self.front_exclusive {
             layout.bounds().intersection(viewport).unwrap_or_default()
         } else {
@@ -1924,6 +1929,51 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_exclusive_chooser_narrower_than_its_base_hides_the_base_from_the_pointer() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let bounds = Rectangle::with_size(Size::new(400.0, 200.0));
+        // Only the gutter beside the narrower chooser lies over the base.
+        let gutter = mouse::Cursor::Available(Point::new(390.0, 100.0));
+        for (front, expected) in [
+            (None, mouse::Interaction::Pointer),
+            (
+                Some(
+                    widget::container(cosmic::iced::widget::Space::new())
+                        .width(300)
+                        .height(Length::Fill)
+                        .into(),
+                ),
+                mouse::Interaction::None,
+            ),
+        ] {
+            let mut element: Element<'_, u8> = exclusive_layer(
+                widget::button::custom(cosmic::iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .on_press(1)
+                    .into(),
+                front,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            assert_eq!(
+                element.as_widget().mouse_interaction(
+                    &tree,
+                    Layout::new(&node),
+                    gutter,
+                    &bounds,
+                    &renderer,
+                ),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn font_zoom_accepts_layout_variants_without_claiming_typing() {
         use cosmic::iced::keyboard::{
