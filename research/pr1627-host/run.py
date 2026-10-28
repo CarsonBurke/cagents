@@ -211,12 +211,17 @@ def checkout(label):
 
 def main():
     global MANIFEST, contract, BEGIN, DEADLINE
+    role_names = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
+    inherited_names = frozenset(os.environ)
+    present = [name for name in role_names if name in inherited_names]
+    if present:
+        say("Refusing inherited agent role markers: " + ", ".join(present))
+        raise SystemExit(1)
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda number, _frame: CANCEL.append(number))
     assert os.environ.get("GITHUB_ACTIONS") == "true", "hosted research only; no local launch admission"
     assert os.environ.get("CARGO_BUILD_JOBS") == "2"
     assert os.environ.get("RUSTUP_TOOLCHAIN") == "1.93.0"
-    assert "CAGENTS_AGENT_AUTHORITY" not in os.environ, "natural-User hosted caller required; never remove inherited authority"
     for name in ("CAGENTS_NATIVE_UI_FIXTURE", "CAGENTS_LATENCY_OUTPUT", "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                  "CAGENTS_PR_FIXTURE_CASE", "CAGENTS_NATIVE_DIRECTORY_EXIT_TEST"):
         assert name not in os.environ, "unexpected ambient fixture/helper selection"
@@ -251,8 +256,8 @@ def main():
         "research_tree": git("rev-parse", "HEAD^{tree}"), "manifest_sha256": digest(HERE / "manifest.json"),
         "absolute_budget_seconds": TOTAL_SECONDS, "setup_and_preflight_elapsed_seconds": now - BEGIN,
         "remaining_seconds_at_harness_start": max(0, DEADLINE - now),
-        "authority_present": "CAGENTS_AGENT_AUTHORITY" in os.environ,
-        "authority": "naturally absent; no value read, removed, or fabricated", "claims": "HOST compiler and six owning parent tests plus one same-test privacy negative only"})
+        "agent_role_marker_names_present": present,
+        "authority": "all three role markers naturally absent; names enumerated only; values never read, removed, or fabricated", "claims": "HOST compiler and six owning parent tests plus one same-test privacy negative only"})
     summary("PR1627 HOST qualification. Actual native error-display/provider UI qualification remains pending.\n")
     passed = True
     after, pin = checkout("after")

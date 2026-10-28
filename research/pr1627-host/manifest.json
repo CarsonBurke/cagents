@@ -37,8 +37,8 @@
   "baseline_policy": "Exact0e HOST bincheck and lib artifact plus all six positives must pass before b1 same-test privacy negative. Negative requires actual101, exact owning failure, final0P1F, and specific credential-canary assertion. No timeout/compile failure/generic parent panic accepted.",
   "observer_sha256": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a",
   "kernel_contract_sha256": "9c96ff05c61969383dd0781dc2761fb08c15e5e5977a44d20b72edbf3fd8fa53",
-  "harness_sha256": "f310a4bbf2f6f430ecf977e7a9c33c72bec08f6ee6ba787b28536519ee693314",
-  "workflow_sha256": "dcdb1abfa29ec3f4254dae1732fee701d8b9e06ba68a205b81ea47ac48f88ac8",
+  "harness_sha256": "da8fa345f7a1259560ca69d714c7392bc40b6aa8eda255cb23211c15e02709e8",
+  "workflow_sha256": "72c29bb8400600ce7ef17fd58764d401663ff913f40099813260b4cd49d4298f",
   "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
   "qualified_setup_source": {
     "head": "1633e661dae18dc2faf8c876b4fae00469ad2a8b",
@@ -55,8 +55,8 @@
     "copied_source": "Exact bb1 observer and six-function kernel closure contract from independently reviewed native1881 CI research; no local B admission imported"
   },
   "caller_and_helper_contract": {
-    "route": "Dedicated hosted ubuntu22 runner, naturally absent CAGENTS_AGENT_AUTHORITY required; refusal before any Cargo/actor if present",
-    "environment": "Parent/observer/test environment copied unchanged; HOME, authority, no-start and account selections never cleared/rewritten by research code. Production synthetic Spawn.command itself env_clear is existing source under test.",
+    "route": "Dedicated hosted ubuntu22 runner: all of CAGENTS_AGENT_AUTHORITY, CAGENTS_AGENT_TOKEN and CAGENTS_SESSION_TOKEN must be naturally absent. First workflow step rejects presence before budget/environment files, checkout/setup or private runtime; harness repeats before child/Cargo/actor work. Names-only enumeration covers empty and non-Unicode values without inspecting them.",
+    "environment": "Parent/observer/test environment inherited unchanged. Presence guards enumerate names only and never read, log, hash, clear or replace any of the three role-marker values. HOME, no-start and account selections are never rewritten by research code. Production synthetic Spawn.command itself env_clear is existing source under test.",
     "actor_preflight": "This exact older source has no Authority check in HostLease::acquire or native transport spawn/.init_array; local Agent actor execution is not claimed permissible. Account authorize_command examines only explicit nonsecret provider-home path selections; fixtures supply none.",
     "helper": "Same freshly compiled HOST libtest /proc/self/exe --cagents-native-holder with .init_array handler, private native protocol3. Not installed helper/cagentsd and not public IPC. Diagnostic capability provider-exit-diagnostics required; absent capability refusal asserted in flood/adoption positive.",
     "platform": "Linux pidfd/waitid/signalfd/subreaper/proc and Unix domain peer credentials required; /usr/bin/python3 and /bin/sh synthetic children only; private HostLease/runtime proofs; no external provider/network/credential access intended.",
@@ -69,6 +69,13 @@
     "Full raw stderr log direct-stdio issue1584/PR1585 is separate; this bounded native tail does not close1584",
     "PR1627 body update rejected once and will not be retried through any route",
     "Fresh native collapsed/expanded error details, copy, narrow layout, exact Close and continued-use evidence still required; no existing native evidence found",
-    "No authority bytes read/logged/hashed; presence check only; no User marker fabricated"
-  ]
+    "No role-marker values read/logged/hashed/removed/replaced; all three names checked by key enumeration only; empty and non-Unicode values refuse; no User marker fabricated"
+  ],
+  "source_successor_provenance": {
+    "preserved_parent_head": "da795671c7b210ddb7c110df056918fb13a940fb",
+    "preserved_parent_tree": "f238f9c62088735445215b37352e5bc3865024b3",
+    "finding": "Lead found admission checked only CAGENTS_AGENT_AUTHORITY and first workflow step did not reject inherited role markers before setup. Real qualification source blocker; prior review does not qualify successor.",
+    "correction": "Reject presence of all3 named role markers in first workflow step before any budget/env write/checkout/setup, and repeat same names-only refusal at harness main entry. Product0e/b1, setup, observer, kernel closure, selectors, budget and phase loop conserved.",
+    "status": "Fresh whole final composition review required from same sole independent reviewer; no public write or execution granted"
+  }
 }

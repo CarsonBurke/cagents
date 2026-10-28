@@ -46,10 +46,21 @@ result. No numeric PID/PPID ownership assumption or local B admission is used.
 
 ## Caller, helper and environment
 
-The harness admits only a dedicated hosted runner where
-`CAGENTS_AGENT_AUTHORITY` is naturally absent. If it is present, the harness
-refuses before Cargo or actors. It never reads, hashes, removes or fabricates an
-authority value, nor rewrites HOME, no-start or account selections.
+The first workflow step admits only a dedicated hosted runner where
+`CAGENTS_AGENT_AUTHORITY`, `CAGENTS_AGENT_TOKEN` and `CAGENTS_SESSION_TOKEN`
+are all naturally absent. It enumerates environment names only, so an empty or
+non-Unicode value still causes refusal, with marker names as the only diagnostic.
+This check precedes budget-file/environment writes, checkout, toolchain setup
+and private runtime setup. The harness repeats the same three-name refusal
+before any child, source checkout, observer, Cargo or actor work. Neither check
+reads, hashes, removes or replaces a role-marker value, nor rewrites HOME,
+no-start or account selections.
+
+The first frozen research head `da795671` checked only authority and did so too
+late to guard setup; the lead found this real admission gap before publication.
+That head and its source-only review remain preserved. This normal private
+successor requires fresh whole-composition review; its earlier source clearance
+does not approve this revision.
 
 This older exact source has no caller-scope preflight in HostLease acquire or
 native transport spawn. Its test actors therefore are not authorized for local

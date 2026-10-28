@@ -21,12 +21,18 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - name: Record the absolute budget before checkout or setup
+      - name: Require a genuine User caller and record the budget before setup
         shell: bash
         run: |
           /usr/bin/python3 -I -B - <<'PY'
-          import json, os, time
+          import json, os, sys, time
           from pathlib import Path
+          role_names = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
+          inherited_names = frozenset(os.environ)
+          present = [name for name in role_names if name in inherited_names]
+          if present:
+              print("Refusing inherited agent role markers: " + ", ".join(present), file=sys.stderr)
+              raise SystemExit(1)
           start = time.monotonic()
           deadline = start + 3000
           record = {"earliest_step_monotonic": start, "deadline_monotonic": deadline,
