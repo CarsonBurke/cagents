@@ -720,6 +720,15 @@ impl Codex {
         }
     }
 
+    fn selection_is_applied(&self) -> bool {
+        self.applied_selection
+            .as_ref()
+            .is_some_and(|(model, reasoning)| {
+                self.selected.as_ref() == Some(model)
+                    && (self.reasoning.is_none() || &self.reasoning == reasoning)
+            })
+    }
+
     fn request_goal(
         &mut self,
         step: &mut Step,
@@ -741,10 +750,7 @@ impl Codex {
         if selects_work && applied.is_none() {
             return Err("The original provider model settings are unconfirmed. Reconnect before requesting native Goal work; your input is kept.".into());
         }
-        let already_applied = applied.as_ref().is_some_and(|(model, reasoning)| {
-            self.selected.as_ref() == Some(model)
-                && (self.reasoning.is_none() || &self.reasoning == reasoning)
-        });
+        let already_applied = self.selection_is_applied();
         // Check transport capacity before reserving the domain's physical slot.
         // No fallible transport allocation remains after begin_for succeeds.
         if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
@@ -780,6 +786,10 @@ impl Codex {
                 settings,
                 Pending::GoalSettings,
             )?;
+            // Once a changed selection can execute, the old actual pair is
+            // no longer proof. A lost application notice must not let a later
+            // request reuse it after this local Goal intent has expired.
+            self.applied_selection = None;
         } else {
             if selects_work {
                 // Providers may suppress unchanged settings notifications. A
@@ -2049,9 +2059,11 @@ impl Adapter for Codex {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
+                        let changes_selection = self.selection_dirty && !self.selection_is_applied();
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        if changes_selection { self.applied_selection = None; }
                         self.notification_turn = None;
                         step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
@@ -2126,6 +2138,9 @@ impl Adapter for Codex {
                     enabled, revision: self.service_tier_revision,
                     model: self.selection_dirty.then(|| self.selected.clone()).flatten(),
                 })?;
+                if self.selection_dirty && !self.selection_is_applied() {
+                    self.applied_selection = None;
+                }
             }
             Command::SetPermissionMode { mode } => {
                 if !self.direct_input || self.busy {

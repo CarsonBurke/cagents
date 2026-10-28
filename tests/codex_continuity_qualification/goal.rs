@@ -529,8 +529,9 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     let resume_baseline_items: BTreeSet<_> =
         settled.items.iter().map(|item| item.id.clone()).collect();
     // Public effort:null preserves the provider's current effort. Stage an
-    // unspecified choice and require the applied notification to restore its
-    // actual value before autonomous Resume, rather than pretending it cleared.
+    // unspecified choice and reuse the coherent actual provider observation
+    // before autonomous Resume, rather than waiting for a deduplicated notice
+    // or pretending that the public null cleared the effort.
     assert!(matches!(
         window.request(ClientRequest::ChatCommand {
             chat_id: chat.id,

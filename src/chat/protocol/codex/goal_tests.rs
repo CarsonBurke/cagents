@@ -51,11 +51,18 @@ fn select_goal_model(adapter: &mut Codex) {
     adapter.receive(json!({"method":"thread/settings/updated","params":{
         "threadId":"thread-exact","threadSettings":{"model":"provider-default","effort":"medium"}
     }})).unwrap();
-    adapter.models = vec![Model {
-        id: "explicit-goal-model".into(),
-        label: "Explicit Goal model".into(),
-        reasoning: vec!["low".into()],
-    }];
+    adapter.models = vec![
+        Model {
+            id: "provider-default".into(),
+            label: "Original model".into(),
+            reasoning: vec!["medium".into()],
+        },
+        Model {
+            id: "explicit-goal-model".into(),
+            label: "Explicit Goal model".into(),
+            reasoning: vec!["low".into()],
+        },
+    ];
     let selected = adapter
         .command(Command::SetModel {
             model: "explicit-goal-model".into(),
@@ -176,9 +183,9 @@ fn settings_ack_waits_for_actual_application_and_unspecified_effort_preserves_pr
                 "an absent or invalid thread witness cannot authorize Goal work"
             );
             assert!(snapshot(&mut adapter).pending);
-            assert_eq!(
-                adapter.applied_selection.as_ref().unwrap().0,
-                "provider-default"
+            assert!(
+                adapter.applied_selection.is_none(),
+                "an unbound notice cannot replace unknown application proof"
             );
         }
         let applied = adapter.receive(json!({"method":"thread/settings/updated","params":{
@@ -348,6 +355,92 @@ fn missing_applied_observation_expires_only_after_ack_and_late_notice_cannot_rep
         snapshot(&mut adapter).pending,
         "an old deadline cannot retire a newer physical Goal RPC"
     );
+}
+
+#[test]
+fn lost_settings_notice_cannot_reuse_the_previous_model_proof_after_goal_expiry() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    let settings = command(
+        &mut adapter,
+        Operation::SetObjective("Original request".into()),
+    );
+    assert!(adapter.applied_selection.is_none());
+    adapter
+        .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+        .unwrap();
+    let deadline = adapter.next_deadline().unwrap();
+    adapter.on_deadline(deadline).unwrap();
+    // Core may already have applied the new model even when its notice was
+    // dropped. Check only reconciles Goal state; it cannot prove the old model.
+    let check = command(&mut adapter, Operation::Get);
+    adapter
+        .receive(json!({"id":check.writes[0]["id"],"result":{"goal":null}}))
+        .unwrap();
+    adapter
+        .command(Command::SetModel {
+            model: "provider-default".into(),
+            reasoning: Some("medium".into()),
+        })
+        .unwrap();
+    let current = snapshot(&mut adapter);
+    let error = adapter
+        .command(Command::Goal {
+            thread_id: current.thread_id,
+            revision: current.revision,
+            operation: Operation::Resume,
+        })
+        .unwrap_err();
+    assert!(error.contains("provider model settings are unconfirmed"));
+    assert!(
+        !snapshot(&mut adapter).pending,
+        "unknown application cannot create another waiting Goal"
+    );
+    let late = adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    assert!(
+        late.writes.is_empty(),
+        "the expired original request stays retired"
+    );
+    let retry = command(&mut adapter, Operation::Resume);
+    assert_eq!(
+        retry.writes[0]["method"], "thread/settings/update",
+        "the user's newly selected original model must actually be applied again"
+    );
+    assert_eq!(retry.writes[0]["params"]["model"], "provider-default");
+}
+
+#[test]
+fn model_changing_turn_and_fast_requests_invalidate_only_changed_application_proof() {
+    for fast in [false, true] {
+        for already_applied in [false, true] {
+            let mut adapter = adapter();
+            select_goal_model(&mut adapter);
+            if already_applied {
+                adapter.receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+                }})).unwrap();
+            }
+            let request = if fast {
+                adapter.fast_models.insert("explicit-goal-model".into());
+                Command::SetFastMode { enabled: true }
+            } else {
+                Command::Prompt {
+                    text: "ordinary explicit prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                }
+            };
+            let issued = adapter.command(request).unwrap();
+            assert_eq!(issued.writes.len(), 1);
+            assert_eq!(
+                adapter.applied_selection.is_some(),
+                already_applied,
+                "only a genuinely unchanged selection can retain its actual application proof"
+            );
+        }
+    }
 }
 
 #[test]
