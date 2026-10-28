@@ -54,9 +54,11 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`), and only while the main
-window is focused. An unfocused window shows each spinner at rest and requests
-no frames. Measure the UI process with one busy agent on screen:
+`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+focused. An unfocused window may still be in view, so its spinners keep turning,
+but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
+advance one focused step per frame. Measure the UI process with one busy agent
+on screen:
 
 1. Run `scripts/run-development --browserless` without `--debug` in a nested
    session, using the isolated environment from
@@ -76,7 +78,7 @@ Each row reports 20 s samples, as a percentage of one core:
 | State | Before (`c07b6f78e`) | After |
 | --- | --- | --- |
 | One busy agent, window focused | 11.1-12.6% (73-86 wakeups/s) | 4.1-4.2% (30-34 wakeups/s) |
-| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | 1.0-1.6% (3 wakeups/s) |
+| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | not yet measured at the 500 ms cadence |
 | Agent interrupted, window focused | not measured | 1.6% (7 wakeups/s) |
 
 Two changes produced the focused result. At the 100 ms cadence alone, the UI
@@ -86,7 +88,9 @@ polled with a zero timeout until that deadline arrived (about 630
 `epoll_pwait` calls per second). The vendored `iced-winit` now replaces an
 elapsed deadline with the requested one; see `vendor/iced-winit/README.cagents.md`.
 Each remaining step still repaints the whole window, which is why a busy
-agent still costs about 3% of a core above idle in this build.
+agent still costs about 3% of a core above idle in this build. An earlier
+revision that stopped unfocused spinners entirely, instead of slowing them,
+measured 1.0-1.6% with another window focused (3 wakeups/s).
 
 ## Native chat stage attribution
 

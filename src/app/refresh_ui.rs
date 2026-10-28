@@ -409,10 +409,10 @@ mod tests {
         projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
     }
 
-    /// Spinners follow the main window's focus and nothing else: another
-    /// window's focus changes must neither stop nor restart them.
+    /// Spinners take their cadence from the main window's focus and nothing
+    /// else: another window's focus changes must neither slow nor restore it.
     #[test]
-    fn activity_spinners_animate_only_while_the_main_window_is_focused() {
+    fn activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let main = window::Id::RESERVED;
         app.core.set_main_window_id(Some(main));

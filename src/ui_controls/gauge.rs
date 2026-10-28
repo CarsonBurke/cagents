@@ -26,9 +26,29 @@ const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(100)
 // toward display refresh.
 const _: () = assert!(SPINNER_FRAME.as_millis() >= 100);
 
+/// How often a spinner asks for a frame while its window is unfocused.
+///
+/// An unfocused window is often still in view, on a second monitor or tiled
+/// beside a terminal, and a spinner that stopped there would read as a hung
+/// agent. It keeps moving at a fraction of the focused frame rate instead,
+/// and turns slower by the same factor, [`BACKGROUND_SLOWDOWN`], so each step
+/// is still one focused step rather than a jump of nearly half a turn.
+const SPINNER_BACKGROUND_FRAME: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many times slower an unfocused spinner turns.
+const BACKGROUND_SLOWDOWN: u32 =
+    (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_FRAME.as_millis()) as u32;
+
+// A whole multiple keeps each background step exactly one focused step.
+const _: () = assert!(
+    SPINNER_BACKGROUND_FRAME.as_millis() % SPINNER_FRAME.as_millis() == 0
+        && BACKGROUND_SLOWDOWN > 1
+);
+
 std::thread_local! {
-    /// Whether spinners may ask for frames at all: true only while the
-    /// window they are drawn in is focused.
+    /// Whether spinners step at the focused cadence: true only while the
+    /// window they are drawn in is focused. Until the first focus event they
+    /// use the slower background cadence.
     ///
     /// This is the window's state rather than any one spinner's, because a
     /// spinner mounted while the window is in the background has never seen
@@ -42,11 +62,13 @@ std::thread_local! {
 /// Tell every activity spinner whether its window is focused.
 ///
 /// The application calls this for its main window's focus changes; spinners
-/// are drawn only there. While unfocused, spinners hold a resting arc and ask
-/// for no frames, so a background window with agents working costs nothing
-/// to keep up to date. A window that is minimized, on another workspace or
-/// behind a lock screen has lost focus too. Regaining focus resumes them on
-/// the redraw that follows the application's update.
+/// are drawn only there. While unfocused, spinners turn slowly and ask for a
+/// frame every [`SPINNER_BACKGROUND_FRAME`]. A background window with agents
+/// working still repaints, but [`BACKGROUND_SLOWDOWN`] times less often. A
+/// window that is minimized, on another workspace or behind a lock screen has
+/// lost focus too, and the compositor's frame callbacks may throttle it
+/// further. Regaining focus restores the full cadence on the redraw that
+/// follows the application's update.
 pub fn animate_activity(focused: bool) {
     ANIMATE_ACTIVITY.set(focused);
 }
@@ -129,8 +151,8 @@ struct ActivitySpinner {
 #[derive(Default)]
 struct SpinnerState {
     /// Time since [`SPINNER_EPOCH`] as of the last frame, kept here because
-    /// `draw` is handed no clock of its own. Zero is the resting arc an
-    /// unfocused window shows.
+    /// `draw` is handed no clock of its own. While the window is unfocused
+    /// this is that time slowed by [`BACKGROUND_SLOWDOWN`].
     elapsed: std::time::Duration,
 }
 
@@ -185,19 +207,19 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
             event
         {
             let state = tree.state.downcast_mut::<SpinnerState>();
-            // An unfocused window still redraws when its content changes,
-            // and a spinner that advanced on those redraws would twitch at
-            // whatever rate an agent happens to stream. It rests instead,
-            // the same arc for every spinner however long it was mounted.
-            if !ANIMATE_ACTIVITY.get() {
-                state.elapsed = std::time::Duration::ZERO;
-                return;
-            }
-            state.elapsed = now.saturating_duration_since(*SPINNER_EPOCH);
+            let since = now.saturating_duration_since(*SPINNER_EPOCH);
             // A redraw repaints the whole window, so the arc is stepped at a
             // fixed cadence instead of holding the window at display refresh
-            // for as long as any agent is working.
-            shell.request_redraw_at(*now + SPINNER_FRAME);
+            // for as long as any agent is working. An unfocused window steps
+            // it slower still. The angle stays a function of the shared epoch,
+            // so every spinner in the window still draws the same arc.
+            let (elapsed, frame) = if ANIMATE_ACTIVITY.get() {
+                (since, SPINNER_FRAME)
+            } else {
+                (since / BACKGROUND_SLOWDOWN, SPINNER_BACKGROUND_FRAME)
+            };
+            state.elapsed = elapsed;
+            shell.request_redraw_at(*now + frame);
         }
     }
 
@@ -619,12 +641,13 @@ mod tests {
         assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
     }
 
-    /// A window in the background with agents working must cost nothing:
-    /// its spinners stop asking for frames and rest, whether they were
-    /// turning when focus left or were mounted after it did, and turn again
-    /// on the first redraw once the window has focus back.
+    /// An unfocused window may still be in view, so its spinners keep moving,
+    /// but slowly: one frame every background cadence, each advancing the arc
+    /// by one focused step. That holds whether a spinner was turning when focus
+    /// left or was mounted after it did, and the full cadence returns on the
+    /// first redraw once the window has focus back.
     #[test]
-    fn an_unfocused_window_rests_its_spinners_until_focus_returns() {
+    fn an_unfocused_window_turns_its_spinners_slowly_until_focus_returns() {
         use cosmic::iced::{Point, window};
 
         let origin = Point::new(8.0, 8.0);
@@ -636,23 +659,37 @@ mod tests {
         animate_activity(false);
         // The frame the spinner had already asked for still arrives.
         let later = half_turn() + SPINNER_FRAME;
-        assert_eq!(
-            redraw(&mut turning, &mut turning_tree, origin, later),
-            (window::RedrawRequest::Wait, Duration::ZERO),
-            "a spinner kept turning in an unfocused window"
-        );
         let (mut fresh, mut fresh_tree) = mounted();
-        assert_eq!(
-            redraw(&mut fresh, &mut fresh_tree, origin, later),
-            (window::RedrawRequest::Wait, Duration::ZERO),
-            "a spinner mounted in an unfocused window started turning"
-        );
+        for (element, tree) in [(&mut turning, &mut turning_tree), (&mut fresh, &mut fresh_tree)] {
+            let (request, slow) = redraw(element, tree, origin, later);
+            assert_eq!(
+                request,
+                window::RedrawRequest::At(later + SPINNER_BACKGROUND_FRAME),
+                "an unfocused spinner kept the focused cadence or stopped"
+            );
+            let next = later + SPINNER_BACKGROUND_FRAME;
+            let (request, stepped) = redraw(element, tree, origin, next);
+            assert_eq!(
+                request,
+                window::RedrawRequest::At(next + SPINNER_BACKGROUND_FRAME)
+            );
+            assert_eq!(
+                stepped - slow,
+                SPINNER_FRAME,
+                "one background frame should advance the arc by one focused step"
+            );
+        }
 
         animate_activity(true);
+        let resumed = later + SPINNER_BACKGROUND_FRAME * 2;
         for (element, tree) in [(&mut turning, &mut turning_tree), (&mut fresh, &mut fresh_tree)] {
-            let (request, elapsed) = redraw(element, tree, origin, later);
-            assert_eq!(request, window::RedrawRequest::At(later + SPINNER_FRAME));
-            assert_ne!(elapsed, Duration::ZERO, "the arc did not resume");
+            let (request, elapsed) = redraw(element, tree, origin, resumed);
+            assert_eq!(request, window::RedrawRequest::At(resumed + SPINNER_FRAME));
+            assert_eq!(
+                elapsed,
+                resumed.saturating_duration_since(*SPINNER_EPOCH),
+                "a refocused spinner did not return to the shared full-speed arc"
+            );
         }
     }
 
