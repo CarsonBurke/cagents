@@ -336,6 +336,7 @@ pub enum Action {
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
     ConfirmRemove,
+    CleanupStart(ProjectId, uuid::Uuid),
     RemovedProject {
         origin: RemovalOrigin,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
@@ -845,6 +846,11 @@ impl Cagents {
             let Some(row) = self.sidebar_model.project(project) else {
                 return Task::none();
             };
+            if let Some(reason) = self.project_start_custody_blocker(project) {
+                self.project_ui.close_failed.insert(project);
+                self.status = Some(TransientNotice::warning(reason));
+                return Task::none();
+            }
             let generation = self.project_ui.close_generation[&project];
             let repository = row.repository.clone();
             let kind = row.kind;
@@ -952,6 +958,57 @@ impl Cagents {
         }
     }
 
+    pub(super) fn project_owns_start_custody(
+        &self,
+        project: ProjectId,
+        entry: &crate::chat::start_custody::StartCustody,
+    ) -> bool {
+        if entry.project.is_some_and(|owner| owner != project) {
+            return false;
+        }
+        if let Some(channel) = entry.channel {
+            if self
+                .durable
+                .channels
+                .iter()
+                .find(|owner| owner.id == channel)
+                .is_none_or(|owner| owner.project_id != project)
+                && entry.project != Some(project)
+            {
+                return false;
+            }
+        }
+        let scope = self.project_session_scope(project);
+        let mut ownership = self.project_session_ownership(project);
+        if entry.project == Some(project) {
+            ownership.owned.insert(entry.source.id);
+        }
+        if let Some(directory) = &entry.directory {
+            ownership
+                .directories
+                .entry(entry.source.id)
+                .or_default()
+                .push(directory.clone());
+        }
+        if !ownership.contains(
+            entry.source.id,
+            &entry.source.launch.recipe.working_directory,
+            &scope,
+        ) {
+            return false;
+        }
+        if entry.project == Some(project) {
+            return true;
+        }
+        if entry.channel.is_some() {
+            return false;
+        }
+        entry.directory.as_deref().map_or_else(
+            || scope.contains(&entry.source.launch.recipe.working_directory),
+            |directory| scope.contains(directory),
+        )
+    }
+
     fn project_session_ownership(&self, project: ProjectId) -> ProjectSessionOwnership {
         let mut ownership = ProjectSessionOwnership {
             local_database: self
@@ -1012,6 +1069,13 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        if let Some(reason) = self.project_start_custody_blocker(id) {
+            self.project_ui.close_in_flight.remove(&id);
+            self.project_ui.close_cancellations.remove(&id);
+            self.project_ui.close_failed.insert(id);
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         // An accepted checkout can begin after session census but before this
         // callback. Keep its owner and the committed close pending until it settles.
         if let Some(reason) = self.project_review_checkout_blocker(id) {
@@ -1591,6 +1655,21 @@ impl Cagents {
                 }
                 return self.project_dialog_closed();
             }
+            Action::CleanupStart(project, operation) => {
+                if self
+                    .project_ui
+                    .remove_dialog
+                    .as_ref()
+                    .is_none_or(|dialog| dialog.project != project)
+                    || !self.unresolved_start_custody().any(|entry| {
+                        entry.operation == operation
+                            && self.project_owns_start_custody(project, entry)
+                    })
+                {
+                    return Task::none();
+                }
+                return self.retry_project_start_custody_operation(project, operation);
+            }
             Action::ConfirmRemove => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
                     return Task::none();
@@ -1635,6 +1714,11 @@ impl Cagents {
                 if let Some(reason) = self.project_review_checkout_blocker(removal.project) {
                     self.status = Some(TransientNotice::warning(reason));
                     return self.project_dialog_closed();
+                }
+                if let Some(reason) = self.project_start_custody_blocker(removal.project) {
+                    self.status = Some(TransientNotice::warning(reason));
+                    self.project_ui.remove_dialog = Some(removal);
+                    return Task::none();
                 }
                 if self.project_has_unsaved_editors(removal.project) {
                     self.status = Some(TransientNotice::warning(
@@ -2245,26 +2329,56 @@ impl Cagents {
                     if removal.channels == 1 { "" } else { "s" }
                 )
             };
+            let mut rows: Vec<Element<'_, Message>> = vec![
+                design::title("Remove project from cagents?").into(),
+                super::notice_body(&removal.name),
+                super::notice_detail(removal.repository.display().to_string()),
+                super::notice_body(detail),
+                super::notice_detail(match removal.kind {
+                    ProjectKind::Folder => {
+                        "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk."
+                    }
+                    ProjectKind::Git => {
+                        "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk."
+                    }
+                }),
+                super::dialog_ui::confirmation_actions(
+                    crate::ui_controls::button::secondary("Cancel")
+                        .id(widget::Id::new("dialog.project.remove.cancel"))
+                        .on_press(Message::ProjectUi(Action::Dismiss)),
+                    crate::ui_controls::button::destructive("Remove project")
+                        .id(widget::Id::new("dialog.project.remove.confirm"))
+                        .on_press(Message::ProjectUi(Action::ConfirmRemove)),
+                ),
+            ];
+            if let Some(entry) = self
+                .unresolved_start_custody()
+                .find(|entry| self.project_owns_start_custody(removal.project, entry))
+            {
+                let at = rows.len().saturating_sub(1);
+                rows.insert(at, super::notice_body("A previous conversation has not confirmed stopped. Its draft is kept. Close it before removing this project."));
+                if let Some(error) = &entry.failure {
+                    rows.insert(rows.len().saturating_sub(1), super::notice_detail(error));
+                }
+                let pending = self.start_custody_cleanup_pending(entry.operation);
+                let button = crate::ui_controls::button::secondary(if pending {
+                    "Closing previous conversation…"
+                } else {
+                    "Close previous conversation"
+                })
+                .id(widget::Id::new("dialog.project.cleanup"));
+                let button = if pending {
+                    button
+                } else {
+                    button.on_press(Message::ProjectUi(Action::CleanupStart(
+                        removal.project,
+                        entry.operation,
+                    )))
+                };
+                rows.insert(rows.len().saturating_sub(1), button.into());
+            }
             return Some(super::dialog_ui::surface(
-                widget::column::with_children(vec![
-                    design::title("Remove project from cagents?").into(),
-                    super::notice_body(&removal.name),
-                    super::notice_detail(removal.repository.display().to_string()),
-                    super::notice_body(detail),
-                    super::notice_detail(match removal.kind {
-                        ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
-                        ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
-                    }),
-                    super::dialog_ui::confirmation_actions(
-                        crate::ui_controls::button::secondary("Cancel")
-                            .id(widget::Id::new("dialog.project.remove.cancel"))
-                            .on_press(Message::ProjectUi(Action::Dismiss)),
-                        crate::ui_controls::button::destructive("Remove project")
-                            .id(widget::Id::new("dialog.project.remove.confirm"))
-                            .on_press(Message::ProjectUi(Action::ConfirmRemove)),
-                    ),
-                ])
-                .spacing(space::M),
+                widget::column::with_children(rows).spacing(space::M),
                 500.0,
             ));
         }

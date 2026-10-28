@@ -102,6 +102,8 @@ impl RestoreFixture {
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
             pending_chat_admissions: Default::default(),
+            native_start_custody: Default::default(),
+            released_native_starts: Default::default(),
             pending_terminal_creations: Default::default(),
             workspace_model_identity: None,
             cards: vec![

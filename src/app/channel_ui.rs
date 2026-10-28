@@ -5,9 +5,10 @@ use crate::workspace_model::ModelEdit;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
-mod session_close_authority_tests;
+pub(super) mod session_close_authority_tests;
 
 /// Original caller and workspace for one asynchronous session close.
+#[derive(Debug, Clone)]
 pub(super) struct SessionCloseContext {
     authority: crate::agent_execution::Authority,
     remote: bool,
@@ -21,6 +22,60 @@ impl SessionCloseContext {
             remote: crate::device::is_remote(),
             registry: (registry != crate::workspace_model::NO_REGISTRY).then_some(registry),
         }
+    }
+
+    pub(super) fn custody_caller(&self) -> Option<String> {
+        crate::chat::start_custody::caller_fingerprint(&self.authority)
+    }
+
+    pub(super) fn custody_registry(&self) -> Option<uuid::Uuid> {
+        self.registry
+    }
+
+    pub(super) fn admit_custody(
+        &self,
+        custody: &crate::chat::start_custody::StartCustody,
+    ) -> Result<(), String> {
+        self.admit_remote()?;
+        // Guarded first starts currently use the existing desktop User path.
+        // A restored User record must not turn a legacy inherited role input
+        // (which Authority::from_environment does not parse) into a User close.
+        if [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err("Conversation start cleanup requires its original desktop caller. No conversation was closed.".into());
+        }
+        if self.custody_caller() != custody.caller
+            || crate::chat::start_custody::device_key() != custody.device
+            || self.registry.is_none()
+            || self.registry != custody.registry
+        {
+            return Err("The original caller, workspace or device changed. Return to it to retry conversation cleanup.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn custody_connection(
+        &self,
+        custody: &crate::chat::start_custody::StartCustody,
+    ) -> Result<crate::control::ControlClient, String> {
+        self.admit_custody(custody)?;
+        let proof = custody
+            .destination
+            .as_ref()
+            .filter(|proof| proof.is_complete())
+            .ok_or("The original start destination was not recorded; cleanup remains protected")?;
+        let client = connect(&self.socket()?, self)?
+            .ok_or("Reconnect the original daemon to retry conversation cleanup")?;
+        if client.proof() != proof {
+            return Err("The original conversation daemon changed. Cleanup remains protected; no replacement was closed.".into());
+        }
+        Ok(client)
     }
 
     pub(super) fn scoped(&self) -> bool {
@@ -244,6 +299,7 @@ pub enum Action {
     /// focused row must never delete it outright.
     RequestDelete(ChannelId),
     ConfirmDelete,
+    CleanupStart(ChannelId, uuid::Uuid),
     Dismiss,
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
     RetryDelete(ChannelId),
@@ -260,7 +316,11 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete
+                | Self::CleanupStart(..)
+                | Self::Dismiss
+                | Self::SessionsClosed(..)
+                | Self::RetryDelete(_)
         )
     }
 }
@@ -544,10 +604,30 @@ impl Cagents {
             Action::Open(id) => self.open_channel_with_default(id),
             Action::Delete(id) => self.begin_channel_deletion(id, false),
             Action::RequestDelete(id) => self.begin_channel_deletion(id, true),
+            Action::CleanupStart(channel, operation) => {
+                if self
+                    .channel_ui
+                    .dialog
+                    .as_ref()
+                    .is_none_or(|dialog| dialog.channel != channel)
+                    || !self.unresolved_start_custody().any(|entry| {
+                        entry.operation == operation
+                            && self.channel_owns_start_custody(channel, entry)
+                    })
+                {
+                    return Task::none();
+                }
+                return self.retry_channel_start_custody_operation(channel, operation);
+            }
             Action::ConfirmDelete => {
                 let Some(deletion) = self.channel_ui.dialog.take() else {
                     return Task::none();
                 };
+                if let Some(reason) = self.channel_start_custody_blocker(deletion.channel) {
+                    self.status = Some(TransientNotice::warning(reason));
+                    self.channel_ui.dialog = Some(deletion);
+                    return Task::none();
+                }
                 self.delete_channel(deletion.channel)
             }
             Action::Dismiss => {
@@ -657,7 +737,7 @@ impl Cagents {
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
         let chats = self.channel_conversation_count(channel);
-        if chats == 0 && !always_confirm {
+        if chats == 0 && !always_confirm && self.channel_start_custody_blocker(id).is_none() {
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
@@ -696,6 +776,12 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        if let Some(reason) = self.channel_start_custody_blocker(id) {
+            self.channel_ui.deleting.remove(&id);
+            self.channel_ui.failed.insert(id, reason.clone());
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         let Some(cards) = self
             .durable
             .channels
@@ -868,6 +954,12 @@ impl Cagents {
     }
 
     fn retire_channel(&mut self, id: ChannelId, passive: bool) -> Task<Message> {
+        if let Some(reason) = self.channel_start_custody_blocker(id) {
+            self.channel_ui.deleting.remove(&id);
+            self.channel_ui.failed.insert(id, reason.clone());
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         let Some(index) = self
             .durable
             .channels
@@ -1061,6 +1153,33 @@ impl Cagents {
             rows.push(super::notice_body(format!(
                 "The last attempt failed: {failure}"
             )));
+        }
+        if let Some(entry) = self
+            .unresolved_start_custody()
+            .find(|entry| self.channel_owns_start_custody(dialog.channel, entry))
+        {
+            rows.push(super::notice_body("A previous conversation has not confirmed stopped. Its draft is kept. Close it before deleting this channel."));
+            if let Some(error) = &entry.failure {
+                rows.push(super::notice_detail(error));
+            }
+            let pending = self.start_custody_cleanup_pending(entry.operation);
+            let button = crate::ui_controls::button::secondary(if pending {
+                "Closing previous conversation…"
+            } else {
+                "Close previous conversation"
+            })
+            .id(widget::Id::new("dialog.channel.cleanup"));
+            rows.push(
+                if pending {
+                    button
+                } else {
+                    button.on_press(Message::ChannelUi(Action::CleanupStart(
+                        dialog.channel,
+                        entry.operation,
+                    )))
+                }
+                .into(),
+            );
         }
         rows.push(super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")

@@ -2788,11 +2788,13 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
                         | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::CleanupStart(..)
                         | project_ui::Action::Dismiss
                 )
                 | Message::ChannelUi(
                     channel_ui::Action::Delete(_)
                         | channel_ui::Action::ConfirmDelete
+                        | channel_ui::Action::CleanupStart(..)
                         | channel_ui::Action::Dismiss
                 )
                 | Message::SidebarSelection(_)
@@ -7506,6 +7508,7 @@ impl Cagents {
             // An accepted identity replacement retires attribution, not journal news.
             self.sidebar_state.forget_card_attention(card);
         }
+        self.invalidate_start_custody_source(card);
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));

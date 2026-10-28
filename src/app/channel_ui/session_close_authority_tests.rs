@@ -993,3 +993,5 @@ fn isolated(roles: &[&str], exercise: fn(&str)) {
         assert!(!root.join("ssh-entered").exists());
     }
 }
+
+include!("start_custody_tests.rs");

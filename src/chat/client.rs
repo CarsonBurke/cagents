@@ -38,6 +38,7 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
             ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
             _ => super::Recovery::Retry,
         },
+        no_start_write: false,
     }
 }
 
@@ -103,8 +104,21 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
     }
 }
 
+/// One local writer checkpoint response. Clones cannot acknowledge twice.
+#[derive(Debug, Clone)]
+pub struct StartCheckpoint(Arc<Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>);
+impl StartCheckpoint {
+    pub(crate) fn answer(&self, result: Result<(), String>) {
+        if let Some(sender) = self.0.lock().ok().and_then(|mut sender| sender.take()) {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Wake {
+    /// The actual connected socket is paused before its first ChatStart write.
+    StartPrepared(uuid::Uuid, HostSessionProof, StartCheckpoint),
     Changed,
     Observed,
     /// Consume the newest state with `take_activity`; never fetches a transcript.
@@ -1681,6 +1695,76 @@ impl ClientHandle {
         )
     }
 
+    /// A fresh UI start cannot write until its original destination epoch is
+    /// durable. The checkpoint uses this same owned socket, not a preflight.
+    pub(crate) fn connect_guarded(
+        session: Session,
+        operation: uuid::Uuid,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::guarded_start_on(session, operation, wake, || {
+            let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
+            connect_daemon(&socket).map_err(|error| StartFailure::retry(error.to_string()))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_guarded_start(
+        stream: UnixStream,
+        session: Session,
+        operation: uuid::Uuid,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::guarded_start_on(session, operation, wake, || Ok(stream))
+    }
+
+    fn guarded_start_on(
+        session: Session,
+        operation: uuid::Uuid,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+        connect: impl FnOnce() -> Result<UnixStream, StartFailure>,
+    ) -> Result<Self, StartFailure> {
+        // This legacy start transport has no scoped authentication binding.
+        // Never let an inherited caller silently use its default User path.
+        if [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            let mut failure = StartFailure::retry(
+                "This inherited caller cannot establish its original scope for a fresh native start. Open a User desktop window to start this draft.",
+            );
+            failure.no_start_write = true;
+            return Err(failure);
+        }
+        let wrote = Arc::new(AtomicBool::new(false));
+        let tracked = wrote.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let stream = connect()?;
+            Self::connect_on_guarded(
+                stream,
+                session,
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some((operation, tracked)),
+                wake,
+            )
+        }));
+        let mut result =
+            result.unwrap_or_else(|_| Err(StartFailure::retry("Native chat start panicked")));
+        if let Err(error) = &mut result {
+            error.no_start_write = !wrote.load(Ordering::Acquire);
+        }
+        result
+    }
+
     /// Attach only the exact canonical replacement authenticated from this
     /// saved source. Unlike ordinary restore, this never starts a provider.
     pub fn connect_upgrade(
@@ -1774,6 +1858,31 @@ impl ClientHandle {
     }
 
     fn connect_on(
+        stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        account_recovery: Option<(Session, Option<u64>)>,
+        upgrade_expected: Option<Session>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on_guarded(
+            stream,
+            session,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            account_recovery,
+            upgrade_expected,
+            None,
+            wake,
+        )
+    }
+
+    fn connect_on_guarded(
         mut stream: UnixStream,
         session: Session,
         intent: Intent,
@@ -1782,6 +1891,7 @@ impl ClientHandle {
         selection: Option<String>,
         account_recovery: Option<(Session, Option<u64>)>,
         upgrade_expected: Option<Session>,
+        guard: Option<(uuid::Uuid, Arc<AtomicBool>)>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
@@ -1916,6 +2026,43 @@ impl ClientHandle {
                 intent == Intent::RetryStart,
             )?
         };
+        if let Some((operation, wrote)) = guard {
+            if [
+                crate::agent_execution::AUTHORITY_ENV,
+                "CAGENTS_AGENT_TOKEN",
+                "CAGENTS_SESSION_TOKEN",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+            {
+                return Err(
+                    "The inherited caller cannot use an unauthenticated fresh-start connection"
+                        .into(),
+                );
+            }
+            if !matches!(
+                &request,
+                ClientRequest::ChatStart {
+                    source: None,
+                    terminate_source: false,
+                    ..
+                }
+            ) {
+                return Err("Start custody cannot guard another operation".into());
+            }
+            let (response, receiver) = std::sync::mpsc::sync_channel(1);
+            wake(Wake::StartPrepared(
+                operation,
+                proof.clone(),
+                StartCheckpoint(Arc::new(Mutex::new(Some(response)))),
+            ));
+            receiver
+                .recv_timeout(CHAT_ATTACH_TIMEOUT)
+                .map_err(|error| format!("The start checkpoint did not complete: {error}"))??;
+            // Every failure from this point, including a partial write or panic,
+            // retains custody. A provider error is not a no-effect certificate.
+            wrote.store(true, Ordering::Release);
+        }
         codec
             .write(
                 &mut stream,
@@ -3452,6 +3599,8 @@ mod tests {
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
     }
+
+    include!("client/start_custody_tests.rs");
 
     fn host_proof(incarnation: &str) -> HostSessionProof {
         use crate::model::{BootId, HostIncarnation, HostSessionId};

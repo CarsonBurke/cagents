@@ -1449,6 +1449,12 @@ fn cleanup_retirement(
                 continue;
             }
             match Handle::inspect_retained_retirement(owner.owner(), proof)? {
+                RetirementInspection::Running if discovered.is_none() => {
+                    return Err(
+                        "A registered conversation owner is still running; reconnect it before retrying Close"
+                            .into(),
+                    );
+                }
                 RetirementInspection::Running => {}
                 RetirementInspection::ExitedUnproved => {
                     return Err(

@@ -1,4 +1,5 @@
 mod session_links;
+mod start_custody;
 use super::*;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
@@ -186,6 +187,27 @@ pub enum Action {
     CancelQueued(Target),
     Switch(CardId),
     Ready(Target, Ready),
+    StartCheckpointed(
+        Target,
+        uuid::Uuid,
+        HostSessionProof,
+        chat::client::StartCheckpoint,
+        Result<(), String>,
+    ),
+    StartOwnerResolved(uuid::Uuid, bool, Result<Option<chat::Session>, String>),
+    StartOwnerCheckpointed(
+        chat::start_custody::StartCustody,
+        super::channel_ui::SessionCloseContext,
+        bool,
+        Result<(), String>,
+    ),
+    StartCleanupFinished(uuid::Uuid, bool, Result<(), String>),
+    StartCustodyReleased(
+        chat::start_custody::StartCustody,
+        bool,
+        bool,
+        Result<(), String>,
+    ),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
@@ -406,6 +428,11 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::StartCheckpointed(..)
+                | Self::StartOwnerResolved(..)
+                | Self::StartOwnerCheckpointed(..)
+                | Self::StartCleanupFinished(..)
+                | Self::StartCustodyReleased(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -590,6 +617,15 @@ pub(super) struct State {
     abandoned: HashMap<Target, chat::Session>,
     /// Conversations being given up in the background after their card left.
     retiring: HashSet<Target>,
+    start_custody: HashMap<Target, (uuid::Uuid, super::channel_ui::SessionCloseContext)>,
+    custody_cleanup: HashSet<uuid::Uuid>,
+    custody_admissions: HashMap<Target, start_custody::StartAdmission>,
+    custody_cleanup_writers: HashMap<uuid::Uuid, Arc<crate::persistence::StateStore>>,
+    custody_cleanup_scopes: HashMap<uuid::Uuid, start_custody::StartCleanupScope>,
+    custody_close_requested: HashSet<uuid::Uuid>,
+    custody_cleanup_requested: HashSet<uuid::Uuid>,
+    custody_releases: HashMap<uuid::Uuid, chat::start_custody::StartCustody>,
+    custody_release_writers: HashMap<uuid::Uuid, Arc<crate::persistence::StateStore>>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -629,6 +665,15 @@ impl Default for State {
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
+            start_custody: HashMap::new(),
+            custody_cleanup: HashSet::new(),
+            custody_admissions: HashMap::new(),
+            custody_cleanup_writers: HashMap::new(),
+            custody_cleanup_scopes: HashMap::new(),
+            custody_close_requested: HashSet::new(),
+            custody_cleanup_requested: HashSet::new(),
+            custody_releases: HashMap::new(),
+            custody_release_writers: HashMap::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             default_chats: HashSet::new(),
@@ -6897,6 +6942,15 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
+        if self.chat_has_unresolved_start_custody(card) {
+            return self.retry_start_custody(card, true);
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -6905,12 +6959,6 @@ impl Cagents {
                 .pending_chat_admissions
                 .remove(&card);
             return remove;
-        }
-        if self.pane_transfer_pending(card) {
-            self.status = Some(TransientNotice::warning(
-                "This pane is moving to a channel. Wait for the move to finish before closing it.",
-            ));
-            return Task::none();
         }
         if matches!(
             self.chat_ui.phases.get(&card),
@@ -7024,6 +7072,24 @@ impl Cagents {
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
     ) -> Task<Message> {
+        if let Some(operation) = self
+            .durable
+            .native_start_custody
+            .iter()
+            .find(|entry| {
+                entry.card == card
+                    && (session.as_ref().is_some_and(|source| {
+                        source == &entry.source || entry.observed.as_ref() == Some(source)
+                    }) || handle
+                        .as_ref()
+                        .is_some_and(|handle| entry.matches_observed(&handle.session())))
+            })
+            .map(|entry| entry.operation)
+        {
+            // A late retired callback or a draft replacement never falls back
+            // to descriptor-only absence while this exact attempt has custody.
+            return self.retry_start_custody_operation(operation, false);
+        }
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         let context =
@@ -7229,7 +7295,35 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
-        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+        if self.chat_has_unresolved_start_custody(card) {
+            self.status = Some(TransientNotice::warning(
+                "Use Close to finish the previous conversation cleanup before starting another conversation.",
+            ));
+            return Task::none();
+        }
+        // Fresh replacement flows used Loading until Ready. Mount the same
+        // editable draft first so guarded starts have an exact runtime owner
+        // to recheck at their prewrite checkpoint, just like first Send.
+        let draft = if intent == chat::Intent::Start
+            && source.is_none()
+            && !terminate_source
+            && session.launch.provider == Provider::Claude
+            && session.is_unstarted()
+            && matches!(
+                self.cards.get(&card),
+                None | Some(CardRuntime::Loading | CardRuntime::Failed(_))
+            )
+            && self.card_state(card).is_some_and(|state| {
+                state.existence.is_open()
+                    && matches!(&state.kind, CardKind::Chat(current) if current == &session)
+            }) {
+            self.open_chat_draft(card, session.clone())
+        } else {
+            Task::none()
+        };
+        let start =
+            self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None);
+        Task::batch([draft, start])
     }
 
     pub(in crate::app) fn start_shared_chat_upgrade(
@@ -7288,9 +7382,32 @@ impl Cagents {
                 upgrade_admission: upgrade_admission.clone(),
             }),
         );
+        let guarded = (intent == chat::Intent::Start
+            && source.is_none()
+            && !terminate_source
+            && upgrade_admission.is_none()
+            && session.is_unstarted()
+            && session.launch.provider == Provider::Claude)
+            .then(|| self.start_custody(target, &session));
+        let checkpoint = guarded.map(|operation| {
+            let (_, context) = &self.chat_ui.start_custody[&target];
+            if context.scoped() {
+                return Err("This inherited caller cannot establish its original scope for a fresh native start. Keep the draft and use a User desktop window.".into());
+            }
+            let entry = self.durable.native_start_custody.iter().find(|entry| entry.operation == operation).unwrap();
+            context.admit_custody(entry)?;
+            self.custody_checkpoint()
+        });
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if let Some(checkpoint) = checkpoint {
+                    if let Err(error) = start_custody::await_checkpoint(checkpoint) {
+                        let mut failure = chat::StartFailure::retry(error);
+                        failure.no_start_write = true;
+                        return Err(failure);
+                    }
+                }
                 // A panic in the provider handshake has to come back as a
                 // failed start. Unwinding here fails the blocking task; the
                 // UI thread then only sees a join error and can still draw.
@@ -7302,6 +7419,9 @@ impl Cagents {
                         match upgrade_admission {
                             Some(canonical) => {
                                 ClientHandle::connect_upgrade(session, canonical, wake)
+                            }
+                            None if guarded.is_some() => {
+                                ClientHandle::connect_guarded(session, guarded.unwrap(), wake)
                             }
                             None => ClientHandle::connect(
                                 session,
@@ -7573,6 +7693,12 @@ impl Cagents {
     /// The conversation starts under a new identity, so it never meets
     /// anything an earlier start of this card may have left in the daemon.
     fn start_chat_draft(&mut self, target: Target) -> Task<Message> {
+        if self.chat_has_unresolved_start_custody(target.card) {
+            self.status = Some(TransientNotice::warning(
+                "Use Close to finish the previous conversation cleanup before sending again.",
+            ));
+            return Task::none();
+        }
         if self.chat_start_pending(target.card)
             || self
                 .card_state(target.card)
@@ -8615,16 +8741,57 @@ impl Cagents {
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
+            Action::StartCheckpointed(target, operation, proof, response, result) => {
+                return self.start_checkpointed(target, operation, proof, response, result);
+            }
+            Action::StartOwnerResolved(operation, close_pane, result) => {
+                return self.start_owner_resolved(operation, close_pane, result);
+            }
+            Action::StartOwnerCheckpointed(entry, context, close_pane, result) => {
+                return self.start_owner_checkpointed(entry, context, close_pane, result);
+            }
+            Action::StartCleanupFinished(operation, close_pane, result) => {
+                return self.finish_start_cleanup(operation, close_pane, result);
+            }
+            Action::StartCustodyReleased(entry, close_pane, ended, result) => {
+                return self.start_custody_released(entry, close_pane, ended, result);
+            }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
                     return Task::none();
                 };
+                let custody_operation = self
+                    .chat_ui
+                    .start_custody
+                    .get(&target)
+                    .map(|(operation, _)| *operation);
+                if result.as_ref().is_err_and(|failure| failure.no_start_write)
+                    && let Some(operation) = custody_operation
+                {
+                    if let Some(entry) = Arc::make_mut(&mut self.durable)
+                        .native_start_custody
+                        .iter_mut()
+                        .find(|entry| entry.operation == operation)
+                    {
+                        entry.destination = None;
+                    }
+                }
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // The card was closed while this start was in flight.
                     // Whatever the start produced is given up now; a failed
                     // start is still checked against the inventory, because a
                     // lost reply is not proof the daemon started nothing.
+                    if let Some(operation) = custody_operation {
+                        if result.as_ref().is_err_and(|failure| failure.no_start_write) {
+                            let close_pane =
+                                self.chat_ui.custody_close_requested.contains(&operation);
+                            return self.release_start_custody(operation, close_pane, true);
+                        }
+                        drop(result);
+                        let close_pane = self.chat_ui.custody_close_requested.contains(&operation);
+                        return self.retry_start_custody(target.card, close_pane);
+                    }
                     return self.retire_chat(target.card, result.ok(), Some(session));
                 }
                 let Some(Phase::Starting(mut attempt)) = self
@@ -8677,6 +8844,22 @@ impl Cagents {
                         self.persist();
                         return retained.0;
                     }
+                    if let Some(operation) = custody_operation {
+                        if result.as_ref().is_err_and(|failure| failure.no_start_write) {
+                            return self.release_start_custody(
+                                operation,
+                                self.chat_ui.custody_close_requested.contains(&operation),
+                                true,
+                            );
+                        }
+                        drop(result);
+                        return self.retry_start_custody(
+                            target.card,
+                            custody_operation.is_some_and(|operation| {
+                                self.chat_ui.custody_close_requested.contains(&operation)
+                            }),
+                        );
+                    }
                     // The conversation started, but this card can no longer
                     // hold it. Leaving it alone left a daemon writer and its
                     // provider process running with nothing on screen able to
@@ -8717,8 +8900,51 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                if result.is_err()
+                    && self.chat_has_unresolved_start_custody(target.card)
+                    && !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+                {
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.unqueue();
+                        runtime.error =
+                            result.as_ref().err().map(|failure| failure.message.clone());
+                    }
+                    if result.as_ref().is_err_and(|failure| failure.no_start_write)
+                        && let Some(operation) = custody_operation
+                    {
+                        return self.release_start_custody(
+                            operation,
+                            self.chat_ui.custody_close_requested.contains(&operation),
+                            true,
+                        );
+                    }
+                    return self.retry_start_custody(
+                        target.card,
+                        custody_operation.is_some_and(|operation| {
+                            self.chat_ui.custody_close_requested.contains(&operation)
+                        }),
+                    );
+                }
                 match result {
                     Ok(handle) => {
+                        if let Some(operation) = custody_operation {
+                            let confirmed = self
+                                .durable
+                                .native_start_custody
+                                .iter()
+                                .find(|entry| entry.operation == operation)
+                                .is_some_and(|entry| entry.matches_observed(&handle.session()));
+                            if !confirmed {
+                                if let Some(CardRuntime::Chat(runtime)) =
+                                    self.cards.get_mut(&target.card)
+                                {
+                                    runtime.unqueue();
+                                    runtime.error = Some("The start reply did not confirm the original destination and exact launch. Your draft is kept; use Close to retry cleanup.".into());
+                                }
+                                self.persist();
+                                return Task::none();
+                            }
+                        }
                         if attempt.upgrade_admission.as_ref().is_some_and(|canonical| {
                             handle.upgrade_recovery().is_none_or(|(source, resolved)| {
                                 source != &attempt.session || resolved != canonical
@@ -8916,8 +9142,31 @@ impl Cagents {
                             self.install_chat_session(target.card, session.clone());
                             self.persist();
                         } else {
-                            self.commit_chat_session(target.card, session);
+                            self.commit_chat_session(target.card, session.clone());
                         }
+                        let custody_release = if let Some(operation) = custody_operation {
+                            if let Some(entry) = Arc::make_mut(&mut self.durable)
+                                .native_start_custody
+                                .iter_mut()
+                                .find(|entry| entry.operation == operation)
+                            {
+                                entry.observed = Some(session);
+                            }
+                            if self.chat_ui.custody_cleanup_requested.contains(&operation) {
+                                if let Some(CardRuntime::Chat(runtime)) =
+                                    self.cards.get_mut(&target.card)
+                                {
+                                    runtime.unqueue();
+                                }
+                                self.persist();
+                                let close_pane =
+                                    self.chat_ui.custody_close_requested.contains(&operation);
+                                return self.retry_start_custody_operation(operation, close_pane);
+                            }
+                            self.release_start_custody(operation, false, false)
+                        } else {
+                            Task::none()
+                        };
                         if let Some(title) = title
                             && self.apply_reported_title(target.card, title)
                         {
@@ -8953,6 +9202,7 @@ impl Cagents {
                             Task::none()
                         };
                         return Task::batch([
+                            custody_release,
                             submitted,
                             usage,
                             self.list_chat_models(target.card),
@@ -8976,6 +9226,21 @@ impl Cagents {
                             runtime.unqueue();
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
+                        }
+                        if let Some(operation) = custody_operation {
+                            if failure.no_start_write {
+                                return self.release_start_custody(
+                                    operation,
+                                    self.chat_ui.custody_close_requested.contains(&operation),
+                                    true,
+                                );
+                            }
+                            return self.retry_start_custody(
+                                target.card,
+                                custody_operation.is_some_and(|operation| {
+                                    self.chat_ui.custody_close_requested.contains(&operation)
+                                }),
+                            );
                         }
                         return self.retire_chat(target.card, None, Some(attempt.session));
                     }
@@ -9195,6 +9460,12 @@ impl Cagents {
                 }
             }
             Action::Wake(target, wake) => {
+                let wake = match wake {
+                    Wake::StartPrepared(operation, proof, response) => {
+                        return self.prepare_start_write(target, operation, proof, response);
+                    }
+                    wake => wake,
+                };
                 // Ready refreshes the new handle.
                 if self.chat_start_pending(target.card) {
                     // The account reports go unread, as the recipe may already
@@ -9246,6 +9517,7 @@ impl Cagents {
                 };
                 runtime.refresh_session();
                 match wake {
+                    Wake::StartPrepared(..) => unreachable!("handled before runtime lookup"),
                     Wake::Changed => {
                         runtime.refresh();
                         let fork = if runtime.fork_requested
@@ -13593,7 +13865,7 @@ pub(super) mod tests {
         app: &mut Cagents,
         provider: Provider,
     ) -> (CardId, Target, Arc<ClientHandle>) {
-        let card = live_chat_for_provider(app, provider, Some(KNOWN_THREAD));
+        let card = synthetic_live_chat_for_provider(app, provider, Some(KNOWN_THREAD));
         let runtime = app
             .chat_runtime_mut(chat_runtime(app, card).target)
             .unwrap();
@@ -14947,7 +15219,7 @@ pub(super) mod tests {
             app.inspector_runtime_status(draft),
             InspectorRuntimeStatus::Ready
         );
-        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let card = synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
         for (ready, exited, expected) in [
             (false, false, InspectorRuntimeStatus::Starting),
             (true, false, InspectorRuntimeStatus::Ready),
@@ -16016,7 +16288,8 @@ pub(super) mod tests {
     fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_ways() {
         use crate::workspace_widget::GlobalShortcut;
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat_for_provider(&mut app, Provider::Claude, Some("permissions"));
+        let card =
+            synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some("permissions"));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.show(true);
@@ -18478,6 +18751,57 @@ pub(super) mod tests {
         (card, target)
     }
 
+    pub(in crate::app) fn attempted_claude_start_fixture(
+        app: &mut Cagents,
+    ) -> (CardId, Target, chat::Session, uuid::Uuid) {
+        attempted_claude_start_in_directory_fixture(app, PathBuf::from(FIXTURE_DIRECTORY))
+    }
+
+    pub(in crate::app) fn attempted_claude_start_in_directory_fixture(
+        app: &mut Cagents,
+        directory: PathBuf,
+    ) -> (CardId, Target, chat::Session, uuid::Uuid) {
+        drop(app.new_native_chat(Provider::Claude, Some(directory)));
+        let card = app.workspace.focused().unwrap();
+        write(app, card, "hello");
+        submit(app, card);
+        let target = app.chat_ui.attempt(card).unwrap().target;
+        let source = app.chat_ui.attempt(card).unwrap().session.clone();
+        let operation = app.chat_ui.start_custody[&target].0;
+        (card, target, source, operation)
+    }
+
+    pub(in crate::app) fn deliver_attempted_start_fixture(
+        app: &mut Cagents,
+        target: Target,
+        result: Result<Arc<ClientHandle>, chat::StartFailure>,
+    ) -> Task<Message> {
+        app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(result)))),
+        )))
+    }
+
+    pub(in crate::app) fn tombstone_attempted_start_fixture(app: &mut Cagents, card: CardId) {
+        drop(app.remove_chat_card(card, None));
+    }
+
+    pub(in crate::app) fn attempted_start_target_fixture(app: &Cagents, card: CardId) -> Target {
+        chat_runtime(app, card).target
+    }
+
+    pub(in crate::app) fn attempted_start_draft_fixture(app: &Cagents, card: CardId) -> String {
+        chat_runtime(app, card).unsent_text()
+    }
+
+    pub(in crate::app) fn edit_attempted_start_fixture(
+        app: &mut Cagents,
+        card: CardId,
+        text: &str,
+    ) {
+        write(app, card, text);
+    }
+
     fn answer_start(
         app: &mut Cagents,
         target: Target,
@@ -18669,13 +18993,37 @@ pub(super) mod tests {
 
     /// A conversation that started, optionally with a provider-confirmed id.
     fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
-        live_chat_for_provider(app, Provider::Codex, session_id)
+        synthetic_live_chat_for_provider(app, Provider::Codex, session_id)
     }
-    fn live_chat_for_provider(
+    fn synthetic_live_chat_for_provider(
         app: &mut Cagents,
         provider: Provider,
         session_id: Option<&str>,
     ) -> CardId {
+        if provider == Provider::Claude {
+            // An already-owned provider-free presentation fixture. This does
+            // not exercise or qualify first-start custody or Host authority.
+            let card = draft_chat_for_provider(app, provider);
+            let mut session = chat_runtime(app, card).session.clone();
+            session.proof = Some(HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            });
+            session.launch.session_id = session_id.map(str::to_owned);
+            app.install_chat_session(card, session.clone());
+            drop(app.start_chat(card, session, chat::Intent::Restore, None, false));
+            let target = app.chat_ui.attempt(card).unwrap().target;
+            let handle = fixture_handle(app, card, session_id);
+            answer_start(app, target, Ok(handle));
+            write(app, card, "hello");
+            submit(app, card);
+            settle(app, card, Ok(()));
+            if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+                preparation::drain_fixture(runtime);
+            }
+            return card;
+        }
         let (card, target) = starting_chat_for_provider(app, provider);
         let handle = fixture_handle(app, card, session_id);
         answer_start(app, target, Ok(handle));
@@ -19084,7 +19432,7 @@ pub(super) mod tests {
         for provider in [Provider::Codex, Provider::Claude] {
             for visible in [true, false] {
                 let mut app = crate::app::tests::context_inspector_test_app(false);
-                let card = live_chat_for_provider(&mut app, provider, Some(KNOWN_THREAD));
+                let card = synthetic_live_chat_for_provider(&mut app, provider, Some(KNOWN_THREAD));
                 let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
                     unreachable!()
                 };
@@ -19409,7 +19757,7 @@ pub(super) mod tests {
     #[test]
     fn connected_read_only_history_releases_body_until_the_daemon_rehydrates_it() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let card = synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
         let source_runtime = chat_runtime(&app, card);
         let missing = tempfile::tempdir().unwrap();
         let mut session = source_runtime.session.clone();
@@ -19484,7 +19832,7 @@ pub(super) mod tests {
     #[test]
     fn saved_history_readiness_requires_exact_settled_read_only_attachment() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let card = synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
         let original = chat_runtime(&app, card);
         let mut source = original.session.clone();
         source.native_continuity = chat::NativeContinuity::ReconnectOnly;
@@ -19528,7 +19876,8 @@ pub(super) mod tests {
         let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let card =
+                synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
             let target = chat_runtime(&app, card).target;
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.session.launch.session_id = Some(KNOWN_THREAD.into());
@@ -19613,7 +19962,8 @@ pub(super) mod tests {
     fn saved_history_explicit_resume_keeps_the_pane_draft_and_image_unsent() {
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let card =
+                synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
             let mut source = chat_runtime(&app, card).session.clone();
             source.launch.session_id = Some(KNOWN_THREAD.into());
             source.native_continuity = chat::NativeContinuity::ReconnectOnly;
@@ -19717,7 +20067,8 @@ pub(super) mod tests {
     fn saved_history_explicit_resume_refuses_unsettled_or_executing_attachments() {
         for mutation in 0..6 {
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let card =
+                synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
             let target = chat_runtime(&app, card).target;
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.session.launch.session_id = Some(KNOWN_THREAD.into());
@@ -19757,7 +20108,8 @@ pub(super) mod tests {
     fn disconnected_saved_history_reconnects_without_borrowing_explicit_start_permission() {
         for stale_resume_click in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let card =
+                synthetic_live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
             let target = chat_runtime(&app, card).target;
             let mut source = chat_runtime(&app, card).session.clone();
             source.launch.session_id = Some(KNOWN_THREAD.into());
@@ -20838,7 +21190,20 @@ pub(super) mod tests {
     /// next launch, where the daemon no longer had it.
     #[test]
     fn a_draft_moved_to_another_provider_or_account_is_saved_as_its_new_conversation() {
+        for name in [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "actual guarded first-start fixture requires a genuine User/CI launch"
+            );
+        }
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let registry = uuid::Uuid::new_v4();
+        app.workspace_model.identity = registry;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(registry);
         let directory = tempfile::tempdir().unwrap();
         let (writer, _) = crate::session::SessionRuntime::open(
             directory.path().join("state.sqlite3"),
@@ -20910,8 +21275,11 @@ pub(super) mod tests {
         assert_ne!(session.id, moved.id);
         assert_eq!(session.launch.recipe, moved.launch.recipe);
         assert_eq!(identity(&flushed(&app)), identity(&session));
-        let handle = fixture_handle(&app, card, Some("replacement"));
-        answer_start(&mut app, started, Ok(handle));
+        let (handle, first_peer) = super::super::channel_ui::session_close_authority_tests::checkpointed_start_ready_fixture(&mut app, started, Some("replacement"));
+        let completion = deliver_attempted_start_fixture(&mut app, started, Ok(handle));
+        super::super::channel_ui::session_close_authority_tests::drain_custody_fixture(
+            &mut app, completion,
+        );
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&session));
         assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
@@ -20924,8 +21292,11 @@ pub(super) mod tests {
         let attempt = app.chat_ui.attempt(card).unwrap();
         let (target, fresh) = (attempt.target, attempt.session.clone());
         assert_eq!(fresh.launch.session_id, None);
-        let handle = fixture_handle(&app, card, Some("fresh"));
-        answer_start(&mut app, target, Ok(handle));
+        let (handle, second_peer) = super::super::channel_ui::session_close_authority_tests::checkpointed_start_ready_fixture(&mut app, target, Some("fresh"));
+        let completion = deliver_attempted_start_fixture(&mut app, target, Ok(handle));
+        super::super::channel_ui::session_close_authority_tests::drain_custody_fixture(
+            &mut app, completion,
+        );
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&fresh));
         assert_eq!(stored.launch.session_id.as_deref(), Some("fresh"));
@@ -20933,6 +21304,9 @@ pub(super) mod tests {
         let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
         assert!(!app.chat_ui.attempt(card).is_some());
         assert_eq!(flushed(&app), stored);
+        drop(app);
+        first_peer.join().unwrap();
+        second_peer.join().unwrap();
     }
 
     /// A conversation that has begun keeps its account.
@@ -22839,6 +23213,7 @@ pub(super) mod tests {
                 Err(chat::StartFailure {
                     message: "The saved account was removed".into(),
                     recovery: chat::Recovery::Account,
+                    no_start_write: false,
                 }),
             );
             assert!(app.chat_ui.removed_accounts.contains(&card));
@@ -23076,6 +23451,7 @@ pub(super) mod tests {
             Err(chat::StartFailure {
                 message: "The saved account was removed".into(),
                 recovery: chat::Recovery::Account,
+                no_start_write: false,
             }),
         );
         assert!(app.chat_ui.removed_accounts.contains(&card));
@@ -23480,6 +23856,7 @@ pub(super) mod tests {
             Err(chat::StartFailure {
                 message: message.into(),
                 recovery: chat::Recovery::Capacity,
+                no_start_write: false,
             }),
         );
         let runtime = chat_runtime(&app, card);
@@ -23544,6 +23921,7 @@ pub(super) mod tests {
             Err(chat::StartFailure {
                 message: "128 resident, 0 starting; limit 128".into(),
                 recovery: chat::Recovery::Capacity,
+                no_start_write: false,
             }),
         );
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
@@ -23590,6 +23968,7 @@ pub(super) mod tests {
             Err(chat::StartFailure {
                 message: "stale capacity".into(),
                 recovery: chat::Recovery::Capacity,
+                no_start_write: false,
             }),
         );
         assert!(!chat_runtime(&app, card).capacity_refused);
@@ -23617,6 +23996,7 @@ pub(super) mod tests {
             Err(chat::StartFailure {
                 message: "Resident slots full".into(),
                 recovery: chat::Recovery::Capacity,
+                no_start_write: false,
             }),
         );
         let runtime = chat_runtime(&app, card);

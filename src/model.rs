@@ -1252,6 +1252,11 @@ pub struct WorkspaceState {
     /// This is local presentation state, never provider or retirement authority.
     #[serde(default)]
     pub pending_chat_admissions: HashMap<CardId, crate::chat::Session>,
+    /// Exact local custody survives pane replacement and failed start retirement.
+    #[serde(default)]
+    pub native_start_custody: Vec<crate::chat::start_custody::StartCustody>,
+    #[serde(default)]
+    pub released_native_starts: HashSet<uuid::Uuid>,
     /// Explicit terminal creations awaiting the daemon's accepted view. Their
     /// exact recipe, scope and insertion order are stored with the pane.
     #[serde(default)]
@@ -1281,6 +1286,8 @@ impl Default for WorkspaceState {
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_chat_admissions: Default::default(),
+            native_start_custody: Default::default(),
+            released_native_starts: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
     }
