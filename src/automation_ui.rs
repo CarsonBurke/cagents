@@ -6519,6 +6519,239 @@ mod tests {
     }
 
     #[test]
+    fn older_coalesced_skip_groups_refresh_without_growing_the_loaded_history() {
+        use crate::automations::{
+            FiringState, Occurrence, SkipReason, SkippedOccurrences, Trigger,
+        };
+        let mut backend = budget_history_rows(PAGE * 3);
+        for row in &mut backend {
+            row.state = FiringState::Succeeded;
+        }
+        let index = PAGE + 3;
+        let group = &mut backend[index];
+        group.state = FiringState::Skipped;
+        group.skip = Some(SkipReason::Overlap);
+        group.trigger = Trigger::Scheduled {
+            occurrence: Occurrence {
+                due_ms: group.created_ms,
+                local: "first exact occurrence".into(),
+            },
+        };
+        group.skipped_occurrences = Some(SkippedOccurrences {
+            count: 1,
+            first_occurrence_ms: group.created_ms,
+            last_occurrence_ms: group.created_ms,
+        });
+        let mut state = State::default();
+        load_budget_history(&mut state, &backend, 2);
+        let ids: Vec<_> = state.history.iter().map(|row| row.id).collect();
+        let cursor = state.history_next.clone();
+        for count in [2, 3] {
+            let group = &mut backend[index];
+            let last = group.created_ms + count * 60_000;
+            group.skipped_occurrences.as_mut().unwrap().count = count;
+            group
+                .skipped_occurrences
+                .as_mut()
+                .unwrap()
+                .last_occurrence_ms = last;
+            group.trigger = Trigger::Scheduled {
+                occurrence: Occurrence {
+                    due_ms: last,
+                    local: format!("exact occurrence {count}"),
+                },
+            };
+            let (sequence, before) = budget_poll(&mut state, &backend)
+                .expect("an old terminal skip group still has mutable metadata");
+            receive_budget_page(&mut state, sequence, &before, &backend);
+            assert_eq!(state.history[index], backend[index]);
+            assert_eq!(
+                state.history.iter().map(|row| row.id).collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(state.history_next, cursor);
+            assert!(!state.history_newer);
+        }
+    }
+
+    #[test]
+    fn cleanup_compaction_of_old_ungrouped_skips_is_discovered_by_bounded_refresh() {
+        use crate::automations::{
+            FiringState, Occurrence, SkipReason, SkippedOccurrences, Trigger,
+        };
+        let mut backend = budget_history_rows(PAGE * 3);
+        for row in &mut backend {
+            row.state = FiringState::Succeeded;
+        }
+        let first_index = PAGE + 4;
+        let second_index = PAGE + 3;
+        let automation = backend[first_index].automation;
+        for (index, due) in [(first_index, 100), (second_index, 200)] {
+            let row = &mut backend[index];
+            row.automation = automation;
+            row.state = FiringState::Skipped;
+            row.skip = Some(SkipReason::PrecheckExit);
+            row.trigger = Trigger::Scheduled {
+                occurrence: Occurrence {
+                    due_ms: due,
+                    local: format!("exact occurrence {due}"),
+                },
+            };
+            assert!(row.skipped_occurrences.is_none());
+        }
+        let first_id = backend[first_index].id;
+        let second = backend[second_index].clone();
+        let mut state = State::default();
+        load_budget_history(&mut state, &backend, 2);
+        let ids: Vec<_> = state.history.iter().map(|row| row.id).collect();
+        let cursor = state.history_next.clone();
+        backend[first_index].skipped_occurrences = Some(SkippedOccurrences {
+            count: 2,
+            first_occurrence_ms: 100,
+            last_occurrence_ms: 200,
+        });
+        backend[first_index].trigger = second.trigger;
+        backend.remove(second_index);
+        let (sequence, before) = budget_poll(&mut state, &backend)
+            .expect("cleanup can still compact old scheduled skips without a summary");
+        receive_budget_page(&mut state, sequence, &before, &backend);
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .find(|row| row.id == first_id)
+                .unwrap()
+                .skipped_occurrences
+                .as_ref()
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            state.history.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(state.history_next, cursor);
+        assert!(
+            state.history_newer,
+            "the missing compacted row exposes explicit refresh"
+        );
+    }
+
+    #[test]
+    fn compacted_history_offers_refresh_without_discarding_the_loaded_snapshot() {
+        use crate::automations::{
+            FiringState, Occurrence, SkipReason, SkippedOccurrences, Trigger,
+        };
+        let mut first = history_firing(100, FiringState::Skipped);
+        first.skip = Some(SkipReason::Overlap);
+        first.finished_ms = Some(100);
+        first.trigger = Trigger::Scheduled {
+            occurrence: Occurrence {
+                due_ms: 100,
+                local: "first exact occurrence".into(),
+            },
+        };
+        first.skipped_occurrences = Some(SkippedOccurrences {
+            count: 1,
+            first_occurrence_ms: 100,
+            last_occurrence_ms: 100,
+        });
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        second.created_ms = 200;
+        second.finished_ms = Some(200);
+        second.trigger = Trigger::Scheduled {
+            occurrence: Occurrence {
+                due_ms: 200,
+                local: "second exact occurrence".into(),
+            },
+        };
+        second
+            .skipped_occurrences
+            .as_mut()
+            .unwrap()
+            .first_occurrence_ms = 200;
+        second
+            .skipped_occurrences
+            .as_mut()
+            .unwrap()
+            .last_occurrence_ms = 200;
+        let active = history_firing(90, FiringState::Waiting);
+        let mut held = history_firing(80, FiringState::Failed);
+        held.release_pending = true;
+        let old = vec![second.clone(), first.clone(), active.clone(), held.clone()];
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::AllHistory) else {
+            panic!()
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(old, false)))),
+        });
+        let cursor = state.history_next.clone();
+        first.skipped_occurrences.as_mut().unwrap().count = 2;
+        first.finished_ms = Some(200);
+        first.trigger = second.trigger.clone();
+        first
+            .skipped_occurrences
+            .as_mut()
+            .unwrap()
+            .last_occurrence_ms = 200;
+        assert!(budget_poll(&mut state, &[first.clone()]).is_none());
+        assert_eq!(
+            state.history,
+            vec![second.clone(), first.clone(), active.clone(), held.clone()],
+            "background metadata retains the reader's original rows, including unresolved work"
+        );
+        assert_eq!(state.history_next, cursor);
+        assert!(
+            state.history_newer,
+            "compaction must expose explicit recovery"
+        );
+        assert!(
+            buttons(&state, 900.0)
+                .iter()
+                .any(|(label, enabled)| label == "Refresh history" && *enabled)
+        );
+        let Some(Effect::Request { sequence, request }) = state.update(Action::History) else {
+            panic!("visible refresh requests canonical history")
+        };
+        assert_eq!(
+            request,
+            Request::History {
+                id: None,
+                before: None,
+                limit: PAGE
+            }
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                vec![first.clone(), active, held],
+                false,
+            )))),
+        });
+        assert_eq!(state.history[0], first);
+        assert!(!state.history.iter().any(|row| row.id == second.id));
+        assert!(!state.history_newer);
+
+        // A bounded page says nothing about settled rows beyond its tail.
+        let mut backend = budget_history_rows(PAGE * 3);
+        for row in &mut backend {
+            row.state = FiringState::Succeeded;
+        }
+        let mut state = State::default();
+        load_budget_history(&mut state, &backend, 2);
+        let original = state.history.clone();
+        assert!(budget_poll(&mut state, &backend).is_none());
+        assert_eq!(
+            state.history, original,
+            "older settled pages remain outside the covered range"
+        );
+    }
+
+    #[test]
     fn history_poll_batches_loaded_metadata_once_and_fairly_reaches_older_release() {
         use crate::automations::FiringState;
         let mut backend = budget_history_rows(PAGE * 4);
