@@ -16884,7 +16884,7 @@ impl Application for Cagents {
                         .as_mut()
                         .filter(|source| source.key.canonical_path == key.canonical_path)
                 {
-                    *source = rollback.clone();
+                    source.restore_mutation_groups(rollback);
                     for pending in &mutation.pending {
                         if let QueuedGitMutation::Stage(selection)
                         | QueuedGitMutation::StageApproved { selection, .. }
@@ -28274,6 +28274,125 @@ mod tests {
                 .is_none(),
             "the next successful mutation clears the inline error"
         );
+    }
+
+    #[test]
+    fn failed_git_mutation_preserves_history_search_and_pending_page_ownership() {
+        use crate::repository::{CommitIdentity, CommitSummary, Oid};
+        for completed in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+            let head = Oid::parse_object("11".repeat(20)).unwrap();
+            let old = Oid::parse_object("22".repeat(20)).unwrap();
+            let found = Oid::parse_object("33".repeat(20)).unwrap();
+            let commit = |oid: Oid| {
+                let author = CommitIdentity {
+                    name: "History fixture".into(),
+                    email: "fixture@example.invalid".into(),
+                    timestamp: 0,
+                    offset_minutes: 0,
+                };
+                CommitSummary {
+                    oid,
+                    parents: vec![],
+                    author: author.clone(),
+                    committer: author,
+                    subject: "History fixture".into(),
+                    body: String::new(),
+                }
+            };
+            let source = app.sidebar_model.source_control.as_mut().unwrap();
+            source.head_oid = Some(head.as_str().into());
+            source.search_history("previous".into());
+            source.append_history(&[commit(old)]);
+            let selection = source
+                .group(crate::repository::ChangeArea::Unstaged)
+                .unwrap()
+                .rows()[0]
+                .selection();
+            drop(app.enqueue_git_mutation(
+                key.clone(),
+                super::QueuedGitMutation::Stage(vec![selection.clone()]),
+            ));
+            let operation = app.source_control_mutations[&key.canonical_path].id;
+            drop(
+                app.update(Message::Sidebar(SidebarAction::HistoryQueryChanged {
+                    key: key.clone(),
+                    query: "current".into(),
+                })),
+            );
+            drop(app.update(Message::Sidebar(SidebarAction::SearchHistory {
+                key: key.clone(),
+                query: "current".into(),
+            })));
+            let generation = app.history_ui.next_page_request();
+            if completed {
+                drop(app.update(Message::SourceControlHistory {
+                    generation,
+                    key: key.clone(),
+                    page: 0,
+                    head: head.clone(),
+                    result: Ok(vec![commit(found.clone())]),
+                }));
+            }
+            let source = app.sidebar_model.source_control.as_mut().unwrap();
+            source.file_search = sidebar::FileSearch::Pending {
+                query: "notes".into(),
+            };
+            source.branch_changes =
+                sidebar::BranchChanges::Unavailable("current comparison fixture");
+            source.stashes_expanded = true;
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation,
+                report: Some("Stage failed: fixture refusal".into()),
+                committed: false,
+            }));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert_eq!(source.history_query, "current");
+            assert!(
+                matches!(&source.file_search, sidebar::FileSearch::Pending { query } if query == "notes")
+            );
+            assert!(matches!(
+                source.branch_changes,
+                sidebar::BranchChanges::Unavailable("current comparison fixture")
+            ));
+            assert!(source.stashes_expanded);
+            assert_eq!(source.next_history_page, u32::from(completed));
+            assert_eq!(source.history_loading, !completed);
+            assert_eq!(source.history.len(), usize::from(completed));
+            assert!(
+                source
+                    .group(crate::repository::ChangeArea::Unstaged)
+                    .unwrap()
+                    .rows()
+                    .iter()
+                    .any(|row| row.entry.path == selection.path)
+            );
+            if !completed {
+                drop(app.update(Message::SourceControlHistory {
+                    generation,
+                    key: key.clone(),
+                    page: 0,
+                    head: head.clone(),
+                    result: Ok(vec![commit(found.clone())]),
+                }));
+            }
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert_eq!(source.history[0].oid, found);
+            assert_eq!(source.next_history_page, 1);
+            let mut refreshed = sidebar::tests::panel_model().source_control.unwrap();
+            refreshed.key = key;
+            refreshed.head_oid = Some(head.as_str().into());
+            refreshed.history.clear();
+            source.carry_mutation_into(&mut refreshed);
+            assert_eq!(refreshed.history_query, "current");
+            assert_eq!(refreshed.history[0].oid, found);
+            assert_eq!(refreshed.next_history_page, 1);
+        }
     }
 
     #[tokio::test]

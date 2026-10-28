@@ -2392,6 +2392,16 @@ impl SourceControlModel {
             .map_or(0, |group| group.rows.len());
     }
 
+    /// Undo the optimistic Stage/Unstage rows without replacing unrelated
+    /// inspection state the user changed while Git was running.
+    pub fn restore_mutation_groups(&mut self, before: &Self) {
+        if self.key != before.key {
+            return;
+        }
+        self.groups.clone_from(&before.groups);
+        self.staged_count = before.staged_count;
+    }
+
     pub fn set_mutation(&mut self, mutation: Option<MutationKind>) {
         self.mutation = mutation;
     }
