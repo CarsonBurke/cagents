@@ -2155,8 +2155,6 @@ static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 pub(crate) fn daemon_autostart_disabled() -> bool {
     NO_START.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("CAGENTS_NO_START")
-            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 struct StartPolicy(bool);
