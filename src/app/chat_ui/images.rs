@@ -1793,6 +1793,39 @@ mod tests {
         assert_eq!(budget.pixels.available_permits(), 8);
     }
     #[test]
+    fn webp_preview_without_usable_first_exif_stays_unrotated() {
+        let bytes = oriented_webp(6);
+        let exif = bytes.len() - 26 - 8;
+        let mut absent = bytes[..exif].to_vec();
+        absent[20] &= !0x08; // Clear VP8X's EXIF-present flag.
+        let length = (absent.len() - 8) as u32;
+        absent[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut invalid_first = bytes.clone();
+        invalid_first[exif + 8 + 18] = 0; // Unrecognized TIFF Orientation.
+        invalid_first.extend_from_slice(&bytes[exif..]);
+        let length = (invalid_first.len() - 8) as u32;
+        invalid_first[4..8].copy_from_slice(&length.to_le_bytes());
+        for input in [absent, invalid_first] {
+            let budget = Budget::new(input.len(), 8);
+            let encoded_length = input.len();
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(input, &budget)
+            else {
+                panic!("missing or unusable first EXIF must not prevent WebP decoding");
+            };
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(pixels.as_ref(), &[255, 0, 0, 255, 0, 255, 0, 255]);
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+    }
+    #[test]
     fn decoded_preview_preserves_all_pinned_exif_orientations() {
         let mut jpeg = Vec::new();
         image::write_buffer_with_format(
