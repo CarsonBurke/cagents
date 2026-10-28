@@ -29,6 +29,12 @@ pub enum Target {
         id: uuid::Uuid,
         sequence: u64,
     },
+    /// A historical creation, never current pending or consent authority.
+    AutomationProposal {
+        registry: uuid::Uuid,
+        id: uuid::Uuid,
+        revision: u64,
+    },
 }
 
 impl Target {
@@ -39,6 +45,11 @@ impl Target {
             Self::AgentRun(id) => format!("run:{id}"),
             Self::SessionInbox(lineage) => format!("inbox:{lineage}"),
             Self::Automation { id, .. } => format!("automation:{id}"),
+            Self::AutomationProposal {
+                registry,
+                id,
+                revision,
+            } => format!("proposal:{registry}:{id}:revision:{revision}"),
         }
     }
 }
@@ -76,6 +87,7 @@ pub enum Kind {
     MessageReceived,
     AutomationPaused,
     AutomationBlocked,
+    ProposalCreated,
 }
 
 impl Kind {
@@ -90,6 +102,7 @@ impl Kind {
             Self::MessageReceived => "Session messages waiting",
             Self::AutomationPaused => "Automation pause recorded",
             Self::AutomationBlocked => "Automation block recorded",
+            Self::ProposalCreated => "Automation request created",
         }
     }
 }
@@ -231,6 +244,29 @@ impl Event {
             Kind::AutomationPaused | Kind::AutomationBlocked
         ) {
             return Err("Automation attention requires an automation target".into());
+        }
+        if let Target::AutomationProposal {
+            registry,
+            id,
+            revision,
+        } = &self.target
+        {
+            if registry.is_nil()
+                || id.is_nil()
+                || *revision == 0
+                || i64::try_from(*revision).is_err()
+                || self.evidence.kind != Kind::ProposalCreated
+                || self.evidence.key
+                    != format!("proposal:{registry}:{id}:revision:{revision}:created")
+                || self.source_session.is_some()
+                || self.provider.is_some()
+                || self.directory.is_some()
+                || self.destination.is_some()
+            {
+                return Err("Proposal alerts require exact registry/request/revision without actor metadata".into());
+            }
+        } else if self.evidence.kind == Kind::ProposalCreated {
+            return Err("Proposal creation attention requires an exact proposal target".into());
         }
         Ok(())
     }
@@ -424,7 +460,8 @@ impl Preferences {
                 | Kind::Interrupted
                 | Kind::MessageReceived
                 | Kind::AutomationPaused
-                | Kind::AutomationBlocked => self.waiting,
+                | Kind::AutomationBlocked
+                | Kind::ProposalCreated => self.waiting,
                 Kind::ReviewRequested => self.review_requests,
             }
     }
@@ -432,7 +469,10 @@ impl Preferences {
 
 /// Private metadata-only context. Rich excerpts are a separate explicit opt-in.
 pub fn context(event: &Event) -> String {
-    if matches!(event.target, Target::Automation { .. }) {
+    if matches!(
+        event.target,
+        Target::Automation { .. } | Target::AutomationProposal { .. }
+    ) {
         return String::new(); // User-authored automation context belongs only in opt-in Content.
     }
     if matches!(event.target, Target::SessionInbox(_)) {

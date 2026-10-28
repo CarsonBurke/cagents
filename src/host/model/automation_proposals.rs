@@ -3,6 +3,9 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
+mod delivery;
+pub(super) use delivery::migrate as migrate_delivery;
+
 use super::{Registry, automations::create_automation_in};
 use crate::{
     agent_execution::Origin,
@@ -102,10 +105,36 @@ impl Registry {
         channel_title: Option<String>,
         now_ms: u64,
     ) -> Result<Proposal, String> {
+        self.propose_automation_with_requester(
+            id,
+            owner,
+            requested,
+            definition,
+            identity,
+            channel_title,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Requester naming is optional creation-time notification metadata. It is
+    /// neither destination placement nor proposal/consent identity.
+    pub(crate) fn propose_automation_with_requester(
+        &mut self,
+        id: Uuid,
+        owner: Origin,
+        requested: Definition,
+        definition: Definition,
+        identity: DirectoryIdentity,
+        channel_title: Option<String>,
+        requester: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current(&tx)?;
         if let Some(previous) = read(&tx, id, Some(&owner))? {
             if previous.requested != requested {
                 return Err(
@@ -152,6 +181,9 @@ impl Registry {
             ],
         )
         .map_err(|_| "Could not save this request ID; use a new request ID".to_owned())?;
+        // Source attention and the proposal INSERT commit or roll back together.
+        super::automation_proposal_notifications::queue_in(&tx, &proposal, requester)?;
+        delivery::changed_in(&tx, true)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
@@ -164,10 +196,34 @@ impl Registry {
         next: Option<Occurrence>,
         now_ms: u64,
     ) -> Result<Proposal, String> {
+        self.resolve_automation_proposal_scoped(None, expected, next, now_ms)
+    }
+
+    pub(crate) fn resolve_automation_proposal_in_registry(
+        &mut self,
+        identity: Uuid,
+        expected: &Proposal,
+        next: Option<Occurrence>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
+        self.resolve_automation_proposal_scoped(Some(identity), expected, next, now_ms)
+    }
+
+    fn resolve_automation_proposal_scoped(
+        &mut self,
+        identity: Option<Uuid>,
+        expected: &Proposal,
+        next: Option<Occurrence>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current(&tx)?;
+        if let Some(identity) = identity {
+            delivery::require_identity(&tx, identity)?;
+        }
         let mut current = read(&tx, expected.id, None)?
             .ok_or("The automation proposal is no longer available")?;
         if current.revision != expected.revision {
@@ -201,9 +257,140 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
+        // A real terminal decision suppresses only an exact not-yet-prepared
+        // source. An already selected immutable notice may still finish.
+        super::automation_proposal_notifications::resolved_in(&tx, &current)?;
+        delivery::changed_in(&tx, false)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
     }
+}
+
+/// Populate a fresh published predecessor from this fixture's existing rows.
+/// Only objects/columns created by the actual published migrations are copied;
+/// the current database is never relabeled or stripped of newer schema objects.
+#[cfg(test)]
+pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22, 23].contains(&version));
+    assert_eq!(
+        source
+            .db
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        super::SCHEMA_VERSION
+    );
+    let path = source.path.with_file_name(format!(
+        "published-schema-{version}-{}.sqlite3",
+        Uuid::new_v4()
+    ));
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap(),
+    );
+    let mut legacy = Connection::open(&path).unwrap();
+    legacy.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let tx = legacy.transaction().unwrap();
+    super::migrate_through(&tx, 0, version).unwrap();
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON").unwrap();
+    let tables = {
+        let mut statement = tx.prepare(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        tables
+            .iter()
+            .any(|name| name.contains("terminal_retention")),
+        version >= 20
+    );
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    for table in tables {
+        let table = quote(&table);
+        let columns = {
+            let mut statement = tx.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(!columns.is_empty());
+        let selected = columns
+            .iter()
+            .map(|column| quote(column))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Keep rowid order for mailbox arrival and history22 backfill, even
+        // when timestamps are nonmonotonic. Only the published23 permanent
+        // UUID archive is WITHOUT ROWID; its declared key is deterministic.
+        let order = if table == quote("compacted_view_operations") {
+            quote("operation")
+        } else {
+            "rowid".into()
+        };
+        let rows = {
+            let mut statement = source
+                .db
+                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY {order}"))
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..columns.len())
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        tx.execute(&format!("DELETE FROM {table}"), []).unwrap();
+        let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        for row in &rows {
+            assert_eq!(
+                tx.execute(
+                    &format!("INSERT INTO {table}({selected}) VALUES({placeholders})"),
+                    rusqlite::params_from_iter(row.iter()),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            rows.len()
+        );
+    }
+    assert_eq!(
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .unwrap(),
+        0
+    );
+    // Publish exactly the version whose real migration bodies created this file.
+    tx.pragma_update(None, "user_version", version).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        legacy
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        version
+    );
+    drop(legacy);
+    path
 }
 
 #[cfg(test)]
@@ -217,7 +404,7 @@ mod tests {
         workspace_model::ModelEdit,
     };
 
-    fn fixture() -> (tempfile::TempDir, Registry, Proposal) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Registry, Proposal) {
         let root = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
         let repository = root.path().to_path_buf();
@@ -281,7 +468,7 @@ mod tests {
         (root, registry, proposal)
     }
 
-    fn next() -> Occurrence {
+    pub(super) fn next() -> Occurrence {
         Occurrence {
             due_ms: 1000,
             local: "2026-10-12T09:30".into(),
@@ -515,7 +702,7 @@ mod tests {
 
     #[test]
     fn legacy_registry_migration_preserves_schedules_and_starts_without_proposals() {
-        let (root, mut registry, proposal) = fixture();
+        let (_root, mut registry, proposal) = fixture();
         let automation = registry
             .create_automation(
                 proposal.definition.clone(),
@@ -523,21 +710,9 @@ mod tests {
                 proposal.target_identity.clone(),
             )
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
-                 DROP TABLE automation_lifecycle;
-                 DROP TABLE automation_proposals; PRAGMA user_version=10;",
-            )
-            .unwrap();
+        let legacy = published_fixture_from_rows(&registry, 10);
         drop(registry);
-        let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        let registry = Registry::at(&legacy).unwrap();
         assert_eq!(registry.automation(automation.id).unwrap(), automation);
         assert!(
             registry

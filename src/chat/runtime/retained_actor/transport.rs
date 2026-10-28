@@ -702,6 +702,18 @@ impl RemoteActor {
         })?;
         Ok((state.session_id.clone(), state.title.clone()))
     }
+    /// Title-only projection; never clones the resident session identity.
+    pub fn conversation_title_prefix(
+        &self,
+    ) -> Result<Option<String>, super::super::TitleUnavailable> {
+        let state = self.0.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => super::super::TitleUnavailable::Busy,
+            std::sync::TryLockError::Poisoned(_) => super::super::TitleUnavailable::Poisoned,
+        })?;
+        Ok(super::super::bounded_conversation_title(
+            state.title.as_deref(),
+        ))
+    }
     pub fn launch_account_scope(&self) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
         self.0.launch_account_scope.as_ref().map_err(String::as_str)
     }
@@ -4298,6 +4310,55 @@ exec /bin/sleep 60
         notify(Update::Presentation);
         assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
     }
+    #[test]
+    fn requester_title_prefix_bounds_published_resident_without_socket_or_identity_copy() {
+        let remote = RemoteActor::fixture();
+        let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let title = format!("{}🦀{}", "a".repeat(8191), "🦀".repeat(256 * 1024));
+        let mut resident = remote.state().as_ref().clone();
+        resident.changed += 1;
+        resident.session_id = Some(id.into());
+        resident.title = Some(title.clone());
+        assert!(remote.publish_resident(resident));
+        let prefix = remote.conversation_title_prefix().unwrap().unwrap();
+        assert_eq!(prefix, "a".repeat(8191));
+        assert!(prefix.len() <= 8192);
+        assert_eq!(
+            crate::notifications::presentation::title(&prefix),
+            crate::notifications::presentation::title(&title)
+        );
+        assert_eq!(
+            remote.conversation_title().unwrap(),
+            (Some(id.into()), Some(title)),
+            "full resident metadata is preserved; only the new projection is bounded"
+        );
+        // This existing fixture has no helper/socket peer. Successful reads
+        // must use its actual published resident state without an RPC fallback.
+        let state = remote.0.state.lock().unwrap();
+        let probe = remote.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = sender.send(probe.conversation_title_prefix());
+        });
+        let busy = receiver.recv_timeout(Duration::from_millis(250));
+        drop(state);
+        worker.join().unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = remote.0.state.lock().unwrap();
+            panic!("poison only this private proxy naming state");
+        }));
+        let unavailable = remote.conversation_title_prefix();
+        remote.0.state.clear_poison();
+        assert_eq!(busy.unwrap(), Err(super::super::TitleUnavailable::Busy));
+        assert!(poisoned.is_err());
+        assert_eq!(unavailable, Err(super::super::TitleUnavailable::Poisoned));
+        let mut resident = remote.state().as_ref().clone();
+        resident.changed += 1;
+        resident.title = None;
+        assert!(remote.publish_resident(resident));
+        assert_eq!(remote.conversation_title_prefix(), Ok(None));
+    }
+
     #[test]
     fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {
         let original = RemoteActor::fixture();

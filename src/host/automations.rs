@@ -4,6 +4,8 @@
 mod notification_event;
 mod notifications;
 pub(super) mod precheck;
+mod proposal_delivery;
+mod proposal_notifications;
 pub(super) use crate::automations::schedule;
 pub(super) mod service;
 pub(super) mod target;

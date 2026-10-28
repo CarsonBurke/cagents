@@ -48,7 +48,8 @@ impl Editor {
                 Target::Session(_)
                 | Target::SessionInbox(_)
                 | Target::AgentRun(_)
-                | Target::Automation { .. },
+                | Target::Automation { .. }
+                | Target::AutomationProposal { .. },
             )) => Task::none(),
             Action::Observed(notifications::ui::Action::ActivateWindow(token)) => iced::Task::done(
                 cosmic::Action::Cosmic(cosmic::app::Action::Activate(token.unwrap_or_default())),
@@ -132,12 +133,25 @@ impl Editor {
             .filter(|notice| notice.event.target == Target::PullRequest(request.clone()))
             .map(|notice| notice.id)
             .collect::<Vec<_>>();
+        let authority = cagents::agent_execution::Authority::from_environment();
         let acknowledge = iced::Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    // Equality tests scope only; never retries with this User value.
+                    if authority != cagents::agent_execution::Authority::default()
+                        && cagents::device::is_remote()
+                    {
+                        return Err(
+                            "A local session capability cannot use remote notification APIs"
+                                .to_owned(),
+                        );
+                    }
                     let socket = cagents::terminal_ipc::daemon_socket_path()
                         .map_err(|error| error.to_string())?;
                     let mut client = cagents::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .authenticate(authority)
                         .map_err(|error| error.to_string())?;
                     for id in ids {
                         client

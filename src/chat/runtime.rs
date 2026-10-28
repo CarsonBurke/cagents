@@ -195,6 +195,20 @@ pub(crate) enum TitleUnavailable {
     Poisoned,
 }
 
+// Match notification presentation's input budget before allocating optional
+// requester metadata. The original identity/title projection stays separate.
+const CONVERSATION_TITLE_PREFIX_BYTES: usize = 8192;
+
+fn bounded_conversation_title(title: Option<&str>) -> Option<String> {
+    title.map(|title| {
+        let mut end = title.len().min(CONVERSATION_TITLE_PREFIX_BYTES);
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title[..end].to_owned()
+    })
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -646,6 +660,13 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // Completion can leave a detached daemon with no other
+                    // event. Publish once after the ownership flag, even when
+                    // its hidden observation was already consumed. Reuse the
+                    // existing helper-compatible metadata notification.
+                    actor.observe_next.store(true, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -1305,6 +1326,16 @@ impl LocalHandle {
             std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
         })?;
         Ok((state.session_id.clone(), state.title.clone()))
+    }
+
+    /// Optional title only, copied within the notification input budget.
+    /// A busy or poisoned resident state never delays requester attribution.
+    pub(crate) fn conversation_title_prefix(&self) -> Result<Option<String>, TitleUnavailable> {
+        let state = self.0.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
+            std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
+        })?;
+        Ok(bounded_conversation_title(state.title.as_deref()))
     }
 
     /// The provider-reported title, read without loading the transcript.
@@ -4508,6 +4539,95 @@ mod tests {
         worker.join().unwrap();
         handle.close().unwrap();
         assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
+    }
+
+    #[test]
+    fn requester_title_prefix_bounds_live_resident_copy_and_preserves_naming_refusals() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Step::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let boundary = format!("{}🦀{}", "a".repeat(8191), "z".repeat(1024 * 1024));
+        for title in ["x".repeat(1024 * 1024), "🦀".repeat(256 * 1024), boundary] {
+            {
+                let mut state = handle.0.state.lock().unwrap();
+                apply_event(
+                    &mut state,
+                    &mut BTreeMap::new(),
+                    Event::Session {
+                        id: id.into(),
+                        title: Some(title.clone()),
+                    },
+                );
+            }
+            let prefix = handle.conversation_title_prefix().unwrap().unwrap();
+            assert!(prefix.len() <= 8192);
+            assert!(title.starts_with(&prefix));
+            let mut expected_end = title.len().min(8192);
+            while !title.is_char_boundary(expected_end) {
+                expected_end -= 1;
+            }
+            assert_eq!(prefix, title[..expected_end]);
+            assert_eq!(
+                crate::notifications::presentation::title(&prefix),
+                crate::notifications::presentation::title(&title),
+                "clipping before allocation must preserve the existing sanitizer result"
+            );
+            assert_eq!(
+                handle.conversation_title().unwrap(),
+                (Some(id.into()), Some(title)),
+                "the original coherent pair getter remains unchanged"
+            );
+        }
+        handle.0.state.lock().unwrap().title = None;
+        assert_eq!(handle.conversation_title_prefix(), Ok(None));
+        let state = handle.0.state.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(probe.conversation_title_prefix());
+        });
+        let busy = receiver.recv_timeout(Duration::from_millis(250));
+        drop(state);
+        worker.join().unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = handle.0.state.lock().unwrap();
+            panic!("poison only this private fixture naming state");
+        }));
+        let unavailable = handle.conversation_title_prefix();
+        handle.0.state.clear_poison();
+        handle.close().unwrap();
+        assert_eq!(busy.unwrap(), Err(TitleUnavailable::Busy));
+        assert!(poisoned.is_err());
+        assert_eq!(unavailable, Err(TitleUnavailable::Poisoned));
     }
 
     #[test]

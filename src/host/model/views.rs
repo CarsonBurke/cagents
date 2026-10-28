@@ -1,6 +1,13 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
+mod history;
+
+/// Import permanent history guards and replay identities in the admitted opener transaction.
+pub(super) fn migrate_history(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    history::migrate(tx)
+}
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -451,6 +458,7 @@ pub(super) fn retire_agent(
         return Ok(false);
     };
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    history::retire(db, &view.scope, id)?;
     view.apply(&Change::Remove { id })?;
     view.revision = view
         .revision
@@ -466,12 +474,7 @@ pub(super) fn retire_agent(
 }
 
 pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
-    db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",
-        [operation.to_string()],
-        |row| row.get(0),
-    )
-    .map_err(|error| error.to_string())
+    history::operation_seen(db, operation)
 }
 
 pub(super) fn apply(
@@ -482,6 +485,13 @@ pub(super) fn apply(
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
         _ => return Err("expected a workspace view edit".into()),
     };
+    // A committed UUID is never new authority, even if a retry changes scope.
+    // Return before registration so the no-op cannot create unsequenced state.
+    if let ModelEdit::ChangeView { operation, .. } = edit
+        && operation_seen(transaction, *operation)?
+    {
+        return Ok(false);
+    }
     if !exists(transaction, scope)? {
         if matches!(
             edit,
@@ -503,6 +513,7 @@ pub(super) fn apply(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
+                history::retire(transaction, scope, *id)?;
                 changed |= view.apply(&Change::Remove { id: *id })?;
                 transaction
                     .execute(
@@ -512,6 +523,9 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
+                if history::contains(transaction, scope, pane.id)? {
+                    continue;
+                }
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -532,9 +546,6 @@ pub(super) fn apply(
             change,
             ..
         } => {
-            if operation_seen(transaction, *operation)? {
-                return Ok(false);
-            }
             if view.revision != *expected_revision {
                 return Err("workspace view revision conflict".into());
             }
@@ -560,6 +571,7 @@ pub(super) fn apply(
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
+                        history::allow_transfer_back(transaction, destination, *id)?;
                         target.apply(&Change::Insert {
                             pane: pane.clone(),
                             before: *before,
@@ -578,6 +590,7 @@ pub(super) fn apply(
                                 params![key(destination)?, id.to_string()],
                             )
                             .map_err(|error| error.to_string())?;
+                        history::retire(transaction, scope, *id)?;
                         view.apply(&Change::Remove { id: *id })?
                     }
                 }
@@ -587,6 +600,9 @@ pub(super) fn apply(
                     false
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
+                    if history::contains(transaction, scope, pane.id)? {
+                        return Ok(false);
+                    }
                     if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
                         return Err(
                             "pane already belongs to another view; use an atomic transfer".into(),
@@ -638,6 +654,7 @@ pub(super) fn apply(
                     }
                 }
                 Change::Remove { id } => {
+                    history::retire(transaction, scope, *id)?;
                     transaction
                         .execute(
                             "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
@@ -654,6 +671,7 @@ pub(super) fn apply(
                     params![operation.to_string(), key(scope)?],
                 )
                 .map_err(|error| error.to_string())?;
+            history::compact_operations(transaction)?;
         }
         _ => unreachable!(),
     }
@@ -683,6 +701,14 @@ pub(super) fn apply(
 }
 
 impl Registry {
+    /// Only saved membership, never proof that an exact worker was cleaned up.
+    pub(crate) fn pinned_terminals(
+        &self,
+        candidates: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<std::collections::BTreeSet<crate::model::TerminalId>, String> {
+        terminal_retention::pinned_terminals(&self.db, candidates)
+    }
+
     pub(crate) fn title_conversation(
         &self,
         id: crate::model::ChannelId,
@@ -819,6 +845,7 @@ pub(super) fn adopt_authenticated_agent_pane(
     // Holder continuity does not start a new channel naming choice, including
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
+    terminal_retention::sync_view_pins(db, &view.panes)?;
     db.execute(
         "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
         params![
@@ -896,6 +923,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
             channel_work::renamed_in(db, *id)?;
         }
     }
+    terminal_retention::sync_view_pins(db, &view.panes)?;
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
         params![key(&view.scope)?, view.revision,
@@ -2249,4 +2277,326 @@ mod tests {
     }
 
     include!("views/placement_tests.rs");
+
+    #[test]
+    fn terminal_retention_projection_tracks_view_changes_and_rolls_back_with_them() {
+        use std::collections::BTreeSet;
+        fn placement_storage(registry: &Registry) -> (Vec<(String, i64)>, Vec<(i64, i64)>) {
+            let active = registry
+                .db
+                .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let clock = registry
+                .db
+                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            (active, clock)
+        }
+        let (mut registry, directory, a, b) = setup();
+        let original = live_source_pane();
+        let terminal_id = |pane: &Pane| {
+            let CardKind::Terminal(session) = &pane.kind else {
+                panic!("terminal")
+            };
+            session.id
+        };
+        let old = terminal_id(&original);
+        seed(&mut registry, a, vec![original.clone()]);
+        registry.pin_window_terminals(&[old]).unwrap();
+        let generation = registry.retention_pin_generation(old).unwrap().unwrap();
+        registry.forget_retention_pin(old, &generation).unwrap();
+        assert_eq!(
+            registry.pinned_terminals(&BTreeSet::from([old])).unwrap(),
+            BTreeSet::from([old]),
+            "forgetting local membership must not erase an independently saved shared pane"
+        );
+        let mut replacement = original.clone();
+        if let CardKind::Terminal(session) = &mut replacement.kind {
+            session.id = crate::model::TerminalId::new();
+        }
+        let new = terminal_id(&replacement);
+        let candidates = BTreeSet::from([old, new]);
+        let update = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: original.clone(),
+                pane: replacement.clone(),
+            },
+        );
+        let before = registry.model().unwrap();
+        let placement_before = placement_storage(&registry);
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention BEFORE UPDATE ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention projection failure'); END;").unwrap();
+        assert!(
+            registry
+                .apply(&update)
+                .unwrap_err()
+                .contains("retention projection failure")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(
+            placement_storage(&registry),
+            placement_before,
+            "rejected pin publication must also roll back active epochs and the allocator"
+        );
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([old])
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_retention;")
+            .unwrap();
+        assert!(registry.apply(&update).unwrap().changed);
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        let browser = Pane {
+            kind: pane().kind,
+            ..replacement.clone()
+        };
+        let change = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: replacement.clone(),
+                pane: browser.clone(),
+            },
+        );
+        registry.apply(&change).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+        let change = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: browser,
+                pane: replacement.clone(),
+            },
+        );
+        registry.apply(&change).unwrap();
+        let CardKind::Terminal(terminal) = replacement.kind.clone() else {
+            unreachable!()
+        };
+        let mut chat = replacement.clone();
+        chat.kind = CardKind::Chat(crate::chat::Session {
+            id: terminal.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal.launch.clone(),
+                session_id: None,
+            },
+            proof: terminal.continuity.live_proof(),
+            terminal: Some(terminal),
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        });
+        let change = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: replacement,
+                pane: chat.clone(),
+            },
+        );
+        registry.apply(&change).unwrap();
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        let mut no_terminal = chat.clone();
+        if let CardKind::Chat(session) = &mut no_terminal.kind {
+            session.terminal = None;
+        }
+        let change = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: chat.clone(),
+                pane: no_terminal.clone(),
+            },
+        );
+        registry.apply(&change).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+        let change = edit(
+            &mut registry,
+            a,
+            Change::Update {
+                before: no_terminal,
+                pane: chat.clone(),
+            },
+        );
+        registry.apply(&change).unwrap();
+        let replacement = chat;
+        let transfer = edit(
+            &mut registry,
+            a,
+            Change::Transfer {
+                id: replacement.id,
+                destination: Scope::Channel(b),
+                before: None,
+            },
+        );
+        let before_transfer = registry.model().unwrap();
+        let placement_before_transfer = placement_storage(&registry);
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention_transfer BEFORE INSERT ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention transfer failure'); END;").unwrap();
+        assert!(
+            registry
+                .apply(&transfer)
+                .unwrap_err()
+                .contains("retention transfer failure")
+        );
+        assert_eq!(registry.model().unwrap(), before_transfer);
+        assert_eq!(
+            placement_storage(&registry),
+            placement_before_transfer,
+            "source-first Transfer and its failed target pins must roll back together"
+        );
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_retention_transfer;")
+            .unwrap();
+        registry.apply(&transfer).unwrap();
+        let placement_after_transfer = placement_storage(&registry);
+        let next = placement_before_transfer.1[0].1 + 1;
+        assert_eq!(placement_after_transfer.1, vec![(1, next)]);
+        assert_eq!(
+            placement_after_transfer.0,
+            vec![(replacement.id.to_string(), next)],
+            "Transfer must leave one fresh active mapping, not a source tombstone"
+        );
+        assert!(
+            read(&registry.db, &Scope::Channel(a))
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(b)).unwrap().panes,
+            vec![replacement.clone()]
+        );
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        let removal = edit(&mut registry, b, Change::Remove { id: replacement.id });
+        registry.apply(&removal).unwrap();
+        assert!(registry.pinned_terminals(&candidates).unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_terminal_adoption_updates_retention_in_the_same_transaction() {
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target,
+        };
+        use std::collections::BTreeSet;
+        let (mut registry, directory, a, _) = setup();
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: "/repo".into(),
+                            directory: "/repo".into(),
+                            placement: Some(Scope::Channel(a)),
+                        },
+                        surface: Surface::Terminal,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Work".into(),
+                    idempotency_key: "retention-index-adoption".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let mut pane = live_source_pane();
+        pane.id = CardId::from_uuid(accepted.agent.id.as_uuid());
+        let CardKind::Terminal(terminal) = &pane.kind else {
+            panic!("terminal")
+        };
+        let id = terminal.id;
+        let source = HostedSession::Terminal(terminal.clone());
+        registry
+            .bind_agent(accepted.agent.id, None, source.clone())
+            .unwrap();
+        seed(&mut registry, a, vec![pane]);
+        let mut successor = source.clone();
+        if let HostedSession::Terminal(terminal) = &mut successor {
+            terminal.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("live"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("retention-successor"),
+            };
+        }
+        let before = registry.model().unwrap();
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_adoption_retention BEFORE INSERT ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'adoption retention failure'); END;").unwrap();
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                .unwrap_err()
+                .contains("adoption retention failure")
+        );
+        assert_eq!(
+            registry.model().unwrap(),
+            before,
+            "Agent source, view, Work and sequence must all roll back"
+        );
+        assert_eq!(
+            registry.pinned_terminals(&BTreeSet::from([id])).unwrap(),
+            BTreeSet::from([id])
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_adoption_retention;")
+            .unwrap();
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                .unwrap()
+        );
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().session,
+            Some(successor.clone())
+        );
+        assert!(
+            matches!(&read(&registry.db, &Scope::Channel(a)).unwrap().panes[0].kind,
+            CardKind::Terminal(terminal) if HostedSession::Terminal(terminal.clone()) == successor)
+        );
+        assert_eq!(
+            registry.pinned_terminals(&BTreeSet::from([id])).unwrap(),
+            BTreeSet::from([id])
+        );
+        drop(registry);
+        assert_eq!(
+            Registry::at(&directory.path().join("model.sqlite3"))
+                .unwrap()
+                .pinned_terminals(&BTreeSet::from([id]))
+                .unwrap(),
+            BTreeSet::from([id])
+        );
+    }
 }
