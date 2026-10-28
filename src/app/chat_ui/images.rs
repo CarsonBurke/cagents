@@ -115,6 +115,53 @@ enum DecodeAdmission {
     Defer,
     Wait,
 }
+struct DecoderInput<'a> {
+    bytes: &'a [u8],
+    webp_orientation: Option<image::metadata::Orientation>,
+}
+fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
+    if bytes.get(..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return Some(DecoderInput {
+            bytes,
+            webp_orientation: None,
+        });
+    }
+    // The pinned WebP decoder records declared metadata ranges before proving
+    // they exist. Bound every top-level chunk, including its odd-byte padding,
+    // without allocating or letting a seek adopt bytes beyond this container.
+    let length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?)).ok()?;
+    let end = length.checked_add(8)?;
+    if end < 12 {
+        return None;
+    }
+    let container = bytes.get(..end)?;
+    let mut offset = 12usize;
+    let mut exif = None;
+    while offset < end {
+        let header_end = offset.checked_add(8)?;
+        let header = container.get(offset..header_end)?;
+        let length = usize::try_from(u32::from_le_bytes(header[4..8].try_into().ok()?)).ok()?;
+        let payload_end = header_end.checked_add(length)?;
+        let next = payload_end.checked_add(length & 1)?;
+        if next > end {
+            return None;
+        }
+        if &header[..4] == b"EXIF" && exif.is_none() {
+            exif = Some(&container[header_end..payload_end]);
+        }
+        offset = next;
+    }
+    // Never ask the inner WebP decoder to allocate EXIF from its range map:
+    // its animation-header scan can also manufacture a range from frame data.
+    // Only the first actual top-level EXIF payload supplies orientation.
+    Some(DecoderInput {
+        bytes: container,
+        webp_orientation: Some(
+            exif.and_then(image::metadata::Orientation::from_exif_chunk)
+                .unwrap_or(image::metadata::Orientation::NoTransforms),
+        ),
+    })
+}
 fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
     decode_handle_with_admission(bytes, budget, edge, max_bytes, DecodeAdmission::Defer)
 }
@@ -157,8 +204,11 @@ fn decode_handle_with_admission(
         },
     };
     use image::ImageDecoder;
+    let Some(input) = bounded_decoder_input(bytes) else {
+        return Loaded::Unavailable;
+    };
     let mut reader =
-        match image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format() {
+        match image::ImageReader::new(std::io::Cursor::new(input.bytes)).with_guessed_format() {
             Ok(reader) => reader,
             Err(_) => return Loaded::Unavailable,
         };
@@ -198,9 +248,11 @@ fn decode_handle_with_admission(
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let orientation = input.webp_orientation.unwrap_or_else(|| {
+        decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms)
+    });
     let Ok(decoded) = image::DynamicImage::from_decoder(decoder) else {
         return Loaded::Unavailable;
     };
@@ -1604,6 +1656,141 @@ mod tests {
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
+    }
+    fn oriented_webp(orientation: u8) -> Vec<u8> {
+        use image::ImageEncoder;
+        // Raw little-endian TIFF: one SHORT Orientation entry, no JPEG prefix.
+        let mut exif = *b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        exif[18] = orientation;
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder.set_exif_metadata(exif.to_vec()).unwrap();
+        encoder
+            .write_image(
+                &[255, 0, 0, 255, 0, 255, 0, 255],
+                2,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        assert_eq!(&bytes[12..16], b"VP8X");
+        bytes
+    }
+    #[test]
+    fn webp_preview_preserves_all_exif_orientations_from_bounded_metadata() {
+        for orientation in 1..=8 {
+            let bytes = oriented_webp(orientation);
+            let budget = Budget::new(bytes.len(), 8);
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(bytes.clone(), &budget)
+            else {
+                panic!("valid oriented WebP must decode");
+            };
+            assert_eq!(
+                (width, height),
+                if orientation >= 5 { (1, 2) } else { (2, 1) },
+                "orientation {orientation}"
+            );
+            let expected = if matches!(orientation, 2 | 3 | 7 | 8) {
+                [0, 255, 0, 255, 255, 0, 0, 255]
+            } else {
+                [255, 0, 0, 255, 0, 255, 0, 255]
+            };
+            assert_eq!(pixels.as_ref(), &expected, "orientation {orientation}");
+            assert_eq!(budget.encoded.available_permits(), bytes.len());
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 0);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+    }
+    #[test]
+    fn webp_preview_rejects_missing_chunk_bytes_and_releases_every_lease() {
+        let bytes = oriented_webp(6);
+        let exif = bytes.len() - 26 - 8;
+        assert_eq!(&bytes[exif..exif + 4], b"EXIF");
+        let mut truncated_exif = bytes.clone();
+        // A modest declaration exercises the same truncated-range failure
+        // without requesting a large allocation even in the unfixed decoder.
+        truncated_exif[exif + 4..exif + 8].copy_from_slice(&4096u32.to_le_bytes());
+        let mut long_riff = bytes.clone();
+        long_riff[4..8].copy_from_slice(&((bytes.len() - 8 + 2) as u32).to_le_bytes());
+        let mut short_riff = bytes.clone();
+        short_riff[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let mut truncated_header = bytes.clone();
+        truncated_header.extend_from_slice(b"JUNK\x01\0\0");
+        let length = (truncated_header.len() - 8) as u32;
+        truncated_header[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut missing_padding = bytes.clone();
+        missing_padding.extend_from_slice(b"JUNK\x01\0\0\0x");
+        let length = (missing_padding.len() - 8) as u32;
+        missing_padding[4..8].copy_from_slice(&length.to_le_bytes());
+        let budget = Budget::new(4096, 8);
+        for malformed in [
+            truncated_exif,
+            long_riff,
+            short_riff,
+            truncated_header,
+            missing_padding,
+        ] {
+            assert!(matches!(
+                bounded_handle(malformed, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), 4096);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("valid WebP must still decode after malformed containers");
+        };
+        drop(handle);
+        assert_eq!(budget.encoded.available_permits(), 4096);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 8);
+    }
+    #[test]
+    fn webp_preview_keeps_first_exif_unknown_padding_and_declared_container_scope() {
+        let mut bytes = oriented_webp(6);
+        let mut second_exif = bytes[bytes.len() - 26..].to_vec();
+        second_exif[18] = 8;
+        bytes.extend_from_slice(b"JUNK\x01\0\0\0x\0");
+        bytes.extend_from_slice(b"JUNK\0\0\0\0");
+        bytes.extend_from_slice(b"EXIF\x1a\0\0\0");
+        bytes.extend_from_slice(&second_exif);
+        let container_length = bytes.len();
+        bytes[4..8].copy_from_slice(&((container_length - 8) as u32).to_le_bytes());
+        // This invalid frame is outside RIFF. The pinned decoder's extended
+        // scan otherwise reads past the declared end and rejects the image.
+        bytes.extend_from_slice(b"ANMF\x01\0\0\0x\0");
+        let budget = Budget::new(bytes.len(), 8);
+        let Loaded::Ready(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = bounded_handle(bytes.clone(), &budget)
+        else {
+            panic!("padded unknown chunks and trailing bytes must preserve valid WebP");
+        };
+        assert_eq!((width, height), (1, 2));
+        assert_eq!(pixels.as_ref(), &[255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        drop(pixels);
+        assert_eq!(budget.pixels.available_permits(), 8);
+        let budget = Budget::new(container_length, 8);
+        assert!(matches!(
+            bounded_handle(bytes.clone(), &budget),
+            Loaded::Deferred(pressure) if pressure.permits as usize == bytes.len()
+        ));
+        assert_eq!(budget.encoded.available_permits(), container_length);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 8);
     }
     #[test]
     fn decoded_preview_preserves_all_pinned_exif_orientations() {
