@@ -4998,6 +4998,16 @@ mod tests {
     fn isolated_upgrade_test(name: &str) -> bool {
         // Check the caller before any fixture environment is sanitized. These
         // real User upgrades must not acquire User scope by clearing delegation.
+        for marker in [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ] {
+            assert!(
+                std::env::var_os(marker).is_none(),
+                "this upgrade fixture requires a genuine User/CI process; inherited {marker} is present"
+            );
+        }
         assert!(
             crate::agent_execution::Authority::from_environment()
                 == crate::agent_execution::Authority::default(),
