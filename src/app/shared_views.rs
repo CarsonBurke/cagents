@@ -1556,6 +1556,13 @@ impl Cagents {
                     self.sync_closed_chat_draft(id);
                 }
                 let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.is_dirty()
+                            && (runtime.has_editor_recovery()
+                                || runtime.has_durability_warning()) =>
+                    {
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning, then save any remaining edits before closing it."
+                    }
                     Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
                         if runtime.is_saving() {
                             "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
@@ -1680,7 +1687,11 @@ impl Cagents {
                         && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
                         && runtime.blocks_navigation()
                     {
-                        let message = if runtime.is_dirty() {
+                        let message = if runtime.is_dirty()
+                            && (runtime.has_editor_recovery() || runtime.has_durability_warning())
+                        {
+                            "Another client changed this pane. Resolve this editor's file recovery or durability warning, then save any remaining edits before adopting that change."
+                        } else if runtime.is_dirty() {
                             "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
                         } else if runtime.is_saving() {
                             "Another client changed this pane. Wait for its save to finish before adopting that change."
@@ -4131,6 +4142,13 @@ mod tests {
         let runtime = match state {
             "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
             "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
+            "dirty-warning" => {
+                let (mut runtime, completion) =
+                    RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                drop(runtime.update(completion));
+                assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                runtime
+            }
             "warning" => {
                 let (mut runtime, completion) =
                     RepositoryRuntime::post_persist_failure_fixture(pane.id);
@@ -4174,9 +4192,15 @@ mod tests {
             "clean" => RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n").0,
             _ => unreachable!(),
         };
-        assert_eq!(runtime.is_dirty(), state == "dirty");
+        assert_eq!(
+            runtime.is_dirty(),
+            matches!(state, "dirty" | "dirty-warning")
+        );
         assert_eq!(runtime.is_saving(), state == "saving");
-        assert_eq!(runtime.has_durability_warning(), state == "warning");
+        assert_eq!(
+            runtime.has_durability_warning(),
+            matches!(state, "warning" | "dirty-warning")
+        );
         assert_eq!(runtime.has_editor_recovery(), state == "recovery");
         assert_eq!(runtime.blocks_navigation(), state != "clean");
         pane.kind = CardKind::Repository(runtime.descriptor.clone());
@@ -4191,7 +4215,7 @@ mod tests {
 
     #[test]
     fn shared_repository_removal_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery"] {
+        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
             let (mut app, channel, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4210,7 +4234,10 @@ mod tests {
                 assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
                 assert!(current.blocks_navigation(), "{state}");
                 assert_eq!(current.has_editor_recovery(), state == "recovery");
-                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 assert!(app.shared_views.retained.contains(&pane.id));
@@ -4218,6 +4245,11 @@ mod tests {
                 let notice = app.notices.recent().next().unwrap().notice.message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("save or discard them before closing")),
+                    "dirty-warning" => {
+                        assert!(notice.contains("resolve its file recovery or durability warning"));
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
                     "saving" => assert!(notice.contains("wait for its save to finish")),
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
@@ -4236,7 +4268,7 @@ mod tests {
 
     #[test]
     fn shared_repository_replacement_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery"] {
+        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
             let (mut app, _, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4261,12 +4293,24 @@ mod tests {
                 assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
                 assert!(current.blocks_navigation(), "{state}");
                 assert_eq!(current.has_editor_recovery(), state == "recovery");
-                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 let notice = app.notices.recent().next().unwrap().notice.message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("Save or discard its unsaved edits")),
+                    "dirty-warning" => {
+                        assert!(
+                            notice.contains(
+                                "Resolve this editor's file recovery or durability warning"
+                            )
+                        );
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
                     "saving" => assert!(notice.contains("Wait for its save to finish")),
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
@@ -4607,7 +4651,7 @@ mod tests {
 
     #[test]
     fn retention_notice_full_reads_preserve_dismissal_and_do_not_count_unchanged_incidents() {
-        for state in ["dirty", "saving", "warning", "recovery"] {
+        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
             for replacement in [false, true] {
                 let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture(state);
                 app.status = None;
@@ -4651,6 +4695,106 @@ mod tests {
 
     #[test]
     fn retention_notice_reports_changed_reason_incoming_target_and_original_source_once() {
+        use crate::repository_widget::{EditorAction, EditorEdit};
+
+        // A save receipt and Discard change the displayed reason, not the
+        // unresolved peer incident. Exercise both removal and replacement.
+        for replacement in [false, true] {
+            let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+            let CardKind::Repository(descriptor) = &pane.kind else {
+                unreachable!()
+            };
+            let (mut runtime, completion) =
+                RepositoryRuntime::post_persist_failure_fixture(pane.id);
+            runtime.descriptor = descriptor.clone();
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card: pane.id,
+                action: EditorAction::Edit(EditorEdit::Paste(Arc::new("new edits".into()))),
+            }));
+            assert!(runtime.is_dirty() && runtime.is_saving());
+            assert!(!runtime.has_durability_warning());
+            app.cards
+                .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+            let incoming = if replacement {
+                let target = &mut app.workspace_model.views[0].panes[0];
+                let CardKind::Repository(repository) = &mut target.kind else {
+                    unreachable!()
+                };
+                repository.selected_file = Some("replacement.txt".into());
+                Some(target.kind.clone())
+            } else {
+                app.workspace_model.views[0].panes.clear();
+                None
+            };
+            app.status = None;
+            app.notices.clear();
+            let mut completion = Some(completion);
+            let mut previous_notice = None;
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**runtime as *const RepositoryRuntime;
+            for reason in ["dirty", "dirty-warning", "warning"] {
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                    unreachable!()
+                };
+                if reason == "dirty-warning" {
+                    drop(runtime.update(completion.take().unwrap()));
+                } else if reason == "warning" {
+                    drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                    assert_eq!(runtime.editor_text().as_deref(), Some("B\n"));
+                }
+                assert_eq!(runtime.is_dirty(), reason != "warning");
+                assert_eq!(runtime.has_durability_warning(), reason != "dirty");
+                assert!(runtime.blocks_navigation());
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries.len(), 1, "{reason}, {replacement}");
+                let notice = &app.notices.entries[0];
+                let id = notice.id;
+                assert_ne!(Some(id), previous_notice);
+                let message = notice.notice.message.clone();
+                assert_eq!(
+                    message.to_ascii_lowercase().contains("discard"),
+                    reason == "dirty"
+                );
+                assert_eq!(
+                    message.contains("then save any remaining edits"),
+                    reason == "dirty-warning"
+                );
+                assert_eq!(
+                    message.contains("file recovery or durability warning"),
+                    reason != "dirty"
+                );
+                assert_eq!(
+                    app.shared_views.retention_incidents[&pane.id].reason,
+                    message.as_str()
+                );
+                assert_eq!(
+                    app.shared_views.retention_incidents[&pane.id].original,
+                    pane.kind
+                );
+                assert_eq!(
+                    app.shared_views.retention_incidents[&pane.id].incoming,
+                    incoming
+                );
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries.len(), 1);
+                assert_eq!(app.notices.entries[0].id, id);
+                assert_eq!(app.notices.entries[0].repeats, 1);
+                drop(app.update(Message::DismissNotice(id)));
+                retention_full_read(&mut app);
+                assert!(app.notices.is_empty());
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+                    panic!("changed guidance must not resolve the editor fence");
+                };
+                assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+                assert!(runtime.blocks_navigation());
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert_eq!(app.shared_views.retention_incidents.len(), 1);
+                previous_notice = Some(id);
+            }
+        }
+
         let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
         app.status = None;
         app.notices.clear();
