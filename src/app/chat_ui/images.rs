@@ -115,6 +115,187 @@ enum DecodeAdmission {
     Defer,
     Wait,
 }
+struct DecoderInput<'a> {
+    bytes: &'a [u8],
+    orientation_override: Option<image::metadata::Orientation>,
+    ico_dimensions: Option<(u16, u16)>,
+}
+fn webp_chunk(bytes: &[u8], offset: usize) -> Option<(&[u8], &[u8], usize)> {
+    let header_end = offset.checked_add(8)?;
+    let header = bytes.get(offset..header_end)?;
+    let length = usize::try_from(u32::from_le_bytes(header[4..8].try_into().ok()?)).ok()?;
+    let payload_end = header_end.checked_add(length)?;
+    let next = payload_end.checked_add(length & 1)?;
+    if next > bytes.len() {
+        return None;
+    }
+    Some((&header[..4], &bytes[header_end..payload_end], next))
+}
+fn webp_vp8_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let header = bytes.get(..10)?;
+    if header[0] & 1 != 0 || &header[3..6] != b"\x9d\x01\x2a" {
+        return None;
+    }
+    Some((
+        u32::from(u16::from_le_bytes([header[6], header[7]]) & 0x3fff),
+        u32::from(u16::from_le_bytes([header[8], header[9]]) & 0x3fff),
+    ))
+}
+fn webp_frame_matches_vp8(frame: &[u8]) -> Option<()> {
+    let header = frame.get(..16)?;
+    let dimension = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) + 1;
+    let expected = (dimension(&header[6..9]), dimension(&header[9..12]));
+    let (kind, payload, next) = webp_chunk(frame, 16)?;
+    let vp8 = match kind {
+        b"VP8 " => payload,
+        b"VP8L" => return Some(()),
+        b"ALPH" => {
+            let (kind, payload, _) = webp_chunk(frame, next)?;
+            if kind != b"VP8 " {
+                return None;
+            }
+            payload
+        }
+        _ => return None,
+    };
+    (webp_vp8_dimensions(vp8)? == expected).then_some(())
+}
+fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
+    if bytes.get(..4) == Some(b"\0\0\x01\0") {
+        return bounded_ico_input(bytes);
+    }
+    if bytes.get(..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return Some(DecoderInput {
+            bytes,
+            orientation_override: None,
+            ico_dimensions: None,
+        });
+    }
+    // The pinned WebP decoder records declared metadata ranges before proving
+    // they exist. Bound every top-level chunk, including its odd-byte padding,
+    // without allocating or letting a seek adopt bytes beyond this container.
+    let length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().ok()?)).ok()?;
+    let end = length.checked_add(8)?;
+    if end < 12 {
+        return None;
+    }
+    let container = bytes.get(..end)?;
+    let mut offset = 12usize;
+    let mut exif = None;
+    let mut extended = None;
+    let mut vp8 = None;
+    let mut frame = None;
+    while offset < end {
+        let (kind, payload, next) = webp_chunk(container, offset)?;
+        if offset == 12 && kind == b"VP8X" {
+            let header = payload.get(..10)?;
+            let dimension =
+                |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]) + 1;
+            extended = Some((
+                header[0] & 0x02 != 0,
+                (dimension(&header[4..7]), dimension(&header[7..10])),
+            ));
+        }
+        match kind {
+            b"EXIF" if exif.is_none() => exif = Some(payload),
+            b"VP8 " if vp8.is_none() => vp8 = Some(payload),
+            b"ANMF" if frame.is_none() => frame = Some(payload),
+            _ => {}
+        }
+        offset = next;
+    }
+    if let Some((animated, dimensions)) = extended {
+        // The pinned VP8 decoder allocates YUV from its own keyframe header
+        // before comparing against the admitted canvas/frame. Check only the
+        // first image/frame actually decoded, using its real bounded payload.
+        if animated {
+            webp_frame_matches_vp8(frame?)?;
+        } else if let Some(vp8) = vp8
+            && webp_vp8_dimensions(vp8)? != dimensions
+        {
+            return None;
+        }
+    }
+    // Never ask the inner WebP decoder to allocate EXIF from its range map:
+    // its animation-header scan can also manufacture a range from frame data.
+    // Only the first actual top-level EXIF payload supplies orientation.
+    Some(DecoderInput {
+        bytes: container,
+        orientation_override: Some(
+            exif.and_then(image::metadata::Orientation::from_exif_chunk)
+                .unwrap_or(image::metadata::Orientation::NoTransforms),
+        ),
+        ico_dimensions: None,
+    })
+}
+fn bounded_ico_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
+    let count = usize::from(u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?));
+    if count == 0 {
+        return None;
+    }
+    let directory_end = 6usize.checked_add(count.checked_mul(16)?)?;
+    let directory = bytes.get(6..directory_end)?;
+    let dimension = |value: u8| if value == 0 { 256 } else { u16::from(value) };
+    let score = |entry: &[u8]| {
+        (
+            u16::from_le_bytes([entry[6], entry[7]]),
+            u32::from(dimension(entry[0])) * u32::from(dimension(entry[1])),
+        )
+    };
+    // Match image 0.25.10: seed the last entry, then replace only on a
+    // strictly greater score while visiting earlier entries in file order.
+    let mut selected = &directory[directory.len() - 16..];
+    for entry in directory.chunks_exact(16) {
+        if u16::from_le_bytes([entry[4], entry[5]]) > 256
+            || u16::from_le_bytes([entry[6], entry[7]]) > 256
+        {
+            return None;
+        }
+        if score(entry) > score(selected) {
+            selected = entry;
+        }
+    }
+    let length = usize::try_from(u32::from_le_bytes(selected[8..12].try_into().ok()?)).ok()?;
+    let start = usize::try_from(u32::from_le_bytes(selected[12..16].try_into().ok()?)).ok()?;
+    let image = bytes.get(start..start.checked_add(length)?)?;
+    let is_png = image.get(..8)? == b"\x89PNG\r\n\x1a\n";
+    Some(DecoderInput {
+        // PNG must receive limits before read_info inflates metadata. Keep
+        // DIBs on the existing ICO decoder, including its AND-mask behavior.
+        bytes: if is_png { image } else { bytes },
+        orientation_override: is_png.then_some(image::metadata::Orientation::NoTransforms),
+        ico_dimensions: is_png.then_some((dimension(selected[0]), dimension(selected[1]))),
+    })
+}
+fn decoder_with_limits<'a>(
+    input: &DecoderInput<'a>,
+    max_alloc: u64,
+) -> Option<impl image::ImageDecoder + 'a> {
+    use image::ImageDecoder;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(input.bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    // Each axis of a positive image within the existing pixel-product limit
+    // fits this ceiling, without an unadmitted dimension-only constructor.
+    limits.max_image_width = Some(MAX_PIXELS as u32);
+    limits.max_image_height = Some(MAX_PIXELS as u32);
+    limits.max_alloc = Some(max_alloc);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().ok()?;
+    if let Some((width, height)) = input.ico_dimensions {
+        let (actual_width, actual_height) = decoder.dimensions();
+        // Preserve the ICO wrapper's PNG-specific checks and its treatment
+        // of a zero directory dimension as 256, including larger PNGs.
+        if u32::from(width) != actual_width.min(256)
+            || u32::from(height) != actual_height.min(256)
+            || decoder.color_type() != image::ColorType::Rgba8
+        {
+            return None;
+        }
+    }
+    Some(decoder)
+}
 fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
     decode_handle_with_admission(bytes, budget, edge, max_bytes, DecodeAdmission::Defer)
 }
@@ -157,19 +338,10 @@ fn decode_handle_with_admission(
         },
     };
     use image::ImageDecoder;
-    let mut reader =
-        match image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format() {
-            Ok(reader) => reader,
-            Err(_) => return Loaded::Unavailable,
-        };
-    let mut limits = image::Limits::default();
-    // Each axis of a positive image within the existing pixel-product limit
-    // fits this ceiling, without an unadmitted dimension-only constructor.
-    limits.max_image_width = Some(MAX_PIXELS as u32);
-    limits.max_image_height = Some(MAX_PIXELS as u32);
-    limits.max_alloc = Some(MAX_DECODE_BYTES);
-    reader.limits(limits);
-    let Ok(mut decoder) = reader.into_decoder() else {
+    let Some(input) = bounded_decoder_input(bytes) else {
+        return Loaded::Unavailable;
+    };
+    let Some(mut decoder) = decoder_with_limits(&input, MAX_DECODE_BYTES) else {
         return Loaded::Unavailable;
     };
     let (width, height) = decoder.dimensions();
@@ -198,9 +370,11 @@ fn decode_handle_with_admission(
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let orientation = input.orientation_override.unwrap_or_else(|| {
+        decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms)
+    });
     let Ok(decoded) = image::DynamicImage::from_decoder(decoder) else {
         return Loaded::Unavailable;
     };
@@ -2944,6 +3118,537 @@ mod tests {
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
+    }
+    fn ico_bytes(entries: &[(u8, u8, u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = b"\0\0\x01\0".to_vec();
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + entries.len() * 16;
+        for &(width, height, depth, image) in entries {
+            bytes.extend_from_slice(&[width, height, 0, 0]);
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&depth.to_le_bytes());
+            bytes.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += image.len();
+        }
+        for &(_, _, _, image) in entries {
+            bytes.extend_from_slice(image);
+        }
+        bytes
+    }
+    fn ico_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(pixels, width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+    fn assert_ico_pixels(bytes: Vec<u8>, dimensions: (u32, u32), expected: &[u8]) {
+        let budget = Budget::new(bytes.len(), expected.len());
+        let encoded_length = bytes.len();
+        let Loaded::Ready(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = bounded_handle(bytes, &budget)
+        else {
+            panic!("valid ICO must decode");
+        };
+        assert_eq!((width, height), dimensions);
+        assert_eq!(pixels.as_ref(), expected);
+        assert_eq!(budget.encoded.available_permits(), encoded_length);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        drop(pixels);
+        assert_eq!(budget.pixels.available_permits(), expected.len());
+    }
+    #[test]
+    fn ico_preview_preserves_selection_ties_and_validates_the_whole_directory() {
+        let red = ico_png(1, 1, &[255, 0, 0, 255]);
+        let green = ico_png(1, 1, &[0, 255, 0, 255]);
+        let blue = ico_png(2, 1, &[0, 0, 255, 255, 0, 0, 255, 255]);
+        for (entries, selected) in [
+            (
+                vec![(1, 1, 32, red.as_slice()), (2, 1, 24, blue.as_slice())],
+                red.as_slice(),
+            ),
+            (
+                vec![(1, 1, 32, red.as_slice()), (2, 1, 32, blue.as_slice())],
+                blue.as_slice(),
+            ),
+            (
+                vec![(1, 1, 32, red.as_slice()), (1, 1, 32, green.as_slice())],
+                green.as_slice(),
+            ),
+            (
+                vec![
+                    (1, 1, 32, red.as_slice()),
+                    (1, 1, 32, green.as_slice()),
+                    (2, 1, 24, blue.as_slice()),
+                ],
+                red.as_slice(),
+            ),
+        ] {
+            let bytes = ico_bytes(&entries);
+            assert_eq!(bounded_decoder_input(&bytes).unwrap().bytes, selected);
+        }
+        assert_ico_pixels(ico_bytes(&[(1, 1, 32, &red)]), (1, 1), &[255, 0, 0, 255]);
+        let bytes = ico_bytes(&[(1, 1, 24, &red), (1, 1, 32, &green)]);
+        let mut unused_bad_range = bytes.clone();
+        unused_bad_range[14..22].fill(255);
+        assert_eq!(
+            bounded_decoder_input(&unused_bad_range).unwrap().bytes,
+            green
+        );
+        for field in [10, 12] {
+            let mut invalid = bytes.clone();
+            invalid[field..field + 2].copy_from_slice(&257u16.to_le_bytes());
+            assert!(bounded_decoder_input(&invalid).is_none());
+            invalid[field..field + 2].copy_from_slice(&256u16.to_le_bytes());
+            assert!(bounded_decoder_input(&invalid).is_some());
+        }
+        let single = ico_bytes(&[(1, 1, 32, &red)]);
+        let mut empty = single.clone();
+        empty[4..6].fill(0);
+        let mut short_directory = single[..21].to_vec();
+        short_directory[4..6].copy_from_slice(&2u16.to_le_bytes());
+        let mut bad_offset = single.clone();
+        bad_offset[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad_length = single.clone();
+        bad_length[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut short_png = single;
+        short_png[14..18].copy_from_slice(&7u32.to_le_bytes());
+        for invalid in [
+            b"\0\0\x01\0".to_vec(),
+            empty,
+            short_directory,
+            bad_offset,
+            bad_length,
+            short_png,
+        ] {
+            assert!(bounded_decoder_input(&invalid).is_none());
+            let budget = Budget::new(invalid.len(), 4);
+            let encoded_length = invalid.len();
+            assert!(matches!(
+                bounded_handle(invalid, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 4);
+        }
+    }
+    #[test]
+    fn ico_preview_preserves_png_checks_orientation_and_dib_mask() {
+        use image::ImageEncoder;
+        let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut oriented = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut oriented);
+        encoder
+            .set_exif_metadata(
+                b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec(),
+            )
+            .unwrap();
+        encoder
+            .write_image(&pixels, 2, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert_ico_pixels(ico_bytes(&[(2, 1, 32, &oriented)]), (2, 1), &pixels);
+        let large_pixels = [1, 2, 3, 255].repeat(257);
+        let large = ico_png(257, 1, &large_pixels);
+        // Directory zero means 256; upstream compares actual.min(256).
+        assert_ico_pixels(ico_bytes(&[(0, 1, 32, &large)]), (257, 1), &large_pixels);
+        let mut rgb = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut rgb)
+            .write_image(&[1, 2, 3], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        for invalid in [
+            ico_bytes(&[(1, 1, 32, &oriented)]),
+            ico_bytes(&[(1, 1, 24, &rgb)]),
+        ] {
+            let budget = Budget::new(invalid.len(), 8);
+            let encoded_length = invalid.len();
+            assert!(matches!(
+                bounded_handle(invalid, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+        let mut dib = vec![0; 48];
+        dib[..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&2u32.to_le_bytes()); // Image plus AND mask.
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&4u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&[3, 2, 1, 255]);
+        dib[44] = 0x80; // Mask the sole pixel transparent.
+        let bytes = ico_bytes(&[(1, 1, 32, &dib)]);
+        let input = bounded_decoder_input(&bytes).unwrap();
+        assert_eq!(input.bytes.as_ptr(), bytes.as_ptr());
+        assert_eq!(input.bytes.len(), bytes.len());
+        assert_eq!(input.orientation_override, None);
+        assert_ico_pixels(bytes, (1, 1), &[1, 2, 3, 0]);
+    }
+    #[test]
+    fn ico_png_metadata_receives_constructor_limits_and_retains_full_input_accounting() {
+        use image::{ImageDecoder, ImageEncoder};
+        let profile = vec![0; 4096];
+        let mut png = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder.set_icc_profile(profile.clone()).unwrap();
+        encoder
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(png.len() < 1024);
+        let bytes = ico_bytes(&[(1, 1, 32, &png)]);
+        let input = bounded_decoder_input(&bytes).unwrap();
+        assert_eq!(input.bytes, png);
+        for max_alloc in [1024, 16384] {
+            let mut decoder = decoder_with_limits(&input, max_alloc).unwrap();
+            let metadata = decoder.icc_profile().unwrap();
+            // png suppresses an iCCP inflation-limit error and still decodes
+            // pixels. Inspect metadata, with the high-limit positive control.
+            assert_eq!(metadata, (max_alloc > 4096).then(|| profile.clone()));
+            assert_eq!(
+                image::DynamicImage::from_decoder(decoder)
+                    .unwrap()
+                    .into_rgba8()
+                    .as_raw(),
+                &[1, 2, 3, 255]
+            );
+        }
+        assert_ico_pixels(bytes.clone(), (1, 1), &[1, 2, 3, 255]);
+        let budget = Budget::new(png.len(), 4);
+        assert!(
+            matches!(bounded_handle(bytes.clone(), &budget), Loaded::Deferred(pressure) if pressure.permits as usize == bytes.len())
+        );
+        assert_eq!(budget.encoded.available_permits(), png.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
+    }
+    // The following three WebP fixtures come from web-platform-tests at
+    // Servo revision 5c14ac9428d8d95c2f6c2f0300fe248d3929f282.
+    // # The 3-Clause BSD License
+    //
+    // Copyright © web-platform-tests contributors
+    //
+    // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+    //
+    // 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+    // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+    // 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+    //
+    // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+    // html/canvas/element/manual/wide-gamut-canvas/resources/pattern-srgb.webp
+    const LOSSY_WEBP: &str = concat!(
+        "UklGRsgAAABXRUJQVlA4ILwAAAAwBACdASoUABQAAAAAJZAB0gH6gUoC1AP4B7YGQAfoBvAANUF9XYU4RdAA/v//FuB/WH/7",
+        "RB//hsjft7//6A7T/4ySu7/ugLf9Y2/lWz/P//Zj5LbXUocuZerf//5T90WfzRF/L1D8Va//vi8Wt/x7Cf6WH+nFylfluYyr",
+        "Vg+80P//+Hl9gX+g7x/v4oa+uhv/uHivX/h1vq/6Ae35Yr5fI8BkrTPnLz5+rYfedEzUtJ+cy06x8xCadXgAAA==",
+    );
+    // html/canvas/element/manual/wide-gamut-canvas/resources/pattern-srgb-transparent.webp
+    const ALPHA_WEBP: &str = concat!(
+        "UklGRvQAAABXRUJQVlA4WAoAAAAQAAAAEwAAEwAAQUxQSBAAAAABB1DAiAgABOF/3UBE/1MFVlA4IL4AAADwBACdASoUABQA",
+        "AAAAJZgB0gH6gfwDBDlAfgBcAH8AvwD9AN4AIgAM3F9XXxj8GAAA/v/+Iir6gP/n3af+gBffxnP/7lnB/+JyuPZ//PpuVPWv",
+        "/IjxNWapByUeKzquf//+6ivgt/kX9dev6jGv/zv5ytT/nzaP45/t64Vq+lUyGhcMQo/r///8sl90qavx/oaGFd28f/xNNCan",
+        "/Mjf7KrT/hkqs714exbeOwRobPr4ijjHCUdiIXQguaWs+cAA",
+    );
+    // html/semantics/embedded-content/the-img-element/resources/animated.webp
+    const ANIMATED_WEBP: &str = concat!(
+        "UklGRhYBAABXRUJQVlA4WAoAAAACAAAAYwAAYwAAQU5JTQYAAAD/////AQBBTk1GdAAAAAAAAAAAAGMAAGMAAGQAAABWUDgg",
+        "XAAAAFAGAJ0BKmQAZAA+MRiLRCIhoRBUACADBLS3cLn0uA/AD8AAAOMgYi8sA11N7iLywDXU3uIvLANdTeiAAP7/FJ///7GY",
+        "/aM/ySv//4Mx/BmP4Mx/8J8bLcNAAAAAQU5NRm4AAAAAAAAAAABjAABjAAAQJwAAVlA4IFYAAABQBgCdASpkAGQAPjEYi0Qi",
+        "IaEQVAAgAwS0t3C59LgPwA/AAADG11N7iLywDXU3uIvLANdTe4i8sA08AAD+/xvOf/+vRB4g360H//3T0hA0f8lAAAAAAA==",
+    );
+    fn webp_fixture(encoded: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    }
+    fn push_webp_fixture_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        if payload.len() & 1 != 0 {
+            bytes.push(0);
+        }
+    }
+    fn extended_webp_fixture(chunks: &[u8], animated: bool, alpha: bool) -> Vec<u8> {
+        let mut bytes = b"RIFF\0\0\0\0WEBP".to_vec();
+        let mut canvas = [0u8; 10];
+        canvas[0] = u8::from(animated) * 0x02 | u8::from(alpha) * 0x10;
+        canvas[4] = 19; // The fixture's VP8 keyframe is 20x20.
+        canvas[7] = 19;
+        push_webp_fixture_chunk(&mut bytes, b"VP8X", &canvas);
+        if animated {
+            push_webp_fixture_chunk(&mut bytes, b"ANIM", &[0; 6]);
+            let mut frame = vec![0; 16];
+            frame[6] = 19;
+            frame[9] = 19;
+            frame[15] = 0x02; // Replace the canvas, without alpha blending.
+            frame.extend_from_slice(chunks);
+            push_webp_fixture_chunk(&mut bytes, b"ANMF", &frame);
+        } else {
+            bytes.extend_from_slice(chunks);
+        }
+        let length = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        bytes
+    }
+    fn animated_alpha_webp_fixture() -> Vec<u8> {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let mut chunks = Vec::new();
+        // Uncompressed ALPH: one control byte plus 400 opaque alpha values.
+        // Its odd length requires padding before the actual VP8 header.
+        let mut alpha = vec![255; 401];
+        alpha[0] = 0;
+        push_webp_fixture_chunk(&mut chunks, b"ALPH", &alpha);
+        chunks.extend_from_slice(&simple[12..]);
+        extended_webp_fixture(&chunks, true, true)
+    }
+    #[test]
+    fn webp_preview_preserves_actual_lossy_static_animated_and_alpha_pixels() {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let opaque = image::load_from_memory(&simple).unwrap().into_rgba8();
+        let assert_pixels = |bytes: Vec<u8>, expected: &image::RgbaImage| {
+            let budget = Budget::new(bytes.len(), expected.len());
+            let encoded_length = bytes.len();
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(bytes, &budget)
+            else {
+                panic!("valid lossy WebP must retain its pixels");
+            };
+            assert_eq!((width, height), expected.dimensions());
+            assert_eq!(pixels.as_ref(), expected.as_raw());
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), expected.len());
+        };
+        assert_pixels(extended_webp_fixture(&simple[12..], false, false), &opaque);
+        assert_pixels(animated_alpha_webp_fixture(), &opaque);
+        assert_pixels(simple, &opaque);
+        let alpha = webp_fixture(ALPHA_WEBP);
+        let expected = image::load_from_memory(&alpha).unwrap().into_rgba8();
+        assert_pixels(alpha, &expected);
+        let animated = webp_fixture(ANIMATED_WEBP);
+        let expected = image::load_from_memory(&animated).unwrap().into_rgba8();
+        assert_pixels(animated.clone(), &expected);
+        let mut unused_frame = animated;
+        let second = unused_frame
+            .windows(3)
+            .enumerate()
+            .filter(|(_, bytes)| *bytes == b"\x9d\x01\x2a")
+            .nth(1)
+            .unwrap()
+            .0;
+        unused_frame[second + 3..second + 5].copy_from_slice(&101u16.to_le_bytes());
+        assert_pixels(unused_frame, &expected);
+    }
+    #[test]
+    fn webp_preview_refuses_vp8_canvas_and_frame_mismatches_before_decoder_construction() {
+        let simple = webp_fixture(LOSSY_WEBP);
+        let extended = extended_webp_fixture(&simple[12..], false, false);
+        for (mut bytes, height) in [
+            (extended, false),
+            (webp_fixture(ANIMATED_WEBP), true),
+            (animated_alpha_webp_fixture(), false),
+        ] {
+            let magic = bytes
+                .windows(3)
+                .position(|bytes| bytes == b"\x9d\x01\x2a")
+                .unwrap();
+            let offset = magic + if height { 5 } else { 3 };
+            let dimension = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            // Only a one-pixel mismatch: never exercise a large allocation.
+            bytes[offset..offset + 2].copy_from_slice(&(dimension + 1).to_le_bytes());
+            assert!(bounded_decoder_input(&bytes).is_none());
+            let budget = Budget::new(bytes.len(), 100 * 100 * 4);
+            let encoded_length = bytes.len();
+            assert!(matches!(
+                bounded_handle(bytes, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 100 * 100 * 4);
+        }
+    }
+    fn oriented_webp(orientation: u8) -> Vec<u8> {
+        use image::ImageEncoder;
+        // Raw little-endian TIFF: one SHORT Orientation entry, no JPEG prefix.
+        let mut exif = *b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        exif[18] = orientation;
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder.set_exif_metadata(exif.to_vec()).unwrap();
+        encoder
+            .write_image(
+                &[255, 0, 0, 255, 0, 255, 0, 255],
+                2,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        assert_eq!(&bytes[12..16], b"VP8X");
+        bytes
+    }
+    #[test]
+    fn webp_preview_preserves_all_exif_orientations_from_bounded_metadata() {
+        for orientation in 1..=8 {
+            let bytes = oriented_webp(orientation);
+            let budget = Budget::new(bytes.len(), 8);
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(bytes.clone(), &budget)
+            else {
+                panic!("valid oriented WebP must decode");
+            };
+            assert_eq!(
+                (width, height),
+                if orientation >= 5 { (1, 2) } else { (2, 1) },
+                "orientation {orientation}"
+            );
+            let expected = if matches!(orientation, 2 | 3 | 7 | 8) {
+                [0, 255, 0, 255, 255, 0, 0, 255]
+            } else {
+                [255, 0, 0, 255, 0, 255, 0, 255]
+            };
+            assert_eq!(pixels.as_ref(), &expected, "orientation {orientation}");
+            assert_eq!(budget.encoded.available_permits(), bytes.len());
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 0);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+    }
+    #[test]
+    fn webp_preview_rejects_missing_chunk_bytes_and_releases_every_lease() {
+        let bytes = oriented_webp(6);
+        let exif = bytes.len() - 26 - 8;
+        assert_eq!(&bytes[exif..exif + 4], b"EXIF");
+        let mut truncated_exif = bytes.clone();
+        // A modest declaration exercises the same truncated-range failure
+        // without requesting a large allocation even in the unfixed decoder.
+        truncated_exif[exif + 4..exif + 8].copy_from_slice(&4096u32.to_le_bytes());
+        let mut long_riff = bytes.clone();
+        long_riff[4..8].copy_from_slice(&((bytes.len() - 8 + 2) as u32).to_le_bytes());
+        let mut short_riff = bytes.clone();
+        short_riff[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let mut truncated_header = bytes.clone();
+        truncated_header.extend_from_slice(b"JUNK\x01\0\0");
+        let length = (truncated_header.len() - 8) as u32;
+        truncated_header[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut missing_padding = bytes.clone();
+        missing_padding.extend_from_slice(b"JUNK\x01\0\0\0x");
+        let length = (missing_padding.len() - 8) as u32;
+        missing_padding[4..8].copy_from_slice(&length.to_le_bytes());
+        let budget = Budget::new(4096, 8);
+        for malformed in [
+            truncated_exif,
+            long_riff,
+            short_riff,
+            truncated_header,
+            missing_padding,
+        ] {
+            assert!(matches!(
+                bounded_handle(malformed, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), 4096);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("valid WebP must still decode after malformed containers");
+        };
+        drop(handle);
+        assert_eq!(budget.encoded.available_permits(), 4096);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 8);
+    }
+    #[test]
+    fn webp_preview_keeps_first_exif_unknown_padding_and_declared_container_scope() {
+        let mut bytes = oriented_webp(6);
+        let mut second_exif = bytes[bytes.len() - 26..].to_vec();
+        second_exif[18] = 8;
+        bytes.extend_from_slice(b"JUNK\x01\0\0\0x\0");
+        bytes.extend_from_slice(b"JUNK\0\0\0\0");
+        bytes.extend_from_slice(b"EXIF\x1a\0\0\0");
+        bytes.extend_from_slice(&second_exif);
+        let container_length = bytes.len();
+        bytes[4..8].copy_from_slice(&((container_length - 8) as u32).to_le_bytes());
+        // This invalid frame is outside RIFF. The pinned decoder's extended
+        // scan otherwise reads past the declared end and rejects the image.
+        bytes.extend_from_slice(b"ANMF\x01\0\0\0x\0");
+        let budget = Budget::new(bytes.len(), 8);
+        let Loaded::Ready(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = bounded_handle(bytes.clone(), &budget)
+        else {
+            panic!("padded unknown chunks and trailing bytes must preserve valid WebP");
+        };
+        assert_eq!((width, height), (1, 2));
+        assert_eq!(pixels.as_ref(), &[255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        drop(pixels);
+        assert_eq!(budget.pixels.available_permits(), 8);
+        let budget = Budget::new(container_length, 8);
+        assert!(matches!(
+            bounded_handle(bytes.clone(), &budget),
+            Loaded::Deferred(pressure) if pressure.permits as usize == bytes.len()
+        ));
+        assert_eq!(budget.encoded.available_permits(), container_length);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 8);
+    }
+    #[test]
+    fn webp_preview_without_usable_first_exif_stays_unrotated() {
+        let bytes = oriented_webp(6);
+        let exif = bytes.len() - 26 - 8;
+        let mut absent = bytes[..exif].to_vec();
+        absent[20] &= !0x08; // Clear VP8X's EXIF-present flag.
+        let length = (absent.len() - 8) as u32;
+        absent[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut invalid_first = bytes.clone();
+        invalid_first[exif + 8 + 18] = 0; // Unrecognized TIFF Orientation.
+        invalid_first.extend_from_slice(&bytes[exif..]);
+        let length = (invalid_first.len() - 8) as u32;
+        invalid_first[4..8].copy_from_slice(&length.to_le_bytes());
+        for input in [absent, invalid_first] {
+            let budget = Budget::new(input.len(), 8);
+            let encoded_length = input.len();
+            let Loaded::Ready(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = bounded_handle(input, &budget)
+            else {
+                panic!("missing or unusable first EXIF must not prevent WebP decoding");
+            };
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(pixels.as_ref(), &[255, 0, 0, 255, 0, 255, 0, 255]);
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            drop(pixels);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
     }
     #[test]
     fn decoded_preview_preserves_all_pinned_exif_orientations() {
