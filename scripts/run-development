@@ -62,6 +62,16 @@ USAGE
     shift
 done
 
+# A diagnostic environment must never fall through to normal restart/hot
+# controls before the UI can refuse a wrong-feature executable.
+if [ "${CAGENTS_LATENCY_OUTPUT+x}" = x ]; then
+    printf '%s\n' 'CAGENTS_LATENCY_OUTPUT belongs to scripts/run-redraw-latency, not the development runner' >&2
+    exit 2
+fi
+if [ "${CAGENTS_NATIVE_UI_FIXTURE+x}" = x ] && [ "$native_fixture" != true ]; then
+    printf '%s\n' 'CAGENTS_NATIVE_UI_FIXTURE requires --native-fixture' >&2
+    exit 2
+fi
 ui_features=development,ui
 if [ "$native_fixture" = true ]; then
     if [ "$hot" = true ] || [ "$fresh_daemon" = true ] || [ "$#" -ne 0 ]; then
