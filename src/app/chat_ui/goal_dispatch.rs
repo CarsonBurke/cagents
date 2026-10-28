@@ -1045,6 +1045,34 @@ mod tests {
     }
 
     #[test]
+    fn goal_submit_preserves_disabled_conversation_draft_without_dispatch() {
+        for state in 0..3 {
+            let (mut app, card, target) = live();
+            write(&mut app, target, "/goal set Keep this unsent");
+            let current = app.chat_runtime_mut(target).unwrap();
+            match state {
+                0 => current.disconnected = true,
+                1 => Arc::make_mut(&mut current.snapshot).exited = true,
+                _ => {
+                    Arc::make_mut(&mut current.snapshot).read_only_reason =
+                        Some("Retained history".into());
+                }
+            }
+            let draft = current.composer.text();
+            let launch = current.session.launch.clone();
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            let runtime = runtime(&app, card);
+            assert_eq!(runtime.composer.text(), draft);
+            assert_eq!(runtime.session.launch, launch);
+            assert!(!runtime.goal_open);
+            assert!(runtime.goal_pending.is_none());
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(runtime.followups.is_empty());
+            assert!(app.chat_ui.attempt(card).is_none());
+        }
+    }
+
+    #[test]
     fn goal_submit_precedes_automatic_account_routing_and_never_creates_a_prompt_queue() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 105);
