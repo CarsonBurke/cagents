@@ -20795,6 +20795,12 @@ mod tests {
             let task = app.update(Message::WindowCloseRequested(window));
             assert!(app.pending_window_close.is_some());
             assert!(app.settings_pending.is_empty());
+            if !unchanged_retry {
+                assert!(matches!(
+                    app.settings_feedback,
+                    Some(SettingsFeedback::Pending)
+                ));
+            }
             assert_eq!(app.settings.chat_expand_tool_groups, desired);
             assert!(matches!(&app.cards[&card], CardRuntime::Chat(runtime)
                 if runtime.tool_groups_expanded == desired));
@@ -20841,6 +20847,11 @@ mod tests {
             assert!(app.chrome_ui.is_open());
             assert!(app.pending_window_close.is_none());
             assert!(app.exit.is_none());
+            assert!(app.settings_save_error.is_some());
+            assert!(matches!(
+                app.settings_feedback,
+                Some(SettingsFeedback::Error(_))
+            ));
             assert_eq!(app.core.main_window_id(), Some(window));
             assert!(!activations.is_closed());
             assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -20920,6 +20931,24 @@ mod tests {
                 ..base.clone()
             };
             settings::save(&path, &external).unwrap();
+            // Reapplying the same visible value is the ordinary Settings
+            // recovery action. It must retry the failed final settings save,
+            // without closing the retained window or losing external edits.
+            let retry = app.update(Message::SettingsChanged {
+                field: SettingsField::ChatExpandToolGroups,
+                value: desired.to_string(),
+            });
+            settle_settings_task(&mut app, retry);
+            assert!(app.settings_save_error.is_none());
+            assert!(matches!(
+                app.settings_feedback,
+                Some(SettingsFeedback::Saved)
+            ));
+            assert!(app.exit.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+            let retried = settings::load(&path).unwrap();
+            assert_eq!(retried.chat_expand_tool_groups, desired);
+            assert_eq!(retried.app_theme, external.app_theme);
             let task = app.update(Message::WindowCloseRequested(window));
             let generation = app.pending_window_close.as_ref().unwrap().generation;
             drop(app.update(late));
