@@ -660,7 +660,8 @@ pub enum RepositoryAction {
         preview: bool,
     },
     RevertFile {
-        card: CardId,
+        identity: AsyncIdentity,
+        request: crate::repository::DiscardRequest,
     },
     ToggleDiffWhitespace {
         card: CardId,
@@ -855,7 +856,6 @@ impl RepositoryAction {
             | Self::ApplyMarkdownMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
             | Self::ToggleDiffWhitespace { card }
-            | Self::RevertFile { card }
             | Self::SelectCommittedBasis { card, .. }
             | Self::ApplyDiffBasis { card, .. }
             | Self::RetryDiff { card }
@@ -891,6 +891,7 @@ impl RepositoryAction {
             | Self::PdfZoom { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
             Self::ReviewLine { identity, .. }
+            | Self::RevertFile { identity, .. }
             | Self::DiffAnnotations { identity, .. }
             | Self::ExpandDiffFold { identity, .. }
             | Self::FilesLoaded { identity, .. }
@@ -4906,6 +4907,25 @@ impl RepositoryRuntime {
             },
             confirmed: false,
         })
+    }
+
+    /// Capture exactly the file and discard offer the toolbar presents.
+    pub fn selected_revert_action(&self, card: CardId) -> Option<RepositoryAction> {
+        let request = self.selected_discard_request()?;
+        Some(RepositoryAction::RevertFile {
+            identity: self.current_identity(card, self.selected_path()?.to_owned()),
+            request,
+        })
+    }
+
+    /// A queued toolbar activation cannot become consent for a replacement
+    /// file, a reloaded generation, or a changed tracked/untracked offer.
+    pub fn accepts_revert(
+        &self,
+        identity: &AsyncIdentity,
+        request: &crate::repository::DiscardRequest,
+    ) -> bool {
+        self.accepts_selected(identity) && self.selected_discard_request().as_ref() == Some(request)
     }
 
     /// Re-announces the open buffer to a replaced language-server manager.
@@ -10715,14 +10735,24 @@ fn labelled_diff_control<'a>(
     selected: bool,
     action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
-    crate::interaction::tooltip(
+    let owner = action.as_ref().and_then(|action| match action {
+        RepositoryAction::RevertFile { identity, request } => {
+            Some((identity.clone(), request.clone()))
+        }
+        _ => None,
+    });
+    let button: Element<'a, RepositoryAction> =
         widget::button::custom(crate::design::caption(label))
             .name(label)
             .class(crate::ui_controls::control_style(selected, None))
             .padding([space::XXS, space::S])
-            .on_press_maybe(action),
-        tooltip,
-    )
+            .on_press_maybe(action)
+            .into();
+    let button = match owner {
+        Some(owner) => crate::ui_controls::owned(owner, button),
+        None => button,
+    };
+    crate::interaction::tooltip(button, tooltip)
 }
 
 fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
@@ -10824,9 +10854,7 @@ fn diff_action_toolbar(
             "Revert",
             "Revert working tree file changes…",
             false,
-            runtime
-                .selected_discard_request()
-                .map(|_| RepositoryAction::RevertFile { card }),
+            runtime.selected_revert_action(card),
         ));
         actions.push(labelled_diff_control(
             "Discard edits",
@@ -13461,6 +13489,122 @@ mod tests {
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
         (runtime, identity)
+    }
+
+    #[test]
+    fn revert_control_keeps_native_press_with_its_exact_file_and_offer() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Size, mouse};
+
+        let mut renderer = headless_renderer();
+        let viewport = Size::new(1000.0, 600.0);
+        for transition in ["unchanged", "path", "reload", "offer", "worktree"] {
+            let card = CardId::new();
+            let (mut runtime, _) = diff_runtime(card);
+            let original = runtime.selected_revert_action(card).unwrap();
+            let RepositoryAction::RevertFile { identity, request } = &original else {
+                unreachable!()
+            };
+            assert!(runtime.accepts_revert(identity, request));
+            let (cache, pointer) = {
+                let mut ui = UserInterface::build(
+                    diff_action_toolbar(card, &runtime, viewport.width),
+                    viewport,
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                let bounds = nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .find(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some("Revert")
+                            && !node.node().is_disabled()
+                    })
+                    .expect("the actual diff toolbar offers Revert")
+                    .node()
+                    .bounds()
+                    .unwrap();
+                let pointer = Point::new(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                );
+                let mut messages = Vec::new();
+                ui.update(
+                    &[Event::Mouse(mouse::Event::ButtonPressed(
+                        mouse::Button::Left,
+                    ))],
+                    mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(messages.is_empty(), "Revert answers on release");
+                (ui.into_cache(), pointer)
+            };
+            match transition {
+                "unchanged" => {}
+                "path" => runtime.selected.as_mut().unwrap().path = "other.txt".into(),
+                "reload" => runtime.generation += 1,
+                "offer" => runtime.selected.as_mut().unwrap().status = Some("??".into()),
+                "worktree" => runtime.descriptor.worktree = "/another-repository".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                runtime.accepts_revert(identity, request),
+                transition == "unchanged",
+                "queued callbacks keep their exact original offer: {transition}"
+            );
+            let mut ui = UserInterface::build(
+                diff_action_toolbar(card, &runtime, viewport.width),
+                viewport,
+                cache,
+                &mut renderer,
+            );
+            let cursor = mouse::Cursor::Available(pointer);
+            let mut messages = Vec::new();
+            ui.update(
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages.len(), usize::from(transition == "unchanged"));
+            if transition == "unchanged" {
+                let [
+                    RepositoryAction::RevertFile {
+                        identity: current,
+                        request: current_request,
+                    },
+                ] = &messages[..]
+                else {
+                    panic!("the original held click activates only its captured Revert offer")
+                };
+                assert_eq!(current, identity);
+                assert_eq!(current_request, request);
+            }
+            messages.clear();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let [RepositoryAction::RevertFile { identity, request }] = &messages[..] else {
+                panic!("a fresh click activates the current offer: {transition}")
+            };
+            assert!(runtime.accepts_revert(identity, request));
+        }
     }
 
     /// The added-line tint only tells the truth while the comparison it came

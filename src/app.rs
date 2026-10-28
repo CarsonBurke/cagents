@@ -15010,22 +15010,23 @@ impl Application for Cagents {
                     self.open_file_in_editor(path, caret, editor_id)
                 })
             }
-            Message::Repository(RepositoryAction::RevertFile { card }) => {
+            Message::Repository(RepositoryAction::RevertFile { identity, request }) => {
                 if self.modal_is_open() {
                     return Task::none();
                 }
+                let card = identity.card;
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
                     return Task::none();
                 };
+                if !runtime.accepts_revert(&identity, &request) {
+                    return Task::none();
+                }
                 let Some(source) = self
                     .sidebar_model
                     .source_control
                     .as_ref()
                     .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
                 else {
-                    return Task::none();
-                };
-                let Some(request) = runtime.selected_discard_request() else {
                     return Task::none();
                 };
                 self.update(Message::Sidebar(SidebarAction::RequestDiscard {
@@ -30961,6 +30962,45 @@ mod tests {
                 &Message::Sidebar(action)
             ));
         }
+    }
+
+    #[test]
+    fn queued_revert_does_not_confirm_a_different_selected_file() {
+        let (mut app, card) = editing_repository_app();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "original\n");
+        let original = runtime.selected_revert_action(card).unwrap();
+        let key = ActiveWorktreeKey {
+            canonical_path: runtime.descriptor.worktree.clone(),
+            project_id: runtime.descriptor.project,
+            worktree_id: crate::model::WorktreeId::new(),
+        };
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(key));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+
+        // A later selection owns the same pane before this callback drains.
+        let (replacement, _) = RepositoryRuntime::open_fixture(card, "other.txt", "other\n");
+        let current = replacement.selected_revert_action(card).unwrap();
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(replacement)));
+        drop(app.update(Message::Repository(original)));
+        assert!(app.sidebar_state.pending_discard().is_none());
+        assert!(app.source_control_mutations.is_empty());
+
+        drop(app.update(Message::Repository(current)));
+        let pending = app
+            .sidebar_state
+            .pending_discard()
+            .expect("a fresh activation uses the existing confirmation");
+        assert_eq!(pending.request.tracked.len(), 1);
+        assert_eq!(
+            pending.request.tracked[0].path.as_path(),
+            Path::new("other.txt")
+        );
+        assert!(!pending.request.confirmed);
+        assert!(app.source_control_mutations.is_empty());
+        drop(app.update(Message::Sidebar(SidebarAction::CancelDiscard)));
+        assert!(app.sidebar_state.pending_discard().is_none());
     }
 
     #[test]
