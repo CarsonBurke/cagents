@@ -746,6 +746,41 @@ impl State {
                     .push(design::heading("Original removal diagnostic"))
                     .push(selectable_detail(original));
             }
+            if let Some(prepared) = &operation.prepared
+                && operation.phase != Phase::Removed
+            {
+                let inspection = &prepared.plan.inspection;
+                if !inspection.ignored.is_empty() {
+                    details = details.push(design::heading("Ignored entries that will be deleted"));
+                    for entry in &inspection.ignored {
+                        details = details.push(selectable_detail(entry.path.as_str()));
+                    }
+                    let shown = inspection.ignored.len() as u32;
+                    if inspection.ignored_total > shown {
+                        details = details.push(design::caption(format!(
+                            "… and {} more ignored entries not included in this inspection",
+                            inspection.ignored_total - shown
+                        )));
+                    }
+                }
+                for (label, paths) in [
+                    (
+                        "Filtered files a snapshot cannot preserve",
+                        &inspection.filtered,
+                    ),
+                    (
+                        "Nested repositories a snapshot cannot preserve",
+                        &inspection.nested,
+                    ),
+                ] {
+                    if !paths.is_empty() {
+                        details = details.push(design::heading(label));
+                        for path in paths {
+                            details = details.push(selectable_detail(path.as_str()));
+                        }
+                    }
+                }
+            }
         }
         // Keep the disclosure's native state and focus stable when its panel
         // opens. The following controls have separate geometry ownership.
@@ -2679,6 +2714,8 @@ mod tests {
                 directory: true,
             })
             .collect();
+        let long_ignored = format!("cache/{}ignored-output", "long-segment/".repeat(15));
+        prepared.plan.inspection.ignored[0].path = long_ignored.clone();
         state.update(
             Action::Planned {
                 generation,
@@ -2700,5 +2737,21 @@ mod tests {
         assert!(!texts.iter().any(|text| text == "cache/6"));
         assert!(!texts.iter().any(|text| text.contains("loses nothing")));
         assert!(texts.iter().any(|text| text == "Remove worktree"));
+        assert!(!texts.iter().any(|text| text == &long_ignored));
+        state.update(
+            Action::Details {
+                generation: state.generation(),
+                open: true,
+            },
+            true,
+        );
+        let details = outline(&state);
+        assert!(details.iter().any(|text| text == &long_ignored));
+        assert!(details.iter().any(|text| text == "cache/19"));
+        assert!(
+            details.iter().any(
+                |text| text == "… and 380 more ignored entries not included in this inspection"
+            )
+        );
     }
 }
