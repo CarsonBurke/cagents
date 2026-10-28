@@ -434,6 +434,7 @@ fn create_inner(
             goal: None,
             goal_settings: None,
             applied_selection: None,
+            unconfirmed_selection: None,
             goal_resume_admission: GoalResumeAdmission::Unavailable,
             goal_resume_pending: false,
             start,
@@ -562,6 +563,13 @@ struct GoalSettings {
     invalidated: bool,
 }
 
+struct PendingSelection {
+    target: (Option<String>, Option<String>),
+    /// Only this sole request's pre-enqueue rejection can retire the fence.
+    /// Compatible retries may leave an earlier queued effect, so drop the ID.
+    first_request: Option<String>,
+}
+
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
     match (approval.as_str(), sandbox["type"].as_str()) {
         (Some("never"), Some("dangerFullAccess")) => Some("yolo"),
@@ -602,6 +610,9 @@ struct Codex {
     goal_settings: Option<GoalSettings>,
     /// One coherent actual provider selection, never a staged UI choice.
     applied_selection: Option<(String, Option<String>)>,
+    /// Queued local effects outlive their RPC ACK and any unsent Goal intent.
+    /// An older snapshot cannot prove that a later conflicting effect settled.
+    unconfirmed_selection: Option<PendingSelection>,
     goal_resume_admission: GoalResumeAdmission,
     /// Keep metadata/stop controls usable while legacy restore lacks authority.
     goal_resume_pending: bool,
@@ -721,12 +732,93 @@ impl Codex {
     }
 
     fn selection_is_applied(&self) -> bool {
-        self.applied_selection
+        self.unconfirmed_selection.is_none()
+            && self
+                .applied_selection
+                .as_ref()
+                .is_some_and(|(model, reasoning)| {
+                    self.selected.as_ref() == Some(model)
+                        && (self.reasoning.is_none() || &self.reasoning == reasoning)
+                })
+    }
+
+    fn selection_admission(&self) -> Result<(), String> {
+        // A settings ACK establishes Core enqueue order, not application. Do
+        // not let an earlier unacknowledged model-carrying request enqueue a
+        // conflicting override after this one. Turn also owns pricing model
+        // metadata, so conservatively wait for any pending turn/start ACK.
+        if self.pending.values().any(|pending| {
+            matches!(
+                pending,
+                Pending::GoalSettings
+                    | Pending::Turn { .. }
+                    | Pending::FastMode { model: Some(_), .. }
+            )
+        }) {
+            return Err("Codex is still accepting the previous model request. Wait for confirmation, then submit again; your input is kept.".into());
+        }
+        let target = (self.selected.clone(), self.reasoning.clone());
+        if self
+            .unconfirmed_selection
             .as_ref()
-            .is_some_and(|(model, reasoning)| {
-                self.selected.as_ref() == Some(model)
-                    && (self.reasoning.is_none() || &self.reasoning == reasoning)
-            })
+            .is_some_and(|pending| pending.target != target)
+        {
+            return Err("The previous Codex model change is unconfirmed. Wait for its applied settings before changing the model again; your input is kept.".into());
+        }
+        Ok(())
+    }
+
+    fn selection_enqueued(&mut self, step: &Step) {
+        self.applied_selection = None;
+        let target = (self.selected.clone(), self.reasoning.clone());
+        // Admission is checked before reservation/enqueue at every caller.
+        // Compatible repeats share one bounded fence; conflicting changes
+        // wait, since the provider may coalesce intermediate snapshots.
+        if let Some(pending) = &mut self.unconfirmed_selection {
+            debug_assert!(pending.target == target);
+            pending.first_request = None;
+        } else {
+            self.unconfirmed_selection = Some(PendingSelection {
+                target,
+                first_request: Some(
+                    step.writes.last().expect("model request was enqueued")["id"].to_string(),
+                ),
+            });
+        }
+    }
+
+    fn selection_rejected(&mut self, id: &str, frame: &Value) {
+        // The pinned settings handler validates before Core submission; its
+        // validation/decoder errors prove this exact RPC did not enqueue an
+        // effect. Internal, malformed and asynchronous Core errors do not.
+        if self
+            .unconfirmed_selection
+            .as_ref()
+            .is_some_and(|pending| pending.first_request.as_deref() == Some(id))
+            && frame.get("result").is_none()
+            && matches!(
+                frame["error"]["code"].as_i64(),
+                Some(-32600 | -32601 | -32602)
+            )
+            && frame["error"]["message"].is_string()
+        {
+            self.unconfirmed_selection = None;
+        }
+    }
+
+    fn observe_selection(&mut self, actual: Option<(String, Option<String>)>) {
+        self.applied_selection = None;
+        let Some((model, reasoning)) = actual else {
+            return;
+        };
+        if let Some(pending) = &self.unconfirmed_selection {
+            let target = &pending.target;
+            if target.0.as_ref() != Some(&model) || (target.1.is_some() && target.1 != reasoning) {
+                return;
+            }
+            self.unconfirmed_selection = None;
+        }
+        self.applied_selection = Some((model, reasoning));
     }
 
     fn request_goal(
@@ -747,10 +839,23 @@ impl Codex {
                 chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume
             );
         let applied = self.applied_selection.clone();
-        if selects_work && applied.is_none() {
-            return Err("The original provider model settings are unconfirmed. Reconnect before requesting native Goal work; your input is kept.".into());
+        let confirms_pending = self.unconfirmed_selection.as_ref().is_some_and(|pending| {
+            pending.target == (self.selected.clone(), self.reasoning.clone())
+        });
+        if selects_work && applied.is_none() && !confirms_pending {
+            let recovery = if self.unconfirmed_selection.is_some() {
+                "Wait for the previous change, or retry with its same model and reasoning before choosing another"
+            } else {
+                "Reconnect to confirm the original settings before requesting native Goal work"
+            };
+            return Err(format!(
+                "The original provider model settings are unconfirmed. {recovery}; your input is kept."
+            ));
         }
         let already_applied = self.selection_is_applied();
+        if selects_work && !already_applied {
+            self.selection_admission()?;
+        }
         // Check transport capacity before reserving the domain's physical slot.
         // No fallible transport allocation remains after begin_for succeeds.
         if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
@@ -789,7 +894,7 @@ impl Codex {
             // Once a changed selection can execute, the old actual pair is
             // no longer proof. A lost application notice must not let a later
             // request reuse it after this local Goal intent has expired.
-            self.applied_selection = None;
+            self.selection_enqueued(step);
         } else {
             if selects_work {
                 // Providers may suppress unchanged settings notifications. A
@@ -816,6 +921,7 @@ impl Codex {
         settings.invalidated |= settings
             .deadline
             .is_some_and(|deadline| deadline <= Instant::now());
+        settings.invalidated |= settings.observed.is_some() && !self.selection_is_applied();
         let current = self.ready
             && self.direct_input
             && self.thread.as_deref() == Some(settings.request.thread_id())
@@ -2060,10 +2166,11 @@ impl Adapter for Codex {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
                         let changes_selection = self.selection_dirty && !self.selection_is_applied();
+                        if changes_selection { self.selection_admission()?; }
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
-                        if changes_selection { self.applied_selection = None; }
+                        if changes_selection { self.selection_enqueued(&step); }
                         self.notification_turn = None;
                         step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
@@ -2134,12 +2241,14 @@ impl Adapter for Codex {
                     params["model"] = json!(self.selected);
                     params["effort"] = json!(self.reasoning);
                 }
+                let changes_selection = self.selection_dirty && !self.selection_is_applied();
+                if changes_selection { self.selection_admission()?; }
                 self.call(&mut step, "thread/settings/update", params, Pending::FastMode {
                     enabled, revision: self.service_tier_revision,
                     model: self.selection_dirty.then(|| self.selected.clone()).flatten(),
                 })?;
-                if self.selection_dirty && !self.selection_is_applied() {
-                    self.applied_selection = None;
+                if changes_selection {
+                    self.selection_enqueued(&step);
                 }
             }
             Command::SetPermissionMode { mode } => {
@@ -2232,6 +2341,7 @@ impl Adapter for Codex {
                 return Ok(step);
             }
             if matches!(pending, Pending::GoalSettings) {
+                self.selection_rejected(&id, &frame);
                 let confirmed = frame.get("error").is_none()
                     && frame.get("result").is_some_and(Value::is_object);
                 if let Some(settings) = &mut self.goal_settings {
@@ -2286,6 +2396,9 @@ impl Adapter for Codex {
             }
             if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
+            }
+            if matches!(pending, Pending::FastMode { model: Some(_), .. }) {
+                self.selection_rejected(&id, &frame);
             }
             if let Some(error) = frame.get("error") {
                 if let Pending::LoginRecovery {
@@ -2529,10 +2642,11 @@ impl Adapter for Codex {
                     self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
-                    self.applied_selection = self
+                    let actual_selection = self
                         .selected
                         .clone()
                         .map(|model| (model, self.reasoning.clone()));
+                    self.observe_selection(actual_selection);
                     self.busy = thread["status"]["type"] == "active";
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
@@ -3220,9 +3334,11 @@ impl Adapter for Codex {
                 let valid_reasoning = settings.get("effort").is_none_or(|effort| {
                     effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
                 });
-                self.applied_selection = actual_model
-                    .filter(|_| valid_reasoning)
-                    .map(|model| (model.to_owned(), actual_reasoning.clone()));
+                self.observe_selection(
+                    actual_model
+                        .filter(|_| valid_reasoning)
+                        .map(|model| (model.to_owned(), actual_reasoning.clone())),
+                );
                 if let Some(pending) = &mut self.goal_settings {
                     pending.invalidated |= !valid_reasoning
                         || (actual_model.is_some() && actual_model != pending.model.as_deref())
@@ -3230,6 +3346,7 @@ impl Adapter for Codex {
                     if actual_model.is_some()
                         && actual_model == pending.model.as_deref()
                         && valid_reasoning
+                        && self.applied_selection.is_some()
                     {
                         pending.observed = Some(actual_reasoning);
                     }
@@ -6278,6 +6395,7 @@ mod tests {
             goal: None,
             goal_settings: None,
             applied_selection: None,
+            unconfirmed_selection: None,
             goal_resume_admission: GoalResumeAdmission::OriginalScope,
             goal_resume_pending: false,
             start: json!({}),

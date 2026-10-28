@@ -444,6 +444,546 @@ fn model_changing_turn_and_fast_requests_invalidate_only_changed_application_pro
 }
 
 #[test]
+fn unacknowledged_model_requests_cannot_enqueue_later_conflicting_changes_out_of_order() {
+    for fast in [false, true] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        adapter
+            .fast_models
+            .extend(["provider-default".into(), "explicit-goal-model".into()]);
+        adapter
+            .command(Command::SetModel {
+                model: "provider-default".into(),
+                reasoning: Some("medium".into()),
+            })
+            .unwrap();
+        let earlier = adapter
+            .command(if fast {
+                Command::SetFastMode { enabled: true }
+            } else {
+                Command::Prompt {
+                    text: "unchanged selection".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                }
+            })
+            .unwrap();
+        assert_eq!(earlier.writes[0]["params"]["model"], "provider-default");
+        // An outstanding compatible override does not invalidate actual A.
+        let unchanged = command(&mut adapter, Operation::Resume);
+        assert_eq!(unchanged.writes[0]["method"], "thread/goal/set");
+        adapter
+            .receive(json!({"id":unchanged.writes[0]["id"],"result":{
+                "goal":raw_goal("thread-exact","Original","paused")
+            }}))
+            .unwrap();
+        adapter
+            .command(Command::SetModel {
+                model: "explicit-goal-model".into(),
+                reasoning: Some("low".into()),
+            })
+            .unwrap();
+        let before = snapshot(&mut adapter);
+        let before_id = adapter.next_id;
+        for request in [
+            Command::SetFastMode { enabled: false },
+            Command::Goal {
+                thread_id: before.thread_id.clone(),
+                revision: before.revision,
+                operation: Operation::Resume,
+            },
+        ] {
+            assert!(adapter.command(request).is_err());
+            assert_eq!(
+                adapter.next_id, before_id,
+                "conflicting request was not allocated"
+            );
+            assert_eq!(snapshot(&mut adapter), before);
+            assert!(adapter.unconfirmed_selection.is_none());
+        }
+        adapter
+            .receive(json!({"id":earlier.writes[0]["id"],"result":if fast {
+            json!({})
+        } else { json!({"turn":{"id":"unchanged-selection-turn"}}) }}))
+            .unwrap();
+        let next = command(&mut adapter, Operation::Resume);
+        assert_eq!(next.writes[0]["method"], "thread/settings/update");
+        assert_eq!(next.writes[0]["params"]["model"], "explicit-goal-model");
+    }
+}
+
+#[test]
+fn older_settings_notices_cannot_restore_proof_while_turn_fast_or_goal_changes_can_execute() {
+    for origin in 0..3 {
+        for ack_first in [false, true] {
+            let mut adapter = adapter();
+            select_goal_model(&mut adapter);
+            adapter
+                .fast_models
+                .extend(["provider-default".into(), "explicit-goal-model".into()]);
+            adapter
+                .command(Command::SetModel {
+                    model: "provider-default".into(),
+                    reasoning: Some("medium".into()),
+                })
+                .unwrap();
+            // The same-selection Fast operation may send its actual A
+            // snapshot after its ACK and after a newer B request is enqueued.
+            let older = adapter
+                .command(Command::SetFastMode { enabled: true })
+                .unwrap();
+            adapter
+                .receive(json!({"id":older.writes[0]["id"],"result":{}}))
+                .unwrap();
+            adapter
+                .command(Command::SetModel {
+                    model: "explicit-goal-model".into(),
+                    reasoning: Some("low".into()),
+                })
+                .unwrap();
+            let newer = match origin {
+                0 => adapter
+                    .command(Command::Prompt {
+                        text: "ordinary selected-model prompt".into(),
+                        attachments: Vec::new(),
+                        mode: PromptMode::Send,
+                    })
+                    .unwrap(),
+                1 => adapter
+                    .command(Command::SetFastMode { enabled: false })
+                    .unwrap(),
+                _ => command(&mut adapter, Operation::Resume),
+            };
+            let ack = json!({"id":newer.writes[0]["id"],"result":if origin == 0 {
+                json!({"turn":{"id":"newer-model-turn"}})
+            } else { json!({}) }});
+            if ack_first {
+                assert!(adapter.receive(ack.clone()).unwrap().writes.is_empty());
+            }
+            let stale = adapter
+                .receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":{
+                        "model":"provider-default","effort":"medium","serviceTier":"fast"
+                    }
+                }}))
+                .unwrap();
+            assert!(stale.writes.is_empty());
+            if !ack_first {
+                assert!(adapter.receive(ack).unwrap().writes.is_empty());
+            }
+            assert!(
+                adapter.applied_selection.is_none(),
+                "origin {origin}, ACK-first {ack_first}"
+            );
+            let check = command(&mut adapter, Operation::Get);
+            adapter
+                .receive(json!({"id":check.writes[0]["id"],"result":{"goal":null}}))
+                .unwrap();
+            adapter
+                .command(Command::SetModel {
+                    model: "provider-default".into(),
+                    reasoning: Some("medium".into()),
+                })
+                .unwrap();
+            let before = snapshot(&mut adapter);
+            let error = adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id.clone(),
+                    revision: before.revision,
+                    operation: Operation::Resume,
+                })
+                .unwrap_err();
+            assert!(error.contains("provider model settings are unconfirmed"));
+            assert_eq!(
+                snapshot(&mut adapter),
+                before,
+                "refusal reserves no Goal intent"
+            );
+            let settled = adapter.receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+            }})).unwrap();
+            assert!(
+                settled.writes.is_empty(),
+                "settlement cannot replay an old Goal"
+            );
+            let retry = command(&mut adapter, Operation::Resume);
+            assert_eq!(retry.writes[0]["method"], "thread/settings/update");
+            assert_eq!(retry.writes[0]["params"]["model"], "provider-default");
+        }
+    }
+}
+
+#[test]
+fn local_selection_custody_survives_ack_expiry_and_same_server_reattachment() {
+    for stale_before_expiry in [false, true] {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        let issued = command(&mut adapter, Operation::Resume);
+        adapter
+            .receive(json!({"id":issued.writes[0]["id"],"result":{}}))
+            .unwrap();
+        let deadline = adapter.next_deadline().unwrap();
+        let stale = json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"provider-default","effort":"medium"}
+        }});
+        if stale_before_expiry {
+            assert!(adapter.receive(stale.clone()).unwrap().writes.is_empty());
+        }
+        assert!(adapter.on_deadline(deadline).unwrap().writes.is_empty());
+        if !stale_before_expiry {
+            assert!(adapter.receive(stale).unwrap().writes.is_empty());
+        }
+        assert!(!snapshot(&mut adapter).pending);
+        let reattached = attach(&mut adapter);
+        let read = reattached
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        adapter
+            .receive(json!({"id":read["id"],"result":{"goal":null}}))
+            .unwrap();
+        assert!(
+            adapter.applied_selection.is_none(),
+            "resume snapshot A is no Core queue flush"
+        );
+        adapter
+            .command(Command::SetModel {
+                model: "provider-default".into(),
+                reasoning: Some("medium".into()),
+            })
+            .unwrap();
+        let current = snapshot(&mut adapter);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: current.thread_id,
+                    revision: current.revision,
+                    operation: Operation::Resume,
+                })
+                .unwrap_err()
+                .contains("provider model settings are unconfirmed")
+        );
+        assert!(adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap().writes.is_empty());
+        let retry = command(&mut adapter, Operation::Resume);
+        assert_eq!(retry.writes[0]["method"], "thread/settings/update");
+    }
+}
+
+#[test]
+fn conflicting_model_changes_wait_for_positive_application_without_aba_shortcuts() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    adapter
+        .fast_models
+        .extend(["provider-default".into(), "explicit-goal-model".into()]);
+    let changed = adapter
+        .command(Command::SetFastMode { enabled: true })
+        .unwrap();
+    adapter
+        .receive(json!({"id":changed.writes[0]["id"],"result":{}}))
+        .unwrap();
+    adapter
+        .command(Command::SetModel {
+            model: "provider-default".into(),
+            reasoning: Some("medium".into()),
+        })
+        .unwrap();
+    let before = snapshot(&mut adapter);
+    let before_id = adapter.next_id;
+    for request in [
+        Command::Prompt {
+            text: "selected-model prompt".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        },
+        Command::SetFastMode { enabled: false },
+        Command::Goal {
+            thread_id: before.thread_id.clone(),
+            revision: before.revision,
+            operation: Operation::Resume,
+        },
+    ] {
+        assert!(adapter.command(request).is_err());
+        assert_eq!(
+            adapter.next_id, before_id,
+            "conflicting request was not allocated"
+        );
+        assert!(adapter.pending.is_empty());
+        assert_eq!(
+            snapshot(&mut adapter),
+            before,
+            "no Goal intent was reserved"
+        );
+    }
+    for (model, effort, confirmed) in [
+        ("provider-default", "medium", false),
+        ("explicit-goal-model", "low", true),
+    ] {
+        assert!(
+            adapter
+                .receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":{"model":model,"effort":effort}
+                }}))
+                .unwrap()
+                .writes
+                .is_empty()
+        );
+        assert_eq!(adapter.unconfirmed_selection.is_none(), confirmed);
+    }
+    let next = adapter
+        .command(Command::SetFastMode { enabled: false })
+        .unwrap();
+    assert_eq!(next.writes[0]["params"]["model"], "provider-default");
+    adapter
+        .receive(json!({"id":next.writes[0]["id"],"result":{}}))
+        .unwrap();
+    // Another old B snapshot cannot settle the user's new A override either.
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    assert!(adapter.applied_selection.is_none());
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"provider-default","effort":"medium"}
+    }})).unwrap();
+    let resume = command(&mut adapter, Operation::Resume);
+    assert_eq!(resume.writes[0]["method"], "thread/goal/set");
+}
+
+#[test]
+fn compatible_model_changes_share_one_bounded_application_fence() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    for enabled in [true, false] {
+        adapter.fast_models.insert("explicit-goal-model".into());
+        let changed = adapter.command(Command::SetFastMode { enabled }).unwrap();
+        adapter
+            .receive(json!({"id":changed.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert_eq!(
+            adapter.unconfirmed_selection.as_ref().unwrap().target,
+            (Some("explicit-goal-model".into()), Some("low".into()))
+        );
+        assert!(adapter.applied_selection.is_none());
+    }
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    assert!(adapter.unconfirmed_selection.is_none());
+    assert!(adapter.selection_is_applied());
+    let resume = command(&mut adapter, Operation::Resume);
+    assert_eq!(resume.writes[0]["method"], "thread/goal/set");
+}
+
+#[test]
+fn an_observed_goal_selection_still_preserves_its_unacknowledged_physical_order() {
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    let settings = command(&mut adapter, Operation::Resume);
+    adapter.receive(json!({"method":"thread/settings/updated","params":{
+        "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+    }})).unwrap();
+    adapter
+        .fast_models
+        .extend(["provider-default".into(), "explicit-goal-model".into()]);
+    adapter
+        .command(Command::SetModel {
+            model: "provider-default".into(),
+            reasoning: Some("medium".into()),
+        })
+        .unwrap();
+    let before_id = adapter.next_id;
+    for request in [
+        Command::Prompt {
+            text: "conflicting selection".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        },
+        Command::SetFastMode { enabled: true },
+    ] {
+        assert!(adapter.command(request).is_err());
+        assert_eq!(adapter.next_id, before_id);
+        assert!(snapshot(&mut adapter).pending);
+    }
+    adapter
+        .command(Command::SetModel {
+            model: "explicit-goal-model".into(),
+            reasoning: Some("low".into()),
+        })
+        .unwrap();
+    let applied = adapter
+        .receive(json!({"id":settings.writes[0]["id"],"result":{}}))
+        .unwrap();
+    assert_eq!(applied.writes.len(), 1);
+    assert_eq!(applied.writes[0]["method"], "thread/goal/set");
+}
+
+#[test]
+fn only_a_sole_settings_rpc_pre_enqueue_rejection_releases_uncertain_selection_custody() {
+    for fast in [false, true] {
+        for (error, rejected) in [
+            (
+                json!({"code":-32600,"message":"invalid model override"}),
+                true,
+            ),
+            (json!({"code":-32601,"message":"method not found"}), true),
+            (json!({"code":-32602,"message":"invalid params"}), true),
+            (json!({"code":-32603,"message":"internal failure"}), false),
+            (json!({"code":"-32600","message":"malformed code"}), false),
+            (json!({"code":-32600}), false),
+        ] {
+            let mut adapter = adapter();
+            select_goal_model(&mut adapter);
+            let issued = if fast {
+                adapter.fast_models.insert("explicit-goal-model".into());
+                adapter
+                    .command(Command::SetFastMode { enabled: true })
+                    .unwrap()
+            } else {
+                command(&mut adapter, Operation::Resume)
+            };
+            let failed = adapter
+                .receive(json!({"id":issued.writes[0]["id"],"error":error}))
+                .unwrap();
+            assert!(failed.writes.is_empty());
+            assert_eq!(adapter.unconfirmed_selection.is_none(), rejected);
+            assert!(
+                adapter.applied_selection.is_none(),
+                "rejection cannot resurrect old A proof"
+            );
+            let reattached = attach(&mut adapter);
+            let read = reattached
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/goal/get")
+                .unwrap();
+            adapter
+                .receive(json!({"id":read["id"],"result":{"goal":null}}))
+                .unwrap();
+            assert_eq!(adapter.applied_selection.is_some(), rejected);
+            adapter
+                .command(Command::SetModel {
+                    model: "provider-default".into(),
+                    reasoning: Some("medium".into()),
+                })
+                .unwrap();
+            let current = snapshot(&mut adapter);
+            let retry = adapter.command(Command::Goal {
+                thread_id: current.thread_id,
+                revision: current.revision,
+                operation: Operation::Resume,
+            });
+            if rejected {
+                assert_eq!(retry.unwrap().writes[0]["method"], "thread/goal/set");
+            } else {
+                assert!(
+                    retry
+                        .unwrap_err()
+                        .contains("provider model settings are unconfirmed")
+                );
+                assert!(!snapshot(&mut adapter).pending);
+            }
+        }
+    }
+    let mut adapter = adapter();
+    select_goal_model(&mut adapter);
+    let issued = command(&mut adapter, Operation::Resume);
+    adapter
+        .receive(json!({"id":issued.writes[0]["id"],"result":{},
+        "error":{"code":-32600,"message":"ambiguous malformed response"}}))
+        .unwrap();
+    assert!(
+        adapter.unconfirmed_selection.is_some(),
+        "a response with both result and error proves no rejection boundary"
+    );
+}
+
+#[test]
+fn uncertain_selection_recovers_only_through_a_new_explicit_same_target_goal() {
+    for failure in 0..3 {
+        let mut adapter = adapter();
+        select_goal_model(&mut adapter);
+        let old = command(
+            &mut adapter,
+            Operation::SetObjective("Never replay this objective".into()),
+        );
+        if failure == 2 {
+            adapter
+                .receive(json!({"id":old.writes[0]["id"],"error":{
+                    "code":-32603,"message":"unknown internal failure"
+                }}))
+                .unwrap();
+        } else {
+            adapter
+                .receive(json!({"id":old.writes[0]["id"],"result":{}}))
+                .unwrap();
+            if failure == 0 {
+                adapter.receive(json!({"method":"error","params":{
+                    "threadId":"thread-exact","turnId":"opaque-core-submission",
+                    "error":{"message":"invalid thread settings override","codexErrorInfo":"badRequest"},
+                    "willRetry":false
+                }})).unwrap();
+            } else {
+                adapter
+                    .on_deadline(adapter.next_deadline().unwrap())
+                    .unwrap();
+            }
+        }
+        assert!(!snapshot(&mut adapter).pending);
+        assert!(adapter.unconfirmed_selection.is_some());
+        let check = command(&mut adapter, Operation::Get);
+        adapter
+            .receive(json!({"id":check.writes[0]["id"],"result":{"goal":null}}))
+            .unwrap();
+        let rejected_retry = command(
+            &mut adapter,
+            Operation::SetObjective("Rejected replacement".into()),
+        );
+        assert_eq!(rejected_retry.writes[0]["method"], "thread/settings/update");
+        assert!(
+            adapter
+                .receive(json!({"id":rejected_retry.writes[0]["id"],"error":{
+                    "code":-32600,"message":"invalid replacement settings"
+                }}))
+                .unwrap()
+                .writes
+                .is_empty()
+        );
+        assert!(
+            adapter.unconfirmed_selection.is_some(),
+            "a later rejection cannot release an earlier effect"
+        );
+        let check = command(&mut adapter, Operation::Get);
+        adapter
+            .receive(json!({"id":check.writes[0]["id"],"result":{"goal":null}}))
+            .unwrap();
+        let replacement = command(
+            &mut adapter,
+            Operation::SetObjective("Only this new objective".into()),
+        );
+        assert_eq!(replacement.writes[0]["method"], "thread/settings/update");
+        assert!(
+            adapter
+                .receive(json!({"id":replacement.writes[0]["id"],"result":{}}))
+                .unwrap()
+                .writes
+                .is_empty()
+        );
+        let applied = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact","threadSettings":{"model":"explicit-goal-model","effort":"low"}
+        }})).unwrap();
+        assert_eq!(applied.writes.len(), 1);
+        assert_eq!(applied.writes[0]["method"], "thread/goal/set");
+        assert_eq!(
+            applied.writes[0]["params"]["objective"],
+            "Only this new objective"
+        );
+    }
+}
+
+#[test]
 fn failed_or_superseded_goal_settings_never_send_or_retry_a_goal_mutation() {
     for case in 0..6 {
         let mut adapter = adapter();
