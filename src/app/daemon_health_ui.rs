@@ -224,7 +224,19 @@ impl Cagents {
         event: &keyboard::Event,
         captured: bool,
     ) -> Option<Task<Message>> {
-        if !self.daemon_health_ui.confirmation || self.daemon_health_is_covered() {
+        if !self.daemon_health_ui.confirmation {
+            return None;
+        }
+        // `dialog` mounts Device above recovery, below these three owners.
+        // Close that visible cover even when its field captured Escape.
+        if self.device_ui.open
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+        {
+            return is_escape_press(event).then(|| self.update_device(device_ui::Action::Close));
+        }
+        if self.daemon_health_is_covered() {
             return None;
         }
         let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
