@@ -2129,6 +2129,90 @@ fn a_push_moves_the_remote_branch_and_invents_no_ref_in_the_remote() {
             behind: 0,
         }
     );
+
+    // The panel captured this branch while it existed. External Git can move
+    // away and delete it before the push worker reads the source.
+    let stale = Fixture::new().expect("Git remains available after the success control");
+    let published = publish_main(&stale);
+    stale.git_in_work(&["checkout", "--quiet", "-b", "topic"]);
+    stale.write("a.txt", b"selected topic history\n");
+    stale.git_in_work(&["add", "a.txt"]);
+    let selected = stale.commit("selected topic");
+    stale.git_in_work(&["branch", "--set-upstream-to=origin/main", "topic"]);
+    let branch = ValidatedBranchName::parse("topic").unwrap();
+    let service = stale.service();
+    let target = service
+        .upstream_push_target(&stale.work(), &branch, &CancellationToken::new())
+        .unwrap()
+        .expect("the captured branch has a real configured upstream");
+    let request = PushRequest {
+        worktree: stale.work(),
+        branch,
+        target,
+    };
+    assert_eq!(
+        stale.text(&["show-ref", "--verify", "--hash", "--", "refs/heads/topic"]),
+        selected.as_str()
+    );
+
+    stale.git_in_work(&["checkout", "--quiet", "main"]);
+    stale.write("a.txt", b"tag-only descendant of the remote\n");
+    stale.git_in_work(&["add", "a.txt"]);
+    let decoy = stale.commit("decoy tag history");
+    assert_ne!(decoy, selected);
+    assert_ne!(decoy, published);
+    stale.git_in_work(&["update-ref", "refs/tags/refs/heads/topic", decoy.as_str()]);
+    stale.git_in_work(&["branch", "-D", "topic"]);
+    stale.write("a.txt", b"uncommitted local work\n");
+    stale.write("draft.txt", b"untracked local draft\n");
+    let origin = stale.origin();
+    let remote_refs = stale.run(&origin, &["show-ref"]);
+    let remote_head = stale.run(&origin, &["symbolic-ref", "HEAD"]);
+    let remote_head_oid = stale.run(&origin, &["rev-parse", "HEAD"]);
+    let local_refs = stale.git_in_work(&["show-ref"]);
+    let local_status = stale.porcelain();
+
+    let outcome = service
+        .push(&request, &CancellationToken::new())
+        .expect("a stale source is a definite push refusal");
+    assert_eq!(
+        stale.run(&origin, &["show-ref"]),
+        remote_refs,
+        "a stale branch must not push a similarly named tag: {outcome:?}"
+    );
+    assert_eq!(stale.run(&origin, &["symbolic-ref", "HEAD"]), remote_head);
+    assert_eq!(stale.run(&origin, &["rev-parse", "HEAD"]), remote_head_oid);
+    assert!(
+        matches!(
+            &outcome,
+            PushOutcome::NotPushed {
+                failure: MutationFailure::Rejected { reason }
+            } if reason.contains("refs/heads/topic") && reason.contains("does not exist")
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stale.git_in_work(&["show-ref"]), local_refs);
+    assert_eq!(stale.text(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(stale.head(), decoy);
+    assert_eq!(stale.porcelain(), local_status);
+    assert_eq!(
+        fs::read(stale.work().join("a.txt")).unwrap(),
+        b"uncommitted local work\n"
+    );
+    assert_eq!(
+        fs::read(stale.work().join("draft.txt")).unwrap(),
+        b"untracked local draft\n"
+    );
+    assert_eq!(
+        stale.text(&[
+            "show-ref",
+            "--verify",
+            "--hash",
+            "--",
+            "refs/tags/refs/heads/topic"
+        ]),
+        decoy.as_str()
+    );
 }
 
 /// A branch published under a different name follows the *upstream's* branch
