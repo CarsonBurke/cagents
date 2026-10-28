@@ -57,9 +57,11 @@ fn channel_order(app: &Cagents, channel: ChannelId) -> Vec<CardId> {
         .clone()
 }
 
-fn publications(rx: &async_channel::Receiver<ModelEdit>) -> Vec<(uuid::Uuid, Scope, Change)> {
+fn publications(
+    rx: &async_channel::Receiver<crate::app::workspace_model_sync::QueuedEdit>,
+) -> Vec<(uuid::Uuid, Scope, Change)> {
     std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|edit| match edit {
+        .map(|queued| match queued.edit {
             ModelEdit::ChangeView {
                 operation,
                 scope,
