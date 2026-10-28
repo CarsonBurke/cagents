@@ -258,6 +258,22 @@ fn content_path(content: &ItemContent) -> Option<&str> {
     }
 }
 
+/// Resolve relative Read targets against the tool's recorded directory,
+/// then present the result relative to the conversation. These directories
+/// may differ when a command runs in a nested or outside checkout.
+fn content_path_label(content: &ItemContent, cwd: &std::path::Path) -> Option<PathLabel> {
+    let path = content_path(content)?;
+    let source_cwd = match content {
+        ItemContent::Command {
+            working_directory, ..
+        } => cwd.join(working_directory),
+        _ => cwd.to_path_buf(),
+    };
+    let mut label = path_label(path, &source_cwd);
+    label.display = display_path(&label.absolute, cwd).to_owned();
+    Some(label)
+}
+
 pub(super) fn diff_stat(changes: &[FileChange]) -> (usize, usize) {
     let (mut added, mut removed) = (0, 0);
     for change in changes {
@@ -427,13 +443,13 @@ impl Runtime {
                     .and_then(|cached| cached.coordination.as_deref())
                     .is_none()
             })
-            .and_then(|item| content_path(&item.content))
-            .map(|path| {
-                turn.summary.replacen(
-                    path,
-                    &path_label(path, &self.session.launch.recipe.working_directory).display,
-                    1,
-                )
+            .and_then(|item| {
+                let path = content_path(&item.content)?;
+                let label = content_path_label(
+                    &item.content,
+                    &self.session.launch.recipe.working_directory,
+                )?;
+                Some(turn.summary.replacen(path, &label.display, 1))
             })
             .unwrap_or_else(|| turn.summary.clone());
         let key = turn.key.as_str();
@@ -636,9 +652,8 @@ impl Runtime {
         let cwd = &self.session.launch.recipe.working_directory;
         let path = coordinated
             .is_none()
-            .then(|| content_path(&item.content))
-            .flatten()
-            .map(|path| path_label(path, cwd));
+            .then(|| content_path_label(&item.content, cwd))
+            .flatten();
         if let Some(path) = &path {
             label = path.display.clone();
             preview = vec![crate::interaction::tooltip(
@@ -1127,6 +1142,58 @@ mod presentation_tests {
         let outside = path_label("/outside/main.rs", std::path::Path::new("/repo/worktree"));
         assert_eq!(outside.display, "/outside/main.rs");
         assert_eq!(outside.absolute, "/outside/main.rs");
+    }
+
+    #[test]
+    fn read_paths_use_tool_directory_and_stay_relative_to_the_session() {
+        let session_cwd = std::path::Path::new("/repo");
+        for (working_directory, target, display, absolute) in [
+            (
+                "/repo/subdir",
+                "file.rs",
+                "subdir/file.rs",
+                "/repo/subdir/file.rs",
+            ),
+            (
+                "/outside",
+                "file.rs",
+                "/outside/file.rs",
+                "/outside/file.rs",
+            ),
+            (
+                "subdir",
+                "file.rs",
+                "subdir/file.rs",
+                "/repo/subdir/file.rs",
+            ),
+            ("", "file.rs", "file.rs", "/repo/file.rs"),
+            ("/outside", "/repo/src.rs", "src.rs", "/repo/src.rs"),
+        ] {
+            let content = ItemContent::Command {
+                label: target.into(),
+                command: format!("cat {target}"),
+                working_directory: working_directory.into(),
+                action: chat::CommandAction::Read,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: String::new(),
+            };
+            let path = content_path_label(&content, session_cwd).unwrap();
+            assert_eq!(path.display, display, "{working_directory}: {target}");
+            assert_eq!(path.absolute, absolute, "{working_directory}: {target}");
+        }
+        let change = ItemContent::Changes {
+            changes: vec![FileChange {
+                path: "src.rs".into(),
+                kind: ChangeKind::Updated,
+                diff: String::new(),
+            }],
+            status: ToolStatus::Succeeded,
+        };
+        let path = content_path_label(&change, session_cwd).unwrap();
+        assert_eq!(path.display, "src.rs");
+        assert_eq!(path.absolute, "/repo/src.rs");
     }
 
     #[test]
