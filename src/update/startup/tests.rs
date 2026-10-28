@@ -48,6 +48,54 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
 }
 
 #[test]
+fn recovery_entry_requires_the_original_parent_and_preserves_only_public_arguments() {
+    let public = vec![
+        "--device".to_owned(),
+        "build-host".to_owned(),
+        "--device-window-scoped".to_owned(),
+        "--window".to_owned(),
+        "device-0123456789abcdef".to_owned(),
+        "--from-window".to_owned(),
+        "device-fedcba9876543210".to_owned(),
+    ];
+    for guarded in [false, true] {
+        for owned in [false, true] {
+            let mut arguments = public.clone();
+            if guarded {
+                arguments.push(RECOVERY_ENTRY_ARGUMENT.to_owned());
+            }
+            let original = arguments.clone();
+            let result = consume_recovery_argument(&mut arguments, owned);
+            if guarded && !owned {
+                assert!(result.is_err());
+                assert_eq!(arguments, original, "refuse before touching the request");
+            } else {
+                result.unwrap();
+                assert_eq!(arguments, public);
+            }
+        }
+    }
+    for option in ["--device", "--window", "--from-window"] {
+        for owned in [false, true] {
+            let mut arguments = vec![option.to_owned(), RECOVERY_ENTRY_ARGUMENT.to_owned()];
+            let public = arguments.clone();
+            consume_recovery_argument(&mut arguments, owned).unwrap();
+            assert_eq!(
+                arguments, public,
+                "a public value is never a private marker"
+            );
+            arguments.push(RECOVERY_ENTRY_ARGUMENT.to_owned());
+            if owned {
+                consume_recovery_argument(&mut arguments, owned).unwrap();
+                assert_eq!(arguments, public);
+            } else {
+                assert!(consume_recovery_argument(&mut arguments, owned).is_err());
+            }
+        }
+    }
+}
+
+#[test]
 fn unverified_helper_copy_and_reopen_refusal_distinguish_free_held_and_unknown_access() {
     for helper in [LockState::Free, LockState::Unknown] {
         for phase in [

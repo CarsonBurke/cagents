@@ -266,7 +266,8 @@ fn actual_reopen_process_receives_exact_original_device_scoped_window_and_source
             "--window",
             "device-0123456789abcdef",
             "--from-window",
-            "device-fedcba9876543210"
+            "device-fedcba9876543210",
+            super::super::RECOVERY_ENTRY_ARGUMENT
         ]
     );
     assert!(
@@ -319,7 +320,8 @@ print('ready', flush=True)
         // screen, including the already-scoped bit that prevents double hashing.
         let restored: Request =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-        let expected = request.arguments();
+        let mut expected = request.arguments();
+        expected.push(super::super::RECOVERY_ENTRY_ARGUMENT.into());
         let failure = root.path().join(format!("failed-{index}.json"));
         let mut first = reopen_command(&script, &restored);
         first
@@ -379,6 +381,7 @@ fn staged_replacement_keeps_recovery_presentation_and_original_scope_through_exe
 import json, os, pathlib, sys
 expected = os.environ['FIXTURE_EXPECT_OWNED'] == '1'
 assert (os.environ.get('CAGENTS_UI_FAILURE_SCREEN_OWNED') == '1') == expected
+assert sys.argv[1:].count('--startup-recovery-parent') == int(expected)
 assert os.environ.get('CAGENTS_UI_LAUNCH_HANDSHAKE') == '1'
 assert os.environ.get('CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS') == '1'
 for key in [b'CAGENTS_AGENT_AUTHORITY', b'CAGENTS_AGENT_TOKEN', b'CAGENTS_SESSION_TOKEN']:
@@ -421,11 +424,19 @@ sys.exit(1)
             // This is the exact staged replacement builder called by UI entry,
             // after its original presentation flag has been consumed. The
             // replacement keeps normal readiness and rejects startup below.
-            let mut command = super::super::staged_ui_command(
-                &script,
-                expected.iter().map(std::ffi::OsString::from),
-                owned,
-            );
+            let mut incoming = expected
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let mut forwarded = expected.clone();
+            if owned {
+                // The next staged exec receives the original argv, including
+                // its private marker. It must forward exactly one copy.
+                incoming.push(super::super::RECOVERY_ENTRY_ARGUMENT.into());
+                incoming.push(super::super::RECOVERY_ENTRY_ARGUMENT.into());
+                forwarded.push(super::super::RECOVERY_ENTRY_ARGUMENT.into());
+            }
+            let mut command = super::super::staged_ui_command(&script, incoming, owned);
             command
                 .env("FIXTURE_EXPECT_OWNED", if owned { "1" } else { "0" })
                 .env("FIXTURE_EXPECT_ORIGIN_HEX", hex)
@@ -444,7 +455,7 @@ sys.exit(1)
             assert!(wait_for_reopen(&mut command).is_err());
             let receipt: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-            assert_eq!(receipt["arguments"], serde_json::json!(expected));
+            assert_eq!(receipt["arguments"], serde_json::json!(forwarded));
             assert_eq!(receipt["owned"], owned);
             assert_eq!(receipt["same_process"], true);
             assert_eq!(receipt["origin_preserved"], true);

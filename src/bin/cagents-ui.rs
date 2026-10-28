@@ -54,7 +54,7 @@ pub(crate) fn main_with_before_start(
     if let Some(code) = cagents::document_render::hook() {
         return code;
     }
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     // The standalone dialogs write their result to stdout and the tray shows
     // that text verbatim. They inherit the launcher handshake variable from
     // the daemon that spawned them, so the startup protocol must stay off
@@ -67,6 +67,11 @@ pub(crate) fn main_with_before_start(
         cagents::instance::install_panic_hook(PRODUCT);
         cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
         return report(run_internal(&arguments));
+    }
+    if let Err(error) =
+        cagents::update::startup::consume_recovery_argument(&mut arguments, failure_screen_owned)
+    {
+        return report(Err(error.into()));
     }
 
     // Argv is settled before the handshake below is armed. A mistyped flag is

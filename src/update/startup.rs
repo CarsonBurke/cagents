@@ -6,10 +6,54 @@ pub use window::{Request, run};
 /// Presentation only: a waiting parent already owns the failure/retry screen.
 /// The normal readiness protocol and every startup fence still apply.
 pub const FAILURE_SCREEN_OWNED_ENV: &str = "CAGENTS_UI_FAILURE_SCREEN_OWNED";
+/// Older UI entry points reject this during argument parsing, before startup.
+pub const RECOVERY_ENTRY_ARGUMENT: &str = "--startup-recovery-parent";
 
 pub fn failure_screen_owned() -> bool {
     crate::instance::ui_launch_handshake_requested()
         && std::env::var_os(FAILURE_SCREEN_OWNED_ENV).as_deref() == Some("1".as_ref())
+}
+
+/// The marker is presentation context, never permission to start a workspace.
+/// Only an entry already bound to the waiting parent's handshake consumes it.
+pub fn consume_recovery_argument<T: AsRef<std::ffi::OsStr>>(
+    arguments: &mut Vec<T>,
+    failure_screen_owned: bool,
+) -> Result<(), &'static str> {
+    let positions = recovery_argument_positions(arguments);
+    if !positions.is_empty() && !failure_screen_owned {
+        return Err("startup recovery requires its original waiting window");
+    }
+    remove_recovery_arguments(arguments, &positions);
+    Ok(())
+}
+
+fn recovery_argument_positions<T: AsRef<std::ffi::OsStr>>(arguments: &[T]) -> Vec<usize> {
+    let mut value = false;
+    arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            if value {
+                value = false;
+                return None;
+            }
+            let argument = argument.as_ref();
+            value = ["--device", "--window", "--from-window"]
+                .iter()
+                .any(|name| argument == std::ffi::OsStr::new(name));
+            (argument == std::ffi::OsStr::new(RECOVERY_ENTRY_ARGUMENT)).then_some(index)
+        })
+        .collect()
+}
+
+fn remove_recovery_arguments<T>(arguments: &mut Vec<T>, positions: &[usize]) {
+    let mut index = 0;
+    arguments.retain(|_| {
+        let keep = positions.binary_search(&index).is_err();
+        index += 1;
+        keep
+    });
 }
 
 /// Replace this UI entry point without losing the waiting recovery screen.
@@ -21,9 +65,14 @@ pub fn staged_ui_command(
     failure_screen_owned: bool,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(executable);
+    let mut arguments = arguments.into_iter().collect::<Vec<_>>();
+    let positions = recovery_argument_positions(&arguments);
+    remove_recovery_arguments(&mut arguments, &positions);
     command.args(arguments);
     if failure_screen_owned {
-        command.env(FAILURE_SCREEN_OWNED_ENV, "1");
+        command
+            .arg(RECOVERY_ENTRY_ARGUMENT)
+            .env(FAILURE_SCREEN_OWNED_ENV, "1");
     } else {
         command.env_remove(FAILURE_SCREEN_OWNED_ENV);
     }

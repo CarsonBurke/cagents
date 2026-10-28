@@ -415,6 +415,7 @@ fn reopen_command(executable: &std::path::Path, request: &Request) -> Command {
     let mut command = Command::new(executable);
     command
         .args(request.arguments())
+        .arg(super::RECOVERY_ENTRY_ARGUMENT)
         .env_remove(instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .env(super::FAILURE_SCREEN_OWNED_ENV, "1")
