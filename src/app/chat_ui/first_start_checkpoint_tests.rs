@@ -707,15 +707,19 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
     // Fresh Claude emits Ready before a native Session frame. Keep the original
     // already-confirmed case, and also clear the first command while identity
     // is still absent: neither an ID nor a pending command protects that pane.
-    for (late_native_identity, wake_before_ack, refuse_creation) in [
-        (false, true, false),
-        (false, false, false),
-        (true, true, false),
-        (true, false, false),
-        (false, true, true),
-        (false, false, true),
-        (true, true, true),
-        (true, false, true),
+    for (late_native_identity, wake_before_ack, refuse_creation, disconnect_before_refusal) in [
+        (false, true, false, false),
+        (false, false, false, false),
+        (true, true, false, false),
+        (true, false, false, false),
+        (false, true, true, false),
+        (false, false, true, false),
+        (true, true, true, false),
+        (true, false, true, false),
+        (false, true, true, true),
+        (false, false, true, true),
+        (true, true, true, true),
+        (true, false, true, true),
     ] {
         use crate::app::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
@@ -855,6 +859,14 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         assert!(!app.shared_chat_has_local_work(card));
         let mut edits = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
         if refuse_creation {
+            if disconnect_before_refusal {
+                drop(app.update(Message::ChatUi(Action::Wake(
+                    target,
+                    Wake::Disconnected("fixture reader connection lost after acceptance".into()),
+                ))));
+                assert!(runtime(&app, card).disconnected);
+                assert!(!app.shared_chat_has_local_work(card));
+            }
             let operation = edits
                 .iter()
                 .find_map(|edit| match edit {
@@ -896,6 +908,19 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             );
             assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
             assert_eq!(runtime(&app, card).session.id, actor);
+            if disconnect_before_refusal {
+                assert!(
+                    runtime(&app, card)
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("Reconnect")
+                );
+                assert_eq!(
+                    app.chat_retry_intent(card, &runtime(&app, card).session),
+                    chat::Intent::Restore
+                );
+            }
             assert!(!app.shared_chat_has_local_work(card));
         }
         if late_native_identity {
