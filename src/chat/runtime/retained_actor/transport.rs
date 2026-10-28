@@ -279,6 +279,18 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
     }
 }
 #[cfg(test)]
+fn fixture_preserve_and_join(actor: &RemoteActor) {
+    actor.preserve().unwrap();
+    // Model the old daemon's exit before rotating its lease. Preserve stops
+    // the observer asynchronously; its last authentication request can still
+    // briefly probe the lease after it drops. Join only that fixture observer,
+    // retaining the actual helper/provider and the old proxy's epoch checks.
+    let worker = actor.0.worker.lock().unwrap().take();
+    if let Some(worker) = worker {
+        worker.join().expect("preserved fixture observer panicked");
+    }
+}
+#[cfg(test)]
 pub(super) fn fixture_source() -> chat::Session {
     let id = crate::model::TerminalId::new();
     chat::Session {
@@ -5448,7 +5460,7 @@ done"#;
         let orphaned: Vec<InputReceipt> = actor.call("acknowledged_inputs", Value::Null).unwrap();
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].identity, identity);
-        actor.preserve().unwrap();
+        fixture_preserve_and_join(actor);
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
