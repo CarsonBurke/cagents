@@ -121,6 +121,18 @@ impl Cagents {
                 .is_some_and(|session| self.terminal_close_attempts.contains(&session.id))
     }
 
+    /// Refuses to close a fenced pane, whatever its kind. Its removal could
+    /// not be shared, so the pane would come back.
+    pub(super) fn refuse_fenced_close(&mut self, card: CardId) -> bool {
+        let fenced = self.shared_views.quarantined.contains(&card);
+        if fenced {
+            self.status = Some(TransientNotice::warning(
+                "This pane can't be closed while its saved session doesn't match its agent. It would reopen in this and your other windows.",
+            ));
+        }
+        fenced
+    }
+
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
         self.close_card_as(card, !self.settings.confirm_terminal_close, false)
     }
@@ -166,11 +178,7 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
-        if self.shared_views.quarantined.contains(&card) {
-            // Its removal could not be shared, so the pane would come back.
-            self.status = Some(TransientNotice::warning(
-                "This pane can't be closed while its saved session doesn't match its agent. It would reopen in this and your other windows.",
-            ));
+        if self.refuse_fenced_close(card) {
             return Task::none();
         }
         if self.pane_transfer_pending(card) {
