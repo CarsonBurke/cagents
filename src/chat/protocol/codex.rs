@@ -2742,13 +2742,13 @@ impl Adapter for Codex {
                         _ => None,
                     };
                     if let Some(outcome) = outcome {
+                        let thread = string(params, "threadId")?;
                         self.remember_pending_completion(
                             turn_id,
                             &turn["status"],
                             outcome,
                             current,
                         )?;
-                        let thread = string(params, "threadId")?;
                         self.resolve_turn_requests(thread, turn_id, &mut step);
                         let key = Some(format!("codex:{thread}:{turn_id}"));
                         step.events.push(if current {
@@ -5401,6 +5401,60 @@ mod tests {
                 .unwrap_err()
                 .contains("correlation capacity")
         );
+    }
+
+    #[test]
+    fn invalid_completion_scope_cannot_gain_authority_from_a_later_exact_ack() {
+        for invalid in [
+            "missing-thread",
+            "empty-thread",
+            "foreign-thread",
+            "missing-turn",
+            "empty-turn",
+        ] {
+            let mut adapter = adapter();
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: "pending".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let mut completion = turn_frame("thread-exact", "new", "failed");
+            match invalid {
+                "missing-thread" => {
+                    completion["params"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("threadId");
+                }
+                "empty-thread" => completion["params"]["threadId"] = json!(""),
+                "foreign-thread" => completion["params"]["threadId"] = json!("foreign"),
+                "missing-turn" => {
+                    completion["params"]["turn"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("id");
+                }
+                "empty-turn" => completion["params"]["turn"]["id"] = json!(""),
+                _ => unreachable!(),
+            }
+            if matches!(invalid, "empty-thread" | "foreign-thread") {
+                assert!(adapter.receive(completion).unwrap().events.is_empty());
+            } else {
+                assert!(adapter.receive(completion).is_err());
+            }
+            let acknowledged = adapter.receive(json!({"id":submitted.writes[0]["id"],"result":{"turn":{"id":"new","status":"inProgress"}}})).unwrap();
+            assert!(
+                adapter.busy,
+                "invalid scope {invalid} must not leave a terminal receipt"
+            );
+            assert_eq!(adapter.turn.as_deref(), Some("new"));
+            assert!(!acknowledged.events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished { .. } | Event::PastTurnFinished { .. }
+            )));
+        }
     }
 
     #[test]
