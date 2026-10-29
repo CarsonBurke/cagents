@@ -7196,8 +7196,9 @@ mod tests {
         server.join().unwrap();
     }
 
-    // Use the real Claude adapter and inherited process authority, but only a
-    // synthetic absolute executable: no discovery, account, or provider calls.
+    // Use the real Claude adapter with a private synthetic executable. The
+    // production launcher supplies its explicit child environment; this test
+    // never changes caller authority or performs discovery or authentication.
     fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
