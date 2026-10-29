@@ -163,6 +163,9 @@ try:
     }, indent=2) + '\n')
     lane = ['--locked', '--no-default-features', '--features', 'ui']
     if '--suites-only' not in sys.argv[3:]:
+        version = subprocess.run(['systemd-run', '--version'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, timeout=5)
+        (evidence / 'systemd-run-version.log').write_bytes(version.stdout)
         state_output = run('atspi-disabled-state-tests', ['cargo', 'test', '--locked',
                            '-p', 'accesskit_atspi_common', '--lib',
                            'node::disabled_state_tests::', '--', '--test-threads=1', '--color=never'])
@@ -195,6 +198,17 @@ try:
                      'saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source',
                      'quarantined_pane_removal_restores_the_surviving_native_control']:
             test = 'app::shared_views::tests::startup_admission::' + name
+            output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
+            text = output.read_text()
+            if name not in failures:
+                assert test in text and '1 passed; 0 failed' in text
+        for test in [
+            'app::notification_ui::tests::notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot',
+            'app::workspace_model_sync::tests::model_read_publishes_new_managed_chat_before_initialized_view_projection',
+            'persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode',
+            'terminal::hosted::tests::systemd_scope_preserves_environment_arguments_and_isolates_cgroup',
+        ]:
+            name = test.rsplit('::', 1)[1]
             output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
             if name not in failures:

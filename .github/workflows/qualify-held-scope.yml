@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: 061a243b6a8ccb0ffe5958488fa4994968b3fa52
-      PRODUCT_TREE: 244f6842d0fb463b87567d8763c548e45d80657d
+      PRODUCT_SHA: 7e02bb894396493444ac5f7cb04b4ec1fea74b89
+      PRODUCT_TREE: e337c9a06f70eb00d49a21946ddaf5b8fe1c38bd
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -65,7 +65,7 @@ jobs:
           key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
           restore-keys: |
             held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
-      - name: Check exact UI source and execute User startup parents
+      - name: Check exact UI source and execute focused User regressions
         id: focus
         shell: bash
         run: python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --focused-only
@@ -74,8 +74,8 @@ jobs:
         shell: bash
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
-      - name: Upload completed native interaction evidence
-        if: success() && steps.native.outcome == 'success'
+      - name: Upload native interaction evidence
+        if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: held-scope-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}-native

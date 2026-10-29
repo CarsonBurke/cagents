@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sqlite3
 import subprocess
@@ -86,6 +87,12 @@ class IncompleteAccessibilityTree(RuntimeError):
     pass
 
 
+def stale_accessibility_object(error):
+    return 'Unknown object' in str(error) or (
+        error.domain == 'atspi_error' and error.code == 1
+        and re.fullmatch(r'/org/a11y/atspi/accessible/[0-9]+/[0-9]+', error.message) is not None)
+
+
 def wait(predicate, timeout=30):
     global stale_accessibility_retries, incomplete_accessibility_retries
     end = time.monotonic() + timeout
@@ -95,7 +102,7 @@ def wait(predicate, timeout=30):
             result = predicate()
         except (GLib.Error, IncompleteAccessibilityTree) as error:
             if isinstance(error, GLib.Error):
-                if 'Unknown object' not in str(error):
+                if not stale_accessibility_object(error):
                     raise
                 stale_accessibility_retries += 1
             else:
@@ -194,8 +201,14 @@ def click(pid, name, keyboard=False):
                  and node.name in names and visible(node)
                  and node.getState().contains(pyatspi.STATE_ENABLED)]
         return nodes[0] if len(nodes) == 1 else None
-    node = wait(find)
-    selected_name = node.name
+    def target_snapshot():
+        node = find()
+        if node is None:
+            return None
+        selected_name = node.name
+        bounds = None if keyboard else node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        return node, selected_name, bounds
+    node, selected_name, bounds = wait(target_snapshot)
     if keyboard:
         def input_focus():
             return int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
@@ -225,7 +238,6 @@ def click(pid, name, keyboard=False):
             event({'event': 'keyboard-focus-readback', 'pid': pid, 'name': name, 'state': last_focus})
         run(['xdotool', 'key', 'Return'])
         return
-    bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
     assert bounds.width > 0 and bounds.height > 0
     assert 0 <= bounds.x + bounds.width // 2 < viewport[0]
     assert 0 <= bounds.y + bounds.height // 2 < viewport[1]
