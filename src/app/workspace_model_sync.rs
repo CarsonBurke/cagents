@@ -2371,16 +2371,23 @@ mod tests {
                 assert_eq!(app.workspace.focused(), Some(primary));
             }
             while rx.try_recv().is_ok() {}
+            let mut conflict_card = None;
             if blocked_before {
                 let mut conflict_agent = agent.clone();
                 conflict_agent.id = crate::model::AgentId::new();
                 conflict_agent.origin = Origin::Automation {
                     id: uuid::Uuid::new_v4(),
                 };
+                let mut conflict_source = session.clone();
+                conflict_source.id = TerminalId::new();
+                conflict_source.proof.as_mut().unwrap().host_session_id =
+                    crate::model::HostSessionId::new("conflicting-execution-host");
+                conflict_agent.session = Some(HostedSession::Chat(conflict_source));
                 let mut foreign_session = session.clone();
                 foreign_session.id = TerminalId::new();
+                let conflict_id = CardId::from_uuid(conflict_agent.id.as_uuid());
                 let conflict = crate::workspace_model::views::Pane {
-                    id: CardId::from_uuid(conflict_agent.id.as_uuid()),
+                    id: conflict_id,
                     title: "Conflicting saved descriptor".into(),
                     user_title: None,
                     pending_terminal_start: false,
@@ -2390,6 +2397,7 @@ mod tests {
                 };
                 model.views[0].panes.push(conflict);
                 model.agents.push(conflict_agent);
+                conflict_card = Some(conflict_id);
                 model.sequence += 1;
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
                 assert!(app.shared_views.blocked.is_empty());
@@ -2403,6 +2411,12 @@ mod tests {
             model.sequence += 1;
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            assert!(!app.shared_views.quarantined.contains(&card));
+            if let Some(conflict) = conflict_card {
+                assert!(app.shared_views.quarantined.contains(&conflict));
+                assert_eq!(app.shared_views.quarantined.len(), 1);
+                assert!(!app.chat_start_pending(conflict));
+            }
             let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
             let inserts = edits
                 .iter()
@@ -2584,6 +2598,12 @@ mod tests {
             }
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.chat_start_pending(card));
+            assert!(!app.shared_views.quarantined.contains(&card));
+            if let Some(conflict) = conflict_card {
+                assert!(app.shared_views.quarantined.contains(&conflict));
+                assert_eq!(app.shared_views.quarantined.len(), 1);
+                assert!(!app.chat_start_pending(conflict));
+            }
             assert!(
                 app.workspace_model
                     .views

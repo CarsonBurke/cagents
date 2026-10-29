@@ -8599,7 +8599,8 @@ mod tests {
                 "SELECT length(CAST(content_json AS BLOB)) +
                  (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM metadata
                   WHERE key LIKE '%:navigation:local_only_cards'
-                     OR key LIKE '%:navigation:pending_chat_admissions')
+                     OR key LIKE '%:navigation:pending_chat_admissions'
+                     OR key LIKE '%:navigation:quarantined_panes')
                  FROM cards WHERE kind_tag='chat'",
                 [],
                 |row| row.get(0),
