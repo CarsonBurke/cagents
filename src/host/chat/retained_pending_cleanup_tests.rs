@@ -273,6 +273,7 @@ fn cleanup_after_publication(installed: bool, unknown_installed: bool) {
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),
+            failed_close: None,
         },
     );
     drop(lease);

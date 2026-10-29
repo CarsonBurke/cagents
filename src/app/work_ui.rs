@@ -101,6 +101,7 @@ impl Cagents {
                 self.handle_chat_ui(chat_ui::Action::OpenSession(session.to_string()))
             }
             Effect::Copy(text) => {
+                chat_ui::invalidate_copy_intent();
                 self.status = Some(TransientNotice::success(format!("Copied {text}")));
                 iced::clipboard::write(text).map(cosmic::Action::App)
             }
