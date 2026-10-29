@@ -28218,7 +28218,14 @@ mod tests {
 
     #[test]
     fn deferred_close_focus_preserves_a_later_search_choice_but_explicit_navigation_wins() {
-        for choice in ["toolbar", "search", "navigate"] {
+        for (width, mounted, choice) in [
+            (320.0, true, "handoff"),
+            (320.0, true, "search"),
+            (320.0, true, "navigate"),
+            (1920.0, false, "handoff"),
+            (1920.0, false, "search"),
+            (1920.0, false, "navigate"),
+        ] {
             let mut app = context_inspector_test_app(false);
             app.context_inspector_open = false;
             app.sidebar_model.projects.push(restored_sidebar_project(
@@ -28234,7 +28241,7 @@ mod tests {
                 app.cards.insert(id, CardRuntime::Loading);
                 app.workspace
                     .add_card(
-                        WorkspaceCard::new(id, "Loading pane", CardWidth::Fixed(1920.0)).unwrap(),
+                        WorkspaceCard::new(id, "Loading pane", CardWidth::Fixed(width)).unwrap(),
                         index,
                         false,
                     )
@@ -28243,16 +28250,22 @@ mod tests {
             let update = app.workspace.resize_viewport(640.0);
             drop(app.apply_viewport(update, false, false));
             assert_eq!(
-                app.workspace.visibility(ids[1]),
-                Some(VisibilityClass::Offscreen)
+                app.workspace
+                    .visibility(ids[1])
+                    .is_some_and(VisibilityClass::is_mounted),
+                mounted
             );
 
-            // Use the App's actual close handoff: the toolbar temporarily
-            // owns the keyboard because the surviving pane is not mounted.
+            // Exercise both the direct handoff to a mounted survivor and
+            // the toolbar placeholder for one that must first be revealed.
             let handoff = app.workspace.request_close(ids[0]).unwrap();
             assert_eq!(
                 handoff.target,
-                crate::workspace::FocusTarget::WorkspaceToolbar
+                if mounted {
+                    crate::workspace::FocusTarget::Card(ids[1])
+                } else {
+                    crate::workspace::FocusTarget::WorkspaceToolbar
+                }
             );
             let park = app.card_removal(handoff);
             let close = app.update(Message::CommitClose(ids[0]));
@@ -28267,7 +28280,7 @@ mod tests {
             );
             assert!(!app.workspace.pending_widget_focus_is_close_handoff());
 
-            let choose = if choice == "toolbar" {
+            let choose = if choice == "handoff" {
                 Task::none()
             } else {
                 app.update(Message::FocusProjectSearch)
@@ -28302,34 +28315,47 @@ mod tests {
                         .chain(settle)
                 ),
                 Some(expected),
-                "the real deferred close operations must respect the later {choice} choice"
+                "the real close operations must respect the later {choice} choice (survivor initially mounted: {mounted})"
             );
         }
     }
 
     #[test]
     fn closing_the_last_pane_leaves_no_deferred_focus_to_replace_search() {
-        let mut app = context_inspector_test_app(true);
-        app.context_inspector_open = false;
-        app.sidebar_model.projects.push(restored_sidebar_project(
-            ProjectId::new(),
-            "Fixture",
-            Path::new("/fixture"),
-        ));
-        let update = app.workspace.resize_viewport(640.0);
-        drop(app.apply_viewport(update, false, false));
-        let closing = app.workspace.focused().unwrap();
-        let handoff = app.workspace.request_close(closing).unwrap();
-        let park = app.card_removal(handoff);
-        let close = app.update(Message::CommitClose(closing));
-        assert_eq!(app.workspace.focused(), None);
-        assert!(!app.workspace.pending_widget_focus_is_close_handoff());
-        let search = app.update(Message::FocusProjectSearch);
-        let later = app.apply_viewport(ViewportUpdate::unchanged(), false, false);
-        assert_eq!(
-            focused(&app, park.chain(close).chain(search).chain(later)),
-            Some(sidebar::search_focus_id())
-        );
+        for choose_search in [false, true] {
+            let mut app = context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            app.sidebar_model.projects.push(restored_sidebar_project(
+                ProjectId::new(),
+                "Fixture",
+                Path::new("/fixture"),
+            ));
+            let update = app.workspace.resize_viewport(640.0);
+            drop(app.apply_viewport(update, false, false));
+            let closing = app.workspace.focused().unwrap();
+            let handoff = app.workspace.request_close(closing).unwrap();
+            let park = app.card_removal(handoff);
+            let close = app.update(Message::CommitClose(closing));
+            assert_eq!(app.workspace.focused(), None);
+            assert!(!app.workspace.pending_widget_focus_is_close_handoff());
+            let search = if choose_search {
+                app.update(Message::FocusProjectSearch)
+            } else {
+                Task::none()
+            };
+            let expected = if choose_search {
+                sidebar::search_focus_id()
+            } else {
+                widget::Id::new(TOOLBAR_FOCUS_ID)
+            };
+            let later = app.apply_viewport(ViewportUpdate::unchanged(), false, false);
+            // The search choice precedes the queued commit effects, so this
+            // catches a fallback that incorrectly takes focus back to chrome.
+            assert_eq!(
+                focused(&app, park.chain(search).chain(close).chain(later)),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
