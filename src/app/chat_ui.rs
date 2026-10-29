@@ -22518,9 +22518,9 @@ mod tests {
         for close_before_ack in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let success_notice = |app: &Cagents| {
-                app.status.as_ref().is_some_and(|notice| {
-                    notice.message == chat::ACCOUNT_SWITCH_NOTICE
-                        && notice.severity == NoticeSeverity::Success
+                app.notices.entries.iter().any(|entry| {
+                    entry.notice.message == chat::ACCOUNT_SWITCH_NOTICE
+                        && entry.notice.severity == NoticeSeverity::Success
                 })
             };
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -22784,7 +22784,10 @@ mod tests {
                 chat_runtime(&app, card).connection,
                 Connection::Live(_)
             ));
-            app.status = None;
+            app.notices.entries.retain(|entry| {
+                entry.notice.message != chat::ACCOUNT_SWITCH_NOTICE
+                    || entry.notice.severity != NoticeSeverity::Success
+            });
             let _ = app.update(Message::ChatUi(Action::AccountCommitted(
                 target,
                 duplicate_ready,
@@ -27371,7 +27374,11 @@ mod tests {
                 "local work is not actor-proved Busy"
             );
             assert!(!runtime.disconnected);
-            assert!(app.status.is_some());
+            assert!(app.notices.entries.iter().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Warning
+                    && entry.notice.message
+                        == "Finish pending commands and send or take back queued messages, then select the account again."
+            }));
             drop(command);
             if let Some(id) = pending {
                 drop(app.update(Message::ChatUi(Action::CommandFinished(target, id, Ok(())))));
