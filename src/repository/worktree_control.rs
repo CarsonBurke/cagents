@@ -122,7 +122,17 @@ fn publish(root: &fs_safety::Root, name: &str, bytes: &[u8], new: bool) -> io::R
 
 fn sync_publication(root: &fs_safety::Root) -> io::Result<()> {
     #[cfg(test)]
-    if FAIL_AFTER_RENAME.with(|fail| fail.replace(false)) {
+    if FAIL_AFTER_RENAME.with(|fail| match fail.get() {
+        Some(0) => {
+            fail.set(None);
+            true
+        }
+        Some(remaining) => {
+            fail.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    }) {
         return Err(io::Error::other(
             "injected setup publication directory-sync failure after rename",
         ));
@@ -132,10 +142,20 @@ fn sync_publication(root: &fs_safety::Root) -> io::Result<()> {
 }
 
 #[cfg(test)]
-thread_local! { static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static FAIL_AFTER_RENAME: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(test, feature = "host"))]
 pub(crate) fn fail_next_setup_publication_sync_for_test() {
-    FAIL_AFTER_RENAME.with(|fail| fail.set(true));
+    fail_setup_publication_sync_after_for_test(0);
+}
+#[cfg(all(test, feature = "host"))]
+fn fail_setup_publication_sync_after_for_test(successful_syncs: usize) {
+    FAIL_AFTER_RENAME.with(|fail| fail.set(Some(successful_syncs)));
+}
+#[cfg(all(test, feature = "host"))]
+impl<E: ProcessExecutor> RepositoryService<E> {
+    pub(crate) fn fail_setup_publication_sync_after_for_test(&self, successful_syncs: usize) {
+        fail_setup_publication_sync_after_for_test(successful_syncs);
+    }
 }
 
 /// A marker is inventory evidence only; callers still prove registration and

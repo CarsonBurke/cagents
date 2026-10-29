@@ -527,6 +527,160 @@ fn shared_journal_creation_and_listing_retain_configured_path_and_ticket() {
     assert_eq!((row.ahead, row.behind), (None, None));
 }
 
+struct CountedWorktreeAdds {
+    adds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl ProcessExecutor for CountedWorktreeAdds {
+    fn execute(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessFailure> {
+        if command
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new("worktree") && pair[1] == OsStr::new("add"))
+        {
+            self.adds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        SystemProcessExecutor.execute(command, cancellation)
+    }
+}
+
+#[test]
+fn original_creation_journal_requires_directory_barrier_before_applied() {
+    if isolated(concat!(
+        module_path!(),
+        "::original_creation_journal_requires_directory_barrier_before_applied"
+    )) {
+        return;
+    }
+    use crate::persistence::PendingOperationStatus;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let fixture = Fixture::new();
+    let adds = std::sync::Arc::new(AtomicUsize::new(0));
+    let service = RepositoryService::new(
+        "git",
+        std::sync::Arc::new(CountedWorktreeAdds { adds: adds.clone() }),
+    );
+    // Allow EXECUTION's publication, then fail CREATION's post-rename barrier.
+    service.fail_setup_publication_sync_after_for_test(1);
+    let Execution::Reply {
+        reply: Reply::CreationFailed(failed),
+        setup: None,
+    } = execute_with(
+        &service,
+        fixture.operation("topic", true),
+        &fixture.store,
+        |_| Ok(Vec::new()),
+        Some(fixture.settings.clone()),
+    )
+    .unwrap()
+    else {
+        panic!("creation must remain unresolved until its directory barrier succeeds");
+    };
+    assert_eq!(failed.state, "reconcile_required");
+    assert!(failed.may_have_effects);
+    assert!(
+        failed
+            .error
+            .contains("injected setup publication directory-sync failure after rename")
+    );
+    let operation_id = failed.operation_id;
+    let original = fixture
+        .store
+        .journaled_worktree_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.payload["state"], "reconcile_required");
+    assert!(original.payload["outcome"].is_null());
+    assert!(original.payload["linear_issue"].is_null());
+    assert_eq!(original.payload["request"]["setup_intent"]["skip"], true);
+    let admin = service
+        .git_dir(&failed.path, &CancellationToken::new())
+        .unwrap();
+    let creation = fs::read(admin.join("cagents-setup-creation")).unwrap();
+    let execution = fs::read(admin.join("cagents-setup-execution")).unwrap();
+    assert_eq!(creation, format!("{operation_id}\n").as_bytes());
+    let disposition: serde_json::Value = serde_json::from_slice(&execution).unwrap();
+    assert_eq!(disposition["creation"], operation_id.to_string());
+    assert_eq!(disposition["phase"], "NeverStarted");
+    let assert_retained = |status| {
+        let operations = fixture.store.journaled_worktree_operations().unwrap();
+        assert_eq!(operations.len(), 1, "recovery must retain the original row");
+        let operation = &operations[0];
+        assert_eq!(operation.id, operation_id);
+        assert_eq!(operation.status, status);
+        assert_eq!(operation.entity_id, original.entity_id);
+        assert_eq!(operation.base_generation, original.base_generation);
+        assert_eq!(operation.created_at_unix_ms, original.created_at_unix_ms);
+        assert_eq!(operation.payload["request"], original.payload["request"]);
+        assert_eq!(
+            fs::read(admin.join("cagents-setup-creation")).unwrap(),
+            creation
+        );
+        assert_eq!(
+            fs::read(admin.join("cagents-setup-execution")).unwrap(),
+            execution
+        );
+        assert_eq!(
+            adds.load(SeqCst),
+            1,
+            "recovery must not replay Git creation"
+        );
+    };
+    assert_retained(PendingOperationStatus::NeedsReconciliation);
+    assert!(
+        service
+            .worktree_setup_creation(&fixture.store, operation_id)
+            .is_err()
+    );
+
+    // Matching visible records still require the same row's real sync barrier.
+    crate::repository::fail_next_setup_publication_sync_for_test();
+    let reports = service
+        .rehydrate_pending_worktree_operations(&fixture.store)
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].operation_id, operation_id);
+    assert_eq!(reports[0].state, WorktreeOperationState::ReconcileRequired);
+    assert!(reports[0].outcome.is_none());
+    assert!(
+        reports[0]
+            .detail
+            .contains("injected setup publication directory-sync failure after rename")
+    );
+    assert_retained(PendingOperationStatus::NeedsReconciliation);
+    assert!(
+        service
+            .worktree_setup_creation(&fixture.store, operation_id)
+            .is_err()
+    );
+
+    let reports = service
+        .rehydrate_pending_worktree_operations(&fixture.store)
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].operation_id, operation_id);
+    assert_eq!(reports[0].state, WorktreeOperationState::Created);
+    let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &reports[0].outcome else {
+        panic!("successful barrier must settle the original creation");
+    };
+    assert_eq!(worktree.path, failed.path);
+    assert_eq!(worktree.branch.as_deref(), Some("refs/heads/topic"));
+    assert_retained(PendingOperationStatus::Applied);
+    let settled = service
+        .worktree_setup_creation(&fixture.store, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation_id, operation_id);
+    assert_eq!(settled.state, WorktreeOperationState::Created);
+    assert!(failed.path.join("tracked").is_file());
+    let inventory = git(&fixture.repository, &["worktree", "list", "--porcelain"]);
+    assert_eq!(inventory.matches("branch refs/heads/topic").count(), 1);
+}
+
 #[derive(Default)]
 struct CreatedStatusCounts {
     adds: std::sync::atomic::AtomicUsize,
