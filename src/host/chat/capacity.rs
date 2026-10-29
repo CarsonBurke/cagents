@@ -266,6 +266,12 @@ impl Reservation {
         if let Some(owner) = admission {
             if let Token::Fresh { id, .. } = &owner.token {
                 state.chat_preparing.remove(id);
+                // The accept loop may have drained SIGTERM's wake while this
+                // preparation still fenced shutdown. The persistent signal
+                // flag owns the intent; promotion must give it another turn.
+                if crate::daemon::termination_requested() || state.ordinary_exit_cleanup_pending() {
+                    crate::daemon::wake();
+                }
             }
             owner.token = Token::Source(source.clone());
         } else {
@@ -281,6 +287,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = matches!(&self.token, Token::Fresh { .. });
         let removed = match &self.token {
             Token::Source(source) if state.chat_spawning.get(&source.id) == Some(source) => {
                 state.chat_spawning.remove(&source.id);
@@ -294,10 +301,41 @@ impl Drop for Reservation {
         };
         if removed {
             state.inventory_generation += 1;
-            if state.ordinary_exit_cleanup_pending() {
+            if state.ordinary_exit_cleanup_pending()
+                || (fresh && crate::daemon::termination_requested())
+            {
                 crate::daemon::wake();
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::host) struct FreshSignalPreparation {
+    host: SharedHost,
+    admission: Option<Reservation>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl FreshSignalPreparation {
+    pub(in crate::host) fn reserve(
+        host: &SharedHost,
+        id: TerminalId,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            host: host.clone(),
+            admission: Some(Reservation::fresh(host, id)?),
+        })
+    }
+
+    pub(in crate::host) fn promote(mut self, source: &Session) -> Result<(), ProtocolError> {
+        let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        Reservation::install(&mut self.admission, &self.host, &mut state, source)?;
+        drop(state);
+        // Model a preparation request completing while its RPC stays open.
+        // This fixture starts no provider and owns no fabricated actor receipt.
+        drop(self);
+        Ok(())
     }
 }
 
