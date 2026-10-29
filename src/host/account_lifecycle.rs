@@ -746,6 +746,51 @@ pub(super) enum PreparedAdmission {
 }
 
 impl PreparedCreationReservation {
+    /// Only an actual receipt callback can populate this root. A Created
+    /// replay returns metadata without recovering original inode provenance.
+    pub(super) fn create_for_code(
+        &self,
+    ) -> std::io::Result<(
+        crate::account::preparation::Preparation,
+        Option<std::sync::Arc<super::fresh_code::CreatedRoot>>,
+    )> {
+        let captured = std::cell::RefCell::new(None);
+        let record = self.create_initialized(
+            |receipt| {
+                *captured.borrow_mut() = Some(std::sync::Arc::new(
+                    super::fresh_code::CreatedRoot::capture(receipt)?,
+                ));
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok((record, captured.into_inner()))
+    }
+
+    pub(super) fn verify_code_root(
+        &self,
+        root: &super::fresh_code::CreatedRoot,
+    ) -> Result<(), String> {
+        root.revalidate().map_err(|error| error.to_string())?;
+        let current = self.reservation.current()?;
+        let actual = current
+            .homes
+            .get(1)
+            .ok_or("The created home enrollment is missing")?;
+        let original = actual
+            .pin
+            .as_ref()
+            .ok_or("The actual creation root was not enrolled")?;
+        let held = original.metadata().map_err(|error| error.to_string())?;
+        if self.binding.payload.provider != root.provider()
+            || self.binding.key != root.key()
+            || !root.matches(&held)
+        {
+            return Err("The original creation enrollment differs from the code-login root".into());
+        }
+        actual.verify()
+    }
+
     pub(super) fn reserve(
         host: &SharedHost,
         store: Store,

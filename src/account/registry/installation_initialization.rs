@@ -304,11 +304,12 @@ mod tests {
             } else {
                 store.path()
             };
+            let newer = format!("version={}\n", VERSION + 1);
             fs::write(
                 &file,
                 match kind {
                     "corrupt" => "private-invalid=[",
-                    "newer" => "version=7\n",
+                    "newer" => &newer,
                     "nil" => "version=6\ninstallation='00000000-0000-0000-0000-000000000000'\n",
                     _ => "version=6\n",
                 },

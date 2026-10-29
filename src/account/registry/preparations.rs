@@ -21,7 +21,10 @@ impl Registry {
             .filter(|entry| entry.binding.payload.provider == provider)
     }
 
-    fn exact_preparation(&self, binding: &PreparationBinding) -> io::Result<&Preparation> {
+    pub(super) fn exact_preparation(
+        &self,
+        binding: &PreparationBinding,
+    ) -> io::Result<&Preparation> {
         self.preparation(binding.request_id)
             .filter(|entry| {
                 &entry.binding == binding && self.installation == Some(binding.installation_id)
@@ -42,6 +45,7 @@ impl Registry {
             )
         };
         self.validate_existing_pending()?;
+        self.validate_fresh_code()?;
         let mut registered_keys = std::collections::HashSet::new();
         if self
             .accounts
@@ -61,7 +65,8 @@ impl Registry {
         if self.preparations.is_empty() && self.installation.is_none() {
             return Ok(());
         }
-        if self.version < VERSION || self.installation.is_none_or(|id| id.is_nil()) {
+        if self.version < PREPARATIONS_MIN_VERSION || self.installation.is_none_or(|id| id.is_nil())
+        {
             return Err(invalid());
         }
         let mut requests = std::collections::HashSet::new();

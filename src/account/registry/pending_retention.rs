@@ -41,7 +41,7 @@ impl Registry {
         let mut cancellations = std::collections::HashSet::new();
         for entry in &self.existing_pending {
             let binding = &entry.binding;
-            if self.version < VERSION
+            if self.version < PREPARATIONS_MIN_VERSION
                 || binding.installation_id.is_nil()
                 || self.installation != Some(binding.installation_id)
                 || binding.key.is_nil()

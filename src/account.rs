@@ -30,6 +30,7 @@ pub mod claude;
 pub mod codex;
 #[cfg(any(feature = "ui", feature = "host"))]
 mod durability;
+pub(crate) mod fresh_code;
 #[cfg(feature = "host")]
 pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]

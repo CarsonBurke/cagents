@@ -33,7 +33,12 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
+// The version that first introduced durable preparation metadata. Raising the
+// current writer must not make a valid version-6 registry unreadable.
+const PREPARATIONS_MIN_VERSION: u32 = 6;
+mod fresh_code;
+pub(crate) use fresh_code::{CodeClaim, CodeRegistration};
 mod installation_initialization;
 #[cfg(test)]
 mod installation_observation_tests;
@@ -140,6 +145,8 @@ pub struct Registry {
     preparations: Vec<Preparation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     existing_pending: Vec<ExistingPending>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fresh_code_owners: Vec<super::fresh_code::CodeOwner>,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -545,6 +552,23 @@ impl Registry {
     /// Records a managed account that has signed in, unless one already
     /// names the same login; returns the account it duplicates, if any.
     pub fn register(
+        &mut self,
+        managed: Registered,
+        system: &[(Provider, Identity)],
+    ) -> Result<(), RegistrationError> {
+        // A stable fresh-code owner cannot be settled by the legacy unbound
+        // provider/key watcher. Its host validates the exact owner and probe.
+        if self
+            .fresh_code_owners
+            .iter()
+            .any(|owner| owner.binding.key == managed.key)
+        {
+            return Err(RegistrationError::RetainedPreparation);
+        }
+        self.register_managed(managed, system)
+    }
+
+    fn register_managed(
         &mut self,
         managed: Registered,
         system: &[(Provider, Identity)],

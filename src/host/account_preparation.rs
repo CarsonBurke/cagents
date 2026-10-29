@@ -83,14 +83,14 @@ impl SeedSelection {
 /// The original admitted connection, not a numeric client ID that can later
 /// be registered again. Once physical admission succeeds its immutable token
 /// owns just this operation; a lost reply does not cause authority fallback.
-struct OriginalCaller {
+pub(super) struct OriginalCaller {
     client: ClientId,
     delivery: Arc<DeliveryQueue>,
     proof: HostSessionProof,
 }
 
 impl OriginalCaller {
-    fn capture(host: &SharedHost, client: ClientId) -> Result<Self, ProtocolError> {
+    pub(super) fn capture(host: &SharedHost, client: ClientId) -> Result<Self, ProtocolError> {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.agent_clients.contains_key(&client)
             || !matches!(
@@ -118,7 +118,15 @@ impl OriginalCaller {
         })
     }
 
-    fn revalidate(&self, host: &SharedHost, request: &ClientRequest) -> Result<(), ProtocolError> {
+    pub(super) fn proof(&self) -> &HostSessionProof {
+        &self.proof
+    }
+
+    pub(super) fn revalidate(
+        &self,
+        host: &SharedHost,
+        request: &ClientRequest,
+    ) -> Result<(), ProtocolError> {
         {
             let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.proof() != &self.proof
@@ -192,7 +200,7 @@ pub(super) fn observation_store() -> Option<Store> {
     }
 }
 
-fn seed_selection(provider: Provider) -> io::Result<SeedSelection> {
+pub(super) fn seed_selection(provider: Provider) -> io::Result<SeedSelection> {
     #[cfg(test)]
     {
         let _ = provider;
