@@ -46,6 +46,7 @@ struct ConnectionContext {
     >,
     home: OnceLock<PathBuf>,
     shell: OnceLock<String>,
+    shell_error: OnceLock<Option<String>>,
     bridge: Mutex<Option<Bridge>>,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -56,6 +57,7 @@ impl ConnectionContext {
             environment: OnceLock::new(),
             home: OnceLock::new(),
             shell: OnceLock::new(),
+            shell_error: OnceLock::new(),
             bridge: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1795,6 +1797,12 @@ pub fn shell() -> Option<&'static str> {
         .and_then(|context| context.shell.get())
         .map(String::as_str)
 }
+pub(crate) fn shell_error() -> Option<&'static str> {
+    SELECTED
+        .get()
+        .and_then(|context| context.shell_error.get())
+        .and_then(|error| error.as_deref())
+}
 pub fn prepare() -> io::Result<()> {
     if !is_remote() {
         return Ok(());
@@ -1804,10 +1812,12 @@ pub fn prepare() -> io::Result<()> {
             path,
             shell,
             environment,
+            shell_error,
         }) => {
             let _ = SELECTED.get().unwrap().home.set(path);
             let _ = SELECTED.get().unwrap().environment.set(environment);
             let _ = SELECTED.get().unwrap().shell.set(shell);
+            let _ = SELECTED.get().unwrap().shell_error.set(shell_error);
             Ok(())
         }
         Ok(_) => Err(io::Error::other(

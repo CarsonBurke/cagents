@@ -9,18 +9,34 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .filter(|id| !state.chats.contains_key(id))
             .count()
         + state
-            .native_actor_startups
+            .chat_preparing
             .keys()
             .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| {
+                !state.chats.contains_key(id)
+                    && !state.chat_spawning.contains_key(id)
+                    && !state.chat_preparing.contains_key(id)
+            })
             .count()
 }
 
 fn pending(state: &HostState) -> usize {
     state.chat_spawning.len()
         + state
-            .native_actor_startups
+            .chat_preparing
             .keys()
             .filter(|id| !state.chat_spawning.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| {
+                !state.chat_spawning.contains_key(id) && !state.chat_preparing.contains_key(id)
+            })
             .count()
 }
 
@@ -42,14 +58,53 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
     Ok(())
 }
 
-/// An exact descriptor is the reservation token. Other transitions cannot
-/// replace it while it is present; cleanup never removes a successor token.
+fn require_preparation_available(state: &HostState) -> Result<(), ProtocolError> {
+    let pending = state
+        .chat_spawning
+        .keys()
+        .chain(state.chat_preparing.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    if pending >= 128 {
+        return Err(unavailable(
+            "Daemon native chat preparation capacity reached",
+        ));
+    }
+    Ok(())
+}
+
+/// A fresh preparation owns a nonce until its real descriptor is installed.
+/// Other transitions cannot replace either token; stale cleanup never removes
+/// a successor preparation or descriptor.
 pub(super) struct Reservation {
     host: SharedHost,
-    source: Session,
+    token: Token,
+}
+
+enum Token {
+    Source(Session),
+    Fresh { id: TerminalId, nonce: uuid::Uuid },
 }
 
 impl Reservation {
+    /// Bound configuration/account/PATH preparation without inventing a Session.
+    pub(super) fn fresh(host: &SharedHost, id: TerminalId) -> Result<Self, ProtocolError> {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down {
+            return Err(unavailable("Daemon is shutting down"));
+        }
+        configured_start::require_fresh_in(&state, id)?;
+        require_preparation_available(&state)?;
+        require_available(&state)?;
+        let nonce = uuid::Uuid::new_v4();
+        state.chat_preparing.insert(id, nonce);
+        state.inventory_generation += 1;
+        Ok(Self {
+            host: host.clone(),
+            token: Token::Fresh { id, nonce },
+        })
+    }
+
     /// Fence teardown through durable retirement, including the interval after
     /// its resident record is removed and before its old authority is retired.
     pub(super) fn closing(
@@ -57,19 +112,28 @@ impl Reservation {
         state: &mut HostState,
         source: &Session,
     ) -> Result<Self, ProtocolError> {
-        if state.chat_spawning.contains_key(&source.id) {
+        if state.chat_preparing.contains_key(&source.id)
+            || state.chat_spawning.contains_key(&source.id)
+        {
             return Err(error("Chat is already starting or closing"));
         }
         state.chat_spawning.insert(source.id, source.clone());
         state.inventory_generation += 1;
         Ok(Self {
             host: host.clone(),
-            source: source.clone(),
+            token: Token::Source(source.clone()),
         })
     }
 
     pub(super) fn holds(&self, state: &HostState, id: TerminalId) -> bool {
-        self.source.id == id && state.chat_spawning.get(&id) == Some(&self.source)
+        match &self.token {
+            Token::Source(source) => {
+                source.id == id && state.chat_spawning.get(&id) == Some(source)
+            }
+            Token::Fresh { id: owned, nonce } => {
+                *owned == id && state.chat_preparing.get(&id) == Some(nonce)
+            }
+        }
     }
 
     pub(super) fn new(host: &SharedHost, source: &Session) -> Result<Option<Self>, ProtocolError> {
@@ -85,7 +149,8 @@ impl Reservation {
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
         }
-        if state.chat_spawning.contains_key(&source.id)
+        if state.chat_preparing.contains_key(&source.id)
+            || state.chat_spawning.contains_key(&source.id)
             || state.native_closing.contains_key(&source.id)
         {
             return Err(error("Chat is already starting or closing"));
@@ -163,6 +228,7 @@ impl Reservation {
         {
             return Err(error("This exact conversation is already starting"));
         }
+        require_preparation_available(&state)?;
         if !state.chats.contains_key(&source.id) {
             require_available(&state)?;
         }
@@ -170,7 +236,7 @@ impl Reservation {
         state.inventory_generation += 1;
         Ok(Some(Self {
             host: host.clone(),
-            source: source.clone(),
+            token: Token::Source(source.clone()),
         }))
     }
 
@@ -180,18 +246,32 @@ impl Reservation {
         state: &mut HostState,
         source: &Session,
     ) -> Result<(), ProtocolError> {
-        if let Some(admission) = admission.as_ref()
-            && state.chat_spawning.get(&admission.source.id) != Some(&admission.source)
-        {
-            return Err(error("Native chat admission reservation changed"));
+        if let Some(owner) = admission.as_ref() {
+            match &owner.token {
+                Token::Source(original) => {
+                    if state.chat_spawning.get(&original.id) != Some(original) {
+                        return Err(error("Native chat admission reservation changed"));
+                    }
+                }
+                Token::Fresh { .. } => {
+                    require_fresh_reservation(state, owner, source.id)?;
+                }
+            }
+        } else if state.chat_preparing.contains_key(&source.id) {
+            return Err(error("Fresh native start owns this admission"));
         }
+        // Fresh promotion is one lock-held transfer. The exact nonce stays
+        // present until the real pending descriptor has been inserted.
         state.chat_spawning.insert(source.id, source.clone());
-        if let Some(admission) = admission {
-            admission.source = source.clone();
+        if let Some(owner) = admission {
+            if let Token::Fresh { id, .. } = &owner.token {
+                state.chat_preparing.remove(id);
+            }
+            owner.token = Token::Source(source.clone());
         } else {
             *admission = Some(Self {
                 host: host.clone(),
-                source: source.clone(),
+                token: Token::Source(source.clone()),
             });
         }
         Ok(())
@@ -201,9 +281,22 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
-            state.chat_spawning.remove(&self.source.id);
+        let removed = match &self.token {
+            Token::Source(source) if state.chat_spawning.get(&source.id) == Some(source) => {
+                state.chat_spawning.remove(&source.id);
+                true
+            }
+            Token::Fresh { id, nonce } if state.chat_preparing.get(id) == Some(nonce) => {
+                state.chat_preparing.remove(id);
+                true
+            }
+            _ => false,
+        };
+        if removed {
             state.inventory_generation += 1;
+            if state.ordinary_exit_cleanup_pending() {
+                crate::daemon::wake();
+            }
         }
     }
 }
@@ -240,6 +333,251 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: Default::default(),
         }
+    }
+
+    #[test]
+    fn configured_admission_promotes_one_owned_slot_without_a_second_reservation() {
+        let host = host();
+        host.lock().unwrap().native_chat_capacity = 1;
+        let mut source = session();
+        let mut admission = Some(Reservation::fresh(&host, source.id).unwrap());
+        {
+            let mut state = host.lock().unwrap();
+            assert_eq!(usage(&state), 1);
+            assert_eq!(pending(&state), 1);
+            assert!(
+                state.chat_spawning.is_empty(),
+                "no provider recipe was invented"
+            );
+            source.proof = Some(state.proof().clone());
+            require_fresh_reservation(&state, admission.as_ref().unwrap(), source.id).unwrap();
+            Reservation::install(&mut admission, &host, &mut state, &source).unwrap();
+            assert!(state.chat_preparing.is_empty());
+            assert_eq!(state.chat_spawning.len(), 1);
+            assert_eq!(state.chat_spawning[&source.id], source);
+            assert!(admission.as_ref().unwrap().holds(&state, source.id));
+            assert_eq!(usage(&state), 1);
+            assert_eq!(pending(&state), 1);
+        }
+        assert!(Reservation::fresh(&host, source.id).is_err());
+        assert!(Reservation::new(&host, &source).is_err());
+        assert!(host.lock().unwrap().reserve_spawn(source.id).is_err());
+        drop(admission);
+        assert_eq!(usage(&host.lock().unwrap()), 0);
+        assert!(Reservation::fresh(&host, source.id).is_ok());
+    }
+
+    #[test]
+    fn configured_preparation_shares_the_128_bound_with_ordinary_starts_and_releases_errors() {
+        let host = host();
+        host.lock().unwrap().native_chat_capacity = 1024;
+        let mut ordinary = Vec::new();
+        let mut fresh = Vec::new();
+        for _ in 0..64 {
+            ordinary.push(Reservation::new(&host, &session()).unwrap().unwrap());
+            fresh.push(Reservation::fresh(&host, TerminalId::new()).unwrap());
+        }
+        for failure in [
+            Reservation::fresh(&host, TerminalId::new()).err().unwrap(),
+            Reservation::new(&host, &session()).err().unwrap(),
+        ] {
+            assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+            assert_eq!(
+                failure.message,
+                "Daemon native chat preparation capacity reached"
+            );
+            assert!(!failure.retryable);
+        }
+        assert_eq!(usage(&host.lock().unwrap()), 128);
+        drop(fresh.pop());
+        let replacement = Reservation::fresh(&host, TerminalId::new()).unwrap();
+        assert_eq!(usage(&host.lock().unwrap()), 128);
+        drop((ordinary, fresh, replacement));
+        assert_eq!(usage(&host.lock().unwrap()), 0);
+    }
+
+    #[test]
+    fn configured_ingress_capacity_refuses_before_factory_settings_or_provider_reads() {
+        let host = host();
+        host.lock().unwrap().native_chat_capacity = 0;
+        let source = session();
+        let failure = configured_start::start(
+            &host,
+            1,
+            chat::ConfiguredChatStart {
+                id: source.id,
+                provider: source.launch.provider,
+                working_directory: source.launch.recipe.working_directory,
+                account: crate::account::Account::system(source.launch.provider).id(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                automatic: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::ChatCapacity);
+        assert!(failure.retryable);
+        assert!(failure.message.contains("limit 0"));
+        let state = host.lock().unwrap();
+        assert!(state.chat_preparing.is_empty());
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
+    }
+
+    #[test]
+    fn configured_duplicate_requests_have_one_atomic_nonce_owner() {
+        let host = host();
+        host.lock().unwrap().native_chat_capacity = 1;
+        let id = TerminalId::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (send, receive) = std::sync::mpsc::channel();
+        let workers = (0..2)
+            .map(|_| {
+                let host = host.clone();
+                let barrier = barrier.clone();
+                let send = send.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert!(send.send(Reservation::fresh(&host, id)).is_ok());
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = [receive.recv().unwrap(), receive.recv().unwrap()];
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(host.lock().unwrap().chat_preparing.len(), 1);
+        assert_eq!(usage(&host.lock().unwrap()), 1);
+        drop(results);
+        assert_eq!(usage(&host.lock().unwrap()), 0);
+    }
+
+    #[test]
+    fn configured_cancel_unwind_and_failed_promotion_never_release_a_successor_nonce() {
+        let host = host();
+        let source = session();
+        let mut owner = Some(Reservation::fresh(&host, source.id).unwrap());
+        let successor = uuid::Uuid::new_v4();
+        host.lock()
+            .unwrap()
+            .chat_preparing
+            .insert(source.id, successor);
+        {
+            let mut state = host.lock().unwrap();
+            assert!(require_fresh_reservation(&state, owner.as_ref().unwrap(), source.id).is_err());
+            assert!(Reservation::install(&mut owner, &host, &mut state, &source).is_err());
+            assert!(state.chat_spawning.is_empty());
+            assert_eq!(state.chat_preparing[&source.id], successor);
+        }
+        drop(owner);
+        assert_eq!(host.lock().unwrap().chat_preparing[&source.id], successor);
+        host.lock().unwrap().chat_preparing.remove(&source.id);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = Reservation::fresh(&host, source.id).unwrap();
+            panic!("preparation worker failed before installation");
+        }));
+        assert!(unwound.is_err());
+        assert!(!host.lock().unwrap().contains_session_identity(source.id));
+        let mut owner = Some(Reservation::fresh(&host, source.id).unwrap());
+        let mut different = source.clone();
+        different.id = TerminalId::new();
+        {
+            let mut state = host.lock().unwrap();
+            assert!(Reservation::install(&mut owner, &host, &mut state, &different).is_err());
+            assert!(state.chat_spawning.is_empty());
+            assert_eq!(state.chat_preparing.len(), 1);
+        }
+        drop(owner);
+        assert_eq!(usage(&host.lock().unwrap()), 0);
+    }
+
+    #[test]
+    fn configured_late_identity_recheck_keeps_active_closed_and_retained_owners() {
+        for closed in [false, true] {
+            let host = host();
+            let (_directory, source, handle) = history_reader(&host, closed);
+            assert!(Reservation::fresh(&host, source.id).is_err());
+            let record = host.lock().unwrap().chats.remove(&source.id).unwrap();
+            let mut owner = Some(Reservation::fresh(&host, source.id).unwrap());
+            host.lock().unwrap().chats.insert(source.id, record);
+            {
+                let mut state = host.lock().unwrap();
+                assert!(
+                    require_fresh_reservation(&state, owner.as_ref().unwrap(), source.id).is_err()
+                );
+                assert!(Reservation::install(&mut owner, &host, &mut state, &source).is_err());
+                assert_eq!(usage(&state), 1, "duplicate IDs consume one distinct slot");
+            }
+            drop(owner);
+            assert!(host.lock().unwrap().chats.contains_key(&source.id));
+            handle.close().unwrap();
+        }
+        let host = host();
+        let source = session();
+        let owner = Reservation::fresh(&host, source.id).unwrap();
+        let context = Arc::new(chat::protocol::ExecutionContext::default());
+        host.lock().unwrap().native_actor_startups.insert(
+            source.id,
+            retained_actor::Startup {
+                source: source.clone(),
+                requested: source.clone(),
+                context: context.clone(),
+                failed_close: None,
+            },
+        );
+        assert!(require_fresh_reservation(&host.lock().unwrap(), &owner, source.id).is_err());
+        drop(owner);
+        assert!(Reservation::fresh(&host, source.id).is_err());
+        assert!(Arc::ptr_eq(
+            &host.lock().unwrap().native_actor_startups[&source.id].context,
+            &context
+        ));
+        assert!(host.lock().unwrap().chat_preparing.is_empty());
+    }
+
+    #[test]
+    fn configured_preparation_blocks_ordinary_exit_terminal_reuse_and_upgrade_checkpoint() {
+        let host = host();
+        let id = TerminalId::new();
+        let owner = Reservation::fresh(&host, id).unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            assert!(state.any_live(&[id]));
+            assert!(state.reserve_spawn(id).is_err());
+            assert!(state.startup_blocks_shutdown());
+            assert!(state.ordinary_exit_cleanup_blocked());
+            let impact = state
+                .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+                .unwrap();
+            assert!(
+                impact
+                    .blockers
+                    .iter()
+                    .any(|reason| reason.contains("starting sessions"))
+            );
+            let outcome = state.shutdown(
+                crate::terminal_ipc::ShutdownOperation::Stop {
+                    require_empty: false,
+                    expected_generation: None,
+                },
+                Instant::now(),
+            );
+            assert!(matches!(
+                outcome,
+                crate::terminal_ipc::ShutdownOutcome::ConfirmationRequired { current_count: 1 }
+            ));
+            state.begin_ordinary_exit_cleanup();
+            assert!(state.ordinary_exit_cleanup_blocked());
+        }
+        drop(owner);
+        let state = host.lock().unwrap();
+        assert!(!state.startup_blocks_shutdown());
+        assert!(!state.ordinary_exit_cleanup_blocked());
+        assert!(state.chat_preparing.is_empty());
     }
 
     #[test]

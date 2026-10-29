@@ -4,6 +4,7 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+mod configured_start;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -866,7 +867,53 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+/// The pending row is authority only through the guard which created it.
+/// Keep that row installed while checking every other identity namespace;
+/// no temporary release can admit a concurrent start or erase a successor.
+fn require_fresh_reservation(
+    state: &HostState,
+    admission: &capacity::Reservation,
+    id: TerminalId,
+) -> Result<(), ProtocolError> {
+    if !admission.holds(state, id) {
+        return Err(error("The original fresh native start reservation changed"));
+    }
+    // Check the owning state's complete identity predicate without exposing
+    // its private terminal reservation set or temporarily releasing our row.
+    if state.contains_session_identity_except_preparation(id) {
+        return Err(error(
+            "This conversation identifier is already owned; attach or explicitly recover it",
+        ));
+    }
+    Ok(())
+}
+
 fn start_with_execution(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    source: Option<HostSessionProof>,
+    terminate_source: bool,
+    selection: Option<PendingBinding>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
+    restart_launch: Option<&chat::Launch>,
+) -> Result<ServerResponse, ProtocolError> {
+    start_with_execution_options(
+        host,
+        client,
+        session,
+        source,
+        terminate_source,
+        selection,
+        execution_environment,
+        execution,
+        restart_launch,
+        None,
+    )
+}
+
+fn start_with_execution_options(
     host: &SharedHost,
     client: ClientId,
     mut session: Session,
@@ -876,36 +923,47 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    mut admission: Option<capacity::Reservation>,
 ) -> Result<ServerResponse, ProtocolError> {
-    // A helper may have committed installation before host publication failed.
-    // Recover its durable outbox through authenticated adoption before asking
-    // an unexposed startup guard to retire it without a semantic consumer.
-    let pending = {
+    let fresh_only = admission.is_some();
+    if let Some(owner) = &admission {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .native_actor_startups
-            .get(&session.id)
-            .filter(|pending| {
-                (pending.source == session || pending.requested == session)
-                    && !state.chats.contains_key(&session.id)
-                    && !state.chat_spawning.contains_key(&session.id)
-            })
-            .cloned()
-    };
-    if let Some(pending) = pending
-        && has_native_owner(&pending.source)?
-    {
-        let response =
-            native_recovery::restore(host, client, &pending.source).map_err(unavailable)?;
-        pending.context.installed();
-        retained_actor::forget_startup(host, &pending.source, &pending.context);
-        return Ok(response);
+        if state.shutting_down {
+            return Err(unavailable("Daemon is shutting down"));
+        }
+        require_fresh_reservation(&state, owner, session.id)?;
     }
-    // A failed pre-discovery helper still owns its exact cleanup context.
-    retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
-    // Reserve before provider/account initialization. Pending owners recovered above
-    // use their own exact reservation through restore.
-    let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
+    if !fresh_only {
+        // A helper may have committed installation before host publication failed.
+        // Recover its durable outbox through authenticated adoption before asking
+        // an unexposed startup guard to retire it without a semantic consumer.
+        let pending = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .native_actor_startups
+                .get(&session.id)
+                .filter(|pending| {
+                    (pending.source == session || pending.requested == session)
+                        && !state.chats.contains_key(&session.id)
+                        && !state.chat_spawning.contains_key(&session.id)
+                })
+                .cloned()
+        };
+        if let Some(pending) = pending
+            && has_native_owner(&pending.source)?
+        {
+            let response =
+                native_recovery::restore(host, client, &pending.source).map_err(unavailable)?;
+            pending.context.installed();
+            retained_actor::forget_startup(host, &pending.source, &pending.context);
+            return Ok(response);
+        }
+        // A failed pre-discovery helper still owns its exact cleanup context.
+        retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
+        // Reserve before provider/account initialization. Pending owners recovered above
+        // use their own exact reservation through restore.
+        admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
+    }
     let reservation_id = session.id;
     super::account_lifecycle::ensure_launch(
         host,
@@ -984,6 +1042,11 @@ fn start_with_execution(
         ));
     }
     if session.native_continuity.retains_provider() || has_native_owner(&session)? {
+        if fresh_only {
+            return Err(error(
+                "This conversation identifier has a native owner; explicitly recover it",
+            ));
+        }
         return native_recovery::restore_with_admission(host, client, &session, admission)
             .map_err(unavailable);
     }
@@ -1285,6 +1348,15 @@ fn start_with_execution(
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
+        }
+        if fresh_only {
+            require_fresh_reservation(
+                &state,
+                admission
+                    .as_ref()
+                    .ok_or_else(|| error("Fresh native start lost its admission guard"))?,
+                session.id,
+            )?;
         }
         if state.chat_handoffs.contains_key(&session.id) {
             return Err(error(
@@ -2483,6 +2555,9 @@ fn process_inner(
             inspection: capacity::release(host, &proof, dry_run)?,
             dry_run,
         }),
+        ClientRequest::ChatStartConfigured { start: intent } => {
+            configured_start::start(host, client, intent)
+        }
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()
@@ -2913,7 +2988,7 @@ fn process_inner(
             let snapshot = handle.snapshot(None).ok_or_else(|| {
                 unavailable("Exact native snapshot is unavailable; no replacement was started")
             })?;
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
+            let recipe = session.launch.terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
             if session.launch.provider == Provider::Codex
@@ -2982,7 +3057,11 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {

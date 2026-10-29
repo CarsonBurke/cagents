@@ -61,6 +61,7 @@ fn accepted(peer: &mut UnixStream, request: &ClientEnvelope) {
 }
 fn home() -> Reply {
     Reply::Home {
+        shell_error: None,
         path: "/synthetic-selected-device/home".into(),
         shell: "/bin/sh".into(),
         environment: Default::default(),

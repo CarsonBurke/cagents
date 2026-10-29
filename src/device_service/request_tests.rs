@@ -67,6 +67,7 @@ fn denied() -> ServerMessage {
 
 fn home() -> Reply {
     Reply::Home {
+        shell_error: None,
         path: "/selected-device/home".into(),
         shell: "/bin/sh".into(),
         environment: Default::default(),

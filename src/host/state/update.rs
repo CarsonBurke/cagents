@@ -156,7 +156,10 @@ impl HostState {
                 .blockers
                 .push("Wait for native provider cleanup to finish.".into());
         }
-        if !self.spawning.is_empty() || !self.chat_spawning.is_empty() {
+        if !self.spawning.is_empty()
+            || !self.chat_spawning.is_empty()
+            || !self.chat_preparing.is_empty()
+        {
             impact
                 .blockers
                 .push("Wait for starting sessions to finish opening.".into());

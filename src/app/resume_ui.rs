@@ -26,6 +26,8 @@ pub(super) struct State {
     /// The sessions found conversations resume with, and their accounts' names.
     seeds: Arc<[chat::Session]>,
     seed_accounts: Vec<String>,
+    launch_errors: HashMap<Provider, String>,
+    launch_settings: std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
     /// The provider and project `/resume` was asked for in, until the reader
     /// widens the search.
     pub(super) scope: Option<Scope>,
@@ -149,6 +151,8 @@ pub enum Action {
 /// What indexing has found so far, in the order it is found.
 #[derive(Debug, Clone)]
 pub enum Progress {
+    /// Read-only history remains discoverable when its current launch is invalid.
+    LaunchErrors(HashMap<Provider, String>),
     /// Conversations cagents saved, and the sessions found ones resume with.
     Saved {
         entries: Vec<SavedConversation>,
@@ -447,6 +451,7 @@ impl Cagents {
         state.visible.clear();
         state.seeds = Arc::from([]);
         state.seed_accounts.clear();
+        state.launch_errors.clear();
         state.scope = scope;
         state.replace = None;
         state.error = None;
@@ -461,6 +466,10 @@ impl Cagents {
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
         let accounts = self.resume_catalog_accounts();
+        // Match new-chat launch policy: an invalid external file edit does not
+        // replace the last valid settings accepted by this window.
+        let agents = self.settings.agents.clone();
+        self.resume_ui.launch_settings = agents.clone();
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let (sender, receiver) = async_channel::bounded(2);
         let spawned = std::thread::Builder::new()
@@ -492,18 +501,13 @@ impl Cagents {
                         }
                     }
                 }
-                let seeds = accounts
-                    .into_iter()
-                    .filter_map(|account| {
-                        chat::fresh_session(
-                            account.provider,
-                            TerminalId::new(),
-                            directory.clone(),
-                            &account,
-                        )
-                        .ok()
-                    })
-                    .collect();
+                if sender
+                    .send_blocking(Progress::LaunchErrors(resume_launch_errors(&agents)))
+                    .is_err()
+                {
+                    return;
+                }
+                let seeds = resume_seeds(accounts, &directory, &agents);
                 index(saved, seeds, &cache, &cancel, |progress| {
                     sender.send_blocking(progress).is_ok()
                 });
@@ -573,6 +577,23 @@ impl Cagents {
                 let Some(row) = self.resume_ui.rows.iter().find(|row| row.card == card) else {
                     return Task::none();
                 };
+                if matches!(&row.source, Source::Found(_))
+                    && let Some(reason) = self.resume_ui.launch_errors.get(&row.provider)
+                {
+                    let error = format!(
+                        "Repair the {} settings in Agents before resuming: {reason}",
+                        row.provider.label()
+                    );
+                    self.resume_error(&error);
+                    return Task::none();
+                }
+                let configuration = matches!(&row.source, Source::Found(_)).then(|| {
+                    self.resume_ui
+                        .launch_settings
+                        .get(settings::agents::provider_key(row.provider))
+                        .cloned()
+                        .unwrap_or_default()
+                });
                 let entry = match &row.source {
                     // Resumed under the title it is listed by.
                     Source::Saved(entry) => Some(SavedConversation {
@@ -596,6 +617,19 @@ impl Cagents {
                     self.resume_error("This conversation can no longer be resumed.");
                     return Task::none();
                 };
+                if let Some(configuration) = configuration {
+                    let generation = self.resume_ui.generation;
+                    self.resume_ui.loading = true;
+                    return cosmic::task::future(async move {
+                        let session = entry.session.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            configuration.validate(session.launch.provider)
+                                .map_err(|reason| format!("Repair the {} settings in Agents before resuming: {reason}", session.launch.provider.label()))
+                                .map(|_| session)
+                        }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                        Message::ResumeConversation(Action::Prepared(generation, entry, result))
+                    });
+                }
                 self.resume_saved_conversation(entry)
             }
             Action::Submit => {
@@ -634,6 +668,7 @@ impl Cagents {
 
     fn resume_indexed(&mut self, progress: Progress) {
         match progress {
+            Progress::LaunchErrors(errors) => self.resume_ui.launch_errors = errors,
             Progress::Saved {
                 entries,
                 seeds,
@@ -854,6 +889,8 @@ impl Cagents {
         state.visible = Vec::new();
         state.seeds = Arc::from([]);
         state.seed_accounts = Vec::new();
+        state.launch_errors.clear();
+        state.launch_settings.clear();
     }
 
     fn resume_error(&mut self, error: &str) {
@@ -1040,6 +1077,64 @@ fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> 
     &expected == prepared
 }
 
+/// Prepare history readers from one captured launch-policy snapshot. Keep
+/// path validation off the UI thread along with the provider history reads.
+fn resume_seeds(
+    accounts: Vec<crate::account::Account>,
+    directory: &Path,
+    agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
+) -> Vec<chat::Session> {
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            let configuration = agents
+                .get(settings::agents::provider_key(account.provider))
+                .cloned()
+                .unwrap_or_default();
+            match chat::history_session_configured(
+                account.provider,
+                TerminalId::new(),
+                directory.into(),
+                &account,
+                &configuration,
+            ) {
+                Ok(session) => Some(session),
+                Err(_) => {
+                    // A malformed launch preference cannot hide the account's
+                    // history. Build only its normal typed account root, retain
+                    // its pin, and keep the separate refusal for activation.
+                    let mut seed = chat::history_session_configured(
+                        account.provider,
+                        TerminalId::new(),
+                        directory.into(),
+                        &account,
+                        &Default::default(),
+                    )
+                    .ok()?;
+                    if let Some(executable) = &configuration.executable {
+                        seed.launch.recipe.program.clone_from(executable);
+                    }
+                    Some(seed)
+                }
+            }
+        })
+        .collect()
+}
+
+fn resume_launch_errors(
+    agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
+) -> HashMap<Provider, String> {
+    Provider::ALL
+        .into_iter()
+        .filter_map(|provider| {
+            agents
+                .get(settings::agents::provider_key(provider))
+                .and_then(|configuration| configuration.validate_syntax(provider).err())
+                .map(|error| (provider, error))
+        })
+        .collect()
+}
+
 /// Indices of the rows matching `query` within `scope`.
 fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize> {
     let query = query.trim().to_lowercase();
@@ -1057,6 +1152,55 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_seeds_keep_the_windows_captured_provider_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("pinned-history-wrapper");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = settings::AgentLaunchSettings {
+            executable: Some(executable.to_string_lossy().into_owned()),
+            model: Some("captured-history-model".into()),
+            permission_mode: Some("plan".into()),
+            arguments: vec![
+                "--append-system-prompt".into(),
+                "captured history policy".into(),
+            ],
+            ..Default::default()
+        };
+        let seeds = resume_seeds(
+            vec![crate::account::Account::system(Provider::Claude)],
+            directory.path(),
+            &std::collections::BTreeMap::from([("claude".into(), policy)]),
+        );
+        let [seed] = seeds.as_slice() else {
+            panic!("a valid captured policy must retain its history reader")
+        };
+        assert_eq!(seed.launch.recipe.program, executable.to_string_lossy());
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|args| args == ["--model", "captured-history-model"])
+        );
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|args| args == ["--permission-mode", "plan"])
+        );
+        assert!(
+            seed.launch
+                .recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == "captured history policy")
+        );
+    }
 
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(
@@ -1434,6 +1578,86 @@ mod tests {
         assert_eq!(listed(&app), [inside.card]);
         let _ = app.update_resume(Action::Unscope);
         assert_eq!(listed(&app).len(), 2);
+    }
+
+    #[test]
+    fn unavailable_launch_policy_keeps_existing_history_visible_and_refuses_activation() {
+        for invalid in ["missing_pin", "retained_mode"] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("claude");
+            let account = crate::account::Account::managed(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                home.clone(),
+            );
+            let missing = root
+                .path()
+                .join("removed-wrapper")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let configuration = settings::AgentLaunchSettings {
+                executable: (invalid == "missing_pin").then(|| missing.clone()),
+                permission_mode: (invalid == "retained_mode")
+                    .then(|| "future-invalid-policy".into()),
+                ..Default::default()
+            };
+            let agents = std::collections::BTreeMap::from([("claude".into(), configuration)]);
+            let seeds = resume_seeds(vec![account], root.path(), &agents);
+            assert_eq!(seeds.len(), 1, "history discovery survives {invalid}");
+            if invalid == "missing_pin" {
+                assert_eq!(seeds[0].launch.recipe.program, missing);
+            }
+            let projects = provider_root(&seeds[0]).join("projects/project");
+            std::fs::create_dir_all(&projects).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            std::fs::write(projects.join(format!("{id}.jsonl")), format!("{}\n", serde_json::json!({
+                "type":"user", "sessionId":id, "cwd":root.path(), "message":{"content":"Existing history remains visible"}
+            }))).unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.resume_ui.open = true;
+            app.resume_ui.launch_settings = agents.clone();
+            app.resume_indexed(Progress::LaunchErrors(resume_launch_errors(&agents)));
+            index(
+                Ok(vec![]),
+                seeds,
+                &catalog::Cache::default(),
+                &AtomicBool::new(false),
+                |progress| {
+                    app.resume_indexed(progress);
+                    true
+                },
+            );
+            assert_eq!(app.resume_ui.rows.len(), 1);
+            assert!(app.resume_ui.rows[0].title.contains("Existing history"));
+            let card = app.resume_ui.rows[0].card;
+            let cards = app.durable.cards.clone();
+            let task = app.update_resume(Action::Resume(card));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::ResumeConversation(action @ Action::Prepared(_, _, _)),
+                            )) = action
+                            {
+                                assert!(
+                                    matches!(&action, Action::Prepared(_, _, Err(_))),
+                                    "invalid policy never prepares an effectful launch"
+                                );
+                                drop(app.update_resume(action));
+                            }
+                        }
+                    }
+                });
+            assert!(app.resume_ui.open);
+            assert_eq!(app.resume_ui.rows.len(), 1);
+            assert_eq!(app.durable.cards, cards);
+            assert!(app.resume_ui.error.as_deref().unwrap().contains("Agents"));
+        }
     }
 
     /// Saved conversations are listed before any history is read; a found
