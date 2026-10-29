@@ -138,14 +138,12 @@ jobs:
       - name: Install the pinned main Linux Rust and Zig setup
         uses: ./setup-main/.github/actions/setup-linux-build
 
-      - name: Retain tools and install the matching formatter
+      - name: Retain the pinned build tools
         run: |
           set -euo pipefail
-          rustup component add rustfmt --toolchain 1.93.0
           {
             rustc -vV
             cargo --version
-            rustfmt --version
             zig version
             clang --version
             git --version
@@ -224,7 +222,6 @@ jobs:
                       env[key] = str(directory)
                   env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("mod1-target-" + product["feature"]))
                   env["CARGO_BUILD_JOBS"] = "2"
-                  phase(product, "format", ["scripts/check-format"], env)
                   phase(product, "check", ["cargo", "check", "--locked", "--no-default-features",
                         "--features", product["feature"], "--bin", product["binary"]], env)
                   for index, selector in enumerate(product["selectors"], 1):

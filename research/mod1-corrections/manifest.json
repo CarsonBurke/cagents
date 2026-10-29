@@ -69,6 +69,7 @@
   "limits": [
     "Temporary hosted research only; close without merging after retaining immutable evidence.",
     "Four exact owning executable checks and six exact headless library parents only.",
+    "Formatting is UNRUN and not established by this workflow, including historical heads without scripts/check-format. Separate exact-head formatter evidence and full PR formatting gates are not waived.",
     "No whole feature suite, native interaction, screenshots, performance, integrated-browser, provider or merge acceptance.",
     "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
     "Natural hosted User context is required; inherited CAGENTS_ names are refused, never removed.",
