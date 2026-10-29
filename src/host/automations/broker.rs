@@ -1117,28 +1117,50 @@ mod tests {
         publish(&root.path().join("release-precheck"), &true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut armed = false;
-        let expected_state = if invalid_target { "failed" } else { "skipped" };
+        let expected_state = if invalid_target {
+            FiringState::Failed
+        } else {
+            FiringState::Skipped
+        };
         loop {
-            let (active, state, run): (Option<String>, String, Option<String>) = database.query_row(
+            let (active, state_json, run): (Option<String>, String, Option<String>) = database.query_row(
                 "SELECT a.active_firing,f.state,f.run_id FROM automations a JOIN automation_firings f ON f.automation=a.id WHERE f.id=?1",
                 [ready["firing"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            let state = serde_json::from_str::<FiringState>(&state_json).unwrap_or_else(|error| {
+                panic!("cannot decode firing state: {error}; active={active:?}, state_json={state_json:?}, run={run:?}; child logs: {}", logs())
+            });
+            let evidence = || {
+                format!(
+                    "active={active:?}, state_json={state_json:?}, state={state:?}, expected_state={expected_state:?}, run={run:?}; child logs: {}",
+                    logs()
+                )
+            };
             let released =
                 active.is_none() && state == expected_state && run.is_some() == invalid_target;
             armed |= released
                 && poll_timeout(&syscall).is_some_and(|timeout| (1..=2_000).contains(&timeout));
             if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(status.success(), "private daemon failed: {}", logs());
+                assert!(
+                    status.success(),
+                    "private daemon failed ({status}): {}",
+                    evidence()
+                );
                 assert!(
                     released,
-                    "daemon exited before committed precheck ownership release"
+                    "daemon exited before committed precheck ownership release: {}",
+                    evidence()
                 );
-                assert!(armed, "no actual idle deadline poll was observed");
+                assert!(
+                    armed,
+                    "no actual idle deadline poll was observed: {}",
+                    evidence()
+                );
                 break;
             }
             assert!(
                 Instant::now() < deadline,
                 "precheck released={released}, idle deadline observed={armed}; accept loop did not exit: {}",
-                logs()
+                evidence()
             );
             std::thread::sleep(Duration::from_millis(10));
         }
