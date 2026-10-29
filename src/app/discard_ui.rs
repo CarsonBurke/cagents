@@ -107,6 +107,27 @@ struct UnconfirmedDiscard {
     request: Option<DiscardRequest>,
     error: String,
 }
+#[derive(Clone, PartialEq, Eq)]
+enum BannerAction {
+    Undo { resolve: bool },
+    RecoverOriginal { nonce: uuid::Uuid, verify: bool },
+    CopyOriginal { nonce: uuid::Uuid },
+    CopyFailure,
+}
+fn banner_button<'a>(
+    slot: uuid::Uuid,
+    action: BannerAction,
+    enabled: bool,
+    button: crate::ui_controls::button::Button<'a, Message>,
+    message: Message,
+) -> Element<'a, Message> {
+    // Positional rows may appear, disappear or change recovery phase between
+    // pointer down/up. Native press and focus belong to this exact action.
+    crate::ui_controls::owned(
+        (slot, action, enabled),
+        button.on_press_maybe(enabled.then_some(message)),
+    )
+}
 struct WorkerSettlement {
     slot: Slot,
     action: &'static str,
@@ -567,8 +588,9 @@ impl State {
                     design::body(format!("{} · Discard completion is unknown", display_path(&entry.source.key.canonical_path)))
                         .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).width(Length::Fill).into(),
                     design::caption("Files may have changed. No complete Undo receipt was returned. Copy the details and inspect the original checkout and system Trash; closing remains blocked.").into(),
-                    crate::ui_controls::button::secondary("Copy failure details")
-                        .on_press_maybe((!disabled).then_some(Message::DiscardCopyFailureDetails { id: entry.id })).into(),
+                    banner_button(entry.id, BannerAction::CopyFailure, !disabled,
+                        crate::ui_controls::button::secondary("Copy failure details"),
+                        Message::DiscardCopyFailureDetails { id: entry.id }),
                 ]).spacing(space::S)).padding(space::S).into());
                 continue;
             }
@@ -595,18 +617,20 @@ impl State {
                     .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
                     .width(Length::Fill)
                     .into(),
-                    crate::ui_controls::button::secondary(if resolve {
-                        "Resolve recovery"
-                    } else {
-                        "Undo discard"
-                    })
-                    .on_press_maybe(
-                        (!entry.running && !disabled).then_some(Message::DiscardUndo {
+                    banner_button(
+                        entry.id,
+                        BannerAction::Undo { resolve },
+                        !entry.running && !disabled,
+                        crate::ui_controls::button::secondary(if resolve {
+                            "Resolve recovery"
+                        } else {
+                            "Undo discard"
+                        }),
+                        Message::DiscardUndo {
                             id: entry.id,
                             resolve,
-                        }),
-                    )
-                    .into(),
+                        },
+                    ),
                 ])
                 .spacing(space::S)
                 .align_y(Alignment::Center)
@@ -632,26 +656,37 @@ impl State {
                             .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
                             .width(Length::Fill)
                             .into(),
-                        crate::ui_controls::button::secondary(if original.published_unconfirmed {
-                            "Verify recovered original"
-                        } else {
-                            "Recover original file"
-                        })
-                        .on_press_maybe((!entry.running && !disabled).then_some(
+                        banner_button(
+                            entry.id,
+                            BannerAction::RecoverOriginal {
+                                nonce: original.nonce,
+                                verify: original.published_unconfirmed,
+                            },
+                            !entry.running && !disabled,
+                            crate::ui_controls::button::secondary(
+                                if original.published_unconfirmed {
+                                    "Verify recovered original"
+                                } else {
+                                    "Recover original file"
+                                },
+                            ),
                             Message::DiscardRecoverOriginal {
                                 id: entry.id,
                                 nonce: original.nonce,
                             },
-                        ))
-                        .into(),
-                        crate::ui_controls::button::quiet("Copy recovery details")
-                            .on_press_maybe((!disabled).then_some(
-                                Message::DiscardCopyRecoveryDetails {
-                                    id: entry.id,
-                                    nonce: original.nonce,
-                                },
-                            ))
-                            .into(),
+                        ),
+                        banner_button(
+                            entry.id,
+                            BannerAction::CopyOriginal {
+                                nonce: original.nonce,
+                            },
+                            !disabled,
+                            crate::ui_controls::button::quiet("Copy recovery details"),
+                            Message::DiscardCopyRecoveryDetails {
+                                id: entry.id,
+                                nonce: original.nonce,
+                            },
+                        ),
                     ])
                     .spacing(space::S)
                     .align_y(Alignment::Center)

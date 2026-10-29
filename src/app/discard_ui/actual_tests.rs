@@ -1298,6 +1298,251 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
 }
 
 #[test]
+fn discard_banner_cached_press_cannot_move_to_an_earlier_materialized_slot() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_banner_cached_press_cannot_move_to_an_earlier_materialized_slot";
+    if isolated(NAME) {
+        return;
+    }
+    use cosmic::iced::{
+        Event, Point, Size,
+        advanced::{clipboard, mouse},
+        runtime::user_interface::{Cache, UserInterface},
+    };
+    use iced_accessibility::accesskit::Role;
+
+    struct Frames {
+        cache: Cache,
+        renderer: cosmic::Renderer,
+    }
+    impl Frames {
+        fn frame(
+            &mut self,
+            state: &State,
+            label: &str,
+            count: usize,
+            disabled: bool,
+            at: Option<Point>,
+            event: Option<mouse::Event>,
+        ) -> (Point, Vec<Message>) {
+            let mut ui = UserInterface::build(
+                state.banner(disabled),
+                Size::new(1280.0, 900.0),
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let mut buttons = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    node.node().role() == Role::Button && node.node().label() == Some(label)
+                })
+                .map(|node| {
+                    assert_eq!(node.node().is_disabled(), disabled);
+                    node.node().bounds().expect("actual banner button geometry")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), count);
+            buttons.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+            let first = buttons[0];
+            let at = at.unwrap_or_else(|| {
+                Point::new(
+                    ((first.x0 + first.x1) / 2.0) as f32,
+                    ((first.y0 + first.y1) / 2.0) as f32,
+                )
+            });
+            // After materialization this SAME coordinate must hit the earlier
+            // slot's actionable button. An empty release outside all controls
+            // would not establish ownership of the native held press.
+            assert!(
+                (first.x0..first.x1).contains(&f64::from(at.x))
+                    && (first.y0..first.y1).contains(&f64::from(at.y))
+                    && (0.0..180.0).contains(&at.y),
+                "the release remains over the first actual banner action"
+            );
+            let mut messages = Vec::new();
+            let events = event.map(Event::Mouse).into_iter().collect::<Vec<_>>();
+            let _ = ui.update(
+                &events,
+                mouse::Cursor::Available(at),
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            self.cache = ui.into_cache();
+            (at, messages)
+        }
+    }
+    fn assert_action(messages: Vec<Message>, id: uuid::Uuid, failure: bool) {
+        assert_eq!(messages.len(), 1, "one exact native action");
+        match &messages[0] {
+            Message::DiscardCopyFailureDetails { id: actual } if failure => {
+                assert_eq!(*actual, id)
+            }
+            Message::DiscardUndo {
+                id: actual,
+                resolve: false,
+            } if !failure => {
+                assert_eq!(*actual, id)
+            }
+            _ => panic!("the native action changed operation or action kind"),
+        }
+    }
+
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    for path in ["earlier", "later"] {
+        fs::write(root.join(path), b"indexed baseline\n").unwrap();
+    }
+    git(&root, &["add", "--all"]);
+    let index = fs::read(root.join(".git/index")).unwrap();
+    // Cover both identical native row shapes: a completed Undo receipt and
+    // the new unconfirmed-operation diagnostic. Callbacks are inspected only;
+    // neither the Undo nor clipboard App action is executed by these frames.
+    for failure in [false, true] {
+        for path in ["earlier", "later"] {
+            fs::write(root.join(path), b"precious original\n").unwrap();
+        }
+        let source = ReadSource::new(ActiveWorktreeKey {
+            project_id: crate::model::ProjectId::new(),
+            worktree_id: crate::model::WorktreeId::new(),
+            canonical_path: root.clone(),
+        });
+        source.read_service().unwrap();
+        let mut state = State {
+            active: Some(source.clone()),
+            ..State::default()
+        };
+        let mut pending = Vec::new();
+        for path in ["earlier", "later"] {
+            let mut request = DiscardRequest {
+                worktree: root.clone(),
+                tracked: vec![crate::repository::PathSelection::new(
+                    RepoPath::parse(path).unwrap(),
+                )],
+                untracked: vec![],
+                confirmed: false,
+            };
+            assert!(state.confirm_intent(source.id, &request));
+            request.confirmed = true;
+            let slot = state.reserve_confirmed(source.id, &request).unwrap();
+            pending.push((slot, request));
+        }
+        let [(earlier, earlier_request), (later, later_request)] = pending.as_slice() else {
+            unreachable!()
+        };
+        if failure {
+            later.worker_failed("Discard", "fixture unknown completion");
+        } else {
+            assert!(
+                later
+                    .finish_discard(later_request.clone(), vec![root.clone()])
+                    .is_none()
+            );
+        }
+        let label = if failure {
+            "Copy failure details"
+        } else {
+            "Undo discard"
+        };
+        let mut frames = Frames {
+            cache: Cache::new(),
+            renderer: crate::app::tests::headless_renderer(),
+        };
+        let press = Some(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Some(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let (at, messages) = frames.frame(&state, label, 1, false, None, press);
+        assert!(messages.is_empty());
+        assert!(
+            frames
+                .frame(&state, label, 1, false, Some(at), None)
+                .1
+                .is_empty()
+        );
+        assert_action(
+            frames.frame(&state, label, 1, false, Some(at), release).1,
+            later.id(),
+            failure,
+        );
+
+        assert!(
+            frames
+                .frame(&state, label, 1, false, Some(at), press)
+                .1
+                .is_empty()
+        );
+        if failure {
+            earlier.worker_failed("Discard", "fixture earlier unknown completion");
+        } else {
+            assert!(
+                earlier
+                    .finish_discard(earlier_request.clone(), vec![root.clone()])
+                    .is_none()
+            );
+        }
+        assert!(
+            frames
+                .frame(&state, label, 2, false, Some(at), release)
+                .1
+                .is_empty()
+        );
+        assert!(
+            frames
+                .frame(&state, label, 2, false, Some(at), press)
+                .1
+                .is_empty()
+        );
+        assert_action(
+            frames.frame(&state, label, 2, false, Some(at), release).1,
+            earlier.id(),
+            failure,
+        );
+
+        // Even the same slot/action must acquire a fresh press after a modal
+        // disables it and then returns. Enabled state is part of its owner.
+        assert!(
+            frames
+                .frame(&state, label, 2, false, Some(at), press)
+                .1
+                .is_empty()
+        );
+        assert!(
+            frames
+                .frame(&state, label, 2, true, Some(at), None)
+                .1
+                .is_empty()
+        );
+        assert!(
+            frames
+                .frame(&state, label, 2, false, Some(at), release)
+                .1
+                .is_empty()
+        );
+        assert!(
+            frames
+                .frame(&state, label, 2, false, Some(at), press)
+                .1
+                .is_empty()
+        );
+        assert_action(
+            frames.frame(&state, label, 2, false, Some(at), release).1,
+            earlier.id(),
+            failure,
+        );
+        let expected = if failure {
+            b"precious original\n".as_slice()
+        } else {
+            b"indexed baseline\n".as_slice()
+        };
+        for path in ["earlier", "later"] {
+            assert_eq!(fs::read(root.join(path)).unwrap(), expected);
+        }
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+    }
+}
+
+#[test]
 fn discard_app_post_restore_panic_retains_unconfirmed_owner_without_awaiter() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_post_restore_panic_retains_unconfirmed_owner_without_awaiter";
     if isolated(NAME) {
