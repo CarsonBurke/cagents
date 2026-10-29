@@ -9332,12 +9332,20 @@ impl Cagents {
                         // given up, since a lost answer is not proof it
                         // started nothing; the next send starts afresh under
                         // an identity of its own.
+                        let account_removed = failure.recovery == chat::Recovery::Account;
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
                         }
-                        return self.retire_chat(target.card, None, Some(attempt.session));
+                        return Task::batch([
+                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            if account_removed {
+                                self.reload_registry()
+                            } else {
+                                Task::none()
+                            },
+                        ]);
                     }
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
@@ -21615,6 +21623,269 @@ mod tests {
             app.persistent_workspace().configured_chat_drafts[&card],
             expected
         );
+    }
+
+    #[test]
+    fn draft_account_refusal_reloads_choices_without_losing_private_input() {
+        use crate::account::registry::{Registered, Store};
+        use iced::futures::StreamExt;
+
+        // The real registry task reads disk, and retirement checks the daemon
+        // socket. Give both a private installation without a running daemon.
+        const CHILD: &str = "CAGENTS_TEST_DRAFT_ACCOUNT_REFUSAL";
+        let Some(directory) = std::env::var_os(CHILD) else {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::chat_ui::tests::draft_account_refusal_reloads_choices_without_losing_private_input",
+                    "--nocapture",
+                ])
+                .env(CHILD, directory.path())
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_STATE_HOME", directory.path().join("state"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated draft account refusal failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(directory.join("runtime")).unwrap();
+        assert!(!crate::device::is_remote());
+        assert!(!crate::terminal::ipc::daemon_socket_path().unwrap().exists());
+        let store = Store::installation().unwrap();
+        let removed = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            directory.join("removed-account"),
+        );
+        let replacement = Account::linked(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            directory.join("replacement-account"),
+        );
+        for account in [&removed, &replacement] {
+            std::fs::create_dir_all(account.resolved_home().unwrap()).unwrap();
+        }
+        for recovery in [
+            chat::Recovery::Retry,
+            chat::Recovery::Capacity,
+            chat::Recovery::Account,
+        ] {
+            let (registry, ()) = store
+                .update(|registry| {
+                    for (account, email) in [
+                        (&removed, "removed@example.com"),
+                        (&replacement, "replacement@example.com"),
+                    ] {
+                        registry
+                            .register(
+                                Registered {
+                                    key: account.registry_key().unwrap(),
+                                    provider: account.provider,
+                                    linked_home: account.resolved_home(),
+                                    label: None,
+                                    email: Some(email.into()),
+                                    organization: None,
+                                    added_at: 0,
+                                },
+                                &[],
+                            )
+                            .unwrap();
+                    }
+                })
+                .unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.account_ui = account_ui::State::installation();
+            // Drop probe tasks: the test exercises registry reads, no CLI.
+            drop(
+                app.update(Message::AccountUi(account_ui::Action::RegistryLoaded(Ok(
+                    registry,
+                )))),
+            );
+            let card = draft_chat_for_provider(&mut app, Provider::Claude);
+            let draft_target = chat_runtime(&app, card).target;
+            drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                draft_target,
+                removed.id(),
+            ))));
+            chat::attachment_assets::with_test_image(|image| {
+                write(&mut app, card, "queued first message");
+                app.chat_runtime_mut(draft_target)
+                    .unwrap()
+                    .merge_attachments([image.clone()]);
+                submit(&mut app, card);
+                let attempt = app.chat_ui.attempt(card).unwrap();
+                let target = attempt.target;
+                assert_eq!(attempt.intent, chat::Intent::Start);
+                let session = attempt.session.clone();
+                let expected = app.persistent_workspace().configured_chat_drafts[&card].clone();
+                assert_eq!(expected.account, removed.id());
+                assert!(session.launch.session_id.is_none());
+                assert_eq!(
+                    chat_runtime(&app, card)
+                        .queued
+                        .as_ref()
+                        .unwrap()
+                        .attachments,
+                    [image.clone()]
+                );
+                write(&mut app, card, "written while starting");
+                let later_image = chat::attachment_assets::test_image("later image");
+                app.chat_runtime_mut(draft_target)
+                    .unwrap()
+                    .merge_attachments([later_image.clone()]);
+                // Another window removes the account after this start was
+                // queued. The window still has the old account choices.
+                store
+                    .update(|registry| registry.unregister(removed.registry_key().unwrap()))
+                    .unwrap();
+                assert!(app.known_account(&removed.id()).is_some());
+
+                let failure = || {
+                    Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure {
+                        message: "private fixture refusal".into(),
+                        recovery,
+                    })))))
+                };
+                let mut stale = target;
+                stale.generation += 1;
+                let task = app.update(Message::ChatUi(Action::Ready(stale, failure())));
+                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_eq!(app.chat_ui.attempt(card).unwrap().target, target);
+                assert_eq!(
+                    chat_runtime(&app, card).composer.text(),
+                    "written while starting"
+                );
+                assert!(chat_runtime(&app, card).queued.is_some());
+                assert!(app.chat_ui.retiring.is_empty());
+
+                let task = app.update(Message::ChatUi(Action::Ready(target, failure())));
+                let retirement = *app.chat_ui.retiring.iter().next().unwrap();
+                assert_eq!(app.chat_ui.retiring.len(), 1);
+                assert_eq!(retirement.card, card);
+                assert!(retirement.generation > target.generation);
+                assert!(app.chat_ui.attempt(card).is_none());
+                let runtime = chat_runtime(&app, card);
+                assert!(runtime.is_draft());
+                assert!(runtime.choosing());
+                assert!(runtime.handle().is_none());
+                assert_eq!(runtime.target, draft_target);
+                assert_eq!(runtime.session, session);
+                assert_eq!(
+                    runtime.composer.text(),
+                    "queued first message\nwritten while starting"
+                );
+                assert_eq!(runtime.attachments, [image.clone(), later_image.clone()]);
+                assert!(runtime.queued.is_none());
+                assert_eq!(runtime.error.as_deref(), Some("private fixture refusal"));
+                assert_eq!(
+                    runtime.capacity_refused,
+                    recovery == chat::Recovery::Capacity
+                );
+                assert_eq!(runtime.configured_start().unwrap().unwrap(), expected);
+                assert_eq!(
+                    app.persistent_workspace().configured_chat_drafts[&card],
+                    expected
+                );
+                assert!(!app.chat_ui.removed_accounts.contains(&card));
+
+                // Poll the actual Ready-error Task to completion and consume
+                // its actual mapped messages. A boolean hook would miss a
+                // dropped, doubled, or incorrectly mapped registry request.
+                let messages = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let stream = iced::runtime::task::into_stream(task).unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+                            .await
+                            .expect("local retirement and registry read must complete")
+                    });
+                let mut reloads = 0;
+                let mut retirements = 0;
+                for action in messages {
+                    let iced::runtime::Action::Output(cosmic::Action::App(message)) = action else {
+                        panic!("Ready refusal returned an unexpected effect");
+                    };
+                    match &message {
+                        Message::AccountUi(account_ui::Action::RegistryLoaded(Ok(registry))) => {
+                            reloads += 1;
+                            assert!(registry.find(removed.registry_key().unwrap()).is_none());
+                            assert!(registry.find(replacement.registry_key().unwrap()).is_some());
+                        }
+                        Message::ChatUi(Action::Retired(receipt, Ok(()))) => {
+                            retirements += 1;
+                            assert_eq!(*receipt, retirement);
+                        }
+                        other => panic!("unexpected Ready-refusal reply: {other:?}"),
+                    }
+                    drop(app.update(message));
+                }
+                assert_eq!(reloads, usize::from(recovery == chat::Recovery::Account));
+                assert_eq!(retirements, 1);
+                assert!(app.chat_ui.retiring.is_empty());
+                assert_eq!(
+                    app.known_account(&removed.id()).is_none(),
+                    recovery == chat::Recovery::Account
+                );
+                assert!(app.known_account(&replacement.id()).is_some());
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.configured_start().unwrap().unwrap(), expected);
+                assert_eq!(
+                    runtime.composer.text(),
+                    "queued first message\nwritten while starting"
+                );
+                assert_eq!(runtime.attachments, [image.clone(), later_image.clone()]);
+                let duplicate = app.update(Message::ChatUi(Action::Ready(target, failure())));
+                assert!(iced::runtime::task::into_stream(duplicate).is_none());
+                assert!(app.chat_ui.retiring.is_empty());
+
+                if recovery == chat::Recovery::Account {
+                    let choices = app
+                        .chat_accounts(Provider::Claude, &session.launch.recipe)
+                        .unwrap();
+                    assert!(
+                        choices
+                            .choices
+                            .iter()
+                            .all(|choice| choice.id != removed.id() && !choice.selected)
+                    );
+                    assert!(
+                        choices
+                            .choices
+                            .iter()
+                            .any(|choice| choice.id == replacement.id())
+                    );
+                    // The ordinary draft selector remains the explicit next
+                    // step; reloading cannot silently change the typed intent.
+                    drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                        draft_target,
+                        replacement.id(),
+                    ))));
+                    let runtime = chat_runtime(&app, card);
+                    assert_eq!(
+                        runtime.configured_start().unwrap().unwrap().account,
+                        replacement.id()
+                    );
+                    assert_eq!(
+                        runtime.composer.text(),
+                        "queued first message\nwritten while starting"
+                    );
+                    assert_eq!(runtime.attachments, [image, later_image]);
+                    assert!(!app.chat_start_pending(card));
+                }
+            });
+        }
     }
 
     #[test]
