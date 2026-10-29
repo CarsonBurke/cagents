@@ -2,7 +2,8 @@
 //! Call these blocking operations on a worker, never on the UI thread. Each
 //! operation releases its process lock before returning to the effect owner.
 use crate::account::preparation::{
-    ExistingPendingBinding, ExistingPendingTarget, PreparationBinding, PreparationPayload,
+    ExistingPendingBinding, ExistingPendingState, ExistingPendingTarget, PreparationBinding,
+    PreparationPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,9 +17,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 // Migration shares the original namespace and lock: a saved Cancel must never
-// disappear behind a newly missing V2 filename.
+// disappear behind a newly missing version-specific filename.
 const JOURNAL: &str = "preparations-v1.json";
 const LOCK: &str = ".preparations.lock";
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -192,11 +193,91 @@ pub(super) enum Desired {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ParentIntent {
+    pub(super) request_id: Uuid,
+    pub(super) revision_at_consent: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AttemptAction {
+    Resume,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Attempt {
+    pub(super) id: Uuid,
+    pub(super) action: AttemptAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Phase {
+    Retained,
+    InFlight {
+        attempt: Attempt,
+    },
+    NeedsReconcile {
+        attempt: Attempt,
+    },
+    Refused {
+        attempt: Attempt,
+    },
+    MetadataConfirmed {
+        attempt: Attempt,
+        state: ExistingPendingState,
+    },
+}
+
+impl Phase {
+    fn attempt(&self) -> Option<&Attempt> {
+        match self {
+            Self::Retained => None,
+            Self::InFlight { attempt }
+            | Self::NeedsReconcile { attempt }
+            | Self::Refused { attempt }
+            | Self::MetadataConfirmed { attempt, .. } => Some(attempt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Record {
     pub(super) intent: Intent,
     pub(super) desired: Desired,
     pub(super) binding: Option<Binding>,
     pub(super) revision: u64,
+    pub(super) caused_by: Option<ParentIntent>,
+    pub(super) phase: Phase,
+}
+
+/// A successful worker return owns one exact durable attempt, not merely a
+/// Resume payload echoed by a remote installation. Keep this with HomeRequest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AttemptEnvelope {
+    pub(super) intent: Intent,
+    pub(super) desired: Desired,
+    pub(super) binding: Option<Binding>,
+    pub(super) revision: u64,
+    pub(super) attempt: Attempt,
+}
+
+impl Record {
+    fn envelope(&self) -> io::Result<AttemptEnvelope> {
+        let Phase::InFlight { attempt } = &self.phase else {
+            return Err(conflict("The account setup attempt is not in flight"));
+        };
+        Ok(AttemptEnvelope {
+            intent: self.intent.clone(),
+            desired: self.desired,
+            binding: self.binding.clone(),
+            revision: self.revision,
+            attempt: attempt.clone(),
+        })
+    }
 }
 
 impl Record {
@@ -204,6 +285,22 @@ impl Record {
         self.intent.validate()?;
         if self.revision == 0 {
             return Err(invalid("The account setup intent has no local revision"));
+        }
+        if let Some(parent) = &self.caused_by
+            && (parent.request_id.is_nil()
+                || parent.request_id == self.intent.request_id
+                || parent.revision_at_consent == 0)
+        {
+            return Err(invalid("The account setup consent link is invalid"));
+        }
+        if let Some(attempt) = self.phase.attempt() {
+            if attempt.id.is_nil() || !matches!(self.intent.target, Target::ExistingPending { .. })
+            {
+                return Err(invalid("The account setup attempt is inconsistent"));
+            }
+            if matches!(self.phase, Phase::MetadataConfirmed { .. }) && self.binding.is_none() {
+                return Err(invalid("The account setup confirmation has no binding"));
+            }
         }
         if let Target::ExistingPending {
             original: ExistingPendingTarget::Bound { binding: original },
@@ -265,6 +362,29 @@ struct Journal {
 }
 
 impl Journal {
+    fn exact(&self, intent: &Intent) -> io::Result<&Record> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.intent.request_id == intent.request_id)
+            .ok_or_else(missing_intent)?;
+        if &record.intent != intent {
+            return Err(conflict(
+                "The account setup intent or original route changed",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn replace(&mut self, record: Record) {
+        let saved = self
+            .records
+            .iter_mut()
+            .find(|saved| saved.intent.request_id == record.intent.request_id)
+            .expect("the exact stored record was checked under this lock");
+        *saved = record;
+    }
+
     fn validate(&self) -> io::Result<()> {
         if self.version != VERSION {
             return Err(io::Error::new(
@@ -274,6 +394,7 @@ impl Journal {
         }
         let mut ids = BTreeSet::new();
         let mut homes = BTreeSet::new();
+        let mut successors = BTreeSet::new();
         for record in &self.records {
             record.validate()?;
             if !ids.insert(record.intent.request_id) {
@@ -284,9 +405,137 @@ impl Journal {
             {
                 return Err(invalid("The account setup outbox repeats a bound home"));
             }
+            if let Some(link) = &record.caused_by {
+                let parent = self
+                    .records
+                    .iter()
+                    .find(|parent| parent.intent.request_id == link.request_id)
+                    .ok_or_else(|| invalid("The account setup consent parent is missing"))?;
+                let installation = consent_installation(parent, &record.intent)?;
+                if link.revision_at_consent > parent.revision
+                    || !successors.insert((link.request_id, installation))
+                {
+                    return Err(invalid("The account setup consent history is inconsistent"));
+                }
+            }
         }
         Ok(())
     }
+
+    fn has_child(&self, id: Uuid) -> bool {
+        self.records.iter().any(|record| {
+            record
+                .caused_by
+                .as_ref()
+                .is_some_and(|parent| parent.request_id == id)
+        })
+    }
+
+    fn mutable_owner(&self, id: Uuid) -> io::Result<()> {
+        if self.has_child(id) {
+            return Err(conflict(
+                "The original account setup has a retained successor",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parent_cancelled(&self, record: &Record) -> bool {
+        record.caused_by.as_ref().is_some_and(|link| {
+            self.records.iter().any(|parent| {
+                parent.intent.request_id == link.request_id && parent.desired == Desired::Cancel
+            })
+        })
+    }
+
+    fn admit_attempt(&self, record: &Record, attempt: &Attempt) -> io::Result<()> {
+        self.mutable_owner(record.intent.request_id)?;
+        let dispatchable = matches!(
+            record.intent.target,
+            Target::ExistingPending {
+                original: ExistingPendingTarget::Observed {
+                    expected_installation: Some(_),
+                    ..
+                } | ExistingPendingTarget::Bound { .. }
+            }
+        );
+        if !dispatchable
+            || attempt.id.is_nil()
+            || !matches!(
+                (record.desired, attempt.action),
+                (Desired::Prepare, AttemptAction::Resume)
+                    | (Desired::Cancel, AttemptAction::Cancel)
+            )
+        {
+            return Err(conflict(
+                "The account setup attempt is not currently admitted",
+            ));
+        }
+        if attempt.action == AttemptAction::Resume && self.parent_cancelled(record) {
+            return Err(conflict(
+                "The original account setup was cancelled; retain reconciliation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn consent_installation(parent: &Record, child: &Intent) -> io::Result<Uuid> {
+    let matches = match (&parent.intent.target, &child.target) {
+        (
+            Target::ExistingPending {
+                original:
+                    ExistingPendingTarget::Observed {
+                        provider,
+                        key,
+                        started_at,
+                        expected_installation: None,
+                    },
+            },
+            Target::ExistingPending {
+                original:
+                    ExistingPendingTarget::Observed {
+                        provider: child_provider,
+                        key: child_key,
+                        started_at: child_started,
+                        expected_installation: Some(installation),
+                    },
+            },
+        ) if provider == child_provider && key == child_key && started_at == child_started => {
+            Some(*installation)
+        }
+        _ => None,
+    };
+    if parent.caused_by.is_some()
+        || parent.binding.is_some()
+        || parent.intent.request_id == child.request_id
+        || parent.intent.original_route != child.original_route
+        || parent.intent.device_code != child.device_code
+        || parent.intent.blocked_login != child.blocked_login
+    {
+        return Err(conflict(
+            "The original account setup must remain held unchanged",
+        ));
+    }
+    matches.ok_or_else(|| conflict("The refreshed account setup does not match its original"))
+}
+
+fn require_revision(record: &Record, expected: u64) -> io::Result<()> {
+    if record.revision != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "The account setup intent has a newer local revision",
+        ));
+    }
+    Ok(())
+}
+
+fn advance(record: &mut Record) -> io::Result<()> {
+    record.revision = record
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("The account setup revision is exhausted"))?;
+    Ok(())
 }
 
 // Keep the original wire schema intact until its exact fields are checked.
@@ -337,6 +586,46 @@ impl V1Journal {
                     desired: record.desired,
                     binding: record.binding.map(|binding| Binding::Prepared { binding }),
                     revision: record.revision,
+                    caused_by: None,
+                    phase: Phase::Retained,
+                })
+                .collect(),
+        }
+    }
+}
+
+// Frozen V2 has no causal or phase fields. Do not deserialize V2 through the
+// expanded V3 record, even with serde defaults: check its exact original wire.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2Record {
+    intent: Intent,
+    desired: Desired,
+    binding: Option<Binding>,
+    revision: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2Journal {
+    version: u32,
+    records: Vec<V2Record>,
+}
+
+impl V2Journal {
+    fn into_current(self) -> Journal {
+        Journal {
+            version: VERSION,
+            records: self
+                .records
+                .into_iter()
+                .map(|record| Record {
+                    intent: record.intent,
+                    desired: record.desired,
+                    binding: record.binding,
+                    revision: record.revision,
+                    caused_by: None,
+                    phase: Phase::Retained,
                 })
                 .collect(),
         }
@@ -441,6 +730,11 @@ fn decode_journal(bytes: &[u8]) -> io::Result<(Journal, u32)> {
             canonical_fields(&original, &wire)?;
             wire.into_current()
         }
+        2 => {
+            let wire: V2Journal = serde_json::from_slice(bytes).map_err(invalid)?;
+            canonical_fields(&original, &wire)?;
+            wire.into_current()
+        }
         version if version == u64::from(VERSION) => {
             let wire: Journal = serde_json::from_slice(bytes).map_err(invalid)?;
             canonical_fields(&original, &wire)?;
@@ -467,7 +761,7 @@ impl Store {
     }
 
     /// None means the journal is missing, not an empty/acknowledged outbox.
-    /// A read normalizes V1 in memory without writing. It establishes visibility
+    /// A read normalizes V1/V2 in memory without writing. It establishes visibility
     /// only, never a durability acknowledgement or a completed migration.
     pub(super) fn load(&self) -> io::Result<Option<Vec<Record>>> {
         let Some(held) = self.lock(false)? else {
@@ -499,6 +793,249 @@ impl Store {
         )
     }
 
+    /// Only a distinct explicit consent action may insert this successor.
+    /// Refresh/load cannot mint it, and the original record is never rewritten.
+    pub(super) fn reaffirm(
+        &self,
+        parent: &ParentIntent,
+        intent: &Intent,
+        desired: Desired,
+    ) -> io::Result<Record> {
+        intent.validate()?;
+        self.transaction(
+            false,
+            |journal| {
+                let original = journal
+                    .records
+                    .iter()
+                    .find(|record| record.intent.request_id == parent.request_id)
+                    .ok_or_else(missing_intent)?;
+                if parent.revision_at_consent == 0 || parent.revision_at_consent > original.revision
+                {
+                    return Err(conflict("The account setup consent revision is invalid"));
+                }
+                let installation = consent_installation(original, intent)?;
+                if original.desired == Desired::Cancel && desired != Desired::Cancel {
+                    return Err(conflict(
+                        "The original account setup was cancelled before consent",
+                    ));
+                }
+                let inserted = Record {
+                    intent: intent.clone(),
+                    desired,
+                    binding: None,
+                    revision: 1,
+                    caused_by: Some(parent.clone()),
+                    phase: Phase::Retained,
+                };
+                if let Some(existing) = journal
+                    .records
+                    .iter()
+                    .find(|record| record.intent.request_id == intent.request_id)
+                {
+                    if existing != &inserted {
+                        return Err(conflict("The account setup successor changed"));
+                    }
+                    return Ok(existing.clone());
+                }
+                if journal.records.iter().any(|record| {
+                    record
+                        .caused_by
+                        .as_ref()
+                        .is_some_and(|link| link.request_id == parent.request_id)
+                        && matches!(&record.intent.target, Target::ExistingPending {
+                        original: ExistingPendingTarget::Observed {
+                            expected_installation: Some(id), ..
+                        }
+                    } if *id == installation)
+                }) {
+                    return Err(conflict(
+                        "The account setup already has a different retained successor",
+                    ));
+                }
+                journal.records.push(inserted.clone());
+                journal
+                    .records
+                    .sort_by_key(|record| record.intent.request_id);
+                Ok(inserted)
+            },
+            Namespace::sync,
+        )
+    }
+
+    /// A returned envelope proves the local pre-dispatch durability barrier.
+    /// It never confers backend, provider, login or physical-home authority.
+    pub(super) fn begin(
+        &self,
+        intent: &Intent,
+        expected_revision: u64,
+        attempt: &Attempt,
+    ) -> io::Result<AttemptEnvelope> {
+        self.begin_with_sync(intent, expected_revision, attempt, Namespace::sync)
+    }
+
+    fn begin_with_sync(
+        &self,
+        intent: &Intent,
+        expected_revision: u64,
+        attempt: &Attempt,
+        sync: impl FnOnce(&Namespace) -> io::Result<()>,
+    ) -> io::Result<AttemptEnvelope> {
+        self.transaction(
+            false,
+            |journal| {
+                let mut record = journal.exact(intent)?.clone();
+                require_revision(&record, expected_revision)?;
+                journal.admit_attempt(&record, attempt)?;
+                if matches!(record.phase, Phase::InFlight { .. })
+                    || record
+                        .phase
+                        .attempt()
+                        .is_some_and(|previous| previous.id == attempt.id)
+                {
+                    return Err(conflict("The account setup attempt is already owned"));
+                }
+                record.phase = Phase::InFlight {
+                    attempt: attempt.clone(),
+                };
+                advance(&mut record)?;
+                journal.replace(record.clone());
+                Ok(record)
+            },
+            sync,
+        )?
+        .envelope()
+    }
+
+    /// Binding and settlement share one CAS, journal publication and barrier.
+    /// The caller must additionally validate the full echoed backend request.
+    pub(super) fn settle(
+        &self,
+        owner: &AttemptEnvelope,
+        binding: Option<&Binding>,
+        phase: &Phase,
+    ) -> io::Result<Record> {
+        self.settle_with_sync(owner, binding, phase, Namespace::sync)
+    }
+
+    fn settle_with_sync(
+        &self,
+        owner: &AttemptEnvelope,
+        binding: Option<&Binding>,
+        phase: &Phase,
+        sync: impl FnOnce(&Namespace) -> io::Result<()>,
+    ) -> io::Result<Record> {
+        if matches!(phase, Phase::Retained | Phase::InFlight { .. })
+            || phase.attempt() != Some(&owner.attempt)
+        {
+            return Err(conflict("The account setup result lost its exact attempt"));
+        }
+        if let Some(binding) = binding {
+            validate_binding(&owner.intent, binding)?;
+        }
+        self.transaction(
+            false,
+            |journal| {
+                let mut record = journal.exact(&owner.intent)?.clone();
+                if record.envelope()? != *owner {
+                    return Err(conflict(
+                        "The account setup result belongs to an older local attempt",
+                    ));
+                }
+                journal.admit_attempt(&record, &owner.attempt)?;
+                if let Some(binding) = binding {
+                    if record
+                        .binding
+                        .as_ref()
+                        .is_some_and(|saved| saved != binding)
+                    {
+                        return Err(conflict("The account setup binding changed"));
+                    }
+                    record.binding = Some(binding.clone());
+                }
+                record.phase = phase.clone();
+                advance(&mut record)?;
+                journal.replace(record.clone());
+                Ok(record)
+            },
+            sync,
+        )
+    }
+
+    /// Explicit reconciliation HOLD preserves the previous attempt and grants
+    /// no dispatch/settlement ACK, including after the parent was cancelled.
+    pub(super) fn hold(
+        &self,
+        intent: &Intent,
+        expected_revision: u64,
+        attempt: &Attempt,
+    ) -> io::Result<Record> {
+        self.transaction(
+            false,
+            |journal| {
+                journal.mutable_owner(intent.request_id)?;
+                let mut record = journal.exact(intent)?.clone();
+                require_revision(&record, expected_revision)?;
+                if record.phase.attempt() != Some(attempt) {
+                    return Err(conflict(
+                        "The account setup reconciliation lost its exact attempt",
+                    ));
+                }
+                let phase = Phase::NeedsReconcile {
+                    attempt: attempt.clone(),
+                };
+                if record.phase != phase {
+                    record.phase = phase;
+                    advance(&mut record)?;
+                    journal.replace(record.clone());
+                }
+                Ok(record)
+            },
+            Namespace::sync,
+        )
+    }
+
+    /// A visible rename after a failed barrier is not an ACK. Only exact
+    /// post-state replay under the same owner guards may confirm its durability.
+    pub(super) fn replay(&self, expected: &Record) -> io::Result<Record> {
+        self.replay_with_sync(expected, Namespace::sync)
+    }
+
+    /// Recover an uncertain pre-dispatch write through the exact barrier again.
+    /// A load alone cannot produce this return value.
+    pub(super) fn replay_attempt(&self, expected: &Record) -> io::Result<AttemptEnvelope> {
+        self.replay(expected)?.envelope()
+    }
+
+    fn replay_with_sync(
+        &self,
+        expected: &Record,
+        sync: impl FnOnce(&Namespace) -> io::Result<()>,
+    ) -> io::Result<Record> {
+        self.transaction(
+            false,
+            |journal| {
+                journal.mutable_owner(expected.intent.request_id)?;
+                let record = journal.exact(&expected.intent)?;
+                if record != expected {
+                    return Err(conflict(
+                        "The account setup post-state changed before durability replay",
+                    ));
+                }
+                // Replaying HOLD confirms local retention only, including a
+                // Resume owner whose parent was cancelled. It cannot yield an
+                // outbound envelope: replay_attempt requires InFlight.
+                if !matches!(record.phase, Phase::NeedsReconcile { .. })
+                    && let Some(attempt) = record.phase.attempt()
+                {
+                    journal.admit_attempt(record, attempt)?;
+                }
+                Ok(record.clone())
+            },
+            sync,
+        )
+    }
+
     fn change(
         &self,
         intent: &Intent,
@@ -509,9 +1046,92 @@ impl Store {
         if let Change::Bind(_, binding) = change {
             validate_binding(intent, binding)?;
         }
-        let held = self
-            .lock(matches!(change, Change::Intent(_)))?
-            .ok_or_else(missing_intent)?;
+        self.transaction(
+            matches!(change, Change::Intent(_)),
+            |journal| {
+                if matches!(change, Change::Bind(..)) {
+                    journal.mutable_owner(intent.request_id)?;
+                    let record = journal.exact(intent)?;
+                    if !matches!(record.phase, Phase::Retained)
+                        || (record.desired == Desired::Prepare && journal.parent_cancelled(record))
+                    {
+                        return Err(conflict(
+                            "The account setup binding needs its retained atomic result owner",
+                        ));
+                    }
+                }
+                let index = journal
+                    .records
+                    .iter()
+                    .position(|record| record.intent.request_id == intent.request_id);
+                let record = match index {
+                    Some(index) => {
+                        let record = &mut journal.records[index];
+                        if &record.intent != intent {
+                            return Err(conflict(
+                                "The account setup intent or original route changed",
+                            ));
+                        }
+                        let changed = match change {
+                            Change::Intent(desired) => {
+                                let cancel =
+                                    desired == Desired::Cancel && record.desired != desired;
+                                if cancel {
+                                    record.desired = Desired::Cancel;
+                                }
+                                cancel
+                            }
+                            Change::Bind(expected, binding) => {
+                                if record
+                                    .binding
+                                    .as_ref()
+                                    .is_some_and(|saved| saved != binding)
+                                {
+                                    return Err(conflict("The account setup binding changed"));
+                                }
+                                require_revision(record, expected)?;
+                                let unbound = record.binding.is_none();
+                                record.binding = Some(binding.clone());
+                                unbound
+                            }
+                        };
+                        if changed {
+                            advance(record)?;
+                        }
+                        record.clone()
+                    }
+                    None => {
+                        let Change::Intent(desired) = change else {
+                            return Err(missing_intent());
+                        };
+                        let record = Record {
+                            intent: intent.clone(),
+                            desired,
+                            binding: intent.initial_binding(),
+                            revision: 1,
+                            caused_by: None,
+                            phase: Phase::Retained,
+                        };
+                        journal.records.push(record.clone());
+                        journal
+                            .records
+                            .sort_by_key(|record| record.intent.request_id);
+                        record
+                    }
+                };
+                Ok(record)
+            },
+            sync,
+        )
+    }
+
+    fn transaction(
+        &self,
+        create: bool,
+        change: impl FnOnce(&mut Journal) -> io::Result<Record>,
+        sync: impl FnOnce(&Namespace) -> io::Result<()>,
+    ) -> io::Result<Record> {
+        let held = self.lock(create)?.ok_or_else(missing_intent)?;
         let previous = self.read(&held)?;
         let mut journal = previous
             .as_ref()
@@ -520,71 +1140,14 @@ impl Store {
                 version: VERSION,
                 records: Vec::new(),
             });
-        let index = journal
-            .records
-            .iter()
-            .position(|record| record.intent.request_id == intent.request_id);
-        let record = match index {
-            Some(index) => {
-                let record = &mut journal.records[index];
-                if &record.intent != intent {
-                    return Err(conflict(
-                        "The account setup intent or original route changed",
-                    ));
-                }
-                let changed = match change {
-                    Change::Intent(desired) => {
-                        let cancel = desired == Desired::Cancel && record.desired != desired;
-                        if cancel {
-                            record.desired = Desired::Cancel;
-                        }
-                        cancel
-                    }
-                    Change::Bind(expected, binding) => {
-                        if record
-                            .binding
-                            .as_ref()
-                            .is_some_and(|saved| saved != binding)
-                        {
-                            return Err(conflict("The account setup binding changed"));
-                        }
-                        if record.revision != expected {
-                            return Err(io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                "The account setup intent has a newer local revision",
-                            ));
-                        }
-                        let unbound = record.binding.is_none();
-                        record.binding = Some(binding.clone());
-                        unbound
-                    }
-                };
-                if changed {
-                    record.revision = record
-                        .revision
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("The account setup revision is exhausted"))?;
-                }
-                record.clone()
-            }
-            None => {
-                let Change::Intent(desired) = change else {
-                    return Err(missing_intent());
-                };
-                let record = Record {
-                    intent: intent.clone(),
-                    desired,
-                    binding: intent.initial_binding(),
-                    revision: 1,
-                };
-                journal.records.push(record.clone());
-                journal
-                    .records
-                    .sort_by_key(|record| record.intent.request_id);
-                record
-            }
-        };
+        let record = change(&mut journal)?;
         journal.validate()?;
+        // Include schema growth even when a legacy record is otherwise equal.
+        // Refuse before creating a temporary file or publishing any new bytes.
+        let bytes = serde_json::to_vec(&journal).map_err(invalid)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid("The account setup outbox is too large"));
+        }
         let persisted = if previous
             .as_ref()
             .is_some_and(|(old, _, version)| *version == VERSION && old == &journal)
@@ -596,12 +1159,8 @@ impl Store {
             file.sync_all()?;
             file
         } else {
-            // An equal V1 replay still rewrites V2 atomically. Only encoding
+            // An equal V1/V2 replay still rewrites V3 atomically. Only encoding
             // changes in that case; the record's local revision stays put.
-            let bytes = serde_json::to_vec(&journal).map_err(invalid)?;
-            if bytes.len() as u64 > MAX_BYTES {
-                return Err(invalid("The account setup outbox is too large"));
-            }
             let mut temporary = tempfile::Builder::new()
                 .prefix(".preparations-")
                 .permissions(fs::Permissions::from_mode(0o600))

@@ -70,7 +70,7 @@ fn prepared_binding_mut(value: &mut Binding) -> &mut PreparationBinding {
     binding
 }
 
-// Frozen V1 wire bytes, independent of the V2 serializer and migration types.
+// Frozen V1 wire bytes, independent of the current serializer and migration types.
 // The valid record order is deliberately not UUID order.
 const V1_DOCUMENT: &str = r#"{
   "version": 1,
@@ -144,6 +144,8 @@ fn expected_v1_records() -> Vec<Record> {
             desired: Desired::Prepare,
             binding: None,
             revision: 7,
+            caused_by: None,
+            phase: Phase::Retained,
         },
         Record {
             intent: Intent {
@@ -174,6 +176,8 @@ fn expected_v1_records() -> Vec<Record> {
                 },
             }),
             revision: u64::MAX,
+            caused_by: None,
+            phase: Phase::Retained,
         },
     ]
 }
@@ -728,7 +732,7 @@ fn v1_visibility_and_equal_migration_preserve_identity_revision_and_durability()
                 let visible = fs::read(&path).unwrap();
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&visible).unwrap()["version"],
-                    2
+                    VERSION
                 );
                 assert_eq!(fixture.store.load().unwrap(), Some(expected.clone()));
                 let held = fixture.store.lock(false).unwrap().unwrap();
@@ -745,7 +749,7 @@ fn v1_visibility_and_equal_migration_preserve_identity_revision_and_durability()
                 assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
                 assert_eq!(
                     calls, 1,
-                    "visible V2 cannot replace an outstanding durability barrier"
+                    "visible V3 cannot replace an outstanding durability barrier"
                 );
                 assert_eq!(fs::read(&path).unwrap(), visible);
                 let result = fixture
@@ -772,7 +776,7 @@ fn v1_visibility_and_equal_migration_preserve_identity_revision_and_durability()
         assert_ne!(bytes, V1_DOCUMENT.as_bytes());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["version"],
-            2
+            VERSION
         );
         assert_ne!(
             fs::metadata(&path).unwrap().ino(),
@@ -793,7 +797,7 @@ fn v1_rejected_documents_and_expanding_migrations_preserve_original_bytes() {
     let expected = expected_v1_records();
     let original: serde_json::Value = serde_json::from_str(V1_DOCUMENT).unwrap();
     let mut future = original.clone();
-    future["version"] = 3.into();
+    future["version"] = (VERSION + 1).into();
     let mut mislabeled = original.clone();
     mislabeled["version"] = 2.into();
     let mut extra = original.clone();
@@ -841,8 +845,8 @@ fn v1_rejected_documents_and_expanding_migrations_preserve_original_bytes() {
         assert!(fixture.store.lock(false).unwrap().is_some());
     }
 
-    // A valid, fully readable V1 can expand beyond the bound when V2 adds
-    // target tags. Migration must preserve it, not partially publish V2.
+    // A valid, fully readable V1 can expand beyond the bound when current encoding adds
+    // target tags. Migration must preserve it, not partially publish the new schema.
     let template = original["records"][0].clone();
     let empty_size = serde_json::to_vec(&serde_json::json!({"version": 1, "records": []}))
         .unwrap()
@@ -865,7 +869,7 @@ fn v1_rejected_documents_and_expanding_migrations_preserve_original_bytes() {
     let bytes = serde_json::to_vec(&serde_json::json!({"version": 1, "records": records})).unwrap();
     assert!(bytes.len() as u64 <= MAX_BYTES);
     let v2 = Journal {
-        version: 2,
+        version: VERSION,
         records: normalized.clone(),
     };
     v2.validate().unwrap();
@@ -1124,7 +1128,7 @@ fn bound_pending_initialization_and_cross_target_home_collisions_fail_closed() {
     assert_eq!(prepared.store.load().unwrap(), Some(vec![prepared_record]));
 
     let valid = Journal {
-        version: 2,
+        version: VERSION,
         records: vec![initial.clone()],
     };
     let mut absent = serde_json::to_value(&valid).unwrap();
@@ -1158,4 +1162,761 @@ fn bound_pending_initialization_and_cross_target_home_collisions_fail_closed() {
         );
         assert_eq!(fixture.bytes(), bytes);
     }
+}
+
+// Literal prior wire: no V3 serializer or new phase/causation defaults build it.
+const V2_DOCUMENT: &str = r#"{"version":2,"records":[{"intent":{"request_id":"00000000-0000-0000-0000-000000000001","target":{"kind":"existing_pending","original":{"kind":"observed","provider":"codex","key":"00000000-0000-0000-0000-000000000002","started_at":0,"expected_installation":null}},"original_route":{"route":{"kind":"remote","name":"Original device","host":"original-device","executable":"/usr/bin/cagents"},"route_revision":"route-v1:b58c991cd0d1be3efa21c946bccc2afeb1c7e5354d3d98c55069740004d2b9a4"},"device_code":true,"blocked_login":"00000000-0000-0000-0000-000000000005"},"desired":"cancel","binding":{"kind":"existing_pending","binding":{"installation_id":"00000000-0000-0000-0000-000000000003","provider":"codex","key":"00000000-0000-0000-0000-000000000002","started_at":0,"generation_id":"00000000-0000-0000-0000-000000000004"}},"revision":9}]}"#;
+
+fn linked_fixture() -> (Fixture, Record, Intent, ExistingPendingBinding) {
+    let (fixture, binding) = observed_fixture(None);
+    let parent = fixture
+        .store
+        .upsert(&fixture.intent, Desired::Prepare)
+        .unwrap();
+    let mut child = fixture.intent.clone();
+    child.request_id = Uuid::new_v4();
+    let Target::ExistingPending {
+        original:
+            ExistingPendingTarget::Observed {
+                expected_installation,
+                ..
+            },
+    } = &mut child.target
+    else {
+        unreachable!()
+    };
+    *expected_installation = Some(binding.installation_id);
+    (fixture, parent, child, binding)
+}
+
+fn parent_link(parent: &Record) -> ParentIntent {
+    ParentIntent {
+        request_id: parent.intent.request_id,
+        revision_at_consent: parent.revision,
+    }
+}
+
+fn attempt(action: AttemptAction) -> Attempt {
+    Attempt {
+        id: Uuid::new_v4(),
+        action,
+    }
+}
+
+#[test]
+fn v3_literal_v2_migration_retains_every_identity_and_bound_none_history() {
+    let fixture = Fixture::new();
+    write_v1(&fixture, V2_DOCUMENT.as_bytes());
+    let initial = fixture.store.load().unwrap().unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].phase, Phase::Retained);
+    assert_eq!(initial[0].caused_by, None);
+    let raw: serde_json::Value = serde_json::from_str(V2_DOCUMENT).unwrap();
+    let mut normalized = serde_json::to_value(&initial[0]).unwrap();
+    normalized.as_object_mut().unwrap().remove("phase");
+    normalized.as_object_mut().unwrap().remove("caused_by");
+    assert_eq!(
+        normalized, raw["records"][0],
+        "all old fields are conserved"
+    );
+    assert_eq!(
+        fixture.bytes(),
+        V2_DOCUMENT.as_bytes(),
+        "load cannot migrate or acknowledge"
+    );
+    let record = &initial[0];
+    assert_eq!(
+        fixture
+            .store
+            .upsert(&record.intent, Desired::Prepare)
+            .unwrap(),
+        *record
+    );
+    let migrated = fixture.bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&migrated).unwrap()["version"],
+        VERSION
+    );
+    assert_eq!(fixture.store.load().unwrap(), Some(initial.clone()));
+    let mut child = record.intent.clone();
+    child.request_id = Uuid::new_v4();
+    let Target::ExistingPending {
+        original:
+            ExistingPendingTarget::Observed {
+                expected_installation,
+                ..
+            },
+    } = &mut child.target
+    else {
+        unreachable!()
+    };
+    *expected_installation = Some(Uuid::from_u128(3));
+    assert!(
+        fixture
+            .store
+            .reaffirm(&parent_link(record), &child, Desired::Cancel)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .begin(
+                &record.intent,
+                record.revision,
+                &attempt(AttemptAction::Cancel)
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture.bytes(),
+        migrated,
+        "already-bound None is retained HOLD, not transferred"
+    );
+    let mut rejected = Vec::new();
+    for field in ["phase", "caused_by"] {
+        let mut malformed = raw.clone();
+        malformed["records"][0][field] = serde_json::Value::Null;
+        rejected.push((field, serde_json::to_vec(&malformed).unwrap()));
+    }
+    let mut unknown = raw.clone();
+    unknown["records"][0]["intent"]["target"]["original"]["unsupported_policy"] = true.into();
+    rejected.push(("nested_unknown", serde_json::to_vec(&unknown).unwrap()));
+    let mut omitted = raw.clone();
+    omitted["records"][0]["intent"]["target"]["original"]
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_installation");
+    rejected.push(("nested_omitted", serde_json::to_vec(&omitted).unwrap()));
+    let duplicate = V2_DOCUMENT.replacen(
+        "\"provider\":\"codex\"",
+        "\"provider\":\"codex\",\"provider\":\"codex\"",
+        1,
+    );
+    assert_ne!(duplicate, V2_DOCUMENT);
+    rejected.push(("nested_duplicate", duplicate.into_bytes()));
+    for (kind, bytes) in rejected {
+        write_v1(&fixture, &bytes);
+        let error = fixture.store.load().unwrap_err();
+        if kind == "nested_duplicate" {
+            assert!(error.to_string().contains("repeats a field"));
+        }
+        assert!(
+            fixture
+                .store
+                .upsert(&record.intent, Desired::Cancel)
+                .is_err(),
+            "{kind}: rejected V2 cannot be normalized by a mutation"
+        );
+        assert_eq!(
+            fixture.bytes(),
+            bytes,
+            "{kind}: strict V2 rejection must retain the exact old bytes"
+        );
+    }
+}
+
+#[test]
+fn v3_migration_and_phase_growth_refuse_before_replacing_bounded_bytes() {
+    let fixture = Fixture::new();
+    let mut template =
+        serde_json::from_str::<serde_json::Value>(V2_DOCUMENT).unwrap()["records"][0].clone();
+    template["binding"] = serde_json::Value::Null;
+    let empty_size = serde_json::to_vec(&serde_json::json!({"version":2,"records":[]}))
+        .unwrap()
+        .len();
+    let record_size = serde_json::to_vec(&template).unwrap().len();
+    let count = (MAX_BYTES as usize - empty_size + 1) / (record_size + 1);
+    let records: Vec<_> = (0..count)
+        .map(|index| {
+            let mut record = template.clone();
+            record["intent"]["request_id"] = Uuid::from_u128(index as u128 + 1).to_string().into();
+            record
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&serde_json::json!({"version":2,"records":records})).unwrap();
+    assert!(bytes.len() as u64 <= MAX_BYTES);
+    write_v1(&fixture, &bytes);
+    let visible = fixture.store.load().unwrap().unwrap();
+    assert!(
+        serde_json::to_vec(&Journal {
+            version: VERSION,
+            records: visible.clone()
+        })
+        .unwrap()
+        .len() as u64
+            > MAX_BYTES
+    );
+    let inode = fs::metadata(fixture.store.directory.join(JOURNAL))
+        .unwrap()
+        .ino();
+    let error = fixture
+        .store
+        .upsert(&visible[0].intent, Desired::Cancel)
+        .unwrap_err();
+    assert_eq!(error.to_string(), "The account setup outbox is too large");
+    assert_eq!(fixture.bytes(), bytes);
+    assert_eq!(
+        fs::metadata(fixture.store.directory.join(JOURNAL))
+            .unwrap()
+            .ino(),
+        inode
+    );
+    assert_eq!(fixture.store.load().unwrap(), Some(visible));
+
+    // A legal current journal can also be too full for an admitted phase.
+    let (fixture, _) = observed_fixture(Some(Uuid::new_v4()));
+    let first = fixture
+        .store
+        .upsert(&fixture.intent, Desired::Prepare)
+        .unwrap();
+    let mut journal = Journal {
+        version: VERSION,
+        records: vec![first.clone()],
+    };
+    let overhead = serde_json::to_vec(&Phase::InFlight {
+        attempt: attempt(AttemptAction::Resume),
+    })
+    .unwrap()
+    .len()
+        - serde_json::to_vec(&Phase::Retained).unwrap().len();
+    // Route public metadata can be padded within its existing validation cap.
+    let empty_size = serde_json::to_vec(&Journal {
+        version: VERSION,
+        records: vec![],
+    })
+    .unwrap()
+    .len();
+    let record_size = serde_json::to_vec(&first).unwrap().len();
+    let count = (MAX_BYTES as usize - 4096 - empty_size + 1).div_ceil(record_size + 1);
+    journal.records = (0..count)
+        .map(|index| {
+            let mut record = first.clone();
+            if index != 0 {
+                record.intent.request_id = Uuid::new_v4();
+            }
+            record
+        })
+        .collect();
+    let current_size = serde_json::to_vec(&journal).unwrap().len();
+    let target_size = MAX_BYTES as usize - overhead / 2;
+    let added = target_size.checked_sub(current_size).unwrap();
+    let last = journal.records.last_mut().unwrap();
+    let Route::Remote { name, .. } = &mut last.intent.original_route.route else {
+        unreachable!()
+    };
+    assert!(name.len() + added <= 4096);
+    name.push_str(&"x".repeat(added));
+    last.intent.original_route.route_revision =
+        route_revision(&last.intent.original_route.route).unwrap();
+    let bytes = serde_json::to_vec(&journal).unwrap();
+    assert!(
+        bytes.len() as u64 <= MAX_BYTES && bytes.len() + overhead > MAX_BYTES as usize,
+        "the fixture must straddle the real phase-growth boundary"
+    );
+    journal.validate().unwrap();
+    write_v1(&fixture, &bytes);
+    assert_eq!(
+        fixture
+            .store
+            .begin(
+                &first.intent,
+                first.revision,
+                &attempt(AttemptAction::Resume)
+            )
+            .unwrap_err()
+            .to_string(),
+        "The account setup outbox is too large"
+    );
+    assert_eq!(fixture.bytes(), bytes);
+}
+
+#[test]
+fn v3_explicit_consent_has_one_canonical_child_and_preserves_historical_parent_revision() {
+    let (fixture, parent, child, _) = linked_fixture();
+    let original_bytes = fixture.bytes();
+    assert_eq!(fixture.store.replay(&parent).unwrap(), parent);
+    assert_eq!(fixture.bytes(), original_bytes);
+    for revision in [0, parent.revision + 1] {
+        let link = ParentIntent {
+            request_id: parent.intent.request_id,
+            revision_at_consent: revision,
+        };
+        assert!(
+            fixture
+                .store
+                .reaffirm(&link, &child, Desired::Prepare)
+                .is_err()
+        );
+        assert_eq!(fixture.bytes(), original_bytes);
+    }
+    let inserted = fixture
+        .store
+        .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+        .unwrap();
+    assert_eq!(inserted.caused_by, Some(parent_link(&parent)));
+    assert_eq!(inserted.phase, Phase::Retained);
+    assert_eq!(inserted.binding, None);
+    let persisted = fixture.bytes();
+    assert!(
+        fixture.store.replay(&parent).is_err(),
+        "the unchanged Retained parent loses acknowledgement ownership once its child exists"
+    );
+    assert_eq!(fixture.bytes(), persisted);
+    assert_eq!(
+        fixture
+            .store
+            .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+            .unwrap(),
+        inserted
+    );
+    assert_eq!(fixture.bytes(), persisted);
+    assert_eq!(
+        fixture
+            .store
+            .load()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.intent == parent.intent)
+            .unwrap(),
+        parent
+    );
+    let mut competing = child.clone();
+    competing.request_id = Uuid::new_v4();
+    assert!(
+        fixture
+            .store
+            .reaffirm(&parent_link(&parent), &competing, Desired::Prepare)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.bytes(),
+        persisted,
+        "a competing click cannot redirect to the first child"
+    );
+    assert!(
+        fixture
+            .store
+            .reaffirm(&parent_link(&inserted), &competing, Desired::Prepare)
+            .is_err()
+    );
+    let mut self_link = parent_link(&parent);
+    self_link.request_id = child.request_id;
+    assert!(
+        fixture
+            .store
+            .reaffirm(&self_link, &child, Desired::Prepare)
+            .is_err()
+    );
+    assert_eq!(fixture.bytes(), persisted);
+
+    let cancelled_parent = fixture
+        .store
+        .upsert(&parent.intent, Desired::Cancel)
+        .unwrap();
+    let cancelled_bytes = fixture.bytes();
+    assert!(
+        fixture
+            .store
+            .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+            .is_err(),
+        "an exact initial child retry must still recheck the current parent Cancel"
+    );
+    assert_eq!(fixture.bytes(), cancelled_bytes);
+    let history = fixture.store.load().unwrap().unwrap();
+    assert!(history.contains(&inserted));
+    assert!(history.contains(&cancelled_parent));
+    let cancelled_child = fixture.store.upsert(&child, Desired::Cancel).unwrap();
+    assert_eq!(cancelled_child.intent, inserted.intent);
+    assert_eq!(cancelled_child.caused_by, inserted.caused_by);
+    assert_eq!(cancelled_child.phase, Phase::Retained);
+    assert_eq!(cancelled_child.desired, Desired::Cancel);
+
+    let (fixture, parent, child, _) = linked_fixture();
+    let cancelled = fixture
+        .store
+        .upsert(&parent.intent, Desired::Cancel)
+        .unwrap();
+    assert!(cancelled.revision > parent.revision);
+    assert!(
+        fixture
+            .store
+            .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+            .is_err()
+    );
+    let accepted = fixture
+        .store
+        .reaffirm(&parent_link(&parent), &child, Desired::Cancel)
+        .unwrap();
+    assert_eq!(accepted.desired, Desired::Cancel);
+    assert_eq!(
+        accepted.caused_by.unwrap().revision_at_consent,
+        parent.revision,
+        "historical consent revision need not equal the later parent revision"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .load()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.intent == parent.intent)
+            .unwrap(),
+        cancelled
+    );
+}
+
+#[test]
+fn v3_parent_cancellation_fences_child_resume_even_without_a_child_revision_change() {
+    let (fixture, parent, child, binding) = linked_fixture();
+    let inserted = fixture
+        .store
+        .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+        .unwrap();
+    let typed_binding = Binding::ExistingPending {
+        binding: binding.clone(),
+    };
+    let bytes = fixture.bytes();
+    assert!(
+        fixture
+            .store
+            .bind(&parent.intent, parent.revision, &typed_binding)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .begin(
+                &parent.intent,
+                parent.revision,
+                &attempt(AttemptAction::Resume)
+            )
+            .is_err()
+    );
+    let parent_attempt = attempt(AttemptAction::Resume);
+    let unowned_parent = AttemptEnvelope {
+        intent: parent.intent.clone(),
+        desired: parent.desired,
+        binding: parent.binding.clone(),
+        revision: parent.revision,
+        attempt: parent_attempt.clone(),
+    };
+    assert!(
+        fixture
+            .store
+            .settle(
+                &unowned_parent,
+                Some(&typed_binding),
+                &Phase::Refused {
+                    attempt: parent_attempt
+                }
+            )
+            .is_err(),
+        "a captured parent revision is not an owned attempt or a successor result"
+    );
+    assert_eq!(fixture.bytes(), bytes);
+    let resume = attempt(AttemptAction::Resume);
+    let owner = fixture
+        .store
+        .begin(&child, inserted.revision, &resume)
+        .unwrap();
+    let in_flight = fixture
+        .store
+        .load()
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.intent == child)
+        .unwrap();
+    fixture
+        .store
+        .upsert(&parent.intent, Desired::Cancel)
+        .unwrap();
+    let unchanged_child = fixture
+        .store
+        .load()
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.intent == child)
+        .unwrap();
+    assert_eq!(
+        in_flight, unchanged_child,
+        "parent Cancel cannot silently mutate the child"
+    );
+    let bytes = fixture.bytes();
+    assert!(
+        fixture
+            .store
+            .settle(
+                &owner,
+                Some(&typed_binding),
+                &Phase::MetadataConfirmed {
+                    attempt: resume.clone(),
+                    state: ExistingPendingState::Pending,
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        fixture.store.replay(&in_flight).is_err(),
+        "exact child revision does not waive parent Cancel"
+    );
+    assert!(
+        fixture
+            .store
+            .bind(&child, in_flight.revision, &typed_binding)
+            .is_err(),
+        "the legacy binding API cannot bypass the atomic result owner"
+    );
+    assert_eq!(fixture.bytes(), bytes);
+    let hold = fixture
+        .store
+        .hold(&child, in_flight.revision, &resume)
+        .unwrap();
+    assert_eq!(
+        hold.phase,
+        Phase::NeedsReconcile {
+            attempt: resume.clone()
+        }
+    );
+    assert_eq!(
+        fixture.store.replay(&hold).unwrap(),
+        hold,
+        "HOLD replay grants no dispatch or ACK"
+    );
+    assert!(
+        fixture.store.replay_attempt(&hold).is_err(),
+        "durable HOLD cannot yield a fresh Resume dispatch envelope"
+    );
+    assert!(
+        fixture
+            .store
+            .begin(&child, hold.revision, &attempt(AttemptAction::Resume))
+            .is_err()
+    );
+    let cancelled = fixture.store.upsert(&child, Desired::Cancel).unwrap();
+    assert_eq!(cancelled.phase.attempt(), Some(&resume));
+    assert!(
+        fixture
+            .store
+            .settle(&owner, None, &Phase::Refused { attempt: resume })
+            .is_err()
+    );
+    let cancellation = attempt(AttemptAction::Cancel);
+    let cancel_owner = fixture
+        .store
+        .begin(&child, cancelled.revision, &cancellation)
+        .unwrap();
+    assert_eq!(
+        cancel_owner.intent.request_id, child.request_id,
+        "wire Cancel uses this stable local operation id"
+    );
+    let settled = fixture
+        .store
+        .settle(
+            &cancel_owner,
+            Some(&typed_binding),
+            &Phase::MetadataConfirmed {
+                attempt: cancellation.clone(),
+                state: ExistingPendingState::CancelledRetained,
+            },
+        )
+        .unwrap();
+    assert_eq!(settled.desired, Desired::Cancel);
+    assert_eq!(settled.phase.attempt(), Some(&cancellation));
+    assert!(
+        fixture
+            .store
+            .upsert(&child, Desired::Prepare)
+            .unwrap()
+            .desired
+            == Desired::Cancel
+    );
+}
+
+#[test]
+fn v3_exact_attempt_and_atomic_binding_settlement_require_the_actual_durability_barrier() {
+    let (fixture, binding) = observed_fixture(Some(Uuid::new_v4()));
+    let first = fixture
+        .store
+        .upsert(&fixture.intent, Desired::Prepare)
+        .unwrap();
+    let resume = attempt(AttemptAction::Resume);
+    let failed = fixture
+        .store
+        .begin_with_sync(&fixture.intent, first.revision, &resume, |_| {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+    assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EIO));
+    let visible = fixture.store.load().unwrap().unwrap().remove(0);
+    assert_eq!(visible.phase.attempt(), Some(&resume));
+    let bytes = fixture.bytes();
+    let mut calls = 0;
+    assert!(
+        fixture
+            .store
+            .replay_with_sync(&visible, |_| {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .is_err()
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(fixture.bytes(), bytes);
+    let durable = fixture
+        .store
+        .replay_with_sync(&visible, |namespace| {
+            calls += 1;
+            namespace.sync()
+        })
+        .unwrap();
+    assert_eq!(calls, 2);
+    let owner = fixture.store.replay_attempt(&durable).unwrap();
+    let mut stale = owner.clone();
+    stale.revision -= 1;
+    let phase = Phase::MetadataConfirmed {
+        attempt: resume.clone(),
+        state: ExistingPendingState::Pending,
+    };
+    let typed = Binding::ExistingPending { binding };
+    for wrong in [
+        stale,
+        AttemptEnvelope {
+            attempt: attempt(AttemptAction::Resume),
+            ..owner.clone()
+        },
+        AttemptEnvelope {
+            desired: Desired::Cancel,
+            ..owner.clone()
+        },
+    ] {
+        assert!(fixture.store.settle(&wrong, Some(&typed), &phase).is_err());
+        assert_eq!(fixture.bytes(), bytes);
+    }
+    assert!(
+        fixture.store.settle(&owner, None, &phase).is_err(),
+        "metadata confirmation requires a real exact binding"
+    );
+    assert!(
+        fixture
+            .store
+            .settle(&owner, Some(&typed), &Phase::Retained)
+            .is_err()
+    );
+    let failed = fixture
+        .store
+        .settle_with_sync(&owner, Some(&typed), &phase, |_| {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+    assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EIO));
+    let post = fixture.store.load().unwrap().unwrap().remove(0);
+    assert_eq!(post.binding, Some(typed));
+    assert_eq!(post.phase, phase);
+    assert_eq!(
+        post.revision,
+        owner.revision + 1,
+        "binding and phase share one revision/barrier"
+    );
+    assert!(
+        fixture
+            .store
+            .settle(
+                &owner,
+                None,
+                &Phase::Refused {
+                    attempt: resume.clone()
+                }
+            )
+            .is_err()
+    );
+    let replay = fixture.store.replay(&post).unwrap();
+    assert_eq!(replay, post);
+    let next = attempt(AttemptAction::Resume);
+    let owner = fixture
+        .store
+        .begin(&fixture.intent, post.revision, &next)
+        .unwrap();
+    let refused = fixture
+        .store
+        .settle(
+            &owner,
+            None,
+            &Phase::Refused {
+                attempt: next.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(refused.phase.attempt(), Some(&next));
+    assert!(
+        fixture.store.replay(&post).is_err(),
+        "late post-state cannot acknowledge the newer owner"
+    );
+    assert!(
+        fixture
+            .store
+            .begin(&fixture.intent, refused.revision, &next)
+            .is_err(),
+        "an explicit retry needs a distinct attempt id"
+    );
+    assert!(
+        fixture.store.replay_attempt(&refused).is_err(),
+        "a settled record cannot yield a dispatch envelope"
+    );
+}
+
+#[test]
+fn v3_malformed_consent_and_phase_documents_are_held_without_repair() {
+    let (fixture, parent, child, _) = linked_fixture();
+    let inserted = fixture
+        .store
+        .reaffirm(&parent_link(&parent), &child, Desired::Prepare)
+        .unwrap();
+    let good = fixture.bytes();
+    let raw: serde_json::Value = serde_json::from_slice(&good).unwrap();
+    let child_index = raw["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|r| r["intent"]["request_id"] == child.request_id.to_string())
+        .unwrap();
+    let parent_index = 1 - child_index;
+    let mut cases = Vec::new();
+    let mut bad = raw.clone();
+    bad["records"][child_index]["caused_by"]["revision_at_consent"] = 0.into();
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][child_index]["caused_by"]["revision_at_consent"] = (parent.revision + 1).into();
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][parent_index]["caused_by"] =
+        serde_json::to_value(parent_link(&inserted)).unwrap();
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][child_index]["intent"]["target"]["original"]["started_at"] = 1.into();
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][child_index]["phase"] = serde_json::json!({"kind":"in_flight"});
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][child_index]["phase"] =
+        serde_json::json!({"kind":"refused","attempt":{"id":Uuid::nil(),"action":"resume"}});
+    cases.push(bad);
+    let mut bad = raw.clone();
+    bad["records"][child_index]["phase"] = serde_json::json!({"kind":"metadata_confirmed","attempt":attempt(AttemptAction::Resume),"state":"pending"});
+    cases.push(bad);
+    for malformed in cases {
+        let bytes = serde_json::to_vec(&malformed).unwrap();
+        write_v1(&fixture, &bytes);
+        assert!(fixture.store.load().is_err());
+        assert!(fixture.store.upsert(&child, Desired::Cancel).is_err());
+        assert_eq!(
+            fixture.bytes(),
+            bytes,
+            "invalid history cannot be normalized or replaced"
+        );
+    }
+    write_v1(&fixture, &good);
+    assert_eq!(fixture.store.load().unwrap().unwrap().len(), 2);
 }
