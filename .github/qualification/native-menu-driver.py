@@ -128,9 +128,9 @@ def cmd(args, env=None, cwd=None, timeout=20, expected=0):
     guard()
     args = [str(arg) for arg in args]
     if CRITICAL:
-        ocr_read = (ACTIVE == 'before' and len(args) == 10 and args[0] == 'tesseract' and
+        ocr_read = (ACTIVE in ('before', 'after') and len(args) == 10 and args[0] == 'tesseract' and
             args[2:] == ['stdout', '-l', 'eng', '--psm', '11', '--oem', '1', 'tsv'] and
-            Path(args[1]).resolve() in CAPTURES and CAPTURES[Path(args[1]).resolve()]['arm'] == 'before')
+            Path(args[1]).resolve() in CAPTURES and CAPTURES[Path(args[1]).resolve()]['arm'] == ACTIVE)
         assert ocr_read or args[:2] == ['import', '-window'] or (args[0] == 'xdotool' and args[1] in
             ('getwindowgeometry', 'getmouselocation', 'getwindowfocus')), 'UI repair command refused during wheel→activation'
     directory = OUT / 'commands' / f'{len(COMMANDS):05d}'
@@ -249,10 +249,10 @@ def exact_pixel_label(lines, label):
 
 
 def ocr_frame(window, size, name):
-    assert ACTIVE == 'before', 'OCR is baseline-only; product accessibility gates are unchanged'
+    assert ACTIVE in ('before', 'after'), 'Native pixel observation requires an identified arm'
     record = capture(window, name, size)
     png = (OUT / (name + '.png')).resolve()
-    assert png in CAPTURES and CAPTURES[png]['arm'] == 'before'
+    assert png in CAPTURES and CAPTURES[png]['arm'] == ACTIVE
     raw = cmd(['tesseract', png, 'stdout', '-l', 'eng', '--psm', '11', '--oem', '1', 'tsv'], timeout=20)
     (OUT / (name + '.tsv')).write_text(raw)
     assert digest(png) == record['png_sha256'], 'OCR input changed after native capture'
@@ -262,13 +262,16 @@ def ocr_frame(window, size, name):
     return dict(name=name, rows=rows, png=png, capture=record)
 
 
-class BaselinePixels:
+class NativeMenuPixels:
     def __init__(self, pid, window, size, label):
-        assert ACTIVE == 'before'
+        assert ACTIVE in ('before', 'after')
+        self.arm = ACTIVE
+        self.labels = M['baseline_menu_labels'] if self.arm == 'before' else M['menu_labels']
         self.pid, self.window, self.size, self.label = pid, window, size, label
         self.opened, self.number, self.context, self.last = False, 0, None, None
 
     def frame(self, purpose):
+        assert self.arm == ACTIVE, 'Cross-arm pixel observation refused'
         self.number += 1
         return ocr_frame(self.window, self.size, f'{self.label}-pixel-{self.number:03d}-{purpose}')
 
@@ -280,11 +283,13 @@ class BaselinePixels:
                 and row['bounds'][1] >= top-4 and sum(character.isalpha() for character in row['text']) >= 3]
 
     def validate_slice(self, frame):
+        assert self.arm == ACTIVE and frame['capture']['arm'] == self.arm
+        assert frame['capture']['window'] == self.window, 'Menu pixels came from a different native window'
         candidates = self.column(frame)
         assert len(candidates) >= 2, 'Insufficient readable menu labels; OCR absence is not a feature negative'
         names = set()
         for row in candidates:
-            assert row['text'] in M['baseline_menu_labels'], 'Unknown/partial OCR menu label: ' + row['text']
+            assert row['text'] in self.labels, 'Unknown/partial OCR menu label: ' + row['text']
             assert row['min_confidence'] >= M['ocr']['minimum_word_confidence'], 'Low-confidence menu text'
             assert row['text'] not in names, 'Ambiguous repeated native menu label'
             names.add(row['text'])
@@ -312,7 +317,7 @@ class BaselinePixels:
         opened = self.frame('opened')
         labels = ['Open folder', 'New terminal', 'New channel']
         rows = [exact_pixel_label(opened['rows'], label) for label in labels]
-        assert all(rows), 'Native menu anchors unavailable; no guessed baseline coordinates'
+        assert all(rows), 'Native menu anchors unavailable; no guessed coordinates'
         assert all(exact_pixel_label(before['rows'], label) is None for label in labels), 'Menu labels already present before opening; ambiguous menu binding'
         assert rows[0]['bounds'][1] < rows[1]['bounds'][1] < rows[2]['bounds'][1]
         left = min(row['bounds'][0] for row in rows)
@@ -325,6 +330,8 @@ class BaselinePixels:
         return opened
 
     def crop_hashes(self, frame, rows):
+        assert frame['png'] in CAPTURES and CAPTURES[frame['png']]['arm'] == self.arm
+        assert CAPTURES[frame['png']]['window'] == self.window
         with Image.open(frame['png']) as image:
             return [hashlib.sha256(image.crop((row['bounds'][0], row['bounds'][1],
                 row['bounds'][0]+row['bounds'][2], row['bounds'][1]+row['bounds'][3])).tobytes()).hexdigest() for row in rows]
@@ -337,7 +344,7 @@ class BaselinePixels:
         frame = self.frame('after-escape')
         candidates = self.column(frame)
         for row in candidates:
-            if row['text'] in M['baseline_menu_labels']:
+            if row['text'] in self.labels:
                 assert row['min_confidence'] >= M['ocr']['minimum_word_confidence'], 'Uncertain OCR after dismissal'
                 return False
         assert not candidates, 'Unknown native text prevents proving menu dismissal'
@@ -351,7 +358,7 @@ class BaselinePixels:
     def modal_closed(self, label):
         # Called only after the unchanged strict native exact-target modal oracle.
         self.opened = False
-        put(OUT / (label + '-pixel-menu-closed-by-modal.json'), dict(reason='Exact native modal/Cancel oracle passed; image retained separately'))
+        put(OUT / (label + '-pixel-menu-closed-by-modal.json'), dict(arm=self.arm, reason='Exact native modal/Cancel oracle passed; image retained separately'))
 
     def calibrate(self, inputs, rect, label):
         self.open(inputs, rect)
@@ -372,6 +379,11 @@ class BaselinePixels:
             if index < 20:
                 inputs.wheel(5, 3)
         if final is None:
+            if self.arm == 'after':
+                put(OUT / (label + '-missing-target.json'), dict(status='FAILED', slices=slices,
+                    observed_editor_labels=sorted(seen), reason='After Remove target not observed; no activation or negative reset'))
+                raise RuntimeError('After Remove target unreachable or unavailable; product qualification fails')
+            assert self.arm == 'before'
             assert len(slices) >= 3 and slices[-1]['rows'] == slices[-2]['rows'] == slices[-3]['rows']
             assert slices[-1]['pixel_hashes'] == slices[-2]['pixel_hashes'] == slices[-3]['pixel_hashes'], 'Unstable/unreadable end state is not unreachable-row evidence'
             assert (pointer()['X'], pointer()['Y']) == wheel_point, 'Calibration pointer drift is not unreachable-row evidence'
@@ -390,7 +402,7 @@ class BaselinePixels:
         b = final['bounds']
         point = (b[0]+b[2]//2, b[1]+b[3]//2)
         put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=b,
-            coordinate_source='This baseline native PNG/TSV only', observed_editor_labels=sorted(seen), slices=slices))
+            coordinate_source='This arm native PNG/TSV only', arm=self.arm, observed_editor_labels=sorted(seen), slices=slices))
         inputs.key('Escape')
         wait(self.closed)
         return rect, point
@@ -425,8 +437,9 @@ def snapshot(pid, name):
 
 
 def unique(pid, name, enabled=True):
-    if ACTIVE == 'before' and PIXEL_MENU is not None and name in M['baseline_menu_labels']:
-        return PIXEL_MENU.lookup(name) if PIXEL_MENU.opened else None
+    if name in M['menu_labels']:
+        assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE, 'Menu labels require this arm native pixels'
+        return PIXEL_MENU.lookup(name) if name in PIXEL_MENU.labels and PIXEL_MENU.opened else None
     found = [node for node in tree(pid) if node.name == name and visible(node)
              and (not enabled or node.getState().contains(pyatspi.STATE_ENABLED))]
     actionable = [node for node in found if node.getRole() in (pyatspi.ROLE_PUSH_BUTTON, pyatspi.ROLE_MENU_ITEM)]
@@ -651,15 +664,15 @@ def conserve(binary, env, projects, expected_rows, expected_files, stub, label):
 
 
 def menu_slice(pid, size):
-    if ACTIVE == 'before' and PIXEL_MENU is not None:
-        return [(row['text'], tuple(row['bounds'])) for row in PIXEL_MENU.read()['menu_rows']]
-    return [(node.name, box(node)) for node in tree(pid) if node.name in M['menu_labels'] and visible(node) and on_screen(box(node), size)]
+    assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE, 'Own-arm native pixel observer unavailable'
+    return [(row['text'], tuple(row['bounds'])) for row in PIXEL_MENU.read()['menu_rows']]
 
 
 def menu_gone(pid):
-    if ACTIVE == 'before' and PIXEL_MENU is not None:
+    if PIXEL_MENU is not None:
+        assert PIXEL_MENU.arm == ACTIVE
         return PIXEL_MENU.closed()
-    return unique(pid, 'Open folder') is None and unique(pid, 'Remove project…') is None
+    return True  # No menu can be opened by this control before its observer exists.
 
 
 def dismiss(inputs, pid):
@@ -706,44 +719,16 @@ def anchor(inputs, pid, size):
 
 
 def open_menu(inputs, rect, pid):
-    if ACTIVE == 'before' and PIXEL_MENU is not None:
-        return PIXEL_MENU.open(inputs, rect)
-    x, y, width, height = rect
-    inputs.move(x + width // 2, y + height // 2)
-    inputs.click(3)
-    wait(lambda: unique(pid, 'Open folder'))
+    assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE, 'Own-arm native pixel observer unavailable'
+    return PIXEL_MENU.open(inputs, rect)
 
 
 def calibrate(inputs, pid, window, size, label):
     rect = anchor(inputs, pid, size)
     snapshot(pid, label + '-anchor')
     capture(window, label + '-anchor', size)
-    if ACTIVE == 'before' and PIXEL_MENU is not None:
-        return PIXEL_MENU.calibrate(inputs, rect, label)
-    open_menu(inputs, rect, pid)
-    first = box(wait(lambda: unique(pid, 'Open folder')))
-    inputs.move(first[0] + first[2] // 2, first[1] + first[3] // 2)
-    seen, slices = set(), []
-    for index in range(21):
-        exposed = [(node.name, box(node)) for node in tree(pid) if node.name in M['editor_labels']
-                   and visible(node) and on_screen(box(node), size)]
-        seen.update(name for name, _ in exposed)
-        slices.append(dict(index=index, exposed=exposed, seen=sorted(seen)))
-        snapshot(pid, label + f'-calibration-slice-{index}')
-        remove = unique(pid, 'Remove project…')
-        if set(M['editor_labels']).issubset(seen) and remove and on_screen(box(remove), size):
-            break
-        inputs.wheel(5, 3)
-    assert set(M['editor_labels']).issubset(seen), 'Not all six real editor labels observed across bounded calibration slices'
-    inputs.wheel(5, 60)  # Establish final lower-limit geometry before accepted replay.
-    final = box(wait(lambda: unique(pid, 'Remove project…')))
-    assert on_screen(final, size)
-    point = (final[0] + final[2] // 2, final[1] + final[3] // 2)
-    put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=final,
-        observed_editor_labels=sorted(seen), slices=slices))
-    inputs.key('Escape')
-    wait(lambda: menu_gone(pid))
-    return rect, point
+    assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE
+    return PIXEL_MENU.calibrate(inputs, rect, label)
 
 
 def modal(pid, target, size, label):
@@ -898,8 +883,8 @@ def trial(inputs, pid, window, size, label, activation, target, binary, env, pro
             raise BaselineKeyboardNegative(observation)
         raise RuntimeError('Expected Remove confirmation absent after native activation')
     cancel = modal(pid, target, size, label)
-    if ACTIVE == 'before' and PIXEL_MENU is not None:
-        PIXEL_MENU.modal_closed(label)
+    assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE
+    PIXEL_MENU.modal_closed(label)
     snapshot(pid, label + '-dialog')
     capture(window, label + '-dialog', size)
     put(OUT / (label + '-trial.json'), dict(activation=activation, anchor=rect, point=point, geometry=initial_geometry,
@@ -1090,7 +1075,7 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                 configured_ui_scale=1.5, settings_sha256=digest(settings), current_native_scale_factor='UNMEASURED',
                 startup_scale_guess='Supporting log only, never a current per-window measurement',
                 display_configuration={k: os.environ.get(k) for k in ('DISPLAY', 'WINIT_X11_SCALE_FACTOR', 'GDK_SCALE', 'GDK_DPI_SCALE')}))
-            PIXEL_MENU = BaselinePixels(pid, window, size, label + '-' + size_name) if label == 'before' else None
+            PIXEL_MENU = NativeMenuPixels(pid, window, size, label + '-' + size_name)
             blocked_by_unreachable = None
             for activation, short in [('Return', 'return'), ('space', 'space'), ('click', 'click'), (None, 'limits'), (None, 'tooltip')]:
                 if CANCEL_SIGNAL is not None:
@@ -1108,6 +1093,7 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                         trial(inputs, pid, window, size, case_label, activation, projects[-1], binary, env, projects, rows, initial_files, stub)
                         row['status'] = 'machine_oracle_complete_visual_review_pending'
                     except BaselineKeyboardNegative as error:
+                        assert label == 'before', 'After observations cannot become before feature negatives'
                         negative = reset_baseline_negative(error, inputs, pid, window, size, case_label, activation,
                             binary, env, projects, rows, initial_files, stub, checkout, pin)
                         row.update(status='observed_negative_unreachable_row' if isinstance(error, BaselineRemoveUnreachable) else 'observed_negative_missing_keyboard_activation',
@@ -1121,6 +1107,7 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                         limits(inputs, pid, window, size, case_label)
                         row['status'] = 'machine_oracle_complete_visual_review_pending'
                     except BaselineRemoveUnreachable as error:
+                        assert label == 'before', 'After missing target remains a failure'
                         negative = reset_baseline_negative(error, inputs, pid, window, size, case_label, activation,
                             binary, env, projects, rows, initial_files, stub, checkout, pin)
                         row.update(status='observed_negative_unreachable_row', product_oracle_passed=False,

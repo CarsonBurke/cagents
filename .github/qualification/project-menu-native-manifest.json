@@ -97,15 +97,16 @@
     "No live commercial provider, concurrent-agent workload, performance/frame/GPU/resource improvement, FW16 compositor or full-PR merge acceptance is established. Remaining PR gates are not waived.",
     "Actual logs, exits, source/executable/config/fixture hashes, PID-filtered accessibility, ordered input/keycode receipts, geometry, native WebPs and cleanup failures are retained. Missing captures are explicit; no placeholder or invented pass.",
     "Owned process identities are captured before waits and revalidated before signals; normal UI close and matched guarded private daemon stop precede final owned cleanup. Cleanup failure refuses the next arm/build. Screenshots remain artifacts only, off product branches.",
-    "Baseline menu observations use their own actual native PNG/WebP plus raw Tesseract TSV, version, confidence and bounds receipts. Coordinates never come from the product arm. Duplicate/unknown/partial/low-confidence OCR labels, unavailable binding or ambiguous dismissal stop affected evidence. Strict product accessibility/modal gates are unchanged.",
-    "A readable baseline menu with no Remove row after bounded real wheel may yield an explicit negative observation with no activation target; later related activation/limit cases remain explicitly UNRUN. Missing editor labels/Before activation states are recorded, never inferred from product. OCR ambiguity never qualifies as this negative.",
+    "Both before and after menu rows are observed through their own actual native PNG/WebP and raw Tesseract TSV, version, confidence, bounds and independently bound menu receipts. No coordinates/data transfer across arms. Duplicate/unknown/partial/low-confidence labels or ambiguous dismissal fail affected evidence. After exact modal/name/path/initial Cancel gates remain unchanged.",
+    "Only a readable before menu with no Remove row after bounded real wheel may yield an explicit negative observation with no activation target; related activation/limit cases remain UNRUN. Missing editor/Before activation states are recorded. AFTER missing target/editor labels, unreachable rows, OCR ambiguity or any input/cancel/conservation/cleanup failure remains failure, never a scoped before negative.",
     "Cancellation propagates globally and refuses later cases/arms. Every gesture releases tracked keys/buttons in finally; arm cleanup verifies releases before dismissal or any later arm. Release failure and cleanup uncertainty remain fatal.",
-    "Matched read-only channel list must stay empty and chat capacity used/resident/spawning must remain zero, alongside project order/membership, empty terminals, editor receipts and Git file/ref conservation. No unexpected New channel action is waived."
+    "Matched read-only channel list must stay empty and chat capacity used/resident/spawning must remain zero, alongside project order/membership, empty terminals, editor receipts and Git file/ref conservation. No unexpected New channel action is waived.",
+    "Menu::operate and Widget::a11y_nodes are separate. Source on both pins does not publish menu rows into the native accessibility tree; header accessibility is separate and retained. This control uses pixels for menu rows and does not establish native menu accessibility. Native modal/Cancel and header/focus checks still use their actual PID-filtered accessibility tree. Existing follow-up #1768 tracks native MenuSurface/ContextMenu accessibility publication; no duplicate issue is created by this control."
   ],
   "previous_product_head": "7c0022e23ea8548dea4df050f68d76fba94bca53",
   "product_successor_note": "Public independently reviewed test-only E0282 correction of Vec<keyboard::Key> inference. Production/native behavior is unchanged; compiler gate still must succeed at this exact successor.",
   "ocr": {
-    "route": "baseline-only actual unchanged native full-window captures",
+    "route": "Both arms independently; each uses only its own actual unchanged native full-window captures, bound menu and literal source label list",
     "minimum_word_confidence": 80.0,
     "column_start_span_pixels": 85,
     "language": "eng",
@@ -113,7 +114,8 @@
     "oem": 1,
     "literal_matching": "Full exact source labels, including punctuation; no fuzzy guesses or punctuation aliases",
     "calibration_slices_maximum": 21,
-    "unreachable_confirmation": "At least3 identical readable end slices and native glyph hashes after bounded real wheel. Actual images require independent review; no activation target is invented."
+    "unreachable_confirmation": "At least3 identical readable end slices and native glyph hashes after bounded real wheel. Actual images require independent review; no activation target is invented.",
+    "cross_arm_policy": "Captured PNG registration arm must equal ACTIVE. No coordinates, rows, OCR evidence or menu context transfers across arms."
   },
   "baseline_menu_labels": [
     "Open folder",
@@ -130,5 +132,6 @@
     "Zed",
     "Sublime Text",
     "Remove project\u2026"
-  ]
+  ],
+  "native_menu_accessibility_follow_up": "https://github.com/CarsonBurke/cagents/issues/1768"
 }
