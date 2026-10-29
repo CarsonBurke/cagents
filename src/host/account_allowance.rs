@@ -218,6 +218,7 @@ mod tests {
     }
     struct Adapter {
         model: Arc<Mutex<Model>>,
+        reservation: Option<crate::account::reset::transport::Reservation>,
     }
     impl crate::chat::protocol::Adapter for Adapter {
         fn initialize(&mut self) -> Result<crate::chat::protocol::Step, String> {
@@ -256,11 +257,44 @@ mod tests {
             let _ = request.reply.send(Ok(model.allowance.clone()));
             Ok(Default::default())
         }
+        fn reserve_reset_credit(
+            &mut self,
+            request: crate::account::reset::transport::Reservation,
+        ) -> Result<(), String> {
+            request.check()?;
+            if self.reservation.as_ref().is_some_and(|reserved| {
+                reserved.check().is_ok()
+                    && (reserved.token != request.token || reserved.attempt != request.attempt)
+            }) {
+                return Err(
+                    "Private fixture actor already has a different reset reservation".into(),
+                );
+            }
+            self.reservation = Some(request);
+            Ok(())
+        }
+        fn release_reset_credit(&mut self, token: uuid::Uuid) {
+            if self
+                .reservation
+                .as_ref()
+                .is_some_and(|reserved| reserved.token == token)
+            {
+                self.reservation = None;
+            }
+        }
         fn consume_reset_credit(
             &mut self,
             request: crate::account::reset::transport::Consume,
         ) -> Result<crate::chat::protocol::Step, String> {
             request.check()?;
+            let reserved = self
+                .reservation
+                .as_ref()
+                .filter(|reserved| {
+                    reserved.token == request.reservation && reserved.attempt == request.attempt()
+                })
+                .ok_or("Private fixture consume requires its exact actor reservation")?;
+            reserved.check()?;
             let mut model = self.model.lock().unwrap();
             assert_eq!(model.allowance.account.as_ref(), Some(&request.expected));
             assert_eq!(request.credit_id, "private-credit");
@@ -279,6 +313,18 @@ mod tests {
             assert_eq!(receipts.len(), 1);
             let receipt: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&receipts[0]).unwrap()).unwrap();
+            assert_eq!(
+                receipt["account_id"].as_str(),
+                Some(request.expected.account_id.as_str())
+            );
+            assert_eq!(
+                receipt["backend_origin"].as_str(),
+                Some(request.expected.backend_origin.as_str())
+            );
+            assert_eq!(
+                receipt["attempts"][0]["credit_id"].as_str(),
+                Some(request.credit_id.as_str())
+            );
             assert_eq!(
                 receipt["attempts"][0]["idempotency_key"].as_str(),
                 Some(request.key.as_str())
@@ -421,7 +467,10 @@ mod tests {
             let store = runtime::preflight(&spec, &mut initial).unwrap();
             let handle = runtime::Handle::start(
                 spec,
-                Box::new(Adapter { model }),
+                Box::new(Adapter {
+                    model,
+                    reservation: None,
+                }),
                 initial,
                 store,
                 None,
