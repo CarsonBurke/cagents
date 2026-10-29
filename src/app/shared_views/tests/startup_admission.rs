@@ -18,6 +18,10 @@ use std::{
 /// every application path in a separate process, away from the user's services
 /// and tests running concurrently in this binary.
 fn isolated(name: &str) -> bool {
+    assert!(
+        std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),
+        "These private startup fixtures require a genuine User invocation; inherited caller authority must not be cleared"
+    );
     const CHILD: &str = "CAGENTS_STARTUP_ADMISSION_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return false;
