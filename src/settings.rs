@@ -1959,6 +1959,27 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
     Ok(lock)
 }
 
+#[cfg(test)]
+thread_local! {
+    static AGENT_REPAIR_CONFIRMATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_agent_repair_confirmation_hook<R>(
+    hook: impl FnOnce(&Path) + 'static,
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Box<dyn FnOnce(&Path)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AGENT_REPAIR_CONFIRMATION_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(AGENT_REPAIR_CONFIRMATION_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    action()
+}
+
 /// Applies only fields this window changed since its last successful save.
 /// Nested shortcut tables merge by action; list-valued preferences are atomic.
 pub fn save_merged(
@@ -1972,11 +1993,21 @@ pub fn save_merged(
     // Loading may retain unreadable saved execution policy, but a newly
     // invalid edited value must still refuse the save rather than fall back.
     desired.clone().validate_transition(base)?;
-    agents::validate_container_repairs(&base.agents, &desired.agents, &previous.agents)
+    let retry_base = if agents::has_policy_repairs(&desired.agents) {
+        let mut retry_base = base.clone();
+        retry_base.agents =
+            agents::policy_repair_merge_base(&base.agents, &desired.agents, &previous.agents)
+                .map_err(SettingsError::AgentLaunch)?;
+        Some(retry_base)
+    } else {
+        None
+    };
+    let merge_base = retry_base.as_ref().unwrap_or(base);
+    agents::validate_container_repairs(&merge_base.agents, &desired.agents, &previous.agents)
         .map_err(SettingsError::AgentLaunch)?;
     let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
-        &merge_base_value(base, desired)?,
+        &merge_base_value(merge_base, desired)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
@@ -1990,6 +2021,10 @@ pub fn save_merged(
         // The same writer lock still owns this file, including on final-close
         // saves. A failed read or changed canonical scope cannot acknowledge
         // the repair or clear its live refusal.
+        #[cfg(test)]
+        if let Some(hook) = AGENT_REPAIR_CONFIRMATION_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
         let persisted = load_unlocked(path)?.settings;
         agents::confirm_policy_repairs(&desired.agents, &persisted.agents)
             .map_err(SettingsError::AgentLaunch)?;
@@ -2020,7 +2055,7 @@ pub(crate) fn merge_base_value(
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
-    if base == desired {
+    if same_toml(base, desired) {
         return;
     }
     if let (Some(base), Some(desired), Some(current)) =
@@ -2039,6 +2074,33 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         }
     } else {
         *current = desired.clone();
+    }
+}
+
+/// Unreadable saved policy may contain TOML NaN. Its non-reflexive float
+/// equality must not turn an unchanged preference into an old window's edit.
+fn same_toml(left: &toml::Value, right: &toml::Value) -> bool {
+    match (left, right) {
+        (toml::Value::Float(left), toml::Value::Float(right)) => {
+            left == right
+                || (left.is_nan()
+                    && right.is_nan()
+                    && left.is_sign_negative() == right.is_sign_negative())
+        }
+        (toml::Value::Array(left), toml::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_toml(left, right))
+        }
+        (toml::Value::Table(left), toml::Value::Table(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|right| same_toml(value, right)))
+        }
+        _ => left == right,
     }
 }
 

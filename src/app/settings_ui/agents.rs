@@ -187,6 +187,16 @@ fn repair_control<'a>(
     detail: &'static str,
     feedback: Option<&SettingsFeedback>,
 ) -> Setting<'a, Message> {
+    let key = if observed.all_providers() {
+        "agents".into()
+    } else if let Some(field) = observed.field() {
+        format!(
+            "agents.{}.{field}",
+            settings::agents::provider_key(provider)
+        )
+    } else {
+        format!("agents.{}", settings::agents::provider_key(provider))
+    };
     let pending = configuration.repair_requested(&observed);
     let failed = matches!(feedback, Some(SettingsFeedback::Error(_)));
     let label = if pending && !failed {
@@ -214,7 +224,67 @@ fn repair_control<'a>(
     .on_press_maybe(
         (!pending || failed).then_some(Message::RepairUnreadableAgentPolicy { provider, observed }),
     );
-    setting_field(title, detail, control.into())
+    setting_field(title, detail, control.into()).keywords(key)
+}
+
+fn retained_arguments<'a>(entry: &'a AgentDraft) -> Setting<'a, Message> {
+    let rows: Vec<Element<'a, Message>> = if entry.configuration.arguments.is_empty() {
+        vec![design::body("No readable arguments.").into()]
+    } else {
+        entry
+            .configuration
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                design::body(format!(
+                    "{}. {}",
+                    index + 1,
+                    if argument.is_empty() {
+                        "(empty argument)"
+                    } else {
+                        argument
+                    }
+                ))
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into()
+            })
+            .collect()
+    };
+    setting_field(
+        "Retained arguments",
+        "Read only until repair. Removing unreadable entries keeps these arguments in this order.",
+        widget::column::with_children(rows)
+            .spacing(space::XS)
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
+fn retained_environment<'a>(entry: &'a AgentDraft) -> Setting<'a, Message> {
+    let rows: Vec<Element<'a, Message>> = if entry.environment.is_empty() {
+        vec![design::body("No readable environment entries.").into()]
+    } else {
+        entry
+            .environment
+            .iter()
+            .map(|(name, _)| {
+                design::body(format!("{name}  ••••••"))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into()
+            })
+            .collect()
+    };
+    setting_field(
+        "Retained environment",
+        "Read only until repair. Values stay masked. Removing unreadable entries keeps these names and their saved values.",
+        widget::column::with_children(rows)
+            .spacing(space::XS)
+            .width(Length::Fill)
+            .into(),
+    )
 }
 
 pub(super) fn controls<'a>(
@@ -352,12 +422,14 @@ pub(super) fn controls<'a>(
         }
 
         if let Some(observed) = configuration.unreadable_field("arguments") {
+            options.push(retained_arguments(entry));
             options.push(repair_control(provider, configuration, observed, "Unreadable extra arguments", "Remove unreadable arguments".into(), "Remove only arguments that cannot be read. Valid saved arguments stay in their original order and can be edited after repair. Other launch preferences stay saved. Provider operations remain unavailable until the repair is saved.", context.feedback));
         } else {
             options.push(setting_field("Extra arguments", "One argument per row, in launch order. Spaces stay inside the argument; no shell parsing is performed.", argument_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Arguments)).map(String::as_str)).keywords(format!("agents.{}.arguments", settings::agents::provider_key(provider))).keywords(configuration.arguments.join(" ")));
         }
 
         if let Some(observed) = configuration.unreadable_field("environment") {
+            options.push(retained_environment(entry));
             options.push(repair_control(provider, configuration, observed, "Unreadable environment entries", "Remove unreadable environment entries".into(), "Remove only environment entries that cannot be read. Valid saved names and values stay saved and can be edited after repair. Other launch preferences stay saved. Provider operations remain unavailable until the repair is saved.", context.feedback));
         } else {
             options.push(setting_field("Environment", "Values are masked. Account home and credential isolation variables cannot be overridden. Changes apply to future launches.", environment_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Environment)).map(String::as_str)).keywords(format!("agents.{}.environment variables", settings::agents::provider_key(provider))).keywords(entry.environment.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ")));

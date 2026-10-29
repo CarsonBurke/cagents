@@ -261,10 +261,10 @@ pub(crate) fn confirm_policy_repairs(
                 .expect("requested container");
             if observed.all_providers {
                 if !persisted.is_empty() {
-                    return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+                    return Err("Provider preference repair changed before it could be acknowledged. Restart the app to load the changed preferences.".into());
                 }
             } else if persisted.get(provider) != Some(&AgentLaunchSettings::default()) {
-                return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+                return Err("Provider preference repair changed before it could be acknowledged. Restart the app to load the changed preferences.".into());
             }
         }
         for field in &configuration.unreadable_execution.2 {
@@ -276,7 +276,7 @@ pub(crate) fn confirm_policy_repairs(
                     || current.unreadable_field(field).is_some()
                     || !same_field(configuration, current, field)
             }) {
-                return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+                return Err("Provider preference repair changed before it could be acknowledged. Restart the app to load the changed preferences.".into());
             }
         }
     }
@@ -329,6 +329,96 @@ pub(crate) fn complete_policy_repairs(settings: &mut BTreeMap<String, AgentLaunc
     acknowledge_policy_repairs(settings, &accepted);
 }
 
+/// A write may have succeeded before its confirmation failed. On retry, an
+/// exact canonical match needs only confirmation, never another replacement.
+/// Different current policy remains protected from the old repair request.
+pub(super) fn policy_repair_merge_base(
+    base: &BTreeMap<String, AgentLaunchSettings>,
+    requested: &BTreeMap<String, AgentLaunchSettings>,
+    current: &BTreeMap<String, AgentLaunchSettings>,
+) -> Result<BTreeMap<String, AgentLaunchSettings>, String> {
+    let changed = || {
+        "Provider preferences changed before this repair was acknowledged. Restart the app to load the changed preferences.".to_owned()
+    };
+    let mut merged_base = base.clone();
+    for (provider, configuration) in requested {
+        let Some(previous) = base.get(provider) else {
+            if configuration.unreadable_execution.2.is_empty() {
+                continue;
+            }
+            return Err(changed());
+        };
+        if configuration.container_repair_requested() {
+            let observed = configuration
+                .unreadable_execution
+                .1
+                .as_ref()
+                .expect("requested container");
+            if previous.unreadable_execution.1.as_ref() != Some(observed) {
+                return Err(changed());
+            }
+            if observed.all_providers {
+                let original = previous.stored_unreadable_container().as_ref() == Some(observed)
+                    && current.len() == Provider::ALL.len()
+                    && current
+                        .values()
+                        .all(|current| current.unreadable_execution.1.as_ref() == Some(observed));
+                if original {
+                    return Ok(merged_base);
+                }
+                if current.is_empty() {
+                    return Ok(BTreeMap::new());
+                }
+                return Err(changed());
+            }
+            let actual = current.get(provider).ok_or_else(changed)?;
+            if previous.stored_unreadable_container().as_ref() == Some(observed)
+                && actual.unreadable_execution.1.as_ref() == Some(observed)
+            {
+                continue;
+            }
+            if actual != &AgentLaunchSettings::default() {
+                return Err(changed());
+            }
+            merged_base.insert(provider.clone(), AgentLaunchSettings::default());
+            continue;
+        }
+        for field in &configuration.unreadable_execution.2 {
+            let observed = configuration
+                .unreadable_execution
+                .0
+                .get(field)
+                .ok_or_else(changed)?;
+            if previous.unreadable_execution.0.get(field) != Some(observed) {
+                return Err(changed());
+            }
+            let actual = current.get(provider).ok_or_else(changed)?;
+            if actual.unreadable_container().is_some() {
+                return Err(changed());
+            }
+            if let Some(raw) = actual.stored_unreadable_field(field) {
+                if previous.stored_unreadable_field(field) == Some(observed) && raw == observed {
+                    continue;
+                }
+                return Err(changed());
+            }
+            if !same_field(configuration, actual, field) {
+                return Err(changed());
+            }
+            let baseline = merged_base.get_mut(provider).expect("observed provider");
+            match field.as_str() {
+                "executable" => baseline.executable.clone_from(&actual.executable),
+                "arguments" => baseline.arguments.clone_from(&actual.arguments),
+                "environment" => baseline.environment.clone_from(&actual.environment),
+                _ => return Err(changed()),
+            }
+            baseline.unreadable_execution.0.remove(field);
+            baseline.unreadable_execution.2.remove(field);
+        }
+    }
+    Ok(merged_base)
+}
+
 /// An old window may edit other preferences, but cannot replace a newly
 /// unreadable container or apply a reset after that exact container changed.
 pub(super) fn validate_container_repairs(
@@ -354,7 +444,7 @@ pub(super) fn validate_container_repairs(
             || base_global != current_global
             || (!desired.is_empty() && !requested)
         {
-            return Err("Provider preferences changed or are unreadable. Reopen Agents settings before resetting this section.".into());
+            return Err("Provider preferences changed or are unreadable. Restart the app to load the changed preferences before resetting this section.".into());
         }
         return Ok(());
     }
@@ -379,7 +469,7 @@ pub(super) fn validate_container_repairs(
                 || (desired.contains_key(key) && !requested))
         {
             return Err(format!(
-                "{} preferences changed or are unreadable. Reopen Agents settings before resetting this provider.",
+                "{} preferences changed or are unreadable. Restart the app to load the changed preferences before resetting this provider.",
                 provider.label()
             ));
         }
@@ -393,11 +483,15 @@ pub(super) fn validate_container_repairs(
             let observed = base.stored_unreadable_field(field);
             let actual = current.stored_unreadable_field(field);
             if (observed.is_some() || actual.is_some())
-                && base_value.get(field) != desired_value.get(field)
+                && match (base_value.get(field), desired_value.get(field)) {
+                    (Some(base), Some(desired)) => !super::same_toml(base, desired),
+                    (None, None) => false,
+                    _ => true,
+                }
                 && (observed.is_none() || observed != actual)
             {
                 return Err(format!(
-                    "{} saved {field} changed or is unreadable. Reopen Agents settings before repairing it.",
+                    "{} saved {field} changed or is unreadable. Restart the app to load the changed preferences before repairing it.",
                     provider.label()
                 ));
             }
@@ -1459,6 +1553,104 @@ environment = { KEEP = "kept-value", BROKEN = 7 }"#,
         );
         assert_eq!(current.agents["claude"].arguments, ["--before", "--after"]);
         assert_eq!(current.agents["claude"].environment["KEEP"], "value");
+    }
+
+    #[test]
+    fn canonical_policy_repair_retries_after_confirmation_failure_without_overwriting_new_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for (index, original) in [
+            "schema_version = 3\n[agents.claude]\narguments = [\"--before\", 7, \"--after\"]\nenvironment = { KEEP = \"value\" }\n",
+            "schema_version = 3\n[agents]\nclaude = [\"private-policy\"]\n[agents.codex]\narguments = [\"--sibling\"]\n",
+            "schema_version = 3\nagents = [\"private-policy\"]\n",
+        ].into_iter().enumerate() {
+            std::fs::write(&path, original).unwrap();
+            let base = super::super::load(&path).unwrap();
+            let observed = base.agents["claude"].unreadable_container()
+                .or_else(|| base.agents["claude"].unreadable_field("arguments")).unwrap();
+            let mut requested = base.clone();
+            assert!(repair_unreadable_policy(&mut requested.agents, Provider::Claude, &observed));
+            let canonical = directory.path().join(format!("canonical-{index}.toml"));
+            let backup = canonical.clone();
+            let result = super::super::with_agent_repair_confirmation_hook(move |path| {
+                // The actual canonical write completed. Make the real
+                // load_unlocked confirmation fail on a non-file destination.
+                std::fs::rename(path, &backup).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }, || super::super::save_merged(&path, &base, &requested));
+            assert!(result.is_err());
+            assert!(path.is_dir());
+            assert!(requested.agents["claude"].validate_execution(Provider::Claude).is_err());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&canonical, &path).unwrap();
+            let persisted = super::super::load(&path).unwrap();
+            confirm_policy_repairs(&requested.agents, &persisted.agents).unwrap();
+            // Preserve another window's unrelated edit during exact retry.
+            let mut other = persisted.clone();
+            other.terminal_font_size = 31.0;
+            super::super::save_merged(&path, &persisted, &other).unwrap();
+            super::super::save_merged(&path, &base, &requested).unwrap();
+            let retried = super::super::load(&path).unwrap();
+            assert_eq!(retried.terminal_font_size, 31.0);
+            assert_eq!(retried.agents, persisted.agents);
+            assert!(requested.agents["claude"].validate_execution(Provider::Claude).is_err());
+            complete_policy_repairs(&mut requested.agents);
+            assert_eq!(requested.agents, retried.agents);
+            // A different canonical policy is never replaced by retrying the
+            // old intent, including an already-confirmed lane's copied base.
+            let mut changed = retried.clone();
+            changed.agents.entry("claude".into()).or_default().arguments = vec!["--new-policy".into()];
+            super::super::save_merged(&path, &retried, &changed).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut old_request = base.clone();
+            assert!(repair_unreadable_policy(&mut old_request.agents, Provider::Claude, &observed));
+            assert!(super::super::save_merged(&path, &base, &old_request).is_err());
+            assert!(super::super::save_merged(&path, &old_request, &old_request).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn unchanged_nan_policy_cannot_undo_another_windows_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for original in [
+            "schema_version = 3\n[agents.claude]\narguments = nan\n",
+            "schema_version = 3\n[agents]\nclaude = nan\n",
+            "schema_version = 3\nagents = nan\n",
+        ] {
+            std::fs::write(&path, original).unwrap();
+            let first = super::super::load(&path).unwrap();
+            let stale = super::super::load(&path).unwrap();
+            assert_eq!(first.agents, stale.agents);
+            let observed = first.agents["claude"]
+                .unreadable_container()
+                .or_else(|| first.agents["claude"].unreadable_field("arguments"))
+                .unwrap();
+            let mut repair = first.clone();
+            assert!(repair_unreadable_policy(
+                &mut repair.agents,
+                Provider::Claude,
+                &observed
+            ));
+            super::super::save_merged(&path, &first, &repair).unwrap();
+            let repaired = super::super::load(&path).unwrap();
+            let mut other = stale.clone();
+            other.terminal_font_size = 27.0;
+            super::super::save_merged(&path, &stale, &other).unwrap();
+            let final_settings = super::super::load(&path).unwrap();
+            assert_eq!(final_settings.terminal_font_size, 27.0);
+            assert_eq!(final_settings.agents, repaired.agents);
+            for provider in Provider::ALL {
+                final_settings
+                    .agents
+                    .get(provider_key(provider))
+                    .cloned()
+                    .unwrap_or_default()
+                    .validate_execution(provider)
+                    .unwrap();
+            }
+        }
     }
 
     #[cfg(any(feature = "ui", feature = "host"))]
