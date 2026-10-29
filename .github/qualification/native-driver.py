@@ -241,13 +241,29 @@ def copy_exact(pid, name, expected, keyboard=False):
     children.append(owner)
     owner.stdin.write(sentinel)
     owner.stdin.close()
+    last_read = {}
     def clipboard():
         result = subprocess.run(['xclip', '-selection', 'clipboard', '-out'],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        last_read.update({'monotonic': time.monotonic(), 'exit_code': result.returncode,
+                          'bytes': len(result.stdout), 'sha256': hashlib.sha256(result.stdout).hexdigest(),
+                          'matches_sentinel': result.stdout == sentinel,
+                          'matches_expected': result.stdout == expected})
         return result.stdout if result.returncode == 0 else None
-    wait(lambda: clipboard() == sentinel)
-    click(pid, name, keyboard=keyboard)
-    wait(lambda: clipboard() == expected)
+    phase = 'await-sentinel'
+    try:
+        wait(lambda: clipboard() == sentinel)
+        phase = 'gesture'
+        click(pid, name, keyboard=keyboard)
+        phase = 'await-expected'
+        wait(lambda: clipboard() == expected)
+    except BaseException:
+        try:
+            event({'event': 'clipboard-incomplete', 'pid': pid, 'name': name, 'phase': phase,
+                   'last_read': last_read, 'sentinel_owner_exit_code': owner.poll()})
+        except BaseException as diagnostic_error:
+            print('Clipboard failure diagnostics unavailable: ' + repr(diagnostic_error), file=sys.stderr)
+        raise
     event({'event': 'clipboard-match', 'pid': pid, 'name': name, 'bytes': len(expected),
            'sha256': hashlib.sha256(expected).hexdigest()})
 
