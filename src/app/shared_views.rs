@@ -2394,10 +2394,15 @@ impl Cagents {
                             (a, b) => a == b,
                         };
                         if !same_session {
-                            // Text the reader has not sent yet belongs to the
-                            // card, not the session, so the replacement opens
-                            // with it.
-                            self.stash_unsent_chat(pane.id);
+                            // An unstarted chat replaced by another unstarted
+                            // one is still the reader's draft, so it opens with
+                            // their unsent text. Text written to a started
+                            // conversation is not handed to a different one.
+                            if matches!((&card.kind, &pane.kind),
+                                (CardKind::Chat(a), CardKind::Chat(b)) if a.is_unstarted() && b.is_unstarted())
+                            {
+                                self.stash_unsent_chat(pane.id);
+                            }
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
                             // Card identity survives a session replacement, but
@@ -6620,13 +6625,20 @@ mod tests {
 
     /// Unsent composer text belongs to the card. Another client replacing an
     /// unstarted chat's identity, then moving the card to another channel, must
-    /// leave the text in the composer and in what autosave writes.
+    /// leave the text in the composer and in what autosave writes. A started
+    /// conversation put in its place is a different conversation, which the
+    /// text was not written to.
     #[test]
     fn unsent_text_survives_replaced_identity_and_transfer() {
         use crate::app::workspace_model_sync::ModelUpdate;
         const TEXT: &str = "unsent fixture draft\n  keeps its spacing ";
-        for (replace, transfer) in [(true, false), (true, true), (false, true)] {
-            let case = format!("replace={replace} transfer={transfer}");
+        for (replace, transfer, started) in [
+            (true, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let case = format!("replace={replace} transfer={transfer} started={started}");
             let (mut app, a, b, _) = fixture();
             app.active_workspace = Some(PathBuf::from("/repo"));
             Arc::make_mut(&mut app.durable).active_channel = Some(a);
@@ -6675,9 +6687,25 @@ mod tests {
                     unreachable!()
                 };
                 session.id = TerminalId::new();
-                assert!(session.is_unstarted(), "{case}");
+                if started {
+                    session.launch.session_id = Some("fixture-started-conversation".into());
+                }
+                assert_eq!(session.is_unstarted(), !started, "{case}");
                 model.views[0].panes = vec![pane.clone()];
                 apply(&mut app, &mut model, Scope::Channel(a));
+            }
+            if started {
+                assert!(app.card_state(card).unwrap().existence.is_open(), "{case}");
+                assert!(
+                    !matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.unsent_text().is_empty()),
+                    "{case}: the started conversation does not show the text"
+                );
+                assert_eq!(
+                    app.persistent_workspace().chat_drafts.get(&card),
+                    None,
+                    "{case}: autosave"
+                );
+                continue;
             }
             if transfer {
                 model.views[0].panes.clear();
