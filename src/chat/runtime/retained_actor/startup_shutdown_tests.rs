@@ -606,22 +606,37 @@ fn actual_helper_subreaper_refusal_is_before_provider_and_still_reaps73() {
     }
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let marker = root.path().join("provider-started");
+    let executable = root.path().join("claude-marker");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&executable)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"#!/bin/sh\n: > \"${0%/*}/provider-started\"\n")
+            .unwrap();
+    }
     let mut source = fixture_source();
-    source.launch.recipe.program = "/bin/sh".into();
-    source.launch.recipe.arguments = vec!["-c".into(), format!("touch {}", marker.display())];
+    source.launch.recipe.program = executable.to_string_lossy().into_owned();
+    source.launch.recipe.arguments.clear();
     source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+    // Validate the actual recipe before creating a helper. Its executable
+    // would leave a marker, but subreaper refusal must precede provider spawn.
+    let request = refused_request(source);
     let owner = owner();
     let (control, peer) = UnixStream::pair().unwrap();
     let mut child = DirectChildGuard::new(owner.clone(), Some(control));
     // Confirm this exact caller would authorize before introducing the kernel
     // refusal; the helper still performs its own real authentication.
-    authorize(child.control(), source.proof.as_ref().unwrap()).unwrap();
+    authorize(child.control(), request.source.proof.as_ref().unwrap()).unwrap();
     let mut command = helper_command(&peer, true);
     child.spawn(&mut command).unwrap();
     drop(peer);
-    send(child.control(), &refused_request(source), TIMEOUT).unwrap();
+    send(child.control(), &request, TIMEOUT).unwrap();
     let response: Result<Attached, String> = receive(child.control(), TIMEOUT).unwrap();
     let Err(error) = response else {
         panic!("helper accepted refused subreaper setup")
