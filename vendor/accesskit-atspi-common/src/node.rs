@@ -303,6 +303,12 @@ impl NodeWrapper<'_> {
         if state.is_multiselectable() {
             atspi_state.insert(State::Multiselectable);
         }
+        if let Some(expanded) = state.data().is_expanded() {
+            atspi_state.insert(State::Expandable);
+            if expanded {
+                atspi_state.insert(State::Expanded);
+            }
+        }
         if let Some(orientation) = state.orientation() {
             atspi_state.insert(if orientation == Orientation::Horizontal {
                 State::Horizontal
@@ -349,7 +355,7 @@ impl NodeWrapper<'_> {
 
         if state.is_read_only_supported() && state.is_read_only_or_disabled() {
             atspi_state.insert(State::ReadOnly);
-        } else {
+        } else if !state.is_disabled() {
             atspi_state.insert(State::Enabled | State::Sensitive);
         }
 
@@ -407,8 +413,30 @@ impl NodeWrapper<'_> {
         self.0.is_root()
     }
 
+    fn supported_actions(&self) -> impl Iterator<Item = Action> + '_ {
+        let enabled = !self.0.is_disabled();
+        [
+            self.0.is_clickable(&filter).then_some(Action::Click),
+            self.0
+                .data()
+                .supports_action(Action::Expand)
+                .then_some(Action::Expand),
+            self.0
+                .data()
+                .supports_action(Action::Collapse)
+                .then_some(Action::Collapse),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(move |_| enabled)
+    }
+
+    fn action_at(&self, index: i32) -> Option<Action> {
+        self.supported_actions().nth(usize::try_from(index).ok()?)
+    }
+
     fn supports_action(&self) -> bool {
-        self.0.is_clickable(&filter)
+        self.supported_actions().next().is_some()
     }
 
     fn supports_component(&self) -> bool {
@@ -466,18 +494,17 @@ impl NodeWrapper<'_> {
     }
 
     fn n_actions(&self) -> i32 {
-        if self.0.is_clickable(&filter) { 1 } else { 0 }
+        self.supported_actions().count() as i32
     }
 
     fn get_action_name(&self, index: i32) -> String {
-        if index != 0 {
-            return String::new();
+        match self.action_at(index) {
+            Some(Action::Click) => "click",
+            Some(Action::Expand) => "expand",
+            Some(Action::Collapse) => "collapse",
+            _ => "",
         }
-        String::from(if self.0.is_clickable(&filter) {
-            "click"
-        } else {
-            ""
-        })
+        .to_owned()
     }
 
     fn raw_bounds_and_transform(&self) -> (Option<Rect>, Affine) {
@@ -514,6 +541,28 @@ impl NodeWrapper<'_> {
         self.0.numeric_value()
     }
 
+    fn active_descendant(&self) -> Option<NodeId> {
+        fn find(node: Node<'_>, target: LocalNodeId) -> Option<NodeId> {
+            // Raw child IDs and consumer children correspond within this
+            // tree. A graft points into another tree and must not alias a
+            // same-numbered local target there.
+            if node.is_graft() {
+                return None;
+            }
+            node.data()
+                .children()
+                .iter()
+                .zip(node.children())
+                .find_map(|(id, child)| match filter(&child) {
+                    FilterResult::ExcludeSubtree => None,
+                    FilterResult::Include if *id == target => Some(child.id()),
+                    _ => find(child, target),
+                })
+        }
+        let target = self.0.data().active_descendant()?;
+        find(*self.0, target).or_else(|| self.0.controls().find_map(|node| find(node, target)))
+    }
+
     pub(crate) fn notify_changes(
         &self,
         window_bounds: &WindowBounds,
@@ -521,6 +570,13 @@ impl NodeWrapper<'_> {
         old: &NodeWrapper<'_>,
     ) {
         self.notify_state_changes(adapter, old);
+        if self.0.data().active_descendant() != old.0.data().active_descendant() {
+            if let Some(target) = self.active_descendant() {
+                adapter.emit_object_event(self.id(), ObjectEvent::ActiveDescendantChanged(target));
+            }
+            // This event has no null target. Clearing the property must not
+            // fabricate a descendant; normal focus/expanded events remain.
+        }
         self.notify_property_changes(adapter, old);
         self.notify_bounds_changes(window_bounds, adapter, old);
         self.notify_children_changes(adapter, old);
@@ -617,6 +673,54 @@ impl NodeWrapper<'_> {
         for child in old_filtered_children.into_iter() {
             if !new_filtered_children.contains(&child) {
                 adapter.emit_object_event(self.id(), ObjectEvent::ChildRemoved(child));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod disabled_state_tests {
+    use super::*;
+
+    fn states(role: Role, disabled: bool, read_only: bool) -> StateSet {
+        let mut node = accesskit::Node::new(role);
+        if disabled {
+            node.set_disabled();
+        }
+        if read_only {
+            node.set_read_only();
+        }
+        let tree = Tree::new(
+            accesskit::TreeUpdate {
+                nodes: vec![(LocalNodeId(0), node)],
+                tree: Some(accesskit::Tree::new(LocalNodeId(0))),
+                tree_id: TreeId::ROOT,
+                focus: LocalNodeId(0),
+            },
+            false,
+        );
+        NodeWrapper(&tree.state().root()).state(false)
+    }
+
+    #[test]
+    fn disabled_action_controls_do_not_advertise_enabled_or_sensitive() {
+        for role in [Role::Button, Role::DefaultButton, Role::Link] {
+            for disabled in [false, true] {
+                let states = states(role, disabled, false);
+                assert_eq!(states.contains(State::Enabled), !disabled, "{role:?}");
+                assert_eq!(states.contains(State::Sensitive), !disabled, "{role:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_text_state_behavior_is_preserved() {
+        for read_only in [false, true] {
+            for disabled in [false, true] {
+                let states = states(Role::TextInput, disabled, read_only);
+                assert_eq!(states.contains(State::ReadOnly), read_only || disabled);
+                assert_eq!(states.contains(State::Enabled), !read_only && !disabled);
+                assert_eq!(states.contains(State::Sensitive), !read_only && !disabled);
             }
         }
     }
@@ -972,15 +1076,23 @@ impl PlatformNode {
     }
 
     pub fn do_action(&self, index: i32) -> Result<bool> {
-        if index != 0 {
-            return Ok(false);
-        }
-        self.do_action_internal(self.id, |_, _, target_node, target_tree| ActionRequest {
-            action: Action::Click,
-            target_tree,
-            target_node,
-            data: None,
-        })?;
+        let context = self.upgrade_context()?;
+        let request = {
+            let tree = context.read_tree();
+            let node = tree.state().node_by_id(self.id).ok_or(Error::Defunct)?;
+            let Some(action) = NodeWrapper(&node).action_at(index) else {
+                return Ok(false);
+            };
+            let (target_node, target_tree) = tree.locate_node(self.id).ok_or(Error::Defunct)?;
+            ActionRequest {
+                action,
+                target_tree,
+                target_node,
+                data: None,
+            }
+        };
+        // Release the tree read lock before calling application code.
+        context.do_action(request);
         Ok(true)
     }
 
@@ -1769,6 +1881,302 @@ mod editable_text_tests {
                     .interfaces()
                     .contains(Interface::EditableText),
                 expected
+            );
+        }
+    }
+}
+
+// In-process platform projection/callback contracts. These do not start a
+// native window, AT-SPI service, accessibility client, or screen reader.
+#[cfg(test)]
+mod dropdown_accessibility_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Callback(Arc<Mutex<Vec<crate::Event>>>);
+    impl crate::AdapterCallback for Callback {
+        fn register_interfaces(&self, _: &crate::Adapter, _: NodeId, _: InterfaceSet) {}
+        fn unregister_interfaces(&self, _: &crate::Adapter, _: NodeId, _: InterfaceSet) {}
+        fn emit_event(&self, _: &crate::Adapter, event: crate::Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    struct Capture(Arc<Mutex<Vec<ActionRequest>>>);
+    impl accesskit::ActionHandler for Capture {
+        fn do_action(&mut self, request: ActionRequest) {
+            self.0.lock().unwrap().push(request);
+        }
+    }
+    fn update(node: accesskit::Node) -> accesskit::TreeUpdate {
+        accesskit::TreeUpdate {
+            nodes: vec![(LocalNodeId(0), node)],
+            tree: Some(accesskit::Tree::new(LocalNodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(0),
+        }
+    }
+    fn combo(expanded: bool) -> accesskit::Node {
+        let mut node = accesskit::Node::new(Role::ComboBox);
+        node.set_label("Settings category");
+        node.set_expanded(expanded);
+        for action in [Action::Click, Action::Expand, Action::Collapse] {
+            node.add_action(action);
+        }
+        node
+    }
+    fn adapter(
+        state: accesskit::TreeUpdate,
+        events: Arc<Mutex<Vec<crate::Event>>>,
+        actions: Arc<Mutex<Vec<ActionRequest>>>,
+    ) -> crate::Adapter {
+        let app = AppContext::new(Some("private-dropdown-test".into()));
+        crate::Adapter::new(
+            &app,
+            Callback(events),
+            state,
+            false,
+            crate::WindowBounds::default(),
+            Capture(actions),
+        )
+    }
+
+    #[test]
+    fn native_dropdown_actions_keep_click_index_and_dispatch_stable_expand_collapse() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = adapter(update(combo(false)), events.clone(), actions.clone());
+        let field = adapter.platform_node(adapter.root_id());
+        assert_eq!(field.n_actions().unwrap(), 3);
+        assert_eq!(field.action_name(0).unwrap(), "click");
+        assert_eq!(field.action_name(1).unwrap(), "expand");
+        assert_eq!(field.action_name(2).unwrap(), "collapse");
+        assert!(field.state().contains(State::Expandable));
+        assert!(!field.state().contains(State::Expanded));
+        assert!(field.do_action(1).unwrap());
+        events.lock().unwrap().clear();
+        adapter.update(update(combo(true)));
+        assert_eq!(field.action_name(1).unwrap(), "expand");
+        assert!(field.do_action(1).unwrap());
+        assert!(field.do_action(2).unwrap());
+        assert!(field.state().contains(State::Expanded));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            crate::Event::Object {
+                event: ObjectEvent::StateChanged(State::Expanded, true),
+                ..
+            }
+        )));
+        let actions = actions.lock().unwrap();
+        assert_eq!(
+            actions
+                .iter()
+                .map(|request| request.action)
+                .collect::<Vec<_>>(),
+            [Action::Expand, Action::Expand, Action::Collapse]
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|request| request.target_node == LocalNodeId(0)
+                    && request.target_tree == TreeId::ROOT
+                    && request.data.is_none())
+        );
+    }
+
+    #[test]
+    fn native_dropdown_actions_refuse_disabled_unsupported_and_invalid_indices() {
+        for disabled in [false, true] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            let mut node = accesskit::Node::new(Role::ListBox);
+            node.add_action(Action::Collapse);
+            if disabled {
+                node.set_disabled();
+            }
+            let adapter = adapter(update(node), events, actions.clone());
+            let list = adapter.platform_node(adapter.root_id());
+            assert_eq!(list.supports_action().unwrap(), !disabled);
+            assert_eq!(list.n_actions().unwrap(), if disabled { 0 } else { 1 });
+            assert_eq!(
+                list.action_name(0).unwrap(),
+                if disabled { "" } else { "collapse" }
+            );
+            assert!(!list.do_action(-1).unwrap());
+            assert!(!list.do_action(1).unwrap());
+            assert!(!list.do_action(i32::MAX).unwrap());
+            assert_eq!(list.do_action(0).unwrap(), !disabled);
+            assert_eq!(actions.lock().unwrap().len(), usize::from(!disabled));
+            assert!(
+                actions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.action == Action::Collapse)
+            );
+        }
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let adapter = adapter(
+            update(accesskit::Node::new(Role::ComboBox)),
+            Default::default(),
+            actions.clone(),
+        );
+        let field = adapter.platform_node(adapter.root_id());
+        assert!(!field.supports_action().unwrap());
+        assert!(!field.do_action(0).unwrap());
+        assert!(actions.lock().unwrap().is_empty());
+        assert!(!field.state().contains(State::Expandable));
+    }
+    fn selection_update(
+        open: bool,
+        scroll: f64,
+        selected: Option<usize>,
+        display: u64,
+    ) -> accesskit::TreeUpdate {
+        let labels = ["Appearance", "Terminal", "Editor"];
+        let mut window = accesskit::Node::new(Role::Window);
+        window.set_children(if open {
+            vec![LocalNodeId(1), LocalNodeId(3)]
+        } else {
+            vec![LocalNodeId(1)]
+        });
+        let mut field = combo(open);
+        field.set_bounds(Rect::new(0.0, 0.0, 200.0, 32.0));
+        let mut nodes = Vec::new();
+        if let Some(label) = selected.and_then(|index| labels.get(index)) {
+            field.set_value(*label);
+            field.set_children(vec![LocalNodeId(display)]);
+            let mut value = accesskit::Node::new(Role::ListBoxOption);
+            value.set_label(*label);
+            value.set_selected(true);
+            value.set_read_only();
+            value.set_bounds(Rect::new(8.0, 7.0, 190.0, 25.0));
+            nodes.push((LocalNodeId(display), value));
+        }
+        if open {
+            field.set_controls(vec![LocalNodeId(3)]);
+            let mut popup = accesskit::Node::new(Role::ListBox);
+            popup.set_bounds(Rect::new(0.0, 40.0, 200.0, 75.0));
+            popup.set_clips_children();
+            popup.add_action(Action::Collapse);
+            popup.set_children((4..7).map(LocalNodeId).collect::<Vec<_>>());
+            nodes.push((LocalNodeId(3), popup));
+            for (index, label) in labels.into_iter().enumerate() {
+                let mut option = accesskit::Node::new(Role::ListBoxOption);
+                option.set_label(label);
+                option.set_selected(selected == Some(index));
+                option.add_action(Action::Click);
+                let top = 40.0 + index as f64 * 30.0 - scroll;
+                option.set_bounds(Rect::new(0.0, top, 200.0, top + 30.0));
+                nodes.push((LocalNodeId(4 + index as u64), option));
+            }
+        }
+        nodes.extend([(LocalNodeId(0), window), (LocalNodeId(1), field)]);
+        accesskit::TreeUpdate {
+            nodes,
+            tree: Some(accesskit::Tree::new(LocalNodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(1),
+        }
+    }
+
+    #[test]
+    fn native_dropdown_selection_exposes_one_real_display_value_across_popup_scroll_and_changes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = adapter(
+            selection_update(false, 0.0, Some(0), 2),
+            events.clone(),
+            actions.clone(),
+        );
+        let window = adapter.platform_node(adapter.root_id());
+        let field = adapter.platform_node(window.child_at_index(0).unwrap().unwrap());
+        for (open, scroll) in [(false, 0.0), (true, 0.0), (true, 100.0)] {
+            adapter.update(selection_update(open, scroll, Some(0), 2));
+            assert_eq!(field.name().unwrap(), "Settings category");
+            assert!(field.interfaces().unwrap().contains(Interface::Selection));
+            assert!(
+                !field.supports_value().unwrap(),
+                "string choices are not numeric Value"
+            );
+            assert_eq!(field.n_selected_children().unwrap(), 1);
+            let selected = field.selected_child(0).unwrap().unwrap();
+            assert_eq!(
+                adapter.platform_node(selected).name().unwrap(),
+                "Appearance"
+            );
+            assert!(!adapter.platform_node(selected).do_action(0).unwrap());
+            assert!(field.selected_child(1).unwrap().is_none());
+            if open {
+                let popup = window.child_at_index(1).unwrap().unwrap();
+                let relations = field.relation_set(|id| id).unwrap();
+                assert_eq!(
+                    relations.get(&RelationType::ControllerFor),
+                    Some(&vec![popup])
+                );
+            }
+        }
+        events.lock().unwrap().clear();
+        adapter.update(selection_update(false, 0.0, Some(1), 7));
+        assert_eq!(field.n_selected_children().unwrap(), 1);
+        let selected = field.selected_child(0).unwrap().unwrap();
+        assert_eq!(adapter.platform_node(selected).name().unwrap(), "Terminal");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event,
+            crate::Event::Object { target: NodeIdOrRoot::Node(target), event: ObjectEvent::SelectionChanged } if *target == field.id()
+        )), "a changed display identity must notify the actual Combo Selection owner");
+        adapter.update(selection_update(false, 0.0, None, 8));
+        assert_eq!(field.n_selected_children().unwrap(), 0);
+        assert!(field.selected_child(0).unwrap().is_none());
+        assert!(actions.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn native_dropdown_active_descendant_notifies_current_controlled_option_and_never_fakes_none() {
+        fn highlighted(target: Option<u64>) -> accesskit::TreeUpdate {
+            let mut state = selection_update(true, 0.0, Some(0), 2);
+            let field = &mut state
+                .nodes
+                .iter_mut()
+                .find(|(id, _)| *id == LocalNodeId(1))
+                .unwrap()
+                .1;
+            if let Some(target) = target {
+                field.set_active_descendant(LocalNodeId(target));
+            }
+            let window = &mut state
+                .nodes
+                .iter_mut()
+                .find(|(id, _)| *id == LocalNodeId(0))
+                .unwrap()
+                .1;
+            window.set_children(vec![LocalNodeId(1), LocalNodeId(3), LocalNodeId(8)]);
+            state
+                .nodes
+                .push((LocalNodeId(8), accesskit::Node::new(Role::Button)));
+            state
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = adapter(highlighted(Some(4)), events.clone(), Default::default());
+        let window = adapter.platform_node(adapter.root_id());
+        let field = adapter.platform_node(window.child_at_index(0).unwrap().unwrap());
+        let popup = adapter.platform_node(window.child_at_index(1).unwrap().unwrap());
+        let current = popup.child_at_index(1).unwrap().unwrap();
+        events.lock().unwrap().clear();
+        adapter.update(highlighted(Some(5)));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(event,
+            crate::Event::Object { target: NodeIdOrRoot::Node(owner), event: ObjectEvent::ActiveDescendantChanged(target) }
+                if *owner == field.id() && *target == current
+        )));
+        for target in [None, Some(8)] {
+            events.lock().unwrap().clear();
+            adapter.update(highlighted(target));
+            assert!(
+                !events.lock().unwrap().iter().any(|event| matches!(
+                    event,
+                    crate::Event::Object {
+                        event: ObjectEvent::ActiveDescendantChanged(_),
+                        ..
+                    }
+                )),
+                "no null or unrelated target may be fabricated"
             );
         }
     }

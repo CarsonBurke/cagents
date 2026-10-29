@@ -1683,15 +1683,10 @@ async fn run_instance<P>(
             }
             #[cfg(feature = "a11y")]
             Event::Accessibility(id, action_request) => {
-                if let (Some(interface), Some(window)) =
-                    (user_interfaces.get_mut(&id), window_manager.get_mut(id))
-                {
-                    if interface.focus_accessibility_action(
-                        &window.renderer,
-                        &action_request,
-                    ) {
-                        window.raw.request_redraw();
-                    }
+                // The UserInterface applies focus in event order, when this
+                // request is delivered through its overlay and base widgets.
+                if let Some(window) = window_manager.get_mut(id) {
+                    window.raw.request_redraw();
                 }
                 events.push((Some(id), conversion::a11y(action_request)));
             }

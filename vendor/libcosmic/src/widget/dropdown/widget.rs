@@ -217,6 +217,10 @@ where
                 .ne(self.selections.iter().map(AsRef::as_ref))
         {
             state.source_epoch.fetch_add(1, Ordering::SeqCst);
+            #[cfg(feature = "a11y")]
+            {
+                state.selected_display_id = Id::unique();
+            }
             state.source_id = self.source_id.as_deref().map(str::to_owned);
             state.source = self
                 .selections
@@ -492,14 +496,13 @@ where
         } else {
             node.add_action(Action::Focus);
             node.add_action(Action::Click);
-            node.add_action(if open {
-                Action::Collapse
-            } else {
-                Action::Expand
-            });
+            // Keep native action indices stable across expand/collapse.
+            // Both operations are idempotent for this current control.
+            node.add_action(Action::Expand);
+            node.add_action(Action::Collapse);
         }
         let active = *state.hovered_option.lock().unwrap();
-        let children = if open && self.window_id.is_none() {
+        let popup = if open && self.window_id.is_none() {
             state
                 .menu
                 .accessibility_tree(&self.selections, self.selected, active)
@@ -507,15 +510,57 @@ where
             A11yTree::default()
         };
         // A separate native popup owns another tree. Only reference options
-        // actually exported beneath this parent control.
-        if let Some(active) = children
+        // actually exported in this owner's controlled popup tree.
+        if let Some(active) = popup
             .root()
             .iter()
             .find_map(|node| node.node().active_descendant())
         {
             node.set_active_descendant(active);
         }
-        A11yTree::node_with_child_tree(A11yNode::new(node, id), children)
+        node.set_controls(
+            popup
+                .root()
+                .iter()
+                .map(|node| node.id().clone().into())
+                .collect::<Vec<_>>(),
+        );
+        // This is the selected text actually painted in the closed control.
+        // Keep it distinct from popup choices: a sibling popup preserves one
+        // ComboBox Selection item even when its selected option is clipped.
+        let displayed =
+            if let Some(value) = self.selected.and_then(|index| self.selections.get(index)) {
+                let mut selected = Node::new(Role::ListBoxOption);
+                selected.set_label(value.as_ref().to_owned());
+                selected.set_selected(true);
+                selected.set_read_only();
+                let icon_width = self
+                    .selected
+                    .and_then(|index| self.icons.get(index))
+                    .map_or(0.0, |_| 24.0);
+                let text_height = f32::from(
+                    self.text_line_height
+                        .to_absolute(Pixels(self.text_size.unwrap_or(14.0))),
+                );
+                let left = (bounds.x + self.padding.left + icon_width).min(bounds.x + bounds.width);
+                let right = (bounds.x + bounds.width - self.padding.right).max(left);
+                selected.set_bounds(Rect::new(
+                    left as f64,
+                    (bounds.center_y() - text_height / 2.0) as f64,
+                    right as f64,
+                    (bounds.center_y() + text_height / 2.0) as f64,
+                ));
+                A11yTree::leaf(selected, state.selected_display_id.clone())
+            } else {
+                A11yTree::default()
+            };
+        A11yTree::join(
+            [
+                A11yTree::node_with_child_tree(A11yNode::new(node, id), displayed),
+                popup,
+            ]
+            .into_iter(),
+        )
     }
 }
 
@@ -552,6 +597,8 @@ pub struct State {
     source_epoch: Arc<AtomicU64>,
     opening_epoch: u64,
     source_id: Option<String>,
+    #[cfg(feature = "a11y")]
+    selected_display_id: Id,
     owns_control: bool,
 }
 
@@ -578,6 +625,8 @@ impl State {
             source_epoch: Arc::new(AtomicU64::new(0)),
             opening_epoch: 0,
             source_id: None,
+            #[cfg(feature = "a11y")]
+            selected_display_id: Id::unique(),
             owns_control: true,
         }
     }
@@ -604,6 +653,8 @@ impl Clone for State {
             source_epoch: self.source_epoch.clone(),
             opening_epoch: self.opening_epoch,
             source_id: self.source_id.clone(),
+            #[cfg(feature = "a11y")]
+            selected_display_id: self.selected_display_id.clone(),
             owns_control: false,
         }
     }

@@ -307,6 +307,60 @@ where
                 event_cursor
             })
             .collect();
+        // Accessibility actions must keep overlay and base delivery in the
+        // same order. Otherwise a later option Click can run before an
+        // earlier root Collapse, or pre-focusing a later control can retire
+        // an earlier queued option before it is selected. Preserve the
+        // original cursor replay when taking this bounded slow path.
+        #[cfg(feature = "a11y")]
+        if events.len() > 1
+            && events.iter().any(|event| matches!(event, Event::A11y(..)))
+        {
+            let mut outdated = false;
+            let mut redraw_request = window::RedrawRequest::Wait;
+            let mut input_method = InputMethod::Disabled;
+            let mut has_layout_changed = false;
+            let mut mouse_interaction = mouse::Interaction::None;
+            let mut statuses = Vec::with_capacity(events.len());
+            for (event, cursor) in events.iter().zip(event_cursors) {
+                let (state, event_statuses) = self.update(
+                    std::slice::from_ref(event),
+                    cursor,
+                    renderer,
+                    clipboard,
+                    messages,
+                );
+                statuses.extend(event_statuses);
+                match state {
+                    State::Outdated => outdated = true,
+                    State::Updated {
+                        mouse_interaction: interaction,
+                        redraw_request: redraw,
+                        input_method: method,
+                        has_layout_changed: changed,
+                    } => {
+                        mouse_interaction = interaction;
+                        redraw_request = redraw_request.min(redraw);
+                        input_method.merge(&method);
+                        has_layout_changed |= changed;
+                    }
+                }
+            }
+            return (
+                if outdated {
+                    State::Outdated
+                } else {
+                    State::Updated {
+                        mouse_interaction,
+                        redraw_request,
+                        input_method,
+                        has_layout_changed,
+                    }
+                },
+                statuses,
+            );
+        }
+
         // Redraws can run before the queued input is drained and already carry
         // its final position. They must not overwrite the last INPUT position.
         // Keep an explicit leave unavailable until another motion/enter arrives:
@@ -320,6 +374,13 @@ where
         let mut input_method = InputMethod::Disabled;
         let mut has_layout_changed = false;
         let viewport = Rectangle::with_size(self.bounds);
+
+        // Apply actual focus at this event's delivery boundary, before an
+        // existing overlay sees it. Option actions never retarget focus.
+        #[cfg(feature = "a11y")]
+        if let [Event::A11y(_, request)] = events {
+            self.focus_accessibility_action(renderer, request);
+        }
 
         let mut maybe_overlay = self
             .root
@@ -751,9 +812,9 @@ where
         )
     }
 
-    /// Apply the same focus preflight before queuing native accessibility
-    /// events. A later queued target supersedes an earlier one; widgets must
-    /// not recreate focus merely by replaying their older queued request.
+    /// Apply focus for the current native accessibility event before its
+    /// overlay and base delivery. Callers must not pre-focus later queued
+    /// requests before earlier inputs have been delivered.
     #[cfg(feature = "a11y")]
     pub fn focus_accessibility_action(
         &mut self,

@@ -170,8 +170,8 @@ impl Fixture {
             target_node: target,
             data: None,
         };
-        // Use the production preflight and real focus operation; native winit
-        // applies this before forwarding exactly this numeric action target.
+        // Use the production preflight and real focus operation. The native
+        // UserInterface applies it at this event's delivery boundary.
         let tree = self.export();
         if let Some(id) =
             cosmic::iced::runtime::user_interface::accessibility_focus_target(&tree, &request)
@@ -270,10 +270,23 @@ fn target(node: &A11yNode) -> NodeId {
     node.id().clone().into()
 }
 fn options(tree: &A11yTree) -> Vec<A11yNode> {
+    let children = nodes(tree)
+        .filter(|node| node.node().role() == Role::ListBox)
+        .flat_map(|node| node.node().children().iter().copied())
+        .collect::<Vec<_>>();
     nodes(tree)
-        .filter(|node| node.node().role() == Role::ListBoxOption)
+        .filter(|node| children.contains(&target(node)))
         .cloned()
         .collect()
+}
+fn displayed_selection(tree: &A11yTree, name: &str) -> Option<A11yNode> {
+    let root = named(tree, name);
+    nodes(tree)
+        .find(|node| {
+            root.node().children().contains(&target(node))
+                && node.node().role() == Role::ListBoxOption
+        })
+        .cloned()
 }
 fn choices(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("Option {index}")).collect()
@@ -292,6 +305,19 @@ fn dropdown_accessibility_names_values_and_absent_selection_are_real_control_sem
             (selected == Some(1)).then_some("Terminal")
         );
         assert_eq!(sibling.node().value(), Some("Automatic"));
+        let displayed = displayed_selection(&tree, "Settings category");
+        assert_eq!(displayed.is_some(), selected == Some(1));
+        if let Some(displayed) = displayed {
+            assert_eq!(displayed.node().label(), Some("Terminal"));
+            assert_eq!(displayed.node().is_selected(), Some(true));
+            assert!(displayed.node().is_read_only());
+            assert!(!displayed.node().supports_action(Action::Click));
+            assert!(!displayed.node().supports_action(Action::Focus));
+            let bounds = displayed.node().bounds().unwrap();
+            let control = root.node().bounds().unwrap();
+            assert!(bounds.x0 >= control.x0 && bounds.x1 <= control.x1);
+            assert!(bounds.y0 >= control.y0 && bounds.y1 <= control.y1);
+        }
         assert_ne!(target(&root), target(&sibling));
         assert_eq!(root.node().is_expanded(), Some(false));
         assert!(root.node().supports_action(Action::Focus));
@@ -383,6 +409,7 @@ fn dropdown_accessibility_rebuild_source_reorder_and_owner_replacement_have_dist
     let labels = vec!["Same".into(), "Same".into()];
     let mut fixture = Fixture::new(labels.clone(), Some(0));
     let root = target(&named(&fixture.export(), "Settings category"));
+    let displayed = target(&displayed_selection(&fixture.export(), "Settings category").unwrap());
     fixture.action(root, Action::Expand);
     let first = options(&fixture.export());
     assert_ne!(
@@ -393,6 +420,10 @@ fn dropdown_accessibility_rebuild_source_reorder_and_owner_replacement_have_dist
     fixture.replace("owner-a", "source-a", labels.clone(), Some(0), 0.0);
     assert_eq!(target(&named(&fixture.export(), "Settings category")), root);
     assert_eq!(
+        target(&displayed_selection(&fixture.export(), "Settings category").unwrap()),
+        displayed
+    );
+    assert_eq!(
         options(&fixture.export())
             .iter()
             .map(target)
@@ -402,6 +433,11 @@ fn dropdown_accessibility_rebuild_source_reorder_and_owner_replacement_have_dist
     );
     // Identical labels now refer to different underlying choices.
     fixture.replace("owner-a", "source-b", labels.clone(), Some(0), 0.0);
+    assert_ne!(
+        target(&displayed_selection(&fixture.export(), "Settings category").unwrap()),
+        displayed,
+        "a replacement source gets a fresh selected display identity"
+    );
     fixture.action(root, Action::Expand);
     assert!(fixture.action(target(&first[1]), Action::Click).is_empty());
     let next = options(&fixture.export());
@@ -555,6 +591,13 @@ fn assert_active_targets_exist(tree: &A11yTree) {
                 emitted.contains(&active),
                 "active descendant must belong to this exported tree"
             );
+            if node.node().role() == Role::ComboBox {
+                assert!(
+                    nodes(tree).any(|popup| node.node().controls().contains(&target(popup))
+                        && popup.node().children().contains(&active)),
+                    "a sibling active descendant must belong to the controlled popup"
+                );
+            }
         }
     }
 }
@@ -715,18 +758,28 @@ fn dropdown_accessibility_native_preflight_prevents_batched_and_separate_sibling
             let disabled = target(&named(&tree, "Unavailable choice"));
             let a = target(&named(&tree, "Settings category"));
             let b = target(&named(&tree, "Terminal color theme"));
-            assert!(ui.focus_accessibility_action(&renderer, &request(notes, Action::Focus)));
             let mut messages = Vec::new();
             let mut queued = Vec::new();
+            // The real text field locally acknowledges its queued Focus.
+            // It must not regain focus beside a later dropdown activation.
+            let notes_focus = request(notes, Action::Focus);
+            if batched {
+                queued.push(event(notes_focus));
+            } else {
+                ui.update(
+                    &[event(notes_focus)],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+            }
             // An accessibility client may activate each control directly,
             // without sending Focus first. Use the actual native preflight
             // for both separate events and a queued A/B action batch.
+            // UserInterface applies production focus at event delivery.
             for target in [a, b] {
                 let action = request(target, activation);
-                assert!(
-                    ui.focus_accessibility_action(&renderer, &action),
-                    "same production native preflight"
-                );
                 if batched {
                     queued.push(event(action));
                 } else {
@@ -806,14 +859,23 @@ fn dropdown_accessibility_native_preflight_prevents_batched_and_separate_sibling
                 [Message::Sibling(1)],
                 "one Enter may commit only the currently focused menu"
             );
-            assert!(ui.focus_accessibility_action(&renderer, &request(notes, Action::Focus)));
+            let notes_focus = request(notes, Action::Focus);
+            ui.update(
+                &[event(notes_focus)],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
             // A stale root target or unsupported option action cannot steal focus.
             let absent = NodeId::from(iced_accessibility::A11yId::from(Id::unique()));
-            assert!(!ui.focus_accessibility_action(&renderer, &request(absent, Action::Expand)));
-            assert!(!ui.focus_accessibility_action(&renderer, &request(b, Action::SetValue)));
+            let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let focus_target = cosmic::iced::runtime::user_interface::accessibility_focus_target;
+            assert!(focus_target(&tree, &request(absent, Action::Expand)).is_none());
+            assert!(focus_target(&tree, &request(b, Action::SetValue)).is_none());
             for action in [Action::Focus, Action::Click, Action::Expand] {
                 assert!(
-                    !ui.focus_accessibility_action(&renderer, &request(disabled, action)),
+                    focus_target(&tree, &request(disabled, action)).is_none(),
                     "disabled target must not steal focus"
                 );
             }
@@ -876,4 +938,166 @@ fn dropdown_accessibility_native_preflight_prevents_batched_and_separate_sibling
             );
         }
     }
+}
+
+#[test]
+fn dropdown_accessibility_native_batches_order_root_collapse_and_overlay_choice() {
+    use cosmic::iced::advanced::widget::Operation;
+    use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+    struct Materialize;
+    impl Operation for Materialize {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+    }
+    fn action(target: NodeId, action: Action) -> Event {
+        Event::A11y(
+            Id::from(target.0),
+            ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: target,
+                data: None,
+            },
+        )
+    }
+    for collapse_first in [true, false] {
+        let fixture = Fixture::new(choices(3), Some(0));
+        let mut renderer = fixture.renderer;
+        let mut ui = UserInterface::build(
+            view("ordered-owner", "ordered-source", choices(3), Some(0), 0.0),
+            Size::new(360.0, 300.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let a = target(&named(&tree, "Settings category"));
+        let b = target(&named(&tree, "Terminal color theme"));
+        let mut messages = Vec::new();
+        ui.update(
+            &[action(a, Action::Expand)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        // Use the actual UI operation/layout path to materialize A's overlay.
+        ui.operate(&renderer, &mut Materialize);
+        let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let old_option = target(&options(&tree)[1]);
+        let batch = if collapse_first {
+            vec![
+                action(a, Action::Collapse),
+                action(old_option, Action::Click),
+            ]
+        } else {
+            vec![action(old_option, Action::Click), action(b, Action::Expand)]
+        };
+        let (_, statuses) = ui.update(
+            &batch,
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses.len(), batch.len());
+        assert_eq!(
+            messages,
+            if collapse_first {
+                Vec::new()
+            } else {
+                vec![Message::Selected(1)]
+            },
+            "root and overlay requests must run in their original order"
+        );
+        ui.operate(&renderer, &mut Materialize);
+        let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        assert_eq!(
+            named(&tree, "Settings category").node().is_expanded(),
+            Some(false)
+        );
+        assert_eq!(
+            named(&tree, "Terminal color theme").node().is_expanded(),
+            Some(!collapse_first)
+        );
+        if collapse_first {
+            assert!(options(&tree).is_empty());
+        } else {
+            let current = target(&options(&tree)[1]);
+            ui.update(
+                &[
+                    action(current, Action::Click),
+                    action(current, Action::Click),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages, [Message::Selected(1), Message::Sibling(1)]);
+        }
+    }
+}
+
+#[test]
+fn dropdown_accessibility_native_mixed_batch_keeps_press_before_later_motion() {
+    use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+    let fixture = Fixture::new(choices(3), Some(0));
+    let mut renderer = fixture.renderer;
+    let mut ui = UserInterface::build(
+        view("pointer-owner", "pointer-source", choices(3), Some(0), 0.0),
+        Size::new(360.0, 300.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    let point = |name| {
+        let bounds = named(&tree, name).node().bounds().unwrap();
+        cosmic::iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        )
+    };
+    let first = point("Settings category");
+    let later = point("Terminal color theme");
+    let mut messages = Vec::new();
+    ui.update(
+        &[Event::Mouse(mouse::Event::CursorMoved { position: first })],
+        mouse::Cursor::Available(first),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let absent = NodeId::from(iced_accessibility::A11yId::from(Id::unique()));
+    let batch = [
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        Event::A11y(
+            Id::from(absent.0),
+            ActionRequest {
+                action: Action::Expand,
+                target_tree: TreeId::ROOT,
+                target_node: absent,
+                data: None,
+            },
+        ),
+        Event::Mouse(mouse::Event::CursorMoved { position: later }),
+    ];
+    let (_, statuses) = ui.update(
+        &batch,
+        mouse::Cursor::Available(later),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(statuses.len(), batch.len());
+    let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    assert!(messages.is_empty());
+    assert_eq!(
+        named(&tree, "Settings category").node().is_expanded(),
+        Some(true)
+    );
+    assert_eq!(
+        named(&tree, "Terminal color theme").node().is_expanded(),
+        Some(false)
+    );
 }
