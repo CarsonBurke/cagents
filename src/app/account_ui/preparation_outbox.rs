@@ -1,7 +1,9 @@
 //! Private local intent only: no RPC, launch, cancellation ACK or retirement.
 //! Call these blocking operations on a worker, never on the UI thread. Each
 //! operation releases its process lock before returning to the effect owner.
-use crate::account::preparation::{PreparationBinding, PreparationPayload};
+use crate::account::preparation::{
+    ExistingPendingBinding, ExistingPendingTarget, PreparationBinding, PreparationPayload,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +16,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+// Migration shares the original namespace and lock: a saved Cancel must never
+// disappear behind a newly missing V2 filename.
 const JOURNAL: &str = "preparations-v1.json";
 const LOCK: &str = ".preparations.lock";
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -82,31 +86,106 @@ fn route_revision(route: &Route) -> io::Result<String> {
 #[serde(deny_unknown_fields)]
 pub(super) struct Intent {
     pub(super) request_id: Uuid,
-    pub(super) payload: PreparationPayload,
+    pub(super) target: Target,
     pub(super) original_route: RouteSnapshot,
     pub(super) device_code: bool,
     pub(super) blocked_login: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Target {
+    Prepared { payload: PreparationPayload },
+    ExistingPending { original: ExistingPendingTarget },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Binding {
+    Prepared { binding: PreparationBinding },
+    ExistingPending { binding: ExistingPendingBinding },
+}
+
+impl Binding {
+    fn home(&self) -> (Uuid, Uuid) {
+        match self {
+            Self::Prepared { binding } => (binding.installation_id, binding.key),
+            Self::ExistingPending { binding } => (binding.installation_id, binding.key),
+        }
+    }
+}
+
+fn supported_provider(provider: crate::agent::Provider) -> bool {
+    matches!(
+        provider,
+        crate::agent::Provider::Claude | crate::agent::Provider::Codex
+    )
+}
+
+fn validate_existing_binding(binding: &ExistingPendingBinding) -> io::Result<()> {
+    if !supported_provider(binding.provider)
+        || binding.installation_id.is_nil()
+        || binding.key.is_nil()
+        || binding.generation_id.is_nil()
+    {
+        return Err(invalid(
+            "The existing account setup binding is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
 impl Intent {
     fn validate(&self) -> io::Result<()> {
         if self.request_id.is_nil()
-            || !matches!(
-                self.payload.provider,
-                crate::agent::Provider::Claude | crate::agent::Provider::Codex
-            )
             || self.blocked_login.is_some_and(|id| id.is_nil())
             || self.original_route.route_revision != route_revision(&self.original_route.route)?
         {
             return Err(invalid("The account setup intent is inconsistent"));
         }
+        match &self.target {
+            Target::Prepared { payload } if !supported_provider(payload.provider) => {
+                return Err(invalid("The account setup provider is unsupported"));
+            }
+            Target::ExistingPending { original } => match original {
+                ExistingPendingTarget::Observed {
+                    provider,
+                    key,
+                    expected_installation,
+                    ..
+                } => {
+                    if !supported_provider(*provider)
+                        || key.is_nil()
+                        || expected_installation.is_some_and(|id| id.is_nil())
+                    {
+                        return Err(invalid(
+                            "The existing account setup observation is inconsistent",
+                        ));
+                    }
+                }
+                ExistingPendingTarget::Bound { binding } => validate_existing_binding(binding)?,
+            },
+            _ => {}
+        }
         Ok(())
+    }
+
+    fn initial_binding(&self) -> Option<Binding> {
+        match &self.target {
+            Target::ExistingPending {
+                original: ExistingPendingTarget::Bound { binding },
+            } => Some(Binding::ExistingPending {
+                binding: binding.clone(),
+            }),
+            _ => None,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Desired {
+    /// ExistingPending only resumes metadata; it never plans or creates a home.
     Prepare,
     Cancel,
 }
@@ -116,7 +195,7 @@ pub(super) enum Desired {
 pub(super) struct Record {
     pub(super) intent: Intent,
     pub(super) desired: Desired,
-    pub(super) binding: Option<PreparationBinding>,
+    pub(super) binding: Option<Binding>,
     pub(super) revision: u64,
 }
 
@@ -126,6 +205,15 @@ impl Record {
         if self.revision == 0 {
             return Err(invalid("The account setup intent has no local revision"));
         }
+        if let Target::ExistingPending {
+            original: ExistingPendingTarget::Bound { binding: original },
+        } = &self.intent.target
+            && !matches!(&self.binding, Some(Binding::ExistingPending { binding }) if binding == original)
+        {
+            return Err(invalid(
+                "The original account setup binding was not retained",
+            ));
+        }
         if let Some(binding) = &self.binding {
             validate_binding(&self.intent, binding)?;
         }
@@ -133,12 +221,35 @@ impl Record {
     }
 }
 
-fn validate_binding(intent: &Intent, binding: &PreparationBinding) -> io::Result<()> {
-    if binding.request_id != intent.request_id
-        || binding.payload != intent.payload
-        || binding.installation_id.is_nil()
-        || binding.key.is_nil()
-    {
+fn validate_binding(intent: &Intent, binding: &Binding) -> io::Result<()> {
+    let matches = match (&intent.target, binding) {
+        (Target::Prepared { payload }, Binding::Prepared { binding }) => {
+            binding.request_id == intent.request_id
+                && binding.payload == *payload
+                && !binding.installation_id.is_nil()
+                && !binding.key.is_nil()
+        }
+        (Target::ExistingPending { original }, Binding::ExistingPending { binding }) => {
+            validate_existing_binding(binding)?;
+            match original {
+                ExistingPendingTarget::Observed {
+                    provider,
+                    key,
+                    started_at,
+                    expected_installation,
+                } => {
+                    binding.provider == *provider
+                        && binding.key == *key
+                        && binding.started_at == *started_at
+                        && expected_installation
+                            .is_none_or(|expected| binding.installation_id == expected)
+                }
+                ExistingPendingTarget::Bound { binding: original } => binding == original,
+            }
+        }
+        _ => false,
+    };
+    if !matches {
         return Err(invalid(
             "The account setup binding does not match its intent",
         ));
@@ -169,13 +280,181 @@ impl Journal {
                 return Err(invalid("The account setup outbox repeats an intent"));
             }
             if let Some(binding) = &record.binding
-                && !homes.insert((binding.installation_id, binding.key))
+                && !homes.insert(binding.home())
             {
                 return Err(invalid("The account setup outbox repeats a bound home"));
             }
         }
         Ok(())
     }
+}
+
+// Keep the original wire schema intact until its exact fields are checked.
+// In particular, mapping first would discard unknown nested backend fields.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1Intent {
+    request_id: Uuid,
+    payload: PreparationPayload,
+    original_route: RouteSnapshot,
+    device_code: bool,
+    blocked_login: Option<Uuid>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1Record {
+    intent: V1Intent,
+    desired: Desired,
+    binding: Option<PreparationBinding>,
+    revision: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1Journal {
+    version: u32,
+    records: Vec<V1Record>,
+}
+
+impl V1Journal {
+    fn into_current(self) -> Journal {
+        Journal {
+            version: VERSION,
+            records: self
+                .records
+                .into_iter()
+                .map(|record| Record {
+                    intent: Intent {
+                        request_id: record.intent.request_id,
+                        target: Target::Prepared {
+                            payload: record.intent.payload,
+                        },
+                        original_route: record.intent.original_route,
+                        device_code: record.intent.device_code,
+                        blocked_login: record.intent.blocked_login,
+                    },
+                    desired: record.desired,
+                    binding: record.binding.map(|binding| Binding::Prepared { binding }),
+                    revision: record.revision,
+                })
+                .collect(),
+        }
+    }
+}
+
+// Reject duplicates in the original document, including inside internally
+// tagged backend DTOs. A Value-only round trip would silently keep one value.
+struct UniqueJson(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct UniqueVisitor;
+        impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate fields")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(serde_json::Value::Number(number)))
+                    .ok_or_else(|| E::custom("The account setup outbox has an invalid number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(value.into()))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<UniqueJson>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueJson(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "The account setup outbox repeats a field",
+                        ));
+                    }
+                    values.insert(key, map.next_value::<UniqueJson>()?.0);
+                }
+                Ok(UniqueJson(serde_json::Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+fn canonical_fields(original: &serde_json::Value, wire: &impl Serialize) -> io::Result<()> {
+    // Shared backend DTOs have broader serde compatibility. Their omitted or
+    // unsupported fields must not be discarded by a private journal rewrite.
+    if *original != serde_json::to_value(wire).map_err(invalid)? {
+        return Err(invalid("The account setup outbox has unsupported fields"));
+    }
+    Ok(())
+}
+
+fn decode_journal(bytes: &[u8]) -> io::Result<(Journal, u32)> {
+    let original = serde_json::from_slice::<UniqueJson>(bytes)
+        .map_err(invalid)?
+        .0;
+    let version = original
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid("The account setup outbox version is invalid"))?;
+    let journal = match version {
+        1 => {
+            let wire: V1Journal = serde_json::from_slice(bytes).map_err(invalid)?;
+            canonical_fields(&original, &wire)?;
+            wire.into_current()
+        }
+        version if version == u64::from(VERSION) => {
+            let wire: Journal = serde_json::from_slice(bytes).map_err(invalid)?;
+            canonical_fields(&original, &wire)?;
+            wire
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The account setup outbox version is unsupported",
+            ));
+        }
+    };
+    journal.validate()?;
+    Ok((journal, version as u32))
 }
 
 pub(super) struct Store {
@@ -188,12 +467,13 @@ impl Store {
     }
 
     /// None means the journal is missing, not an empty/acknowledged outbox.
-    /// A read establishes visibility only, never a durability acknowledgement.
+    /// A read normalizes V1 in memory without writing. It establishes visibility
+    /// only, never a durability acknowledgement or a completed migration.
     pub(super) fn load(&self) -> io::Result<Option<Vec<Record>>> {
         let Some(held) = self.lock(false)? else {
             return Ok(None);
         };
-        let result = self.read(&held)?.map(|(journal, _)| journal.records);
+        let result = self.read(&held)?.map(|(journal, _, _)| journal.records);
         held.revalidate()?;
         Ok(result)
     }
@@ -210,7 +490,7 @@ impl Store {
         &self,
         intent: &Intent,
         expected_revision: u64,
-        binding: &PreparationBinding,
+        binding: &Binding,
     ) -> io::Result<Record> {
         self.change(
             intent,
@@ -235,7 +515,7 @@ impl Store {
         let previous = self.read(&held)?;
         let mut journal = previous
             .as_ref()
-            .map(|(journal, _)| journal.clone())
+            .map(|(journal, _, _)| journal.clone())
             .unwrap_or(Journal {
                 version: VERSION,
                 records: Vec::new(),
@@ -294,7 +574,7 @@ impl Store {
                 let record = Record {
                     intent: intent.clone(),
                     desired,
-                    binding: None,
+                    binding: intent.initial_binding(),
                     revision: 1,
                 };
                 journal.records.push(record.clone());
@@ -305,7 +585,10 @@ impl Store {
             }
         };
         journal.validate()?;
-        let persisted = if previous.as_ref().is_some_and(|(old, _)| old == &journal) {
+        let persisted = if previous
+            .as_ref()
+            .is_some_and(|(old, _, version)| *version == VERSION && old == &journal)
+        {
             // Equality and a successful reread prove visibility, not durable
             // persistence after an earlier rename/directory-sync failure.
             let file = previous.as_ref().unwrap().1.try_clone()?;
@@ -313,6 +596,8 @@ impl Store {
             file.sync_all()?;
             file
         } else {
+            // An equal V1 replay still rewrites V2 atomically. Only encoding
+            // changes in that case; the record's local revision stays put.
             let bytes = serde_json::to_vec(&journal).map_err(invalid)?;
             if bytes.len() as u64 > MAX_BYTES {
                 return Err(invalid("The account setup outbox is too large"));
@@ -324,7 +609,7 @@ impl Store {
             temporary.write_all(&bytes)?;
             temporary.as_file().sync_all()?;
             held.revalidate()?;
-            self.revalidate_journal(&held, previous.as_ref().map(|(_, file)| file))?;
+            self.revalidate_journal(&held, previous.as_ref().map(|(_, file, _)| file))?;
             temporary
                 .persist(held.namespace.path().join(JOURNAL))
                 .map_err(|error| error.error)?
@@ -335,7 +620,7 @@ impl Store {
         Ok(record)
     }
 
-    fn read(&self, held: &Locked) -> io::Result<Option<(Journal, File)>> {
+    fn read(&self, held: &Locked) -> io::Result<Option<(Journal, File, u32)>> {
         let path = held.namespace.path().join(JOURNAL);
         let mut file = match crate::secure_file::open_existing_private_file_readonly(&path) {
             Ok(file) => file,
@@ -348,17 +633,9 @@ impl Store {
         if bytes.len() as u64 > MAX_BYTES {
             return Err(invalid("The account setup outbox is too large"));
         }
-        let journal: Journal = serde_json::from_slice(&bytes).map_err(invalid)?;
-        journal.validate()?;
-        // Shared backend DTOs deliberately have broader serde compatibility.
-        // This private journal must reject unknown or omitted fields there,
-        // too, instead of discarding them during its next write.
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
-        if parsed != serde_json::to_value(&journal).map_err(invalid)? {
-            return Err(invalid("The account setup outbox has unsupported fields"));
-        }
+        let (journal, original_version) = decode_journal(&bytes)?;
         self.revalidate_journal(held, Some(&file))?;
-        Ok(Some((journal, file)))
+        Ok(Some((journal, file, original_version)))
     }
 
     fn revalidate_journal(&self, held: &Locked, previous: Option<&File>) -> io::Result<()> {
@@ -429,7 +706,7 @@ impl Store {
 #[derive(Clone, Copy)]
 enum Change<'a> {
     Intent(Desired),
-    Bind(u64, &'a PreparationBinding),
+    Bind(u64, &'a Binding),
 }
 
 struct Locked {
