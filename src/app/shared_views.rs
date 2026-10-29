@@ -88,27 +88,29 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
-pub(super) fn blocked_managed_view_scopes(
+/// Canonical managed panes whose saved descriptor no longer matches the
+/// registry's actor, or whose card is ambiguous. Each one stays inert alone:
+/// it neither projects nor publishes, while its scope's other panes proceed.
+pub(super) fn quarantined_managed_panes(
     model: &crate::workspace_model::WorkspaceModel,
     views: &[View],
-) -> HashSet<Scope> {
-    let mut blocked = HashSet::new();
+) -> HashSet<CardId> {
     let display_index = views::ManagedDisplayIndex::new(model);
     let managed = model
         .agents
         .iter()
         .map(|agent| (CardId::from_uuid(agent.id.as_uuid()), agent))
         .collect::<HashMap<_, _>>();
-    for view in views {
-        if view.panes.iter().any(|pane| {
+    views
+        .iter()
+        .flat_map(|view| &view.panes)
+        .filter(|pane| {
             managed
                 .get(&pane.id)
                 .is_some_and(|agent| !display_index.permits_projection(agent, pane))
-        }) {
-            blocked.insert(view.scope.clone());
-        }
-    }
-    blocked
+        })
+        .map(|pane| pane.id)
+        .collect()
 }
 
 #[derive(Default)]
@@ -138,7 +140,12 @@ pub(super) struct State {
     pub deferred_default: Option<PathBuf>,
     pub defaults: HashMap<CardId, TerminalSession>,
     default_requests: HashSet<CardId>,
+    /// Scopes whose local aliases cannot yet adopt their canonical panes.
     pub blocked: HashSet<Scope>,
+    /// Cards fenced from shared projection and publication, keeping their
+    /// local presentation and saved evidence: managed panes that fail their
+    /// registry proof, and the local aliases of those panes.
+    pub quarantined: HashSet<CardId>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
@@ -673,6 +680,7 @@ impl Cagents {
                 && owners.next().is_none()
                 && !owner.retired.contains(&pane.id)
                 && !self.shared_views.blocked.contains(&owner.scope)
+                && !self.shared_views.quarantined.contains(&pane.id)
                 && captured_repository.is_some()
                 && captured_repository == repository(&self.workspace_model, &scope)
                 && captured_repository == repository(&self.workspace_model, &owner.scope)
@@ -1106,6 +1114,9 @@ impl Cagents {
         {
             return None;
         }
+        if self.shared_views.quarantined.contains(&card) {
+            return None;
+        }
         let source = self
             .workspace_model
             .views
@@ -1406,6 +1417,7 @@ impl Cagents {
                     .filter(|source| source != destination)
                 {
                     if !self.shared_views.initialized.contains(&source)
+                        || self.shared_views.quarantined.contains(&pane.id)
                         || self.shared_views.blocked.contains(&source)
                         || self.shared_views.blocked.contains(destination)
                     {
@@ -1446,6 +1458,9 @@ impl Cagents {
                 }
             }
         }
+        // A quarantined pane keeps its canonical descriptor and placement:
+        // this client neither seeds, closes, moves nor rewrites it.
+        let quarantined = self.shared_views.quarantined.clone();
         for scope in scopes {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -1467,6 +1482,7 @@ impl Cagents {
                         .map(|view| {
                             view.panes
                                 .iter()
+                                .filter(|pane| !quarantined.contains(&pane.id))
                                 .filter_map(|pane| {
                                     self.card_state(pane.id)
                                         .filter(|card| !card.existence.is_open())
@@ -1480,7 +1496,10 @@ impl Cagents {
                     // They must not migrate as append-only legacy panes.
                     let legacy = panes
                         .into_iter()
-                        .filter(|pane| !self.durable.pending_terminal_creations.contains(&pane.id))
+                        .filter(|pane| {
+                            !quarantined.contains(&pane.id)
+                                && !self.durable.pending_terminal_creations.contains(&pane.id)
+                        })
                         .collect::<Vec<_>>();
                     let retry_sources = self
                         .shared_views
@@ -1537,7 +1556,14 @@ impl Cagents {
                 .find(|view| view.scope == scope)
                 .map(|view| view.revision)
                 .unwrap_or(0);
-            for change in views::changes(&previous, &panes) {
+            let unfenced = |panes: &[Pane]| {
+                panes
+                    .iter()
+                    .filter(|pane| !quarantined.contains(&pane.id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for change in views::changes(&unfenced(&previous), &unfenced(&panes)) {
                 if let Change::Insert { pane, .. } = &change
                     && matches!(pane.kind, CardKind::Chat(_))
                 {
@@ -1919,7 +1945,8 @@ impl Cagents {
     }
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
-        self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
+        self.shared_views.blocked.clear();
+        self.shared_views.quarantined = quarantined_managed_panes(&self.workspace_model, views);
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -1944,6 +1971,11 @@ impl Cagents {
                     })
                     .map(|card| card.id)
                     .collect::<Vec<_>>();
+                if self.shared_views.quarantined.contains(&shared.id) {
+                    // A fenced canonical pane cannot replace its local alias.
+                    self.shared_views.quarantined.extend(aliases);
+                    continue;
+                }
                 for alias in aliases {
                     let ready = self.shared_views.initialized.contains(&view.scope)
                         && !self.shared_views.seeding.contains(&view.scope)
@@ -2114,11 +2146,13 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         let mut retained_upgrades = Vec::new();
+        let local_members = current.iter().copied().collect::<HashSet<_>>();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
             }
             if owned.contains(&id)
+                || self.shared_views.quarantined.contains(&id)
                 || self
                     .card_state(id)
                     .is_some_and(|card| card.kind.is_utility())
@@ -2176,6 +2210,9 @@ impl Cagents {
         }
         current.extend(retained_upgrades);
         for shared in &view.panes {
+            if self.shared_views.quarantined.contains(&shared.id) {
+                continue;
+            }
             self.shared_views.closed_chats.remove(&shared.id);
             self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);
@@ -2355,18 +2392,37 @@ impl Cagents {
                 }
             }
         }
+        // A quarantined pane stays where and as this client shows it; without
+        // a local card here, there is nothing this client may show for it.
+        let strip = view
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                if !self.shared_views.quarantined.contains(&pane.id) {
+                    return Some(pane.clone());
+                }
+                if !local_members.contains(&pane.id) {
+                    return None;
+                }
+                let card = self.card_state(pane.id)?;
+                let mut local = Pane::from_card(card, pane.scope.clone())?;
+                local.user_title = self.chrome_ui.user_titles.get(&pane.id).cloned();
+                Some(local)
+            })
+            .collect::<Vec<_>>();
+        let shared = strip.iter().map(|pane| pane.id).collect::<HashSet<_>>();
         let retained = current
             .into_iter()
             .filter(|id| {
-                self.shared_views.retained.contains(id)
+                (self.shared_views.quarantined.contains(id) && !shared.contains(id))
+                    || self.shared_views.retained.contains(id)
                     || (view.panes.is_empty() && self.chat_is_unused_default(*id))
                     || self
                         .card_state(*id)
                         .is_some_and(|card| card.kind.is_utility())
             })
             .collect::<Vec<_>>();
-        let visible = view
-            .panes
+        let visible = strip
             .iter()
             .map(|pane| pane.id)
             .chain(retained)
@@ -2398,7 +2454,7 @@ impl Cagents {
             }
         }
         if active {
-            tasks.push(self.project_shared_strip(&view.panes, &visible));
+            tasks.push(self.project_shared_strip(&strip, &visible));
         }
         if !self.shared_views.applying {
             self.persist();
