@@ -4812,7 +4812,7 @@ pub struct Cagents {
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     terminal_failure: terminal_failure::State,
     /// Observations held back while a start was outstanding.
-    pending_adoptions: Vec<TerminalSession>,
+    pending_adoptions: Vec<terminal_adoption::Observation>,
     /// Restored agent terminals that are not on screen, attached one at a
     /// time after startup so their rows show what the agent is doing.
     restored_agent_attaches: VecDeque<CardId>,

@@ -9,6 +9,52 @@ use crate::control::ControlClient;
 /// is an inventory it re-reads in full on the next connection.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Inventory availability is not a replacement for an issued saved source.
+/// Bind pending presentation to the whole source observed at arrival so a
+/// deferred notice cannot downgrade a subsequently reconciled card.
+pub(super) enum Observation {
+    Hosted(TerminalSession),
+    AuthorityPending {
+        targets: Vec<(CardId, TerminalSession)>,
+        message: String,
+    },
+}
+
+#[cfg(test)]
+#[path = "terminal_adoption/authority_pending_tests.rs"]
+mod authority_pending_tests;
+
+fn authority_pending_message(session: &TerminalSession) -> Option<&str> {
+    match &session.continuity {
+        TerminalContinuity::Failed { typed_error, .. }
+            if typed_error.code == "terminal_authority_rebind_pending" =>
+        {
+            Some(&typed_error.message)
+        }
+        _ => None,
+    }
+}
+
+fn issued_source_matches(issued: &TerminalSession, saved: &TerminalSession) -> bool {
+    let Some(proof) = issued
+        .continuity
+        .live_proof()
+        .filter(|proof| proof.is_complete())
+    else {
+        return false;
+    };
+    if saved.continuity.live_proof().as_ref() != Some(&proof) {
+        return false;
+    }
+    // Compare the entire issued source with the same Live/Detached and
+    // foreground-hint normalization as explicit reconciliation. This value is
+    // used only for comparison, never as a replacement saved descriptor.
+    let mut comparison = issued.clone();
+    comparison.continuity = saved.continuity.clone();
+    comparison.resume_hint = saved.resume_hint.clone();
+    &comparison == saved
+}
+
 /// Watches the daemon for terminals this window does not own.
 ///
 /// Every message is a complete set of observed sessions: the full inventory on
@@ -102,7 +148,36 @@ impl Cagents {
         terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
     ) -> Task<Message> {
         let mut reconnect = Vec::new();
+        let mut observations = Vec::new();
         for terminal in &terminals {
+            if let Some(message) = authority_pending_message(&terminal.session) {
+                let targets = self
+                    .durable
+                    .cards
+                    .iter()
+                    .filter_map(|card| {
+                        let CardKind::Terminal(saved) = &card.kind else {
+                            return None;
+                        };
+                        (card.existence.is_open()
+                            && saved.id == terminal.session.id
+                            && saved.continuity.live_proof().is_some()
+                            && terminal
+                                .upgrade_sources
+                                .iter()
+                                .any(|issued| issued_source_matches(issued, saved)))
+                        .then(|| (card.id, saved.clone()))
+                    })
+                    .collect();
+                observations.push(Observation::AuthorityPending {
+                    targets,
+                    message: message.into(),
+                });
+                // This worker has not completed durable reconciliation. Neither
+                // automatic attachment nor a proofless replacement is useful.
+                continue;
+            }
+            observations.push(Observation::Hosted(terminal.session.clone()));
             // Existing handles intentionally refuse proof changes. Replace one
             // only after a fresh inventory proves its complete issued lineage;
             // the start path checks the replacement daemon's lease again.
@@ -158,14 +233,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             tasks.push(self.start_terminal(card, session, visible, false));
         }
-        tasks.push(
-            self.observe_hosted_terminals(
-                terminals
-                    .iter()
-                    .map(|terminal| terminal.session.clone())
-                    .collect(),
-            ),
-        );
+        tasks.push(self.observe_terminal_observations(observations));
         self.terminal_crash_notices.retain(|card, _| {
             self.durable
                 .cards
@@ -217,6 +285,10 @@ impl Cagents {
         &mut self,
         terminals: Vec<TerminalSession>,
     ) -> Task<Message> {
+        self.observe_terminal_observations(terminals.into_iter().map(Observation::Hosted).collect())
+    }
+
+    fn observe_terminal_observations(&mut self, terminals: Vec<Observation>) -> Task<Message> {
         // A start that has not reported back may be about to claim one of these
         // identities: recovery can replace a terminal ID mid-start, so the card
         // does not hold the identity the daemon already published. Deciding now
@@ -226,7 +298,29 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        for session in terminals {
+        for observation in terminals {
+            let session = match observation {
+                Observation::AuthorityPending { targets, message } => {
+                    for (card, source) in targets {
+                        if self.card_state(card).is_some_and(|state| {
+                            state.existence.is_open()
+                                && matches!(&state.kind, CardKind::Terminal(current) if current == &source)
+                        }) {
+                            // fail_runtime changes availability only. The whole
+                            // source remains canonical for explicit Retry/Close
+                            // and for every subsequent persistent snapshot.
+                            self.fail_runtime(card, message.clone());
+                        }
+                    }
+                    continue;
+                }
+                Observation::Hosted(session) => session,
+            };
+            // Session-only callers have no issued-source context to bind this
+            // availability notice. They must not flatten it into saved state.
+            if authority_pending_message(&session).is_some() {
+                continue;
+            }
             let waiting = self
                 .durable
                 .cards
@@ -288,7 +382,7 @@ impl Cagents {
             Task::none()
         } else {
             let pending = std::mem::take(&mut self.pending_adoptions);
-            self.observe_hosted_terminals(pending)
+            self.observe_terminal_observations(pending)
         };
         Task::batch([adopted, self.attach_next_restored_agent()])
     }

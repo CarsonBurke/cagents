@@ -41,13 +41,22 @@ pub(super) struct QueuedCardClose {
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     intent.completed_source.is_none()
         && matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
-        if session.id == intent.terminal && session.continuity.live_proof().as_ref() == Some(&intent.proof))
+        if session.id == intent.terminal
+            && session.continuity.live_proof().as_ref() == Some(&intent.proof)
+            && intent.live_source.as_ref().is_none_or(|source| source == session))
 }
 
 fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
         if session.id == intent.terminal
             && intent.completed_source.as_ref().is_none_or(|source| source == session)
+            && intent.live_source.as_ref().is_none_or(|source| {
+                // An exit may land while checked Close is outstanding. Only
+                // that continuity transition may differ from its whole source.
+                let mut ended = source.clone();
+                ended.continuity = session.continuity.clone();
+                &ended == session
+            })
             && matches!(session.continuity,
             TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }))
 }
@@ -1108,6 +1117,160 @@ fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessi
 mod paired_close_regression {
     use super::*;
     use crate::terminal_ipc::{ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, read_frame, write_frame};
+
+    #[test]
+    fn authority_pending_close_carries_whole_source_and_keeps_failed_or_changed_targets() {
+        for outcome in 0..4 {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.settings.confirm_terminal_close = true;
+            let card = app.workspace.focused().unwrap();
+            let proof = HostSessionProof {
+                host_session_id: "pending-close-host".into(),
+                boot_id: "pending-close-boot".into(),
+                host_incarnation: "pending-close-incarnation".into(),
+            };
+            let CardKind::Terminal(source) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            source
+                .launch
+                .environment
+                .insert("SAVED_HOME".into(), "/saved/account".into());
+            source
+                .launch
+                .unset_environment
+                .insert("OTHER_ACCOUNT".into());
+            source.transcript_path = Some("/saved/transcript.log".into());
+            source.recovery_origin = Some(TerminalId::new());
+            source.predecessor = Some(TerminalId::new());
+            source.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
+            let source = source.clone();
+            let mut pending =
+                TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+            pending.session.continuity = TerminalContinuity::Failed {
+                typed_error: crate::model::RuntimeError {
+                    code: "terminal_authority_rebind_pending".into(),
+                    message: "fixture durable binding unavailable".into(),
+                },
+                retryable: true,
+            };
+            pending.upgrade_sources = vec![source.clone()];
+            drop(app.observe_hosted_descriptors(vec![pending]));
+            drop(app.begin_card_close(card));
+            let intent = app
+                .terminal_close
+                .clone()
+                .expect("pending availability still has its authenticated Close source");
+            assert_eq!(intent.live_source, Some(source.clone()));
+            assert!(intent.pending);
+
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let expected = source.clone();
+            let server_proof = proof.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let send = |stream: &mut std::os::unix::net::UnixStream, request_id, response| {
+                    write_frame(
+                        stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request_id),
+                            proof: server_proof.clone(),
+                            message: ServerMessage::Response { response },
+                        },
+                    )
+                    .unwrap();
+                };
+                let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                send(
+                    &mut stream,
+                    connect.request_id,
+                    ServerResponse::Connected {
+                        proof: server_proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let close: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(
+                    close.request,
+                    ClientRequest::ReconcileTerminalClose {
+                        session: expected.clone(),
+                        allow_active: false
+                    }
+                );
+                if outcome == 0 {
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(close.request_id),
+                            proof: server_proof.clone(),
+                            message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                                "binding still unavailable",
+                                false,
+                            )),
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    send(
+                        &mut stream,
+                        close.request_id,
+                        ServerResponse::TerminalCloseChecked {
+                            terminal_id: expected.id,
+                            outcome: if outcome == 1 {
+                                TerminalCloseResult::Active
+                            } else {
+                                TerminalCloseResult::Closed
+                            },
+                        },
+                    );
+                }
+                let detach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(
+                    detach.request,
+                    ClientRequest::Detach {
+                        terminal_id: expected.id
+                    }
+                );
+                send(&mut stream, detach.request_id, ServerResponse::Detached);
+                assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
+            });
+            // Poll the real checked-Close RPC at a fixture socket, separately
+            // from the unpolled UI dispatch above; no real daemon is involved.
+            let result = revalidate_and_close_at(&intent, false, &socket);
+            server.join().unwrap();
+            let mut current = source.clone();
+            if outcome == 3 {
+                current.predecessor = Some(TerminalId::new());
+                app.card_state_mut(card).unwrap().kind = CardKind::Terminal(current.clone());
+            }
+            drop(app.terminal_close_finished(card, source.id, proof, intent.generation, result));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Terminal(current)
+            );
+            if outcome == 2 {
+                assert!(app.closed_terminal_cards.contains(&card));
+            } else {
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(!app.closed_terminal_cards.contains(&card));
+                assert!(!app.terminal_close.as_ref().unwrap().pending);
+            }
+        }
+    }
+
     #[test]
     fn current_native_and_execution_console_close_carry_exact_source_without_an_id_only_gap() {
         for (native_listener, stale_source) in [(true, false), (false, false), (true, true), (false, true)] {

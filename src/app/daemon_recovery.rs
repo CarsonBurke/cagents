@@ -442,6 +442,103 @@ mod tests {
     }
 
     #[test]
+    fn authority_pending_retry_submits_the_whole_saved_source_without_spawn_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("recovered-owner");
+        let mut source = session(directory.path(), &proof("original-owner"));
+        source
+            .launch
+            .environment
+            .insert("SAVED_HOME".into(), "/saved/account".into());
+        source
+            .launch
+            .unset_environment
+            .insert("OTHER_ACCOUNT".into());
+        source.transcript_path = Some(directory.path().join("saved.log"));
+        source.resume_hint = Some("saved-foreground".into());
+        source.recovery_origin = Some(TerminalId::new());
+        source.predecessor = Some(TerminalId::new());
+        let mut pending = TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+        pending.session.continuity = crate::model::TerminalContinuity::Failed {
+            typed_error: crate::model::RuntimeError {
+                code: "terminal_authority_rebind_pending".into(),
+                message: "fixture durable binding unavailable".into(),
+            },
+            retryable: true,
+        };
+        pending.upgrade_sources = vec![source.clone()];
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = source.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let send = |stream: &mut std::os::unix::net::UnixStream, request_id, response| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: owner.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            send(
+                &mut stream,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: owner.clone(),
+                    resumed: vec![],
+                },
+            );
+            let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(list.request, ClientRequest::List);
+            send(
+                &mut stream,
+                list.request_id,
+                ServerResponse::Listed {
+                    terminals: vec![pending],
+                },
+            );
+            let reconcile: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(
+                reconcile.request,
+                ClientRequest::ReconcileTerminal { session: expected }
+            );
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(reconcile.request_id),
+                    proof: owner,
+                    message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "durable binding still unavailable; original worker retained",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                read_frame::<ClientEnvelope>(&mut stream).unwrap(),
+                None,
+                "a failed authenticated reconciliation must not send Spawn, Attach, Input or Shutdown"
+            );
+        });
+        let error = reconcile_at(source, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        assert!(error.contains("no replacement was started"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn replaced_daemon_recovers_a_shell_with_fresh_identity_and_pinned_owner() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
