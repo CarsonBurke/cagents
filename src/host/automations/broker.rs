@@ -795,14 +795,13 @@ impl AttentionTransfer {
         self.retry_at = None;
         match self.pump_ready(registry, notifications) {
             Ok(AttentionProgress::Retry) => Ok(Some(self.defer_retry())),
-            Ok(progress) => {
+            Ok(AttentionProgress::Idle) => {
                 self.retry_delay = Duration::ZERO;
-                Ok(match progress {
-                    AttentionProgress::Idle => None,
-                    AttentionProgress::Waiting => Some(Duration::from_millis(250)),
-                    AttentionProgress::Retry => unreachable!(),
-                })
+                Ok(None)
             }
+            // Queue admission and pending receipts do not prove recovery.
+            // Preserve prior failures until the durable handoff is idle.
+            Ok(AttentionProgress::Waiting) => Ok(Some(Duration::from_millis(250))),
             Err(error) => {
                 self.defer_retry();
                 Err(error)
