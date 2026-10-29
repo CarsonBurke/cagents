@@ -1,0 +1,156 @@
+name: Research PR 1940 exact CLI qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/research-pr1940-cli.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-pr1940-cli-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.93.0
+  EXPECTED_PRODUCT_SHA: 59857700fa3d5dbbc44e6bfe0fc17337ca489805
+  EXPECTED_PRODUCT_TREE: 76be0e6582897accc28789c0f41c0b6f76d5b2ba
+
+jobs:
+  cli:
+    if: >-
+      github.event.pull_request.head.ref == 'research/fw16-pr1940-cli-qualification' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Require a natural User execution context
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          present = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+          if present:
+              print('Natural User qualification refused: ' + ', '.join(present), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Check out the research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out the literal product
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 59857700fa3d5dbbc44e6bfe0fc17337ca489805
+          path: product
+          persist-credentials: false
+
+      - name: Verify source and prepare isolated fixture paths
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          test "$(git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD)" = "$EXPECTED_CONTROL_SHA"
+          install -d -m 700 "$RUNNER_TEMP/pr1940-logs"
+          fixture_root=$(mktemp -d /tmp/c1940XXXXXX)
+          install -d -m 700 "$fixture_root/runtime" "$fixture_root/data" "$fixture_root/config" "$fixture_root/cache" "$fixture_root/state"
+          printf '%s\n' "TMPDIR=$fixture_root" "XDG_RUNTIME_DIR=$fixture_root/runtime" \
+            "XDG_DATA_HOME=$fixture_root/data" "XDG_CONFIG_HOME=$fixture_root/config" \
+            "XDG_CACHE_HOME=$fixture_root/cache" "XDG_STATE_HOME=$fixture_root/state" \
+            "CARGO_TARGET_DIR=$RUNNER_TEMP/pr1940-cli-target" >> "$GITHUB_ENV"
+          {
+            git rev-parse HEAD 'HEAD^{tree}'
+            git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
+            sha256sum src/control.rs src/device.rs install.sh packaging/cagents-uninstall tests/cli_read_contracts.rs tests/installer_lifecycle_contract.rs
+            sha256sum src/control/*authority_tests.rs src/agent_execution/authority_environment_tests.rs
+            sha256sum src/control/project_channel_authority_tests/*.rs
+            sha256sum "$GITHUB_WORKSPACE/research/.github/workflows/research-pr1940-cli.yml"
+          } > "$RUNNER_TEMP/pr1940-logs/source-before.txt"
+
+      - name: Prepare the CLI compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential pkg-config libssl-dev
+          rustup toolchain install 1.93.0 --profile minimal --component rustfmt
+          {
+            rustc -vV
+            cargo --version
+            git --version
+          } > "$RUNNER_TEMP/pr1940-logs/tools.txt"
+
+      - name: Check literal product formatting and the isolated CLI
+        run: |
+          set -euo pipefail
+          scripts/check-format > "$RUNNER_TEMP/pr1940-logs/format.txt" 2>&1
+          set +e
+          cargo check --locked --no-default-features --bin cagents > "$RUNNER_TEMP/pr1940-logs/cli-check.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1940-logs/cli-check.exit"
+          exit "$task_status"
+
+      - name: Run every owning CLI target
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test --locked --no-default-features --all-targets -- --test-threads=2 > "$RUNNER_TEMP/pr1940-logs/cli-all-targets.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1940-logs/cli-all-targets.exit"
+          tail -n 80 "$RUNNER_TEMP/pr1940-logs/cli-all-targets.txt"
+          exit "$task_status"
+
+      - name: Require the exact public caller-scope parents and unchanged source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1940-logs/cli-all-targets.txt').read_text()
+          names = [
+              'agent_execution::authority_environment_tests::present_authority_never_downgrades_terminal_or_work_cli_to_user',
+              'control::agent_start_authority_tests::public_agent_list_and_exact_submit_retry_keep_scope_before_staged_owner_and_readiness',
+              'control::automation_work_authority_tests::public_automation_and_work_keep_captured_scope_before_routing_and_readiness',
+              'control::terminal_start_authority_tests::public_terminal_mutations_preserve_original_scope_before_staged_lookup_and_readiness',
+              'control::project_channel_authority_tests::read_routing::public_lists_preserve_readiness_and_no_start_errors_for_every_caller_scope',
+              'control::tests::hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable',
+              'device::tests::binary_bridge_flushes_a_response_before_reading_the_next_frame',
+              'device::tests::ssh_bridge_forwards_before_an_unpublished_master_and_propagates_eof',
+              'installer_entrypoints_refuse_inherited_callers_before_tools_or_purge',
+              'protocol_version_is_local_before_device_selection_or_service_preparation',
+              'local_lifecycle_refuses_remote_selection_before_local_or_remote_effects',
+          ]
+          for name in names:
+              assert len(re.findall(r'^test ' + re.escape(name) + r' \.\.\. ok$', log, re.M)) == 1, name
+          project_parents = re.findall(r'^test control::project_channel_authority_tests::\S+ \.\.\. ok$', log, re.M)
+          assert len(project_parents) == 14, project_parents
+          print('All 24 caller-scope, lifecycle, bridge and new contract parents passed; nested child summaries are nonadditive.')
+          PY
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/pr1940-logs/source-after.txt"
+
+      - name: Retain original qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr1940-exact-cli-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/pr1940-logs/
+          if-no-files-found: error
+          retention-days: 14
