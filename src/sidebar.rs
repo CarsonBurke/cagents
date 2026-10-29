@@ -4910,13 +4910,11 @@ fn header<'a>(
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
         actions.push(crate::interaction::tooltip(
-            button::icon(Icon::Attention)
+            centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
                 .class(sidebar_button_style(attention))
                 .id(filter_id(SidebarFilter::Attention))
                 .name("Show projects needing attention")
                 .selected(attention)
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
                 .on_press_maybe(gated(
                     SidebarAction::SetFilter(if attention {
                         SidebarFilter::All
@@ -4933,13 +4931,11 @@ fn header<'a>(
         ));
         let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
-            button::icon(Icon::Search)
+            centered_icon_button(Icon::Search, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
                 .class(sidebar_button_style(selected))
                 .id(search_toggle_focus_id())
                 .name("Search projects")
                 .selected(selected)
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
                 .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.search_filters_active() {
@@ -6944,13 +6940,10 @@ fn row_quick_delete<'a>(
     } else {
         ICON_CONTROL_SIZE
     };
-    let control = button::icon(Icon::Delete)
+    let control = centered_icon_button(Icon::Delete, width, WORKTREE_ROW_HEIGHT)
         .class(sidebar_button_style(false))
         .id(id)
         .name(label.to_owned())
-        .width(width)
-        .height(WORKTREE_ROW_HEIGHT)
-        .padding(0)
         .on_press_maybe(action);
     let controls = widget::container(
         widget::container(crate::interaction::tooltip(control, label.to_owned()))
@@ -10532,22 +10525,36 @@ fn project_icon_action<'a>(
 ) -> Element<'a, SidebarAction> {
     let label = label.into();
     crate::interaction::tooltip(
-        button::custom(
-            widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
-                .class(theme::Container::custom(|_| {
-                    cosmic::iced::widget::container::Style::default()
-                }))
-                .center(Length::Fill),
-        )
-        .class(sidebar_button_style(false))
-        .id(id)
-        .name(label.clone())
-        .padding(0)
-        .width(ICON_CONTROL_SIZE)
-        .height(ICON_CONTROL_SIZE)
-        .on_press_maybe(action),
+        centered_icon_button(icon_name, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
+            .class(sidebar_button_style(false))
+            .id(id)
+            .name(label.clone())
+            .on_press_maybe(action),
         label,
     )
+}
+
+/// A fixed-size icon target whose glyph sits in the middle of its whole
+/// hit area.
+///
+/// libcosmic's `button::icon` lays its glyph out in a row, and a row has no
+/// main-axis alignment: given a fixed width wider than the glyph, the glyph
+/// stays at the leading edge and the rest of the target is blank. Centering a
+/// glyph container inside a custom button keeps every sidebar icon command
+/// aligned however wide its slot is.
+fn centered_icon_button<'a>(
+    icon_name: Icon,
+    width: f32,
+    height: f32,
+) -> button::Button<'a, SidebarAction> {
+    button::custom(
+        widget::container(widget::icon(icon_name.handle()).size(ROW_ICON_SIZE))
+            .class(design::transparent())
+            .center(Length::Fill),
+    )
+    .padding(0)
+    .width(width)
+    .height(height)
 }
 
 /// One icon command in shared workspace chrome.
@@ -13717,6 +13724,151 @@ pub(crate) mod tests {
                 "compact={compact}, modal={modal}"
             );
         }
+    }
+
+    /// Lays `element` out at `size` with the pointer at `hover`, then returns
+    /// the bounds of the control named `label` and of the unnamed glyphs drawn
+    /// inside it, as the accessibility tree publishes them.
+    fn icon_glyphs_in_control(
+        mut element: Element<'_, SidebarAction>,
+        size: Size,
+        hover: cosmic::iced::Point,
+        label: &str,
+    ) -> (cosmic::iced::Rectangle, Vec<cosmic::iced::Rectangle>) {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(size);
+        let limits = layout::Limits::new(Size::ZERO, size);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let cursor = mouse::Cursor::Available(hover);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved { position: hover }),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut Vec::new()),
+            &viewport,
+        );
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let nodes = element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, cursor);
+        let published: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| {
+                let rect = node.node().bounds()?;
+                let bounds = Rectangle::new(
+                    Point::new(rect.x0 as f32, rect.y0 as f32),
+                    Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+                );
+                Some((node.node().label().map(ToOwned::to_owned), bounds))
+            })
+            .collect();
+        let control = published
+            .iter()
+            .find(|(name, _)| name.as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("{label} is published"))
+            .1;
+        let glyphs = published
+            .iter()
+            .filter(|(name, glyph)| {
+                name.is_none()
+                    && *glyph != control
+                    && control.contains(glyph.position())
+                    && control.contains(Point::new(glyph.x + glyph.width, glyph.y + glyph.height))
+            })
+            .map(|(_, glyph)| *glyph)
+            .collect();
+        (control, glyphs)
+    }
+
+    fn assert_glyph_centered(
+        label: &str,
+        control: cosmic::iced::Rectangle,
+        glyphs: &[cosmic::iced::Rectangle],
+    ) {
+        let [glyph] = glyphs else {
+            panic!("{label}: expected one glyph inside {control:?}, found {glyphs:?}");
+        };
+        let (glyph, control) = (glyph.center(), control.center());
+        assert!(
+            (glyph.x - control.x).abs() <= 0.5 && (glyph.y - control.y).abs() <= 0.5,
+            "{label}: glyph centered at {glyph:?}, but its hit area is centered at {control:?}"
+        );
+    }
+
+    #[test]
+    fn row_quick_delete_centers_its_glyph_in_the_whole_hit_area() {
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "WhatsApp conversation export".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        );
+        let label = "Delete channel WhatsApp conversation export";
+        for compact in [false, true] {
+            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
+            let hover = cosmic::iced::Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
+            let (control, glyphs) = icon_glyphs_in_control(
+                channel_view(&channel, Listing::Live, false, compact, Some(1), ""),
+                Size::new(width, WORKTREE_ROW_HEIGHT),
+                hover,
+                label,
+            );
+            assert_eq!(
+                control.width,
+                if compact {
+                    ROW_STATUS_WIDTH
+                } else {
+                    ICON_CONTROL_SIZE
+                },
+                "compact={compact}: the hit area keeps its reserved slot"
+            );
+            assert_glyph_centered(&format!("{label}, compact={compact}"), control, &glyphs);
+        }
+
+        let mut worktree = worktree(3, "feature", false);
+        let mut pr = project().pull_requests.remove(0);
+        pr.state = Some(WorktreePullRequestState::Merged);
+        worktree.set_pull_request(pr);
+        let (control, glyphs) = icon_glyphs_in_control(
+            worktree_view(
+                project_id(1),
+                &worktree,
+                false,
+                false,
+                None,
+                false,
+                true,
+                &[],
+                WorktreeRowState::default(),
+                false,
+                Some(1),
+                "",
+                true,
+            ),
+            Size::new(240.0, WORKTREE_ROW_HEIGHT),
+            cosmic::iced::Point::new(232.0, WORKTREE_ROW_HEIGHT / 2.0),
+            "Delete merged worktree feature",
+        );
+        assert_glyph_centered("Delete merged worktree feature", control, &glyphs);
     }
 
     #[test]
