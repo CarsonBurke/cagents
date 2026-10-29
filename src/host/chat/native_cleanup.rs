@@ -94,6 +94,10 @@ fn close_retained_inner(
                             .any(|capability| capability.starts_with("claude-actor-"))
                     })
             })
+            // Retirement removes discovery before every UI close gate has
+            // consumed its receipt. An old ReconnectOnly alias still needs
+            // the registered actor's exact receipt, not generic holder cleanup.
+            || (owner.is_none() && super::retained_actor::has_registered_owner(host, source)?)
         {
             return if let Some(expected) = expected {
                 super::retained_actor::close_captured(host, source, expected, closing)

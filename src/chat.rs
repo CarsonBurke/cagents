@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+pub mod start_custody;
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
@@ -316,6 +317,8 @@ pub struct StartFailure {
     /// is worth less than the sentence that named it.
     pub message: String,
     pub recovery: Recovery,
+    /// Local transport evidence; never inferred from a remote error string.
+    pub(crate) no_start_write: bool,
 }
 
 /// What the reader can still do about a conversation that did not come back.
@@ -353,12 +356,14 @@ impl StartFailure {
         Self {
             message: message.into(),
             recovery: Recovery::Retry,
+            no_start_write: false,
         }
     }
     pub fn fresh(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             recovery: Recovery::Fresh,
+            no_start_write: false,
         }
     }
 }
@@ -813,17 +818,26 @@ impl OwnedCodexListener {
 }
 
 impl Session {
-    /// Whether no daemon has ever held this conversation: it has no provider
-    /// identity, no proof of a host that ran it, and no terminal it came
-    /// from. A conversation is proven the moment its start is answered, which
-    /// is before anything can be sent to it, so nothing a reader wrote can be
-    /// in one that is still unstarted.
+    /// Whether this descriptor has no recorded start evidence. An attempted
+    /// start can still have an uncertain physical effect before Ready; callers
+    /// must also consult their exact local start-custody ledger.
     pub fn is_unstarted(&self) -> bool {
         self.launch.session_id.is_none()
             && self.proof.is_none()
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
             && self.native_continuity == NativeContinuity::ReconnectOnly
+    }
+
+    /// A missing live inventory entry cannot prove this native owner stopped.
+    /// Claude descriptors issued before retained capabilities were published
+    /// can remain ReconnectOnly while their exact registered helper survives.
+    /// This is only a close-confirmation requirement, never authority to adopt
+    /// that helper or to promote the saved descriptor's continuity.
+    pub(crate) fn requires_native_close_confirmation(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || self.native_continuity.retains_provider()
+            || (self.launch.provider == Provider::Claude && !self.is_unstarted())
     }
 
     /// An endpoint allocated for this exact cagents thread, retained in both views.

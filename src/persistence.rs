@@ -275,6 +275,8 @@ pub struct WorkspaceManifest {
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_chat_admissions: HashMap<CardId, crate::chat::Session>,
+    pub native_start_custody: Vec<crate::chat::start_custody::StartCustody>,
+    pub released_native_starts: HashSet<uuid::Uuid>,
     pub pending_terminal_creations: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
@@ -2072,6 +2074,8 @@ impl StateStore {
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
             pending_chat_admissions: manifest.pending_chat_admissions,
+            native_start_custody: manifest.native_start_custody,
+            released_native_starts: manifest.released_native_starts,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
         state.pending_chat_admissions.retain(|id, source| {
@@ -3971,6 +3975,39 @@ fn save_workspace_transaction(
         &to_json(&state.workspace_model_identity)?,
     )?;
 
+    if state
+        .native_start_custody
+        .iter()
+        .any(|entry| entry.workspace != state.id)
+    {
+        return Err(StoreError::InvalidState(
+            "A native start custody record belongs to another workspace".into(),
+        ));
+    }
+    // An older window cannot erase an attempt it has not loaded, or
+    // resurrect a released attempt. Both values commit in this transaction.
+    let custody_key = format!("workspace:{workspace_id}:navigation:native_start_custody");
+    let release_key = format!("workspace:{workspace_id}:navigation:released_native_starts");
+    let previous = metadata(transaction, &custody_key)?
+        .map(|value| {
+            from_json::<Vec<crate::chat::start_custody::StartCustody>>(
+                "native start retirement custody",
+                &value,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut released = metadata(transaction, &release_key)?
+        .map(|value| from_json::<HashSet<uuid::Uuid>>("released native starts", &value))
+        .transpose()?
+        .unwrap_or_default();
+    released.extend(state.released_native_starts.iter().copied());
+    let custody =
+        crate::chat::start_custody::merge_records(previous, &state.native_start_custody, &released)
+            .map_err(StoreError::InvalidState)?;
+    set_metadata(transaction, &custody_key, &to_json(&custody)?)?;
+    set_metadata(transaction, &release_key, &to_json(&released)?)?;
+
     let pending = state
         .pending_chat_admissions
         .iter()
@@ -5344,6 +5381,20 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("local-only pane identities", &value))
         .transpose()?
         .unwrap_or_default(),
+        released_native_starts: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:released_native_starts"),
+        )?
+        .map(|value| from_json("released native starts", &value))
+        .transpose()?
+        .unwrap_or_default(),
+        native_start_custody: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:native_start_custody"),
+        )?
+        .map(|value| from_json("native start retirement custody", &value))
+        .transpose()?
+        .unwrap_or_default(),
         pending_chat_admissions: metadata(
             connection,
             &format!("workspace:{id}:navigation:pending_chat_admissions"),
@@ -6005,8 +6056,91 @@ mod tests {
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
             pending_chat_admissions: Default::default(),
+            native_start_custody: Default::default(),
+            released_native_starts: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn native_start_custody_survives_stale_windows_closed_cards_and_database_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("custody.sqlite3");
+        let boot_id = boot("custody-boot");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let mut entry = crate::chat::start_custody::tests::fixture();
+        entry.card = state.cards[0].id;
+        entry.workspace = state.id;
+        let stale_without_entry = state.clone();
+        state.native_start_custody.push(entry.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        lane.save(&store, &stale_without_entry).unwrap();
+        assert_eq!(
+            store
+                .load_workspace_manifest(state.id)
+                .unwrap()
+                .unwrap()
+                .native_start_custody,
+            [entry.clone()]
+        );
+        let mut observed = entry.source.clone();
+        observed.proof = entry.destination.clone();
+        observed.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        entry.observed = Some(observed);
+        state.native_start_custody = vec![entry.clone()];
+        lane.save(&store, &state).unwrap();
+        let mut stale_before_observation = state.clone();
+        stale_before_observation.native_start_custody[0].observed = None;
+        stale_before_observation.native_start_custody[0].destination = None;
+        lane.save(&store, &stale_before_observation).unwrap();
+        assert_eq!(
+            store
+                .load_workspace_manifest(state.id)
+                .unwrap()
+                .unwrap()
+                .native_start_custody,
+            [entry.clone()]
+        );
+        state.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 123,
+                reason: Some("source pane replaced".into()),
+            },
+        };
+        state.focused = None;
+        lane.save(&store, &state).unwrap();
+        assert_eq!(
+            store
+                .load_workspace_manifest(state.id)
+                .unwrap()
+                .unwrap()
+                .native_start_custody,
+            [entry.clone()],
+            "no open-card filter may drop custody"
+        );
+        let mut corrupt = state.clone();
+        corrupt.native_start_custody[0]
+            .source
+            .launch
+            .recipe
+            .working_directory = "/different-source".into();
+        assert!(lane.save(&store, &corrupt).is_err());
+        state.native_start_custody.clear();
+        state.released_native_starts.insert(entry.operation);
+        lane.save(&store, &state).unwrap();
+        lane.save(&store, &stale_before_observation).unwrap();
+        let manifest = store.load_workspace_manifest(state.id).unwrap().unwrap();
+        assert!(manifest.native_start_custody.is_empty());
+        assert!(manifest.released_native_starts.contains(&entry.operation));
+        store.shutdown().unwrap();
+        let reopened = StateStore::open(&path, boot_id).unwrap();
+        let manifest = reopened.load_workspace_manifest(state.id).unwrap().unwrap();
+        assert!(manifest.native_start_custody.is_empty());
+        assert!(manifest.released_native_starts.contains(&entry.operation));
     }
 
     const RETAINED_UI_DRAFT: &str = "Unsent λ thought\n  café — preserve spacing  ";

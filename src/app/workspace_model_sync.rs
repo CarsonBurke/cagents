@@ -13,6 +13,67 @@ use crate::workspace_model::{
     canonical_repository,
 };
 
+#[cfg(test)]
+mod publication_authority_tests;
+
+/// The original window caller, retained through publisher reconnects.
+struct PublicationContext {
+    authority: crate::agent_execution::Authority,
+    remote: bool,
+    no_start: bool,
+}
+
+impl PublicationContext {
+    fn capture() -> Self {
+        Self {
+            authority: crate::agent_execution::Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
+        }
+    }
+
+    fn connect(&self) -> Result<ControlClient, ControlError> {
+        self.connect_with(
+            || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+            || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+            ControlClient::connect,
+        )
+    }
+
+    fn connect_with(
+        &self,
+        existing: impl FnOnce() -> Result<PathBuf, String>,
+        ready: impl FnOnce() -> Result<PathBuf, String>,
+        connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
+    ) -> Result<ControlClient, ControlError> {
+        let scoped = self.authority.token().is_some();
+        // A local session's capability cannot authorize a remote workspace.
+        // Refuse before its resolver can start an SSH bridge or remote daemon.
+        if scoped && self.remote {
+            return Err(ControlError::Remote {
+                code: crate::terminal::ipc::ProtocolErrorCode::PermissionDenied,
+                message: "Shared workspace changes require your own terminal on the remote device"
+                    .into(),
+                retryable: false,
+            });
+        }
+        let socket = if scoped || self.no_start {
+            existing()
+        } else {
+            ready()
+        }
+        .map_err(|error| ControlError::Connect(std::io::Error::other(error)))?;
+        let mut client = connect(&socket)?;
+        if scoped {
+            client.authenticate(self.authority.clone())?;
+        }
+        Ok(client)
+    }
+}
+
 /// How long a thread waits before reconnecting.
 ///
 /// A window can open before any daemon exists, and the daemon can be replaced
@@ -20,6 +81,97 @@ use crate::workspace_model::{
 /// and slowly, because a reconnection re-reads the whole model and therefore
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Local correlation travels with the queued edit, never over the daemon wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenOrigin {
+    nonce: uuid::Uuid,
+    registry: uuid::Uuid,
+    project: ProjectId,
+    repository: PathBuf,
+    inventory_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QueuedEdit {
+    pub(super) edit: ModelEdit,
+    pub(super) reopen: Option<ReopenOrigin>,
+}
+
+impl From<ModelEdit> for QueuedEdit {
+    fn from(edit: ModelEdit) -> Self {
+        Self { edit, reopen: None }
+    }
+}
+
+struct ReopenAcknowledgement {
+    origin: ReopenOrigin,
+    registry: uuid::Uuid,
+    sequence: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ReopenTracking {
+    active: HashMap<ProjectId, ReopenOrigin>,
+    deferred: HashMap<ProjectId, ReopenAcknowledgement>,
+    queued: HashSet<ProjectId>,
+    retryable: HashSet<ProjectId>,
+}
+
+impl ReopenTracking {
+    pub(super) fn invalidate(&mut self, project: ProjectId) {
+        self.active.remove(&project);
+        self.deferred.remove(&project);
+        self.queued.remove(&project);
+        self.retryable.remove(&project);
+    }
+
+    pub(super) fn begin(
+        &mut self,
+        project: ProjectId,
+        repository: PathBuf,
+        registry: uuid::Uuid,
+        inventory_generation: Option<u64>,
+    ) {
+        self.invalidate(project);
+        self.active.insert(
+            project,
+            ReopenOrigin {
+                nonce: uuid::Uuid::new_v4(),
+                registry,
+                project,
+                repository,
+                inventory_generation,
+            },
+        );
+    }
+
+    pub(super) fn remap(&mut self, previous: ProjectId, project: ProjectId) {
+        let origin = self.active.get(&previous).cloned();
+        self.invalidate(previous);
+        self.invalidate(project);
+        if let Some(mut origin) = origin {
+            origin.project = project;
+            self.active.insert(project, origin);
+        }
+    }
+
+    pub(super) fn for_repository(&self, repository: &Path) -> Vec<ReopenOrigin> {
+        self.active
+            .values()
+            .filter(|origin| origin.repository == repository)
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn can_retry(&self, repository: &Path) -> bool {
+        self.active.values().any(|origin| {
+            origin.repository == repository
+                && (self.retryable.contains(&origin.project)
+                    || self.deferred.contains_key(&origin.project))
+        })
+    }
+}
 
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
@@ -36,10 +188,12 @@ pub enum ModelUpdate {
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
+        origin: Option<ReopenOrigin>,
     },
     ReopenFailed {
         repository: PathBuf,
         error: String,
+        origin: Option<ReopenOrigin>,
     },
     Edited {
         sequence: u64,
@@ -56,9 +210,16 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// A local project/channel was kept, but its shared publication was refused.
+    PublicationFailed {
+        edit: ModelEdit,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
+    /// A title was refused before an authenticated edit connection existed.
+    /// Its exact candidate may still own an optimistic local name.
+    TitleRefused(ModelEdit),
     PaneTransferFailed {
         operation: uuid::Uuid,
         error: String,
@@ -78,6 +239,8 @@ pub enum ModelUpdate {
         error: String,
     },
     Ranked {
+        registry: uuid::Uuid,
+        repository: PathBuf,
         channel: ChannelId,
         ordinal: u32,
     },
@@ -166,14 +329,15 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelEdit>,
+    requests: async_channel::Receiver<QueuedEdit>,
 ) {
+    let context = PublicationContext::capture();
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
         .spawn(move || {
             let mut pending = None;
             while !requests.is_closed() || pending.is_some() {
-                if let Err(error) = publish(&updates, &requests, &mut pending) {
+                if let Err(error) = publish(&context, &updates, &requests, &mut pending) {
                     tracing::debug!(%error, "shared workspace model publishing ended");
                 }
                 std::thread::sleep(RECONNECT_DELAY);
@@ -189,15 +353,21 @@ pub(super) fn publish_workspace_model(
 }
 
 fn publish(
+    context: &PublicationContext,
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    pending: &mut Option<QueuedEdit>,
 ) -> Result<(), String> {
-    // Unlike the observer, the publisher starts a daemon: a channel the user
-    // just created has to reach the registry, and there is no registry without
-    // a daemon to hold it.
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    publish_with(updates, requests, pending, || context.connect())
+}
+
+fn publish_with(
+    updates: &async_channel::Sender<ModelUpdate>,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    pending: &mut Option<QueuedEdit>,
+    mut connect: impl FnMut() -> Result<ControlClient, ControlError>,
+) -> Result<(), String> {
+    let mut client = None;
     loop {
         let request = match pending.take() {
             Some(request) => request,
@@ -208,7 +378,16 @@ fn publish(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some(request.clone());
-        match send(&mut client, request.clone(), updates) {
+        // Resolve and authenticate only after retaining this edit. A permanent
+        // scope refusal must drain it through the same path as a refused edit,
+        // rather than reconnect forever with the request still in the queue.
+        let result = (|| {
+            if client.is_none() {
+                client = Some(connect()?);
+            }
+            send_queued(client.as_mut().unwrap(), request.clone(), updates)
+        })();
+        match result {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -223,22 +402,40 @@ fn publish(
                 ) {
                     *pending = None;
                     if matches!(
-                        &request,
+                        &request.edit,
+                        ModelEdit::OpenProject { .. } | ModelEdit::CreateChannel { .. }
+                    ) {
+                        let _ = updates.send_blocking(ModelUpdate::PublicationFailed {
+                            edit: request.edit.clone(),
+                        });
+                    }
+                    if matches!(
+                        &request.edit,
                         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
-                        && let Ok(model) = client.read_workspace_model()
-                    {
-                        // A refused suggestion is not replayed against a newer
-                        // owner. Restore the authoritative name after optimism.
-                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                    if matches!(&request.edit, ModelEdit::SuggestConversationTitle { .. }) {
+                        if let Some(model) = client
+                            .as_mut()
+                            .and_then(|client| client.read_workspace_model().ok())
+                        {
+                            // A refused suggestion is not replayed against a newer
+                            // owner. Restore the authoritative name after optimism.
+                            let _ = updates.send_blocking(ModelUpdate::Read(model));
+                        } else {
+                            // Authentication may refuse before a connection exists,
+                            // or the canonical read may fail after a definite edit
+                            // refusal. Reconcile only the still-owned candidate
+                            // from the UI's last confirmed model in either case.
+                            let _ = updates
+                                .send_blocking(ModelUpdate::TitleRefused(request.edit.clone()));
+                        }
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
-                    } = &request
+                    } = &request.edit
                     {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
@@ -246,10 +443,11 @@ fn publish(
                             error: error.to_string(),
                         });
                     }
-                    if let ModelEdit::ReopenProject { repository, .. } = request {
+                    if let ModelEdit::ReopenProject { repository, .. } = request.edit {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
                             error: error.to_string(),
+                            origin: request.reopen,
                         });
                     }
                 }
@@ -259,11 +457,21 @@ fn publish(
     }
 }
 
+#[cfg(test)]
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
+    send_queued(client, edit.into(), updates)
+}
+
+fn send_queued(
+    client: &mut ControlClient,
+    queued: QueuedEdit,
+    updates: &async_channel::Sender<ModelUpdate>,
+) -> Result<(), ControlError> {
+    let QueuedEdit { edit, reopen } = queued;
     let reordered = matches!(
         &edit,
         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -369,6 +577,8 @@ fn send(
         && let Some(channel) = model.channel(id)
     {
         let _ = updates.send_blocking(ModelUpdate::Ranked {
+            registry: model.identity,
+            repository: channel.repository.clone(),
             channel: id,
             ordinal: channel.ordinal,
         });
@@ -382,7 +592,11 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
-        let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
+        let _ = updates.send_blocking(ModelUpdate::Reopened {
+            repository,
+            model,
+            origin: reopen,
+        });
     }
     Ok(())
 }
@@ -424,6 +638,188 @@ enum Adoption {
 }
 
 impl Cagents {
+    fn live_reopen_intent(&self, origin: &ReopenOrigin) -> bool {
+        self.workspace_model_reopens.active.get(&origin.project) == Some(origin)
+            && self.project_ui.reopening.get(&origin.project) == Some(&origin.repository)
+            && !self.project_ui.closed.contains(&origin.repository)
+            && self.sidebar_model.project(origin.project).map_or_else(
+                // A new picker has no row until its inventory read completes.
+                || {
+                    !self
+                        .workspace_model_reopens
+                        .queued
+                        .contains(&origin.project)
+                },
+                |project| project.repository == origin.repository,
+            )
+    }
+
+    pub(super) fn inventory_failed_reopen(&mut self, project: ProjectId) {
+        let Some(origin) = self.workspace_model_reopens.active.get(&project) else {
+            return;
+        };
+        if self.project_ui.reopening.get(&project) == Some(&origin.repository)
+            && !self.workspace_model_reopens.queued.contains(&project)
+        {
+            // An inventory failure is not acknowledgement of a close. Keep
+            // local work protected, but let a fresh explicit picker retry an
+            // attempt that has not admitted any physical publication.
+            self.workspace_model_reopens.retryable.insert(project);
+        }
+    }
+
+    pub(super) fn finish_removed_project_reopens(&mut self, origins: &[ReopenOrigin]) {
+        for origin in origins {
+            if self
+                .workspace_model_reopens
+                .active
+                .get(&origin.project)
+                .is_some_and(|current| {
+                    current.nonce == origin.nonce
+                        && current.project == origin.project
+                        && current.repository == origin.repository
+                })
+            {
+                self.workspace_model_reopens.invalidate(origin.project);
+                if self.project_ui.reopening.get(&origin.project) == Some(&origin.repository) {
+                    self.project_ui.reopening.remove(&origin.project);
+                }
+            }
+        }
+    }
+
+    fn current_reopen(&self, origin: &ReopenOrigin) -> bool {
+        self.live_reopen_intent(origin)
+            && self
+                .sidebar_model
+                .project(origin.project)
+                .is_some_and(|project| project.repository == origin.repository)
+    }
+
+    fn capture_reopen_origin(
+        &mut self,
+        edit: &ModelEdit,
+        registry: uuid::Uuid,
+    ) -> Option<ReopenOrigin> {
+        let ModelEdit::ReopenProject { repository, .. } = edit else {
+            return None;
+        };
+        let project = self.project_ui.reopening.iter().find_map(|(id, path)| {
+            (path == repository
+                && self
+                    .sidebar_model
+                    .project(*id)
+                    .is_some_and(|project| project.repository == *repository))
+            .then_some(*id)
+        })?;
+        // Passive repository refreshes publish through this same path. They
+        // retain the explicit picker's nonce rather than minting a new intent.
+        let generation = self.repository_generations.get(&project).copied();
+        let queued = self.workspace_model_reopens.queued.contains(&project);
+        let origin = self.workspace_model_reopens.active.get_mut(&project)?;
+        if origin.repository != *repository {
+            return None;
+        }
+        if !queued {
+            origin.registry = registry;
+            origin.inventory_generation = generation;
+        }
+        Some(origin.clone())
+    }
+
+    fn defer_reopen_acknowledgement(
+        &mut self,
+        repository: &Path,
+        model: &WorkspaceModel,
+        origin: Option<&ReopenOrigin>,
+    ) {
+        if let Some(origin) = origin
+            && origin.repository == repository
+            && self.current_reopen(origin)
+            && !self
+                .workspace_model_reopens
+                .retryable
+                .contains(&origin.project)
+            && model.identity != NO_REGISTRY
+            && model.project(repository).is_some()
+        {
+            self.workspace_model_reopens.deferred.insert(
+                origin.project,
+                ReopenAcknowledgement {
+                    origin: origin.clone(),
+                    registry: model.identity,
+                    sequence: model.sequence,
+                },
+            );
+        }
+    }
+
+    fn settle_reopen_acknowledgements(&mut self, connected: Option<uuid::Uuid>) -> bool {
+        let obsolete: Vec<_> = self
+            .workspace_model_reopens
+            .active
+            .values()
+            .filter(|origin| !self.live_reopen_intent(origin))
+            .map(|origin| origin.project)
+            .collect();
+        for project in obsolete {
+            if self
+                .workspace_model_reopens
+                .active
+                .get(&project)
+                .is_some_and(|origin| {
+                    self.project_ui.reopening.get(&project) == Some(&origin.repository)
+                })
+            {
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+            } else {
+                self.workspace_model_reopens.invalidate(project);
+            }
+        }
+        let completed: Vec<_> = self
+            .workspace_model_reopens
+            .deferred
+            .iter()
+            .filter(|(_, ack)| self.current_reopen(&ack.origin))
+            .filter_map(|(project, ack)| {
+                let confirmed = self.workspace_model.identity == ack.registry
+                    && self.workspace_model.sequence >= ack.sequence;
+                let replaced = connected.is_some_and(|registry| registry != ack.registry);
+                (confirmed || replaced).then_some((
+                    *project,
+                    ack.origin.repository.clone(),
+                    confirmed,
+                ))
+            })
+            .collect();
+        let mut changed = false;
+        for (project, repository, confirmed) in completed {
+            if confirmed {
+                self.workspace_model_reopens.invalidate(project);
+                self.project_ui.reopening.remove(&project);
+                if self.workspace_model.project(&repository).is_some() {
+                    self.cancel_shared_project_close(&repository);
+                    self.project_ui.closed.remove(&repository);
+                }
+                // This exact attempt completed even when a later current
+                // close outran its reply. Release only its shield, then apply
+                // the current tombstone rather than resurrecting old state.
+                changed = true;
+            } else {
+                // Keep the local-work shield until an explicit new picker
+                // attempt replaces it. A different connection's tombstone is
+                // not permission to retire this unfinished local reopen.
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+                self.status = Some(TransientNotice::warning(
+                    "Project reopening could not be confirmed on the current workspace connection. Open the project again to retry.",
+                ));
+            }
+        }
+        changed
+    }
+
     pub(super) fn reorder_sidebar_member(
         &mut self,
         project: crate::model::ProjectId,
@@ -525,26 +921,76 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
-    /// Only stale complete snapshots skip projection. Even an equal model can
-    /// restore optimistic local state after refusal (for example channel titles).
-    /// Newer metadata edges may still lack an older snapshot's full inventory.
+    /// Stale snapshots and replies from a replaced registry skip projection.
+    /// An equal current model can still restore optimistic state after refusal
+    /// (for example channel titles). Newer metadata edges may still lack an
+    /// older snapshot's full inventory.
     pub(super) fn apply_workspace_model_update_effect(
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        // Publisher replies can cross the observer's Connected boundary. Only
+        // that observer may replace an already known registry; an old read or
+        // reopen must not roll back sharing or settle a successor's intent.
+        if let ModelUpdate::Reopened {
+            repository,
+            origin: Some(origin),
+            ..
+        } = &update
+            && (origin.repository != *repository || !self.current_reopen(origin))
+        {
+            return (Task::none(), false);
+        }
+        if let ModelUpdate::Reopened {
+            repository,
+            model,
+            origin,
+        } = &update
+            && self.workspace_model.identity != NO_REGISTRY
+            && model.identity != self.workspace_model.identity
+        {
+            self.defer_reopen_acknowledgement(repository, model, origin.as_ref());
+            return (Task::none(), false);
+        }
+        if let ModelUpdate::Read(model) = &update
+            && self.workspace_model.identity != NO_REGISTRY
+            && model.identity != self.workspace_model.identity
+        {
+            return (Task::none(), false);
+        }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
         {
             return (Task::none(), false);
         }
-        (self.apply_workspace_model_update_inner(update), true)
+        let connected = match &update {
+            ModelUpdate::Connected(model) => Some(model.identity),
+            _ => None,
+        };
+        let task = self.apply_workspace_model_update_inner(update);
+        let task = if self.settle_reopen_acknowledgements(connected) {
+            Task::batch([
+                task,
+                self.apply_closed_project_tombstones(),
+                self.reconcile_workspace_model(),
+            ])
+        } else {
+            task
+        };
+        self.resolve_workspace_publication_notices();
+        (task, true)
     }
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
+                Task::none()
+            }
+            ModelUpdate::TitleRefused(edit) => self.restore_refused_channel_title(edit),
+            ModelUpdate::PublicationFailed { edit } => {
+                self.report_workspace_publication_failure(edit);
                 Task::none()
             }
             ModelUpdate::ViewConflicted {
@@ -604,43 +1050,61 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.retire_foreign_project_operations(model.identity);
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Read(model) => {
+                if self.workspace_model.identity == NO_REGISTRY {
+                    // A publisher can answer before the observer. Saved shared
+                    // flags belong to the saved registry, so bind this real
+                    // incoming registry before interpreting any absence.
+                    self.join_workspace_model(model.identity);
+                }
                 if !self.install_workspace_model_snapshot(model) {
                     return Task::none();
                 }
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Reopened { repository, model } => {
+            ModelUpdate::Reopened {
+                repository,
+                model,
+                origin,
+            } => {
+                self.defer_reopen_acknowledgement(&repository, &model, origin.as_ref());
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.workspace_model.sequence
                 {
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
-                    return self.apply_closed_project_tombstones();
+                    return Task::none();
                 }
-                self.join_workspace_model(model.identity);
-                if model.project(&repository).is_some() {
-                    self.cancel_shared_project_close(&repository);
-                    self.project_ui.closed.remove(&repository);
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
+                if self.workspace_model.identity == NO_REGISTRY {
+                    self.join_workspace_model(model.identity);
                 }
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::ReopenFailed { repository, error } => {
-                self.project_ui
-                    .reopening
-                    .retain(|_, path| path != &repository);
+            ModelUpdate::ReopenFailed {
+                repository,
+                error,
+                origin,
+            } => {
+                if let Some(origin) = origin {
+                    if origin.repository != repository || !self.current_reopen(&origin) {
+                        return Task::none();
+                    }
+                    self.workspace_model_reopens
+                        .deferred
+                        .remove(&origin.project);
+                    self.workspace_model_reopens
+                        .retryable
+                        .insert(origin.project);
+                } else if self.project_ui.is_reopening(&repository) {
+                    return Task::none();
+                }
                 self.status = Some(crate::app::TransientNotice::error(format!(
                     "Could not reopen project: {error}"
                 )));
@@ -710,7 +1174,22 @@ impl Cagents {
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Ranked { channel, ordinal } => {
+            ModelUpdate::Ranked {
+                registry,
+                repository,
+                channel,
+                ordinal,
+            } => {
+                // A delayed reply from the previous registry cannot establish
+                // sharing in its replacement: that would turn the next absent
+                // snapshot into permission to retire this window's local work.
+                if (self.workspace_model.identity != NO_REGISTRY
+                    && self.workspace_model.identity != registry)
+                    || self.channel_ui.is_deleting(channel)
+                    || self.channel_ui.was_deleted(channel)
+                {
+                    return Task::none();
+                }
                 let Some(index) = self
                     .durable
                     .channels
@@ -719,6 +1198,19 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let local = &self.durable.channels[index];
+                if !self
+                    .sidebar_model
+                    .project(local.project_id)
+                    .is_some_and(|project| project.repository == repository)
+                {
+                    return Task::none();
+                }
+                if self.workspace_model.identity == NO_REGISTRY {
+                    // Bind bootstrap ACK authority too. Otherwise an ACK from
+                    // A could survive Connected(B) when B matches saved state.
+                    self.join_workspace_model(registry);
+                }
                 let local = &self.durable.channels[index];
                 if local.ordinal == ordinal && local.shared {
                     return Task::none();
@@ -746,6 +1238,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        self.retire_stale_shared_project_closes();
         let closed = self
             .workspace_model
             .closed_projects
@@ -776,7 +1269,14 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        // A real default-terminal choice can precede the first model. Its
+        // existing active-path/empty-view checks still govern consumption;
+        // joining the first registry must not silently discard that choice.
+        let deferred_default = (self.workspace_model.identity == NO_REGISTRY)
+            .then(|| self.shared_views.deferred_default.take())
+            .flatten();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
@@ -813,6 +1313,21 @@ impl Cagents {
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
+        // The publisher retains a queued creation through transient transport
+        // failures. An absent channel is not permission to queue that same
+        // creation again, including after a permanent refusal. Keep this fact
+        // separate from `shared`: only acknowledgement authorizes retirement.
+        let unshared = self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| !channel.shared)
+            .map(|channel| (channel.id, channel.project_id))
+            .collect::<HashSet<_>>();
+        self.workspace_model_publications
+            .retain(|(registry, channel, project)| {
+                *registry == model.identity && unshared.contains(&(*channel, *project))
+            });
         let mut tasks = Vec::new();
         let mut changed = false;
         // Projects first, so a channel's owner exists by the time the channel is
@@ -868,6 +1383,18 @@ impl Cagents {
             .channels
             .iter()
             .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
+            // Closing a project removes all of its shared channels too. That
+            // absence must honor the same pending-reopen shield as the parent
+            // close; otherwise it retires conversations before our exact ACK.
+            .filter(|local| {
+                !self
+                    .sidebar_model
+                    .project(local.project_id)
+                    .is_some_and(|project| {
+                        model.closed_projects.contains(&project.repository)
+                            && self.project_ui.is_reopening(&project.repository)
+                    })
+            })
             .map(|local| (local.id, local.shared))
             .collect::<Vec<_>>();
         for (id, shared) in retired {
@@ -893,7 +1420,7 @@ impl Cagents {
         // that is the only order two windows can agree on without a clock they
         // share.
         for id in republished {
-            self.publish_shared_channel(id);
+            self.publish_shared_channel(id, model.identity);
         }
         // Admission uses this incoming snapshot, not a blocked flag left by a
         // previous projection. Defer fresh actors while their scope is truly
@@ -945,6 +1472,9 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        // Channel retirement may have drained a project while the model was
+        // taken. Admit its close only after restoring canonical authority.
+        tasks.push(self.complete_closed_projects());
         Task::batch(tasks)
     }
 
@@ -1215,6 +1745,193 @@ impl Cagents {
         Some(Task::batch([attach, task]))
     }
 
+    /// Keep local work usable after permanent shared-publication refusal.
+    /// No retry or compensating edit is implied by this notice.
+    fn report_workspace_publication_failure(&mut self, edit: ModelEdit) {
+        let (key, message) = match edit {
+            ModelEdit::OpenProject { repository, .. } => {
+                let Some(project) = self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .find(|project| project.repository == repository)
+                else {
+                    return;
+                };
+                if self.workspace_model.project(&repository).is_some()
+                    || self.project_ui.closed.contains(&repository)
+                {
+                    return;
+                }
+                (
+                    NoticeKey::SharedProject(project.id),
+                    format!(
+                        "Could not share project “{}”. Local work was kept.",
+                        project.name
+                    ),
+                )
+            }
+            ModelEdit::CreateChannel { id, repository, .. } => {
+                let Some(channel) = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                else {
+                    return;
+                };
+                let Some(project) = self
+                    .sidebar_model
+                    .project(channel.project_id)
+                    .filter(|project| project.repository == repository)
+                else {
+                    return;
+                };
+                if channel.shared
+                    || self.workspace_model.channel(id).is_some()
+                    || self.channel_ui.is_deleting(id)
+                    || self.channel_ui.was_deleted(id)
+                {
+                    return;
+                }
+                let title = if channel.title.is_empty() {
+                    "New channel"
+                } else {
+                    &channel.title
+                };
+                (
+                    NoticeKey::SharedChannel(id, channel.project_id),
+                    format!(
+                        "Could not share channel “{title}” in “{}”. Local work and drafts were kept.",
+                        project.name
+                    ),
+                )
+            }
+            _ => return,
+        };
+        self.status = Some(
+            TransientNotice::warning(message)
+                .with_key(key)
+                .with_details("You can keep working locally. To share this workspace, reopen it from your own terminal."),
+        );
+    }
+
+    /// A real model acknowledgement or target retirement resolves only its
+    /// own report. Repeated refusals replace a keyed notice instead of piling up.
+    pub(super) fn resolve_workspace_publication_notices(&mut self) {
+        let resolved = self
+            .notices
+            .entries
+            .iter()
+            .map(|entry| &entry.notice)
+            .chain(self.status.iter())
+            .filter_map(|notice| match notice.key {
+                Some(key @ NoticeKey::SharedProject(id))
+                    if self.sidebar_model.project(id).is_none_or(|project| {
+                        self.workspace_model.project(&project.repository).is_some()
+                            || self.project_ui.closed.contains(&project.repository)
+                    }) =>
+                {
+                    Some(key)
+                }
+                Some(key @ NoticeKey::SharedChannel(id, project))
+                    if self
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id && channel.project_id == project)
+                        .is_none_or(|channel| channel.shared)
+                        || self.workspace_model.channel(id).is_some() =>
+                {
+                    Some(key)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in resolved {
+            self.resolve_notice(key);
+        }
+    }
+
+    /// Undo only the optimism still owned by this refused title candidate.
+    /// The wire edit carries no registry identity: use its existing channel,
+    /// primary conversation and view-revision proof, never invent a new one.
+    fn restore_refused_channel_title(&mut self, edit: ModelEdit) -> Task<Message> {
+        let ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = edit
+        else {
+            return Task::none();
+        };
+        if self.workspace_model.identity == NO_REGISTRY
+            || self.channel_ui.is_deleting(id)
+            || self.channel_ui.was_deleted(id)
+        {
+            return Task::none();
+        }
+        let Some(index) = self
+            .durable
+            .channels
+            .iter()
+            .position(|local| local.id == id)
+        else {
+            return Task::none();
+        };
+        let local = &self.durable.channels[index];
+        if local.title != title
+            || local.title_source != source
+            || self.channel_primary_chat(local) != Some(card)
+        {
+            return Task::none();
+        }
+        let Some(confirmed) = self.workspace_model.channel(id) else {
+            return Task::none();
+        };
+        if !self
+            .sidebar_model
+            .project(local.project_id)
+            .is_some_and(|project| project.repository == confirmed.repository)
+        {
+            return Task::none();
+        }
+        let Some(view) = self.workspace_model.views.iter().find(|view| {
+            view.scope == crate::workspace_model::views::Scope::Channel(id)
+                && view.revision == expected_revision
+                && view.primary_chat() == Some(card)
+        }) else {
+            return Task::none();
+        };
+        let same_source = match (
+            self.card_state(card).map(|local| &local.kind),
+            view.panes
+                .iter()
+                .find(|pane| pane.id == card)
+                .map(|pane| &pane.kind),
+        ) {
+            (Some(CardKind::Chat(local)), Some(CardKind::Chat(confirmed))) => local == confirmed,
+            _ => false,
+        };
+        if !same_source
+            || local.title == confirmed.title && local.title_source == confirmed.title_source
+        {
+            return Task::none();
+        }
+        // The same title/source projection as an equal authoritative snapshot,
+        // restricted to one candidate so other optimistic edits remain intact.
+        let title = confirmed.title.clone();
+        let source = confirmed.title_source;
+        let local = &mut Arc::make_mut(&mut self.durable).channels[index];
+        local.title = title;
+        local.title_source = source;
+        self.refresh_sidebar_channels();
+        self.persist();
+        self.sync_chrome()
+    }
+
     /// Takes the shared half of a channel this window already has.
     fn absorb_shared_channel(&mut self, index: usize, shared: &ModelChannel) -> bool {
         let local = &self.durable.channels[index];
@@ -1465,10 +2182,16 @@ impl Cagents {
     /// Publishes a channel this window holds and the registry has never heard
     /// of, which is how a window that predates the registry - or that was open
     /// while a replacement one was created - introduces what it already has.
-    fn publish_shared_channel(&mut self, id: ChannelId) {
+    fn publish_shared_channel(&mut self, id: ChannelId, registry: uuid::Uuid) {
         let Some(channel) = self.durable.channels.iter().find(|local| local.id == id) else {
             return;
         };
+        if self
+            .workspace_model_publications
+            .contains(&(registry, id, channel.project_id))
+        {
+            return;
+        }
         let title = channel.title.clone();
         let title_source = channel.title_source;
         let project_id = channel.project_id;
@@ -1489,12 +2212,15 @@ impl Cagents {
         // Carrying the title this window already derived, unlike a fresh
         // creation: a channel being reintroduced has a name the user has seen,
         // and publishing it empty would blank it in every other window.
-        self.publish_model_edit(ModelEdit::CreateChannel {
-            id,
-            repository,
-            title,
-            title_source,
-        });
+        self.publish_model_edit_for_registry(
+            ModelEdit::CreateChannel {
+                id,
+                repository,
+                title,
+                title_source,
+            },
+            registry,
+        );
     }
 
     /// Publishes a project this window opened.
@@ -1530,17 +2256,65 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+        self.publish_model_edit_for_registry(edit, self.workspace_model.identity);
+    }
+
+    fn publish_model_edit_for_registry(&mut self, edit: ModelEdit, registry: uuid::Uuid) {
         self.capture_view_update_source(&edit);
+        let publication = match &edit {
+            ModelEdit::CreateChannel { id, repository, .. } => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == *id)
+                .filter(|channel| {
+                    self.sidebar_model
+                        .project(channel.project_id)
+                        .is_some_and(|project| project.repository == *repository)
+                })
+                .map(|channel| (registry, *id, channel.project_id)),
+            _ => None,
+        };
         let navigation = matches!(
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
-        if let Err(error) = self.workspace_model_tx.try_send(edit) {
+        let reopen = self.capture_reopen_origin(&edit, registry);
+        if reopen.as_ref().is_some_and(|origin| {
+            self.workspace_model_reopens
+                .queued
+                .contains(&origin.project)
+                || self
+                    .workspace_model_reopens
+                    .retryable
+                    .contains(&origin.project)
+        }) {
+            return;
+        }
+        if let Err(error) = self.workspace_model_tx.try_send(QueuedEdit {
+            edit,
+            reopen: reopen.clone(),
+        }) {
+            if let Some(origin) = reopen {
+                self.workspace_model_reopens
+                    .retryable
+                    .insert(origin.project);
+                self.status = Some(TransientNotice::warning(
+                    "Could not queue reopening this project. Open the project again to retry.",
+                ));
+            }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
                 self.status = Some(TransientNotice::warning(
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
+            }
+        } else {
+            if let Some(origin) = reopen {
+                self.workspace_model_reopens.queued.insert(origin.project);
+            }
+            if let Some(publication) = publication {
+                self.workspace_model_publications.insert(publication);
             }
         }
     }
@@ -2381,8 +3155,8 @@ mod tests {
                     "a truly blocked scope must not create a fresh card or Starting Task"
                 );
                 assert!(!app.chat_start_pending(card));
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
-                    matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|queued|
+                    matches!(queued.edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
                 // The next authoritative read removes the conflict while the
                 // previous projection's blocked flag is still set locally.
                 model.views[0].panes.clear();
@@ -2393,7 +3167,9 @@ mod tests {
             model.sequence += 1;
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-            let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let edits = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|queued| queued.edit)
+                .collect::<Vec<_>>();
             let inserts = edits
                 .iter()
                 .filter_map(|edit| match edit {
@@ -2455,8 +3231,8 @@ mod tests {
             // rather than re-issuing it or treating the old empty view as close.
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
             assert!(app.card_state(card).unwrap().existence.is_open());
-            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
-                matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|queued|
+                matches!(queued.edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
             let change = Change::Insert {
                 pane: pane.clone(),
                 before: None,
@@ -3234,6 +4010,12 @@ mod tests {
     fn an_unchanged_explicit_open_acknowledges_the_pending_reopen() {
         let (mut app, project, repository) = app_with_project();
         app.project_ui.reopening.insert(project, repository.clone());
+        app.workspace_model_reopens.begin(
+            project,
+            repository.clone(),
+            app.workspace_model.identity,
+            None,
+        );
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
             kind: Default::default(),
@@ -3241,9 +4023,18 @@ mod tests {
             name: "repo".into(),
             ordinal: 1,
         });
+        let origin = app.capture_reopen_origin(
+            &ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: Default::default(),
+            },
+            app.workspace_model.identity,
+        );
         drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
             repository: repository.clone(),
             model,
+            origin,
         }));
         assert!(!app.project_ui.is_reopening(&repository));
         assert!(app.sidebar_model.project(project).is_some());
@@ -3251,14 +4042,16 @@ mod tests {
 
     /// Replaces the publish queue with one the test can read, which is how the
     /// window's side of a publish is observed without a daemon.
-    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
+    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<QueuedEdit> {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         rx
     }
 
-    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    fn drain(rx: &async_channel::Receiver<QueuedEdit>) -> Vec<ModelEdit> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|queued| queued.edit)
+            .collect()
     }
 
     /// A real checkout, because adopting a project runs the repository loader
@@ -4020,7 +4813,7 @@ mod tests {
     /// proof the registry holds it.
     #[test]
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
-        let (mut app, project, _repository) = app_with_project();
+        let (mut app, project, repository) = app_with_project();
         let id = ChannelId::new();
         let provisional = app.next_provisional_ordinal();
         Arc::make_mut(&mut app.durable)
@@ -4029,6 +4822,8 @@ mod tests {
         assert_ne!(provisional, 11);
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
+            registry: app.workspace_model.identity,
+            repository,
             channel: id,
             ordinal: 11,
         });

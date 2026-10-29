@@ -201,6 +201,8 @@ fn scope_descriptor(
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
         pending_chat_admissions: Default::default(),
+        native_start_custody: Default::default(),
+        released_native_starts: Default::default(),
         pending_terminal_creations: HashSet::new(),
     }
 }
