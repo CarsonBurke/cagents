@@ -162,11 +162,17 @@ def live_tree(pid):
     return nodes
 
 
-def capture(window, name, size):
+def capture(window, name, size, *, neutral_pointer=False):
     global viewport
     run(['xdotool', 'windowsize', '--sync', window, *map(str, size)])
     run(['xdotool', 'windowmove', '--sync', window, '0', '0'])
     viewport = size
+    if neutral_pointer:
+        # Match comparison frames without hovering unrelated navigation. This
+        # moves only the pointer; keyboard focus and all gestures stay intact.
+        point = (size[0] - 1, size[1] - 1)
+        run(['xdotool', 'mousemove', '--sync', *map(str, point)])
+        event({'event': 'comparison-pointer-parked', 'capture': name, 'point': list(point)})
     time.sleep(.6)
     png = out / (name + '.png')
     def rendered_frame():
@@ -715,7 +721,7 @@ try:
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', ' and still active'])
                 wait(lambda: (field := peer_field()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
                      and field.queryText().getText(0, -1) == 'peer scope preserved and still active')
-                capture(window, label + '-removed-wide', (1280, 800))
+                capture(window, label + '-removed-wide', (1280, 800), neutral_pointer=True)
                 database = Path((root / 'database-path').read_text())
                 assert database.is_relative_to(root)
                 workspace_id = (root / 'workspace-id').read_text().strip()
@@ -825,8 +831,8 @@ try:
                 wait(lambda: hidden_field.queryText().getText(0, -1) == 'active scope preserved')
                 assert not accessibility_snapshot(lambda: any(
                     node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
-            capture(window, label + '-wide', (1280, 800))
-            capture(window, label + '-narrow', (900, 700))
+            capture(window, label + '-wide', (1280, 800), neutral_pointer=True)
+            capture(window, label + '-narrow', (900, 700), neutral_pointer=True)
             run(['xdotool', 'key', 'Tab', 'shift+Tab'])
             focused = accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)
                        if node.getState().contains(pyatspi.STATE_FOCUSED)])
@@ -892,7 +898,7 @@ try:
                 assert field.queryComponent().grabFocus()
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'Fresh work after ordinary History recovery.'])
                 wait(lambda: field.queryText().getText(0, -1) == 'Fresh work after ordinary History recovery.')
-                capture(window, label + '-ordinary-recovered', (1280, 800))
+                capture(window, label + '-ordinary-recovered', (1280, 800), neutral_pointer=True)
                 # Ordinary typing has no idle snapshot timer in either
                 # revision. Exercise the real save-on-navigation contract.
                 def saved_channel_control():
