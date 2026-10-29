@@ -114,17 +114,21 @@ fn publish(root: &fs_safety::Root, name: &str, bytes: &[u8], new: bool) -> io::R
             fs_safety::rename_within(root, &temporary, OsStr::new(name))
                 .map_err(io::Error::other)?;
         }
-        #[cfg(test)]
-        if FAIL_AFTER_RENAME.with(|fail| fail.replace(false)) {
-            return Err(io::Error::other(
-                "injected setup publication directory-sync failure after rename",
-            ));
-        }
-        fs_safety::sync_directory(root)?;
-        named(root)
+        sync_publication(root)
     })();
     let _ = fs_safety::unlink_within(root, &temporary);
     result
+}
+
+fn sync_publication(root: &fs_safety::Root) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_AFTER_RENAME.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other(
+            "injected setup publication directory-sync failure after rename",
+        ));
+    }
+    fs_safety::sync_directory(root)?;
+    named(root)
 }
 
 #[cfg(test)]
@@ -171,7 +175,9 @@ pub(super) fn record_creation(admin: &fs_safety::Root, creation: OperationId) ->
     match marker(admin) {
         Ok(existing) if existing == creation => {
             read_disposition(admin, creation)?;
-            return Ok(());
+            // A previous rename may be visible after its directory sync failed.
+            // Replaying the same generation must finish that barrier too.
+            return sync_publication(admin);
         }
         Ok(_) => {
             return Err(io::Error::other(
@@ -916,6 +922,49 @@ mod tests {
             "another run cannot reuse the completed write"
         );
     }
+    #[test]
+    fn creation_replay_finishes_the_failed_directory_barrier_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let admin = fs_safety::Root::open(temp.path()).unwrap();
+        let creation = OperationId::new();
+        let metadata = admin.metadata().unwrap();
+        let disposition = Disposition {
+            creation,
+            admin: (metadata.dev(), metadata.ino()),
+            phase: Phase::NeverStarted,
+        };
+        let expected_execution = serde_json::to_vec(&disposition).unwrap();
+        publish(&admin, EXECUTION, &expected_execution, true).unwrap();
+
+        // EXECUTION is already durable; fail the later CREATION rename barrier.
+        fail_next_setup_publication_sync_for_test();
+        assert!(record_creation(&admin, creation).is_err());
+        assert_eq!(marker(&admin).unwrap(), creation);
+        assert_eq!(read_disposition(&admin, creation).unwrap(), disposition);
+        let expected_creation = format!("{creation}\n").into_bytes();
+        let assert_unchanged = || {
+            assert_eq!(
+                fs::read(temp.path().join(CREATION)).unwrap(),
+                expected_creation
+            );
+            assert_eq!(
+                fs::read(temp.path().join(EXECUTION)).unwrap(),
+                expected_execution
+            );
+        };
+        assert_unchanged();
+
+        // Visible matching bytes cannot turn a second failed barrier into success.
+        fail_next_setup_publication_sync_for_test();
+        assert!(record_creation(&admin, creation).is_err());
+        assert_unchanged();
+        record_creation(&admin, creation).unwrap();
+        assert_unchanged();
+        assert!(removal_is_quiescent(&admin).is_ok());
+        assert!(record_creation(&admin, OperationId::new()).is_err());
+        assert_unchanged();
+    }
+
     #[test]
     fn interrupted_disposition_first_initialization_only_finishes_same_creation() {
         let temp = tempfile::tempdir().unwrap();
