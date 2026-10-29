@@ -1,0 +1,220 @@
+{
+  "schema": 1,
+  "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
+  "never_merge": true,
+  "status": "RUNNABLE_SOURCE_PREPARED_UNGRANTED_UNRUN",
+  "parent_control_head": "77647db730fd0d5b6ec7f2fc984d5edc94d42a3c",
+  "after": {
+    "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
+    "tree": "7d84da268933045b1add2ad310ce45c84be751db"
+  },
+  "before_immutable_unexecuted": {
+    "head": "94c3cef719f5cb27637899dfd13e67baca3cbc34",
+    "tree": "63e08c61e41e20192fc7d869cad8e3ddf8043200"
+  },
+  "new_control_paths": [
+    ".github/qualification/native-worktree-delete-after-probe.py",
+    "research/worktree-delete-native/after-probe.json",
+    "research/worktree-delete-native/AFTER-PROBE.md"
+  ],
+  "review_paths": [
+    ".github/qualification/native-worktree-delete-after-probe.py",
+    "research/worktree-delete-native/after-probe.json",
+    "research/worktree-delete-native/AFTER-PROBE.md",
+    ".github/qualification/native-worktree-delete-driver.py",
+    ".github/qualification/native-worktree-delete-primitives.py",
+    "research/worktree-delete-native/manifest.json",
+    "research/worktree-delete-native/primitives-provenance.json"
+  ],
+  "product_source_sha256": {
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "mise.toml": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+    "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "scripts/check-format": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7",
+    ".github/actions/setup-linux-build/action.yml": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+    "src/control.rs": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673",
+    "src/control/terminal_list.rs": "61c46d6ef3e131c402b281590e9e294c3835ba531570b8942d3db4a9d316e082",
+    "src/control/work.rs": "530d849fda8b1e9acf12604ff1fde10b325ed90b30db2a8a1a83b986b0c4010e",
+    "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+    "src/session.rs": "72e34f0c595243ebdc899d29fc232cc64fda5000c7036505773667ffd180223e",
+    "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+    "src/host/client.rs": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9",
+    "src/terminal/hosted.rs": "d6c65d889586ba176e7266d94057c06ec0d6f67fc5a02d69b8b81c5f226d56e3",
+    "src/app.rs": "1ba68f9549829e73a3eaa77a73d7e54e027eaedae01f6060c02c68e700796ec7",
+    "src/sidebar.rs": "8453d1263998ccfacffe46adbd2e9c3a1c88badbd8804917efb547688fbc3c18",
+    "src/app/project_ui.rs": "be6e6ed19a47343c924f833afaa82254b811dbfa4d0b7d6cb7614f82cf1f0ab8",
+    "src/app/sidebar_selection_ui.rs": "c9c3ebb07c6c7b9bcd4ce2e4cbde90666b97d81d9da0a4d80ec8514c2e207085",
+    "src/app/terminal_adoption.rs": "1e83cb5f3fec49250d1f3457c8ce2aa9d09f255ecd159fdfb4a67b9baf241bf3",
+    "src/app/terminal_end_ui.rs": "577324afa74865b16ac466b92e55aa25ecf3d56d6ec633a92c8659eea3975103",
+    "src/app/session_recovery.rs": "0cfee2c192d0dfef3e3fb7dbfafe0953bab015e8b3d10b01e39d50c3be6096f9",
+    "src/app/startup_gate.rs": "205d415af76c9e222cdacc1c1d1f516fefdf913adb57ddf4d11121330c45e730",
+    "src/app/workspace_model_sync.rs": "cef30b3124fe0313fcdc35f8241660857672609424b9ac31b61c57c469c5693d",
+    "src/repository.rs": "869bc77966139dfceb79c5f1963849b266d7f4c59015330b5e78e04e194537cc",
+    "src/worktree_cleanup.rs": "45062881b5725eb9ae39d9ed7604b815ad8e0ff81d6b18cc529c58395c117ea0",
+    "src/repository/nested_repositories.rs": "2413d10b4deaacc5d58e1ab5f78873a8c22efc440c0c8aa3824a362f216b886a"
+  },
+  "viewports": [
+    {
+      "name": "wide",
+      "size": [
+        1400,
+        875
+      ]
+    },
+    {
+      "name": "narrow",
+      "size": [
+        900,
+        600
+      ]
+    }
+  ],
+  "root_screen": {
+    "size": [
+      1600,
+      1000
+    ],
+    "dpi": 96
+  },
+  "requested_renderer": {
+    "ICED_BACKEND": "wgpu",
+    "WGPU_BACKEND": "gl",
+    "LIBGL_ALWAYS_SOFTWARE": "1"
+  },
+  "expected_observed_backend": "Gl",
+  "native_scale": "Configured1.0; actual native factor remains UNMEASURED unless separately observed. No inference from env/DPI or screenshots.",
+  "fixture_terminal_count": 4,
+  "provider": "NONE",
+  "sequence": [
+    "Gate exact control child/product hashes, independent source/composition review and actual fresh EC lease before effects. External positive CLI/HOST/UI checks are optional; matched runner supplies compilation evidence before UI startup.",
+    "Create new0700 disposable A/B fixture and private desktop/XDG runtime. Under the same lease run actual scripts/run-development --browserless --debug --fresh-daemon --log-file VERSION_LOG -- --version; require exit0 from unchanged set-e three isolated builds and no native window. Hash/version all3 actual ELF files before startup. Then use ordinary runner in the same serial granted target and require identical ELF bytes.",
+    "Record exact runner-built CLI/HOST/UI versions and hashes, owned PID/start/XID, namespace/runtime custody, root/direct/nonblank frame, requested-v-observed exact UI-log renderer.",
+    "Use actual matched User daemon start/project open A. Spawn only four /bin/sleep86400 terminals in primary/outer/foreign/own fixture scopes; retain real issued IDs/full proofs/actual process identities.",
+    "At both viewports inspect primary native context menu, real Delete-key refusal through Application notices, outer unknown-B context menu and enabled confirmation Cancel, independent own confirmation Cancel, same-common nested disabled refusal Cancel.",
+    "Open B through supported matched User project open. At both viewports inspect real foreign row/menu and enabled confirmation Cancel, outer known-B disabled nested refusal Cancel, existing absent-named valid target confirmation Cancel.",
+    "Compare actual Git registrations/refs, directory identities, nested tracked/uncommitted/ignored/untracked bytes, four running terminal IDs/launch/host proofs and unchanged owned /bin/sleep PID/start identities. Retain raw source DB/WAL/SHM observed bytes.",
+    "Mark G1 absence/replacement/row-retirement recovery UNQUALIFIED, not inferred from valid dialog. G3 complete eight-case paired suite remains held.",
+    "After final conservation only, close exact four issued synthetic terminals, normal WM_DELETE UI, empty matched-daemon stop. Retain private fixture directories and all original evidence. Any forced app cleanup invalidates success."
+  ],
+  "forbidden": [
+    "No Before execution or destructive comparison.",
+    "No worktree/project remove, Git worktree remove, directory removal/parking/replacement, registry repair, database mutation or product hook.",
+    "No Delete worktree/Retry delete confirmation activation, Return/space in modal, forced stale selection or input replay.",
+    "No provider Send/start, account/model/limit changes, role/environment authority fabrication or broader User API.",
+    "No build/native/helper/OCR/hosted/GH execution is authorized by this source artifact.",
+    "No historical WebP/native/renderer/terminal resource result transfers."
+  ],
+  "state_counts": {
+    "expected_native_capture_checkpoints": 39,
+    "conservation_checkpoints": 7,
+    "maximum_fixture_terminals": 4,
+    "products_built_serially": [
+      "CLI development",
+      "HOST development,host",
+      "UI development,ui"
+    ],
+    "parallel_builds": 1
+  },
+  "evidence_contract": {
+    "actual_native": [
+      "Original full-root PNG",
+      "Original actual direct-drawable PNG+command exit/nonblank",
+      "Unscaled actual client PNG/lossless WebP",
+      "Absolute root/client geometry and occlusion/focus/pointer before/after",
+      "Owned UI/daemon/terminal PID/start/executable/namespace metadata and actual XID/PID relation",
+      "PID-filtered bounded native AX trees, native query/input event records",
+      "Actual native same-frame TSV/OCR only for readable labels, never probe input coordinates"
+    ],
+    "scope": [
+      "Private fixture ownership nonce+uid/dev/inode marker",
+      "Original command argv/cwd/stdout/stderr/exit/digests",
+      "Seven raw fixture/DB/Git/terminal scope snapshots",
+      "B file bytes and .git references/registrations plus A refs and directory identities",
+      "Actual four terminal IDs, full HostSessionProof/continuity, launch scopes and unchanged actual sleep PID/start identities",
+      "Explicit final-before-cleanup conservation separate from synthetic resource disposal"
+    ],
+    "limits": "AX/OCR and nonblank machine checks are not independent readability/UX approval. Raw live DB bytes are observational, not a consistent transaction snapshot. No unsaved native editor buffer, backend scanner confirmation, absent/replacement recovery, Before causal result or full feature qualification."
+  },
+  "external_gate_receipts": {
+    "source_review": {
+      "verdict": "AFTER_ONLY_PROBE_SOURCE_CLEAR",
+      "independent": true,
+      "reviewer": "actual nonauthor reviewer identity",
+      "control_head": "exact final control commit",
+      "control_tree": "exact final control tree",
+      "product_head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
+      "product_tree": "7d84da268933045b1add2ad310ce45c84be751db",
+      "source_sha256": "exact map for every review_paths entry",
+      "composition_review": "SOURCE_CLEAR"
+    },
+    "ui_checks": {
+      "verdict": "MATCHED_BOUNDARIES_PASS",
+      "source_only": false,
+      "product_head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
+      "product_tree": "7d84da268933045b1add2ad310ce45c84be751db",
+      "raw_evidence_sha256": "actual64hex aggregate receipt hash",
+      "boundaries": {
+        "cli": {
+          "features": [],
+          "exit": 0,
+          "raw_receipt_sha256": "actual64hex receipt hash"
+        },
+        "host": {
+          "features": [
+            "host"
+          ],
+          "exit": 0,
+          "raw_receipt_sha256": "actual64hex receipt hash"
+        },
+        "ui": {
+          "features": [
+            "ui"
+          ],
+          "exit": 0,
+          "raw_receipt_sha256": "actual64hex receipt hash"
+        }
+      },
+      "optional": true,
+      "not_required_when": "Actual matched runner builds all3 isolated executables successfully and records source/ELF custody before native UI startup. Unit/full-flow/readiness checks remain separate merge gates."
+    },
+    "ec_lease": {
+      "verdict": "GRANTED",
+      "issuer": "EC",
+      "grant_id": "actual fresh granted lease identity",
+      "actual_grant_reference": "actual archived EC grant message/receipt reference, not invented by controller",
+      "scope": "PR1984_AFTER_ONLY_CANCEL_NATIVE_PROBE",
+      "control_head": "exact final control commit",
+      "control_tree": "exact final control tree",
+      "product_head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
+      "product_tree": "7d84da268933045b1add2ad310ce45c84be751db",
+      "issued_at": "actual UTC RFC3339 timestamp",
+      "expires_at": "actual UTC RFC3339 timestamp",
+      "collection_seconds": "positive duration actually granted by EC",
+      "cleanup_seconds": "positive <=60s actually granted by EC",
+      "max_parallel_builds": 1,
+      "cargo_jobs": "1 or2 actually granted",
+      "max_fixture_terminals": 4,
+      "provider_allowed": false,
+      "rust_toolchain": "1.93.0",
+      "target": "actual EC-granted existing target under RUNNER_TEMP",
+      "evidence_root": "new exact EC-granted evidence path under RUNNER_TEMP"
+    }
+  },
+  "gate_authority": "These are controller input contracts, not a new service/API or self-issued authority. Root must archive the actual independently issued review/checks/EC grant and pass independently frozen SHA256s. No receipt is generated or approved by the probe. Absent, drifted, malformed or expired input stops before effects.",
+  "runtime": "UNRUN; all receipts/grants absent at preparation; no workflow or publication added.",
+  "matched_build_contract": {
+    "external_compile_receipt": "OPTIONAL",
+    "required_before_native_window": "Actual unchanged development runner version-only invocation --browserless --debug --fresh-daemon --log-file VERSION_LOG -- --version completes exit0 with three isolated CLI/HOST/UI builds; all3 actual ELF hashes/versions and exact source pins recorded.",
+    "actual_ui": "Ordinary runner afterward reuses same serial granted target incrementally; every ELF must equal pre-start hash. No build-only flag, direct cargo workflow, source hook, second queue/job, cold parallel graph or extra test/check target.",
+    "resource_budget": "Both supported runner invocations share the original actual EC collection deadline and one target; first failure stops, no retry/extension.",
+    "limits": "Matched compilation is not a claim of unit/full-flow checks or merge readiness."
+  }
+}
