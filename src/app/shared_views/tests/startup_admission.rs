@@ -808,7 +808,7 @@ fn fenced_managed_chat_keeps_its_text_and_closes_only_here() {
     view.panes.push(pane.clone());
     let mut model = model(identity, active, hidden, view);
     model.agents = vec![agent];
-    admit(&mut app, active, hidden, model);
+    admit(&mut app, active, hidden, model.clone());
     assert!(app.shared_views.quarantined.contains(&pane.id));
     assert!(app.chat_awaiting_admission(pane.id));
     let visible = visible_text(&app, pane.id);
@@ -825,6 +825,17 @@ fn fenced_managed_chat_keeps_its_text_and_closes_only_here() {
     assert!(!app.card_state(pane.id).unwrap().existence.is_open());
     assert!(!app.workspace.order().any(|id| id == pane.id));
     assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
+    // Later snapshots, still fenced, leave it closed here.
+    for _ in 0..2 {
+        model.sequence += 1;
+        let read = app.apply_workspace_model_update(
+            crate::app::workspace_model_sync::ModelUpdate::Read(model.clone()),
+        );
+        settle(&mut app, read);
+        assert!(app.shared_views.quarantined.contains(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == pane.id));
+    }
     assert!(
         daemon.requests().is_empty(),
         "a fenced pane must not reconnect or close its stale session"
