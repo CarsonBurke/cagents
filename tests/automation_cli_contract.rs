@@ -9,7 +9,7 @@ mod private_cli_capture;
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
@@ -43,19 +43,46 @@ impl Fixture {
     }
 
     fn start(root: &Path) -> Child {
+        Self::start_with_soft_limit(root, None)
+    }
+
+    fn start_with_soft_limit(root: &Path, soft_limit: Option<libc::rlim_t>) -> Child {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("daemon.log"))
             .unwrap();
-        Self::command(root, env!("CARGO_BIN_EXE_cagentsd"))
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap()
+        let mut command = Self::command(root, env!("CARGO_BIN_EXE_cagentsd"));
+        command.stdout(log.try_clone().unwrap()).stderr(log);
+        if let Some(soft_limit) = soft_limit {
+            // Set only the fixture daemon's incoming limit. The test process
+            // and the other contracts running beside it retain their limits.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut limit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = soft_limit;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        command.spawn().unwrap()
     }
 
     fn new() -> Self {
+        Self::with_soft_limit(None)
+    }
+
+    fn with_soft_limit(soft_limit: Option<libc::rlim_t>) -> Self {
+        Self::with_soft_limit_and_branch(soft_limit, "main")
+    }
+
+    fn with_soft_limit_and_branch(soft_limit: Option<libc::rlim_t>, branch: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         for name in [
             "home", "run", "data", "config", "cache", "tmp", "project", "bin",
@@ -63,7 +90,18 @@ impl Fixture {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
-        let daemon = Self::start(root.path());
+        // Own the repository identity even when TMPDIR has enclosing Git
+        // metadata. Plain-folder discovery must not select another checkout.
+        let initialized = Self::command(root.path(), "/usr/bin/git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template="])
+            .arg(format!("--initial-branch={branch}"))
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
+        let daemon = Self::start_with_soft_limit(root.path(), soft_limit);
         let mut fixture = Self {
             root,
             daemon,
@@ -385,6 +423,104 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
+    let mut incoming: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut incoming) },
+        0
+    );
+    assert!(
+        incoming.rlim_max > 64,
+        "fixture needs room below the hard limit"
+    );
+    let soft_limit = incoming.rlim_cur.min(1024).min(incoming.rlim_max - 1);
+    let fixture = Fixture::with_soft_limit(Some(soft_limit));
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let definition = json!({
+        "name": "Descriptor limit fixture", "prompt": "must never launch a provider",
+        "agent": { "provider": "Omp", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null },
+        "schedule": {"pattern": {"daily": {"hour": 3, "minute": 0}}, "timezone": "UTC"},
+        "session_mode": "fresh",
+        "precheck": {"command": "ulimit -Sn > soft-limit; ulimit -Hn > hard-limit; exit 1", "timeout_seconds": 2}
+    });
+    let path = fixture.root.path().join("definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap();
+    let revision = created["automation"]["execution_revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let accepted = fixture.cli(&[
+        "automation",
+        "run-now",
+        id,
+        "--execution-revision",
+        &revision,
+        "--request-id",
+        &uuid::Uuid::new_v4().to_string(),
+        "--confirm",
+    ]);
+    let firing = accepted["firing"]["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let detail = fixture.cli(&["automation", "run", firing]);
+        if detail["run"]["firing"]["state"] == "skipped" {
+            assert!(detail["run"]["run"].is_null());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "precheck did not settle: {detail}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let limit_text = |limit: libc::rlim_t| {
+        if limit == libc::RLIM_INFINITY {
+            "unlimited".to_owned()
+        } else {
+            limit.to_string()
+        }
+    };
+    assert_eq!(
+        fs::read_to_string(project.join("soft-limit"))
+            .unwrap()
+            .trim(),
+        limit_text(soft_limit)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("hard-limit"))
+            .unwrap()
+            .trim(),
+        limit_text(incoming.rlim_max)
+    );
+    let daemon_limits =
+        fs::read_to_string(format!("/proc/{}/limits", fixture.daemon.id())).unwrap();
+    let mut fields = daemon_limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .unwrap()
+        .split_whitespace();
+    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+    let mut unchanged: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut unchanged) },
+        0
+    );
+    assert_eq!(unchanged.rlim_cur, incoming.rlim_cur);
+    assert_eq!(unchanged.rlim_max, incoming.rlim_max);
+}
+
+#[test]
 fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal() {
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
@@ -497,7 +633,7 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
 
 #[test]
 fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::with_soft_limit_and_branch(None, "lifecycle-fixture");
     let project = fixture.root.path().join("project");
     // This case owns lifecycle receipts, not discovery of a plain folder.
     // Bind its project explicitly even when TMPDIR is inside another checkout.

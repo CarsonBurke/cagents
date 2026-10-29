@@ -1109,7 +1109,9 @@ mod tests {
             // render_with_helper returned only after kill_and_reap waited on this
             // exact original. A zombie with the same epoch is still a failure.
             match crate::daemon::holder_registry::Process::read(pid) {
-                Ok(current) => assert_ne!(current.start, start, "the original helper was not reaped"),
+                Ok(current) => {
+                    assert_ne!(current.start, start, "the original helper was not reaped")
+                }
                 Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
             }
         }

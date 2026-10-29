@@ -473,6 +473,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::host::descriptor_limit::inherit(&mut holder);
     unsafe {
         holder.pre_exec(move || {
             crate::daemon::seal_inherited_descriptors()?;
@@ -1445,7 +1446,20 @@ extern "C" fn serve_if_requested() {
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
         let _ = crate::daemon::process_scope::enroll_holder();
-        let mut residence = Residence::start(spawn)?;
+        let mut residence = match Residence::start(spawn) {
+            Ok(residence) => residence,
+            Err(error) => {
+                // Only startup has no Started response yet. Preserve the
+                // original failure on its existing control channel; sending
+                // diagnostics grants no ownership or cleanup authority.
+                let _ = send(
+                    &control,
+                    &Report::Failed(format!("Native holder startup failed: {error}")),
+                    START_TIMEOUT,
+                );
+                return Err(error);
+            }
+        };
         send(
             &control,
             &Report::Started {
@@ -1631,6 +1645,43 @@ mod tests {
         }
     }
 
+    fn assert_live_adopted_fixture_process(process: &Process) {
+        assert!(process.is_current(), "fixture child identity changed");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
+        let parent = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        assert_eq!(
+            parent.parse::<u32>().unwrap(),
+            std::process::id(),
+            "fixture child was not adopted"
+        );
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process.pid as u32,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "fixture child observation failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { status.si_pid() },
+            0,
+            "fixture child exited before gate release"
+        );
+    }
+
     #[test]
     fn idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LIVE_REAPER_TEST";
@@ -1673,9 +1724,10 @@ while IFS=: read -r field value; do
     if [ "$field" = SigBlk ]; then printf '%s\n' "$value" > "$1/provider-mask"; fi
 done < "/proc/$$/status"
 /bin/sh -c '
-    /bin/sleep 60 </dev/null &
+    exec 3<&0
+    /bin/sleep 60 </dev/null 3<&- &
     echo $! > "$1/live"
-    /bin/sh -c "read -r token" <&0 &
+    /bin/sh -c "echo ready > \"\$1/tool-ready\"; read -r token" fixture "$1" <&3 3<&- &
     echo $! > "$1/tool"
 ' fixture "$1"
 echo ready > "$1/ready"
@@ -1702,7 +1754,9 @@ exec /bin/sleep 60
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
             let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !directory.path().join("ready").exists() {
+            while !directory.path().join("ready").exists()
+                || !directory.path().join("tool-ready").exists()
+            {
                 assert!(!server.exited(), "provider exited during fixture startup");
                 assert!(Instant::now() < deadline, "provider fixture did not start");
                 std::thread::sleep(Duration::from_millis(5));
@@ -1717,15 +1771,7 @@ exec /bin/sleep 60
             let tool = Process::read(read_pid("tool")).unwrap();
             let live = Process::read(read_pid("live")).unwrap();
             for process in [&tool, &live] {
-                let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
-                let parent = stat
-                    .rsplit_once(')')
-                    .unwrap()
-                    .1
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap();
-                assert_eq!(parent.parse::<u32>().unwrap(), std::process::id());
+                assert_live_adopted_fixture_process(process);
             }
             let mask = std::fs::read_to_string(directory.path().join("provider-mask")).unwrap();
             let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
@@ -1848,8 +1894,9 @@ exec /bin/sleep 60
                 arguments: vec![
                     "-c".into(),
                     r#"/bin/sh -c '
-                        /bin/sleep 60 </dev/null & echo $! > "$1/live"
-                        /bin/sh -c "read -r token" <&0 & echo $! > "$1/tool"
+                        exec 3<&0
+                        /bin/sleep 60 </dev/null 3<&- & echo $! > "$1/live"
+                        /bin/sh -c "echo ready > \"\$1/tool-ready\"; read -r token" fixture "$1" <&3 3<&- & echo $! > "$1/tool"
                     ' fixture "$1"
                     echo ready > "$1/ready"
                     exec /bin/sleep 60"#
@@ -1867,7 +1914,9 @@ exec /bin/sleep 60
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
             let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !directory.path().join("ready").exists() {
+            while !directory.path().join("ready").exists()
+                || !directory.path().join("tool-ready").exists()
+            {
                 assert!(!server.exited());
                 assert!(Instant::now() < deadline, "provider fixture did not start");
                 std::thread::sleep(Duration::from_millis(5));
@@ -1882,6 +1931,9 @@ exec /bin/sleep 60
             };
             let tool = identity("tool");
             let live = identity("live");
+            for process in [&tool, &live] {
+                assert_live_adopted_fixture_process(process);
+            }
             // Clear setup notifications before inducing the exact child-exit
             // boundary. The short tool still waits for this original pipe.
             child_events.drain().unwrap();
@@ -1912,13 +1964,18 @@ exec /bin/sleep 60
             let mut calls = 0;
             let mut released = false;
             let mut observed_exit = false;
+            let mut release_error = None;
+            let mut observation_error = None;
             let mut gate = Some(gate);
             let waited = wait_for_control_with_reaper(fd, &child_events, || {
                 calls += 1;
                 if calls == 1 {
                     server.reap_exited_descendants()?;
                     let mut original = gate.take().unwrap();
-                    released = original.write_all(b"exit\n").is_ok();
+                    match original.write_all(b"exit\n") {
+                        Ok(()) => released = true,
+                        Err(error) => release_error = Some(error),
+                    }
                     drop(original);
                     let deadline = Instant::now() + Duration::from_secs(3);
                     while released && Instant::now() < deadline {
@@ -1932,6 +1989,7 @@ exec /bin/sleep 60
                             )
                         };
                         if result != 0 {
+                            observation_error = Some(io::Error::last_os_error());
                             break;
                         }
                         if unsafe { status.si_pid() } == tool.pid {
@@ -1953,7 +2011,14 @@ exec /bin/sleep 60
                 waited.is_ok(),
                 "inspection failure abandoned control: {waited:?}"
             );
-            assert!(released && observed_exit);
+            assert!(
+                released,
+                "original tool gate write failed: {release_error:?}"
+            );
+            assert!(
+                observed_exit,
+                "gated tool exit was not observed: {observation_error:?}"
+            );
             assert_eq!(calls, 2, "fault must occur after the real SIGCHLD wake");
             let control = if let Some(listener) = listener {
                 listener.accept().unwrap().0
@@ -2073,6 +2138,7 @@ exec /bin/sleep 60
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         let mut holder = spawn(spec.clone(), source.clone()).unwrap();
         assert!(
             context.outcome() == LaunchOutcome::Uncertain,
@@ -2086,6 +2152,12 @@ exec /bin/sleep 60
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            record.holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
             record.root.pid as u32,
@@ -2593,7 +2665,9 @@ exec /bin/sleep 60
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        assert!(spawn(spec, source).is_err());
+        let startup_error = spawn(spec, source)
+            .err()
+            .expect("the missing provider must fail in the actual helper");
         let deadline = Instant::now() + Duration::from_secs(3);
         while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
             assert!(
@@ -2615,6 +2689,14 @@ exec /bin/sleep 60
             )
             .unwrap()
             .is_empty()
+        );
+        assert_eq!(
+            startup_error,
+            format!(
+                "Native holder startup failed: {}",
+                io::Error::from_raw_os_error(libc::ENOENT)
+            ),
+            "the real helper must expose its original spawn failure, not an EOF acknowledgement"
         );
     }
 

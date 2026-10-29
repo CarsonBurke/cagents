@@ -397,20 +397,12 @@ where
                     task::Poll::Pending => match self.receiver.try_next() {
                         Ok(Some(control)) => match control {
                             Control::ChangeFlow(flow) => {
-                                use winit::event_loop::ControlFlow;
-
-                                match (event_loop.control_flow(), flow) {
-                                    (
-                                        ControlFlow::WaitUntil(current),
-                                        ControlFlow::WaitUntil(new),
-                                    ) if current < new => {}
-                                    (
-                                        ControlFlow::WaitUntil(target),
-                                        ControlFlow::Wait,
-                                    ) if target > Instant::now() => {}
-                                    _ => {
-                                        event_loop.set_control_flow(flow);
-                                    }
+                                if let Some(flow) = merged_control_flow(
+                                    event_loop.control_flow(),
+                                    flow,
+                                    Instant::now(),
+                                ) {
+                                    event_loop.set_control_flow(flow);
                                 }
                             }
                             Control::CreateWindow {
@@ -2773,6 +2765,97 @@ fn system_information(
         graphics_backend: graphics.backend,
     }
 }
+
+/// The control flow to adopt when `requested` arrives while `current` is in
+/// effect, or `None` to keep `current`.
+///
+/// An earlier pending deadline wins over a later one, and a pending deadline
+/// survives a request to wait indefinitely. A deadline that has already
+/// passed is not pending, though: keeping it over a later request leaves the
+/// event loop polling with a zero timeout until that later deadline, which is
+/// a busy loop for the whole interval between two timed redraws.
+fn merged_control_flow(
+    current: winit::event_loop::ControlFlow,
+    requested: winit::event_loop::ControlFlow,
+    now: Instant,
+) -> Option<winit::event_loop::ControlFlow> {
+    use winit::event_loop::ControlFlow;
+
+    match (current, requested) {
+        (ControlFlow::WaitUntil(current), ControlFlow::WaitUntil(new))
+            if current < new && current > now =>
+        {
+            None
+        }
+        (ControlFlow::WaitUntil(target), ControlFlow::Wait) if target > now => {
+            None
+        }
+        _ => Some(requested),
+    }
+}
+
+#[cfg(test)]
+mod control_flow_tests {
+    use super::*;
+    use std::time::Duration;
+    use winit::event_loop::ControlFlow;
+
+    #[test]
+    fn an_elapsed_deadline_yields_to_a_later_one() {
+        let now = Instant::now();
+        let elapsed = now - Duration::from_millis(5);
+        let later = now + Duration::from_millis(100);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(elapsed),
+                ControlFlow::WaitUntil(later),
+                now
+            ),
+            Some(ControlFlow::WaitUntil(later))
+        );
+    }
+
+    #[test]
+    fn a_pending_deadline_keeps_its_place() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(10);
+        let later = now + Duration::from_millis(100);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(soon),
+                ControlFlow::WaitUntil(later),
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(soon),
+                ControlFlow::Wait,
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(later),
+                ControlFlow::WaitUntil(soon),
+                now
+            ),
+            Some(ControlFlow::WaitUntil(soon))
+        );
+        let elapsed = now - Duration::from_millis(5);
+        assert_eq!(
+            merged_control_flow(
+                ControlFlow::WaitUntil(elapsed),
+                ControlFlow::Wait,
+                now
+            ),
+            Some(ControlFlow::Wait)
+        );
+    }
+}
+
 #[cfg(feature = "program")]
 pub use program::Program;
 

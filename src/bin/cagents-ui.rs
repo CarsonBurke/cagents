@@ -8,9 +8,10 @@ const PRODUCT: &str = "cagents-ui";
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 const CONFIRM_DAEMON_STOP: &str = "--confirm-daemon-stop";
 const STARTUP_ERROR: &str = "--startup-error";
+const STARTUP_UPDATE: &str = "--startup-update";
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
-/// The internal `--confirm-daemon-stop`, `--startup-error` and
+/// The internal `--confirm-daemon-stop`, `--startup-error`, `--startup-update` and
 /// `--internal-render-page` modes are deliberately absent: cagents spawns
 /// itself with those, and documenting them would invite a user to hand-craft
 /// a capability payload.
@@ -55,9 +56,9 @@ pub(crate) fn main_with_before_start(
     // the daemon that spawned them, so the startup protocol must stay off
     // here: otherwise a "ready"/"error: ..." line lands inside the status the
     // user reads as the outcome of their shutdown request.
-    let standalone = arguments
-        .first()
-        .is_some_and(|argument| argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR);
+    let standalone = arguments.first().is_some_and(|argument| {
+        argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR || argument == STARTUP_UPDATE
+    });
     if standalone {
         cagents::instance::install_panic_hook(PRODUCT);
         cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
@@ -103,6 +104,24 @@ pub(crate) fn main_with_before_start(
     let _browser_cleanup = cagents::browser::ProcessShutdown;
     let result = run(options);
     match &result {
+        Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
+            // Expected coordinator ownership is not a crash. Preserve the
+            // original public launch context in a capability-free payload.
+            if let Ok(Some(options)) = parse(&arguments) {
+                let request = cagents::update::startup::Request::new(
+                    options.new_window,
+                    options.slot.map(str::to_owned),
+                    options.source.map(str::to_owned),
+                    options.device.map(str::to_owned),
+                    options.device_window_scoped,
+                );
+                match request {
+                    Ok(request) if spawn_startup_update_dialog(&request).is_ok() => (),
+                    _ => tracing::error!("could not open the update progress window"),
+                }
+            }
+            let _ = cagents::instance::report_ui_startup(&Err("an update is in progress".into()));
+        }
         Err(error) => report_startup_failure(&error.to_string()),
         // The window reports readiness from its first frame, so reaching here
         // with the handshake unclaimed means no window ever opened.
@@ -176,10 +195,33 @@ fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+fn spawn_startup_update_dialog(request: &cagents::update::startup::Request) -> std::io::Result<()> {
+    let payload = serde_json::to_string(request).map_err(std::io::Error::other)?;
+    std::process::Command::new(std::env::current_exe()?)
+        .args([STARTUP_UPDATE, &payload])
+        .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+}
+
 /// The standalone modes cagents spawns for itself. They must not touch the
 /// window lease, the session store, or the launcher handshake.
 fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = arguments.iter().map(String::as_str).peekable();
+    if arguments.peek() == Some(&STARTUP_UPDATE) {
+        arguments.next();
+        let payload = arguments.next().ok_or("missing startup update context")?;
+        if payload.len() > 4096 || arguments.next().is_some() {
+            return Err("invalid startup update context".into());
+        }
+        let request: cagents::update::startup::Request = serde_json::from_str(payload)?;
+        return cagents::update::startup::run(request);
+    }
     if arguments.peek() == Some(&CONFIRM_DAEMON_STOP) {
         arguments.next();
         let payload = arguments
@@ -332,7 +374,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 min_size: Some(iced::Size::new(900.0, 600.0)),
                 decorations: false,
                 transparent: true,
-                resize_border: 8,
+                resize_border: cagents::design::WINDOW_RESIZE_BORDER as u32,
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.

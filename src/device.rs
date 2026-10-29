@@ -1023,6 +1023,12 @@ fn forward(transport: &Arc<Transport>, stream: UnixStream) -> io::Result<()> {
 /// Runs on the selected host through SSH. stdout contains only framed protocol
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
 pub fn serve_stdio() -> io::Result<()> {
+    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "A daemon bridge requires your own terminal",
+        ));
+    }
     if is_remote() {
         return Err(io::Error::other(
             "a daemon bridge cannot target another device",
@@ -1556,7 +1562,10 @@ mod tests {
             scoped_window_slot("a-b", "c"),
             scoped_window_slot("a", "b-c")
         );
-        assert_ne!(scoped_window_slot("build-host", "primary"), "build-host-primary");
+        assert_ne!(
+            scoped_window_slot("build-host", "primary"),
+            "build-host-primary"
+        );
         assert_eq!(
             scoped_window_slot("build-host", "primary"),
             scoped_window_slot("build-host", "primary")
