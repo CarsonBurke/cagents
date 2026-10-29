@@ -1121,7 +1121,10 @@ where
             if before.trim_end().ends_with(['{', '(', '[']) { result.push_str(&indentation.unit()); }
             result
         }).unwrap_or_default();
-        let ending = self.line_ending().unwrap_or(LineEnding::Lf);
+        let ending = self
+            .line_ending()
+            .filter(|ending| *ending != LineEnding::None)
+            .unwrap_or(LineEnding::Lf);
         self.perform(Action::Edit(Edit::Paste(Arc::new(format!("{}{prefix}", ending.as_str())))));
     }
 
@@ -5321,20 +5324,127 @@ mod tests {
 
     #[test]
     fn enter_replaces_selection_and_keeps_bracket_aware_indentation() {
+        use history::{EditKind, History, Replay};
+
+        fn assert_enter(
+            mut content: Content,
+            cursor: Cursor,
+            expected: &str,
+            expected_position: Position,
+            expected_lines: usize,
+        ) {
+            let original = content.text();
+            let original_lines = content.line_count();
+            content.set_cursor(cursor);
+            let before = content.cursor();
+            let recorded = content
+                .perform_edit(Edit::Enter)
+                .expect("Enter must insert a newline");
+            let after = Cursor {
+                position: expected_position,
+                selection: None,
+            };
+            assert_eq!(content.text(), expected);
+            assert_eq!(content.line_count(), expected_lines);
+            assert_eq!(content.cursor(), after);
+
+            let mut history = History::default();
+            history.record(
+                recorded.change,
+                EditKind::Other,
+                recorded.before,
+                content.cursor(),
+                Instant::now(),
+            );
+            assert_eq!(history.undo(&mut content), Replay::Applied);
+            assert_eq!(content.text(), original);
+            assert_eq!(content.line_count(), original_lines);
+            assert_eq!(content.cursor(), before);
+            assert_eq!(history.undo(&mut content), Replay::Empty);
+            assert_eq!(history.redo(&mut content), Replay::Applied);
+            assert_eq!(content.text(), expected);
+            assert_eq!(content.line_count(), expected_lines);
+            assert_eq!(content.cursor(), after);
+            assert_eq!(history.redo(&mut content), Replay::Empty);
+        }
+
+        let caret = |line, column| Cursor {
+            position: Position { line, column },
+            selection: None,
+        };
+        assert_enter(
+            Content::new(),
+            caret(0, 0),
+            "\n",
+            Position { line: 1, column: 0 },
+            2,
+        );
+        for original in ["", "abc", "é漢", "é\u{2028}漢\u{2029}"] {
+            assert_enter(
+                Content::with_text(original),
+                caret(0, original.len()),
+                &format!("{original}\n"),
+                Position { line: 1, column: 0 },
+                2,
+            );
+        }
         for opener in ['{', '(', '['] {
             let original = format!("    {opener}");
-            let mut content: Content = Content::with_text(&original);
-            content.set_cursor(Cursor { position: Position { line: 0, column: original.len() }, selection: None });
-            content.perform_edit(Edit::Enter).unwrap();
-            assert_eq!(content.text(), format!("{original}\n        "));
+            assert_enter(
+                Content::with_text(&original),
+                caret(0, original.len()),
+                &format!("{original}\n        "),
+                Position { line: 1, column: 8 },
+                2,
+            );
+        }
+        let mut content: Content = Content::with_text("  {");
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: false,
+            size: 2,
+            tab_width: 2,
+        });
+        assert_enter(
+            content,
+            caret(0, 3),
+            "  {\n    ",
+            Position { line: 1, column: 4 },
+            2,
+        );
+        for ending in ["\n", "\r\n", "\r", "\n\r"] {
+            let original = format!("é{ending}tail");
+            assert_enter(
+                Content::with_text(&original),
+                caret(1, 4),
+                &format!("{original}{ending}"),
+                Position { line: 2, column: 0 },
+                3,
+            );
         }
         let mut content: Content = Content::with_text("\tfoo selection");
-        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 4, tab_width: 8 });
-        content.set_cursor(Cursor { position: Position { line: 0, column: 14 }, selection: Some(Position { line: 0, column: 5 }) });
-        content.perform_edit(Edit::Enter).unwrap();
-        assert_eq!(content.text(), "\tfoo \n\t");
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: true,
+            size: 4,
+            tab_width: 8,
+        });
+        assert_enter(
+            content,
+            Cursor {
+                position: Position {
+                    line: 0,
+                    column: 14,
+                },
+                selection: Some(Position { line: 0, column: 5 }),
+            },
+            "\tfoo \n\t",
+            Position { line: 1, column: 1 },
+            2,
+        );
         let mut content: Content = Content::with_text("        ");
-        content.set_cursor(Cursor { position: Position { line: 0, column: 8 }, selection: None });
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 8 },
+            selection: None,
+        });
         content.perform_edit(Edit::Insert('}')).unwrap();
         assert_eq!(content.text(), "    }");
     }
