@@ -195,6 +195,10 @@ pub(super) struct Redemption {
     permit: Arc<Permit>,
 }
 impl Redemption {
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.request.expires = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
     fn stale(&self) -> bool {
         self.invalidated
             || self.request.check().is_err()
@@ -405,4 +409,48 @@ pub(super) fn receive(
         }
     }
     Ok(step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::protocol::WriteGuard;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn expired_consume_permit_and_reservation_stay_revoked_when_a_fresh_retry_is_issued() {
+        let (reply, receiver) = crossbeam_channel::bounded(1);
+        let expected = crate::account::reset::ProviderAccount {
+            account_id: "actual-account".into(),
+            backend_origin: "https://chatgpt.com".into(),
+        };
+        let expired = transport::Consume::fixture(
+            Instant::now() - Duration::from_millis(1),
+            expected.clone(),
+            reply,
+        );
+        assert!(transport::Reservation::fixture(&expired).check().is_err());
+        let old = Permit {
+            request: expired.clone(),
+            valid: AtomicBool::new(true),
+            reservation: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(!old.before_first_byte());
+        assert!(receiver.try_recv().unwrap().is_err());
+        // Repeated guard checks cannot block when the requester channel fills
+        // or convert the old deadline into the new retry's deadline.
+        assert!(!old.before_first_byte());
+        let (reply, _) = crossbeam_channel::bounded(1);
+        let fresh =
+            transport::Consume::fixture(Instant::now() + Duration::from_secs(2), expected, reply);
+        assert_eq!(expired.key, fresh.key);
+        assert_ne!(expired.reservation, fresh.reservation);
+        let retry = Permit {
+            request: fresh,
+            valid: AtomicBool::new(true),
+            reservation: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(retry.before_first_byte());
+        assert!(!old.before_first_byte());
+    }
 }

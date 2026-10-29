@@ -3251,6 +3251,40 @@ fn trim_subagent(agent: &mut Subagent) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn write_guards_cancel_only_their_own_zero_byte_frame_after_partial_frames_finish() {
+        struct Guard(Arc<AtomicBool>);
+        impl super::super::protocol::WriteGuard for Guard {
+            fn before_first_byte(&self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+        let valid = Arc::new(AtomicBool::new(true));
+        let mut queue = PendingWrites::default();
+        let ordinary = b"{\"ordinary\":true}\n".to_vec();
+        let consume = b"{\"consume\":true}\n".to_vec();
+        queue.push_back(ordinary.clone(), None);
+        queue.push_back(consume.clone(), Some(Arc::new(Guard(valid.clone()))));
+        valid.store(false, Ordering::Release);
+        let prefix = 5;
+        let mut written = ordinary[..prefix].to_vec();
+        assert_eq!(queue.discard_rejected(prefix), 0);
+        written.extend_from_slice(&queue.front().unwrap()[prefix..]);
+        queue.pop_front();
+        assert_eq!(queue.discard_rejected(0), consume.len());
+        assert!(queue.is_empty());
+        assert_eq!(written, ordinary);
+
+        // A consuming frame that already started also keeps its complete
+        // suffix. Revocation never truncates a JSON line or skips its bytes.
+        queue.push_back(consume.clone(), Some(Arc::new(Guard(valid))));
+        let mut written = consume[..prefix].to_vec();
+        assert_eq!(queue.discard_rejected(prefix), 0);
+        written.extend_from_slice(&queue.front().unwrap()[prefix..]);
+        assert_eq!(queue.pop_front().unwrap(), consume);
+        assert_eq!(written, consume);
+    }
+
+    #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
         let mut state = Snapshot {
             session_id: Some("session".into()),

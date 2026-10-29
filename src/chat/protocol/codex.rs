@@ -4476,6 +4476,405 @@ mod tests {
         assert_eq!(adapter.pending.len(), 1);
     }
 
+    struct ResetFixture {
+        handle: crate::chat::runtime::Handle,
+        session: crate::model::TerminalId,
+    }
+    impl std::ops::Deref for ResetFixture {
+        type Target = crate::chat::runtime::Handle;
+        fn deref(&self) -> &Self::Target {
+            &self.handle
+        }
+    }
+
+    fn reset_fixture(mode: &str, directory: &std::path::Path) -> ResetFixture {
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/python3".into(),
+            arguments: vec![
+                "-u".into(),
+                "-c".into(),
+                include_str!("codex/reset_credit_fixture.py").into(),
+                mode.into(),
+                directory
+                    .join(format!("{mode}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            working_directory: directory.into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step::default();
+        let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = crate::chat::runtime::Handle::start(
+            spec,
+            Box::new(adapter()),
+            initial,
+            store,
+            Some("thread-exact".into()),
+            |_| {},
+        )
+        .unwrap();
+        ResetFixture {
+            handle,
+            session: crate::model::TerminalId::new(),
+        }
+    }
+
+    fn queued_reset(
+        adapter: &mut Codex,
+        request: crate::account::reset::transport::Consume,
+    ) -> Step {
+        let identity = adapter.fixture_consume(request).unwrap();
+        let limits = adapter
+            .receive(json!({"id":identity.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        adapter
+            .receive(json!({"id":limits.writes[0]["id"],"result":reset_limits(96,1)}))
+            .unwrap()
+    }
+
+    #[test]
+    fn retired_consume_and_verification_replies_cannot_advance_same_tuple_retry() {
+        for verification_reply in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            adapter.turn = Some("preserved-running-turn".into());
+            let (request, _) = reset_request();
+            let old = queued_reset(&mut adapter, request);
+            let old_permit = adapter.write_guard(&old.writes[0]).unwrap();
+            let late = if verification_reply {
+                let identity = adapter
+                    .receive(json!({"id":old.writes[0]["id"],"result":{"outcome":"reset"}}))
+                    .unwrap();
+                adapter
+                    .receive(json!({"id":identity.writes[0]["id"],"result":allowance_account()}))
+                    .unwrap()
+            } else {
+                old
+            };
+            for pending in adapter.pending.values_mut() {
+                if let Pending::ResetCredit(redemption) = pending {
+                    redemption.expire_for_test();
+                }
+            }
+            reset_credit::invalidate(&mut adapter); // expired/dropped controller lease
+            let (read, read_reply) = allowance_request();
+            let fresh = adapter.read_allowance(read).unwrap();
+            let limits = adapter
+                .receive(json!({"id":fresh.writes[0]["id"],"result":allowance_account()}))
+                .unwrap();
+            adapter
+                .receive(json!({"id":limits.writes[0]["id"],"result":reset_limits(96,1)}))
+                .unwrap();
+            assert!(read_reply.try_recv().unwrap().is_ok());
+            assert!(!old_permit.before_first_byte());
+            for changed in 0..4 {
+                let (mut wrong, _) = reset_request();
+                wrong.reconcile = true;
+                match changed {
+                    0 => wrong.key = uuid::Uuid::new_v4().to_string(),
+                    1 => wrong.credit_id = "other-credit".into(),
+                    2 => wrong.expected.account_id = "other-account".into(),
+                    _ => wrong.expected.backend_origin = "https://other.invalid".into(),
+                }
+                assert!(
+                    adapter
+                        .fixture_consume(wrong)
+                        .unwrap_err()
+                        .contains("remain uncertain")
+                );
+            }
+            let (mut retry, _) = reset_request();
+            retry.reconcile = true;
+            let identity = adapter.fixture_consume(retry).unwrap();
+            let ignored = adapter.receive(json!({"id":late.writes[0]["id"],"result":if verification_reply {reset_limits(0,0)} else {json!({"outcome":"reset"})}})).unwrap();
+            assert!(ignored.writes.is_empty() && ignored.events.is_empty());
+            assert_eq!(adapter.pending.len(), 1);
+            let limits = adapter
+                .receive(json!({"id":identity.writes[0]["id"],"result":allowance_account()}))
+                .unwrap();
+            let consume = adapter
+                .receive(json!({"id":limits.writes[0]["id"],"result":reset_limits(96,1)}))
+                .unwrap();
+            assert_eq!(
+                consume.writes[0]["params"]["idempotencyKey"],
+                "d4883d22-89ad-8c5f-a577-53ada6ed3afb"
+            );
+            assert!(
+                adapter
+                    .write_guard(&consume.writes[0])
+                    .unwrap()
+                    .before_first_byte()
+            );
+            assert!(!old_permit.before_first_byte());
+            assert!(adapter.busy);
+            assert_eq!(adapter.turn.as_deref(), Some("preserved-running-turn"));
+        }
+    }
+
+    #[test]
+    fn account_tombstone_capacity_refuses_only_account_operations_and_never_forgets_ids() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        adapter.turn = Some("preserved-running-turn".into());
+        let (request, _) = allowance_request();
+        let first = adapter.read_allowance(request).unwrap();
+        for _ in 0..MAX_PENDING {
+            for pending in adapter.pending.values_mut() {
+                if let Pending::Allowance(read) = pending {
+                    read.expire_for_test();
+                }
+            }
+            let (request, _) = allowance_request();
+            adapter.read_allowance(request).unwrap();
+        }
+        for pending in adapter.pending.values_mut() {
+            if let Pending::Allowance(read) = pending {
+                read.expire_for_test();
+            }
+        }
+        let (request, _) = allowance_request();
+        assert!(
+            adapter
+                .read_allowance(request)
+                .unwrap_err()
+                .contains("late-response IDs")
+        );
+        assert_eq!(adapter.pending.len(), 1);
+        assert_eq!(adapter.reset_state.tombstones.len(), MAX_PENDING);
+        let ongoing = adapter.receive(json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"thread-exact","turnId":"preserved-running-turn","itemId":"stream","delta":"still running"}})).unwrap();
+        assert!(matches!(
+            ongoing.events.as_slice(),
+            [Event::TextDelta { .. }]
+        ));
+        let late = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        assert!(late.writes.is_empty() && late.events.is_empty());
+        let (request, _) = allowance_request();
+        adapter.read_allowance(request).unwrap();
+        assert_eq!(adapter.pending.len(), 1);
+        assert_eq!(adapter.reset_state.tombstones.len(), MAX_PENDING);
+        assert!(adapter.busy);
+    }
+
+    #[test]
+    fn controller_reservation_is_exclusive_and_release_fences_preflight_and_first_byte() {
+        let mut adapter = adapter();
+        let (first, _) = reset_request();
+        let token = first.reservation;
+        adapter
+            .reserve_reset_credit(crate::account::reset::transport::Reservation::fixture(
+                &first,
+            ))
+            .unwrap();
+        let (mut competing, _) = reset_request();
+        competing.expected.account_id = "another-account".into();
+        assert!(
+            adapter
+                .reserve_reset_credit(crate::account::reset::transport::Reservation::fixture(
+                    &competing
+                ))
+                .unwrap_err()
+                .contains("reserved")
+        );
+        let identity = adapter.consume_reset_credit(first).unwrap();
+        adapter.release_reset_credit(token);
+        let refused = adapter
+            .receive(json!({"id":identity.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        assert!(refused.writes.is_empty());
+        let (second, _) = reset_request();
+        let second_token = second.reservation;
+        let queued = queued_reset(&mut adapter, second);
+        let permit = adapter.write_guard(&queued.writes[0]).unwrap();
+        adapter.release_reset_credit(token); // old UUID cannot release second
+        assert!(permit.before_first_byte());
+        adapter.release_reset_credit(second_token);
+        assert!(!permit.before_first_byte());
+        let (mut other, _) = reset_request();
+        other.credit_id = "other-credit".into();
+        assert!(
+            adapter
+                .fixture_consume(other)
+                .unwrap_err()
+                .contains("remain uncertain")
+        );
+    }
+
+    fn fixture_execute(
+        handle: &ResetFixture,
+        root: &std::path::Path,
+        credit: Option<&str>,
+        seconds: u64,
+    ) -> Result<crate::account::reset::request::Report, String> {
+        use crate::account::reset::{
+            ProviderAccount,
+            request::{Action, Request},
+        };
+        let pinned = handle.handle.clone();
+        let report = crate::account::reset::controller::execute(
+            handle,
+            Request {
+                session: handle.session,
+                action: credit.map_or(Action::Inspect, |credit_id| Action::Redeem {
+                    expected: ProviderAccount {
+                        account_id: "actual-account".into(),
+                        backend_origin: "https://chatgpt.com".into(),
+                    },
+                    credit_id: credit_id.into(),
+                    authorized: true,
+                    condition: None,
+                }),
+            },
+            Some(root),
+            std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+            || {
+                if handle.same_actor(&pinned) && !handle.is_completed() {
+                    Ok(())
+                } else {
+                    Err("the pinned fixture actor changed".into())
+                }
+            },
+        )?;
+        assert_eq!(report.session, handle.session);
+        Ok(report)
+    }
+
+    fn fixture_consumes(directory: &std::path::Path, mode: &str) -> Vec<Value> {
+        std::fs::read_to_string(directory.join(format!("{mode}.jsonl")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|frame| frame["method"] == "account/rateLimitResetCredit/consume")
+            .collect()
+    }
+
+    #[test]
+    fn live_controller_reconciles_lost_ack_on_same_busy_actor_with_original_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = directory.path().join("ledger");
+        let handle = reset_fixture("lost", directory.path());
+        assert!(
+            fixture_execute(&handle, &ledger, Some("actual-credit"), 1)
+                .unwrap_err()
+                .contains("uncertain")
+        );
+        let inspected = fixture_execute(&handle, &ledger, None, 3).unwrap();
+        assert_eq!(
+            inspected.allowance.reset_credits.unwrap().available_count,
+            0
+        );
+        let report = fixture_execute(&handle, &ledger, Some("actual-credit"), 3).unwrap();
+        assert!(report.reconciled);
+        assert_eq!(
+            report.outcome,
+            Some(crate::account::reset::Outcome::AlreadyRedeemed)
+        );
+        let consumes = fixture_consumes(directory.path(), "lost");
+        assert_eq!(consumes.len(), 2);
+        assert_eq!(consumes[0]["params"], consumes[1]["params"]);
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(snapshot.busy && !snapshot.exited && snapshot.error.is_none());
+        let transcript = serde_json::to_string(&snapshot.items).unwrap();
+        assert!(transcript.contains("ack-suppressed;") && transcript.contains("reconciled;"));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn live_buffered_limits_then_login_cancels_zero_byte_consume_and_preserves_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("ledger");
+        let handle = reset_fixture("buffer-login", directory.path());
+        let error = fixture_execute(&handle, &root, Some("actual-credit"), 3).unwrap_err();
+        assert!(error.contains("wholly unsent"), "{error}");
+        assert!(fixture_consumes(directory.path(), "buffer-login").is_empty());
+        let account = crate::account::reset::ProviderAccount {
+            account_id: "actual-account".into(),
+            backend_origin: "https://chatgpt.com".into(),
+        };
+        let ledger = crate::account::reset::attempts::Ledger::open(&root, &account).unwrap();
+        assert_eq!(ledger.uncertain_credit().unwrap(), Some("actual-credit"));
+        let original_key = ledger.original_key("actual-credit").unwrap();
+        drop(ledger);
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(snapshot.busy && !snapshot.exited && snapshot.error.is_none());
+        assert!(
+            serde_json::to_string(&snapshot.items)
+                .unwrap()
+                .contains("after-login;")
+        );
+        let report = fixture_execute(&handle, &root, Some("actual-credit"), 3).unwrap();
+        assert!(report.reconciled);
+        let consumes = fixture_consumes(directory.path(), "buffer-login");
+        assert_eq!(consumes.len(), 1);
+        assert_eq!(consumes[0]["params"]["idempotencyKey"], original_key);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn live_cross_pane_verified_terminal_outcomes_release_old_tuple_without_reviving_credit() {
+        use crate::account::reset::{Outcome, attempts::Ledger};
+        for outcome in ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("ledger");
+            let lost_mode = format!("lost-{outcome}");
+            let resolve_mode = format!("resolve-{outcome}");
+            let original = reset_fixture(&lost_mode, directory.path());
+            assert!(fixture_execute(&original, &root, Some("actual-credit"), 1).is_err());
+            let resolver = reset_fixture(&resolve_mode, directory.path());
+            let terminal = fixture_execute(&resolver, &root, Some("actual-credit"), 3).unwrap();
+            let parsed = Outcome::parse(&json!({"outcome":outcome})).unwrap();
+            assert!(terminal.reconciled);
+            assert_eq!(terminal.outcome, Some(parsed));
+            resolver.close().unwrap();
+            // C is absent; only B is available. Reserving B must use the
+            // current terminal C record, never revive or consume C again.
+            let next = fixture_execute(&original, &root, Some("other-credit"), 3).unwrap();
+            assert_eq!(next.outcome, Some(Outcome::Reset));
+            let consumes = fixture_consumes(directory.path(), &lost_mode);
+            assert_eq!(consumes.len(), 2);
+            assert_eq!(consumes[0]["params"]["creditId"], "actual-credit");
+            assert_eq!(consumes[1]["params"]["creditId"], "other-credit");
+            if matches!(parsed, Outcome::NothingToReset | Outcome::NoCredit) {
+                let account = next.allowance.account.clone().unwrap();
+                let mut ledger = Ledger::open(&root, &account).unwrap();
+                let old_key = ledger.original_key("actual-credit").unwrap();
+                let now = crate::chat::now_ms().unwrap();
+                let fresh = crate::account::reset::parse_codex(
+                    &allowance_account(),
+                    &reset_limits(96, 1),
+                    now,
+                )
+                .unwrap();
+                let admission = ledger
+                    .begin_available("actual-credit", now, &fresh)
+                    .unwrap();
+                assert_eq!(
+                    admission,
+                    crate::account::reset::attempts::Admission::Pending {
+                        idempotency_key: old_key,
+                        reconcile_first: false,
+                    }
+                );
+                assert_eq!(ledger.uncertain_credit().unwrap(), Some("actual-credit"));
+                assert!(
+                    !ledger
+                        .verified_attempts(&fresh)
+                        .unwrap()
+                        .iter()
+                        .any(|proof| proof.attempt.credit_id == "actual-credit")
+                );
+            }
+            original.close().unwrap();
+        }
+    }
+
     fn allowance_request() -> (
         crate::account::reset::transport::Read,
         crossbeam_channel::Receiver<Result<crate::account::reset::Allowance, String>>,
