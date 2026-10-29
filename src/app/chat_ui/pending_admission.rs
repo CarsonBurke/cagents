@@ -6,7 +6,9 @@ impl Runtime {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
-    pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
+    /// `fenced`: the saved descriptor failed its agent's proof, so this pane
+    /// stays as saved rather than waiting to reconnect.
+    pub(super) fn pending_admission_view(&self, fenced: bool) -> Element<'_, Message> {
         let text = self.unsent_text();
         let copy = widget::button::custom(design::body("Copy saved draft"))
             .class(crate::ui_controls::control_style(false, None))
@@ -27,7 +29,12 @@ impl Runtime {
             ));
         let content = widget::column::with_children(vec![
             header.into(),
-            design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
+            design::body(if fenced {
+                "This pane's saved session doesn't match what its agent now reports, so it stays as saved instead of reopening. Your unsent text is kept here; you can copy it, or open the conversation from history."
+            } else {
+                "This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history."
+            })
+            .into(),
             widget::scrollable(draft).height(Length::Fill).into(),
         ])
         .spacing(space::M)

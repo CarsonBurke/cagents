@@ -166,6 +166,13 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            // Its removal could not be shared, so the pane would come back.
+            self.status = Some(TransientNotice::warning(
+                "This pane can't be closed while its saved session doesn't match its agent. It would reopen in this and your other windows.",
+            ));
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
