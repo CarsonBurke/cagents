@@ -35,6 +35,7 @@ native_renderer = {'ICED_BACKEND': 'wgpu', 'WGPU_BACKEND': 'gl', 'LIBGL_ALWAYS_S
 stale_accessibility_retries = 0
 incomplete_accessibility_retries = 0
 active_arm = None
+window = pid = None
 command_sequence = 0
 
 
@@ -418,6 +419,7 @@ try:
     pixel_helper = base / 'pixel-response'
     run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(control / '.github/qualification/pixel-response.c'),
          '-o', str(pixel_helper), '-lX11', '-lXtst'])
+    fixtures = {}
     for variant, checkout in [('before', before), ('after', after)]:
         revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
         expected_sha = 'c727f886628897c1749290213e9d65037253095a' if variant == 'before' else os.environ['PRODUCT_SHA']
@@ -446,9 +448,18 @@ try:
                 for path in row.get('linked_paths', []):
                     command += ['-L', path]
         run(command, timeout=180)
+        fixtures[variant] = (revision, helper, expected_sha, expected_tree)
+    # Compile both immutable helpers first so candidate evidence can use the
+    # schema-13 reader while exercising the changed interaction first.
+    for variant, checkout in [('after', after), ('before', before)]:
+        revision, helper, expected_sha, expected_tree = fixtures[variant]
+        assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
+        assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
+        assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
         for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'stale', 'short', False, True)]:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             active_arm = label
+            window = pid = None
             event({'event': 'arm-started', 'revision': revision})
             root = base / label
             root.mkdir(mode=0o700)
@@ -517,13 +528,43 @@ try:
             time.sleep(.4)
             hidden_field = None
             if hidden:
-                hidden_field = wait(lambda: next((node for node in tree(pid)
-                                                 if node.name == 'Search settings' and visible(node)
-                                                 and node.getState().contains(pyatspi.STATE_EDITABLE)), None))
-                assert hidden_field.queryComponent().grabFocus()
+                settings_focused = 'Settings pane Active settings, Application-wide, focused'
+                settings_unfocused = 'Settings pane Active settings, Application-wide, not focused'
+                def inside_viewport(node):
+                    bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    return (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
+                            and bounds.x + bounds.width <= viewport[0] and bounds.y + bounds.height <= viewport[1])
+                settings_tab = wait(lambda: next((node.name for node in live_tree(pid)
+                                                  if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                                  and node.name in (settings_focused, settings_unfocused)
+                                                  and visible(node) and inside_viewport(node)
+                                                  and node.getState().contains(pyatspi.STATE_ENABLED)), None))
+                click(pid, settings_tab)
+                wait(lambda: any(node.name == settings_focused and visible(node) and inside_viewport(node)
+                                 for node in live_tree(pid)))
+                previous_settings_bounds = [None]
+                def current_settings_field():
+                    fields = [node for node in live_tree(pid)
+                              if node.name == 'Search settings' and visible(node) and inside_viewport(node)
+                              and node.getState().contains(pyatspi.STATE_EDITABLE)]
+                    assert len(fields) <= 1, 'Settings must expose one visible editable search field'
+                    if not fields:
+                        return None
+                    bounds = fields[0].queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    current = (bounds.x, bounds.y, bounds.width, bounds.height)
+                    stable = previous_settings_bounds[0] == current
+                    previous_settings_bounds[0] = current
+                    return fields[0] if stable else None
+                hidden_field = wait(current_settings_field)
+                bounds = hidden_field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                run(['xdotool', 'mousemove', '--sync', str(bounds.x + bounds.width // 2),
+                     str(bounds.y + bounds.height // 2), 'click', '1'])
                 wait(lambda: hidden_field.getState().contains(pyatspi.STATE_FOCUSED))
+                assert hidden_field.queryText().getText(0, -1) == ''
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'active '])
                 wait(lambda: hidden_field.queryText().getText(0, -1) == 'active ')
+                capture(window, label + '-active-input-ready', (1280, 800))
+                assert hidden_field.getState().contains(pyatspi.STATE_FOCUSED)
                 if variant == 'after':
                     wait(lambda: 'healthy-attach-held-before-ready' in receipt.read_text())
                     (root / 'release-hidden-healthy').touch()
@@ -542,7 +583,12 @@ try:
                     wait(lambda: 'hidden-healthy-ready-title-published' in receipt.read_text())
                     wait(lambda: any('Hidden conversation recovered' in node.name and visible(node)
                                      for node in live_tree(pid)))
+                assert accessibility_snapshot(lambda: any(
+                    node.name == settings_focused and visible(node) and inside_viewport(node)
+                    for node in live_tree(pid))), 'Background saved recovery changed the selected Settings pane'
+                hidden_field = wait(current_settings_field)  # Reacquire only; never repair focus after Ready.
                 assert hidden_field.getState().contains(pyatspi.STATE_FOCUSED), 'Background saved recovery stole native active-pane focus'
+                assert hidden_field.queryText().getText(0, -1) == 'active '
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'scope preserved'])
                 wait(lambda: hidden_field.queryText().getText(0, -1) == 'active scope preserved')
                 assert not accessibility_snapshot(lambda: any(
@@ -741,6 +787,44 @@ try:
             active_arm = None
 finally:
     native_failure = sys.exc_info()[1]
+    diagnostic_errors = []
+    if native_failure is not None and active_arm and window is not None and pid is not None:
+        try:
+            assert (Path('/proc') / str(pid) / 'exe').resolve() == (target / 'dev-runtime/cagents-ui').resolve()
+        except BaseException as error:
+            diagnostic_errors.append({'kind': 'ownership', 'error': repr(error)})
+        else:
+            try:
+                run(['import', '-screen', '-window', window,
+                     str(out / (active_arm + '-failure-diagnostic.png'))], timeout=5)
+            except BaseException as error:
+                diagnostic_errors.append({'kind': 'screen', 'error': repr(error)})
+            try:
+                def diagnostic_tree():
+                    assert (Path('/proc') / str(pid) / 'exe').resolve() == (target / 'dev-runtime/cagents-ui').resolve()
+                    values = []
+                    for node in live_tree(pid):
+                        states = node.getState()
+                        focused = states.contains(pyatspi.STATE_FOCUSED)
+                        editable = states.contains(pyatspi.STATE_EDITABLE)
+                        if node.getRole() != pyatspi.ROLE_PUSH_BUTTON and not (focused or editable):
+                            continue
+                        value = {'name': node.name[:400], 'role': node.getRoleName(), 'focused': focused,
+                                 'editable': editable, 'showing': states.contains(pyatspi.STATE_SHOWING)}
+                        bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                        value['desktop_bounds'] = [bounds.x, bounds.y, bounds.width, bounds.height]
+                        if editable:
+                            value['text_preview'] = node.queryText().getText(0, 256)
+                        values.append(value)
+                    return values
+                (out / (active_arm + '-failure-accessibility.json')).write_text(
+                    json.dumps(accessibility_snapshot(diagnostic_tree), indent=2) + '\n')
+            except BaseException as error:
+                diagnostic_errors.append({'kind': 'accessibility', 'error': repr(error)})
+        try:
+            event({'event': 'failure-diagnostics', 'errors': diagnostic_errors})
+        except BaseException as error:
+            diagnostic_errors.append({'kind': 'event', 'error': repr(error)})
     cleanup_errors = []
     for process in reversed(children):
         try:
@@ -772,6 +856,7 @@ finally:
         'outcome': 'failed' if native_failure is not None or cleanup_errors else 'complete',
         'incomplete_arm': active_arm, 'error_type': type(native_failure).__name__ if native_failure else None,
         'error': str(native_failure)[:2000] if native_failure else None, 'cleanup_errors': cleanup_errors,
+        'diagnostic_errors': diagnostic_errors,
     }, indent=2) + '\n')
     (out / 'accessibility-retries.json').write_text(json.dumps({'unknown_object_retries': stale_accessibility_retries,
         'incomplete_tree_retries': incomplete_accessibility_retries,
