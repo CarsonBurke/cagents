@@ -1732,4 +1732,354 @@ mod tests {
         );
         assert_all_closed(witnesses);
     }
+
+    fn rejected_stage0_body(mode: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+        let (path, parent, mut binding) = holder_context().unwrap();
+        let mut original = child("exec /bin/sleep 30");
+        let mut other = child("exec /bin/sleep 30");
+        let (candidate, owner) =
+            original_holder_candidate(&mut original.child, original.descriptor.as_fd()).unwrap();
+        let mut close_witness = None;
+        let descriptor = match mode {
+            "wrong-case" => {
+                binding.case = uuid::Uuid::new_v4();
+                candidate
+            }
+            "wrong-terminal" => {
+                binding.terminal = TerminalId::new();
+                candidate
+            }
+            "wrong-pidfd" => other.descriptor.try_clone().unwrap(),
+            "not-pidfd" => {
+                let (delivered, witness) = UnixStream::pair().unwrap();
+                witness.set_read_timeout(Some(IO_BOUND)).unwrap();
+                close_witness = Some(witness);
+                OwnedFd::from(delivered)
+            }
+            _ => panic!("unknown rejection mode"),
+        };
+        let deadline = Instant::now() + IO_BOUND;
+        let stream = connect(&path, deadline).unwrap();
+        let credentials = peer(&stream).unwrap();
+        assert_eq!(credentials.pid, parent);
+        assert_eq!(credentials.uid, unsafe { libc::getuid() });
+        let bytes = serde_json::to_vec(&HolderRegistration {
+            role: OriginalHolderRole::OriginalTerminalHolder,
+            binding,
+            owner,
+        })
+        .unwrap();
+        send_holder_registration(&stream, &bytes, &descriptor).unwrap();
+        drop(descriptor);
+        assert!(holder_acknowledgment(&stream, binding, deadline).is_err());
+        if let Some(mut witness) = close_witness {
+            assert_eq!(witness.read(&mut [0]).unwrap(), 0);
+        }
+        assert!(original.child.try_wait().unwrap().is_none());
+        assert!(other.child.try_wait().unwrap().is_none());
+        for issued in [&mut original, &mut other] {
+            signal(&issued.descriptor).unwrap();
+            assert_eq!(issued.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        }
+        fs::write(root.join("child-original-wait-completed"), b"waited").unwrap();
+    }
+
+    #[test]
+    fn single_holder_owned_stage0_rejects_wrong_binding_and_descriptor_close_only() {
+        let modes = ["wrong-case", "wrong-terminal", "wrong-pidfd", "not-pidfd"];
+        match std::env::var(HOLDER_TEST_CHILD) {
+            Ok(mode) => {
+                assert!(modes.contains(&mode.as_str()));
+                rejected_stage0_body(&mode);
+                return;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("invalid rejection test role: {error}"),
+        }
+        for mode in modes {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = holder_child_command(root.path(), mode);
+            let mut parent =
+                TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
+                    .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut reached_storage = false;
+            let result = parent.await_with_before_ack(deadline, |_| {
+                reached_storage = true;
+                // A regression must still let the real source Child unwind
+                // and wait its own originals before the parent assertions.
+                Err(refused("unexpected storage of rejected registration"))
+            });
+            assert_holder_child_success(&mut parent, root.path(), deadline);
+            let error = result.unwrap_err().to_string();
+            if mode.starts_with("wrong-") && mode != "wrong-pidfd" {
+                assert!(error.contains("foreign case/stage0/terminal/owner"));
+            } else {
+                assert!(error.contains("descriptor does not match its admitted owner"));
+            }
+            assert!(!reached_storage, "{mode} reached the pre-ACK callback");
+            assert!(parent.holder.is_none() && !parent.acknowledged);
+            assert!(parent.listener.is_none());
+            assert!(parent.await_registration_until(deadline).is_err());
+        }
+    }
+
+    // This test-only waiter is installed from the already stored original pin
+    // BEFORE ACK. It never signals, opens a PID, or constructs another Child.
+    // Only the private coordinator becomes the orphan's kernel parent; after
+    // the original source Child is killed/waited, it collects this exact pidfd.
+    struct AdoptedHolderWait {
+        descriptor: OwnedFd,
+        owner: Process,
+        collected: bool,
+    }
+    impl AdoptedHolderWait {
+        fn collect_until(&mut self, deadline: Instant) -> io::Result<()> {
+            Self::collect_descriptor(&self.descriptor, &self.owner, &mut self.collected, deadline)
+        }
+
+        fn collect_descriptor(
+            descriptor: &OwnedFd,
+            owner: &Process,
+            collected: &mut bool,
+            deadline: Instant,
+        ) -> io::Result<()> {
+            if *collected {
+                return Ok(());
+            }
+            loop {
+                let mut information: libc::siginfo_t = unsafe { mem::zeroed() };
+                if unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        descriptor.as_raw_fd() as libc::id_t,
+                        &mut information,
+                        libc::WEXITED | libc::WNOHANG,
+                    )
+                } != 0
+                {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                } else if unsafe { information.si_pid() } != 0 {
+                    // The sole exact wait has consumed its status even if a
+                    // subsequent oracle fails. Never retry a consumed status.
+                    *collected = true;
+                    if unsafe { information.si_pid() } != owner.pid
+                        || information.si_code != libc::CLD_KILLED
+                        || unsafe { information.si_status() } != libc::SIGKILL
+                    {
+                        return Err(refused(
+                            "adopted original holder has unexpected exit status",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(refused(
+                        "adopted original holder exact wait exceeded deadline",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    struct HolderCrashCustody {
+        parent: Option<TerminalHolderParent>,
+        wait: Option<AdoptedHolderWait>,
+    }
+    impl Drop for HolderCrashCustody {
+        fn drop(&mut self) {
+            if self.wait.is_none() {
+                if let Some(parent) = &mut self.parent {
+                    if parent.holder.is_some() {
+                        // If the test's extra fd clone failed before ACK, no
+                        // independent waiter exists. Keep the admitted fd open
+                        // through exact cleanup/wait instead of leaking status.
+                        // The successful oracle below uses the real unmodified
+                        // TerminalHolderParent Drop with its extra wait fd.
+                        drop(parent.original.take());
+                        let holder = parent.holder.as_mut().unwrap();
+                        let result = signal(&holder.descriptor).and_then(|()| {
+                            holder.confirm_exit_until(Instant::now() + CLEANUP_BOUND)
+                        });
+                        if let Err(error) = result {
+                            eprintln!("private coordinator holder fallback unconfirmed: {error}");
+                        }
+                        let mut collected = false;
+                        if let Err(error) = AdoptedHolderWait::collect_descriptor(
+                            &holder.descriptor,
+                            &holder.owner,
+                            &mut collected,
+                            Instant::now() + CLEANUP_BOUND,
+                        ) {
+                            eprintln!(
+                                "private coordinator fallback exact wait unconfirmed: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Drop the actual startup owner first, then its original holder's
+            // failure pin; only afterwards may our separate kernel wait run.
+            drop(self.parent.take());
+            if let Some(wait) = &mut self.wait {
+                if let Err(error) = wait.collect_until(Instant::now() + CLEANUP_BOUND) {
+                    eprintln!("private coordinator original holder wait unconfirmed: {error}");
+                }
+            }
+        }
+    }
+
+    fn acknowledged_stage0_body() {
+        let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+        let terminal = terminal_holder_terminal_from_environment().unwrap();
+        let mut original = child("exec /bin/sleep 30");
+        register_original_terminal_holder(
+            &mut original.child,
+            original.descriptor.as_fd(),
+            terminal,
+            Instant::now() + IO_BOUND,
+        )
+        .unwrap();
+        fs::write(root.join("stage0-observed-ack"), b"acknowledged").unwrap();
+        // Keep the actual original Child and startup guard on this stack. The
+        // test deliberately kills this daemon only after its real ACK returned.
+        // An ordinary panic here still uses OriginalChild's own kill/wait.
+        loop {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn holder_crash_coordinator(root: &Path) {
+        use std::os::unix::{fs::DirBuilderExt, process::ExitStatusExt};
+        require_waitable_children().unwrap();
+        // This body is reached only after reexec of this one exact test. Never
+        // change process-wide subreaping beside unrelated libtest parents.
+        assert_eq!(
+            std::env::var(HOLDER_TEST_CHILD).as_deref(),
+            Ok("crash-coordinator")
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut sentinel = child("exec /bin/sleep 30");
+        let stage0 = root.join("stage0");
+        fs::DirBuilder::new().mode(0o700).create(&stage0).unwrap();
+        let mut command = holder_child_command(&stage0, "crash-stage0");
+        let parent =
+            TerminalHolderParent::spawn_stage0(&stage0, TerminalId::new(), &mut command).unwrap();
+        let mut custody = HolderCrashCustody {
+            parent: Some(parent),
+            wait: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let HolderCrashCustody { parent, wait } = &mut custody;
+        parent
+            .as_mut()
+            .unwrap()
+            .await_with_before_ack(deadline, |stored| {
+                *wait = Some(AdoptedHolderWait {
+                    descriptor: stored.descriptor.try_clone()?,
+                    owner: stored.owner.clone(),
+                    collected: false,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let parent = custody.parent.as_mut().unwrap();
+        while !stage0.join("stage0-observed-ack").exists() {
+            assert!(
+                parent
+                    .stage0_child_after_ack()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let descriptor = parent.holder.as_ref().unwrap().descriptor.as_raw_fd();
+        let original_owner = parent.holder.as_ref().unwrap().owner.clone();
+        let original_binding = parent.holder.as_ref().unwrap().binding;
+        let daemon = parent.stage0_child_after_ack().unwrap();
+        daemon.kill().unwrap();
+        assert_eq!(daemon.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let stored = parent.holder.as_ref().unwrap();
+        assert_eq!(stored.descriptor.as_raw_fd(), descriptor);
+        assert_eq!(stored.owner, original_owner);
+        assert_eq!(stored.binding, original_binding);
+        assert!(stored.armed && !exited(&stored.descriptor).unwrap());
+        let error = parent
+            .confirm_holder_exit_until(Instant::now())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("holder exit remains unconfirmed")
+        );
+        let stored = parent.holder.as_ref().unwrap();
+        assert_eq!(stored.descriptor.as_raw_fd(), descriptor);
+        assert!(stored.armed && !exited(&stored.descriptor).unwrap());
+        assert!(sentinel.child.try_wait().unwrap().is_none());
+        // Exercise the actual failure Drop, keeping only the independently
+        // owned wait descriptor. No test-side holder signal precedes this.
+        drop(custody.parent.take());
+        let wait = custody.wait.as_mut().unwrap();
+        assert!(exited(&wait.descriptor).unwrap());
+        wait.collect_until(deadline).unwrap();
+        assert!(wait.collected);
+        assert!(sentinel.child.try_wait().unwrap().is_none());
+        signal(&sentinel.descriptor).unwrap();
+        assert_eq!(sentinel.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        fs::write(
+            root.join("post-ack-crash-oracles-completed"),
+            b"original-only",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn single_holder_post_ack_daemon_death_retains_pin_until_failure_drop() {
+        match std::env::var(HOLDER_TEST_CHILD).as_deref() {
+            Ok("crash-stage0") => acknowledged_stage0_body(),
+            Ok("crash-coordinator") => {
+                let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+                holder_crash_coordinator(&root);
+            }
+            Err(std::env::VarError::NotPresent) => {
+                let root = tempfile::tempdir().unwrap();
+                let mut command = holder_child_command(root.path(), "crash-coordinator");
+                let mut coordinator = OriginalChild::spawn(&mut command).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let status = loop {
+                    if let Some(status) = coordinator.child.try_wait().unwrap() {
+                        break status;
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                };
+                assert!(
+                    status.success(),
+                    "{}",
+                    fs::read_to_string(root.path().join("holder-child.stderr")).unwrap()
+                );
+                assert_eq!(
+                    fs::read(root.path().join("post-ack-crash-oracles-completed")).unwrap(),
+                    b"original-only"
+                );
+                assert!(
+                    fs::read_to_string(root.path().join("holder-child.stdout"))
+                        .unwrap()
+                        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                );
+            }
+            _ => panic!("unknown post-ACK crash test role"),
+        }
+    }
 }
