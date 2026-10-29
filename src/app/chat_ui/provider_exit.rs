@@ -2,6 +2,10 @@
 //! One inspector per pane bounds retained text; clipboard reads keep their
 //! existing shared intent and source-authority fences in text_copy.
 use super::*;
+use iced::advanced::widget::{Operation, Tree, tree};
+use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};
+use iced::{Event, Rectangle, Size};
+use std::{cell::RefCell, rc::Rc};
 
 const PAGE_BYTES: usize = 16 * 1024;
 
@@ -27,6 +31,192 @@ pub(super) struct State {
     ready: Option<Arc<String>>,
     error: Option<String>,
     page: usize,
+    selection: Rc<RefCell<PageSelection>>,
+}
+
+#[derive(Default)]
+struct PageSelection {
+    selected: Option<Arc<str>>,
+    select_all: bool,
+}
+
+// Use the same selectable core as COSMIC's text widget, but keep its menu
+// actions in the app's shared clipboard-intent path. COSMIC's automatic native
+// text popup writes directly from another surface on Wayland.
+struct PageText {
+    text: widget::text::Text<'static, cosmic::Theme, cosmic::Renderer>,
+    selection: Rc<RefCell<PageSelection>>,
+    key: Key,
+    handle: Arc<ClientHandle>,
+    visible: Arc<AtomicBool>,
+}
+
+struct SelectionClipboard<'a> {
+    clipboard: &'a mut dyn Clipboard,
+    key: &'a Key,
+    handle: &'a ClientHandle,
+    visible: &'a AtomicBool,
+}
+
+impl Clipboard for SelectionClipboard<'_> {
+    fn read(&self, kind: iced::advanced::clipboard::Kind) -> Option<String> {
+        self.clipboard.read(kind)
+    }
+
+    fn write(&mut self, kind: iced::advanced::clipboard::Kind, contents: String) {
+        if self.visible.load(Ordering::Relaxed) && snapshot_keeps(&self.handle.snapshot(), self.key)
+        {
+            text_copy::invalidate();
+            self.clipboard.write(kind, contents);
+        }
+    }
+}
+
+impl PageText {
+    fn widget(&self) -> &dyn Widget<Message, cosmic::Theme, cosmic::Renderer> {
+        &self.text
+    }
+
+    fn widget_mut(&mut self) -> &mut dyn Widget<Message, cosmic::Theme, cosmic::Renderer> {
+        &mut self.text
+    }
+}
+
+impl Widget<Message, cosmic::Theme, cosmic::Renderer> for PageText {
+    fn tag(&self) -> tree::Tag {
+        self.widget().tag()
+    }
+    fn state(&self) -> tree::State {
+        self.widget().state()
+    }
+    fn children(&self) -> Vec<Tree> {
+        self.widget().children()
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        self.widget_mut().diff(tree);
+    }
+    fn size(&self) -> Size<Length> {
+        self.widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.widget_mut().layout(tree, renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.widget_mut().operate(tree, layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        use widget::HasSelectableText;
+        if std::mem::take(&mut self.selection.borrow_mut().select_all) {
+            self.text.select_all(tree);
+            shell.request_redraw();
+        }
+        Widget::<Message, cosmic::Theme, cosmic::Renderer>::update(
+            &mut self.text,
+            tree,
+            event,
+            layout,
+            cursor,
+            renderer,
+            &mut SelectionClipboard {
+                clipboard,
+                key: &self.key,
+                handle: &self.handle,
+                visible: &self.visible,
+            },
+            shell,
+            viewport,
+        );
+        self.text.set_context_menu_position(tree, None);
+        self.selection.borrow_mut().selected = self.text.selected_text(tree).map(Arc::from);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        self.widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.widget().a11y_nodes(layout, tree, cursor)
+    }
+}
+
+fn page_menu(
+    target: Target,
+    key: Key,
+    page: usize,
+    selection: &PageSelection,
+) -> Vec<widget::menu::Tree<Message>> {
+    let copy: Element<'static, Message> =
+        widget::menu::menu_button(vec![widget::text("Copy").into()])
+            .name("Copy selected saved output")
+            .on_press_maybe(selection.selected.as_ref().map(|text| {
+                action(Action::CopyReportSelection(
+                    target,
+                    key.clone(),
+                    page,
+                    text.clone(),
+                ))
+            }))
+            .into();
+    let select: Element<'static, Message> =
+        widget::menu::menu_button(vec![widget::text("Select all").into()])
+            .name("Select all on this saved output page")
+            .on_press(action(Action::SelectReportPage(target, key, page)))
+            .into();
+    vec![copy.into(), select.into()]
 }
 
 impl State {
@@ -40,6 +230,7 @@ impl State {
         self.cancel();
         if reloadable {
             self.ready = None;
+            self.selection = Rc::default();
         }
     }
 
@@ -130,7 +321,12 @@ impl Runtime {
         Some(Key {
             id: id.to_owned(),
             source: source.clone(),
-            conversation_revision: self.snapshot.text_copy_sources.conversation_revision,
+            conversation_revision: match &source.scope {
+                chat::TextCopyScope::Conversation => {
+                    self.snapshot.text_copy_sources.conversation_revision
+                }
+                chat::TextCopyScope::Subagent { .. } => 0,
+            },
         })
     }
 
@@ -225,14 +421,27 @@ impl Runtime {
             }
             // Materialize only this bounded visible page, never the full body
             // on each frame. The original report/encoding labels stay intact.
+            let selection = state.selection.clone();
+            let menu_key = key.clone();
+            let page_text = PageText {
+                text: widget::text(text[range].to_owned())
+                    .selectable()
+                    .size(design::TEXT_CAPTION)
+                    .font(iced::Font::MONOSPACE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill),
+                selection: selection.clone(),
+                key: key.clone(),
+                handle: self.handle()?.clone(),
+                visible: self.visible.clone(),
+            };
             rows.push(
-                widget::scrollable(
-                    widget::selectable_text(text[range].to_owned())
-                        .size(design::TEXT_CAPTION)
-                        .font(iced::Font::MONOSPACE)
-                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                        .width(Length::Fill),
-                )
+                widget::scrollable(crate::ui_controls::owned(
+                    (key.clone(), page),
+                    crate::interaction::context_menu_lazy(Element::new(page_text), move || {
+                        page_menu(target, menu_key.clone(), page, &selection.borrow())
+                    }),
+                ))
                 .id(widget::Id::new(format!(
                     "saved-report-{:?}-{}-{}-{page}",
                     target, source.cache, source.token
@@ -386,6 +595,7 @@ impl Cagents {
             {
                 runtime.provider_exit.ready = Some(text);
                 runtime.provider_exit.error = None;
+                runtime.provider_exit.selection = Rc::default();
             }
             Ok(_) => {}
             Err(error) => runtime.provider_exit.error = Some(error),
@@ -413,11 +623,58 @@ impl Cagents {
             return;
         };
         let last = text.len().div_ceil(PAGE_BYTES).max(1) - 1;
-        state.page = if forward {
+        let page = if forward {
             state.page.saturating_add(1).min(last)
         } else {
             state.page.min(last).saturating_sub(1)
         };
+        if state.page != page {
+            state.page = page;
+            state.selection = Rc::default();
+        }
+    }
+
+    pub(super) fn report_page_selection(
+        &mut self,
+        target: Target,
+        key: Key,
+        page: usize,
+        copied: Option<Arc<str>>,
+    ) -> Task<Message> {
+        if self.workspace.focused() != Some(target.card) {
+            return Task::none();
+        }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let state = &runtime.provider_exit;
+        if !runtime.visible.load(Ordering::Relaxed)
+            || !state.expanded
+            || state.key.as_ref() != Some(&key)
+            || !runtime.keeps_report_output(&key)
+            || state.page != page
+            || state.ready.is_none()
+        {
+            return Task::none();
+        }
+        if let Some(text) = copied {
+            if state.selection.borrow().selected.as_ref() != Some(&text) {
+                return Task::none();
+            }
+            let handle = runtime.handle().unwrap().clone();
+            let visible = runtime.visible.clone();
+            let mut write = Some(text_copy::write_shared_literal(text));
+            return Task::done(()).then(move |_| {
+                let effect = write.take();
+                if visible.load(Ordering::Relaxed) && snapshot_keeps(&handle.snapshot(), &key) {
+                    effect.unwrap_or_else(Task::none)
+                } else {
+                    Task::none()
+                }
+            });
+        }
+        state.selection.borrow_mut().select_all = true;
+        Task::none()
     }
 }
 
@@ -825,5 +1082,249 @@ mod tests {
             restored.push_str(&text[range]);
         }
         assert_eq!(restored, text);
+    }
+
+    #[test]
+    fn child_report_inspection_survives_parent_revision_but_parent_inspection_does_not() {
+        let (mut app, target, handle, source) = fixture();
+        let mut child_source = source.clone();
+        child_source.scope = chat::TextCopyScope::Subagent { id: "child".into() };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.subagents.push(chat::Subagent {
+            id: "child".into(),
+            kind: "review".into(),
+            description: String::new(),
+            model: None,
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            waiting: false,
+            detail: String::new(),
+            items: snapshot.items.clone(),
+        });
+        snapshot
+            .text_copy_sources
+            .children
+            .insert("child".into(), vec![Some(child_source.clone())]);
+        handle.publish_snapshot_for_test(snapshot.clone());
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        let child = begin(&mut app, target, &child_source);
+        snapshot.generation += 1;
+        snapshot.items.clear();
+        snapshot.text_copy_sources.conversation.clear();
+        snapshot.text_copy_sources.conversation_revision += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(
+            runtime.provider_exit.key == runtime.report_output_key("owned-report", &child_source)
+        );
+        assert!(runtime.provider_exit.expanded);
+        assert!(!child.cancelled.load(Ordering::Acquire));
+        let loaded = Arc::new(SAVED.into());
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            child,
+            Ok(loaded.clone()),
+        )));
+        assert!(Arc::ptr_eq(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .ready
+                .as_ref()
+                .unwrap(),
+            &loaded
+        ));
+
+        let (mut app, target, handle, source) = fixture();
+        let parent = begin(&mut app, target, &source);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.text_copy_sources.conversation_revision += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert!(parent.cancelled.load(Ordering::Acquire));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .key
+                .is_none()
+        );
+    }
+
+    fn clipboard_writes(task: Task<Message>) -> Vec<String> {
+        use iced::futures::StreamExt;
+        iced::futures::executor::block_on(async move {
+            let Some(stream) = iced::runtime::task::into_stream(task) else {
+                return vec![];
+            };
+            stream
+                .filter_map(|effect| async move {
+                    match effect {
+                        iced::runtime::Action::Clipboard(
+                            iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) => Some(contents),
+                        _ => None,
+                    }
+                })
+                .collect()
+                .await
+        })
+    }
+
+    #[test]
+    fn page_selection_copy_supersedes_delayed_full_copy_and_refuses_stale_actions() {
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, source) = fixture();
+        let request = begin(&mut app, target, &source);
+        let loaded = Arc::new(SAVED.to_owned());
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            request,
+            Ok(loaded.clone()),
+        )));
+        let key = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .provider_exit
+            .key
+            .as_ref()
+            .unwrap()
+            .clone();
+        let selected: Arc<str> = Arc::from("Saved first");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .provider_exit
+            .selection
+            .borrow_mut()
+            .selected = Some(selected.clone());
+        let delayed = text_copy::Request::for_test(handle.clone(), source.clone());
+        let pointer_copy = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            0,
+            selected.clone(),
+        ));
+        assert_eq!(clipboard_writes(pointer_copy), [selected.to_string()]);
+        let obsolete = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "owned-report".into(),
+            delayed,
+            Ok(SAVED.into()),
+        ));
+        assert!(
+            clipboard_writes(obsolete).is_empty(),
+            "an earlier full read cannot overwrite the newer pointer copy"
+        );
+        assert!(Arc::ptr_eq(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .ready
+                .as_ref()
+                .unwrap(),
+            &loaded
+        ));
+
+        let stale_page = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            1,
+            selected.clone(),
+        ));
+        assert!(clipboard_writes(stale_page).is_empty());
+        drop(app.handle_chat_ui(Action::SelectReportPage(target, key.clone(), 1)));
+        assert!(
+            !app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .selection
+                .borrow()
+                .select_all
+        );
+        drop(app.handle_chat_ui(Action::SelectReportPage(target, key.clone(), 0)));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .selection
+                .borrow()
+                .select_all
+        );
+
+        // Source withdrawal between the click and polling the actual effect
+        // must also refuse the captured menu write.
+        let pending = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            0,
+            selected.clone(),
+        ));
+        let mut withdrawn = (*handle.snapshot()).clone();
+        withdrawn.text_copy_sources.conversation = vec![None];
+        handle.publish_snapshot_for_test(withdrawn);
+        assert!(clipboard_writes(pending).is_empty());
+        let stale_source =
+            app.handle_chat_ui(Action::CopyReportSelection(target, key, 0, selected));
+        assert!(clipboard_writes(stale_source).is_empty());
+    }
+
+    #[test]
+    fn page_keyboard_clipboard_effect_invalidates_older_full_copy_before_writing() {
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, source) = fixture();
+        let request = begin(&mut app, target, &source);
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            request,
+            Ok(Arc::new(SAVED.into())),
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let key = runtime.provider_exit.key.as_ref().unwrap().clone();
+        let visible = runtime.visible.clone();
+        let delayed = text_copy::Request::for_test(handle.clone(), source);
+        #[derive(Default)]
+        struct MemoryClipboard(Vec<String>);
+        impl Clipboard for MemoryClipboard {
+            fn read(&self, _kind: iced::advanced::clipboard::Kind) -> Option<String> {
+                self.0.last().cloned()
+            }
+            fn write(&mut self, _kind: iced::advanced::clipboard::Kind, text: String) {
+                self.0.push(text);
+            }
+        }
+        let mut clipboard = MemoryClipboard::default();
+        SelectionClipboard {
+            clipboard: &mut clipboard,
+            key: &key,
+            handle: &handle,
+            visible: &visible,
+        }
+        .write(
+            iced::advanced::clipboard::Kind::Standard,
+            "Saved final line".into(),
+        );
+        assert_eq!(clipboard.0, ["Saved final line"]);
+        let obsolete = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "owned-report".into(),
+            delayed,
+            Ok(SAVED.into()),
+        ));
+        assert!(clipboard_writes(obsolete).is_empty());
+        visible.store(false, Ordering::Relaxed);
+        SelectionClipboard {
+            clipboard: &mut clipboard,
+            key: &key,
+            handle: &handle,
+            visible: &visible,
+        }
+        .write(
+            iced::advanced::clipboard::Kind::Standard,
+            "hidden page".into(),
+        );
+        assert_eq!(clipboard.0, ["Saved final line"]);
     }
 }

@@ -276,6 +276,8 @@ pub enum Action {
     LoadReportOutput(Target, String, chat::TextCopySource),
     ReportOutputLoaded(Target, provider_exit::Request, Result<Arc<String>, String>),
     ReportOutputPage(Target, bool),
+    CopyReportSelection(Target, provider_exit::Key, usize, Arc<str>),
+    SelectReportPage(Target, provider_exit::Key, usize),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
     LocalPromptPrepared(Target, u64, preparation::Ready),
     RetryMarkdown(Target),
@@ -10700,6 +10702,12 @@ impl Cagents {
             }
             Action::ReportOutputPage(target, forward) => {
                 self.report_output_page(target, forward);
+            }
+            Action::CopyReportSelection(target, key, page, text) => {
+                return self.report_page_selection(target, key, page, Some(text));
+            }
+            Action::SelectReportPage(target, key, page) => {
+                return self.report_page_selection(target, key, page, None);
             }
             Action::CopyMessage(target, id, source) => {
                 return self.start_message_copy(target, id, source);
