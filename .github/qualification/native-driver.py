@@ -237,6 +237,31 @@ def click(pid, name, keyboard=False):
 
 
 def capture_notice(pid, window, name, message):
+    def notice_control():
+        nodes = [node for node in live_tree(pid) if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                 and node.name in ('Application notices: success', 'Application notices', 'Application errors')
+                 and visible(node) and node.getState().contains(pyatspi.STATE_ENABLED)]
+        assert len(nodes) <= 1, 'Application notices must expose one current control'
+        return nodes[0] if nodes else None
+    control = wait(notice_control)
+    bounds = control.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+    geometry = dict(line.split('=', 1) for line in subprocess.check_output(
+        ['xdotool', 'getwindowgeometry', '--shell', window], text=True, timeout=5).splitlines())
+    assert int(geometry['X']) == 0 and int(geometry['Y']) == 0
+    assert bounds.width >= 18 and bounds.height >= 18
+    center_x, center_y = bounds.x + bounds.width // 2, bounds.y + bounds.height // 2
+    assert 9 <= center_x <= viewport[0] - 9 and 9 <= center_y <= viewport[1] - 9
+    glyph_frame = out / (name + '-notice-control.png')
+    run(['import', '-screen', '-window', window, str(glyph_frame)])
+    with Image.open(glyph_frame) as picture:
+        assert picture.size == viewport
+        glyph = picture.crop((center_x - 9, center_y - 9, center_x + 9, center_y + 9)).convert('RGB')
+        low, high = glyph.convert('L').getextrema()
+        metrics = {'luminance_range': high - low, 'at_least_4_colors': glyph.getcolors(maxcolors=3) is None,
+                   'desktop_bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
+                   'roi': [center_x - 9, center_y - 9, center_x + 9, center_y + 9]}
+    event({'event': 'notice-control-glyph', 'pid': pid, 'capture': glyph_frame.name, **metrics})
+    assert metrics['luminance_range'] >= 16 and metrics['at_least_4_colors'], 'Notices control glyph is blank'
     control_name = click(pid, ('Application notices: success', 'Application notices', 'Application errors'))
     wait(lambda: any(node.name == 'Close application notices' and visible(node) for node in live_tree(pid)))
     wait(lambda: any(node.name == message and visible(node) for node in live_tree(pid)))
@@ -449,6 +474,19 @@ def responsiveness(window, pid, fixture, root, label, helper):
 
 
 try:
+    icon_root = Path('/usr/share/icons/Adwaita')
+    assert (icon_root / 'index.theme').is_file()
+    icon_resources = {}
+    for icon_name in ['dialog-warning-symbolic', 'dialog-error-symbolic', 'emblem-ok-symbolic']:
+        candidates = sorted(path for path in icon_root.rglob(icon_name + '.*') if path.is_file())
+        assert candidates, 'Missing installed Adwaita resource: ' + icon_name
+        icon_resources[icon_name] = [{'path': str(path), 'sha256': digest(path)} for path in candidates]
+    with (out / 'adwaita-package-version.txt').open('w') as package_version:
+        run(['dpkg-query', '-W', '-f=${Version}\n', 'adwaita-icon-theme'], stdout=package_version)
+    (out / 'icon-theme-resources.json').write_text(json.dumps({
+        'requested_theme': 'Adwaita', 'index_sha256': digest(icon_root / 'index.theme'),
+        'installed_resource_candidates': icon_resources,
+    }, indent=2) + '\n')
     launcher = next(path for path in [Path('/usr/libexec/at-spi-bus-launcher'),
                                     Path('/usr/lib/at-spi2-core/at-spi-bus-launcher')] if path.exists())
     accessibility = subprocess.Popen([str(launcher), '--launch-immediately'], start_new_session=True)
@@ -522,6 +560,15 @@ try:
                 path = root / name
                 path.mkdir(mode=0o700)
                 env[key] = str(path)
+            assert 'FLATPAK_ID' not in env, 'Private icon configuration requires the ordinary XDG config route'
+            icon_config = Path(env['XDG_CONFIG_HOME']) / 'cosmic/com.system76.CosmicTk/v1/icon_theme'
+            icon_config.parent.mkdir(parents=True)
+            icon_config.write_text('"Adwaita"\n')
+            (out / (label + '-icon-theme.json')).write_text(json.dumps({
+                'requested_theme': 'Adwaita', 'private_config_path': str(icon_config),
+                'config_sha256': digest(icon_config),
+                'installed_resources_sha256': digest(out / 'icon-theme-resources.json'),
+            }, indent=2) + '\n')
             env['CARGO_HOME'] = os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))
             env['RUSTUP_HOME'] = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
             env['HELD_FIXTURE_PAYLOAD'] = payload
@@ -835,6 +882,7 @@ try:
                 wait(recovered_durable_settled)
             stop(ui)
             stop(fixture)
+            assert icon_config.read_text() == '"Adwaita"\n', 'Private icon setting changed during native interaction'
             expected_existence = 'closed' if variant == 'after' and (mode == 'closed' or ordinary) else 'open'
             with (out / (label + '-typed-persistence.log')).open('w') as log:
                 run([str(helper), str(root), mode, '--inspect', expected_existence], env=env, stdout=log)

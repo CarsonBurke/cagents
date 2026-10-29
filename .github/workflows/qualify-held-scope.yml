@@ -53,7 +53,7 @@ jobs:
           persist-credentials: false
       - name: Install native evidence tools
         shell: bash
-        run: sudo apt-get update && sudo apt-get install -y xvfb xauth x11-utils openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install -y xvfb xauth x11-utils openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 adwaita-icon-theme
       - name: Restore the isolated hosted build lane
         id: cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
