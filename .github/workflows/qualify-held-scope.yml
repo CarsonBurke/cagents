@@ -74,6 +74,14 @@ jobs:
         shell: bash
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
+      - name: Upload completed native interaction evidence
+        if: success() && steps.native.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: held-scope-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}-native
+          path: ${{ runner.temp }}/held-scope-evidence
+          if-no-files-found: error
+          retention-days: 14
       - name: Run every affected isolated suite after native cleanup
         if: success() && steps.focus.outcome == 'success' && steps.native.outcome == 'success'
         shell: bash

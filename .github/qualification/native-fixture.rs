@@ -396,6 +396,19 @@ fn client(
                     snapshot: snapshot(&session), session,
                 }}
             }
+            ClientRequest::ChatCommitTerminal { terminal_id }
+                if terminal_id == held.id && {
+                    let fixture = state.lock().unwrap();
+                    fixture.model.agents.get(1).is_some_and(|agent|
+                        agent.closed && agent.spec.surface == Surface::Terminal
+                        && matches!(agent.session.as_ref(), Some(HostedSession::Terminal(session)) if session.id == terminal_id))
+                } =>
+            {
+                // Production accepts this durability acknowledgement even when
+                // no handoff receipt exists. It does not admit or act on an actor.
+                record(&root, "terminal-handoff-ack-idempotent-no-receipt");
+                ServerMessage::Response { response: ServerResponse::Accepted }
+            }
             ClientRequest::ChatStart { .. }
             | ClientRequest::ChatRecoverAccount { .. }
             | ClientRequest::ChatStartSelected { .. }

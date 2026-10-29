@@ -329,12 +329,12 @@ def resource_sample(pid):
 
 
 def responsiveness(window, pid, fixture, root, label, helper):
-    def attention_control():
+    def common_control():
         nodes = [node for node in live_tree(pid)
-                 if node.name == 'Attention' and node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)]
+                 if node.name == 'Search projects' and node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)]
         assert len(nodes) <= 1, f'The common control must have one native target, found {len(nodes)}'
         return nodes[0] if nodes else None
-    node = wait(attention_control)
+    node = wait(common_control)
     bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
     assert 0 <= bounds.x and 0 <= bounds.y and bounds.x + bounds.width <= 1280 and bounds.y + bounds.height <= 800
     (out / (label + '-probe-target.json')).write_text(json.dumps({
@@ -370,6 +370,9 @@ def responsiveness(window, pid, fixture, root, label, helper):
             assert probe.returncode == 0, 'Common-control hover calibration or response probe failed'
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             assert rows[0]['calibrated'] and len(rows) == 61
+            with Image.open(str(output.with_suffix('')) + '-calibration-0.ppm') as reference:
+                low, high = reference.convert('L').getextrema()
+                assert high - low >= 16, 'The common control glyph must be visibly rendered'
             assert all(row['timeout'] is False and 0 <= row['seconds'] < 1
                        and 0 <= row['max_poll_gap_seconds'] < 1 for row in rows[1:]), (
                            'Common-chrome response or observation stalled for at least one second')
@@ -379,6 +382,7 @@ def responsiveness(window, pid, fixture, root, label, helper):
                 assert len(updates) == 150 and [int(row[2]) for row in updates] == list(range(150))
                 assert all(int(a[3]) < int(b[3]) and int(a[9]) < int(b[9])
                            for a, b in zip(updates, updates[1:]))
+            capture(window, label + '-' + phase + '-hover', (1280, 800))
             completed_phases.append(phase)
     finally:
         (out / (label + '-responsiveness-resources.json')).write_text(json.dumps({
@@ -386,7 +390,7 @@ def responsiveness(window, pid, fixture, root, label, helper):
             'completed_phases': completed_phases,
             'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
             'synthetic_workload': '200-item healthy transcript, 32 managed registry entries (30 idle peers), 150 channel-title events at nominal 5Hz',
-            'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe covers the first approximately 8 seconds, resources cover the full 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
+            'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe covers its recorded sample interval, resources cover the full 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
             'probe_sha256': digest(helper), 'samples': samples,
         }, indent=2) + '\n')
 
@@ -726,7 +730,8 @@ try:
                     assert list(db.iterdump()) == before_rows
             events = receipt.read_text()
             (out / (label + '-receipts.txt')).write_text(events)
-            assert 'UNEXPECTED-' not in events
+            assert 'UNEXPECTED-' not in events, '\n'.join(
+                line for line in events.splitlines() if line.startswith('UNEXPECTED-'))
             receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
                              'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
                              'events': events.splitlines()})
