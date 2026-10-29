@@ -3051,7 +3051,15 @@ mod tests {
             }
             app.card_state_mut(managed).unwrap().width_fraction = 0.9;
             app.publish_view_changes();
-            drop(app.begin_card_close(managed));
+            // The tab's close button routes a chat through its own close.
+            for close in [
+                Message::CloseCard(managed),
+                Message::CloseCardUnasked(managed),
+            ] {
+                drop(app.update(close));
+                assert!(app.card_state(managed).unwrap().existence.is_open());
+            }
+            drop(app.begin_chat_close(managed));
             assert!(app.card_state(managed).unwrap().existence.is_open());
             assert!(app.workspace.order().any(|id| id == managed));
             let edits = drain(&published);
