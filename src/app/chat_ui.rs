@@ -29,6 +29,8 @@ mod find_navigation;
 mod flow_layout;
 mod fold;
 mod hover;
+#[cfg(test)]
+mod image_only_peer_remove_tests;
 pub(super) mod images;
 mod layout;
 mod literal_content;
@@ -6619,6 +6621,7 @@ impl Cagents {
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
                 || runtime.has_unsent_text()
+                || !runtime.unsent_attachments().is_empty()
                 || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
