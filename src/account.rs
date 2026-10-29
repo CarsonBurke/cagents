@@ -35,6 +35,7 @@ pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
 pub mod info;
+pub mod installation;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;

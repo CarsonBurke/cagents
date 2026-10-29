@@ -207,7 +207,9 @@ use crate::{
 /// only the current optional installation identity; it does not reaffirm an
 /// installation-less intent or authorize setup continuation. Preparation DTOs
 /// and prior device-operation request/reply tags remain unchanged.
-pub const PROTOCOL_VERSION: u16 = 144;
+// 145 appends identity-only initialization to the 144 preparation lineage.
+// Older uncomposed CodingConfigCreate/Import tag-20/17 layouts are not adopted.
+pub const PROTOCOL_VERSION: u16 = 145;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2227,6 +2229,9 @@ mod tests {
                 request: request.clone(),
             };
             assert_eq!(postcard::to_allocvec(&operation).unwrap()[0], 18);
+            let mut original_payload = vec![18];
+            original_payload.extend(postcard::to_allocvec(&request).unwrap());
+            assert_eq!(postcard::to_allocvec(&operation).unwrap(), original_payload);
             let envelope = ClientEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id: 100 + index as u64,
@@ -2252,6 +2257,15 @@ mod tests {
                     outcome: outcome.clone(),
                 });
                 assert_eq!(postcard::to_allocvec(&reply).unwrap()[0], 15);
+                let mut original_payload = vec![15];
+                original_payload.extend(
+                    postcard::to_allocvec(&AccountPreparationReply {
+                        request: request.clone(),
+                        outcome: outcome.clone(),
+                    })
+                    .unwrap(),
+                );
+                assert_eq!(postcard::to_allocvec(&reply).unwrap(), original_payload);
                 let envelope = ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: Some(100 + index as u64),
@@ -2394,6 +2408,100 @@ mod tests {
                     .read::<ServerEnvelope>(&mut cursor)
                     .unwrap()
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn account_installation_initialization_appends_only_its_own_framed_payload() {
+        use crate::{
+            account::installation::{
+                InitializationOutcome, InitializationRefusal, InitializationReply,
+                InitializationRequest,
+            },
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+        let request = InitializationRequest {
+            request_id: Uuid::from_u128(401),
+        };
+        let operation = Operation::AccountInstallationInitialize { request };
+        let mut expected = vec![20];
+        expected.extend(postcard::to_allocvec(&request).unwrap());
+        assert_eq!(postcard::to_allocvec(&operation).unwrap(), expected);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("initializer"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let envelope = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: 901,
+            proof: Some(proof.clone()),
+            request: ClientRequest::DeviceOperation { operation },
+        };
+        let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut bytes = Vec::new();
+        codec.write(&mut bytes, &envelope).unwrap();
+        assert_eq!(
+            codec
+                .read::<ClientEnvelope>(&mut Cursor::new(bytes))
+                .unwrap(),
+            Some(envelope)
+        );
+        for outcome in [
+            InitializationOutcome::Confirmed {
+                installation_id: Uuid::from_u128(402),
+            },
+            InitializationOutcome::Unknown,
+            InitializationOutcome::NotAttempted {
+                reason: InitializationRefusal::InvalidRequestId,
+            },
+            InitializationOutcome::NotAttempted {
+                reason: InitializationRefusal::StoreUnavailable,
+            },
+        ] {
+            let payload = InitializationReply {
+                request_id: request.request_id,
+                outcome,
+            };
+            let reply = Reply::AccountInstallationInitialized(payload);
+            let mut expected = vec![17];
+            expected.extend(postcard::to_allocvec(&payload).unwrap());
+            assert_eq!(postcard::to_allocvec(&reply).unwrap(), expected);
+            let envelope = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(901),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation { reply },
+                },
+            };
+            let mut bytes = Vec::new();
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec.write(&mut bytes, &envelope).unwrap();
+            assert_eq!(
+                codec
+                    .read::<ServerEnvelope>(&mut Cursor::new(bytes))
+                    .unwrap(),
+                Some(envelope)
+            );
+        }
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountInstallationRead {
+                request_id: request.request_id
+            })
+            .unwrap()[0],
+            19
+        );
+        for installation_id in [None, Some(Uuid::from_u128(403))] {
+            assert_eq!(
+                postcard::to_allocvec(&Reply::AccountInstallationObservation {
+                    request_id: request.request_id,
+                    installation_id
+                })
+                .unwrap()[0],
+                16
             );
         }
     }

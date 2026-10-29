@@ -89,6 +89,11 @@ pub enum Operation {
     AccountInstallationRead {
         request_id: uuid::Uuid,
     },
+    /// Explicit identity-only initialization on this original connection.
+    /// Appended only to the protocol-144 preparation lineage.
+    AccountInstallationInitialize {
+        request: crate::account::installation::InitializationRequest,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -149,6 +154,7 @@ pub enum Reply {
         request_id: uuid::Uuid,
         installation_id: Option<uuid::Uuid>,
     },
+    AccountInstallationInitialized(crate::account::installation::InitializationReply),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -214,6 +220,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
         }
         Operation::AccountInstallationRead { .. } => {
             Err("Installation observation requires explicit user and daemon admission".into())
+        }
+        Operation::AccountInstallationInitialize { .. } => {
+            Err("Installation initialization requires explicit user and daemon admission".into())
         }
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)

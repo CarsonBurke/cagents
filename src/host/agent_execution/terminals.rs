@@ -177,6 +177,7 @@ pub(in crate::host) fn admit(
         ClientRequest::DeviceOperation {
             operation: crate::device_service::Operation::AccountPreparation { .. }
                 | crate::device_service::Operation::AccountInstallationRead { .. }
+                | crate::device_service::Operation::AccountInstallationInitialize { .. }
         }
     ) {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());

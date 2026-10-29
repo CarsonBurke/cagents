@@ -34,6 +34,7 @@ use crate::model::ProjectId;
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
 const VERSION: u32 = 6;
+mod installation_initialization;
 #[cfg(test)]
 mod installation_observation_tests;
 mod pending_retention;

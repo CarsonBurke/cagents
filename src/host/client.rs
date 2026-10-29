@@ -30,6 +30,8 @@ mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 #[cfg(test)]
+mod installation_initialization_tests;
+#[cfg(test)]
 mod installation_observation_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -665,6 +667,25 @@ pub(super) fn process_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             let operation = match operation {
+                crate::device_service::Operation::AccountInstallationInitialize { request } => {
+                    // All ordinary admission gates above remain authoritative.
+                    // Their outer errors are caller-Unknown, never a typed
+                    // claim that initialization was not attempted.
+                    super::account_lifecycle::ensure_idle(host)?;
+                    let reply = crate::account::installation::initialize(
+                        request,
+                        super::account_preparation::observation_store,
+                    );
+                    return Ok((
+                        ServerResponse::DeviceOperation {
+                            reply: crate::device_service::Reply::AccountInstallationInitialized(
+                                reply,
+                            ),
+                        },
+                        Vec::new(),
+                        false,
+                    ));
+                }
                 crate::device_service::Operation::AccountInstallationRead { request_id } => {
                     // Keep the original authenticated route and shared
                     // admission through the bounded read. This does not mint
