@@ -17,8 +17,8 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: 6a287ca24f2c701fc4daea6265cf9cb98d559c71
-  EXPECTED_PRODUCT_TREE: 92970c09b529c07db918c77ee388f4799cc30ba9
+  EXPECTED_PRODUCT_SHA: 543de3bbc2592941aaec0e7b212c931793494425
+  EXPECTED_PRODUCT_TREE: cecb20a0bc8b2394fac6b1c1d7c9ffcad8e6fb8e
 
 jobs:
   host:
@@ -61,7 +61,7 @@ jobs:
       - name: Check out the literal product
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 6a287ca24f2c701fc4daea6265cf9cb98d559c71
+          ref: 543de3bbc2592941aaec0e7b212c931793494425
           path: product
           persist-credentials: false
 
@@ -150,6 +150,9 @@ jobs:
           import os, pathlib, re
           log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1931-logs/host-all-targets.txt').read_text()
           names = [
+              "chat::native_holder::transport::tests::post_child_census_failure_preserves_live_ownership_and_services_control",
+              "chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool",
+              "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
               "host::chat::retained_actor_tests::pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown",
               "host::chat::retained_admission_tests::installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry",
               "host::chat::capacity::tests::rejected_start_precedes_account_setup_and_provider_history_reads",
@@ -180,7 +183,7 @@ jobs:
           ]
           for name in names:
               assert len(re.findall(r'^test ' + re.escape(name) + r' \.\.\. ok$', log, re.M)) == 1, name
-          print('All 27 capacity/retained-startup parents passed once within the full HOST all-target invocation.')
+          print('All 27 capacity/retained-startup and three fixture parents passed once within the full HOST all-target invocation.')
           PY
           sha256sum --check "$RUNNER_TEMP/pr1931-logs/helper.sha256"
           test -z "$(git status --porcelain --untracked-files=all)"
