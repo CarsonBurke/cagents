@@ -1274,7 +1274,14 @@ fn quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner() {
     let source = current_owner(&mut initial_pane);
     let daemon = ScriptedDaemon::with_owner(source);
     for retained in [false, true] {
-        for route in ["chrome", "failed-button", "unasked", "commit", "chat-entry"] {
+        for route in [
+            "chrome",
+            "failed-button",
+            "unasked",
+            "commit",
+            "chat-entry",
+            "stale-repaired-button",
+        ] {
             let (mut app, active, hidden, mut pane, identity) = cached_chat();
             current_owner(&mut pane);
             let CardKind::Chat(session) = &mut pane.kind else {
@@ -1305,6 +1312,15 @@ fn quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner() {
                 app.cards.get(&pane.id),
                 Some(CardRuntime::Failed(_))
             ));
+            let stale_repaired = route == "stale-repaired-button";
+            let queued = stale_repaired.then(|| click_quarantined_remove(&app, pane.id));
+            if stale_repaired {
+                full.sequence += 1;
+                full.agents[0].closed = false;
+                app.refresh_managed_pane_quarantine(&full);
+                app.workspace_model = full;
+                assert!(!app.pane_is_quarantined(pane.id));
+            }
             let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
             let inventory = crate::control::ControlClient::connect(&socket)
                 .unwrap()
@@ -1325,6 +1341,7 @@ fn quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner() {
                 "unasked" => app.update(Message::CloseCardUnasked(pane.id)),
                 "commit" => app.update(Message::CommitClose(pane.id)),
                 "chat-entry" => app.begin_chat_close(pane.id),
+                "stale-repaired-button" => app.update(queued.unwrap()),
                 _ => unreachable!(),
             };
             settle(&mut app, task);
@@ -1340,11 +1357,17 @@ fn quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner() {
             assert!(!app.chat_close_owned(pane.id));
             let saved = app.persistent_workspace();
             let history = saved.cards.iter().find(|card| card.id == pane.id).unwrap();
-            assert!(!history.existence.is_open(), "{route}/{retained}");
             assert_eq!(history.kind, pane.kind);
-            assert_eq!(saved.quarantined_panes.get(&pane.id), Some(&pane.kind));
             assert_eq!(saved.chat_drafts[&pane.id], "Keep local removal payload");
-            assert!(!app.workspace.order().any(|id| id == pane.id));
+            if stale_repaired {
+                assert!(history.existence.is_open(), "{route}/{retained}");
+                assert!(!saved.quarantined_panes.contains_key(&pane.id));
+                assert!(app.workspace.order().any(|id| id == pane.id));
+            } else {
+                assert!(!history.existence.is_open(), "{route}/{retained}");
+                assert_eq!(saved.quarantined_panes.get(&pane.id), Some(&pane.kind));
+                assert!(!app.workspace.order().any(|id| id == pane.id));
+            }
             assert_eq!(
                 crate::control::ControlClient::connect(&socket)
                     .unwrap()
@@ -1461,11 +1484,16 @@ fn queued_failed_remove_cannot_close_an_exactly_repaired_chat() {
         app.refresh_managed_pane_quarantine(&repaired);
         app.workspace_model = repaired;
         assert!(!app.pane_is_quarantined(pane.id));
-        let task = app.update(queued);
-        assert!(
-            cosmic::iced::runtime::task::into_stream(task).is_none(),
-            "stale failed-pane removal emits no host close task after exact repair"
-        );
+        let Message::RemoveQuarantinedPane(card, nonce) = &queued else {
+            unreachable!()
+        };
+        assert!(!app.quarantine_presentation_action_allowed(*card, *nonce));
+        // The full App always batches its visibility/presence postlude, even
+        // when the action is refused. Check the synchronous close/source
+        // contract here without running hypothetical host work in this pure
+        // fixture. The genuine-User isolated inventory fixture above drains
+        // this actual stale-button task and verifies that it sends zero IPC.
+        drop(app.update(queued));
         assert!(app.card_state(pane.id).unwrap().existence.is_open());
         assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
         assert!(!app.chat_close_owned(pane.id));
