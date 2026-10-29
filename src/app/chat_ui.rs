@@ -21630,6 +21630,24 @@ mod tests {
         use crate::account::registry::{Registered, Store};
         use iced::futures::StreamExt;
 
+        fn effects(task: Task<Message>) -> Vec<iced::runtime::Action<cosmic::Action<Message>>> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => stream.collect::<Vec<_>>().await,
+                        None => Vec::new(),
+                    }
+                })
+                .await
+            });
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            result.expect("Ready-error tasks must settle within five seconds")
+        }
+
         // The real registry task reads disk, and retirement checks the daemon
         // socket. Give both a private installation without a running daemon.
         const CHILD: &str = "CAGENTS_TEST_DRAFT_ACCOUNT_REFUSAL";
@@ -21759,7 +21777,10 @@ mod tests {
                 let mut stale = target;
                 stale.generation += 1;
                 let task = app.update(Message::ChatUi(Action::Ready(stale, failure())));
-                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert!(
+                    effects(task).is_empty(),
+                    "a stale Ready must have no effects"
+                );
                 assert_eq!(app.chat_ui.attempt(card).unwrap().target, target);
                 assert_eq!(
                     chat_runtime(&app, card).composer.text(),
@@ -21801,16 +21822,7 @@ mod tests {
                 // Poll the actual Ready-error Task to completion and consume
                 // its actual mapped messages. A boolean hook would miss a
                 // dropped, doubled, or incorrectly mapped registry request.
-                let messages = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        let stream = iced::runtime::task::into_stream(task).unwrap();
-                        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-                            .await
-                            .expect("local retirement and registry read must complete")
-                    });
+                let messages = effects(task);
                 let mut reloads = 0;
                 let mut retirements = 0;
                 for action in messages {
@@ -21847,7 +21859,10 @@ mod tests {
                 );
                 assert_eq!(runtime.attachments, [image.clone(), later_image.clone()]);
                 let duplicate = app.update(Message::ChatUi(Action::Ready(target, failure())));
-                assert!(iced::runtime::task::into_stream(duplicate).is_none());
+                assert!(
+                    effects(duplicate).is_empty(),
+                    "a consumed Ready must have no effects"
+                );
                 assert!(app.chat_ui.retiring.is_empty());
 
                 if recovery == chat::Recovery::Account {
