@@ -703,7 +703,7 @@ fn quiet_signal_preparation_exit(name: &str, promote: bool) {
     // An unsupported DaemonAdmission must fail; this test never retries with
     // removed credentials, another role or a fabricated launch permit.
     let quiet = Rpc::connect(&paths.socket);
-    let mut source = crate::chat::fresh_session_draft(
+    let mut source = crate::chat::history_session_configured(
         crate::agent::Provider::Claude,
         TerminalId::new(),
         root.clone(),
