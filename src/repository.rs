@@ -177,7 +177,15 @@ pub fn nested_worktrees_refusal_in(
     nested_worktrees_refusal(
         nested_worktree_paths(path, present.map(|record| record.path.as_path())).count(),
     )
-    .or_else(|| nested_repositories::refusal(path, cancellation))
+    .or_else(|| {
+        // Manual deletion can retire an exact registration whose directory
+        // was already removed. The scanner must confirm absence beneath a
+        // retained root; prunable metadata never excuses existing content.
+        let allow_absent = records
+            .iter()
+            .any(|record| record.path == path && record.prunable_reason.is_some());
+        nested_repositories::refusal(path, cancellation, allow_absent)
+    })
 }
 
 /// Why a worktree containing `nested` other worktrees cannot be removed, or

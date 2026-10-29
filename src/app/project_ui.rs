@@ -4275,6 +4275,92 @@ mod tests {
     }
 
     #[test]
+    fn absent_registered_worktree_can_retire_its_exact_prunable_registration() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::absent_registered_worktree_can_retire_its_exact_prunable_registration"
+        )) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("repository");
+        let selected = root.join("selected");
+        git(&root, &["init", "-b", "main", "repository"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "selected",
+                selected.to_str().unwrap(),
+            ],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let record = service
+            .list_worktrees(&repository, &cancellation)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == selected)
+            .unwrap();
+        std::fs::remove_dir_all(&selected).unwrap();
+        let stale = service
+            .list_worktrees(&repository, &cancellation)
+            .unwrap()
+            .into_iter()
+            .find(|current| current.id == record.id && current.path == selected)
+            .unwrap();
+        assert!(stale.prunable_reason.is_some());
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(record.id),
+            repository: repository.clone(),
+            path: selected.clone(),
+            label: "selected".into(),
+            nested: Vec::new(),
+        };
+        let closed = std::cell::Cell::new(false);
+        // A prunable record cannot authorize deleting a replacement that
+        // appeared at the stale selection's pathname before inspection.
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("replacement.txt"), "retain replacement").unwrap();
+        let reason = delete_worktree_with_sessions(&target, |_| {
+            closed.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(reason.contains("prunable selected worktree"), "{reason}");
+        assert!(!closed.get());
+        assert_eq!(
+            std::fs::read(selected.join("replacement.txt")).unwrap(),
+            b"retain replacement"
+        );
+        std::fs::remove_dir_all(&selected).unwrap();
+        delete_worktree_with_sessions(&target, |_| {
+            closed.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(closed.get());
+        assert!(!selected.exists());
+        assert!(
+            service
+                .list_worktrees(&repository, &cancellation)
+                .unwrap()
+                .iter()
+                .all(|current| current.id != record.id)
+        );
+        assert!(repository.is_dir());
+        git(
+            &repository,
+            &["show-ref", "--verify", "refs/heads/selected"],
+        );
+    }
+
+    #[test]
     fn dirty_worktree_confirmation_warns_without_blocking() {
         let repository = PathBuf::from("/repo");
         let primary = SidebarWorktree::from_durable(
