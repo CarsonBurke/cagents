@@ -1349,6 +1349,7 @@ mod tests {
             let mut source = fixture.session.clone();
             source.proof = Some(host.lock().unwrap().proof().clone());
             let issued = source.clone();
+            let probe = chat::protocol::claude::history_open_probe(fixture.root.path());
             // No resident handle is installed by the fixture. The real client
             // handshake and Host Attach must construct the forced A reader.
             let (first, server) = restore_client(&host, source.clone(), 71);
@@ -1381,6 +1382,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(first.session(), issued);
+            assert_eq!(probe.paths(), vec![provider_history_path(&source)]);
             drop(first);
             server.join().unwrap();
 
@@ -1413,7 +1415,12 @@ mod tests {
             assert!(!host.lock().unwrap().chats.contains_key(&source.id));
 
             fixture.replace_cwd();
-            let probe = chat::protocol::claude::history_open_probe(fixture.root.path());
+            let opened_before_replacement = probe.paths();
+            assert!(
+                opened_before_replacement
+                    .iter()
+                    .all(|path| path == &provider_history_path(&source))
+            );
             let (result, server) = restore_client(&host, source.clone(), 73);
             let failure = match result {
                 Err(failure) => failure,
@@ -1429,7 +1436,7 @@ mod tests {
                 failure.message
             );
             assert!(
-                probe.paths().is_empty(),
+                probe.paths() == opened_before_replacement,
                 "the production transcript open path must not try B"
             );
             assert_eq!(source, issued);
