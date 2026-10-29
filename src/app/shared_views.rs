@@ -216,9 +216,14 @@ fn quarantined_managed_panes(
         }
     }
     for card in &workspace.cards {
-        if !card.existence.is_open() && workspace.local_only_cards.contains(&card.id) {
+        if !card.existence.is_open()
+            && workspace.local_only_cards.contains(&card.id)
+            && (previous.contains(&card.id) || workspace.quarantined_panes.contains_key(&card.id))
+        {
             // Explicit local dismissal is durable presentation retirement. It
             // never turns into host close authority on a later reconnect.
+            // Ordinary retained drafts/editors also use local_only_cards;
+            // that custody marker alone is never evidence of rejected proof.
             quarantined.insert(card.id);
             continue;
         }
@@ -430,15 +435,7 @@ impl State {
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
         let mut state = Self::default();
         state.retained = workspace.local_only_cards.clone();
-        state.quarantined = workspace
-            .cards
-            .iter()
-            .filter(|card| {
-                !card.existence.is_open() && workspace.local_only_cards.contains(&card.id)
-            })
-            .map(|card| card.id)
-            .chain(workspace.quarantined_panes.keys().copied())
-            .collect();
+        state.quarantined = workspace.quarantined_panes.keys().copied().collect();
         state.attached = workspace
             .channels
             .iter()

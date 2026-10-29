@@ -2626,6 +2626,308 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
     );
 }
 
+struct OrdinaryRetainedChatFixture {
+    _directory: tempfile::TempDir,
+    app: Cagents,
+    full: crate::workspace_model::WorkspaceModel,
+    loaded: WorkspaceState,
+    entry: crate::persistence::SavedConversation,
+}
+
+fn ordinary_closed_retained_chat_fixture() -> OrdinaryRetainedChatFixture {
+    use crate::persistence::{SnapshotBase, StateStore};
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    let CardKind::Chat(source) = &mut pane.kind else {
+        unreachable!()
+    };
+    source.launch.recipe.working_directory = directory.path().into();
+    let original = source.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+        pane.id,
+        "Ordinary retained source draft".into(),
+    )]));
+    drop(app.initialize_runtimes());
+    assert!(app.chat_awaiting_admission(pane.id));
+    let CardKind::Chat(replacement) = &mut pane.kind else {
+        unreachable!()
+    };
+    replacement.id = TerminalId::new();
+    replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    replacement.proof = Some(scripted_proof());
+    // Use the real incompatible-source producer, including its new retained
+    // CardId, pending-admission payload and ordinary local custody marker.
+    let (presentation, copy) = app.retain_unresolved_shared_upgrade(&pane);
+    drop(presentation);
+    let copy = copy.expect("the original unsent source receives a retained copy");
+    assert!(app.chat_awaiting_admission(copy));
+    assert!(app.durable.local_only_cards.contains(&copy));
+    assert!(!app.pane_is_quarantined(copy));
+    drop(app.begin_chat_close(copy));
+    assert!(!app.card_state(copy).unwrap().existence.is_open());
+    assert!(app.durable.local_only_cards.contains(&copy));
+    assert!(!app.durable.pending_chat_admissions.contains_key(&copy));
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut full = model(identity, active, hidden, view);
+    full.agents.push(managed_owner(&pane, hidden));
+    app.refresh_managed_pane_quarantine(&full);
+    assert!(!app.pane_is_quarantined(copy));
+    assert!(!app.durable.quarantined_panes.contains_key(&copy));
+    let saved = app.persistent_workspace();
+    let store = StateStore::open(
+        directory.path().join("ordinary-retained-chat.sqlite3"),
+        crate::model::BootId::new("ordinary-retained-chat"),
+    )
+    .unwrap();
+    store
+        .save_workspace(
+            &saved,
+            SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert!(loaded.local_only_cards.contains(&copy));
+    assert!(!loaded.quarantined_panes.contains_key(&copy));
+    let entry = store
+        .saved_conversations()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.card == copy)
+        .expect("ordinary closed retained source stays in saved History");
+    assert!(!entry.open);
+    assert!(!entry.quarantined);
+    assert_eq!(entry.session, original);
+    OrdinaryRetainedChatFixture {
+        _directory: directory,
+        app,
+        full,
+        loaded,
+        entry,
+    }
+}
+
+fn restore_ordinary_retained_chat(fixture: &OrdinaryRetainedChatFixture) -> Cagents {
+    let (mut restored, _, _, _, _) = cached_chat();
+    restored.durable = Arc::new(fixture.loaded.clone());
+    restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+    restored.shared_views = State::for_workspace(&restored.durable);
+    restored.workspace_model = fixture.full.clone();
+    restored.refresh_managed_pane_quarantine(&fixture.full);
+    assert!(!restored.pane_is_quarantined(fixture.entry.card));
+    restored
+}
+
+#[test]
+fn ordinary_retained_chat_copy_close_allows_same_process_reopen_and_restored_history() {
+    for route in ["history", "reopen"] {
+        let fixture = ordinary_closed_retained_chat_fixture();
+        let entry = fixture.entry.clone();
+        let copy = entry.card;
+        let mut restored = if route == "history" {
+            restore_ordinary_retained_chat(&fixture)
+        } else {
+            // Reopen owns only the original process's in-memory close queue.
+            // It is not copied into the restarted application.
+            fixture.app
+        };
+        let task = if route == "history" {
+            restored.resume_saved_conversation(entry.clone())
+        } else {
+            restored.run_workspace_command(
+                workspace_widget::GlobalShortcut::ReopenPane,
+                keyboard::Modifiers::empty(),
+            )
+        };
+        // Test the actual user reducer through insertion; provider I/O remains
+        // lazy and is never executed by this pure regression.
+        drop(task);
+        assert!(restored.resume_ui.error.is_none(), "{route}");
+        let reopened = restored.workspace.focused().unwrap();
+        assert_ne!(reopened, copy);
+        assert!(
+            matches!(restored.card_state(reopened).map(|card| &card.kind),
+            Some(CardKind::Chat(session)) if session.launch == entry.session.launch)
+        );
+        assert!(restored.terminal_starts.lock().unwrap().is_empty());
+        assert!(!restored.pane_is_quarantined(copy));
+    }
+}
+
+#[test]
+fn ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume()
+{
+    assert!(
+        crate::agent_execution::Authority::from_environment()
+            .token()
+            .is_none(),
+        "provider-effect qualification requires a genuine User invocation before isolation; inherited authority must not be cleared"
+    );
+    if isolated(
+        "ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume",
+    ) {
+        return;
+    }
+    let daemon = ScriptedDaemon::start();
+    for (index, route) in ["history", "reopen"].into_iter().enumerate() {
+        let fixture = ordinary_closed_retained_chat_fixture();
+        let entry = fixture.entry.clone();
+        let mut restored = if route == "history" {
+            restore_ordinary_retained_chat(&fixture)
+        } else {
+            fixture.app
+        };
+        let task = if route == "history" {
+            restored.resume_saved_conversation(entry.clone())
+        } else {
+            restored.run_workspace_command(
+                workspace_widget::GlobalShortcut::ReopenPane,
+                keyboard::Modifiers::empty(),
+            )
+        };
+        settle(&mut restored, task);
+        let requests = daemon.requests();
+        assert_eq!(requests.len(), index + 1, "{route}");
+        let request = requests.last().unwrap();
+        assert_eq!(request.launch, entry.session.launch, "{route}");
+        assert_ne!(request.id, entry.session.id);
+        assert!(request.proof.is_none());
+        assert!(!restored.pane_is_quarantined(entry.card));
+        assert!(daemon.resolutions().is_empty());
+    }
+    assert!(
+        !daemon
+            .controls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(
+                request,
+                ClientRequest::ChatClose { .. }
+                    | ClientRequest::ChatCloseRetained { .. }
+                    | ClientRequest::CloseTerminalChecked { .. }
+            ))
+    );
+}
+
+#[test]
+fn ordinary_retained_repository_close_keeps_custody_without_denial_and_allows_same_process_reopen()
+{
+    use crate::persistence::{SnapshotBase, StateStore};
+    let (mut app, active, hidden, mut pane) = fixture();
+    let runtime = RepositoryRuntime::dirty_fixture(pane.id);
+    pane.kind = CardKind::Repository(runtime.descriptor.clone());
+    Arc::make_mut(&mut app.durable).active_channel = Some(active);
+    let mut view = View::empty(active);
+    view.panes.push(pane.clone());
+    drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+    app.cards
+        .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+    let mut retired = View::empty(active);
+    retired.retired.push(pane.id);
+    // The actual omission reducer retains a dirty editor locally; this is
+    // ordinary unsaved-work custody, with no managed-proof denial.
+    drop(app.project_shared_view(&retired, &HashSet::new()));
+    assert!(app.durable.local_only_cards.contains(&pane.id));
+    assert!(!app.pane_is_quarantined(pane.id));
+    assert!(
+        matches!(app.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty())
+    );
+    drop(app.update(Message::CloseCard(pane.id)));
+    assert!(app.dirty_repository_close.is_some());
+    drop(app.update(Message::DiscardAndCloseRepository(pane.id)));
+    assert!(app.dirty_repository_close.is_none());
+    // Deliver the ordinary close continuation after the editor's explicit
+    // discard, then its reserved native focus-handoff completion.
+    drop(app.update(Message::CloseCard(pane.id)));
+    assert!(
+        app.workspace
+            .pending_close()
+            .is_some_and(|close| close.unmounting == pane.id)
+    );
+    drop(app.update(Message::CommitClose(pane.id)));
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(app.durable.local_only_cards.contains(&pane.id));
+    let full = model(
+        app.workspace_model.identity,
+        active,
+        hidden,
+        View::empty(hidden),
+    );
+    app.refresh_managed_pane_quarantine(&full);
+    assert!(!app.pane_is_quarantined(pane.id));
+    let saved = app.persistent_workspace();
+    let directory = tempfile::tempdir().unwrap();
+    let store = StateStore::open(
+        directory.path().join("ordinary-retained-editor.sqlite3"),
+        crate::model::BootId::new("ordinary-retained-editor"),
+    )
+    .unwrap();
+    store
+        .save_workspace(
+            &saved,
+            SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert!(loaded.local_only_cards.contains(&pane.id));
+    assert!(!loaded.quarantined_panes.contains_key(&pane.id));
+    let mut restored = crate::app::tests::context_inspector_test_app(false);
+    restored.durable = Arc::new(loaded);
+    restored.shared_views = State::for_workspace(&restored.durable);
+    restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+    restored.refresh_managed_pane_quarantine(&full);
+    assert!(!restored.pane_is_quarantined(pane.id));
+    assert!(!restored.card_state(pane.id).unwrap().existence.is_open());
+    // The close queue belongs to the original process. The restarted editor's
+    // saved source and custody marker separately remain free of denial.
+    drop(app.run_workspace_command(
+        workspace_widget::GlobalShortcut::ReopenPane,
+        keyboard::Modifiers::empty(),
+    ));
+    let reopened = app.workspace.focused().expect("ordinary editor reopens");
+    assert_ne!(reopened, pane.id);
+    assert_eq!(app.card_state(reopened).unwrap().kind, pane.kind);
+    assert!(app.recently_closed.is_empty());
+    assert!(app.terminal_starts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn closed_local_dismissal_keeps_explicit_denial_after_exact_owner_returns() {
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut full = model(identity, active, hidden, view);
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    full.agents.push(owner);
+    app.refresh_managed_pane_quarantine(&full);
+    drop(app.begin_chat_close(pane.id));
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(app.durable.local_only_cards.contains(&pane.id));
+    assert_eq!(app.durable.quarantined_panes[&pane.id], pane.kind);
+    app.shared_views = State::for_workspace(&app.durable);
+    full.sequence += 1;
+    full.agents[0].closed = false;
+    app.refresh_managed_pane_quarantine(&full);
+    assert!(app.pane_is_quarantined(pane.id));
+    assert_eq!(app.durable.quarantined_panes[&pane.id], pane.kind);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(!app.chat_close_owned(pane.id));
+    assert!(app.terminal_starts.lock().unwrap().is_empty());
+}
+
 #[test]
 fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
     if isolated("replacement_admission_keeps_old_draft_beside_exact_canonical_chat") {
