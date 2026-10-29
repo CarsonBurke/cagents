@@ -9095,7 +9095,11 @@ mod tests {
             }
             let live = Claude::default().receive(frame.clone()).unwrap();
             let expected = context_item("summary:0".into(), body.into());
-            assert!(matches!(&live.events[..], [Event::Item(item)] if item == &expected));
+            assert!(
+                matches!(&live.events[..], [Event::Session { .. }, Event::Item(item)] if item == &expected),
+                "{:#?}",
+                live.events
+            );
             let mut history = correlation_history(vec![frame]);
             let records = history.page().unwrap();
             assert_eq!(
