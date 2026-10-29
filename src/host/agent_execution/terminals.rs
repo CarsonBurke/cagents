@@ -24,7 +24,7 @@ enum Access<'a> {
     Refused,
 }
 
-/// Explicit scope for retained setup metadata only. Other requests retain
+/// Explicit scope for retained setup and installation observations. Other requests retain
 /// their existing connection policy. A delegation attempt is sticky even if
 /// its capability is refused; retrying without it must not become User.
 #[derive(Clone, Copy)]
@@ -176,6 +176,7 @@ pub(in crate::host) fn admit(
         request,
         ClientRequest::DeviceOperation {
             operation: crate::device_service::Operation::AccountPreparation { .. }
+                | crate::device_service::Operation::AccountInstallationRead { .. }
         }
     ) {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -188,7 +189,7 @@ pub(in crate::host) fn admit(
             Ok(())
         } else {
             Err(denied(
-                "Account preparation requires this connection's explicit User scope",
+                "Account preparation and installation observation require this connection's explicit User scope",
             ))
         };
     }

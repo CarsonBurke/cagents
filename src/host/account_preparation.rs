@@ -179,6 +179,19 @@ pub(super) fn metadata_stores() -> (Option<Store>, Option<Homes>) {
     }
 }
 
+/// Resolve only the owning registry. Observing identity must not resolve Homes
+/// or enter account discovery. Tests require the private handler-thread fixture.
+pub(super) fn observation_store() -> Option<Store> {
+    #[cfg(test)]
+    {
+        TEST_STORES.with(|slot| slot.borrow().as_ref().map(|stores| stores.store.clone()))
+    }
+    #[cfg(not(test))]
+    {
+        Store::installation()
+    }
+}
+
 fn seed_selection(provider: Provider) -> io::Result<SeedSelection> {
     #[cfg(test)]
     {

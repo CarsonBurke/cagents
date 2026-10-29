@@ -200,9 +200,14 @@ use crate::{
 /// explicit User connection scope and metadata/physical admission. Matched executables
 /// are required; this does not adopt unrelated private protocol experiments.
 /// The metadata facade refuses Create without physical authority; owning HOST
-/// admission can create its exact planned home. Installation-less observations
-/// remain refused. Transport alone does not complete the account setup flow.
-pub const PROTOCOL_VERSION: u16 = 143;
+/// admission can create its exact planned home. Installation-less existing-pending
+/// intents remain refused. Transport alone does not complete the account setup flow.
+/// Version 144 preserves version 143 and appends a correlated, read-only
+/// installation observation under explicit User connection scope. It reports
+/// only the current optional installation identity; it does not reaffirm an
+/// installation-less intent or authorize setup continuation. Preparation DTOs
+/// and prior device-operation request/reply tags remain unchanged.
+pub const PROTOCOL_VERSION: u16 = 144;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2275,6 +2280,122 @@ mod tests {
             count, 60,
             "all ten request/target forms and six outcome forms must run"
         );
+    }
+
+    #[test]
+    fn account_installation_observation_appends_wire_tags_and_preserves_framed_correlation() {
+        use crate::{
+            account::preparation::{
+                AccountPreparationOutcome, AccountPreparationReply, AccountPreparationRequest,
+                PreparationPayload, PreparationRequest,
+            },
+            agent::Provider,
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+
+        let preparation = AccountPreparationRequest::Preparation(PreparationRequest::Plan {
+            request_id: Uuid::from_u128(10),
+            payload: PreparationPayload {
+                provider: Provider::Codex,
+                copy_codex_config: true,
+            },
+        });
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountPreparation {
+                request: preparation.clone(),
+            })
+            .unwrap()[0],
+            18,
+            "installation reads must not move the existing preparation request tag"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Reply::AccountPreparation(AccountPreparationReply {
+                request: preparation,
+                outcome: AccountPreparationOutcome::NotAttempted {
+                    message: "Installation observation grants no setup authority".into(),
+                },
+            }))
+            .unwrap()[0],
+            15,
+            "installation observations must not move the existing preparation reply tag"
+        );
+
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("installation-observation-codec-host"),
+            boot_id: BootId::new("installation-observation-codec-boot"),
+            host_incarnation: HostIncarnation::new("installation-observation-codec-incarnation"),
+        };
+        let mut request_codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut response_codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for (index, installation_id) in [None, Some(Uuid::from_u128(20))].into_iter().enumerate() {
+            let request_id = Uuid::from_u128(30 + index as u128);
+            let wire_request_id = 200 + index as u64;
+            let operation = Operation::AccountInstallationRead { request_id };
+            assert_eq!(postcard::to_allocvec(&operation).unwrap()[0], 19);
+            let request = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: wire_request_id,
+                proof: Some(proof.clone()),
+                request: ClientRequest::DeviceOperation { operation },
+            };
+            let mut bytes = Vec::new();
+            request_codec.write(&mut bytes, &request).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            let decoded = request_codec
+                .read::<ClientEnvelope>(&mut cursor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, request);
+            validate_proof(decoded.proof.as_ref(), &proof).unwrap();
+            assert!(
+                request_codec
+                    .read::<ClientEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let reply = Reply::AccountInstallationObservation {
+                request_id,
+                installation_id,
+            };
+            assert_eq!(postcard::to_allocvec(&reply).unwrap()[0], 16);
+            let response = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(wire_request_id),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation { reply },
+                },
+            };
+            let mut bytes = Vec::new();
+            response_codec.write(&mut bytes, &response).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            let decoded = response_codec
+                .read::<ServerEnvelope>(&mut cursor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, response);
+            assert_eq!(decoded.request_id, Some(wire_request_id));
+            assert_eq!(decoded.proof, proof);
+            assert!(matches!(
+                decoded.message,
+                ServerMessage::Response {
+                    response: ServerResponse::DeviceOperation {
+                        reply: Reply::AccountInstallationObservation {
+                            request_id: echoed,
+                            installation_id: observed,
+                        },
+                    },
+                } if echoed == request_id && observed == installation_id
+            ));
+            assert!(
+                response_codec
+                    .read::<ServerEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

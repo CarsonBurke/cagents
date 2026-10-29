@@ -29,6 +29,8 @@ mod account_preparation_tests;
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
+#[cfg(test)]
+mod installation_observation_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
@@ -659,6 +661,44 @@ pub(super) fn process_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             let operation = match operation {
+                crate::device_service::Operation::AccountInstallationRead { request_id } => {
+                    // Keep the original authenticated route and shared
+                    // admission through the bounded read. This does not mint
+                    // identity, run discovery, or authorize any later intent.
+                    super::account_lifecycle::ensure_idle(host)?;
+                    if request_id.is_nil() {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Installation observation requires a nonempty request identity",
+                            false,
+                        ));
+                    }
+                    let store =
+                        super::account_preparation::observation_store().ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::InvalidRequest,
+                                "The device installation observation store is unavailable",
+                                false,
+                            )
+                        })?;
+                    let installation_id = store.inspect_installation_id().map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The device installation identity could not be safely observed",
+                            false,
+                        )
+                    })?;
+                    return Ok((
+                        ServerResponse::DeviceOperation {
+                            reply: crate::device_service::Reply::AccountInstallationObservation {
+                                request_id,
+                                installation_id,
+                            },
+                        },
+                        Vec::new(),
+                        false,
+                    ));
+                }
                 crate::device_service::Operation::AccountPreparation { request } => {
                     // The shared control gate remains held through the Store's
                     // metadata barrier: physical reservations, shutdown and

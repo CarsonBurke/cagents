@@ -34,6 +34,8 @@ use crate::model::ProjectId;
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
 const VERSION: u32 = 6;
+#[cfg(test)]
+mod installation_observation_tests;
 mod pending_retention;
 mod preparations;
 pub use super::preparation::{
@@ -1003,6 +1005,59 @@ impl Store {
         Self {
             directory: directory.into(),
         }
+    }
+
+    /// Observes an existing installation identity without preparing storage,
+    /// taking locks, repairing permissions, or creating an identity. Absence
+    /// is distinct from an unsafe or unreadable registry. This observation
+    /// grants no account setup or filesystem authority.
+    pub fn inspect_installation_id(&self) -> io::Result<Option<Uuid>> {
+        let directory = if self.directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &self.directory
+        };
+        let path = directory.join(FILE_NAME);
+        let unavailable = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                "The account installation identity could not be inspected",
+            )
+        };
+        crate::secure_file::reject_symlink_components(&path).map_err(unavailable)?;
+        match crate::secure_file::validate_owned_directory(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable(error)),
+        }
+        let file = match crate::secure_file::open_existing_private_file_readonly(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable(error)),
+        };
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The accounts file could not be validated",
+            )
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(unavailable)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        let registry: Registry = toml::from_str(text).map_err(|_| invalid())?;
+        registry.validate_preparations().map_err(|_| invalid())?;
+        if registry.is_newer() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The accounts file was saved by a newer cagents",
+            ));
+        }
+        Ok(registry.installation_id())
     }
 
     /// Creates and records a pending sign-in as one lifecycle transaction.
