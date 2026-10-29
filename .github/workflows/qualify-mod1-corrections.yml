@@ -26,7 +26,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     name: Sequential exact UI and HOST corrections
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     defaults:
       run:
         shell: bash
@@ -68,7 +68,7 @@ jobs:
       - name: Check out corrected PR 1354
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 7ca8dc7b82090381a43e64c59c4bc4db2037b7f5
+          ref: 7c0022e23ea8548dea4df050f68d76fba94bca53
           path: product-1354
           persist-credentials: false
 
@@ -91,6 +91,13 @@ jobs:
         with:
           ref: 22c0d9350fc658b58f44700298577494312b9c10
           path: product-1228
+          persist-credentials: false
+
+      - name: Check out the exact PR 1931 capacity component
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 6a287ca24f2c701fc4daea6265cf9cb98d559c71
+          path: product-1931
           persist-credentials: false
 
       - name: Verify every literal source and setup before compilation
@@ -124,8 +131,16 @@ jobs:
           action = workspace / "setup-main/.github/actions/setup-linux-build/action.yml"
           assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
           assert manifest["never_merge"] is True
-          assert [p["pr"] for p in manifest["products"]] == [1354, 1564, 1294, 1228]
-          assert sum(len(p["selectors"]) for p in manifest["products"]) == 6
+          assert [p["pr"] for p in manifest["products"]] == [1354, 1564, 1294, 1228, 1931]
+          assert sum(len(p["selectors"]) for p in manifest["products"][:4]) == 8
+          assert sum(len(set(p["selectors"] + [name for suite in p.get("suites", []) for name in suite["selectors"]])) for p in manifest["products"]) == 35
+          capacity = manifest["products"][-1]
+          assert len(capacity["selectors"]) == 2 and len(capacity["suites"]) == 1
+          assert len(capacity["suites"][0]["selectors"]) == 25
+          for product in manifest["products"]:
+              names = product["selectors"] + [name for suite in product.get("suites", []) for name in suite["selectors"]]
+              assert len(names) == len(set(names)), "no parent may run twice"
+              assert set(product.get("owning_selectors", product["selectors"])).issubset(names)
           for product in manifest["products"]:
               root = workspace / ("product-" + str(product["pr"]))
               record = source(root, product["head"], product["tree"])
@@ -166,18 +181,27 @@ jobs:
                   super().__init__(message)
           def put(path, value):
               path.write_text(json.dumps(value, indent=2) + "\n")
+          def digest(path):
+              value = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
           def result(global_error=None):
+              for product in products:
+                  source = next(item for item in manifest["products"] if item["pr"] == product["pr"])
+                  product["observed_owning_selectors"] = [name for name in source.get("owning_selectors", source["selectors"]) if name in product["qualified_parents"]]
               if global_error is not None:
                   for product in products:
                       if product["status"] == "running":
-                          product.update(status="stopped_globally", unrun_selector_invocations=None)
+                          product.update(status="stopped_globally", unrun_selector_invocations=None, unrun_suite_invocations=None)
               passed = len(products) == len(manifest["products"]) and all(product["status"] == "passed" for product in products)
               value = {"narrow_qualification": "passed" if passed and global_error is None else "failed",
                        "stopped_globally": global_error is not None, "error": global_error,
                        "completed_phases": len(results), "products": products,
                        "unattempted_products": [product["pr"] for product in manifest["products"] if product["pr"] not in {item["pr"] for item in products}],
                        "qualified_parent_count": sum(len(product["qualified_parents"]) for product in products),
-                       "requested_parent_count": sum(len(product["selectors"]) for product in manifest["products"]),
+                       "requested_parent_count": sum(len(set(product["selectors"] + [name for suite in product.get("suites", []) for name in suite["selectors"]])) for product in manifest["products"]),
                        "limits": manifest["limits"]}
               put(evidence / "result.json", value)
               return value
@@ -187,13 +211,19 @@ jobs:
               assert git(root, "rev-parse", "HEAD") == product["head"]
               assert git(root, "rev-parse", "HEAD^{tree}") == product["tree"]
               assert git(root, "status", "--porcelain=v1", "--untracked-files=all") == ""
-          def phase(product, label, command, env, selector=None):
+          def verify_helper(helper, env):
+              assert env["CAGENTS_TEST_RETAINED_ACTOR_HELPER"] == helper["path"]
+              assert digest(helper["path"]) == helper["sha256"], "matched helper changed"
+          def phase(product, label, command, env, selector=None, expected_names=None, inventory_names=None, helper=None):
               root = workspace / ("product-" + str(product["pr"]))
               verify(root, product)
+              if helper is not None:
+                  verify_helper(helper, env)
               output = evidence / (str(product["pr"]) + "-" + label)
               output.mkdir()
               bounded = ["timeout", "--signal=TERM", "--kill-after=30s", "2700s", *command]
               record = {"source": product, "label": label, "selector": selector, "cwd": str(root), "command": command,
+                        "expected_names": expected_names, "inventory_names": inventory_names, "matched_helper": helper,
                         "bounded_command": bounded, "command_bound_seconds": 2700,
                         "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "status": "running", "fixture_root": env["TMPDIR"],
@@ -217,17 +247,28 @@ jobs:
               put(evidence / "phases.json", results)
               print("RETURN", product["pr"], label, "exit", status, flush=True)
               verify(root, product)
+              if helper is not None:
+                  verify_helper(helper, env)
               if record["timeout_or_wrapper_failure"]:
                   raise RuntimeError(f"PR {product['pr']} {label}: uncertain timeout/signal/wrapper outcome; stop globally")
               if status != 0:
                   raise ProductFailure(label, f"PR {product['pr']} {label} failed with exit {status}; preserve original logs, no retry")
-              if selector:
+              if inventory_names is not None:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^(\S+): test$", text, re.M)
+                  if not inventory_names or sorted(names) != sorted(inventory_names):
+                      raise ProductFailure(label, f"Compiled test inventory differs: expected={inventory_names}, actual={names}")
+                  put(output / "inventory.json", {"names": names, "count": len(names), "execution": "list only; no parent pass claimed"})
+              if selector or expected_names is not None:
                   text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
                   names = re.findall(r"^test (\S+) \.\.\. ok$", text, re.M)
                   summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
-                  if names != [selector] or summaries != [("ok", "1", "0", "0")]:
-                      raise ProductFailure(label, f"Exact-parent oracle failed: selector={selector}, names={names}, summaries={summaries}")
-                  put(output / "exact-parent.json", {"selector": selector, "passed": 1, "failed": 0, "ignored": 0})
+                  expected = [selector] if selector else expected_names
+                  if not expected or sorted(names) != sorted(expected) or summaries != [("ok", str(len(expected)), "0", "0")]:
+                      raise ProductFailure(label, f"Parent oracle failed: expected={expected}, names={names}, summaries={summaries}")
+                  put(output / ("exact-parent.json" if selector else "suite-parents.json"),
+                      {"names": names, "passed": len(names), "failed": 0, "ignored": 0})
+              return output
           try:
               assert not any(name.startswith("CAGENTS_") for name in os.environ)
               for product in manifest["products"]:
@@ -247,7 +288,8 @@ jobs:
                   env["CARGO_BUILD_JOBS"] = "2"
                   outcome = {"pr": product["pr"], "head": product["head"], "status": "running",
                              "check": "unrun", "qualified_parents": [],
-                             "unrun_selector_invocations": list(product["selectors"])}
+                             "unrun_selector_invocations": list(product["selectors"]),
+                             "unrun_suite_invocations": [suite["prefix"] for suite in product.get("suites", [])]}
                   products.append(outcome)
                   result()
                   try:
@@ -255,12 +297,43 @@ jobs:
                       phase(product, "check", ["cargo", "check", "--locked", "--no-default-features",
                             "--features", product["feature"], "--bin", product["binary"]], env)
                       outcome["check"] = "passed"
+                      helper = None
+                      if product.get("matched_helper"):
+                          assert product["pr"] == 1931 and product["feature"] == "host"
+                          built = phase(product, "helper-build", ["python3", "scripts/build-ceditor-product", "cagentsd",
+                              "--locked", "--no-default-features", "--features", "host", "--bin", "cagentsd"], env)
+                          paths = (built / "stdout.log").read_text().splitlines()
+                          assert len(paths) == 1 and pathlib.Path(paths[0]).is_absolute(), "one Cargo-reported helper path required"
+                          executable = pathlib.Path(paths[0]).resolve(strict=True)
+                          assert executable.is_file() and os.access(executable, os.X_OK)
+                          assert executable.is_relative_to(pathlib.Path(env["CARGO_TARGET_DIR"]).resolve(strict=True))
+                          root = workspace / ("product-" + str(product["pr"]))
+                          build = json.loads((built / "command.json").read_text())
+                          assert build["command_exit"] == build["wrapper_exit"] == 0
+                          helper = {"path": str(executable), "sha256": digest(executable),
+                                    "source_head": product["head"], "source_tree": product["tree"],
+                                    "build_phase": str(built), "build_command_exit": build["command_exit"],
+                                    "target_dir": env["CARGO_TARGET_DIR"],
+                                    "source_sha256": {name: digest(root / name) for name in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "scripts/build-ceditor-product"]},
+                                    "scope": "Cargo-reported path and digest observed after this same-source build, rechecked around tests; no execution-held image claim."}
+                          put(evidence / "1931-matched-helper.json", helper)
+                          env = env.copy()
+                          env["CAGENTS_TEST_RETAINED_ACTOR_HELPER"] = helper["path"]
+                      for index, suite in enumerate(product.get("suites", []), 1):
+                          base = ["cargo", "test", "--locked", "--no-default-features", "--features", product["feature"], "--lib", suite["prefix"]]
+                          phase(product, f"list-{index}", base + ["--", "--list", "--color=never"], env,
+                                inventory_names=suite["selectors"], helper=helper)
+                          outcome["unrun_suite_invocations"].remove(suite["prefix"])
+                          observed = phase(product, f"suite-{index}", base + ["--", "--nocapture", "--test-threads=1", "--color=never"], env,
+                                           expected_names=suite["selectors"], helper=helper)
+                          outcome["qualified_parents"].extend(json.loads((observed / "suite-parents.json").read_text())["names"])
                       for index, selector in enumerate(product["selectors"], 1):
                           outcome["unrun_selector_invocations"].remove(selector)
-                          phase(product, f"parent-{index}", ["cargo", "test", "--locked", "--no-default-features",
-                                "--features", product["feature"], "--lib", selector, "--",
-                                "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
-                          outcome["qualified_parents"].append(selector)
+                          observed = phase(product, f"parent-{index}", ["cargo", "test", "--locked", "--no-default-features",
+                                           "--features", product["feature"], "--lib", selector, "--",
+                                           "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector, helper=helper)
+                          outcome["qualified_parents"].extend(json.loads((observed / "exact-parent.json").read_text())["names"])
+                      assert set(product.get("owning_selectors", product["selectors"])).issubset(outcome["qualified_parents"])
                       outcome["status"] = "passed"
                   except ProductFailure as error:
                       outcome.update(status="failed", failed_phase=error.label, error=str(error))

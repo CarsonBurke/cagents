@@ -7,12 +7,14 @@
   "products": [
     {
       "pr": 1354,
-      "head": "7ca8dc7b82090381a43e64c59c4bc4db2037b7f5",
-      "tree": "402b0e88fdf714cc2d8aa3631c0628898588164e",
+      "head": "7c0022e23ea8548dea4df050f68d76fba94bca53",
+      "tree": "465f7e71d091b493bb05a65e66be55a478f094d1",
       "feature": "ui",
       "binary": "cagents-ui",
       "selectors": [
-        "interaction::context_menu::tests::tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge"
+        "interaction::context_menu::tests::tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge",
+        "interaction::context_menu::tests::keyboard_menu_selects_enabled_actions_without_pointer_motion",
+        "interaction::context_menu::tests::generated_menu_actions_retain_their_captured_local_message_for_keyboard"
       ],
       "source_paths": [
         "src/interaction.rs",
@@ -64,17 +66,79 @@
         "src/daemon.rs",
         "src/daemon/holder_registry.rs"
       ]
+    },
+    {
+      "pr": 1931,
+      "head": "6a287ca24f2c701fc4daea6265cf9cb98d559c71",
+      "tree": "92970c09b529c07db918c77ee388f4799cc30ba9",
+      "feature": "host",
+      "binary": "cagentsd",
+      "matched_helper": true,
+      "selectors": [
+        "host::chat::retained_actor_tests::pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown",
+        "host::chat::retained_admission_tests::installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry"
+      ],
+      "owning_selectors": [
+        "host::chat::capacity::tests::recovery_reservation_counts_existing_resident_once_above_lowered_limit",
+        "host::chat::retained_actor_tests::pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown",
+        "host::chat::retained_admission_tests::installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry"
+      ],
+      "suites": [
+        {
+          "prefix": "host::chat::capacity::tests::",
+          "selectors": [
+            "host::chat::capacity::tests::rejected_start_precedes_account_setup_and_provider_history_reads",
+            "host::chat::capacity::tests::last_slot_is_reserved_atomically_until_its_owner_finishes",
+            "host::chat::capacity::tests::failed_start_and_stale_guard_do_not_leak_or_remove_successor_reservations",
+            "host::chat::capacity::tests::pending_same_conversation_is_rejected_before_another_slot_is_consumed",
+            "host::chat::capacity::tests::pending_recovery_rejects_close_without_stopping_retained_actor",
+            "host::chat::capacity::tests::close_fences_replacement_before_retirement_and_after_resident_removal",
+            "host::chat::capacity::tests::recovery_reservation_counts_existing_resident_once_above_lowered_limit",
+            "host::chat::capacity::tests::failed_exact_recovery_keeps_the_previous_resident_actor_at_capacity",
+            "host::chat::capacity::tests::release_dry_run_and_exact_nonce_preserve_history_and_successor",
+            "host::chat::capacity::tests::release_refuses_attached_transition_and_missing_provider_history",
+            "host::chat::capacity::tests::exact_recovery_has_one_reservation_and_rejects_the_second_before_setup",
+            "host::chat::capacity::tests::live_read_only_paging_worker_can_be_released_without_provider_execution",
+            "host::chat::capacity::tests::live_writers_are_protected_and_completed_writers_require_full_coverage",
+            "host::chat::capacity::tests::completed_writer_release_checks_saved_bytes_and_stale_generation",
+            "host::chat::capacity::tests::truncated_or_changed_provider_history_cannot_release_the_only_cached_body",
+            "host::chat::capacity::tests::pending_launches_and_retained_managed_authorities_block_resident_release",
+            "host::chat::capacity::tests::account_operation_refuses_inspection_before_opening_provider_history",
+            "host::chat::capacity::tests::history_release_reservation_prevents_a_new_attached_view",
+            "host::chat::capacity::tests::unavailable_managed_registry_preserves_reader_until_verified_empty_registry_returns",
+            "host::chat::capacity::tests::pending_inventory_proves_the_daemon_without_replacing_its_reservation",
+            "host::chat::capacity::tests::proofless_client_restore_of_a_pending_start_reports_transition_not_identity_mismatch",
+            "host::chat::capacity::tests::released_history_reopens_through_real_client_restore_even_when_directory_returns",
+            "host::chat::capacity::tests::missing_saved_history_refuses_unknown_ownership_and_native_writer_descriptors",
+            "host::chat::capacity::tests::old_epoch_history_recovery_uses_real_handshake_without_launching_65_providers",
+            "host::chat::capacity::tests::history_preview_preserves_an_attached_view_and_unrelated_live_consent"
+          ]
+        }
+      ],
+      "source_paths": [
+        ".cargo/config.toml",
+        "scripts/build-ceditor-product",
+        "src/host/mod.rs",
+        "src/host/chat.rs",
+        "src/host/chat/capacity.rs",
+        "src/host/chat/native_recovery.rs",
+        "src/host/chat/retained_actor.rs",
+        "src/host/chat/retained_actor_tests.rs",
+        "src/host/chat/retained_admission_tests.rs",
+        "src/chat/runtime/retained_actor/transport.rs"
+      ]
     }
   ],
   "limits": [
     "Temporary hosted research only; close without merging after retaining immutable evidence.",
-    "Four exact owning executable checks and six exact headless library parents only.",
+    "Five exact owning executable checks and 35 distinct headless library parents only: eight on the first four sources, capacity's strict 25-parent suite once and its other two owning exact parents.",
     "Formatting is UNRUN and not established by this workflow, including historical heads without scripts/check-format. Separate exact-head formatter evidence and full PR formatting gates are not waived.",
-    "No whole feature suite, native interaction, screenshots, performance, integrated-browser, provider or merge acceptance.",
+    "No whole HOST all-targets, 100-chat, whole feature, native interaction, screenshots, performance, integrated-browser, commercial provider or merge acceptance; none of those gates is waived.",
     "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
     "An ordinary product command or exact-parent oracle failure stops only that product and preserves aggregate failure while later independent products run serially. Context, source, configuration and uncertain timeout/signal/wrapper failures stop globally.",
     "Qualified parent counts require the original successful command and exact one-pass oracle. Unrun selector invocations were never reached; a failed invocation may fail compilation before its parent executes, so its raw test outcome remains separate.",
     "Natural hosted User context is required; inherited CAGENTS_ names are refused, never removed.",
+    "Only PR1931 tests receive the matched CAGENTS_TEST_RETAINED_ACTOR_HELPER built immediately beforehand from that source using the same inherited Cargo environment and HOST target. Helper path/digest bindings are observation points, not execution-held executable proofs. The installed test uses an offline synthetic provider; deterministic cleanup and capacity bookkeeping tests prove their narrower contracts only.",
     "GNU timeout bounds each command; its wrapper return and direct completion are recorded. No detached-process census or whole-family closure is claimed.",
     "No local build, test, provider, daemon or native execution is authorized by this research file."
   ]
