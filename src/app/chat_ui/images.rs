@@ -1621,6 +1621,7 @@ mod tests {
                     ),
                     zoomed
                 );
+                drop(redraw);
                 let mut queued = button_pointer_step(
                     control(&gallery, forward),
                     &mut tree,
