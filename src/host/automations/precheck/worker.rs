@@ -135,6 +135,17 @@ impl Worker {
         read_retirement(root, firing).map(|record| record.map(|(record, _)| record.revision))
     }
 
+    fn original_directory(&self) -> io::Result<Option<fs::Metadata>> {
+        match self.directory.symlink_metadata() {
+            Ok(metadata) if metadata.is_dir() => Ok(Some(metadata)),
+            Ok(_) => Err(io::Error::other(
+                "Precheck retirement directory was replaced",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn launch(root: &Path, request: &Request) -> io::Result<Self> {
         validate_request(request)?;
         crate::secure_file::prepare_private_directory(root)?;
@@ -288,7 +299,8 @@ impl Worker {
                 "Precheck retirement revision does not match",
             ));
         }
-        if !self.directory.try_exists()? {
+        let directory_identity = self.original_directory()?;
+        if directory_identity.is_none() {
             if retirement.is_none() && self.retirement_unlinked {
                 // This exact live owner already unlinked its receipt after
                 // ACK; only the failed final parent fsync remains to retry.
@@ -307,7 +319,7 @@ impl Worker {
         }
         crate::secure_file::reject_symlink_components(&self.directory)?;
         crate::secure_file::validate_owned_directory(&self.directory)?;
-        let identity = self.directory.metadata()?;
+        let identity = directory_identity.expect("original directory was checked");
         if identity.mode() & 0o077 != 0 {
             return Err(io::Error::other(
                 "Precheck retirement directory is not private",
@@ -406,7 +418,7 @@ impl Worker {
     /// Only after the database ACK committed (or its firing was already
     /// compacted). Absence alone never authorizes producing that ACK.
     pub fn forget_retirement(&mut self) -> io::Result<()> {
-        if !self.reaped()? || self.directory.try_exists()? {
+        if !self.reaped()? || self.original_directory()?.is_some() {
             return Err(io::Error::other("Precheck retirement is not complete"));
         }
         let root = self
@@ -965,6 +977,18 @@ mod tests {
             assert!(marker.exists());
             let mut recovered = Worker::recover(root.path(), retirement.firing, 1);
             assert!(recovered.retire().unwrap());
+            std::os::unix::fs::symlink(root.path().join("missing-target"), &recovered.directory)
+                .unwrap();
+            assert!(
+                recovered.retire().is_err(),
+                "dangling replacement is not absence"
+            );
+            assert!(recovered.forget_retirement().is_err());
+            assert!(
+                marker.exists(),
+                "final cleanup erased a dangling replacement's custody"
+            );
+            fs::remove_file(&recovered.directory).unwrap();
             let mut replacement = retirement.clone();
             replacement.inode += 1;
             fs::remove_file(&marker).unwrap();
@@ -1034,6 +1058,32 @@ mod tests {
         assert_eq!(
             fs::read(worker.directory.join("replacement")).unwrap(),
             b"preserve replacement"
+        );
+        assert!(original.join("receipt").exists());
+        assert!(
+            root.path()
+                .join(retirement_name(retirement.firing))
+                .exists()
+        );
+
+        let (root, mut worker, retirement) = retirement_fixture();
+        create_record(
+            root.path(),
+            &retirement_name(retirement.firing),
+            &retirement,
+        )
+        .unwrap();
+        let original = root.path().join("original-directory");
+        fs::rename(&worker.directory, &original).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing-target"), &worker.directory).unwrap();
+        assert!(worker.retire().is_err());
+        assert!(
+            worker
+                .directory
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
         assert!(original.join("receipt").exists());
         assert!(

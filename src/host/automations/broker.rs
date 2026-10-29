@@ -754,13 +754,13 @@ impl Handle {
             return Ok(());
         }
         let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let directory_missing = match self.0.root.join(id.to_string()).symlink_metadata() {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.to_string()),
+        };
         if !workers.contains_key(&id)
-            && !self
-                .0
-                .root
-                .join(id.to_string())
-                .try_exists()
-                .map_err(|error| error.to_string())?
+            && directory_missing
             && Worker::retirement_revision(&self.0.root, id)
                 .map_err(|error| error.to_string())?
                 .is_none()
