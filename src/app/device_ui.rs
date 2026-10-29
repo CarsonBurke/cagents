@@ -197,9 +197,14 @@ impl Default for State {
     }
 }
 impl Cagents {
-    pub(super) fn observe_device_reopen_close(&mut self, repository: &Path) {
+    pub(super) fn observe_device_reopen_close(&mut self, sequence: u64, repository: &Path) {
         if let Some(origin) = &mut self.device_ui.reopen_origin {
-            origin.observe_close(repository);
+            origin.observe_close(
+                sequence,
+                repository,
+                self.workspace_model.identity,
+                self.workspace_model_source.as_ref(),
+            );
         }
     }
 
@@ -1807,6 +1812,112 @@ mod tests {
                 rx.try_recv().unwrap().reopen.is_some(),
                 "{replacement}: a current explicit request still works"
             );
+        }
+    }
+
+    #[test]
+    fn device_discovery_keeps_overtaken_closes_newer_than_its_dispatch() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::{ModelEdit, WorkspaceModel};
+        let key = PathBuf::from("/remote/reopened/.git");
+        for connected_snapshot in [false, true] {
+            for closed_after_dispatch in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                let mut model = WorkspaceModel::default();
+                model.identity = uuid::Uuid::new_v4();
+                model.sequence = if closed_after_dispatch { 4 } else { 6 };
+                model.closed_projects.push(key.clone());
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::connected_fixture(model.clone()),
+                )));
+                let (tx, rx) = async_channel::unbounded();
+                app.workspace_model_tx = tx;
+                app.device_ui.path = "/remote/reopened".into();
+                drop(app.update(Message::Device(Action::OpenProject)));
+                let generation = app.device_ui.generation;
+                let mut latest = model.clone();
+                let reopened = ModelEdit::ReopenProject {
+                    repository: key.clone(),
+                    name: "reopened".into(),
+                    kind: ProjectKind::Git,
+                };
+                let closed = ModelEdit::CloseProject {
+                    repository: key.clone(),
+                };
+                if closed_after_dispatch {
+                    // Two real changes return the key to its original state.
+                    latest.fold(5, &reopened);
+                    latest.fold(6, &closed);
+                }
+                let snapshot = if connected_snapshot {
+                    ModelUpdate::connected_fixture(latest)
+                } else {
+                    ModelUpdate::Read(latest)
+                };
+                drop(app.update(Message::WorkspaceModelObserved(snapshot)));
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: 5,
+                        edit: reopened,
+                    })),
+                );
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: 6,
+                        edit: closed,
+                    })),
+                );
+                let active = app.active_workspace.clone();
+                drop(app.update(Message::Device(Action::Loaded {
+                    generation,
+                    result: Ok(Reply::Project {
+                        path: "/remote/reopened".into(),
+                        key: key.clone(),
+                        kind: ProjectKind::Git,
+                    }),
+                })));
+                if closed_after_dispatch {
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "a complete snapshot cannot hide a post-dispatch close"
+                    );
+                    assert_eq!(app.active_workspace, active);
+                    assert!(app.workspace_model.closed_projects.contains(&key));
+                    assert!(app.project_ui.closed.contains(&key));
+                    assert!(
+                        app.device_ui
+                            .notice
+                            .as_deref()
+                            .unwrap()
+                            .contains("closed while it was opening")
+                    );
+                    // A current explicit retry sees closed6 as its starting
+                    // state, so a late copy of that edge must not veto it.
+                    drop(app.update(Message::Device(Action::OpenProject)));
+                    let generation = app.device_ui.generation;
+                    drop(
+                        app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                            sequence: 6,
+                            edit: ModelEdit::CloseProject {
+                                repository: key.clone(),
+                            },
+                        })),
+                    );
+                    drop(app.update(Message::Device(Action::Loaded {
+                        generation,
+                        result: Ok(Reply::Project {
+                            path: "/remote/reopened".into(),
+                            key: key.clone(),
+                            kind: ProjectKind::Git,
+                        }),
+                    })));
+                }
+                assert!(
+                    matches!(rx.try_recv().unwrap().edit, ModelEdit::ReopenProject { repository, .. } if repository == key),
+                    "a close at or before dispatch does not veto an explicit reopen"
+                );
+                assert!(rx.try_recv().is_err());
+            }
         }
     }
 

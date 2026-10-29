@@ -36,6 +36,7 @@ pub(super) struct DeviceOrigin {
     registry: uuid::Uuid,
     host: Option<crate::model::HostSessionProof>,
     generation: u64,
+    sequence: u64,
     closed_before: HashSet<PathBuf>,
     closed_after: HashSet<PathBuf>,
     // Discovery has not established a canonical key yet. Capture nonces so
@@ -44,9 +45,32 @@ pub(super) struct DeviceOrigin {
 }
 
 impl DeviceOrigin {
-    pub(super) fn observe_close(&mut self, repository: &Path) {
-        self.closed_after.insert(repository.to_path_buf());
+    pub(super) fn observe_close(
+        &mut self,
+        sequence: u64,
+        repository: &Path,
+        registry: uuid::Uuid,
+        host: Option<&crate::model::HostSessionProof>,
+    ) {
+        if sequence > self.sequence
+            && observes_reopen_source(self.registry, self.host.as_ref(), registry, host)
+        {
+            self.closed_after.insert(repository.to_path_buf());
+        }
     }
+}
+
+fn observes_reopen_source(
+    origin_registry: uuid::Uuid,
+    origin_host: Option<&crate::model::HostSessionProof>,
+    registry: uuid::Uuid,
+    host: Option<&crate::model::HostSessionProof>,
+) -> bool {
+    registry != NO_REGISTRY
+        && host.is_some_and(crate::model::HostSessionProof::is_complete)
+        && (origin_registry == NO_REGISTRY
+            || (origin_registry == registry && origin_host.is_some()))
+        && origin_host.is_none_or(|origin| Some(origin) == host)
 }
 
 /// Local correlation travels with the queued edit, never over the daemon wire.
@@ -87,6 +111,7 @@ struct ReopenAcknowledgement {
 
 #[derive(Default)]
 struct ReopenDiscovery {
+    sequence: u64,
     closed_before: HashSet<PathBuf>,
     closed_after: HashSet<PathBuf>,
 }
@@ -117,11 +142,13 @@ impl ReopenTracking {
         host: Option<crate::model::HostSessionProof>,
         inventory_generation: Option<u64>,
         closed_before: HashSet<PathBuf>,
+        sequence: u64,
     ) {
         self.invalidate(project);
         self.discovery.insert(
             project,
             ReopenDiscovery {
+                sequence,
                 closed_before,
                 closed_after: HashSet::new(),
             },
@@ -154,9 +181,20 @@ impl ReopenTracking {
         }
     }
 
-    fn observe_close(&mut self, repository: &Path) {
+    fn observe_close(
+        &mut self,
+        sequence: u64,
+        repository: &Path,
+        registry: uuid::Uuid,
+        host: Option<&crate::model::HostSessionProof>,
+    ) {
         for (project, discovery) in &mut self.discovery {
-            if !self.queued.contains(project) {
+            if !self.queued.contains(project)
+                && sequence > discovery.sequence
+                && self.active.get(project).is_some_and(|origin| {
+                    observes_reopen_source(origin.registry, origin.host.as_ref(), registry, host)
+                })
+            {
                 discovery.closed_after.insert(repository.to_path_buf());
             }
         }
@@ -1305,6 +1343,18 @@ impl Cagents {
                     };
                 }
 
+                // A complete publisher read can overtake an observer edge.
+                // Its fold may be redundant while its post-dispatch close is
+                // still essential to revoke the exact pending discovery.
+                if let ModelEdit::CloseProject { repository } = &edit {
+                    self.workspace_model_reopens.observe_close(
+                        sequence,
+                        repository,
+                        self.workspace_model.identity,
+                        self.workspace_model_source.as_ref(),
+                    );
+                    self.observe_device_reopen_close(sequence, repository);
+                }
                 if sequence <= self.workspace_model.sequence {
                     return Task::none();
                 }
@@ -1317,11 +1367,7 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => {
-                        self.workspace_model_reopens.observe_close(repository);
-                        self.observe_device_reopen_close(repository);
-                        Some(repository.clone())
-                    }
+                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
@@ -2276,6 +2322,7 @@ impl Cagents {
             registry: self.workspace_model.identity,
             host: self.workspace_model_source.clone(),
             generation,
+            sequence: self.workspace_model.sequence,
             closed_before: self
                 .project_ui
                 .closed
@@ -2362,6 +2409,7 @@ impl Cagents {
             origin.host,
             None,
             closed_before,
+            origin.sequence,
         );
         let captured = self
             .workspace_model_reopens
@@ -2719,6 +2767,110 @@ mod tests {
                         .message
                         .contains("Open the project again to retry")
                 }));
+            }
+        }
+    }
+
+    #[test]
+    fn picker_discovery_keeps_overtaken_closes_newer_than_its_dispatch() {
+        let checkout =
+            git_checkout().expect("Git is required for the owning picker discovery regression");
+        let repository = checkout.path().join(".git").canonicalize().unwrap();
+        for connected_snapshot in [false, true] {
+            for closed_after_dispatch in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                let mut model = registry(Vec::new());
+                model.sequence = if closed_after_dispatch { 4 } else { 6 };
+                model.closed_projects.push(repository.clone());
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::connected_fixture(model.clone()),
+                )));
+                let task = app.update(Message::RepositorySelected(Ok(checkout
+                    .path()
+                    .to_path_buf())));
+                let origin = app
+                    .workspace_model_reopens
+                    .active
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                assert_eq!(
+                    app.workspace_model_reopens.discovery[&origin.project].sequence,
+                    model.sequence
+                );
+                let loaded = first_message(task).expect("actual Git discovery completes");
+                assert!(matches!(
+                    &loaded,
+                    Message::RepositoryLoaded { result: Ok(_), .. }
+                ));
+                let mut latest = model.clone();
+                let reopened = ModelEdit::ReopenProject {
+                    repository: repository.clone(),
+                    name: "reopened".into(),
+                    kind: ProjectKind::Git,
+                };
+                let closed = ModelEdit::CloseProject {
+                    repository: repository.clone(),
+                };
+                if closed_after_dispatch {
+                    latest.fold(5, &reopened);
+                    latest.fold(6, &closed);
+                }
+                let snapshot = if connected_snapshot {
+                    ModelUpdate::connected_fixture(latest)
+                } else {
+                    ModelUpdate::Read(latest)
+                };
+                drop(app.update(Message::WorkspaceModelObserved(snapshot)));
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: 5,
+                        edit: reopened,
+                    })),
+                );
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: 6,
+                        edit: closed,
+                    })),
+                );
+                let active = app.active_workspace.clone();
+                let published = intercept_publishes(&mut app);
+                drop(app.update(loaded));
+                let requests = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+                let reopens = requests
+                    .iter()
+                    .filter(|request| {
+                        matches!(&request.edit,
+                    ModelEdit::ReopenProject { repository: key, .. } if key == &repository)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(reopens.len(), usize::from(!closed_after_dispatch));
+                assert!(
+                    !requests.iter().any(|request| matches!(&request.edit,
+                    ModelEdit::OpenProject { repository: key, .. } if key == &repository)),
+                    "an obsolete picker must not fall back to an ordinary open"
+                );
+                if closed_after_dispatch {
+                    assert_eq!(app.active_workspace, active);
+                    assert!(app.workspace_model.closed_projects.contains(&repository));
+                    assert!(app.project_ui.closed.contains(&repository));
+                    assert!(app.workspace_model_reopens.can_retry(&repository));
+                    assert!(
+                        app.notices.recent().any(|entry| entry
+                            .notice
+                            .message
+                            .contains("closed while it was opening"))
+                    );
+                } else {
+                    let current = reopens[0].reopen.as_ref().unwrap();
+                    assert_eq!(current.nonce, origin.nonce);
+                    assert_eq!(current.registry, origin.registry);
+                    assert_eq!(current.host, origin.host);
+                    assert_eq!(current.inventory_generation, origin.inventory_generation);
+                    assert!(!app.project_ui.closed.contains(&repository));
+                }
             }
         }
     }

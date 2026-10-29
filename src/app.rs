@@ -5663,6 +5663,7 @@ impl Cagents {
                 self.workspace_model_source.clone(),
                 Some(generation),
                 reopen_closed_before.unwrap_or_default(),
+                self.workspace_model.sequence,
             );
         }
         if let Some(previous) = self
