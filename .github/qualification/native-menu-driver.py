@@ -479,15 +479,26 @@ def calibrate(inputs, pid, window, size, label):
     snapshot(pid, label + '-anchor')
     capture(window, label + '-anchor', size)
     open_menu(inputs, rect, pid)
-    wait(lambda: set(M['editor_labels']).issubset({node.name for node in tree(pid)}))
-    snapshot(pid, label + '-calibration')
     first = box(wait(lambda: unique(pid, 'Open folder')))
     inputs.move(first[0] + first[2] // 2, first[1] + first[3] // 2)
-    inputs.wheel(5, 60)
+    seen, slices = set(), []
+    for index in range(21):
+        exposed = [(node.name, box(node)) for node in tree(pid) if node.name in M['editor_labels']
+                   and visible(node) and on_screen(box(node), size)]
+        seen.update(name for name, _ in exposed)
+        slices.append(dict(index=index, exposed=exposed, seen=sorted(seen)))
+        snapshot(pid, label + f'-calibration-slice-{index}')
+        remove = unique(pid, 'Remove project…')
+        if set(M['editor_labels']).issubset(seen) and remove and on_screen(box(remove), size):
+            break
+        inputs.wheel(5, 3)
+    assert set(M['editor_labels']).issubset(seen), 'Not all six real editor labels observed across bounded calibration slices'
+    inputs.wheel(5, 60)  # Establish final lower-limit geometry before accepted replay.
     final = box(wait(lambda: unique(pid, 'Remove project…')))
     assert on_screen(final, size)
     point = (final[0] + final[2] // 2, final[1] + final[3] // 2)
-    put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=final))
+    put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=final,
+        observed_editor_labels=sorted(seen), slices=slices))
     inputs.key('Escape')
     wait(lambda: menu_gone(pid))
     return rect, point
@@ -543,6 +554,56 @@ def recovery(inputs, pid, window, size, label):
     wait(lambda: search(pid) is None)
 
 
+class BaselineKeyboardNegative(RuntimeError):
+    def __init__(self, observation):
+        self.observation = observation
+        super().__init__('Observed no Remove confirmation after baseline keyboard activation; not a passing case')
+
+
+def observe_remove(pid, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        assert any(row['pid'] == pid for row in live(ACTIVE)), 'Owned native UI identity disappeared'
+        nodes = tree(pid)
+        assert nodes, 'Native accessibility tree unavailable; cannot classify feature-negative'
+        titles = [node for node in nodes if node.name == 'Remove project from cagents?' and visible(node)]
+        assert len(titles) <= 1, 'Ambiguous multiple confirmations'
+        if titles:
+            return True
+        time.sleep(.1)
+    return False
+
+
+def reset_baseline_negative(error, inputs, pid, window, size, label, activation,
+                            binary, env, projects, rows, initial_files, stub, checkout, pin):
+    assert ACTIVE == 'before' and activation in ('Return', 'space') and not CRITICAL
+    observation = dict(error.observation, status='observed_negative_reset_UNVERIFIED', product_oracle_passed=False)
+    # Preserve the original post-input truth before any dismissal/reset input.
+    snapshot(pid, label + '-post-activation-negative')
+    capture(window, label + '-post-activation-negative', size)
+    put(OUT / (label + '-negative.json'), observation)
+    assert geometry(window) == observation['geometry']
+    assert (pointer()['X'], pointer()['Y']) == tuple(observation['point'])
+    assert any(row['pid'] == pid for row in live('before'))
+    nodes = tree(pid)
+    assert nodes and not any(visible(node) and (node.getRole() == pyatspi.ROLE_DIALOG or
+        node.name in ('Cancel', 'Remove project', 'Remove project from cagents?')) for node in nodes), 'Other/ambiguous modal prevents safe baseline reset'
+    conserve(binary, env, projects, rows, initial_files, stub, label + '-negative-before-reset')
+    observation['source_before_reset'] = source(checkout, pin)
+    dismiss(inputs, pid)  # Outside the completed accepted interval; never repairs its outcome.
+    assert unique(pid, 'Search projects') and unique(pid, 'Open project menu-project-12'), 'Underlying controls are not usable'
+    recovery(inputs, pid, window, size, label + '-negative-reset')
+    conserve(binary, env, projects, rows, initial_files, stub, label + '-negative-after-reset')
+    restored_anchor = anchor(inputs, pid, size)
+    assert restored_anchor == tuple(observation['anchor']), 'Independent target sidebar state was not restored'
+    assert geometry(window) == observation['geometry']
+    observation['restored_anchor'] = restored_anchor
+    observation.update(status='observed_negative_safely_reset', reset='Escape and useful search typing/clear verified',
+                       source_after_reset=source(checkout, pin))
+    put(OUT / (label + '-negative.json'), observation)
+    return observation
+
+
 def trial(inputs, pid, window, size, label, activation, target, binary, env, projects, rows, initial_files, stub):
     global CRITICAL
     dismiss(inputs, pid)
@@ -577,7 +638,14 @@ def trial(inputs, pid, window, size, label, activation, target, binary, env, pro
         assert pointer() == initial_pointer and geometry(window) == initial_geometry
     finally:
         CRITICAL = False
-    wait(lambda: unique(pid, 'Remove project from cagents?', False), timeout=5)
+    observation = dict(activation=activation, anchor=rect, point=point, geometry=initial_geometry,
+        final_bounds=final, top_slice=top_slice, bottom_slice=bottom_slice, overflow_observed=overflow,
+        event_start=event_start, event_end=len(EVENTS), expected_modal_observed=False)
+    put(OUT / (label + '-trial.json'), observation)
+    if not observe_remove(pid, timeout=5):
+        if ACTIVE == 'before' and activation in ('Return', 'space'):
+            raise BaselineKeyboardNegative(observation)
+        raise RuntimeError('Expected Remove confirmation absent after native activation')
     cancel = modal(pid, target, size, label)
     snapshot(pid, label + '-dialog')
     capture(window, label + '-dialog', size)
@@ -700,7 +768,7 @@ def matched(window, pin, env, label):
         records[name] = dict(path=str(path), sha256=digest(path), version=version)
     binary = actual.parent / 'cagents'
     status = cli(binary, env, ['daemon', 'status'], label + '-daemon')
-    assert status['running'] and status['instance'] == 'cagents-development'
+    assert status['running'] and status['instance'] == 'development'
     socket = Path(status['socket'])
     assert socket.is_relative_to(Path(env['XDG_RUNTIME_DIR'])) and len(os.fsencode(socket)) < 108
     assert status['daemon_version'] and 'local.' + pin['head'][:7] in status['daemon_version']
@@ -775,8 +843,14 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                 result['cases'].append(row)
                 case_label = label + '-project-menu-' + case
                 if activation:
-                    trial(inputs, pid, window, size, case_label, activation, projects[-1], binary, env, projects, rows, initial_files, stub)
-                    row['status'] = 'machine_oracle_complete_visual_review_pending'
+                    try:
+                        trial(inputs, pid, window, size, case_label, activation, projects[-1], binary, env, projects, rows, initial_files, stub)
+                        row['status'] = 'machine_oracle_complete_visual_review_pending'
+                    except BaselineKeyboardNegative as error:
+                        negative = reset_baseline_negative(error, inputs, pid, window, size, case_label, activation,
+                            binary, env, projects, rows, initial_files, stub, checkout, pin)
+                        row.update(status='observed_negative_missing_keyboard_activation', product_oracle_passed=False,
+                                   failure=str(error), reset=negative['reset'])
                 elif short == 'limits':
                     limits(inputs, pid, window, size, case_label)
                     row['status'] = 'machine_oracle_complete_visual_review_pending'
@@ -784,7 +858,9 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                     tooltip(inputs, pid, window, size, case_label)
                     row['status'] = 'images_recorded_visual_oracle_UNQUALIFIED'
                 conserve(binary, env, projects, rows, initial_files, stub, case_label + '-final')
-        result['status'] = 'machine_flow_complete_visual_review_pending'
+        result['status'] = ('machine_flow_complete_with_observed_baseline_negatives' if
+            any(row['status'] == 'observed_negative_missing_keyboard_activation' for row in result['cases'])
+            else 'machine_flow_complete_visual_review_pending')
     except Exception as error:
         result.update(status='failed', error=str(error))
         if result['cases'] and result['cases'][-1]['status'] == 'running':
@@ -926,7 +1002,8 @@ def main():
         put(OUT / 'cleanup.json', dict(errors=cleanup_errors, subreaper=True, live_owned=live(),
             identity_rule='PID/start/group recorded before wait; each signal revalidates start identity'))
         baseline_failed = any(arm['arm'] == 'before' and arm['status'] == 'failed' for arm in ARMS)
-        put(OUT / 'result.json', dict(collection_status='failed' if failed or cleanup_errors else ('completed_with_baseline_failure' if baseline_failed else 'completed'), arms=ARMS,
+        baseline_negatives = sum(row['status'] == 'observed_negative_missing_keyboard_activation' for arm in ARMS for row in arm['cases'])
+        put(OUT / 'result.json', dict(collection_status='failed' if failed or cleanup_errors else ('completed_with_baseline_failure' if baseline_failed else ('completed_with_baseline_negatives' if baseline_negatives else 'completed')), arms=ARMS, baseline_negative_count=baseline_negatives,
             acceptance='UNQUALIFIED pending independent actual-image/UX review and remaining PR gates', limits=M['limits']))
         (OUT / 'sha256.txt').write_text(''.join(f'{digest(p)}  {p.relative_to(OUT)}\n' for p in sorted(OUT.rglob('*'))
             if p.is_file() and p.name != 'sha256.txt'))
