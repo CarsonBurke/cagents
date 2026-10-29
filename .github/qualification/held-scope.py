@@ -209,7 +209,7 @@ try:
             'app::shared_views::tests::startup_admission::verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources',
             'app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope',
             'app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof',
-            'app::shared_views::tests::startup_admission::retirement_witness_requires_the_full_issuer_before_canonical_admission',
+            'app::shared_views::tests::startup_admission::retirement_witness_binds_canonical_metadata_and_issuer_separately',
             'app::shared_views::tests::startup_admission::verified_terminal_retirement_preserves_exact_ended_and_archived_sources',
             'persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode',
             'terminal::hosted::tests::systemd_scope_preserves_environment_arguments_and_isolates_cgroup',

@@ -54,7 +54,15 @@ fn snapshot(session: &Session) -> Snapshot {
         session_id: session.launch.session_id.clone(),
         title: (std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1"))
             .then(|| "Hidden conversation recovered".into()),
-        items: if session.launch.recipe.arguments.first().map(String::as_str) == Some("ordinary-retained-source") {
+        items: if std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1") {
+            vec![Arc::new(cagents::chat::Item {
+                id: "peer-removal-ready".into(), role: cagents::chat::Role::Assistant,
+                content: cagents::chat::ItemContent::Text {
+                    text: "Verified conversation ready for peer removal.".into(), thinking: false,
+                    phase: cagents::chat::Phase::Final,
+                }, at: None, started_at: None,
+            })]
+        } else if session.launch.recipe.arguments.first().map(String::as_str) == Some("ordinary-retained-source") {
             vec![Arc::new(cagents::chat::Item {
                 id: "ordinary-history-ready".into(), role: cagents::chat::Role::Assistant,
                 content: cagents::chat::ItemContent::Text {
@@ -94,7 +102,72 @@ struct FixtureState {
     repaired: bool,
     performance_started: bool,
     ordinary_started: bool,
+    peer_removal_started: bool,
 }
+
+fn peer_edit(root: &std::path::Path, model: &mut WorkspaceModel, edit: ModelEdit, healthy: &Session) -> ServerMessage {
+    let id = CardId::from_uuid(model.agents[0].id.as_uuid());
+    let expected_scope = Scope::Channel(model.channels[0].id);
+    let result: Result<(), String> = (|| {
+        match edit {
+            ModelEdit::OpenProject { repository, name, kind }
+                if repository == model.projects[0].repository && kind == ProjectKind::Folder
+                    && (name == "project" || name == model.projects[0].name) => {
+                model.projects[0].name = name;
+            }
+            ModelEdit::SeedView { scope: Scope::Worktree { repository, path }, panes, closed }
+                if repository == model.projects[0].repository && path == repository
+                    && panes.is_empty() && closed.is_empty() => {
+                let scope = Scope::Worktree { repository, path };
+                let mut views = model.views.iter().filter(|view| view.scope == scope);
+                if !views.next().is_some_and(|view| view.panes.is_empty() && view.retired.is_empty())
+                    || views.next().is_some() {
+                    return Err("Private Worktree bootstrap changed".into());
+                }
+                record(root, "peer-empty-private-worktree-seed-checked");
+            }
+            ModelEdit::SeedView { scope, panes, closed }
+                if scope == expected_scope && closed.is_empty() => {
+                let view = model.views.iter_mut().find(|view| view.scope == scope).ok_or("Missing peer scope")?;
+                if view.retired.contains(&id) && !panes.is_empty() { return Err("Seed after peer retirement".into()); }
+                for pane in panes {
+                    pane.validate()?;
+                    if pane.id != id || pane.kind != CardKind::Chat(healthy.clone())
+                        || pane.scope.is_some() || pane.pending_terminal_start {
+                        return Err("Unexpected peer seed source".into());
+                    }
+                    if !view.panes.iter().any(|current| current.id == id && current.kind == pane.kind) {
+                        return Err("Peer seed cannot introduce a source".into());
+                    }
+                }
+                record(root, "peer-existing-seed-checked");
+            }
+            ModelEdit::ChangeView { scope, expected_revision, change: Change::Update { before, pane }, .. }
+                if scope == expected_scope && before.id == id && pane.id == id
+                    && before.kind == CardKind::Chat(healthy.clone()) && pane.kind == before.kind
+                    && before.scope.is_none() && pane.scope.is_none()
+                    && !before.pending_terminal_start && !pane.pending_terminal_start => {
+                let view = model.views.iter_mut().find(|view| view.scope == scope).ok_or("Missing peer scope")?;
+                if view.retired.contains(&id) || view.revision != expected_revision {
+                    return Err("Peer update after retirement or stale revision".into());
+                }
+                if view.apply(&Change::Update { before, pane })? { view.revision += 1; }
+                record(root, "peer-presentation-update-checked");
+            }
+            _ => return Err("Mutation outside peer-removal bootstrap".into()),
+        }
+        model.sequence += 1;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ServerMessage::Response { response: ServerResponse::WorkspaceModel { model: model.clone() } },
+        Err(reason) => {
+            record(root, &format!("UNEXPECTED-peer-model-mutation {reason}"));
+            error("Peer-removal fixture refused a workspace mutation")
+        }
+    }
+}
+
 fn client(
     mut stream: UnixStream,
     state: Arc<Mutex<FixtureState>>,
@@ -102,6 +175,7 @@ fn client(
     healthy: Session,
     held: Session,
 ) {
+    let peer_mode = std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1");
     let writer = Arc::new(Mutex::new(stream.try_clone().expect("private fixture writer")));
     let mut admitted: Option<Session> = None;
     while let Ok(Some(request)) = terminal_ipc::read_frame::<ClientEnvelope>(&mut stream) {
@@ -155,6 +229,14 @@ fn client(
             ClientRequest::Authenticate { .. } => {
                 error("This native fixture does not accept delegated callers")
             }
+            ClientRequest::ChatStart { .. } | ClientRequest::ChatPrepareResume { .. }
+            | ClientRequest::ChatRecoverAccount { .. } | ClientRequest::ChatStartSelected { .. }
+            | ClientRequest::ChatReturnTerminal { .. } | ClientRequest::ChatClose { .. }
+            | ClientRequest::ChatCloseRetained { .. } | ClientRequest::ChatCommitTerminal { .. }
+                if peer_mode => {
+                record(&root, "UNEXPECTED-peer-provider-mutation");
+                error("Peer removal grants no provider mutation authority")
+            }
             ClientRequest::WatchWorkspaceModel | ClientRequest::ReadWorkspaceModel => {
                 let mut fixture = state.lock().unwrap();
                 if explicit_read && root.join("repair-evidence").exists() && !fixture.repaired {
@@ -170,6 +252,9 @@ fn client(
                         model: fixture.model.clone(),
                     },
                 }
+            }
+            ClientRequest::EditWorkspaceModel { edit } if peer_mode => {
+                peer_edit(&root, &mut state.lock().unwrap().model, edit, &healthy)
             }
             ClientRequest::EditWorkspaceModel { edit } => {
                 let mut fixture = state.lock().unwrap();
@@ -299,12 +384,19 @@ fn client(
             },
             ClientRequest::ChatList => ServerMessage::Response {
                 response: ServerResponse::ChatListed {
-                    sessions: vec![healthy.clone(), held.clone()],
+                    sessions: if peer_mode { vec![healthy.clone()] } else { vec![healthy.clone(), held.clone()] },
                 },
             },
             ClientRequest::ChatAttach { session } => {
                 let repaired = state.lock().unwrap().repaired;
-                if session == healthy || (repaired && session == held) {
+                let retired = if peer_mode {
+                    let fixture = state.lock().unwrap();
+                    fixture.model.views[0].retired.contains(&CardId::from_uuid(fixture.model.agents[0].id.as_uuid()))
+                } else { false };
+                if retired {
+                    record(&root, "UNEXPECTED-peer-reattach-after-removal");
+                    error("A retired pane cannot attach again")
+                } else if session == healthy || (repaired && session == held) {
                     if session == healthy && std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1") {
                         record(&root, "healthy-attach-held-before-ready");
                         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -460,6 +552,10 @@ fn client(
         let full_model_delivered = matches!(&response, ServerMessage::Response {
             response: ServerResponse::WorkspaceModel { .. },
         });
+        let peer_model_delivered = peer_mode && explicit_read && matches!(&response,
+            ServerMessage::Response { response: ServerResponse::WorkspaceModel { model } }
+                if model.channels[0].title == "Peer removal received"
+                    && model.views[0].retired.contains(&CardId::from_uuid(model.agents[0].id.as_uuid())));
         let healthy_long_snapshot = match &response {
             ServerMessage::Response {
                 response: ServerResponse::ChatAttached { session, snapshot },
@@ -493,6 +589,7 @@ fn client(
             break;
         }
         if full_model_delivered { record(&root, "full-model-delivered"); }
+        if peer_model_delivered { record(&root, "peer-removal-model-delivered"); }
         if let Some(receipt) = healthy_long_snapshot { record(&root, &receipt); }
         if let Some(chat_id) = visible_chat {
             if terminal_ipc::write_frame(&mut *writer.lock().unwrap(), &ServerEnvelope {
@@ -501,6 +598,57 @@ fn client(
             }).is_err() { break; }
         }
         if explicit_read { record(&root, "explicit-read-replied"); }
+        let start_peer = if watching && peer_mode {
+            let mut fixture = state.lock().unwrap();
+            let first = !fixture.peer_removal_started;
+            fixture.peer_removal_started = true;
+            first
+        } else { false };
+        if start_peer {
+            let writer = writer.clone();
+            let state = state.clone();
+            let root = root.clone();
+            let healthy = healthy.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !root.join("peer-remove").exists() {
+                    if std::time::Instant::now() >= deadline { record(&root, "UNEXPECTED-peer-trigger-deadline"); return; }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let mut writer = writer.lock().unwrap();
+                let mut fixture = state.lock().unwrap();
+                let agent = fixture.model.agents[0].clone();
+                let mut expected_issuer = healthy.clone();
+                expected_issuer.launch.session_id = None;
+                if agent.closed || agent.session != Some(HostedSession::Chat(expected_issuer)) {
+                    record(&root, "UNEXPECTED-peer-issuer-changed"); return;
+                }
+                let id = CardId::from_uuid(agent.id.as_uuid());
+                let view = &mut fixture.model.views[0];
+                if view.panes.len() != 1 || view.panes[0].id != id || view.panes[0].kind != CardKind::Chat(healthy) {
+                    record(&root, "UNEXPECTED-peer-canonical-source-changed"); return;
+                }
+                let expected_revision = view.revision;
+                let scope = view.scope.clone();
+                view.apply(&Change::Remove { id }).expect("exact private peer removal");
+                view.revision += 1;
+                fixture.model.sequence += 1;
+                fixture.model.channels[0].title = "Peer removal received".into();
+                fixture.model.channels[0].title_source = ChannelTitleSource::Manual;
+                let message = ServerEnvelope {
+                    version: terminal_ipc::PROTOCOL_VERSION, request_id: None, proof: proof(),
+                    message: ServerMessage::WorkspaceModelEdited {
+                        sequence: fixture.model.sequence,
+                        edit: ModelEdit::ChangeView { scope, expected_revision, operation: OperationId::new().as_uuid(), change: Change::Remove { id } },
+                    },
+                };
+                drop(fixture);
+                if terminal_ipc::write_frame(&mut *writer, &message).is_err() {
+                    record(&root, "UNEXPECTED-peer-event-write-failed"); return;
+                }
+                record(&root, "peer-removal-event-delivered");
+            });
+        }
         let start_performance = if watching && std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") {
             let mut fixture = state.lock().unwrap();
             let first = !fixture.performance_started;
@@ -576,8 +724,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mode = std::env::args().nth(2).unwrap_or_else(|| "stale".into());
-    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history") {
+    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history" | "peer-removal") {
         return Err("Unknown native fixture mode".into());
+    }
+    let peer_mode = mode == "peer-removal";
+    if peer_mode != (std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1")) {
+        return Err("Peer-removal mode and private environment disagree".into());
     }
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").ok_or("Private runtime required")?);
@@ -641,6 +793,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exposure: Exposure::Visible,
         residency: Residency::Cold,
     });
+    if peer_mode {
+        cards[1].kind = CardKind::Settings;
+        cards[1].title = "Active settings".into();
+    }
     let terminal_surface = std::env::var("HELD_FIXTURE_SURFACE").as_deref() == Ok("terminal");
     if terminal_surface {
         let issued = proof();
@@ -687,6 +843,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        if peer_mode {
+            let channel_state = saved.channels.iter().find(|owner| owner.id == channel).ok_or("Peer channel missing")?;
+            let removed = saved.cards.iter().find(|card| card.id == healthy_id).ok_or("Peer retired history missing")?;
+            let settings = saved.cards.iter().find(|card| card.id == bad_id).ok_or("Peer Settings survivor missing")?;
+            if removed.existence.is_open() || removed.kind != CardKind::Chat(healthy.clone())
+                || channel_state.cards.contains(&healthy_id) || channel_state.cards != vec![bad_id]
+                || !settings.existence.is_open() || settings.kind != CardKind::Settings
+                || saved.active_channel != Some(channel) || saved.focused != Some(bad_id)
+                || channel_state.focused != Some(bad_id)
+                || saved.chat_drafts.get(&healthy_id).is_some_and(|draft| !draft.is_empty())
+                || saved.chat_draft_attachments.get(&healthy_id).is_some_and(|images| !images.is_empty()) {
+                return Err("Peer removal changed source, membership, survivor or saved focus".into());
+            }
+            #[cfg(held_product_after)]
+            if saved.quarantined_panes.contains_key(&healthy_id) {
+                return Err("Verified peer retirement manufactured quarantine".into());
+            }
+            println!("typed-peer-retirement-source-history-membership-and-focus-verified");
+            return Ok(());
+        }
         if std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1") {
             let id = ordinary_card();
             let original = ordinary_source(&healthy);
@@ -848,6 +1024,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(store);
     let panes = cards
         .iter()
+        .filter(|card| !peer_mode || !card.kind.is_utility())
         .map(|card| Pane {
             id: card.id,
             title: card.title.clone(),
@@ -893,6 +1070,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         agents[1].console = Some(stale);
     }
     let mut agents = agents.to_vec();
+    if peer_mode {
+        agents.truncate(1);
+        let Some(HostedSession::Chat(issued)) = &mut agents[0].session else { unreachable!() };
+        issued.launch.session_id = None;
+    }
     if payload == "long" {
         for index in 0..30 {
             let mut agent = agents[0].clone();
@@ -910,6 +1092,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repaired: false,
         performance_started: false,
         ordinary_started: false,
+        peer_removal_started: false,
         model: WorkspaceModel {
             identity: workspace.workspace_model_identity.unwrap(),
             sequence: 1,

@@ -572,7 +572,7 @@ try:
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
         assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
-        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False)]:
+        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'peer-removal', 'empty', False, False)]:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             active_arm = label
             window = pid = None
@@ -601,6 +601,7 @@ try:
             env['HELD_FIXTURE_SURFACE'] = surface
             env['HELD_FIXTURE_HIDDEN'] = '1' if hidden else '0'
             env['HELD_FIXTURE_ORDINARY'] = '1' if ordinary else '0'
+            env['HELD_FIXTURE_PEER'] = '1' if mode == 'peer-removal' else '0'
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
@@ -649,6 +650,112 @@ try:
                              and visible(node)
                              for node in tree(pid)))
             capture(window, label + '-launch-wide', (1280, 800))
+            if mode == 'peer-removal':
+                ready = 'Verified conversation ready for peer removal.'
+                wait(lambda: any(node.name == ready and visible(node) for node in live_tree(pid)))
+                wait(lambda: any(visible(node) and node.name.startswith('Chat pane Healthy saved pane,')
+                                 for node in live_tree(pid)))
+                def peer_inside_viewport(node):
+                    bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    return (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
+                            and bounds.x + bounds.width <= viewport[0] and bounds.y + bounds.height <= viewport[1])
+                def empty_peer_composer():
+                    fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
+                              and node.getState().contains(pyatspi.STATE_EDITABLE)]
+                    assert len(fields) <= 1
+                    return len(fields) == 1 and fields[0].queryText().getText(0, -1) == ''
+                wait(empty_peer_composer)
+                capture(window, label + '-ready-wide', (1280, 800))
+                settings_focused = 'Settings pane Active settings, Application-wide, focused'
+                settings_unfocused = 'Settings pane Active settings, Application-wide, not focused'
+                settings_tab = wait(lambda: next((node.name for node in live_tree(pid)
+                    if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                    and node.name in (settings_focused, settings_unfocused)
+                    and peer_inside_viewport(node)
+                    and node.getState().contains(pyatspi.STATE_ENABLED)), None))
+                click(pid, settings_tab)
+                def peer_field():
+                    fields = [node for node in live_tree(pid) if node.name == 'Search settings' and visible(node)
+                              and peer_inside_viewport(node)
+                              and node.getState().contains(pyatspi.STATE_EDITABLE)]
+                    assert len(fields) <= 1
+                    return fields[0] if fields else None
+                def peer_field_bounds():
+                    field = peer_field()
+                    if field is None:
+                        return None
+                    bounds = field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    return (bounds.x, bounds.y, bounds.width, bounds.height) if bounds.width > 0 and bounds.height > 0 else None
+                x, y, width, height = wait(peer_field_bounds)
+                run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1'])
+                wait(lambda: (field := peer_field()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED))
+                assert accessibility_snapshot(lambda: peer_field().queryText().getText(0, -1)) == ''
+                run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'peer scope preserved'])
+                wait(lambda: (field := peer_field()) is not None and field.queryText().getText(0, -1) == 'peer scope preserved')
+                assert receipt.read_text().splitlines().count('healthy-attach-requested') == 1
+                (root / 'peer-remove').touch()
+                event({'event': 'peer-removal-triggered', 'input': 'external model watcher; no application input'})
+                wait(lambda: 'peer-removal-event-delivered' in receipt.read_text().splitlines())
+                wait(lambda: 'peer-removal-model-delivered' in receipt.read_text().splitlines())
+                wait(lambda: any(node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                                and node.name.startswith('Open channel Peer removal received, ') for node in live_tree(pid)))
+                def peer_removed():
+                    nodes = live_tree(pid)
+                    field = peer_field()
+                    return (not any(visible(node) and (node.name == ready or node.name == 'Message'
+                                    or node.name.startswith('Chat pane Healthy saved pane,')) for node in nodes)
+                            and any(visible(node) and node.name == settings_focused for node in nodes)
+                            and field is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
+                            and field.queryText().getText(0, -1) == 'peer scope preserved')
+                wait(peer_removed)
+                assert not accessibility_snapshot(lambda: any(visible(node) and node.name == 'Saved pane unavailable'
+                                                               for node in live_tree(pid)))
+                # No focus repair after the external removal. Confirm actual
+                # keyboard routing before capturing the retained task.
+                run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', ' and still active'])
+                wait(lambda: (field := peer_field()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
+                     and field.queryText().getText(0, -1) == 'peer scope preserved and still active')
+                capture(window, label + '-removed-wide', (1280, 800))
+                database = Path((root / 'database-path').read_text())
+                assert database.is_relative_to(root)
+                workspace_id = (root / 'workspace-id').read_text().strip()
+                prefix = 'workspace:' + workspace_id + ':navigation:'
+                def peer_durable():
+                    try:
+                        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                            channels = db.execute('SELECT value FROM metadata WHERE key=?', (prefix + 'threads',)).fetchone()
+                            card = db.execute('SELECT existence_json FROM cards WHERE card_id=?',
+                                              ('00000000-0000-4000-8000-000000003922',)).fetchone()
+                            if not channels or not card:
+                                return False
+                            owners = [channel for channel in json.loads(channels[0])
+                                      if channel['id'] == '00000000-0000-4000-8000-000000002922']
+                            return (len(owners) == 1 and owners[0]['cards'] == ['00000000-0000-4000-8000-000000004922']
+                                    and 'closed' in json.loads(card[0]))
+                    except (sqlite3.Error, FileNotFoundError):
+                        return False
+                wait(peer_durable)
+                stop(ui)
+                stop(fixture)
+                assert icon_config.read_text() == '"Adwaita"\n'
+                with (out / (label + '-typed-persistence.log')).open('w') as log:
+                    run([str(helper), str(root), mode, '--inspect', 'closed'], env=env, stdout=log, stderr=subprocess.STDOUT)
+                events = receipt.read_text()
+                assert 'UNEXPECTED-' not in events
+                assert events.splitlines().count('healthy-attach-requested') == 1
+                assert events.splitlines().count('peer-removal-event-delivered') == 1
+                assert not any(line.startswith(('effect-request-chat-start', 'effect-request-chat-prepare',
+                                               'effect-request-other-provider-mutation', 'effect-request-chat-close'))
+                               for line in events.splitlines())
+                (out / (label + '-receipts.txt')).write_text(events)
+                receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
+                                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                                 'events': events.splitlines()})
+                assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
+                assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
+                event({'event': 'arm-completed', 'revision': revision})
+                active_arm = None
+                continue
             run(['xdotool', 'key', 'ctrl+shift+i'])
             time.sleep(.4)
             hidden_field = None
