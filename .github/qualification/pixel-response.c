@@ -56,33 +56,41 @@ int main(int argc, char **argv) {
     if (width < 4 || height < 4 || width > 200 || height > 100 || count < 2 || count > 100) return 2;
     Window child, pointer_root, pointer_child;
     XWindowAttributes attributes;
-    int local_x, local_y, screen_x, screen_y, root_x, root_y, pointer_x, pointer_y;
+    int local_x, local_y, screen_x, screen_y, off_screen_x, off_screen_y;
+    int root_x, root_y, pointer_x, pointer_y;
     unsigned int pointer_mask;
     if (!XGetWindowAttributes(display, window, &attributes) || attributes.map_state != IsViewable
         || !XTranslateCoordinates(display, DefaultRootWindow(display), window, x, y, &local_x, &local_y, &child)) return 3;
     x = local_x; y = local_y;
-    if (x < 0 || y < 0 || x + width > attributes.width || y + height > attributes.height) return 3;
+    if (x < 0 || y < 0 || x + width > attributes.width || y + height > attributes.height
+        || attributes.width <= 64 || attributes.height <= 64) return 3;
+    /* The undecorated window has an 8px resize border. Border/interior
+       transitions can consume the one motion event before widget dispatch. */
+    int off_x = 32, off_y = attributes.height / 2;
+    if (off_x >= x && off_x < x + width && off_y >= y && off_y < y + height) return 3;
+    if (!XTranslateCoordinates(display, window, DefaultRootWindow(display), off_x, off_y,
+                               &off_screen_x, &off_screen_y, &child)) return 3;
     if (!XTranslateCoordinates(display, window, DefaultRootWindow(display), x + width / 2, y + height / 2,
                                &screen_x, &screen_y, &child)) return 3;
     Window input_focus;
     int focus_revert;
     XGetInputFocus(display, &input_focus, &focus_revert);
-    fprintf(stderr, "{\"event\":\"probe-geometry\",\"window\":%lu,\"roi_window\":[%d,%d,%d,%d],\"hover_root\":[%d,%d],\"depth\":%d,\"input_focus\":%lu}\n",
-            window, x, y, width, height, screen_x, screen_y, attributes.depth, input_focus);
+    fprintf(stderr, "{\"event\":\"probe-geometry\",\"window\":%lu,\"roi_window\":[%d,%d,%d,%d],\"hover_root\":[%d,%d],\"off_root\":[%d,%d],\"depth\":%d,\"input_focus\":%lu}\n",
+            window, x, y, width, height, screen_x, screen_y, off_screen_x, off_screen_y, attributes.depth, input_focus);
     size_t path_size = strlen(argv[7]) + 32;
     char *path = malloc(path_size);
     if (!path) return 3;
     uint64_t reference[2];
     for (int active = 0; active < 2; active++) {
         double started = now();
-        if (!XTestFakeMotionEvent(display, DefaultScreen(display), active ? screen_x : 5,
-                                 active ? screen_y : 400, CurrentTime)) return 3;
+        if (!XTestFakeMotionEvent(display, DefaultScreen(display), active ? screen_x : off_screen_x,
+                                 active ? screen_y : off_screen_y, CurrentTime)) return 3;
         XSync(display, False);
         if (!XQueryPointer(display, window, &pointer_root, &pointer_child, &root_x, &root_y,
                            &pointer_x, &pointer_y, &pointer_mask)) return 3;
         fprintf(stderr, "{\"event\":\"calibration-pointer\",\"hover\":%s,\"root\":[%d,%d],\"window\":[%d,%d]}\n",
                 active ? "true" : "false", root_x, root_y, pointer_x, pointer_y);
-        if (root_x != (active ? screen_x : 5) || root_y != (active ? screen_y : 400)) {
+        if (root_x != (active ? screen_x : off_screen_x) || root_y != (active ? screen_y : off_screen_y)) {
             puts("{\"calibrated\":false,\"reason\":\"pointer did not reach the requested position\"}");
             free(path); XCloseDisplay(display); return 4;
         }
@@ -115,8 +123,8 @@ int main(int argc, char **argv) {
     for (int index = 0; index < count; index++) {
         int active = index % 2;
         double start = now(), last = start, max_gap = 0;
-        if (!XTestFakeMotionEvent(display, DefaultScreen(display), active ? screen_x : 5,
-                                 active ? screen_y : 400, CurrentTime)) return 3;
+        if (!XTestFakeMotionEvent(display, DefaultScreen(display), active ? screen_x : off_screen_x,
+                                 active ? screen_y : off_screen_y, CurrentTime)) return 3;
         XFlush(display);
         int reached = 0;
         double elapsed;

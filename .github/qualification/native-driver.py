@@ -33,6 +33,7 @@ stopped = set()
 viewport = (1280, 800)
 native_renderer = {'ICED_BACKEND': 'wgpu', 'WGPU_BACKEND': 'gl', 'LIBGL_ALWAYS_SOFTWARE': '1'}
 stale_accessibility_retries = 0
+incomplete_accessibility_retries = 0
 active_arm = None
 command_sequence = 0
 
@@ -80,18 +81,25 @@ def run(args, **kwargs):
     return subprocess.CompletedProcess(args, code)
 
 
+class IncompleteAccessibilityTree(RuntimeError):
+    pass
+
+
 def wait(predicate, timeout=30):
-    global stale_accessibility_retries
+    global stale_accessibility_retries, incomplete_accessibility_retries
     end = time.monotonic() + timeout
     last_stale = None
     while time.monotonic() < end:
         try:
             result = predicate()
-        except GLib.Error as error:
-            if 'Unknown object' not in str(error):
-                raise
+        except (GLib.Error, IncompleteAccessibilityTree) as error:
+            if isinstance(error, GLib.Error):
+                if 'Unknown object' not in str(error):
+                    raise
+                stale_accessibility_retries += 1
+            else:
+                incomplete_accessibility_retries += 1
             last_stale = error
-            stale_accessibility_retries += 1
             result = None
         if result:
             return result
@@ -114,14 +122,21 @@ def digest(path):
 
 
 def tree(pid):
+    os.kill(pid, 0)
     desktop = pyatspi.Registry.getDesktop(0)
+    if desktop is None:
+        raise IncompleteAccessibilityTree('Accessibility desktop is not published yet')
     apps = [desktop.getChildAtIndex(i) for i in range(desktop.childCount)]
+    if any(app is None for app in apps):
+        raise IncompleteAccessibilityTree('Accessibility desktop child changed during traversal')
     apps = [app for app in apps if app.get_process_id() == pid]
     if len(apps) != 1:
         return []
     pending, result = [apps[0]], []
     while pending:
         node = pending.pop()
+        if node is None:
+            raise IncompleteAccessibilityTree('Accessibility child changed during traversal')
         result.append(node)
         assert len(result) < 10000 and node.childCount < 1000
         pending.extend(node.getChildAtIndex(i) for i in range(node.childCount))
@@ -133,7 +148,6 @@ def visible(node):
 
 
 def live_tree(pid):
-    os.kill(pid, 0)
     nodes = tree(pid)
     if not nodes:
         raise RuntimeError('The native application accessibility tree disappeared')
@@ -215,11 +229,11 @@ def copy_exact(pid, name, expected, keyboard=False):
 
 
 def open_ordinary_history(pid):
-    plus = wait(lambda: next((node for node in live_tree(pid)
-                             if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                             and node.name.startswith('New tab · Thread ')
-                             and visible(node)), None))
-    click(pid, plus.name)
+    plus_name = wait(lambda: next((node.name for node in live_tree(pid)
+                                  if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                  and node.name.startswith('New tab · Thread ')
+                                  and visible(node)), None))
+    click(pid, plus_name)
     click(pid, 'New Resume conversation tab')
     wait(lambda: any(node.name == 'Resume Ordinary retained conversation' and visible(node)
                      for node in live_tree(pid)))
@@ -493,7 +507,7 @@ try:
             wait(lambda: any(node.getRole() == pyatspi.ROLE_PUSH_BUTTON
                              and node.name.startswith('Open channel Saved recovery model received, ')
                              and visible(node)
-                             for node in live_tree(pid)))
+                             for node in tree(pid)))
             capture(window, label + '-launch-wide', (1280, 800))
             run(['xdotool', 'key', 'ctrl+shift+i'])
             time.sleep(.4)
@@ -527,7 +541,8 @@ try:
                 assert hidden_field.getState().contains(pyatspi.STATE_FOCUSED), 'Background saved recovery stole native active-pane focus'
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'scope preserved'])
                 wait(lambda: hidden_field.queryText().getText(0, -1) == 'active scope preserved')
-                assert not any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid))
+                assert not accessibility_snapshot(lambda: any(
+                    node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
             capture(window, label + '-wide', (1280, 800))
             capture(window, label + '-narrow', (900, 700))
             run(['xdotool', 'key', 'Tab', 'shift+Tab'])
@@ -543,8 +558,9 @@ try:
                 responsiveness(window, pid, fixture, root, label, pixel_helper)
             if variant == 'after' and not hidden:
                 capture(window, label + '-wide-restored', (1280, 800))
-                fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
-                          and node.getState().contains(pyatspi.STATE_EDITABLE)]
+                fields = accessibility_snapshot(lambda: [
+                    node for node in live_tree(pid) if node.name == 'Message' and visible(node)
+                    and node.getState().contains(pyatspi.STATE_EDITABLE)])
                 assert len(fields) == 1, 'Healthy sibling must expose one editable Message field'
                 field = fields[0]
                 bounds = field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
@@ -640,15 +656,11 @@ try:
             elif variant == 'after' and mode == 'closed':
                 focus_failed_pane(pid)
                 if payload == 'short':
-                    wait(lambda: next((node for node in live_tree(pid)
-                                       if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                                       and node.name.startswith('Close Chat pane Unavailable saved pane')
-                                       and visible(node)), None))
-                    close = next(node for node in live_tree(pid)
-                                 if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                                 and node.name.startswith('Close Chat pane Unavailable saved pane')
-                                 and visible(node))
-                    click(pid, close.name)
+                    close_name = wait(lambda: next((node.name for node in live_tree(pid)
+                                                    if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                                    and node.name.startswith('Close Chat pane Unavailable saved pane')
+                                                    and visible(node)), None))
+                    click(pid, close_name)
                 else:
                     click(pid, 'Remove saved pane')
                 wait(lambda: not any(node.name == 'Saved pane unavailable' for node in live_tree(pid)))
@@ -757,7 +769,8 @@ finally:
         'error': str(native_failure)[:2000] if native_failure else None, 'cleanup_errors': cleanup_errors,
     }, indent=2) + '\n')
     (out / 'accessibility-retries.json').write_text(json.dumps({'unknown_object_retries': stale_accessibility_retries,
-        'scope': 'Bounded whole-query retry for AT-SPI Unknown object only; no input gesture is retried.'}, indent=2) + '\n')
+        'incomplete_tree_retries': incomplete_accessibility_retries,
+        'scope': 'Bounded whole-query retry for AT-SPI Unknown object or explicit missing-child snapshots; no input gesture is retried.'}, indent=2) + '\n')
     if not cleanup_errors:
         (out / 'cleanup-complete').write_text('Owned descendant families observed inactive; private native fixture closed.\n')
     (out / 'native-receipts.json').write_text(json.dumps(receipts, indent=2) + '\n')
