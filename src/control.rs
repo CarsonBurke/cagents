@@ -3634,11 +3634,11 @@ impl ProjectChannelContext {
         self.connect_with(
             mutation,
             || {
-                if self.authority.token().is_some() {
+                if mutation && self.authority.token().is_some() {
                     daemon_socket_path().map_err(|error| AppError::new("socket_path", error))
                 } else {
-                    // Keep the ordinary User's existing --no-start absence and
-                    // ownership checks, rather than weakening them to connect.
+                    // Preserve --no-start absence and ownership checks for
+                    // ordinary Users and intentionally global reads alike.
                     control_daemon_socket()
                 }
             },
@@ -3666,7 +3666,7 @@ impl ProjectChannelContext {
     ) -> Result<ControlClient, AppError> {
         let scoped = self.authority.token().is_some();
         self.admit_remote()?;
-        let socket = if scoped || self.no_start {
+        let socket = if (scoped && mutation) || self.no_start {
             existing()?
         } else {
             ready()?

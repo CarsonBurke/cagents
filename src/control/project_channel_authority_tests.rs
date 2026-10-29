@@ -1,6 +1,7 @@
 //! Actual public parsing and legacy dispatch over a private framed Unix peer.
 //! No Host policy, staged executable, provider or remote transport is simulated
 //! as a successful production integration; these tests pin the caller boundary.
+mod read_routing;
 mod remote_entry;
 
 use super::*;
@@ -635,7 +636,7 @@ fn public_lists_remain_global_unauthenticated_reads_with_explicit_folder_filter_
             let context = ProjectChannelContext {
                 authority: authority.clone(),
                 remote: false,
-                no_start: authority.token().is_none(),
+                no_start: true,
             };
             let output = dispatch(parse(&args), |mutation| {
                 assert!(!mutation);
