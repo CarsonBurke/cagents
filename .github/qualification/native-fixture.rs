@@ -338,10 +338,10 @@ fn client(
             },
             ClientRequest::Automation {
                 authority,
-                operation: cagents::automations::Request::List { after: None, limit },
-            } if authority == Authority::default() && limit > 0 => {
-                record(&root, "readonly-automation-empty-list-replied");
-                ServerMessage::Response { response: ServerResponse::Automation(cagents::automations::Response::Listed(vec![])) }
+                operation: cagents::automations::Request::PendingProposals { repository, after: None, limit: 1 },
+            } if authority == Authority::default() && repository == healthy.launch.recipe.working_directory => {
+                record(&root, "readonly-private-project-pending-proposals-replied");
+                ServerMessage::Response { response: ServerResponse::Automation(cagents::automations::Response::Proposals(vec![])) }
             }
             ClientRequest::NotificationPresence { .. }
             | ClientRequest::NotificationPreferencesChanged { .. }
@@ -412,7 +412,11 @@ fn client(
                 error("This fixture never closes a provider")
             }
             other => {
-                record(&root, &format!("UNEXPECTED-unsupported-request-{:?}", std::mem::discriminant(&other)));
+                let kind = match &other {
+                    ClientRequest::Automation { operation, .. } => format!("Automation-{:?}", std::mem::discriminant(operation)),
+                    _ => format!("{:?}", std::mem::discriminant(&other)),
+                };
+                record(&root, &format!("UNEXPECTED-unsupported-request-{kind}"));
                 error("Request outside this synthetic native fixture")
             }
         };
