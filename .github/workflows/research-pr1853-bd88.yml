@@ -1,414 +1,461 @@
-name: Research native portability and bounded backend followups
-'on':
+name: Research exact final-save diagnostic
+
+on:
   pull_request:
-    types:
-    - opened
-    - synchronize
-    - reopened
+    types: [opened, synchronize, reopened]
     paths:
-    - .github/workflows/research-pr1853-bd88.yml
+      - .github/workflows/research-pr1853-bd88.yml
+
 permissions:
   contents: read
+
 concurrency:
-  group: research-pr1951-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: research-final-save-diagnostic-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
-  EXPECTED_PRODUCT_TREE: 4e436ed156df1f959014204fa58e663f359cf0bd
-  EXPECTED_RECEIPT_SHA: 5ad7985a56aaac5760cb71a6ea3d1ed2ba2c956a
-  EXPECTED_RECEIPT_TREE: 67cbc81261e9c0f2a6f1bdf8718b7fd12fd2e787
-  EXPECTED_FIXTURE_SHA: 32bc36da066bcf0cb614cff704a94c442279d3b1
-  EXPECTED_FIXTURE_TREE: 68620a875769fcd9a0505165460689bbded9fc80
+  # Exact reviewed diagnostic manifest, embedded to keep this control to one file.
+  FINAL_SAVE_DIAGNOSTIC_MANIFEST: |
+    {
+      "schema": 2,
+      "never_merge": true,
+      "prepared_only": true,
+      "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+      "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21",
+      "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "contract_sources": [
+        {
+          "head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+          "path": ".github/workflows/qualify-recovery-products.yml",
+          "sha256": "5ed902501f1bba82391b2ae1d407dbcf7c0011604a3fd54b204b037f655973cb"
+        }
+      ],
+      "products": [
+        {
+          "pr": 1726,
+          "head": "40a574dcb5fdb8a96986412399324fda07598032",
+          "tree": "ae66e2f08cc0dce6388db46efe27f80ed77aedd8",
+          "selectors": [
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+          ],
+          "source_paths": [
+            "src/app.rs",
+            "src/app/shared_views.rs",
+            "src/settings.rs",
+            "src/persistence.rs",
+            ".cargo/config.toml"
+          ],
+          "fixture_contract": "Actual headless production app reducers, real SettingsSave/final-save worker and temporary Settings/SQLite stores. The three original equal-read scenarios and all original assertion predicates remain unchanged. This source adds only scenario and saved/result Err diagnostics before the original success assertion and before ACK application; it is not a causal repair. No native window, provider, terminal or executable helper is launched by the controller.",
+          "selector_sources": {
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs"
+          },
+          "source_sha256": {
+            "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+            "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+            "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+            "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
+            "src/app/shared_views.rs": "6eede63fa8f4d19ccfe14d088483483b7a7ba94e1a592050750e0d01b15d61fa",
+            "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de",
+            "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+            ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+          },
+          "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490739169"
+        }
+      ],
+      "lanes": [
+        {
+          "id": "1726-ui",
+          "pr": 1726,
+          "feature": "ui",
+          "binary": "cagents-ui",
+          "selectors": [
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+          ],
+          "matched_helper": false
+        }
+      ],
+      "original_negative": {
+        "pr": 1959,
+        "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+        "run_id": 40828554073,
+        "artifact_id": 12878074392,
+        "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a",
+        "product_pr": 1726,
+        "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+        "phase": "1726-ui-parent-5",
+        "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+        "outer_result": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        "command_exit": 101,
+        "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+        "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+        "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+        "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair."
+      },
+      "limits": [
+        "Temporary isolated research control only; never merge. Preparation is not queue admission, publication or dispatch authorization. Parent must grant a shared lane before execution.",
+        "One serial hosted job, CARGO_BUILD_JOBS=2, one browserless UI target and one isolated UI binary check followed by one exact compiled inventory and one exact parent invocation. Exactly three planned phases; planned counts are not executed results. No CLI/HOST builds, graph unification, helper build, provider or native launcher.",
+        "Natural hosted User context is mandatory: refuse every inherited CAGENTS_ name by presence without reading values or clearing authority. Source Cargo checkout-root configuration stays intact.",
+        "Pin exact source head/tree/clean status, source hashes, build configuration/input hashes, control head/tree/workflow and proven setup action. Recheck source/config/context around every command; retain original stdout/stderr/command/exits/digests and final source state.",
+        "Each command retains GNU timeout2700s plus30s TERM-to-KILL grace and direct-wrapper wait accounting. Uncertain timeout/signal/wrapper, context, source or config faults stop globally; ordinary settled check/inventory/parent failure stops dependent phases and fails qualification. No retry, ignored-test waiver or evidence replacement.",
+        "One exact inventory entry and one matching named outer parent plus a single1P0F0I summary are required for success. A real runtime failure remains a failure while its raw diagnostic payload is retained; inner lines are never salvaged.",
+        "All three scenarios, original production Arc/no-op/title guards, real final-save/settings-writer ownership and original ten assertion predicates are preserved in the pinned source. Obtain actual saved/result Err before proposing a causal correction; no speculative repair is included.",
+        "The previous final-save negative and earlier cancelled-close negative remain at original source/run scopes. No prior pass transfers to this source.",
+        "No native close/recovery interaction, matched screenshots, UX acceptance, responsiveness, whole feature suite, integrated-browser, commercial provider or merge readiness is established. All current Cargo/test/helper/native/provider/workflow execution is UNRUN."
+      ]
+    }
+
 jobs:
-  macos:
-    if: github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' && github.event.pull_request.head.repo.full_name ==
-      github.repository
-    name: Native Apple ARM CLI link run and seventeen owning roots
-    runs-on: macos-15
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
-        working-directory: product
-    steps:
-    - name: Require natural User context and private fixture paths
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import json, os, pathlib, sys, tempfile
-        logs=pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-apple-logs'
-        logs.mkdir(mode=0o700)
-        names=sorted(name for name in os.environ if name.startswith('CAGENTS_'))
-        (logs/'natural-context.json').write_text(json.dumps({'present_names':names})+'\n')
-        if names:
-            raise SystemExit('Natural User qualification refused: '+', '.join(names))
-        fixture=pathlib.Path(tempfile.mkdtemp(prefix='c1951',dir='/tmp'))
-        with open(os.environ['GITHUB_ENV'],'a') as env:
-            print('EVIDENCE_DIR='+str(logs),file=env)
-            print('CARGO_TARGET_DIR='+str(pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-apple-target'),file=env)
-            print('TMPDIR='+str(fixture),file=env)
-            for name,leaf in [('XDG_RUNTIME_DIR','runtime'),('XDG_DATA_HOME','data'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_STATE_HOME','state')]:
-                (fixture/leaf).mkdir(mode=0o700)
-                print(name+'='+str(fixture/leaf),file=env)
-        PY
-    - name: Check out research
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        path: research
-        persist-credentials: false
-    - name: Check out product
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
-        path: product
-        persist-credentials: false
-    - name: Bind exact product and research sources
-      env:
-        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib,json,os,pathlib,subprocess
-        root=pathlib.Path.cwd()
-        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        def git(*args,where=root):
-            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
-        assert git('rev-parse','HEAD')==os.environ['EXPECTED_PRODUCT_SHA']
-        assert git('rev-parse','HEAD^{tree}')==os.environ['EXPECTED_PRODUCT_TREE']
-        assert not git('status','--porcelain','--untracked-files=all')
-        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
-        assert not git('status','--porcelain','--untracked-files=all',where=research)
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
-        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
-        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
-        (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
-        PY
-    - name: Prepare and record native Apple toolchain
-      run: |
-        set -euo pipefail
-        test "$(uname -m)" = arm64
-        rustup toolchain install 1.93.0 --profile minimal
-        { rustc -vV; cargo --version; sw_vers; uname -m; xcrun --show-sdk-path; cc --version; git --version; } > "$EVIDENCE_DIR/tools.txt"
-        grep -Fx 'host: aarch64-apple-darwin' "$EVIDENCE_DIR/tools.txt"
-    - name: Run literal apple qualification and retain every original exit
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib, json, os, pathlib, re, subprocess, sys, time
-        logs = pathlib.Path(os.environ['EVIDENCE_DIR'])
-        records = []
-
-        def phase(label, command):
-            record = dict(label=label, command=command, started=time.time())
-            records.append(record)
-            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
-            print('Starting ' + label, flush=True)
-            path = logs / (label + '.txt')
-            with path.open('wb') as output:
-                result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
-            record.update(exit=result.returncode, finished=time.time(), log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-            (logs / (label + '.exit')).write_text(str(result.returncode) + '\n')
-            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
-            print(path.read_text(errors='replace')[-14000:], flush=True)
-            if result.returncode:
-                raise SystemExit(result.returncode)
-            return path.read_text(errors='replace')
-
-        def exact(label, selector, feature=None):
-            command = ['cargo', 'test', '--locked', '--no-default-features']
-            if feature:
-                command += ['--features', feature]
-            command += ['--lib', selector, '--', '--exact', '--show-output', '--test-threads=1', '--color=never']
-            output = phase(label, command)
-            assert len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. ok$', output, re.M)) == 1, selector
-            assert re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output, re.M) == [('1', '0', '0')], selector
-            return output
-
-        phase('apple-cli-check', ['cargo','check','--locked','--no-default-features','--bin','cagents'])
-        build = phase('apple-cli-build', ['cargo','build','--locked','--no-default-features','--bin','cagents','--message-format=json-render-diagnostics'])
-        artifacts=[]
-        for line in build.splitlines():
-            try:
-                item=json.loads(line)
-            except ValueError:
-                continue
-            if item.get('reason')=='compiler-artifact' and item.get('target',{}).get('name')=='cagents' and item.get('executable'):
-                assert item.get('features')==[], item
-                artifacts.append(item)
-        assert len(artifacts)==1, artifacts
-        binary=pathlib.Path(artifacts[0]['executable']).resolve(strict=True)
-        assert binary.is_relative_to(pathlib.Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True))
-        binary_hash=hashlib.sha256(binary.read_bytes()).hexdigest()
-        (logs/'linked-cli.json').write_text(json.dumps(dict(path=str(binary),sha256=binary_hash,artifact=artifacts[0]),indent=2)+'\n')
-        output=phase('apple-cli-protocol-version', [str(binary),'--json','--device','unconfigured-portability-device','daemon','protocol-version'])
-        reply=json.loads(output)
-        assert reply['ok'] is True and reply['command']=='daemon.protocol_version' and reply['data']['protocol_version']==127, reply
-        assert hashlib.sha256(binary.read_bytes()).hexdigest()==binary_hash
-        phase('apple-lib-test-compile',['cargo','test','--locked','--no-default-features','--lib','--no-run'])
-        for index, selector in enumerate(['update::tests::unsupported_streaming_never_starts_a_command_and_keeps_cancellation', 'install_guard::tests::unsupported_installation_refuses_before_path_or_window_preparation', 'instance::tests::unsupported_process_census_never_reports_an_empty_owned_inventory', 'update::source::platform_tests::unsupported_source_cannot_be_classified_as_an_absent_daemon', 'daemon::unsupported_platform_tests::ownership_refusal_precedes_runtime_discovery_and_socket_or_lease_access', 'daemon::unsupported_platform_tests::unsupported_descriptor_sealing_preserves_errno_without_executing_child', 'control::unsupported_connection_tests::unsupported_control_connection_precedes_path_validation_and_deadline_arithmetic', 'daemon::holder_registry::connection::unsupported_tests::unsupported_holder_connection_precedes_deadline_and_endpoint_work', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::unavailable_anonymous_publication_leaves_no_named_fallback', 'fs_safety::platform::tests::native_access_acl_copy_replaces_existing_acl_and_removes_observed_absence', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links', 'worktree_cleanup::tests::root_operation_protection_uses_native_event_only_directory_pins'], 1):
-            exact("apple-parent-%02d" % index, selector)
-        print('Seventeen native owning CLI parents passed exactly once.', flush=True)
-        PY
-    - name: Always retain and require unchanged literal source
-      if: always()
-      env:
-        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib,json,os,pathlib,subprocess
-        root=pathlib.Path.cwd()
-        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        def git(*args,where=root):
-            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
-        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
-        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
-        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
-        state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
-        (logs/'source-after-always.json').write_text(json.dumps(state,indent=2)+'\n')
-        assert state['head']==os.environ['EXPECTED_PRODUCT_SHA'] and state['tree']==os.environ['EXPECTED_PRODUCT_TREE']
-        assert state['research_head']==os.environ['EXPECTED_RESEARCH_SHA']
-        assert not state['product_status'] and not state['research_status']
-        before=json.loads((logs/'source-before.json').read_text())
-        assert state['sha256']==before['sha256']
-        assert state['research_tree']==before['research_tree']
-        PY
-    - name: Retain original apple qualification evidence
-      if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: research-pr1951-apple-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/pr1951-apple-logs/
-        if-no-files-found: error
-        retention-days: 14
-  linux:
-    needs: macos
-    name: Linux isolated CLI HOST UI and bounded backend followups
+  qualify:
+    if: >-
+      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: One exact UI final-save diagnostic
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 240
     defaults:
       run:
         shell: bash
-        working-directory: product
     steps:
-    - name: Require natural User context and private fixture paths
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import json, os, pathlib, sys, tempfile
-        logs=pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-linux-logs'
-        logs.mkdir(mode=0o700)
-        names=sorted(name for name in os.environ if name.startswith('CAGENTS_'))
-        (logs/'natural-context.json').write_text(json.dumps({'present_names':names})+'\n')
-        if names:
-            raise SystemExit('Natural User qualification refused: '+', '.join(names))
-        fixture=pathlib.Path(tempfile.mkdtemp(prefix='c1951',dir='/tmp'))
-        with open(os.environ['GITHUB_ENV'],'a') as env:
-            print('EVIDENCE_DIR='+str(logs),file=env)
-            print('CARGO_TARGET_DIR='+str(pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-linux-target'),file=env)
-            print('TMPDIR='+str(fixture),file=env)
-            for name,leaf in [('XDG_RUNTIME_DIR','runtime'),('XDG_DATA_HOME','data'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_STATE_HOME','state')]:
-                (fixture/leaf).mkdir(mode=0o700)
-                print(name+'='+str(fixture/leaf),file=env)
-        PY
-    - name: Check out research
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        path: research
-        persist-credentials: false
-    - name: Check out product
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
-        path: product
-        persist-credentials: false
-    - name: Check out receipt-product
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: 5ad7985a56aaac5760cb71a6ea3d1ed2ba2c956a
-        path: receipt-product
-        persist-credentials: false
-    - name: Check out fixture-product
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      with:
-        ref: 32bc36da066bcf0cb614cff704a94c442279d3b1
-        path: fixture-product
-        persist-credentials: false
-    - name: Bind exact product and research sources
-      env:
-        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib,json,os,pathlib,subprocess
-        root=pathlib.Path.cwd()
-        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        def git(*args,where=root):
-            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
-        assert git('rev-parse','HEAD')==os.environ['EXPECTED_PRODUCT_SHA']
-        assert git('rev-parse','HEAD^{tree}')==os.environ['EXPECTED_PRODUCT_TREE']
-        assert not git('status','--porcelain','--untracked-files=all')
-        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
-        assert not git('status','--porcelain','--untracked-files=all',where=research)
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
-        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
-        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
-        (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
+      - name: Require natural hosted User context and initialize evidence
+        run: |
+          set -euo pipefail
+          evidence_root="$RUNNER_TEMP/final-save-diagnostic-evidence"
+          install -d -m 700 "$evidence_root"
+          printf '%s\n' "FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "final-save-diagnostic-evidence"
+          present = sorted(name for name in os.environ if name.startswith("CAGENTS_"))
+          (root / "context.json").write_text(json.dumps({
+              "hosted": os.environ.get("GITHUB_ACTIONS") == "true",
+              "inherited_cagents_names": present,
+              "policy": "Presence only; no values inspected, removed or replaced."
+          }, indent=2) + "\n")
+          if os.environ.get("GITHUB_ACTIONS") != "true" or present:
+              print("Natural hosted User context required; present names: " + ", ".join(present), file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
-        companions={
-            'receipt-product': ('EXPECTED_RECEIPT_SHA','EXPECTED_RECEIPT_TREE',['Cargo.toml','Cargo.lock','src/control/agents.rs','tests/cli_list_contracts.rs']),
-            'fixture-product': ('EXPECTED_FIXTURE_SHA','EXPECTED_FIXTURE_TREE',['Cargo.toml','Cargo.lock','src/git_watch.rs','src/chat/native_holder/transport.rs']),
-        }
-        companion_state={}
-        for folder,(head_name,tree_name,paths) in companions.items():
-            checkout=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/folder
-            state={'head':git('rev-parse','HEAD',where=checkout),'tree':git('rev-parse','HEAD^{tree}',where=checkout),'status':git('status','--porcelain','--untracked-files=all',where=checkout),'sha256':{name:hashlib.sha256((checkout/name).read_bytes()).hexdigest() for name in paths}}
-            companion_state[folder]=state
-        (logs/'companions-before.json').write_text(json.dumps(companion_state,indent=2)+'\n')
-        for folder,(head_name,tree_name,_) in companions.items():
-            state=companion_state[folder]
-            assert state['head']==os.environ[head_name] and state['tree']==os.environ[tree_name] and not state['status'], state
-        PY
-    - name: Set up the literal product Linux build environment
-      uses: ./product/.github/actions/setup-linux-build
-    - name: Prepare and record Linux tools
-      run: |
-        set -euo pipefail
-        test "$(id -u)" -ne 0
-        rustup component add --toolchain 1.93.0 rustfmt
-        { rustc -vV; cargo --version; rustfmt --version; zig version; cc --version; git --version; id; } > "$EVIDENCE_DIR/tools.txt"
-    - name: Run literal linux qualification and retain every original exit
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib, json, os, pathlib, re, subprocess, sys, time
-        logs = pathlib.Path(os.environ['EVIDENCE_DIR'])
-        records = []
+      - name: Check out the exact research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
 
-        def phase(label, command, cwd=None):
-            record = dict(label=label, command=command, cwd=str(cwd or pathlib.Path.cwd()), started=time.time())
-            records.append(record)
-            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
-            print('Starting ' + label, flush=True)
-            path = logs / (label + '.txt')
-            with path.open('wb') as output:
-                result = subprocess.run(command, cwd=cwd, stdout=output, stderr=subprocess.STDOUT)
-            record.update(exit=result.returncode, finished=time.time(), log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-            (logs / (label + '.exit')).write_text(str(result.returncode) + '\n')
-            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
-            print(path.read_text(errors='replace')[-14000:], flush=True)
-            if result.returncode:
-                raise SystemExit(result.returncode)
-            return path.read_text(errors='replace')
+      - name: Check out the pinned main setup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: b855d789f2609cf16870951b5e92914f66843fc4
+          path: setup-main
+          persist-credentials: false
 
-        def exact(label, selector, feature=None, cwd=None):
-            command = ['cargo', 'test', '--locked', '--no-default-features']
-            if feature:
-                command += ['--features', feature]
-            command += ['--lib', selector, '--', '--exact', '--show-output', '--test-threads=1', '--color=never']
-            output = phase(label, command, cwd=cwd)
-            assert len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. ok$', output, re.M)) == 1, selector
-            assert re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output, re.M) == [('1', '0', '0')], selector
-            return output
+      - name: Check out exact PR 1726
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 40a574dcb5fdb8a96986412399324fda07598032
+          path: product-1726
+          persist-credentials: false
 
-        phase('format',['scripts/check-format'])
-        phase('linux-cli-check',['cargo','check','--locked','--no-default-features','--bin','cagents'])
-        output=phase('linux-cli-all-targets',['cargo','test','--locked','--no-default-features','--all-targets','--','--test-threads=2','--color=never'])
-        expected=['fs_safety::tests::a_root_reports_its_own_identity', 'fs_safety::tests::a_relative_path_resolves_and_reads', 'fs_safety::tests::a_symlinked_final_component_is_rejected', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::an_absolute_path_and_a_parent_component_are_rejected', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::a_temporary_file_is_renamed_over_its_target_atomically', 'fs_safety::tests::only_the_user_and_access_control_namespaces_are_reproduced', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::directory_creation::tests::publication_retains_original_before_public_target_replacement', 'fs_safety::directory_creation::tests::different_parent_preserves_native_creation_as_unverified', 'fs_safety::directory_creation::tests::shared_namespace_returns_unverified_without_permission_claim', 'fs_safety::directory_creation::tests::restrictive_umask_creation_uses_retained_descriptor', 'fs_safety::directory_creation::tests::mode_restore_failure_keeps_published_identity_and_explicit_retry', 'fs_safety::directory_creation::tests::pending_mode_retry_preserves_observed_newer_public_permissions', 'fs_safety::directory_creation::tests::sticky_parent_effective_access_checks_the_retained_original_before_creation', 'fs_safety::directory_creation::tests::postpublication_cleanup_error_retains_cached_identity_and_stage', 'fs_safety::directory_creation::tests::failed_publication_retains_prepared_identity_and_retries_cleanup', 'update::tests::streaming_capture_failure_cleans_fresh_original_before_returning_error', 'update::tests::bounded_stream_preserves_success_and_size_failure', 'update::tests::bounded_stream_keeps_live_timeout_and_cancellation_cleanup', 'update::tests::streaming_child_observation_keeps_leader_until_final_cleanup', 'update::tests::streaming_signal_error_reaps_exited_leader_and_refuses_live_wait', 'update::tests::bounded_failed_stream_cleans_owned_descendants_after_exit', 'update::tests::a_failed_build_requires_a_later_matched_installation_to_be_superseded']
-        for selector in expected:
-            count=len(re.findall(r'^test '+re.escape(selector)+r' \.\.\. ok$',output,re.M))
-            assert count>=1, selector
-            if selector!='fs_safety::directory_creation::tests::restrictive_umask_creation_uses_retained_descriptor':
-                assert count==1, (selector,count)
-        assert 'test update::tests::streaming_child_refuses_a_kernel_reused_original_pid ... ignored' in output
-        print('All '+str(len(expected))+' strict Linux filesystem/supervision roots passed; nested self-exec output is nonadditive and ignored PID-reuse remains ignored.',flush=True)
+      - name: Verify every literal source and setup before compilation
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT"])
+          manifest_text = os.environ["FINAL_SAVE_DIAGNOSTIC_MANIFEST"]
+          manifest = json.loads(manifest_text)
+          (evidence / "manifest.json").write_text(manifest_text)
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def source(root, head, tree):
+              result = {"head": git(root, "rev-parse", "HEAD"), "tree": git(root, "rev-parse", "HEAD^{tree}"),
+                        "status": git(root, "status", "--porcelain=v1", "--untracked-files=all")}
+              assert result == {"head": head, "tree": tree, "status": ""}, result
+              assert not any(line.startswith("160000 ") for line in git(root, "ls-files", "--stage").splitlines()), "unexpected submodule"
+              return result
+          control = workspace / "research"
+          assert git(control, "rev-parse", "HEAD") == os.environ["EXPECTED_CONTROL_SHA"]
+          assert git(control, "status", "--porcelain=v1", "--untracked-files=all") == ""
+          records = {"control_head": git(control, "rev-parse", "HEAD"),
+                     "control_tree": git(control, "rev-parse", "HEAD^{tree}"),
+                     "workflow_sha256": hashlib.sha256((control / ".github/workflows/research-pr1853-bd88.yml").read_bytes()).hexdigest(),
+                     "setup": source(workspace / "setup-main", manifest["setup_head"], manifest["setup_tree"]),
+                     "products": {}}
+          action = workspace / "setup-main/.github/actions/setup-linux-build/action.yml"
+          assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
+          assert manifest["never_merge"] is True
+          assert [p["pr"] for p in manifest["products"]] == [1726]
+          assert [lane["id"] for lane in manifest["lanes"]] == ["1726-ui"]
+          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [1]
+          selected = [name for lane in manifest["lanes"] for name in lane["selectors"]]
+          assert len(selected) == len(set(selected)) == 1
+          for lane in manifest["lanes"]:
+              assert lane["feature"] == "ui" and lane["binary"] == "cagents-ui"
+              assert lane["matched_helper"] is False
+          for product in manifest["products"]:
+              names = [name for lane in manifest["lanes"] if lane["pr"] == product["pr"] for name in lane["selectors"]]
+              assert sorted(names) == sorted(product["selectors"])
+          for product in manifest["products"]:
+              names = product["selectors"] + [name for suite in product.get("suites", []) for name in suite["selectors"]]
+              assert len(names) == len(set(names)), "no parent may run twice"
+              assert set(product.get("owning_selectors", product["selectors"])).issubset(names)
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = source(root, product["head"], product["tree"])
+              paths = ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/modules.rs", *product["source_paths"]]
+              record["source_sha256"] = {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
+              assert record["source_sha256"] == product["source_sha256"], "immutable source hashes differ"
+              for selector, path in product["selector_sources"].items():
+                  leaf = selector.rsplit("::", 1)[1]
+                  assert len(re.findall(r"\bfn\s+" + re.escape(leaf) + r"\s*\(", (root / path).read_text())) == 1
+              records["products"][str(product["pr"])] = record
+          (evidence / "sources-before.json").write_text(json.dumps(records, indent=2) + "\n")
+          PY
 
+      - name: Install the pinned main Linux Rust and Zig setup
+        uses: ./setup-main/.github/actions/setup-linux-build
 
-        receipt=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'receipt-product'
-        phase('receipt-cli-check',['cargo','check','--locked','--no-default-features','--bin','cagents'],cwd=receipt)
-        receipt_output=phase('receipt-cli-all-targets',['cargo','test','--locked','--no-default-features','--all-targets','--','--test-threads=2','--color=never'],cwd=receipt)
-        for selector in [
-            'control::agents::tests::accepted_wait_recovery_keeps_device_routing_and_original_error_details',
-            'accepted_wait_errors_retain_original_receipts_without_resubmission',
-            'accepted_final_status_errors_retain_original_receipts_without_resubmission',
-            'accepted_wait_recovery_is_readable_and_normal_timeout_stays_distinct',
-        ]:
-            assert len(re.findall(r'^test '+re.escape(selector)+r' \.\.\. ok$',receipt_output,re.M))==1, selector
+      - name: Retain the pinned build tools
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            clang --version
+            git --version
+            timeout --version
+          } > "$FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT/tools.txt"
 
-        phase('linux-host-check',['cargo','check','--locked','--no-default-features','--features','host','--bin','cagentsd'])
-        for index, selector in enumerate(['worktree_setup::tests::anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names', 'worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask', 'worktree_setup::tests::changed_source_cannot_publish_new_private_bytes_with_old_permissions', 'worktree_setup::tests::source_changes_after_permission_application_refuse_publication', 'worktree_setup::tests::copy_preserves_restrictive_access_acl_and_removes_inherited_acl'], 1):
-            output = exact("linux-host-parent-%02d" % index,selector,"host")
-            if selector.endswith("::copy_preserves_restrictive_access_acl_and_removes_inherited_acl"):
-                assert "SETUP_ACL_COPY_VERIFIED" in output
-                assert "SETUP_ACL_FIXTURE_UNSUPPORTED" not in output
+      - name: Check and run the exact UI diagnostic serially
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, subprocess, tempfile, time
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT"])
+          manifest = json.loads((evidence / "manifest.json").read_text())
+          results = []
+          outcomes = []
+          class ProductFailure(RuntimeError):
+              def __init__(self, label, message):
+                  self.label = label
+                  super().__init__(message)
+          def put(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n")
+          def digest(path):
+              value = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+          def result(global_error=None):
+              if global_error is not None:
+                  for outcome in outcomes:
+                      if outcome["status"] == "running":
+                          outcome.update(status="stopped_globally", unrun_selector_invocations=None)
+              grouped = []
+              for product in manifest["products"]:
+                  observed = [outcome for outcome in outcomes if outcome["pr"] == product["pr"]]
+                  requested = [lane for lane in manifest["lanes"] if lane["pr"] == product["pr"]]
+                  status = "passed" if len(observed) == len(requested) and all(o["status"] == "passed" for o in observed) else "incomplete"
+                  if any(o["status"] in ("failed", "stopped_globally") for o in observed):
+                      status = "failed"
+                  grouped.append({"pr": product["pr"], "head": product["head"], "status": status,
+                                  "qualified_parents": [name for outcome in observed for name in outcome["qualified_parents"]]})
+              passed = len(outcomes) == len(manifest["lanes"]) and all(o["status"] == "passed" for o in outcomes)
+              value = {"narrow_qualification": "passed" if passed and global_error is None else "failed",
+                       "stopped_globally": global_error is not None, "error": global_error,
+                       "completed_phases": len(results), "lanes": outcomes, "products": grouped,
+                       "unattempted_lanes": [lane["id"] for lane in manifest["lanes"] if lane["id"] not in {o["id"] for o in outcomes}],
+                       "qualified_parent_count": sum(len(o["qualified_parents"]) for o in outcomes),
+                       "requested_parent_count": sum(len(lane["selectors"]) for lane in manifest["lanes"]),
+                       "requested_check_count": len(manifest["lanes"]), "limits": manifest["limits"]}
+              put(evidence / "result.json", value)
+              return value
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def verify(root, product):
+              assert git(root, "rev-parse", "HEAD") == product["head"]
+              assert git(root, "rev-parse", "HEAD^{tree}") == product["tree"]
+              assert git(root, "status", "--porcelain=v1", "--untracked-files=all") == ""
+              assert {name: digest(root / name) for name in product["source_sha256"]} == product["source_sha256"], "source hashes changed"
+          def configuration(root, env):
+              candidates = {parent / ".cargo" / name for parent in [root, *root.parents] for name in ["config", "config.toml"]}
+              cargo_home = pathlib.Path(env.get("CARGO_HOME", str(pathlib.Path(env["HOME"]) / ".cargo"))).resolve()
+              candidates.update(cargo_home / name for name in ["config", "config.toml"])
+              files = {}
+              for path in sorted(candidates):
+                  try:
+                      metadata = path.lstat()
+                  except FileNotFoundError:
+                      files[str(path)] = {"present": False}
+                      continue
+                  assert path.is_file(), "Cargo config is not a readable regular file: " + str(path)
+                  files[str(path)] = {"present": True, "sha256": digest(path), "mode": metadata.st_mode,
+                                      "symlink": os.readlink(path) if path.is_symlink() else None}
+              explicit = {"PATH", "HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTC", "RUSTC_WRAPPER",
+                          "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS",
+                          "CARGO_ENCODED_RUSTDOCFLAGS", "RUSTUP_TOOLCHAIN", "CC", "CXX", "AR", "LD",
+                          "LIBCLANG_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"}
+              inputs = {name: hashlib.sha256(value.encode()).hexdigest() for name, value in env.items()
+                        if name in explicit or name.startswith(("CARGO_BUILD_", "CARGO_TARGET_", "CARGO_PROFILE_", "CC_", "CXX_", "AR_"))}
+              return {"cargo_configs": files, "build_environment_sha256": inputs,
+                      "scope": "Input names and hashes only; no credential values or inherited authority are disclosed or changed."}
+          def phase(product, label, command, env, selector=None, expected_names=None, inventory_names=None, helper=None):
+              root = workspace / ("product-" + str(product["pr"]))
+              verify(root, product)
+              assert configuration(root, env) == baseline_context, "Cargo configuration or build environment changed"
+              assert helper is None, "This diagnostic never accepts a helper"
+              expected_names_present = set()
+              assert {name for name in env if name.startswith("CAGENTS_")} == expected_names_present, "unexpected inherited authority or helper context"
+              output = evidence / (active_lane["id"] + "-" + label)
+              output.mkdir()
+              bounded = ["timeout", "--signal=TERM", "--kill-after=30s", "2700s", *command]
+              record = {"source": product, "lane": active_lane, "label": label, "selector": selector, "cwd": str(root), "command": command,
+                        "expected_names": expected_names, "inventory_names": inventory_names, "matched_helper": helper,
+                        "bounded_command": bounded, "command_bound_seconds": 2700,
+                        "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "status": "running", "fixture_root": env["TMPDIR"],
+                        "target_dir": env["CARGO_TARGET_DIR"],
+                        "completion_scope": "GNU timeout wrapper/direct wait only; no detached-family closure claim."}
+              put(output / "command.json", record)
+              print("START", product["pr"], label, flush=True)
+              start = time.monotonic()
+              with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
+                  completed = subprocess.run(bounded, cwd=root, env=env, stdout=stdout, stderr=stderr)
+              status = completed.returncode
+              record.update(status="returned", wrapper_exit=status, direct_wait_complete=True,
+                            wall_seconds=time.monotonic() - start)
+              record["command_exit"] = status if 0 <= status < 124 else None
+              record["timeout_or_wrapper_failure"] = status >= 124 or status < 0
+              record["stdout_sha256"] = hashlib.sha256((output / "stdout.log").read_bytes()).hexdigest()
+              record["stderr_sha256"] = hashlib.sha256((output / "stderr.log").read_bytes()).hexdigest()
+              put(output / "command.json", record)
+              (output / "exit.txt").write_text(str(status) + "\n")
+              results.append(record)
+              put(evidence / "phases.json", results)
+              print("RETURN", product["pr"], label, "exit", status, flush=True)
+              verify(root, product)
+              assert configuration(root, env) == baseline_context, "Cargo configuration or build environment changed"
+              assert helper is None, "This diagnostic never accepts a helper"
+              expected_names_present = set()
+              assert {name for name in env if name.startswith("CAGENTS_")} == expected_names_present, "unexpected inherited authority or helper context"
+              if record["timeout_or_wrapper_failure"]:
+                  raise RuntimeError(f"PR {product['pr']} {label}: uncertain timeout/signal/wrapper outcome; stop globally")
+              if status != 0:
+                  raise ProductFailure(label, f"PR {product['pr']} {label} failed with exit {status}; preserve original logs, no retry")
+              if inventory_names is not None:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^(\S+): test$", text, re.M)
+                  if not inventory_names or sorted(names) != sorted(inventory_names):
+                      raise ProductFailure(label, f"Compiled test inventory differs: expected={inventory_names}, actual={names}")
+                  put(output / "inventory.json", {"names": names, "count": len(names), "execution": "list only; no parent pass claimed"})
+              if selector or expected_names is not None:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^test (\S+) \.\.\. ok$", text, re.M)
+                  summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
+                  expected = [selector] if selector else expected_names
+                  if not expected or sorted(names) != sorted(expected) or summaries != [("ok", str(len(expected)), "0", "0")]:
+                      raise ProductFailure(label, f"Parent oracle failed: expected={expected}, names={names}, summaries={summaries}")
+                  put(output / ("exact-parent.json" if selector else "suite-parents.json"),
+                      {"names": names, "passed": len(names), "failed": 0, "ignored": 0})
+              return output
+          try:
+              assert not any(name.startswith("CAGENTS_") for name in os.environ)
+              for lane in manifest["lanes"]:
+                  product = next(p for p in manifest["products"] if p["pr"] == lane["pr"])
+                  active_lane, active_product = lane, product
+                  assert lane["feature"] == "ui" and lane["binary"] == "cagents-ui"
+                  fixture = pathlib.Path(tempfile.mkdtemp(prefix="rp", dir="/tmp"))
+                  fixture.chmod(0o700)
+                  env = os.environ.copy()
+                  env["TMPDIR"] = str(fixture)
+                  for key, leaf in [("XDG_RUNTIME_DIR", "run"), ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")]:
+                      directory = fixture / leaf
+                      directory.mkdir(mode=0o700)
+                      env[key] = str(directory)
+                  env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("final-save-diagnostic-target-" + lane["feature"]))
+                  env["CARGO_BUILD_JOBS"] = "2"
+                  root = workspace / ("product-" + str(product["pr"]))
+                  baseline_context = configuration(root, env)
+                  put(evidence / (lane["id"] + "-build-context.json"), baseline_context)
+                  outcome = {"id": lane["id"], "pr": product["pr"], "head": product["head"], "feature": lane["feature"],
+                             "status": "running", "check": "unrun", "qualified_parents": [],
+                             "unrun_selector_invocations": list(lane["selectors"])}
+                  outcomes.append(outcome)
+                  result()
+                  feature_arguments = [] if lane["feature"] == "cli" else ["--features", lane["feature"]]
+                  try:
+                      outcome["check"] = "running"
+                      phase(product, "check", ["cargo", "check", "--locked", "--no-default-features", *feature_arguments, "--bin", lane["binary"]], env)
+                      outcome["check"] = "passed"
+                      for index, selector in enumerate(lane["selectors"], 1):
+                          command = ["cargo", "test", "--locked", "--no-default-features", *feature_arguments, "--lib", selector]
+                          phase(product, f"list-{index}", command + ["--", "--exact", "--list", "--color=never"], env, inventory_names=[selector])
+                          outcome["unrun_selector_invocations"].remove(selector)
+                          observed = phase(product, f"parent-{index}", command + ["--", "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
+                          outcome["qualified_parents"].extend(json.loads((observed / "exact-parent.json").read_text())["names"])
+                      outcome["status"] = "passed"
+                  except ProductFailure as error:
+                      outcome.update(status="failed", failed_phase=error.label, error=str(error))
+                      if error.label == "check":
+                          outcome["check"] = "failed"
+                      print("LANE FAILED", lane["id"], str(error), flush=True)
+                  result()
+          except BaseException as error:
+              result(global_error=str(error))
+              raise
+          if result()["narrow_qualification"] != "passed":
+              raise SystemExit(1)
+          PY
 
+      - name: Retain final source state even after a failed phase
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "final-save-diagnostic-evidence"
+          evidence.mkdir(mode=0o700, exist_ok=True)
+          expected = evidence / "manifest.json"
+          if not expected.exists():
+              (evidence / "sources-after.json").write_text(json.dumps({"audit": "unavailable before source preflight"}) + "\n")
+              raise SystemExit(0)
+          manifest = json.loads(expected.read_text())
+          records, failures = {}, []
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = {}
+              for label, args in [("head", ["rev-parse", "HEAD"]), ("tree", ["rev-parse", "HEAD^{tree}"]),
+                                  ("status", ["status", "--porcelain=v1", "--untracked-files=all"])]:
+                  result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), *args], capture_output=True, text=True)
+                  record[label] = {"exit": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr}
+              records[str(product["pr"])] = record
+              if any(item["exit"] != 0 for item in record.values()) or record["head"]["stdout"] != product["head"] or record["tree"]["stdout"] != product["tree"] or record["status"]["stdout"]:
+                  failures.append(product["pr"])
+          (evidence / "sources-after.json").write_text(json.dumps({"products": records, "failures": failures}, indent=2) + "\n")
+          assert not failures, failures
+          PY
 
-        fixtures=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'fixture-product'
-        phase('fixture-host-check',['cargo','check','--locked','--no-default-features','--features','host','--bin','cagentsd'],cwd=fixtures)
-        for index,selector in enumerate([
-            'chat::native_holder::transport::tests::post_child_census_failure_preserves_live_ownership_and_services_control',
-            'chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool',
-            'git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory',
-        ],1):
-            exact('fixture-host-parent-%02d'%index,selector,'host',cwd=fixtures)
-
-        phase('linux-ui-check',['cargo','check','--locked','--no-default-features','--features','ui','--bin','cagents-ui'])
-        PY
-    - name: Always retain and require unchanged literal source
-      if: always()
-      env:
-        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-        python3 - <<'PY'
-        import hashlib,json,os,pathlib,subprocess
-        root=pathlib.Path.cwd()
-        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        def git(*args,where=root):
-            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
-        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
-        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
-        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
-        state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
-        (logs/'source-after-always.json').write_text(json.dumps(state,indent=2)+'\n')
-        assert state['head']==os.environ['EXPECTED_PRODUCT_SHA'] and state['tree']==os.environ['EXPECTED_PRODUCT_TREE']
-        assert state['research_head']==os.environ['EXPECTED_RESEARCH_SHA']
-        assert not state['product_status'] and not state['research_status']
-        before=json.loads((logs/'source-before.json').read_text())
-        assert state['sha256']==before['sha256']
-        assert state['research_tree']==before['research_tree']
-
-        companions={
-            'receipt-product': ('EXPECTED_RECEIPT_SHA','EXPECTED_RECEIPT_TREE',['Cargo.toml','Cargo.lock','src/control/agents.rs','tests/cli_list_contracts.rs']),
-            'fixture-product': ('EXPECTED_FIXTURE_SHA','EXPECTED_FIXTURE_TREE',['Cargo.toml','Cargo.lock','src/git_watch.rs','src/chat/native_holder/transport.rs']),
-        }
-        companion_state={}
-        for folder,(head_name,tree_name,paths) in companions.items():
-            checkout=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/folder
-            state={'head':git('rev-parse','HEAD',where=checkout),'tree':git('rev-parse','HEAD^{tree}',where=checkout),'status':git('status','--porcelain','--untracked-files=all',where=checkout),'sha256':{name:hashlib.sha256((checkout/name).read_bytes()).hexdigest() for name in paths}}
-            companion_state[folder]=state
-        (logs/'companions-after-always.json').write_text(json.dumps(companion_state,indent=2)+'\n')
-        for folder,(head_name,tree_name,_) in companions.items():
-            state=companion_state[folder]
-            assert state['head']==os.environ[head_name] and state['tree']==os.environ[tree_name] and not state['status'], state
-        assert companion_state==json.loads((logs/'companions-before.json').read_text())
-        PY
-    - name: Retain original linux qualification evidence
-      if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: research-pr1951-linux-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/pr1951-linux-logs/
-        if-no-files-found: error
-        retention-days: 14
+      - name: Retain original raw qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final-save-diagnostic-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/final-save-diagnostic-evidence/
+          if-no-files-found: error
+          retention-days: 14

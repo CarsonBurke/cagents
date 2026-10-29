@@ -741,8 +741,24 @@ fn verify_mode(runtime: &Path, lease: Option<&File>, stage_only: bool) -> Output
 #[test]
 fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
     let _fixture = OS_FIXTURE.lock().unwrap();
-    for status in ["0", "7", "cancel", "deferred", "complete"] {
+    for status in [
+        "0",
+        "7",
+        "cancel",
+        "deferred",
+        "complete",
+        "inspector-refused",
+        "inspector-missing",
+    ] {
         let root = coordinator_fixture::Root::new(tempfile::tempdir().unwrap());
+        let refused = matches!(status, "inspector-refused" | "inspector-missing");
+        let fixture_bin = root.path().join("bin");
+        fs::create_dir(&fixture_bin).unwrap();
+        let cli = fixture_bin.join("cagents");
+        fs::copy(env!("CARGO_BIN_EXE_cagents"), &cli).unwrap();
+        if status != "inspector-missing" {
+            install_source_inspector_fixture(&fixture_bin.join("cagentsd"));
+        }
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
@@ -762,7 +778,14 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         let events = root.path().join("events");
         let server_events = events.clone();
         let server = thread::spawn(move || {
-            for expected in ["update-prepare", "update-commit"] {
+            for expected in [
+                "update-prepare",
+                if refused {
+                    "update-cancel"
+                } else {
+                    "update-commit"
+                },
+            ] {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -796,6 +819,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
                 }
                 writeln!(stream, "ok").unwrap();
             }
+            (window, listener)
         });
         let prefix = root.path().join("installation");
         let bin = prefix.join("versions/old/bin");
@@ -821,7 +845,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         fs::set_permissions(&new_ui, fs::Permissions::from_mode(0o700)).unwrap();
         let installer = root.path().join("installer.sh");
         fs::write(&installer, "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\ntrap 'printf \"rolled-back\\n\" >> \"$HOME/events\"; exit 7' TERM\nprintf 'installed\\n' >> \"$HOME/events\"\nif [ \"$1\" = cancel ]; then while :; do sleep 0.05; done; fi\nif [ \"$1\" = deferred ]; then \"$FIXTURE_REAL_CLI\" record-deferred-install >/dev/null || exit 93; fi\ncase \"$1\" in deferred|complete) ln -sfn versions/new \"$FIXTURE_PREFIX/current\"; exit 0 ;; esac\nexit \"$1\"\n").unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cagents"));
+        let mut command = Command::new(&cli);
         command
             .arg("coordinate-install")
             .arg("--prefix")
@@ -838,8 +862,20 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             .env("CAGENTS_ARCHIVE", "/stale/installer/archive")
             .env("CAGENTS_CHECKSUMS", "/stale/installer/checksums")
             .env("CAGENTS_REPOSITORY", "fixture/source")
-            .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+            .env("FIXTURE_REAL_CLI", &cli)
             .env("FIXTURE_PREFIX", &prefix)
+            .env(
+                "FIXTURE_SOURCE_PROTOCOL",
+                cagents::terminal_ipc::PROTOCOL_VERSION.to_string(),
+            )
+            .env(
+                "FIXTURE_SOURCE_REFUSED",
+                if status == "inspector-refused" {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Ignored SIGCHLD survives exec; the coordinator must reset it before
@@ -855,33 +891,106 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         let output = child.wait_until(deadline).unwrap();
-        server.join().unwrap();
+        let (window, listener) = server.join().unwrap_or_else(|error| {
+            panic!("window fixture failed: {error:?}; coordinator: {output:?}")
+        });
         assert_eq!(
             output.status.success(),
             matches!(status, "0" | "deferred" | "complete"),
             "{output:?}"
         );
-        assert_eq!(
-            fs::read_to_string(events).unwrap(),
-            if status == "cancel" {
-                "update-prepare\nupdate-commit\ninstalled\nrolled-back\n"
+        if refused {
+            assert_eq!(
+                fs::read_to_string(&events).unwrap(),
+                if status == "inspector-refused" {
+                    "update-prepare\nsource-inspect\nupdate-cancel\n"
+                } else {
+                    "update-prepare\nupdate-cancel\n"
+                },
+                "{output:?}"
+            );
+            if status == "inspector-refused" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("fixture source panes refused"),
+                    "{output:?}"
+                );
             } else {
-                "update-prepare\nupdate-commit\ninstalled\n"
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("(os error 2)"),
+                    "missing matched inspector must expose the actual not-found failure: {output:?}"
+                );
             }
-        );
-        assert!(
-            fs::read_to_string(root.path().join("reopened"))
-                .unwrap()
-                .contains("--window primary")
-        );
-        assert!(
-            fs::read_to_string(root.path().join("reopened"))
-                .unwrap()
-                .starts_with(if status == "complete" { "new " } else { "old " }),
-            "deferred installations must reopen the exact prior UI version"
-        );
+            println!(
+                "source inspection {status}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let probe = File::open(runtime.join(format!("{name}.lock.primary"))).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                -1,
+                "source inspection refusal closed the original window"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(listener.local_addr().is_ok());
+            assert!(
+                !root.path().join("reopened").exists(),
+                "an unclosed source window was relaunched"
+            );
+        } else {
+            assert_eq!(
+                fs::read_to_string(events).unwrap(),
+                if status == "cancel" {
+                    "update-prepare\nsource-inspect\nupdate-commit\ninstalled\nrolled-back\n"
+                } else {
+                    "update-prepare\nsource-inspect\nupdate-commit\ninstalled\n"
+                }
+            );
+            assert!(
+                fs::read_to_string(root.path().join("reopened"))
+                    .unwrap()
+                    .contains("--window primary")
+            );
+            assert!(
+                fs::read_to_string(root.path().join("reopened"))
+                    .unwrap()
+                    .starts_with(if status == "complete" { "new " } else { "old " }),
+                "deferred installations must reopen the exact prior UI version"
+            );
+        }
+        assert_eq!(unsafe { libc::flock(window.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(window);
+        drop(listener);
         root.close();
     }
+}
+
+/// The isolated CLI lane has no host executable. Model its process boundary
+/// explicitly beside a private copy of the real CLI; never use a stale helper
+/// from another feature lane. This fixture verifies the actual inherited fence
+/// and request, but does not qualify the host's SQLite/provider inspection.
+fn install_source_inspector_fixture(path: &Path) {
+    fs::write(path, r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys
+assert len(sys.argv) == 3 and sys.argv[1] == '--inspect-upgrade-source'
+assert json.loads(sys.argv[2]) == {'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
+    'proof':None, 'require_resumable':False, 'reconcile_retained':False}
+assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
+verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
+    pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if verified.returncode:
+    sys.stderr.buffer.write(verified.stderr)
+    sys.exit(91)
+with (pathlib.Path(os.environ['HOME'])/'events').open('a') as events:
+    events.write('source-inspect\n')
+print(json.dumps({'Err':'fixture source panes refused'} if os.environ['FIXTURE_SOURCE_REFUSED']=='1' else {'Ok':None}))
+"#).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn file(path: &Path) -> File {

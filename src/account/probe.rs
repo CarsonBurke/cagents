@@ -1056,9 +1056,10 @@ mod tests {
         const CHILD: &str = "CAGENTS_ACCOUNT_ENV_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
+            // Preserve the caller's scope; override only these fixture inputs.
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact", "account::probe::tests::selected_home_probes_remove_inherited_credentials_but_system_keeps_them", "--nocapture"])
-                .env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
+                .env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
             for provider in Account::PROVIDERS {
                 for name in super::super::credential_overrides(provider) {
                     child.env(name, "fixture-only");
