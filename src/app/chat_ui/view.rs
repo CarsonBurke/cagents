@@ -1,5 +1,6 @@
 use super::coordination::Coordinated;
 use super::*;
+use crate::chat::protocol::codex::{ApprovalRole, approval_role as codex_approval_role};
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -742,14 +743,8 @@ fn paragraphed(text: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// How much an answer commits the reader to.
-///
-/// This is what orders the answers and decides which of them the keyboard
-/// reaches first. The model carries no such flag - a provider hands over a
-/// list of ids and labels - so it is read from the vocabulary the providers
-/// actually use. Reading one wrong costs an answer its place in the row,
-/// never its meaning: every answer the provider offered is still drawn, and
-/// still sends exactly the decision it names.
+/// Presentation ordering for ordinary question and consent answers.
+/// Approval shortcuts use producer-classified decision identities instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Stake {
     /// Refusing, which is the answer that cannot cost the reader anything.
@@ -788,6 +783,51 @@ fn stake(choice: &chat::Choice) -> Stake {
     } else {
         Stake::Once
     }
+}
+
+fn approval_role(choice: &chat::Choice) -> Option<ApprovalRole> {
+    match choice.id.as_str() {
+        "allow" => Some(ApprovalRole::Once),
+        "allow_session" | "allowForSession" => Some(ApprovalRole::Session),
+        _ => codex_approval_role(&choice.id),
+    }
+}
+
+fn approval_rank(choice: &chat::Choice) -> u8 {
+    match approval_role(choice) {
+        Some(ApprovalRole::Decline | ApprovalRole::DenyPermissions) => 0,
+        Some(ApprovalRole::Cancel) => 1,
+        Some(ApprovalRole::Once) => 2,
+        Some(ApprovalRole::Session) => 3,
+        Some(ApprovalRole::PolicyAllow | ApprovalRole::PolicyDeny) => 4,
+        None => 5,
+    }
+}
+
+/// Only an explicit one-time grant and a nonpersistent refusal form a card
+/// shortcut pair. Prefer declining without interruption when it is offered;
+/// persistent allow/deny policy changes always require their own control.
+fn approval_bindings(request: &chat::Request) -> Option<(&chat::Choice, &chat::Choice)> {
+    if request.kind != chat::RequestKind::Approval {
+        return None;
+    }
+    let once = request
+        .actions
+        .iter()
+        .find(|choice| approval_role(choice) == Some(ApprovalRole::Once))?;
+    let deny = [
+        ApprovalRole::Decline,
+        ApprovalRole::DenyPermissions,
+        ApprovalRole::Cancel,
+    ]
+    .into_iter()
+    .find_map(|role| {
+        request
+            .actions
+            .iter()
+            .find(|choice| approval_role(choice) == Some(role))
+    })?;
+    Some((once, deny))
 }
 
 /// An affirmative question control is visually primary even when skipping is
@@ -4188,34 +4228,24 @@ pub(super) fn request_view_with_redirect<'a>(
         ),
     )
     .into();
-    if available && request.kind == chat::RequestKind::Approval {
-        let once = request
-            .actions
-            .iter()
-            .find(|choice| stake(choice) == Stake::Once);
-        let deny = request
-            .actions
-            .iter()
-            .find(|choice| stake(choice) == Stake::Refuse);
-        if let (Some(once), Some(deny)) = (once, deny) {
-            return crate::interaction::focused_decisions(
-                card_control_id(
-                    target.card,
-                    &format!(
-                        "chat-approval-{}-{}-{}",
-                        match surface {
-                            RequestSurface::Transcript => "transcript",
-                            RequestSurface::Permissions => "permissions",
-                        },
-                        target.generation,
-                        request.id
-                    ),
+    if available && let Some((once, deny)) = approval_bindings(request) {
+        return crate::interaction::focused_decisions(
+            card_control_id(
+                target.card,
+                &format!(
+                    "chat-approval-{}-{}-{}",
+                    match surface {
+                        RequestSurface::Transcript => "transcript",
+                        RequestSurface::Permissions => "permissions",
+                    },
+                    target.generation,
+                    request.id
                 ),
-                content,
-                move || action(Action::Answer(target, request.id.clone(), once.id.clone())),
-                move || action(Action::Answer(target, request.id.clone(), deny.id.clone())),
-            );
-        }
+            ),
+            content,
+            move || action(Action::Answer(target, request.id.clone(), once.id.clone())),
+            move || action(Action::Answer(target, request.id.clone(), deny.id.clone())),
+        );
     }
     content
 }
@@ -4423,6 +4453,7 @@ fn answers_view<'a>(
     }
     let answers = ordered_answers(request);
     let primary = primary_answer(request).map(|choice| &choice.id);
+    let bindings = available.then(|| approval_bindings(request)).flatten();
     widget::row::with_children(
         answers
             .into_iter()
@@ -4432,12 +4463,10 @@ fn answers_view<'a>(
                     request.id.clone(),
                     choice.id.clone(),
                 )));
-                let label = if request.kind == chat::RequestKind::Approval {
-                    match stake(choice) {
-                        Stake::Once => format!("{} (Enter)", choice.label),
-                        Stake::Refuse => format!("{} (Esc)", choice.label),
-                        Stake::Session => choice.label.clone(),
-                    }
+                let label = if bindings.is_some_and(|(once, _)| once.id == choice.id) {
+                    format!("{} (Enter)", choice.label)
+                } else if bindings.is_some_and(|(_, deny)| deny.id == choice.id) {
+                    format!("{} (Esc)", choice.label)
                 } else {
                     choice.label.clone()
                 };
@@ -4480,7 +4509,9 @@ fn answers_view<'a>(
 pub(super) fn ordered_answers(request: &chat::Request) -> Vec<&chat::Choice> {
     let mut answers: Vec<_> = request.actions.iter().collect();
     // A stable sort keeps equal-stake answers in the provider's order.
-    if request.kind != chat::RequestKind::Question {
+    if request.kind == chat::RequestKind::Approval {
+        answers.sort_by_key(|choice| approval_rank(choice));
+    } else if request.kind != chat::RequestKind::Question {
         answers.sort_by_key(|choice| stake(choice));
     }
     answers
@@ -7254,6 +7285,403 @@ mod tests {
     }
 
     #[test]
+    fn codex_approval_shortcuts_dispatch_wire_decisions_without_payload_inference() {
+        use chat::protocol::{Adapter, codex};
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        use serde_json::{Value, json};
+
+        fn request(
+            home: &Path,
+            method: &str,
+            decisions: &[Value],
+        ) -> (Box<dyn Adapter>, chat::Request) {
+            let launch = chat::Launch {
+                provider: Provider::Codex,
+                recipe: crate::model::LaunchRecipe {
+                    program: "unused-provider-fixture".into(),
+                    arguments: Vec::new(),
+                    working_directory: home.into(),
+                    environment: [("CODEX_HOME".into(), home.to_string_lossy().into_owned())]
+                        .into(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("thread-exact".into()),
+            };
+            // This factory prepares an adapter/spec only. No socket, process,
+            // provider, account configuration or durable permission is opened.
+            let (_, mut adapter) =
+                codex::create_with_listener(&launch, home.join("unused.sock")).unwrap();
+            let initialize = adapter.initialize().unwrap();
+            let setup = adapter
+                .receive(json!({"id":initialize.writes[0]["id"],"result":{
+                    "userAgent":"codex-fixture","codexHome":home
+                }}))
+                .unwrap();
+            let resume = setup
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap();
+            adapter.receive(json!({"id":resume["id"],"result":{
+                "thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true},
+                "model":"fixture","initialTurnsPage":{"data":[],"nextCursor":null}
+            }})).unwrap();
+            for frame in setup.writes.iter().filter(|frame| {
+                matches!(frame["method"].as_str(), Some("skills/list" | "model/list"))
+            }) {
+                adapter
+                    .receive(json!({"id":frame["id"],"result":{"data":[]}}))
+                    .unwrap();
+            }
+            let step = adapter
+                .receive(json!({"id":71,"method":method,"params":{
+                    "threadId":"thread-exact","turnId":"turn","itemId":"tool",
+                    "command":"python scripts/cancel_job.py","cwd":home,
+                    "availableDecisions":decisions,"permissions":{"network":{"enabled":true}}
+                }}))
+                .unwrap();
+            assert!(step.writes.is_empty(), "request arrival never answers it");
+            let request = step
+                .events
+                .into_iter()
+                .find_map(|event| match event {
+                    chat::Event::Request(request) => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            (adapter, request)
+        }
+
+        fn dispatch(
+            renderer: &cosmic::Renderer,
+            request: &chat::Request,
+            surface: RequestSurface,
+            available: bool,
+            focus: Option<&str>,
+            key: keyboard::key::Named,
+        ) -> (Vec<Message>, Vec<String>) {
+            let target = Target {
+                card: CardId::new(),
+                generation: 7,
+            };
+            let answers = Answers::new();
+            let mut element = request_view(target, request, &answers, available, surface);
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 900.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let buttons: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| node.node().role() == Role::Button)
+                .filter_map(|node| {
+                    node.node()
+                        .label()
+                        .map(|label| (node.id().clone(), label.to_owned()))
+                })
+                .collect();
+            let labels = buttons.iter().map(|(_, label)| label.clone()).collect();
+            match focus {
+                Some("card") => element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    renderer,
+                    &mut iced::advanced::widget::operation::focusable::focus::<()>(
+                        card_control_id(
+                            target.card,
+                            &format!(
+                                "chat-approval-{}-{}-{}",
+                                match surface {
+                                    RequestSurface::Transcript => "transcript",
+                                    RequestSurface::Permissions => "permissions",
+                                },
+                                target.generation,
+                                request.id
+                            ),
+                        ),
+                    ),
+                ),
+                Some(label) => {
+                    let (id, _) = buttons
+                        .iter()
+                        .find(|(_, actual)| {
+                            actual.as_str() == label
+                                || actual.strip_suffix(" (Esc)") == Some(label)
+                                || actual.strip_suffix(" (Enter)") == Some(label)
+                        })
+                        .expect("the actual decision control is advertised");
+                    let native_id: iced_accessibility::accesskit::NodeId = id.clone().into();
+                    // Use the same native focus operation as keyboard traversal,
+                    // resolving the actual advertised button on either surface.
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        renderer,
+                        &mut iced::advanced::widget::operation::focusable::focus::<()>(
+                            widget::Id::from(u128::from(native_id.0) as u64),
+                        ),
+                    );
+                }
+                None => {}
+            }
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(key),
+                    modified_key: keyboard::Key::Named(key),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            (messages, labels)
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(fixture.path()).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        let policy = json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":[
+            "python","scripts/cancel_job.py","deny","decline","always"
+        ]}});
+        let network_deny = json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{
+            "host":"allow.example","action":"deny"
+        }}});
+        let unknown = json!({"futureDecision":{"command":"deny cancel always"}});
+        let cases = [
+            (
+                "item/commandExecution/requestApproval",
+                vec![json!("accept"), policy.clone(), json!("cancel")],
+                json!({"decision":"cancel"}),
+                policy.clone(),
+            ),
+            (
+                "item/commandExecution/requestApproval",
+                vec![policy.clone(), json!("cancel"), json!("accept")],
+                json!({"decision":"cancel"}),
+                policy,
+            ),
+            (
+                "item/commandExecution/requestApproval",
+                vec![
+                    json!("cancel"),
+                    network_deny.clone(),
+                    json!("accept"),
+                    json!("decline"),
+                ],
+                json!({"decision":"decline"}),
+                network_deny,
+            ),
+            (
+                "item/commandExecution/requestApproval",
+                vec![json!("accept"), unknown.clone(), json!("cancel")],
+                json!({"decision":"cancel"}),
+                unknown,
+            ),
+            (
+                "item/permissions/requestApproval",
+                Vec::new(),
+                json!({"permissions":{},"scope":"turn"}),
+                json!({"permissions":{"network":{"enabled":true}},"scope":"turn"}),
+            ),
+        ];
+        for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
+            for (method, decisions, refusal, explicit) in &cases {
+                for focused in ["card", "refusal", "explicit"] {
+                    let (mut adapter, request) = request(&home, method, decisions);
+                    let refusal_label = if refusal["decision"] == "cancel" {
+                        "Deny and cancel"
+                    } else {
+                        "Deny"
+                    };
+                    let explicit_choice = request
+                        .actions
+                        .iter()
+                        .find(|choice| choice.description == explicit.to_string())
+                        .unwrap();
+                    let (focus, key, expected) = match focused {
+                        "card" => ("card", keyboard::key::Named::Escape, refusal.clone()),
+                        "refusal" => (refusal_label, keyboard::key::Named::Escape, refusal.clone()),
+                        _ => (
+                            explicit_choice.label.as_str(),
+                            keyboard::key::Named::Enter,
+                            if *method == "item/permissions/requestApproval" {
+                                explicit.clone()
+                            } else {
+                                json!({"decision":explicit})
+                            },
+                        ),
+                    };
+                    let (messages, labels) =
+                        dispatch(&renderer, &request, surface, true, Some(focus), key);
+                    let [Message::ChatUi(Action::Answer(_, id, choice))] = messages.as_slice()
+                    else {
+                        panic!("one real keyboard action must answer, got {messages:?}");
+                    };
+                    // The widget's exact Answer identity is passed to the real
+                    // adapter, as the unchanged App answer handler does.
+                    let reply = adapter
+                        .command(Command::Answer {
+                            request_id: id.clone(),
+                            action: choice.clone(),
+                            answers: Vec::new(),
+                        })
+                        .unwrap();
+                    assert_eq!(reply.writes, vec![json!({"id":71,"result":expected})]);
+                    assert_eq!(
+                        labels
+                            .iter()
+                            .filter(|label| label.ends_with(" (Esc)"))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec![format!("{refusal_label} (Esc)")]
+                    );
+                    if *method != "item/permissions/requestApproval" {
+                        assert!(
+                            !labels
+                                .iter()
+                                .any(|label| label.starts_with(explicit_choice.label.as_str())
+                                    && label.ends_with(" (Enter)"))
+                        );
+                    }
+                }
+            }
+            let (_, mut legacy) = request(
+                &home,
+                "item/commandExecution/requestApproval",
+                &[json!("accept"), json!("cancel")],
+            );
+            for (index, choice) in legacy.actions.iter_mut().enumerate() {
+                choice.id = format!("decision-{index}");
+            }
+            for (available, focus) in [
+                (true, Some("card")),
+                (true, Some("Deny and cancel")),
+                (false, None),
+            ] {
+                let (messages, labels) = dispatch(
+                    &renderer,
+                    &legacy,
+                    surface,
+                    available,
+                    focus,
+                    keyboard::key::Named::Escape,
+                );
+                assert!(
+                    messages.is_empty(),
+                    "legacy labels supply no shortcut authority"
+                );
+                assert!(
+                    !labels
+                        .iter()
+                        .any(|label| label.ends_with(" (Esc)") || label.ends_with(" (Enter)"))
+                );
+            }
+            assert!(
+                dispatch(
+                    &renderer,
+                    &legacy,
+                    surface,
+                    true,
+                    Some("card"),
+                    keyboard::key::Named::Enter,
+                )
+                .0
+                .is_empty()
+            );
+            for decisions in [
+                vec![
+                    json!("accept"),
+                    json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{
+                        "host":"cancel.example","action":"deny"
+                    }}}),
+                ],
+                vec![
+                    json!({"futureDecision":{"command":"deny cancel"}}),
+                    json!("cancel"),
+                ],
+            ] {
+                let (_, request) =
+                    request(&home, "item/commandExecution/requestApproval", &decisions);
+                for key in [keyboard::key::Named::Enter, keyboard::key::Named::Escape] {
+                    let (messages, labels) =
+                        dispatch(&renderer, &request, surface, true, Some("card"), key);
+                    assert!(
+                        messages.is_empty(),
+                        "policy or unknown decisions supply no card shortcut"
+                    );
+                    assert!(
+                        !labels
+                            .iter()
+                            .any(|label| label.ends_with(" (Esc)") || label.ends_with(" (Enter)"))
+                    );
+                }
+            }
+            let (mut adapter, request) = request(
+                &home,
+                "item/commandExecution/requestApproval",
+                &[json!("accept"), json!("cancel")],
+            );
+            for (available, focus) in [(true, None), (false, Some("card"))] {
+                assert!(
+                    dispatch(
+                        &renderer,
+                        &request,
+                        surface,
+                        available,
+                        focus,
+                        keyboard::key::Named::Escape
+                    )
+                    .0
+                    .is_empty()
+                );
+            }
+            let (messages, _) = dispatch(
+                &renderer,
+                &request,
+                surface,
+                true,
+                Some("card"),
+                keyboard::key::Named::Enter,
+            );
+            let [Message::ChatUi(Action::Answer(_, id, choice))] = messages.as_slice() else {
+                panic!("focused card Enter retains the explicit one-time grant");
+            };
+            assert_eq!(
+                adapter
+                    .command(Command::Answer {
+                        request_id: id.clone(),
+                        action: choice.clone(),
+                        answers: Vec::new(),
+                    })
+                    .unwrap()
+                    .writes,
+                vec![json!({"id":71,"result":{"decision":"accept"}})]
+            );
+        }
+    }
+
+    #[test]
     fn reused_requests_reject_retired_native_actions_in_both_surfaces() {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced_accessibility::accesskit::{
@@ -7291,9 +7719,7 @@ mod tests {
             let mut messages = Vec::new();
             // Match iced-winit conversion::a11y: native events contain only
             // the advertised numeric NodeId, never a Custom widget name.
-            let event_id = iced::advanced::widget::Id::from(
-                u128::from(target_node.0) as u64,
-            );
+            let event_id = iced::advanced::widget::Id::from(u128::from(target_node.0) as u64);
             element.as_widget_mut().update(
                 tree,
                 &iced::Event::A11y(
@@ -7344,7 +7770,9 @@ mod tests {
                 };
                 let mut element = request_view(original, &request, &answers, true, surface);
                 let mut tree = Tree::new(element.as_widget());
-                let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
                 let first = advertised_answer(&element, &tree, &node);
                 let initial = click(&mut element, &mut tree, &node, &renderer, first);
                 assert!(matches!(initial.as_slice(),
@@ -7353,7 +7781,9 @@ mod tests {
 
                 element = request_view(original, &request, &answers, true, surface);
                 tree.diff(element.as_widget_mut());
-                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
                 let retired = advertised_answer(&element, &tree, &node);
                 if matches!(surface, RequestSurface::Transcript) {
                     // Anonymous transcript answers retain their numeric ID on
@@ -7368,7 +7798,9 @@ mod tests {
                 // The new actor can reuse the provider's numeric request ID.
                 element = request_view(replacement, &request, &answers, true, surface);
                 tree.diff(element.as_widget_mut());
-                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
                 let current = advertised_answer(&element, &tree, &node);
                 assert!(click(&mut element, &mut tree, &node, &renderer, retired).is_empty());
                 let fresh = click(&mut element, &mut tree, &node, &renderer, current);

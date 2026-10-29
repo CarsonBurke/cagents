@@ -63,6 +63,86 @@ const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
 const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
 
+/// The effect of an approval action, independent of its displayed payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalRole {
+    Once,
+    Session,
+    Decline,
+    Cancel,
+    DenyPermissions,
+    PolicyAllow,
+    PolicyDeny,
+}
+
+/// Action IDs are opaque to callers. The adapter stamps known wire semantics
+/// into its own IDs so views never infer permission from labels or arguments.
+/// Old unclassified IDs deliberately provide no keyboard authority.
+pub fn approval_role(id: &str) -> Option<ApprovalRole> {
+    use ApprovalRole::*;
+    Some(match id {
+        "accept" | "grant-turn" => Once,
+        "acceptForSession" | "grant-session" => Session,
+        "decline" => Decline,
+        "cancel" => Cancel,
+        "deny" => DenyPermissions,
+        _ => {
+            let (index, role) = id.strip_prefix("decision-")?.split_once(':')?;
+            index.parse::<usize>().ok()?;
+            match role {
+                "once" => Once,
+                "session" => Session,
+                "decline" => Decline,
+                "cancel" => Cancel,
+                "policy-allow" => PolicyAllow,
+                "policy-deny" => PolicyDeny,
+                _ => return None,
+            }
+        }
+    })
+}
+
+fn decision_id(index: usize, value: &Value) -> String {
+    let role = match value.as_str() {
+        Some("accept") => "once",
+        Some("acceptForSession") => "session",
+        Some("decline") => "decline",
+        Some("cancel") => "cancel",
+        _ => match value.as_object().filter(|object| object.len() == 1) {
+            Some(object)
+                if object
+                    .get("acceptWithExecpolicyAmendment")
+                    .and_then(Value::as_object)
+                    .filter(|amendment| amendment.len() == 1)
+                    .and_then(|amendment| amendment.get("execpolicy_amendment"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|arguments| arguments.iter().all(Value::is_string)) =>
+            {
+                "policy-allow"
+            }
+            Some(object) => object
+                .get("applyNetworkPolicyAmendment")
+                .and_then(Value::as_object)
+                .filter(|amendment| amendment.len() == 1)
+                .and_then(|amendment| amendment.get("network_policy_amendment"))
+                .and_then(Value::as_object)
+                .filter(|policy| {
+                    policy.len() == 2 && policy.get("host").is_some_and(Value::is_string)
+                })
+                .and_then(|policy| policy.get("action"))
+                .and_then(Value::as_str)
+                .map(|action| match action {
+                    "allow" => "policy-allow",
+                    "deny" => "policy-deny",
+                    _ => "unknown",
+                })
+                .unwrap_or("unknown"),
+            None => "unknown",
+        },
+    };
+    format!("decision-{index}:{role}")
+}
+
 fn append_display_output(output: &mut String, delta: &str, limit: usize) -> bool {
     if (output.ends_with(OUTPUT_TRUNCATED) && output.len().saturating_add(3) >= limit)
         || delta.is_empty()
@@ -1406,7 +1486,7 @@ impl Codex {
                 }
                 if let Some(decisions) = params["availableDecisions"].as_array() {
                     for (index, decision) in decisions.iter().enumerate() {
-                        actions.insert(format!("decision-{index}"), decision.clone());
+                        actions.insert(decision_id(index, decision), decision.clone());
                     }
                 } else {
                     for decision in ["accept", "acceptForSession", "decline", "cancel"] {
@@ -3222,6 +3302,14 @@ fn unique_answer<'a>(answers: &'a [Answer], field: &str) -> Result<&'a Answer, S
     Ok(answer)
 }
 fn decision_label(id: &str, value: &Value) -> String {
+    match approval_role(id) {
+        Some(ApprovalRole::PolicyAllow) if value.get("acceptWithExecpolicyAmendment").is_some() => {
+            return "Always allow this command prefix".into();
+        }
+        Some(ApprovalRole::PolicyAllow) => return "Always allow this host".into(),
+        Some(ApprovalRole::PolicyDeny) => return "Always deny this host".into(),
+        _ => {}
+    }
     match value.as_str().unwrap_or(id) {
         "accept" => "Allow once",
         "acceptForSession" => "Allow for session",
@@ -5917,7 +6005,7 @@ mod tests {
             adapter
                 .command(Command::Answer {
                     request_id: rpc_id(&json!(7)).unwrap(),
-                    action: "decision-0".into(),
+                    action: "decision-0:once".into(),
                     answers: vec![]
                 })
                 .is_err()
@@ -5925,7 +6013,7 @@ mod tests {
         let answered = adapter
             .command(Command::Answer {
                 request_id: rpc_id(&json!("7")).unwrap(),
-                action: "decision-1".into(),
+                action: "decision-1:decline".into(),
                 answers: vec![],
             })
             .unwrap();
@@ -5936,6 +6024,77 @@ mod tests {
                 .unwrap()
                 .clone()
         );
+    }
+
+    #[test]
+    fn approval_roles_preserve_the_original_decision_and_reject_unknown_inference() {
+        use ApprovalRole::*;
+        for (decision, role) in [
+            (json!("accept"), Some(Once)),
+            (json!("acceptForSession"), Some(Session)),
+            (json!("decline"), Some(Decline)),
+            (json!("cancel"), Some(Cancel)),
+            (
+                json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["python","scripts/cancel_job.py","deny","always"]}}),
+                Some(PolicyAllow),
+            ),
+            (
+                json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"deny.example","action":"allow"}}}),
+                Some(PolicyAllow),
+            ),
+            (
+                json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"allow.example","action":"deny"}}}),
+                Some(PolicyDeny),
+            ),
+            (json!("deny"), None),
+            (json!({"futureDecision":{"label":"deny and cancel"}}), None),
+            (
+                json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":"cancel"}}),
+                None,
+            ),
+            (
+                json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"cancel.example","action":"future"}}}),
+                None,
+            ),
+            (
+                json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["cancel"]},"futureDecision":"deny"}),
+                None,
+            ),
+        ] {
+            let mut adapter = adapter();
+            let step = adapter.receive(json!({"id":71,"method":"item/commandExecution/requestApproval","params":{
+                "threadId":"thread-exact","turnId":"turn","itemId":"tool","availableDecisions":[decision],"command":"fixture"
+            }})).unwrap();
+            let request = step
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Request(request) => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            let choice = &request.actions[0];
+            assert_eq!(approval_role(&choice.id), role);
+            let reply = adapter
+                .command(Command::Answer {
+                    request_id: request.id.clone(),
+                    action: choice.id.clone(),
+                    answers: Vec::new(),
+                })
+                .unwrap();
+            assert_eq!(
+                reply.writes,
+                vec![json!({"id":71,"result":{"decision":decision}})]
+            );
+        }
+        for id in [
+            "decision-0",
+            "decision-1",
+            "decision-x:once",
+            "decision-1:cancel:once",
+        ] {
+            assert_eq!(approval_role(id), None);
+        }
     }
 
     /// A command writes for a terminal, and Codex forwards what it wrote: a
@@ -6639,7 +6798,7 @@ mod tests {
         let denied = adapter
             .command(Command::Answer {
                 request_id: "1".into(),
-                action: "decision-1".into(),
+                action: "decision-1:decline".into(),
                 answers: vec![],
             })
             .unwrap();
@@ -6666,7 +6825,7 @@ mod tests {
         let allowed = adapter
             .command(Command::Answer {
                 request_id: "1".into(),
-                action: "decision-0".into(),
+                action: "decision-0:once".into(),
                 answers: vec![],
             })
             .unwrap();
@@ -6718,7 +6877,7 @@ mod tests {
         let denied = parent
             .command(Command::Answer {
                 request_id: "1".into(),
-                action: "decision-1".into(),
+                action: "decision-1:decline".into(),
                 answers: vec![],
             })
             .unwrap();
@@ -6741,7 +6900,7 @@ mod tests {
         adapter
             .command(Command::Answer {
                 request_id: "1".into(),
-                action: "decision-1".into(),
+                action: "decision-1:decline".into(),
                 answers: vec![],
             })
             .unwrap();
