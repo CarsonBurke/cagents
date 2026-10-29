@@ -1730,6 +1730,98 @@ fn queued_failed_remove_cannot_close_an_exactly_repaired_chat() {
 }
 
 #[test]
+fn quarantined_pane_removal_restores_the_surviving_native_control() {
+    assert!(
+        std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),
+        "This isolated widget fixture requires a genuine User invocation; inherited caller authority must not be cleared"
+    );
+    if isolated("quarantined_pane_removal_restores_the_surviving_native_control") {
+        return;
+    }
+    for route in ["chrome", "failed-button", "background", "last"] {
+        let (mut app, _, hidden, pane, _) = cached_chat();
+        let healthy = CardId::new();
+        let mut session = match &pane.kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        session.id = TerminalId::new();
+        session.launch.session_id = None;
+        session.proof = None;
+        session.terminal = None;
+        session.owned_codex_listener = None;
+        session.native_continuity = Default::default();
+        assert!(session.is_unstarted());
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(hidden);
+        durable.focused = Some(if route == "background" {
+            healthy
+        } else {
+            pane.id
+        });
+        let generation = durable.generation;
+        if route != "last" {
+            durable.cards.push(CardState {
+                id: healthy,
+                generation,
+                title: "Healthy draft".into(),
+                width_fraction: 0.5,
+                kind: CardKind::Chat(session.clone()),
+                existence: Existence::Open,
+                exposure: Exposure::Visible,
+                residency: Residency::Hot,
+            });
+        }
+        let channel = durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap();
+        if route != "last" {
+            channel.cards.insert(0, healthy);
+        }
+        channel.focused = durable.focused;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        app.context_inspector_open = false;
+        if route != "last" {
+            // An unstarted draft supplies the real composer; its returned
+            // skill-loading Task is not executed and no provider is started.
+            drop(app.open_chat(healthy, session, crate::chat::Intent::Start));
+        }
+        app.shared_views.quarantined.insert(pane.id);
+        app.present_quarantined_pane(pane.id);
+        drop(app.sync_chrome());
+        // Do not let setup's deferred focus conceal a missing close handoff.
+        let _ = app.workspace.take_widget_focus_request();
+        let task = if route == "failed-button" {
+            let message = click_quarantined_remove(&app, pane.id);
+            app.update(message)
+        } else {
+            app.update(Message::CloseCard(pane.id))
+        };
+        assert!(app.workspace.card(pane.id).is_none());
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        let toolbar = widget::Id::new(TOOLBAR_FOCUS_ID);
+        let (expected, task) = if route == "background" {
+            // Closing a different pane must preserve a deliberate toolbar
+            // choice instead of pulling the keyboard back to the composer.
+            let initial = iced::widget::operation::focus(toolbar.clone()).map(cosmic::Action::App);
+            (toolbar, initial.chain(task))
+        } else if route == "last" {
+            (toolbar, task)
+        } else {
+            (card_control_id(healthy, "chat-composer"), task)
+        };
+        assert_eq!(
+            crate::app::tests::focused(&app, task),
+            Some(expected),
+            "{route} must hand the keyboard to the actual surviving widget"
+        );
+    }
+}
+
+#[test]
 fn keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click() {
     assert!(
         std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),

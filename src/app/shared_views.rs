@@ -638,18 +638,22 @@ impl Cagents {
         {
             return Task::none();
         }
-        let update = if self.workspace.card(card).is_some() {
-            if self.workspace.pending_close().is_none()
-                && self.workspace.request_close(card).is_err()
-            {
-                return Task::none();
-            }
-            match self.workspace.commit_close(card) {
-                Ok(update) => Some(update),
+        let (update, handoff) = if self.workspace.card(card).is_some() {
+            let handoff = match self.workspace.pending_close() {
+                Some(handoff) if handoff.unmounting == card => handoff,
+                Some(_) => return Task::none(),
+                None => match self.workspace.request_close(card) {
+                    Ok(handoff) => handoff,
+                    Err(_) => return Task::none(),
+                },
+            };
+            let update = match self.workspace.commit_close(card) {
+                Ok(update) => update,
                 Err(_) => return Task::none(),
-            }
+            };
+            (Some(update), Some(handoff))
         } else {
-            None
+            (None, None)
         };
         self.quarantine_shared_chat(card);
         self.cards.remove(&card);
@@ -688,7 +692,24 @@ impl Cagents {
         ));
         let viewport =
             update.map_or_else(Task::none, |update| self.apply_viewport(update, true, true));
-        Task::batch([viewport, self.sync_chrome()])
+        // This local close bypasses ordinary runtime retirement and its native
+        // handoff. Restore the surviving control after committing the removal,
+        // with the same hidden/background guards as ordinary card removal.
+        let focus = if self.workspace_surfaces_visible()
+            && handoff
+                .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
+        {
+            iced::widget::operation::focus(
+                self.workspace
+                    .focused()
+                    .map(|card| self.card_keyboard_focus(card))
+                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+            )
+            .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        };
+        Task::batch([viewport, self.sync_chrome(), focus])
     }
     pub(super) fn refresh_managed_pane_quarantine(
         &mut self,
