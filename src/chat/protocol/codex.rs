@@ -451,6 +451,7 @@ fn create_inner(
             suggestion_turn: None,
             prediction_turn: None,
             predictions_unsupported: false,
+            subagent_named: false,
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
@@ -604,6 +605,7 @@ struct Codex {
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
     predictions_unsupported: bool,
+    subagent_named: bool,
     subagent_status: Option<ToolStatus>,
     subagent_waiting: bool,
     subagent_detail: String,
@@ -727,6 +729,12 @@ impl Codex {
             // Sparse collab metadata must not reset a known terminal outcome.
             child.subagent_status = Some(status);
         }
+        let nickname = agent_nickname(metadata);
+        if nickname.is_some()
+            && let Some(child) = self.children.get_mut(id)
+        {
+            child.subagent_named = true;
+        }
         step.events.push(Event::Subagent {
             model,
             waiting: None,
@@ -735,12 +743,7 @@ impl Codex {
             // Roles describe capabilities, not identity. Empty sparse metadata
             // preserves a known nickname in the runtime; an unnamed child
             // otherwise leaves its identity to the navigation fallback.
-            kind: metadata["agentNickname"]
-                .as_str()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_default()
-                .into(),
+            kind: nickname.unwrap_or_default().into(),
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
@@ -2605,6 +2608,23 @@ impl Adapter for Codex {
                                 child.history(&mut content, None)?;
                             }
                         }
+                        // Hydration can fill an identity absent from discovery,
+                        // but cannot replace any genuine name already seen live.
+                        if !child.subagent_named
+                            && let Some(nickname) = agent_nickname(&result["thread"])
+                        {
+                            child.subagent_named = true;
+                            step.events.push(Event::Subagent {
+                                id: id.clone(),
+                                kind: nickname.into(),
+                                description: String::new(),
+                                status: None,
+                                background: None,
+                                model: None,
+                                waiting: None,
+                                detail: None,
+                            });
+                        }
                         self.child_step(&id, content, &mut step)?;
                     }
                     let buffered = if self
@@ -3328,6 +3348,13 @@ impl Codex {
         Ok(())
     }
 }
+fn agent_nickname(metadata: &Value) -> Option<&str> {
+    metadata["agentNickname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 fn agent_status(status: &Value) -> Option<ToolStatus> {
     match status.as_str().or_else(|| status["type"].as_str()) {
         Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
@@ -5850,6 +5877,7 @@ mod tests {
             suggestion_turn: None,
             prediction_turn: None,
             predictions_unsupported: false,
+            subagent_named: false,
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
