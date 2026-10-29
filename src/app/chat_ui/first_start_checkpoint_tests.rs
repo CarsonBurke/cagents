@@ -293,7 +293,7 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
 }
 
 #[test]
-fn failed_first_start_save_can_retry_the_same_candidate_after_its_cause_is_repaired() {
+fn failed_first_start_save_retries_with_a_fresh_candidate_after_its_cause_is_repaired() {
     let (mut app, _directory, card, target) = fixture();
     let source = runtime(&app, card).session.clone();
     let images = runtime(&app, card).attachments.clone();
@@ -335,9 +335,15 @@ fn failed_first_start_save_can_retry_the_same_candidate_after_its_cause_is_repai
         "First prompt remains local"
     );
     assert_eq!(runtime(&app, card).attachments, images);
-    assert_eq!(
-        app.chat_ui.canceled_draft_starts[&card].candidate,
-        candidate
+    assert!(app.chat_ui.draft_checkpoints.is_empty());
+    // The failure queued its return to A behind the refused write. Storage
+    // still holds the fixture's foreign identity, so that is refused too.
+    assert!(
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .is_err()
     );
 
     store
@@ -347,7 +353,9 @@ fn failed_first_start_save_can_retry_the_same_candidate_after_its_cause_is_repai
     let pending = &app.chat_ui.draft_checkpoints[&card];
     assert_eq!(pending.target, target);
     assert_eq!(pending.source, source);
-    assert_eq!(pending.candidate, candidate);
+    assert_ne!(pending.candidate.id, candidate.id);
+    assert_ne!(pending.candidate.id, source.id);
+    let candidate = pending.candidate.clone();
     assert_eq!(pending.registry, registry);
     assert_eq!(
         pending.scope,
@@ -649,11 +657,28 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
         }
         if change != "nonce" {
             assert!(app.chat_ui.draft_checkpoints.is_empty());
-            assert_eq!(
-                app.chat_ui.canceled_draft_starts[&card].candidate.id,
-                candidate
-            );
-        } else {
+        }
+        if !matches!(change, "nonce" | "closed" | "writer") {
+            // B landed, but nothing started: storage returns to the
+            // conversation the composer shows, so later saves are accepted.
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            let shown = match &app.card_state(card).unwrap().kind {
+                CardKind::Chat(source) => source.clone(),
+                _ => unreachable!(),
+            };
+            assert_eq!(stored(&app, card), shown, "{change}");
+            assert_ne!(shown.id, candidate, "{change}");
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+        } else if change == "nonce" {
             assert_eq!(
                 app.chat_ui.draft_checkpoints[&card].candidate.id, candidate,
                 "no new candidate or false rollback"
@@ -663,7 +688,7 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
 }
 
 #[test]
-fn edited_message_requires_new_save_of_same_candidate_before_starting() {
+fn edited_message_requires_a_new_save_before_starting() {
     let (mut app, _directory, card, target) = fixture();
     let first = app.start_chat_draft(target);
     let candidate = app.chat_ui.draft_checkpoints[&card].candidate.id;
@@ -677,7 +702,11 @@ fn edited_message_requires_new_save_of_same_candidate_before_starting() {
     drop(app.draft_start_checkpointed(target, old_attempt, result));
     no_starter(&app, card);
     let next = app.start_chat_draft(target);
-    assert_eq!(app.chat_ui.draft_checkpoints[&card].candidate.id, candidate);
+    let candidate = {
+        let retry = app.chat_ui.draft_checkpoints[&card].candidate.id;
+        assert_ne!(retry, candidate, "the declined B was returned to A");
+        retry
+    };
     let attempt = app.chat_ui.draft_checkpoints[&card].attempt;
     assert_ne!(attempt, old_attempt);
     drop(app.draft_start_checkpointed(target, old_attempt, Ok(())));
@@ -697,6 +726,9 @@ fn edited_message_requires_new_save_of_same_candidate_before_starting() {
     assert_eq!(
         runtime(&app, card).queued.as_ref().unwrap().source.text(),
         "Second deliberate send"
+    );
+    assert!(
+        matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate)
     );
     drop(start);
 }
@@ -742,14 +774,15 @@ fn closing_a_checkpoint_keeps_landed_identity_tombstoned_without_an_actor_or_pro
 }
 
 #[test]
-fn deliberate_candidate_retry_does_not_rearm_an_unrelated_refused_identity() {
+fn deliberate_retry_does_not_rearm_an_unrelated_refused_identity() {
     let (mut app, _directory, card, target) = fixture();
+    let source = runtime(&app, card).session.clone();
     let first = app.start_chat_draft(target);
     let candidate = app.chat_ui.draft_checkpoints[&card].candidate.clone();
     let (target, attempt, result) = checkpoint(first);
     assert!(result.is_ok());
-    // Editing after the receipt declines activation while leaving the exact
-    // already-landed B as the only candidate for the next deliberate Send.
+    // Editing after the receipt declines activation and returns the
+    // already-landed B to A behind it.
     match app.cards.get_mut(&card).unwrap() {
         CardRuntime::Chat(runtime) => {
             runtime.replace_draft(text_editor::Content::with_text("Edited first prompt"))
@@ -794,19 +827,72 @@ fn deliberate_candidate_retry_does_not_rearm_an_unrelated_refused_identity() {
     store
         .replace_chat_identity(other, foreign.id, &unrelated)
         .unwrap();
+    assert_eq!(stored(&app, card), source);
     let retry = app.start_chat_draft(target);
-    assert_eq!(app.chat_ui.draft_checkpoints[&card].candidate, candidate);
+    let retried = app.chat_ui.draft_checkpoints[&card].candidate.clone();
+    assert_ne!(retried.id, candidate.id);
     let (target, attempt, result) = checkpoint(retry);
     assert!(
         result.is_err(),
         "unrelated refusal is still truthful save health"
     );
+    // This card's own C landed beside the unrelated refusal.
+    assert_eq!(stored(&app, card), retried);
     drop(app.draft_start_checkpointed(target, attempt, result));
-    assert_eq!(stored(&app, other), unrelated);
-    assert_ne!(stored(&app, other), refused);
-    assert_eq!(stored(&app, card), candidate);
     no_starter(&app, card);
     assert_eq!(runtime(&app, card).composer.text(), "Edited first prompt");
+    // The failed receipt returns C to A, so later autosaves of the composer
+    // the reader still sees are accepted rather than refused for C.
+    assert!(
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .is_err()
+    );
+    assert_eq!(stored(&app, card), source);
+    assert_eq!(stored(&app, other), unrelated);
+    assert_ne!(stored(&app, other), refused);
+    match app.cards.get_mut(&card).unwrap() {
+        CardRuntime::Chat(runtime) => {
+            runtime.replace_draft(text_editor::Content::with_text("Autosaved after failure"))
+        }
+        _ => unreachable!(),
+    }
+    app.persist();
+    let _ = app.session.as_ref().unwrap().flush(Duration::from_secs(5));
+    let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+    assert_eq!(saved.chat_drafts[&card], "Autosaved after failure");
+}
+
+#[test]
+fn declined_first_start_leaves_a_provider_switch_its_expected_identity() {
+    // A landed B whose start was declined must not strand storage on B: the
+    // picker's provider switch replaces the identity the composer shows, A.
+    let (mut app, directory, card, target) = fixture();
+    let source = runtime(&app, card).session.clone();
+    let task = app.start_chat_draft(target);
+    let (target, attempt, result) = checkpoint(task);
+    assert!(result.is_ok());
+    app.settings_reset_confirm = true;
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    app.settings_reset_confirm = false;
+    no_starter(&app, card);
+    let switched = fresh_chat_session(
+        Provider::Claude,
+        source.id,
+        directory.path().to_owned(),
+        &Account::system(Provider::Claude),
+        false,
+    )
+    .unwrap();
+    app.replace_chat_conversation(card, switched.clone());
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(stored(&app, card), switched);
 }
 
 #[test]
@@ -1198,7 +1284,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         // protects the pane, and the provider is still busy with the original turn.
         drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
         drop(app.handle_chat_ui(Action::CommandFinished(target, command, Ok(()))));
-        drop(app.apply_workspace_model_update(ModelUpdate::Read(empty)));
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
         let current = runtime(&app, card);
         assert!(Arc::ptr_eq(current.handle().unwrap(), &handle));
         assert_eq!(current.session.id, actor);
@@ -1279,6 +1365,53 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
         );
         assert!(!app.chat_start_pending(card));
+        // The first turn finishes, so no local work protects the pane any
+        // more. Later reads, including a reordered one from before the ack,
+        // must neither detach it nor turn a shared creation local-only.
+        let items = runtime(&app, card).snapshot.items.clone();
+        super::show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            Snapshot {
+                ready: true,
+                busy: false,
+                session_id: Some("first-send-native-thread".into()),
+                items,
+                ..Snapshot::default()
+            },
+        );
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        assert!(!runtime(&app, card).snapshot.busy);
+        assert!(!app.shared_chat_has_local_work(card));
+        let reads = if refuse_creation {
+            vec![app.workspace_model.clone(), empty]
+        } else {
+            vec![accepted.clone(), empty, accepted]
+        };
+        for read in reads {
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(read)));
+            assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
+            assert_eq!(runtime(&app, card).session.id, actor);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert_eq!(
+                app.durable.local_only_cards.contains(&card),
+                refuse_creation
+            );
+            assert_eq!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|entry| entry.id == channel)
+                    .unwrap()
+                    .cards,
+                vec![card]
+            );
+        }
+        assert!(
+            !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(edit,
+        ModelEdit::ChangeView { change: Change::Remove { id }, .. } if id == card))
+        );
         if refuse_creation {
             // A separate app reads the actual saved workspace. This exercises
             // only projection/custody; native actor reattachment is not polled.
@@ -1321,7 +1454,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             }
             assert!(!reopened.chat_start_pending(card));
             // Retaining a refused creation grants no authority to override a
-            // later canonical retirement, even while the provider is busy.
+            // later canonical retirement.
             let mut retired = app.workspace_model.clone();
             retired.sequence += 1;
             retired.views[0].retired.push(card);
