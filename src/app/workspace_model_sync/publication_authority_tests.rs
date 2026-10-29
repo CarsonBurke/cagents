@@ -3148,7 +3148,7 @@ fn an_exact_completed_reopen_releases_its_shield_for_a_newer_current_project_clo
         };
         let close_sequence = opened.sequence + 1;
         let cards = app.durable.cards.clone();
-        let drafts = app.persistent_workspace().chat_drafts;
+        let drafts = app.persistent_workspace().chat_drafts.clone();
         let focus = app.workspace.focused();
         if reply_before_connection {
             // The reply from B cannot itself replace A. A later observer
@@ -3243,7 +3243,7 @@ fn a_provisional_picker_reopen_shields_existing_shared_channels_before_inventory
     let generation = app.repository_generations[&provisional];
     let original = app.workspace_model_reopens.active[&provisional].clone();
     let cards = app.durable.cards.clone();
-    let drafts = app.persistent_workspace().chat_drafts;
+    let drafts = app.persistent_workspace().chat_drafts.clone();
     let focus = app.workspace.focused();
     drop(
         app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
@@ -3323,7 +3323,7 @@ fn contradicted_reopen_proof_cannot_repeat_a_dismissed_warning_or_settle_on_late
     closed.projects.clear();
     closed.closed_projects.push(repository.clone());
     closed.identity = uuid::Uuid::new_v4();
-    let drafts = app.persistent_workspace().chat_drafts;
+    let drafts = app.persistent_workspace().chat_drafts.clone();
     let cards = app.durable.cards.clone();
     let focus = app.workspace.focused();
     drop(
@@ -4298,7 +4298,7 @@ fn prepublication_inventory_failure_keeps_loaded_and_provisional_retry_work_prot
         );
         let channels = app.durable.channels.clone();
         let cards = app.durable.cards.clone();
-        let drafts = app.persistent_workspace().chat_drafts;
+        let drafts = app.persistent_workspace().chat_drafts.clone();
         let focused = app.workspace.focused();
         // A retry from the picker can use either the loaded project P or a
         // provisional Q that has no sidebar row until inventory completes.
@@ -4405,7 +4405,7 @@ fn prepublication_inventory_failure_keeps_loaded_and_provisional_retry_work_prot
             );
         }
         let recovered_cards = app.durable.cards.clone();
-        let recovered_drafts = app.persistent_workspace().chat_drafts;
+        let recovered_drafts = app.persistent_workspace().chat_drafts.clone();
         for (target, draft) in &drafts {
             assert_eq!(recovered_drafts.get(target), Some(draft));
         }
@@ -4458,7 +4458,7 @@ fn inventory_failure_after_publication_keeps_the_inflight_shield_until_its_real_
     );
     let channels = app.durable.channels.clone();
     let cards = app.durable.cards.clone();
-    let drafts = app.persistent_workspace().chat_drafts;
+    let drafts = app.persistent_workspace().chat_drafts.clone();
     let focused = app.workspace.focused();
     drop(app.update(Message::RepositoryLoaded {
         open_cards: true,
