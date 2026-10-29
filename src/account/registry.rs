@@ -677,6 +677,7 @@ impl Registry {
             return Ok(key);
         }
         if self.find(key).is_some()
+            || self.pending.iter().any(|row| row.key == key)
             || self
                 .preparations
                 .iter()

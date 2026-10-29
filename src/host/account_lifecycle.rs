@@ -1230,6 +1230,144 @@ pub(crate) mod tests {
         assert_eq!(store.load().unwrap().label(&account), Some("external edit"));
     }
     #[test]
+    fn scoped_registry_mutation_detects_retained_identity_and_receipt_changes() {
+        use crate::account::registry::ExistingPendingTarget;
+        for stage in ["adopt", "cancel", "receipt"] {
+            let root = tempfile::tempdir().unwrap();
+            let homes = Homes::at(root.path().join("homes"));
+            let store = Store::at(root.path().join("registry"));
+            let (key, path) = store
+                .create_pending(&homes, Provider::Codex, 1, || {
+                    homes.create(Provider::Codex, None)
+                })
+                .unwrap();
+            let target = ExistingPendingTarget::Observed {
+                provider: Provider::Codex,
+                key,
+                started_at: 1,
+                expected_installation: None,
+            };
+            let adopted = if stage == "adopt" {
+                None
+            } else {
+                Some(store.resume_existing_pending(&target).unwrap())
+            };
+            if stage == "receipt" {
+                store
+                    .cancel_existing_pending(
+                        &homes,
+                        uuid::Uuid::new_v4(),
+                        &adopted.as_ref().unwrap().binding,
+                    )
+                    .unwrap();
+            }
+            let account = Account::managed(Provider::Codex, key, path);
+            let host = host();
+            let reservation =
+                Reservation::test_install(&host, &[account], store.clone(), &homes).unwrap();
+            store
+                .update(|registry| {
+                    registry.set_label(&Account::system(Provider::Claude), Some("unrelated".into()))
+                })
+                .unwrap();
+            let mut effects = 0;
+            store
+                .try_update_reserved(&reservation, |_| effects += 1)
+                .unwrap();
+            assert_eq!(
+                effects, 1,
+                "unrelated preference edit is not a global revision veto"
+            );
+            let pending_before = store.load().unwrap().pending().to_vec();
+            if stage == "adopt" {
+                store.resume_existing_pending(&target).unwrap();
+            } else {
+                store
+                    .cancel_existing_pending(
+                        &homes,
+                        uuid::Uuid::new_v4(),
+                        &adopted.as_ref().unwrap().binding,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(store.load().unwrap().pending(), pending_before);
+            effects = 0;
+            assert!(
+                store
+                    .try_update_reserved(&reservation, |_| effects += 1)
+                    .is_err()
+            );
+            assert_eq!(effects, 0);
+            let registered = crate::account::registry::Registered {
+                key,
+                provider: Provider::Codex,
+                linked_home: None,
+                label: None,
+                email: Some("cas@example.invalid".into()),
+                organization: None,
+                added_at: 1,
+            };
+            assert!(
+                store
+                    .try_register_pending_reserved(&reservation, &homes, registered, &[])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_registry_mutation_detects_preparation_only_cancellation() {
+        use crate::account::registry::PreparationPayload;
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let planned = store
+            .plan_preparation(
+                uuid::Uuid::new_v4(),
+                PreparationPayload {
+                    provider: Provider::Codex,
+                    copy_codex_config: true,
+                },
+            )
+            .unwrap();
+        store
+            .create_prepared(
+                &homes,
+                &planned.binding,
+                false,
+                |_| Ok(()),
+                || {
+                    homes.create_planned_with_config_initialized(
+                        Provider::Codex,
+                        planned.binding.key,
+                        None,
+                        CodexConfig::Copy,
+                        |_| Ok(()),
+                    )
+                },
+            )
+            .unwrap();
+        let host = host();
+        let account = Account::managed(
+            Provider::Codex,
+            planned.binding.key,
+            homes.path(Provider::Codex, planned.binding.key),
+        );
+        let reservation =
+            Reservation::test_install(&host, &[account], store.clone(), &homes).unwrap();
+        let pending = store.load().unwrap().pending().to_vec();
+        store.cancel_preparation(&homes, &planned.binding).unwrap();
+        assert_eq!(store.load().unwrap().pending(), pending);
+        let mut effects = 0;
+        assert!(
+            store
+                .try_update_reserved(&reservation, |_| effects += 1)
+                .is_err()
+        );
+        assert_eq!(effects, 0);
+    }
+
+    #[test]
     fn unknown_and_relative_pinned_roots_cannot_bypass_reservation() {
         let root = tempfile::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));

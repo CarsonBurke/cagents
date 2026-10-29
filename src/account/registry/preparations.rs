@@ -50,6 +50,14 @@ impl Registry {
         {
             return Err(invalid());
         }
+        let mut pending_keys = std::collections::HashSet::new();
+        if self
+            .pending
+            .iter()
+            .any(|row| !pending_keys.insert(row.key) || registered_keys.contains(&row.key))
+        {
+            return Err(invalid());
+        }
         if self.preparations.is_empty() && self.installation.is_none() {
             return Ok(());
         }
@@ -218,7 +226,10 @@ impl Store {
         self.preparation_transaction(nonblocking, |registry| {
             let existing = registry.exact_preparation(binding)?.clone();
             let path = homes.path(binding.payload.provider, binding.key);
-            if existing.state == PreparationState::Registered {
+            if matches!(
+                existing.state,
+                PreparationState::Registered | PreparationState::CancelledRetained
+            ) {
                 return Ok(existing);
             }
             if registry.accounts.iter().any(|account| {
@@ -369,7 +380,7 @@ impl Store {
         self.preparation_transaction_with_sync(nonblocking, change, |namespace| namespace.sync())
     }
 
-    fn preparation_transaction_with_sync<T>(
+    pub(super) fn preparation_transaction_with_sync<T>(
         &self,
         nonblocking: bool,
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
@@ -959,6 +970,18 @@ mod tests {
                 .unwrap()
                 .1
                 .unwrap();
+            if state == PreparationState::CancelledRetained {
+                let before = fs::read(fixture.store.path()).unwrap();
+                assert_eq!(
+                    fixture
+                        .store
+                        .cancel_preparation(&fixture.homes, &planned.binding)
+                        .unwrap()
+                        .state,
+                    state
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            }
             let registry = fixture.store.load().unwrap();
             assert!(registry.contains_managed_home(
                 &fixture.homes,
