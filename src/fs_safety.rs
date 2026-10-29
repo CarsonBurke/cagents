@@ -2316,6 +2316,7 @@ pub(crate) mod tests {
         let restricted = File::open(directory.path().join("restricted")).unwrap();
         let acl = restrictive_access_acl();
         if !set_test_access_acl(&restricted, &acl) {
+            eprintln!("EDITOR_ACL_FIXTURE_UNSUPPORTED");
             return;
         }
         assert_eq!(
@@ -2360,6 +2361,7 @@ pub(crate) mod tests {
             fs::read(directory.path().join("copies/restricted")).unwrap(),
             b"private contents"
         );
+        eprintln!("EDITOR_ACL_COPY_VERIFIED");
     }
 
     #[cfg(target_os = "linux")]
