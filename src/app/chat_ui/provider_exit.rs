@@ -444,6 +444,140 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_output_reconnect_retires_old_copy_and_admits_fresh_copy_for_the_same_log() {
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+
+        for stale_success in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(
+                Provider::Codex,
+                Some(PathBuf::from("/workspace/chat-fixture")),
+            ));
+            let card = app.workspace.focused().unwrap();
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("draft chat");
+            };
+            let old_target = runtime.target;
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.ready = true;
+            snapshot.exited = true;
+            snapshot.turn_generation = 7;
+            snapshot.provider_exit = Some(chat::ProviderExitDiagnostic {
+                summary: "Provider exited with status 7".into(),
+                output: "recent tail".into(),
+                log: Some(chat::ProviderExitLog {
+                    id: "same-retained-log".into(),
+                    bytes: 17,
+                    omitted: 2,
+                }),
+            });
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot.clone());
+            runtime.provider_exit_expanded = true;
+            // Hold the real load task without polling its fixture transport.
+            let _old_load = app.handle_chat_ui(Action::CopyProviderExit(old_target));
+            let old_request = app
+                .chat_runtime_mut(old_target)
+                .unwrap()
+                .provider_exit_output
+                .request
+                .as_ref()
+                .unwrap()
+                .request
+                .clone();
+            drop(app.handle_chat_ui(Action::Reconnect(old_target)));
+            let target = app.chat_ui.attempt(card).unwrap().target;
+            assert_ne!(target, old_target);
+            assert!(app.chat_runtime_mut(old_target).is_some());
+            assert!(!old_request.cancelled.load(Ordering::Acquire));
+            let ready = super::super::ready_message_for_pending_switch(&app, card, snapshot);
+            drop(app.update(ready));
+            assert!(old_request.cancelled.load(Ordering::Acquire));
+            assert!(app.chat_runtime_mut(old_target).is_none());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(old_request.key.matches(&runtime.snapshot));
+            assert!(runtime.provider_exit_output.request.is_none());
+            assert!(runtime.provider_exit_output.ready.is_none());
+            assert!(runtime.provider_exit_output.error.is_none());
+            assert!(!runtime.provider_exit_expanded);
+
+            let _fresh_load = app.handle_chat_ui(Action::CopyProviderExit(target));
+            let loading = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit_output
+                .request
+                .as_ref()
+                .unwrap();
+            assert!(loading.copy);
+            let fresh_request = loading.request.clone();
+            assert_eq!(fresh_request.id, old_request.id);
+            app.status = None;
+            for stale_target in [old_target, target] {
+                let text = Arc::new("retired output must not reach the clipboard".to_owned());
+                let weak = Arc::downgrade(&text);
+                let result = if stale_success {
+                    Ok(chat::client::ProviderExitOutput { text, omitted: 0 })
+                } else {
+                    drop(text);
+                    Err("retired load timed out".into())
+                };
+                let stale = app.handle_chat_ui(Action::ProviderExitLoaded(
+                    stale_target,
+                    old_request.clone(),
+                    result,
+                ));
+                assert!(cosmic::iced::runtime::task::into_stream(stale).is_none());
+                assert!(weak.upgrade().is_none());
+                assert!(app.status.is_none());
+                let state = &app.chat_runtime_mut(target).unwrap().provider_exit_output;
+                let loading = state.request.as_ref().unwrap();
+                assert!(Arc::ptr_eq(
+                    &loading.request.cancelled,
+                    &fresh_request.cancelled
+                ));
+                assert!(loading.copy);
+                assert!(!fresh_request.cancelled.load(Ordering::Acquire));
+                assert!(state.ready.is_none());
+                assert!(state.error.is_none());
+            }
+
+            let text = Arc::new("first saved line\nlast saved line".to_owned());
+            let weak = Arc::downgrade(&text);
+            let copied = app.handle_chat_ui(Action::ProviderExitLoaded(
+                target,
+                fresh_request,
+                Ok(chat::client::ProviderExitOutput { text, omitted: 2 }),
+            ));
+            let state = &app.chat_runtime_mut(target).unwrap().provider_exit_output;
+            assert!(state.request.is_none());
+            assert!(state.ready.is_none());
+            assert!(state.error.is_none());
+            assert!(weak.upgrade().is_none());
+            let mut stream = cosmic::iced::runtime::task::into_stream(copied).unwrap();
+            let effect = stream.next().now_or_never().unwrap().unwrap();
+            let cosmic::iced::runtime::Action::Clipboard(
+                cosmic::iced::runtime::clipboard::Action::Write {
+                    target: iced::advanced::clipboard::Kind::Standard,
+                    contents,
+                },
+            ) = effect
+            else {
+                panic!("a fresh copy must write the standard clipboard");
+            };
+            assert_eq!(
+                contents,
+                "Provider exited with status 7\n\nfirst saved line\nlast saved line\n\n[2 raw output bytes were not retained]"
+            );
+            assert!(stream.next().now_or_never().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn provider_output_late_results_ignore_old_turns_and_hidden_copy_retains_no_buffer() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

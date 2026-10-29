@@ -6248,6 +6248,12 @@ impl Cagents {
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            if runtime.target != target {
+                                // Saved-output work belongs to the old attachment.
+                                // Dropping it cancels reads, including explicit copies.
+                                runtime.provider_exit_output = provider_exit::State::default();
+                                runtime.provider_exit_expanded = false;
+                            }
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
