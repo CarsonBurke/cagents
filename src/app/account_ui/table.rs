@@ -1220,7 +1220,7 @@ fn login_caption(login: &Login) -> &'static str {
 
 fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     let phase = login_caption(login);
-    let account = widget::row::with_children(vec![
+    let account: Element<'a, Message> = widget::row::with_children(vec![
         if matches!(
             login.phase,
             LoginPhase::CallbackBlocked | LoginPhase::CodeStarted | LoginPhase::DismissFailed
