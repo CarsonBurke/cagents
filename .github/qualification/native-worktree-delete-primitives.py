@@ -785,5 +785,3 @@ def renderer(log, owner):
                 requested_environment=REQUESTED_RENDERER,
                 inherited_environment={name: os.environ.get(name) for name in REQUESTED_RENDERER},
                 observed_renderer=observed)
-
-
