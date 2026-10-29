@@ -336,6 +336,13 @@ fn client(
             | ClientRequest::ChatDetach { .. } => ServerMessage::Response {
                 response: ServerResponse::Accepted,
             },
+            ClientRequest::Automation {
+                authority,
+                operation: cagents::automations::Request::List { after: None, limit },
+            } if authority == Authority::default() && limit > 0 => {
+                record(&root, "readonly-automation-empty-list-replied");
+                ServerMessage::Response { response: ServerResponse::Automation(cagents::automations::Response::Listed(vec![])) }
+            }
             ClientRequest::NotificationPresence { .. }
             | ClientRequest::NotificationPreferencesChanged { .. }
             | ClientRequest::AcknowledgeNotification { .. } => ServerMessage::Response {
@@ -597,10 +604,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "long" => "Saved Unicode draft: café 🌿 日本語. Keep every line.\n".repeat(500),
         _ => "Keep this saved draft intact.\nIt belongs to the unavailable pane.".into(),
     };
-    fs::write(root.join("expected-draft.txt"), &draft)?;
-    let attachment = root.parent().ok_or("Fixture parent missing")?.join("synthetic-saved-attachment.txt");
-    fs::write(&attachment, "Synthetic saved attachment. No private content.\n")?;
-    fs::write(root.join("expected-attachment.txt"), attachment.to_string_lossy().as_bytes())?;
+    // A saved image carries immutable reference metadata. Legacy path-only
+    // provider files are not persisted draft images. This synthetic reference
+    // is deliberately unavailable in the private asset registry: its path is
+    // a location hint, never authority to resolve or publish an image.
+    const IMAGE_BYTES: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 80, 153, 22, 253, 31, 0, 4, 12, 2, 21, 73, 175, 151, 59, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+    let attachment = cagents::chat::Attachment {
+        path: root.parent().ok_or("Fixture parent missing")?.join("synthetic-saved-attachment.png"),
+        reference: Some(cagents::chat::ImageReference {
+            id: "00000000-0000-4000-8000-000000001923".parse()?,
+            number: 1,
+            device: "00000000-0000-4000-8000-000000002923".parse()?,
+            name: "Synthetic saved attachment.png".into(),
+            sha256: "6aa8d4c0d15e7b9c7a02ddb0699e41448ef178b2f18e83597b673c559bef04cb".into(),
+            extension: "png".into(),
+        }),
+    };
+    attachment.reference.as_ref().unwrap().validate()?;
     if std::env::args().nth(3).as_deref() == Some("--inspect") {
         let database = SessionRuntime::default_database_path()?;
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
@@ -614,7 +634,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || !saved.local_only_cards.contains(&id)
                 || saved.pending_chat_admissions.contains_key(&id)
                 || saved.chat_drafts.get(&id).map(String::as_str) != Some(ORDINARY_DRAFT)
-                || saved.chat_draft_attachments.get(&id) != Some(&vec![cagents::chat::Attachment::file(attachment.clone())])
+                || saved.chat_draft_attachments.get(&id) != Some(&vec![attachment.clone()])
             { return Err("Ordinary closed source or its saved payload changed".into()); }
             #[cfg(held_product_after)]
             if saved.quarantined_panes.contains_key(&id) {
@@ -638,12 +658,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let should_be_closed = std::env::args().nth(4).as_deref() == Some("closed");
         if bad.existence.is_open() == should_be_closed { return Err("Saved pane existence changed unexpectedly".into()); }
         if saved.chat_drafts.get(&bad_id).map(String::as_str).unwrap_or("") != draft { return Err("Saved draft changed".into()); }
-        let expected = if payload == "empty" { vec![] } else { vec![cagents::chat::Attachment::file(attachment)] };
+        let expected = if payload == "empty" { vec![] } else { vec![attachment.clone()] };
         if saved.chat_draft_attachments.get(&bad_id).cloned().unwrap_or_default() != expected { return Err("Saved attachments changed".into()); }
         if root.join("healthy-draft-expected").exists() && saved.chat_drafts.get(&healthy_id).map(String::as_str) != Some(fs::read_to_string(root.join("healthy-draft-expected"))?.as_str()) { return Err("Healthy sibling edited draft did not persist".into()); }
-        println!("typed-saved-source-draft-attachments-and-existence-verified");
+        if fs::read(&attachment.path)? != IMAGE_BYTES { return Err("Saved attachment bytes changed".into()); }
+        if cagents::chat::attachment_assets::validate(&attachment).is_ok() { return Err("Unavailable image reference unexpectedly gained asset authority".into()); }
+        println!("typed-saved-source-draft-attachments-bytes-and-existence-verified");
         return Ok(());
     }
+    fs::write(root.join("expected-draft.txt"), &draft)?;
+    fs::write(&attachment.path, IMAGE_BYTES)?;
+    fs::write(root.join("expected-attachment.txt"), attachment.path.to_string_lossy().as_bytes())?;
+    if cagents::chat::attachment_assets::validate(&attachment).is_ok() { return Err("Synthetic unavailable image fixture acquired asset authority".into()); }
     let hidden_mode = std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1");
     let held_channel_title_source = if hidden_mode {
         cagents::model::ChannelTitleSource::Prompt
@@ -660,7 +686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bad_id,
             draft,
         )]),
-        chat_draft_attachments: if payload == "empty" { HashMap::new() } else { HashMap::from([(bad_id, vec![cagents::chat::Attachment::file(attachment.clone())])]) },
+        chat_draft_attachments: if payload == "empty" { HashMap::new() } else { HashMap::from([(bad_id, vec![attachment.clone()])]) },
         ..Default::default()
     };
     fs::write(root.join("workspace-id"), workspace.id.to_string())?;
@@ -693,7 +719,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         workspace.local_only_cards.insert(id);
         workspace.chat_drafts.insert(id, ORDINARY_DRAFT.into());
-        workspace.chat_draft_attachments.insert(id, vec![cagents::chat::Attachment::file(attachment.clone())]);
+        workspace.chat_draft_attachments.insert(id, vec![attachment.clone()]);
     }
     if hidden_mode {
         let settings: CardId = "00000000-0000-4000-8000-000000009922".parse()?;
