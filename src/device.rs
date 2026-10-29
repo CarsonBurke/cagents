@@ -1211,7 +1211,9 @@ mod tests {
 
     #[test]
     fn captured_no_start_proxy_has_its_own_listener_policy_and_master_pool() {
-        let context = fixture_context();
+        // Match the process-lifetime selection without changing SELECTED or
+        // any caller environment. close() still settles both owned workers.
+        let context = Box::leak(Box::new(fixture_context()));
         let directory = tempfile::tempdir().unwrap();
         let legacy = context
             .socket_path_with_runtime(&context.bridge, false, || {
@@ -1225,6 +1227,8 @@ mod tests {
             .unwrap();
         assert_ne!(legacy, restricted);
         assert!(legacy.exists() && restricted.exists());
+        let route = CapturedRemoteRoute { context };
+        assert_eq!(route.socket_path_no_start().unwrap(), restricted);
         {
             let legacy_slot = context.bridge.lock().unwrap();
             let restricted_slot = context.no_start_bridge.lock().unwrap();
