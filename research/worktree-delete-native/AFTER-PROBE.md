@@ -1,6 +1,8 @@
 The After-only probe is implemented in
 `.github/qualification/native-worktree-delete-after-probe.py`. It is a direct
-child control of `77647db730fd0d5b6ec7f2fc984d5edc94d42a3c`; its parent files,
+child control of `c7a41814f19a00229cc96ae4c3ab471eb352c018`, correcting its C1
+cleanup cancellation blocker. The original preserved base is
+`77647db730fd0d5b6ec7f2fc984d5edc94d42a3c`; all of that base's files,
 matched Before `94c3cef719f5cb27637899dfd13e67baca3cbc34` and product After
 `24d0474e250bcc4acc0958cf3abbf53ee1125581` are unchanged. No Before executable
 is used by this probe.
@@ -93,6 +95,35 @@ Collection and cleanup use the original actual EC budgets; there is no retry,
 extension, second build job, account/model switch, extra cache/pool or capacity
 workaround. The first failure retains original command output/exit and stops
 dependent work.
+
+The separately granted one-shot cleanup alarm now escapes every cleanup stage
+to one outer handler. After cancellation, the controller performs only local
+bookkeeping and evidence writes: no further input release, CLI, wait, forced
+process close or source inspection. Probe-local sequential exact-held input and
+Xlib shutdown avoids the reusable helpers' broad catch/finally; all original
+helper bodies remain unchanged. An ordinary input-release error remains a
+cleanup failure even if later owned-process disposal succeeds. Process disposal,
+observer closure and overall physical custody have separate statuses. Interrupted
+or incomplete physical custody is UNCONFIRMED, and original collection or cleanup
+errors remain sticky. Successful physical disposal alone cannot qualify a probe.
+
+The c7 negative review remains immutable at
+`/tmp/coord-b9-1984-c7a41814-after-probe-independent-review.json`, SHA256
+`ee6e92a9c2ba3a6e8c86645e7da122f97538d0c86a5d1a4700754ec1e50020d0`.
+It does not clear this corrected successor. The source-only causal check
+`.github/qualification/native-worktree-delete-cleanup-memory-check.py` extracts
+the actual cleanup functions with AST, excludes imports/main/helpers, and uses
+only memory fakes. It injects a BaseException at every actual successful cleanup
+call, requires the effect trace to end at that call, and checks ordinary-error,
+sticky-error and physical-disposal outcomes. An optional source export of exact
+c7 also reproduces its swallowed cancellation. The check uses no helper, signal,
+process, fixture or native resource and is not native qualification:
+
+```sh
+python3 CONTROL/.github/qualification/native-worktree-delete-cleanup-memory-check.py \
+  --source CONTROL/.github/qualification/native-worktree-delete-after-probe.py \
+  --predecessor-source EXACT_C7_SOURCE_EXPORT.py --receipt NEW_MEMORY_RECEIPT.json
+```
 
 G1 remains explicit: this probe observes a valid existing target's real dialog,
 then cancels. It does not establish that a missing/prunable row stays reachable

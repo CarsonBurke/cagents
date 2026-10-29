@@ -3,7 +3,7 @@
   "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
   "never_merge": true,
   "status": "RUNNABLE_SOURCE_PREPARED_UNGRANTED_UNRUN",
-  "parent_control_head": "77647db730fd0d5b6ec7f2fc984d5edc94d42a3c",
+  "parent_control_head": "c7a41814f19a00229cc96ae4c3ab471eb352c018",
   "after": {
     "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
     "tree": "7d84da268933045b1add2ad310ce45c84be751db"
@@ -12,11 +12,6 @@
     "head": "94c3cef719f5cb27637899dfd13e67baca3cbc34",
     "tree": "63e08c61e41e20192fc7d869cad8e3ddf8043200"
   },
-  "new_control_paths": [
-    ".github/qualification/native-worktree-delete-after-probe.py",
-    "research/worktree-delete-native/after-probe.json",
-    "research/worktree-delete-native/AFTER-PROBE.md"
-  ],
   "review_paths": [
     ".github/qualification/native-worktree-delete-after-probe.py",
     "research/worktree-delete-native/after-probe.json",
@@ -24,7 +19,8 @@
     ".github/qualification/native-worktree-delete-driver.py",
     ".github/qualification/native-worktree-delete-primitives.py",
     "research/worktree-delete-native/manifest.json",
-    "research/worktree-delete-native/primitives-provenance.json"
+    "research/worktree-delete-native/primitives-provenance.json",
+    ".github/qualification/native-worktree-delete-cleanup-memory-check.py"
   ],
   "product_source_sha256": {
     "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
@@ -216,5 +212,27 @@
     "actual_ui": "Ordinary runner afterward reuses same serial granted target incrementally; every ELF must equal pre-start hash. No build-only flag, direct cargo workflow, source hook, second queue/job, cold parallel graph or extra test/check target.",
     "resource_budget": "Both supported runner invocations share the original actual EC collection deadline and one target; first failure stops, no retry/extension.",
     "limits": "Matched compilation is not a claim of unit/full-flow checks or merge readiness."
+  },
+  "control_base_head": "77647db730fd0d5b6ec7f2fc984d5edc94d42a3c",
+  "control_paths_from_base": [
+    ".github/qualification/native-worktree-delete-after-probe.py",
+    "research/worktree-delete-native/after-probe.json",
+    "research/worktree-delete-native/AFTER-PROBE.md",
+    ".github/qualification/native-worktree-delete-cleanup-memory-check.py"
+  ],
+  "cleanup_contract": {
+    "deadline": "Original granted one-shot cleanup alarm; BaseException propagates from every stage to one outer abort handler. After expiry no later input, CLI, wait, forced process cleanup or source inspection.",
+    "observer_close": "Probe-local sequential exact-held input releases and Xlib close. Original reusable helper bodies unchanged; no swallowing catch/finally.",
+    "custody": "Process status, observer status and physical status are distinct. Interrupted or incomplete physical custody stays UNCONFIRMED. Successful forced disposal never restores qualification.",
+    "sticky_errors": "Original collection failure, all earlier ordinary cleanup errors, observer release errors and cancellation retain FAILED_UNQUALIFIED regardless of later empty process observation.",
+    "memory_check": ".github/qualification/native-worktree-delete-cleanup-memory-check.py",
+    "memory_scope": "AST-extracted actual cleanup functions only; pure memory dependencies; no probe/helper import, signals, process, native or fixture workload. Not native qualification.",
+    "preserved_negative": {
+      "head": "c7a41814f19a00229cc96ae4c3ab471eb352c018",
+      "review": "/tmp/coord-b9-1984-c7a41814-after-probe-independent-review.json",
+      "sha256": "ee6e92a9c2ba3a6e8c86645e7da122f97538d0c86a5d1a4700754ec1e50020d0",
+      "verdict": "BLOCKED_C1_CLEANUP_DEADLINE_SWALLOWED"
+    },
+    "successor_review": "Exact new child head/tree and all review_paths must receive an independent fresh source clearance before any execution."
   }
 }

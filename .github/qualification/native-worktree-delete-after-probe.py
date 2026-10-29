@@ -21,7 +21,8 @@ import subprocess
 import sys
 import time
 
-PARENT = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
+CONTROL_BASE = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
+PARENT = 'c7a41814f19a00229cc96ae4c3ab471eb352c018'
 AFTER = '24d0474e250bcc4acc0958cf3abbf53ee1125581'
 AFTER_TREE = '7d84da268933045b1add2ad310ce45c84be751db'
 NATIVE, CONTEXT, INPUTS = None, None, None
@@ -55,11 +56,13 @@ def gates(args):
     manifest_path = control / 'research/worktree-delete-native/after-probe.json'
     manifest = json.loads(manifest_path.read_text())
     assert manifest['parent_control_head'] == PARENT
+    assert manifest['control_base_head'] == CONTROL_BASE
     assert manifest['after'] == dict(head=AFTER, tree=AFTER_TREE)
     assert manifest['mode'] == 'AFTER_ONLY_CANCEL_NO_REMOVE'
-    assert set(git(control, 'diff', '--name-only', PARENT, 'HEAD').splitlines()) == set(manifest['new_control_paths'])
-    # Every parent control/product entry, including Before pins, is retained.
-    removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', PARENT, 'HEAD')
+    assert set(git(control, 'diff', '--name-only', CONTROL_BASE, 'HEAD').splitlines()) == set(manifest['control_paths_from_base'])
+    # Every original base control/product entry, including Before pins, is
+    # retained. The exact direct predecessor is the preserved negative c7.
+    removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', CONTROL_BASE, 'HEAD')
     assert removed_or_modified == ''
     hashes = {path: digest(control / path) for path in manifest['review_paths']}
     for path, expected in manifest['product_source_sha256'].items():
@@ -522,9 +525,32 @@ def collect(context):
         full_suite='G3 destructive/buffer/absent-replacement cases remain held until probe mapping is independently reviewed.'))
 
 
+def close_probe_inputs(inputs):
+    """Release exact held inputs without the parent's broad catch/finally.
+
+    Any cancellation escapes immediately, before a later release or Xlib close.
+    The original reusable primitive bodies remain immutable.
+    """
+    NATIVE.CRITICAL = False
+    for kind, values in [('key', inputs.keys), ('button', inputs.buttons)]:
+        for value in list(values):
+            inputs.event(kind, value, False, 'cleanup')
+    assert not inputs.keys and not inputs.buttons, 'Held input cleanup incomplete'
+    inputs.x.XCloseDisplay(inputs.display)
+
+
+def close_probe_screen(screen):
+    """Sequential observer shutdown; no native operation in an abort finally."""
+    screen.checked(True)
+    screen.x.XCloseDisplay(screen.display)
+    screen.x.XSetErrorHandler(screen.previous)
+
+
 def cleanup(context):
     p = NATIVE
-    errors = []
+    # Keep this same list at outer handback even when cancellation prevents a
+    # normal return. Earlier ordinary cleanup failures must not be lost.
+    errors = context.setdefault('cleanup_errors', [])
     # Explicit disposal occurs after final conservation, only for four actually
     # issued synthetic IDs. No project/worktree close/remove command exists.
     if context.get('terminal_ids') and context.get('binary'):
@@ -534,7 +560,7 @@ def cleanup(context):
                 assert shown['terminal']['session']['id'] == terminal_id
                 assert shown['terminal']['session']['launch']['working_directory'] == str(context['terminal_scopes'][role])
                 cli(context, ['terminal', 'close', terminal_id], 'cleanup-close-' + role)
-            except BaseException as error:
+            except Exception as error:
                 errors.append(dict(stage='terminal-' + role, error=str(error)))
                 break
     try:
@@ -549,14 +575,15 @@ def cleanup(context):
             remaining = cli(context, ['terminal', 'list', '--all'], 'cleanup-inventory')
             assert remaining['terminals'] == []
             cli(context, ['daemon', 'stop', '--require-empty'], 'cleanup-daemon-stop')
-    except BaseException as error:
+    except Exception as error:
         errors.append(dict(stage='normal-app-host-close', error=str(error)))
     try:
         if INPUTS:
-            INPUTS.close()
+            close_probe_inputs(INPUTS)
         if p.SCREEN:
-            p.SCREEN.close()
-    except BaseException as error:
+            close_probe_screen(p.SCREEN)
+        context['cleanup_observer_status'] = 'CLOSED'
+    except Exception as error:
         errors.append(dict(stage='native-observer-close', error=str(error)))
     try:
         # Only descendant PID/start identities retained by the reviewed helper.
@@ -567,7 +594,7 @@ def cleanup(context):
         if application_residue:
             errors.append(dict(stage='application-residue', identities=application_residue))
         p.close_owned()
-    except BaseException as error:
+    except Exception as error:
         errors.append(dict(stage='owned-cleanup', error=str(error)))
     try:
         source = {path: digest(context['after'] / path)
@@ -580,11 +607,47 @@ def cleanup(context):
         assert {path: digest(context['control'] / path) for path in context['hashes']} == context['hashes']
         p.put(p.OUT / 'final-source-conservation.json', dict(status='UNCHANGED', product=source,
             control_head=context['head'], source_sha256=context['hashes']))
-    except BaseException as error:
+    except Exception as error:
         errors.append(dict(stage='final-source-conservation', error=str(error)))
-    p.put(p.OUT / 'cleanup.json', dict(errors=errors, live_owned=p.live(),
+    remaining = p.live()
+    if remaining:
+        errors.append(dict(stage='owned-processes-remain', identities=remaining))
+    context['cleanup_process_status'] = (
+        'OBSERVED_NO_OWNED_PROCESSES' if not remaining else 'OWNED_PROCESSES_REMAIN')
+    context['cleanup_physical_status'] = ('OBSERVED_DISPOSED' if not remaining and
+        context.get('cleanup_observer_status') == 'CLOSED' else 'UNCONFIRMED')
+    p.put(p.OUT / 'cleanup.json', dict(errors=errors, live_owned=remaining,
+        physical_status=context['cleanup_physical_status'],
+        process_status=context['cleanup_process_status'],
+        observer_status=context.get('cleanup_observer_status', 'UNCONFIRMED'),
         retained_fixture=str(context.get('fixture')), directories_removed=False))
     return errors
+
+
+def cleanup_handback(context):
+    """One outer abort handler; after cancellation only memory bookkeeping.
+
+    QualificationCancelled inherits BaseException. Each cleanup stage catches
+    only Exception, so the single-shot alarm cannot be swallowed and followed
+    by more input, CLI, waits, forced cleanup or source inspection.
+    """
+    errors = context.setdefault('cleanup_errors', [])
+    context['cleanup_physical_status'] = 'UNCONFIRMED'
+    context['cleanup_process_status'] = 'UNCONFIRMED'
+    context['cleanup_observer_status'] = 'UNCONFIRMED'
+    try:
+        cleanup(context)
+    except BaseException as error:
+        context['cleanup_physical_status'] = 'UNCONFIRMED'
+        errors.append(dict(stage='cleanup-aborted', type=type(error).__name__,
+            error=str(error), signal=NATIVE.CANCEL_SIGNAL))
+    return errors
+
+
+def probe_status(collection_failed, cleanup_errors, physical_status):
+    if collection_failed or cleanup_errors or physical_status != 'OBSERVED_DISPOSED':
+        return 'FAILED_UNQUALIFIED'
+    return 'AFTER_ONLY_CANCEL_PROBE_OBSERVED_REVIEW_PENDING'
 
 
 def main():
@@ -673,17 +736,19 @@ def main():
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.setitimer(signal.ITIMER_REAL, context['lease']['cleanup_seconds'])
         try:
-            cleanup_errors = cleanup(context)
-        except BaseException as error:
-            cleanup_errors.append(dict(stage='cleanup-deadline', type=type(error).__name__, error=str(error)))
-        signal.setitimer(signal.ITIMER_REAL, 0)
+            cleanup_errors = cleanup_handback(context)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
         native.put(out / 'inputs.json', native.EVENTS)
         native.put(out / 'commands.json', native.COMMANDS)
         native.put(out / 'owned-processes.json', native.OWNED)
         native.put(out / 'result.json', dict(
-            status='FAILED_UNQUALIFIED' if failed or cleanup_errors else 'AFTER_ONLY_CANCEL_PROBE_OBSERVED_REVIEW_PENDING',
+            status=probe_status(failed, cleanup_errors, context.get('cleanup_physical_status', 'UNCONFIRMED')),
             product_head=AFTER, control_head=context['head'], captures=context['completed_captures'],
             first_failure=error_record, cleanup_errors=cleanup_errors,
+            cleanup_physical_status=context.get('cleanup_physical_status', 'UNCONFIRMED'),
+            cleanup_process_status=context.get('cleanup_process_status', 'UNCONFIRMED'),
+            cleanup_observer_status=context.get('cleanup_observer_status', 'UNCONFIRMED'),
             G1='UNQUALIFIED_NO_ABSENCE_OR_REPLACEMENT_PROBE',
             G3='Full eight-case Before/After suite remains held; no causal/destructive/buffer/recovery evidence',
             native_scale_factor='UNMEASURED; physical viewport and configured scale retained separately',
@@ -691,7 +756,7 @@ def main():
         (out / 'sha256.txt').write_text(''.join(
             digest(path) + '  ' + str(path.relative_to(out)) + '\n'
             for path in sorted(out.rglob('*')) if path.is_file() and path.name != 'sha256.txt'))
-    if failed or cleanup_errors:
+    if probe_status(failed, cleanup_errors, context.get('cleanup_physical_status', 'UNCONFIRMED')) == 'FAILED_UNQUALIFIED':
         raise SystemExit(1)
 
 
