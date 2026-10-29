@@ -18,7 +18,7 @@ import pyatspi
 from gi.repository import GLib
 from PIL import Image
 
-control, before, after = map(Path, sys.argv[1:4])
+control, before, after, before_main = map(Path, sys.argv[1:5])
 out = Path(os.environ['QUALIFICATION_EVIDENCE']) / 'native'
 if os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted' or 'CAGENTS_AGENT_AUTHORITY' in os.environ:
     raise RuntimeError('A genuine GitHub-hosted User context is required; inherited authority is unchanged')
@@ -407,6 +407,24 @@ def composition_context_gesture(pid, *, copy=False):
     run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1'])
 
 
+def observe_composition_created_scope(root, created):
+    database = Path((root / 'database-path').read_text())
+    assert database.is_relative_to(root)
+    key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:active_thread'
+    def read():
+        try:
+            with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                row = db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+                active = json.loads(row[0]) if row else None
+                return {'active_thread': active} if active == created else None
+        except (sqlite3.Error, json.JSONDecodeError):
+            return None
+    observation = wait(read)
+    event({'event': 'composition-created-channel-persisted', 'created_channel_id': created,
+           'database': str(database), 'metadata_key': key, **observation,
+           'scope': 'Read-only private SQLite observation before the New channel reveal capture.'})
+
+
 def composition_flow(pid, window, root, label):
     user = 'Actual user request: keep my saved work while I open another channel.'
     ready = 'Composition transcript is ready.'
@@ -451,6 +469,7 @@ def composition_flow(pid, window, root, label):
     wait(lambda: not any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
     wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
          and field.queryText().getText(0, -1) == '')
+    observe_composition_created_scope(root, created)
     event({'event': 'composition-new-channel-revealed', 'channel_id': created, 'control': new_control})
     capture(window, label + '-new-channel-revealed', (1280, 800), neutral_pointer=True)
     saved_control = wait(lambda: channel_control('Open channel Saved recovery model received, '))
@@ -481,6 +500,76 @@ def composition_flow(pid, window, root, label):
     click(pid, wait(lambda: channel_control('Open channel Saved recovery model received, ')))
     wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
          and field.queryText().getText(0, -1) == draft)
+
+
+def composition_main_before_flow(pid, window, root, label):
+    """Capture the same task on main without inventing its blocked controls."""
+    run(['xdotool', 'key', 'ctrl+shift+i'])
+    observations = []
+    def blocked(target, capture_suffix):
+        def read():
+            nodes = [node for node in live_tree(pid) if visible(node)]
+            names = [node.name for node in nodes]
+            pending = [name for name in names if name.startswith('This saved pane has not been reopened.')]
+            tabs = [node for node in nodes if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                    and node.name.startswith('Chat pane ')]
+            editable = [node.name for node in nodes if node.name == 'Message'
+                        and node.getState().contains(pyatspi.STATE_EDITABLE)]
+            if not pending or len(tabs) != 2:
+                return None
+            for tab in tabs:
+                assert ', ' + str(root.parent / 'project') + ', ' in tab.name
+            forbidden = [name for name in names if name in ('Claude context', 'Copy this message')
+                         or 'Composition transcript is ready.' in name
+                         or 'Actual user request: keep my saved work while I open another channel.' in name
+                         or 'SYNTHETIC_CONTEXT_BEGIN' in name or 'SYNTHETIC_CONTEXT_END' in name]
+            assert not editable and not forbidden, 'Main no longer reproduces the mixed-scope admission block'
+            events = (root / 'receipts.txt').read_text().splitlines()
+            assert not any(line in events for line in (
+                'healthy-attach-requested', 'healthy-attach-held-before-ready',
+                'repaired-held-attach-requested', 'composition-context-copy-delivered'))
+            return {'target': target, 'unavailable_before': True, 'interaction_performed': False,
+                    'paired_capture': label + '-' + capture_suffix + '.webp', 'viewport': list(viewport),
+                    'pending_labels': pending, 'saved_chat_tabs': [node.name for node in tabs],
+                    'editable_message_fields': editable, 'unexpected_transcript_controls': forbidden,
+                    'visible_labels': names, 'receipt_lines': len(events),
+                    'scope': 'The same synthetic transcript is configured but not admitted; main renders the saved panes awaiting admission. No healthy typing, context disclosure or context-copy gesture was possible.'}
+        value = wait(read)
+        observations.append(value)
+        event({'event': 'composition-target-unavailable-before', **value})
+    def channel_control(prefix):
+        names = [node.name for node in live_tree(pid)
+                 if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                 and node.name.startswith(prefix)]
+        assert len(names) <= 1, 'Main composition navigation must identify one exact channel'
+        return names[0] if names else None
+    def new_composer():
+        fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
+                  and node.getState().contains(pyatspi.STATE_EDITABLE)]
+        assert len(fields) <= 1
+        return (len(fields) == 1 and fields[0].getState().contains(pyatspi.STATE_FOCUSED)
+                and fields[0].queryText().getText(0, -1) == '')
+    blocked('Healthy draft entry and collapsed Claude context', 'context-collapsed-wide')
+    capture(window, label + '-context-collapsed-wide', (1280, 800), neutral_pointer=True)
+    (root / 'composition-create-allowed').touch()
+    click(pid, 'New channel for project')
+    wait(lambda: 'composition-ranked-response-delivered' in (root / 'receipts.txt').read_text().splitlines())
+    created = (root / 'composition-channel-id').read_text().strip()
+    new_control = wait(lambda: channel_control('Open channel New channel, '))
+    wait(new_composer)
+    wait(lambda: not any(node.name.startswith('This saved pane has not been reopened.')
+                         and visible(node) for node in live_tree(pid)))
+    observe_composition_created_scope(root, created)
+    event({'event': 'composition-new-channel-revealed', 'channel_id': created, 'control': new_control})
+    capture(window, label + '-new-channel-revealed', (1280, 800), neutral_pointer=True)
+    click(pid, wait(lambda: channel_control('Open channel Saved recovery model received, ')))
+    blocked('Expand Claude context and copy its original bytes at wide width', 'context-expanded-wide-request-unavailable')
+    capture(window, label + '-context-expanded-wide-request-unavailable', (1280, 800), neutral_pointer=True)
+    capture(window, label + '-context-expanded-narrow-request-unavailable', (900, 700), neutral_pointer=True)
+    blocked('Expand Claude context and copy its original bytes at narrow width', 'context-expanded-narrow-request-unavailable')
+    blocked('Collapse Claude context and continue the healthy composer at narrow width', 'context-collapsed-narrow')
+    capture(window, label + '-context-collapsed-narrow', (900, 700), neutral_pointer=True)
+    (out / (label + '-baseline-unavailable.json')).write_text(json.dumps(observations, indent=2) + '\n')
 
 
 
@@ -712,10 +801,13 @@ try:
     run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(control / '.github/qualification/pixel-response.c'),
          '-o', str(pixel_helper), '-lX11', '-lXtst'])
     fixtures = {}
-    for variant, checkout in [('before', before), ('after', after)]:
+    for variant, checkout in [('before', before), ('after', after), ('before-main', before_main)]:
         revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
-        expected_sha = 'c727f886628897c1749290213e9d65037253095a' if variant == 'before' else os.environ['PRODUCT_SHA']
-        expected_tree = '6d4f36e2b4dd48fc9744305d34c78469384edcc5' if variant == 'before' else os.environ['PRODUCT_TREE']
+        expected_sha, expected_tree = {
+            'before': ('c727f886628897c1749290213e9d65037253095a', '6d4f36e2b4dd48fc9744305d34c78469384edcc5'),
+            'after': (os.environ['PRODUCT_SHA'], os.environ['PRODUCT_TREE']),
+            'before-main': ('c4e75601ae2e8c6f11f810d36af94726477efbb4', '69dacc7a72689e6d24f0a3d4122f9ddfe6ed23c8'),
+        }[variant]
         assert revision == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
         assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
@@ -735,15 +827,24 @@ try:
                    '-L', 'dependency=' + str(target / 'dev-runtime/deps'), '-o', str(helper)]
         if variant == 'after':
             command += ['--cfg', 'held_product_after']
+        elif variant == 'before-main':
+            command += ['--cfg', 'held_composition_main_before']
         for row in rows:
             if row.get('reason') == 'build-script-executed':
                 for path in row.get('linked_paths', []):
                     command += ['-L', path]
         run(command, timeout=180)
         fixtures[variant] = (revision, helper, expected_sha, expected_tree)
-    # Compile both immutable helpers first so candidate evidence can use the
-    # schema-13 reader while exercising the changed interaction first.
-    for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True)]:
+        if variant == 'before-main':
+            (out / 'before-main-source.json').write_text(json.dumps({
+                'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
+                'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                'helper_cfg': 'held_composition_main_before',
+                'scope': 'Current-main native composition comparison only; original c727 comparison remains separate.',
+            }, indent=2) + '\n')
+    # Compile each matched helper first. The original c727 reader still checks
+    # candidate schema refusal; current main owns only the last comparison arm.
+    for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True), ('before-main', before_main, True)]:
         revision, helper, expected_sha, expected_tree = fixtures[variant]
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
@@ -830,6 +931,55 @@ try:
                              and visible(node)
                              for node in tree(pid)))
             capture(window, label + '-launch-wide', (1280, 800))
+            if variant == 'before-main':
+                assert composition and mode == 'composition'
+                composition_main_before_flow(pid, window, root, label)
+                database = Path((root / 'database-path').read_text())
+                assert database.is_relative_to(root)
+                prefix = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:'
+                def composition_main_before_durable():
+                    try:
+                        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                            values = dict(db.execute('SELECT key, value FROM metadata WHERE key LIKE ?', (prefix + '%',)))
+                            if not all(prefix + key in values for key in ['chat_drafts', 'pending_chat_admissions', 'active_thread', 'threads']):
+                                return False
+                            drafts = json.loads(values[prefix + 'chat_drafts'])
+                            pending = json.loads(values[prefix + 'pending_chat_admissions'])
+                            channels = json.loads(values[prefix + 'threads'])
+                            created = (root / 'composition-channel-id').read_text().strip()
+                            return (not drafts.get('00000000-0000-4000-8000-000000003922', '')
+                                    and drafts.get('00000000-0000-4000-8000-000000004922') == (root / 'expected-draft.txt').read_text()
+                                    and all(card in pending for card in ['00000000-0000-4000-8000-000000003922', '00000000-0000-4000-8000-000000004922'])
+                                    and json.loads(values[prefix + 'active_thread']) == '00000000-0000-4000-8000-000000002922'
+                                    and any(channel['id'] == created and channel['shared'] for channel in channels))
+                    except (sqlite3.Error, FileNotFoundError):
+                        return False
+                wait(composition_main_before_durable)
+                stop(ui)
+                stop(fixture)
+                assert icon_config.read_text() == '\"Adwaita\"\n'
+                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
+                    before_rows = list(db.iterdump())
+                with (out / (label + '-typed-persistence.log')).open('w') as log:
+                    run([str(helper), str(root), mode, '--inspect', 'open'], env=env, stdout=log, stderr=subprocess.STDOUT)
+                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
+                    assert list(db.iterdump()) == before_rows
+                events = receipt.read_text()
+                assert 'UNEXPECTED-' not in events
+                assert events.splitlines().count('composition-ranked-response-delivered') == 1
+                assert not any(line in events.splitlines() for line in (
+                    'healthy-attach-requested', 'healthy-attach-held-before-ready',
+                    'repaired-held-attach-requested', 'composition-context-copy-delivered'))
+                assert not any(line.startswith('effect-request-') for line in events.splitlines())
+                (out / (label + '-receipts.txt')).write_text(events)
+                receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
+                                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                                 'events': events.splitlines(), 'scope': 'Current-main synthetic mixed-scope comparison. Healthy draft entry and context disclosure/copy were unavailable; only New channel creation/reveal and return navigation were exercised.'})
+                assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
+                assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
+                event({'event': 'arm-completed', 'revision': revision})
+                active_arm = None
+                continue
             if composition:
                 assert variant == 'after' and mode == 'composition'
                 composition_flow(pid, window, root, label)

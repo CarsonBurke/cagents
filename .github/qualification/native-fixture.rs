@@ -976,6 +976,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        #[cfg(held_composition_main_before)]
+        if composition_mode {
+            let created: ChannelId = fs::read_to_string(root.join("composition-channel-id"))?.parse()?;
+            let owner = saved.channels.iter().find(|entry| entry.id == channel).ok_or("Original main comparison channel missing")?;
+            let new = saved.channels.iter().find(|entry| entry.id == created).ok_or("New main comparison channel missing")?;
+            let healthy_card = saved.cards.iter().find(|card| card.id == healthy_id).ok_or("Main comparison healthy source missing")?;
+            let bad = saved.cards.iter().find(|card| card.id == bad_id).ok_or("Main comparison held source missing")?;
+            if new.project_id != project || !new.shared || new.ordinal <= owner.ordinal
+                || saved.active_channel != Some(channel) || saved.focused != Some(healthy_id)
+                || !owner.cards.contains(&healthy_id) || !owner.cards.contains(&bad_id)
+                || new.cards.contains(&healthy_id) || new.cards.contains(&bad_id)
+                || healthy_card.kind != CardKind::Chat(healthy.clone()) || !healthy_card.existence.is_open()
+                || bad.kind != cards[1].kind || !bad.existence.is_open()
+                || saved.pending_chat_admissions.get(&healthy_id) != Some(&healthy)
+                || saved.pending_chat_admissions.get(&bad_id) != Some(&held)
+                || saved.chat_drafts.get(&healthy_id).is_some_and(|text| !text.is_empty())
+                || saved.chat_draft_attachments.get(&healthy_id).is_some_and(|images| !images.is_empty())
+                || saved.chat_drafts.get(&bad_id).map(String::as_str) != Some(draft.as_str())
+                || saved.chat_draft_attachments.get(&bad_id) != Some(&vec![attachment.clone()]) {
+                return Err("Main comparison changed exact blocked sources, saved payload, pending intent, rank or navigation".into());
+            }
+            if fs::read(&attachment.path)? != IMAGE_BYTES
+                || cagents::chat::attachment_assets::validate(&attachment).is_ok() {
+                return Err("Main comparison changed saved image bytes or acquired image authority".into());
+            }
+            println!("typed-main-before-blocked-sources-both-pending-intents-saved-payload-rank-and-return-verified");
+            return Ok(());
+        }
         if composition_mode {
             let created: ChannelId = fs::read_to_string(root.join("composition-channel-id"))?.parse()?;
             let owner = saved.channels.iter().find(|entry| entry.id == channel).ok_or("Original composition channel missing")?;
