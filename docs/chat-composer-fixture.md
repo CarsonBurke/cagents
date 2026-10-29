@@ -37,8 +37,8 @@ fixture_env scripts/run-development --browserless --debug --log-file "$fixture_r
 
 Keep the existing Cargo target/cache configuration when using a worktree; do
 not start another build while the runner builds its matched executables. For
-a nested Niri session, use `niri-harness session start ... --no-window-wait`
-with a wrapper containing that runner command. Before replacing
+a nested Niri session, use `niri-harness start --no-window-wait WRAPPER`, where
+`WRAPPER` is a script containing that runner command. Before replacing
 `XDG_RUNTIME_DIR`, convert the inherited relative `WAYLAND_DISPLAY` to an
 absolute path (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`). Keep the inherited
 `NIRI_SOCKET`, and use only this owned nested session for input and screenshots.
