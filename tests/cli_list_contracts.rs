@@ -376,6 +376,323 @@ fn output(listing: Listing, populated: bool, json: bool) -> String {
     String::from_utf8(result.stdout).unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum AcceptedWait {
+    CodedError,
+    Disconnect,
+    WrongStatus,
+    Running,
+}
+
+fn accepted_wait_output(
+    spawn: bool,
+    supplied_key: Option<&str>,
+    json: bool,
+    behavior: AcceptedWait,
+) -> (cagents::process::ProcessOutput, serde_json::Value) {
+    use agent_execution::{Accepted, Reply, ResultSummary, Run};
+    use cagents::terminal::ipc::{ProtocolError, ProtocolErrorCode};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let service = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&service).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener =
+        UnixListener::bind(service.join(cagents::terminal::ipc::SOCKET_FILE_NAME)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let agent_id = "abcdef00-0000-4000-8000-000000000001".parse().unwrap();
+    let run_id = "12345678-0000-4000-8000-000000000001".parse().unwrap();
+    let accepted = Accepted {
+        agent: Agent {
+            id: agent_id,
+            name: Some("accepted-fixture".into()),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: root.path().join(".git"),
+                    directory: root.path().into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(ChannelId::new()),
+            session: None,
+            console: None,
+            created_ms: 123,
+            closed: false,
+        },
+        run: Run {
+            id: run_id,
+            agent: agent_id,
+            state: State::Accepted,
+            revision: 7,
+            accepted_ms: 456,
+            started_ms: None,
+            finished_ms: None,
+            provider_key: None,
+            result: ResultSummary::default(),
+        },
+        created: supplied_key.is_none(),
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let peer_done = done.clone();
+    let peer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("accepted-wait-peer"),
+            boot_id: BootId::new("private-boot"),
+            host_incarnation: HostIncarnation::new("private-incarnation"),
+        };
+        let mut submits = 0;
+        let mut run_reads = 0;
+        let mut receipt = None;
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if peer_done.load(Ordering::Acquire) {
+                        assert_eq!(submits, 1, "post-accept failure must never resubmit");
+                        assert!(run_reads > 0);
+                        return receipt.expect("original acceptance");
+                    }
+                    assert!(Instant::now() < deadline, "bounded private accept");
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("private accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            let respond = |stream: &mut _, request_id, message| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            respond(
+                &mut stream,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                assert_eq!(request.proof.as_ref(), Some(&proof));
+                let ClientRequest::Agent { operation, .. } = request.request else {
+                    panic!("request outside private agent contract");
+                };
+                let reply = match operation {
+                    Operation::Directory(_) => {
+                        Reply::Directory(agent_execution::directory::Directory {
+                            caller: None,
+                            scope: agent_execution::directory::Scope::Project(
+                                accepted.agent.spec.target.repository.clone(),
+                            ),
+                            sessions: vec![],
+                        })
+                    }
+                    Operation::List => Reply::Listed(vec![]),
+                    Operation::Inbox(_) | Operation::PeekInbox(_) => Reply::Inbox(vec![]),
+                    Operation::Submit(submit) => {
+                        submits += 1;
+                        assert_eq!(submits, 1, "no duplicate submission after Accepted");
+                        match submit.destination {
+                            agent_execution::Destination::New(_) => assert!(spawn),
+                            agent_execution::Destination::Existing(id) => {
+                                assert!(!spawn);
+                                assert_eq!(id, accepted.agent.id);
+                            }
+                        }
+                        receipt = Some(serde_json::json!({
+                            "agent": accepted.agent,
+                            "run": accepted.run,
+                            "created": accepted.created,
+                            "idempotency_key": submit.idempotency_key,
+                            "device": "local",
+                        }));
+                        Reply::Accepted(accepted.clone())
+                    }
+                    Operation::Run(id) => {
+                        assert_eq!(id, accepted.run.id);
+                        run_reads += 1;
+                        match behavior {
+                            AcceptedWait::Disconnect => break,
+                            AcceptedWait::CodedError => {
+                                respond(
+                                    &mut stream,
+                                    request.request_id,
+                                    ServerMessage::Error(ProtocolError::new(
+                                        ProtocolErrorCode::InvalidRequest,
+                                        "fixture run observation failed",
+                                        true,
+                                    )),
+                                );
+                                continue;
+                            }
+                            AcceptedWait::WrongStatus => Reply::Listed(vec![]),
+                            AcceptedWait::Running => {
+                                let mut run = accepted.run.clone();
+                                run.state = State::Running;
+                                Reply::Status {
+                                    agent: accepted.agent.clone(),
+                                    run,
+                                }
+                            }
+                        }
+                    }
+                    _ => panic!("operation outside private accepted-wait contract"),
+                };
+                respond(
+                    &mut stream,
+                    request.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::Agent(reply),
+                    },
+                );
+            }
+        }
+    });
+    let executable = Path::new(env!("CARGO_BIN_EXE_cagents"));
+    let mut command = CommandSpec::new(executable).args(["--device", "local", "agent"]);
+    if spawn {
+        command = command.args(["spawn", "--provider", "claude"]);
+    } else {
+        command = command.args(["send", &agent_id.to_string()]);
+    }
+    command = command
+        .args(["--wait", "--timeout", "0.15"])
+        .arg("private accepted-wait fixture")
+        .cwd(root.path())
+        .env("HOME", root.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .timeout(Duration::from_secs(6))
+        .output_limits(64 * 1024, 64 * 1024);
+    if let Some(key) = supplied_key {
+        command = command.args(["--idempotency-key", key]);
+    }
+    if json {
+        command = command.arg("--json");
+    }
+    let result = SystemProcessExecutor.execute(&command, &CancellationToken::new());
+    done.store(true, Ordering::Release);
+    let receipt = peer.join().unwrap();
+    (result.unwrap(), receipt)
+}
+
+#[test]
+fn accepted_wait_errors_retain_original_receipts_without_resubmission() {
+    for spawn in [false, true] {
+        for supplied_key in [
+            None,
+            Some("same key 'quoted' \"double\" $(literal); `data`"),
+        ] {
+            for behavior in [AcceptedWait::CodedError, AcceptedWait::Disconnect] {
+                let (output, acceptance) =
+                    accepted_wait_output(spawn, supplied_key, true, behavior);
+                assert_eq!(output.exit_code, Some(1));
+                assert!(output.stdout.is_empty());
+                let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(error["ok"], false);
+                assert_eq!(error["error"]["details"]["acceptance"], acceptance);
+                let expected_kind = if matches!(behavior, AcceptedWait::CodedError) {
+                    assert_eq!(error["error"]["details"]["code"], "invalid_request");
+                    assert_eq!(error["error"]["details"]["retryable"], true);
+                    "protocol"
+                } else {
+                    "connection"
+                };
+                assert_eq!(error["error"]["kind"], expected_kind);
+            }
+        }
+    }
+}
+
+#[test]
+fn accepted_final_status_errors_retain_original_receipts_without_resubmission() {
+    for spawn in [false, true] {
+        for supplied_key in [None, Some("same supplied key")] {
+            let (output, acceptance) =
+                accepted_wait_output(spawn, supplied_key, true, AcceptedWait::WrongStatus);
+            assert_eq!(output.exit_code, Some(1));
+            assert!(output.stdout.is_empty());
+            let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["ok"], false);
+            assert_eq!(error["error"]["kind"], "agent.status");
+            assert_eq!(error["error"]["details"]["acceptance"], acceptance);
+        }
+    }
+}
+
+#[test]
+fn accepted_wait_recovery_is_readable_and_normal_timeout_stays_distinct() {
+    for spawn in [false, true] {
+        let key = "same key 'quoted' \"double\" $(literal); `data`";
+        let (output, receipt) =
+            accepted_wait_output(spawn, Some(key), false, AcceptedWait::CodedError);
+        assert_eq!(output.exit_code, Some(1));
+        assert!(output.stdout.is_empty());
+        let human = String::from_utf8(output.stderr).unwrap();
+        for field in ["agent", "run"] {
+            assert!(
+                human.contains(receipt[field]["id"].as_str().unwrap()),
+                "{human}"
+            );
+        }
+        assert!(
+            human.contains(&format!("idempotency key {key:?}")),
+            "{human}"
+        );
+        assert!(
+            human.contains(&format!(
+                "cagents --device=local agent wait {}",
+                receipt["run"]["id"].as_str().unwrap()
+            )),
+            "{human}"
+        );
+        let (output, receipt) = accepted_wait_output(spawn, None, true, AcceptedWait::Running);
+        assert_eq!(output.exit_code, Some(3));
+        assert!(output.stderr.is_empty());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data"]["ended_by"], "timeout");
+        assert_eq!(response["data"]["timed_out"], true);
+        assert_eq!(
+            response["data"]["idempotency_key"],
+            receipt["idempotency_key"]
+        );
+        assert_eq!(response["data"]["run"]["state"], "Running");
+    }
+}
+
 #[test]
 fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values() {
     for (listing, header, empty, content) in [
