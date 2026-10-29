@@ -139,6 +139,7 @@ pub(super) struct State {
     busy: bool,
     generation: u64,
     pending: Option<Operation>,
+    reopen_origin: Option<super::workspace_model_sync::DeviceOrigin>,
     image: Option<ImageRequest>,
     linked_file: Option<PathBuf>,
     linked_fragment: Option<String>,
@@ -180,6 +181,7 @@ impl Default for State {
             busy: false,
             generation: 0,
             pending: None,
+            reopen_origin: None,
             image: None,
             linked_file: None,
             linked_fragment: None,
@@ -195,6 +197,12 @@ impl Default for State {
     }
 }
 impl Cagents {
+    pub(super) fn observe_device_reopen_close(&mut self, repository: &Path) {
+        if let Some(origin) = &mut self.device_ui.reopen_origin {
+            origin.observe_close(repository);
+        }
+    }
+
     pub(super) fn device_project_read_task(
         &mut self,
         repository: PathBuf,
@@ -643,6 +651,7 @@ impl Cagents {
                 }
                 self.device_ui.busy = false;
                 let pending = self.device_ui.pending.take();
+                let reopen_origin = self.device_ui.reopen_origin.take();
                 match result {
                     Err(error) => {
                         self.device_ui.linked_file = None;
@@ -721,6 +730,25 @@ impl Cagents {
                         });
                     }
                     Ok(Reply::Project { path, key, kind }) => {
+                        let Some(origin) = reopen_origin
+                            .filter(|_| matches!(pending, Some(Operation::Discover { .. })))
+                        else {
+                            self.device_ui.notice = Some("Project opening could not be confirmed. Open the project again to retry.".into());
+                            return Task::none();
+                        };
+                        if let Err(error) = self.publish_device_reopen(
+                            origin,
+                            generation,
+                            key,
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            kind,
+                        ) {
+                            self.device_ui.notice = Some(error);
+                            return Task::none();
+                        }
                         self.device_ui.path = path.display().to_string();
                         self.device_ui.notice =
                             Some(format!("Project opened on device: {}", path.display()));
@@ -733,16 +761,6 @@ impl Cagents {
                         self.device_ui.output.clear();
                         self.device_ui.worktree_output.clear();
                         self.device_ui.panel = Panel::Files;
-                        let edit = crate::workspace_model::ModelEdit::ReopenProject {
-                            repository: key,
-                            name: path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                            kind,
-                        };
-                        self.publish_model_edit(edit);
                         return self.update_device(Action::Browse);
                     }
                     Ok(_) => self.device_ui.notice = Some("Unexpected device response".into()),
@@ -789,6 +807,8 @@ impl Cagents {
         self.device_ui.busy = true;
         self.device_ui.pending = Some(operation.clone());
         self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
+        self.device_ui.reopen_origin = matches!(operation, Operation::Discover { .. })
+            .then(|| self.capture_device_origin(self.device_ui.generation));
         self.device_ui.notice = None;
         let generation = self.device_ui.generation;
         Task::perform(
@@ -1606,6 +1626,188 @@ mod tests {
             sidebar::SidebarFilter::Attention
         );
         assert!(!navigation.device_ui.open);
+    }
+
+    #[test]
+    fn device_project_reply_publishes_its_reopen_and_clears_the_registry_closed_marker() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::{ModelEdit, WorkspaceModel};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let key = PathBuf::from("/remote/reopened/.git");
+        let mut closed = WorkspaceModel::default();
+        closed.identity = uuid::Uuid::new_v4();
+        closed.sequence = 4;
+        closed.closed_projects.push(key.clone());
+        let connected = ModelUpdate::connected_fixture(closed.clone());
+        let ModelUpdate::Connected { proof, .. } = &connected else {
+            unreachable!()
+        };
+        let proof = proof.clone();
+        drop(app.update(Message::WorkspaceModelObserved(connected)));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        app.device_ui.path = "/remote/reopened".into();
+        drop(app.update(Message::Device(Action::OpenProject)));
+        let generation = app.device_ui.generation;
+        drop(app.update(Message::Device(Action::Loaded {
+            generation,
+            result: Ok(Reply::Project {
+                path: "/remote/reopened".into(),
+                key: key.clone(),
+                kind: ProjectKind::Git,
+            }),
+        })));
+        let request = rx
+            .try_recv()
+            .expect("device discovery queues a reopen without a local Git picker");
+        assert!(
+            matches!(&request.edit, ModelEdit::ReopenProject { repository, .. } if repository == &key)
+        );
+        assert!(
+            request.reopen.is_some(),
+            "the device request carries explicit local custody"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the callback queues exactly one reopen"
+        );
+        assert!(app.project_ui.is_reopening(&key));
+        // The backend's canonical edit clears the marker; exercise its receipt
+        // and the peer observer through the actual app reducers. Discovery and
+        // this response are fixtures, not a live remote daemon/native test.
+        let mut reopened = closed.clone();
+        reopened.fold(closed.sequence + 1, &request.edit);
+        assert!(!reopened.closed_projects.contains(&key));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                repository: key.clone(),
+                model: reopened.clone(),
+                origin: request.reopen,
+                destination: Some(proof),
+            })),
+        );
+        assert_eq!(app.workspace_model.identity, closed.identity);
+        assert!(!app.workspace_model.closed_projects.contains(&key));
+        assert!(!app.project_ui.is_reopening(&key));
+        assert!(!app.project_ui.closed.contains(&key));
+        let mut peer = super::super::tests::context_inspector_test_app(false);
+        drop(peer.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(closed),
+        )));
+        drop(
+            peer.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                sequence: reopened.sequence,
+                edit: request.edit,
+            })),
+        );
+        drop(peer.apply_closed_project_tombstones());
+        assert!(!peer.workspace_model.closed_projects.contains(&key));
+        assert!(!peer.project_ui.closed.contains(&key));
+    }
+
+    #[test]
+    fn device_project_reply_preserves_dispatch_registry_host_and_generation() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::WorkspaceModel;
+        for replacement in [
+            "registry",
+            "host",
+            "stale generation",
+            "missing context",
+            "close",
+            "repeat close",
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let mut model = WorkspaceModel::default();
+            model.identity = uuid::Uuid::new_v4();
+            if replacement == "repeat close" {
+                model.closed_projects.push("/remote/reopened/.git".into());
+            }
+            let connected = ModelUpdate::connected_fixture(model.clone());
+            let ModelUpdate::Connected { proof, .. } = &connected else {
+                unreachable!()
+            };
+            let mut proof = proof.clone();
+            drop(app.update(Message::WorkspaceModelObserved(connected)));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            app.device_ui.path = "/remote/reopened".into();
+            if replacement != "missing context" {
+                drop(app.update(Message::Device(Action::OpenProject)));
+            }
+            let generation = app.device_ui.generation;
+            if replacement == "registry" {
+                model.identity = uuid::Uuid::new_v4();
+            }
+            if replacement == "host" {
+                proof.host_incarnation = "replacement-host".into();
+            }
+            if matches!(replacement, "registry" | "host") {
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected {
+                        model: model.clone(),
+                        proof,
+                    })),
+                );
+            }
+            if matches!(replacement, "close" | "repeat close") {
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: model.sequence + 1,
+                        edit: crate::workspace_model::ModelEdit::CloseProject {
+                            repository: "/remote/reopened/.git".into(),
+                        },
+                    })),
+                );
+            }
+            let reply = Reply::Project {
+                path: "/remote/reopened".into(),
+                key: "/remote/reopened/.git".into(),
+                kind: ProjectKind::Git,
+            };
+            let active = app.active_workspace.clone();
+            drop(app.update(Message::Device(Action::Loaded {
+                generation: if replacement == "stale generation" {
+                    generation.wrapping_sub(1)
+                } else {
+                    generation
+                },
+                result: Ok(reply.clone()),
+            })));
+            assert!(
+                rx.try_recv().is_err(),
+                "{replacement}: an old context cannot publish to a replacement"
+            );
+            assert_eq!(app.workspace_model.identity, model.identity);
+            assert_eq!(
+                app.active_workspace, active,
+                "a rejected callback cannot switch the current workspace"
+            );
+            if replacement == "stale generation" {
+                assert!(app.device_ui.reopen_origin.is_some());
+                drop(app.update(Message::Device(Action::Loaded {
+                    generation,
+                    result: Ok(reply),
+                })));
+            } else {
+                assert!(
+                    app.device_ui
+                        .notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("Open the project again to retry")
+                );
+                drop(app.update(Message::Device(Action::OpenProject)));
+                drop(app.update(Message::Device(Action::Loaded {
+                    generation: app.device_ui.generation,
+                    result: Ok(reply),
+                })));
+            }
+            assert!(
+                rx.try_recv().unwrap().reopen.is_some(),
+                "{replacement}: a current explicit request still works"
+            );
+        }
     }
 
     #[test]
