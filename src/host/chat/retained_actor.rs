@@ -584,6 +584,7 @@ pub(super) fn forget_startup(
             })
     {
         state.native_actor_startups.remove(&source.id);
+        state.inventory_generation += 1;
     }
 }
 
