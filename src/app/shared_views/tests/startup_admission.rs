@@ -965,6 +965,75 @@ fn exact_canonical_replacement_and_valid_closed_history_keep_their_admission_con
     );
 }
 
+fn focus_active_settings_pane(app: &mut Cagents, active: ChannelId) -> CardId {
+    let pane = Pane {
+        id: CardId::new(),
+        title: "Active settings".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        scope: None,
+        kind: CardKind::Settings,
+    };
+    install_held_pane(app, active, &pane);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.active_channel = Some(active);
+    durable.focused = Some(pane.id);
+    durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == active)
+        .unwrap()
+        .focused = Some(pane.id);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    // rebuild_workspace is startup staging for every open durable pane. The
+    // real startup scopes its strip before initializing runtimes; exercise the
+    // production strip projection here before recording the active focus.
+    drop(app.project_shared_strip(&[], &[pane.id]));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![pane.id]);
+    assert_eq!(app.workspace.focused(), Some(pane.id));
+    pane.id
+}
+
+#[test]
+fn hidden_quarantine_projection_preserves_the_active_scope_pane_and_focus() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut rejected, identity) = cached_chat();
+    current_owner(&mut rejected);
+    app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+    let healthy = sibling_chat(&rejected, "Healthy hidden conversation");
+    install_held_pane(&mut app, hidden, &healthy);
+    let focused = focus_active_settings_pane(&mut app, active);
+    let mut view = View::empty(hidden);
+    view.panes = vec![rejected.clone(), healthy.clone()];
+    let mut full = model(identity, active, hidden, view);
+    let mut closed = managed_owner(&rejected, hidden);
+    closed.closed = true;
+    full.agents = vec![closed, managed_owner(&healthy, hidden)];
+    app.workspace_model = full.clone();
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    // These tasks remain unexecuted in this source-only reducer fixture.
+    // Actual healthy attachment/readiness is qualified by the User IPC tests.
+    drop(app.reconcile_workspace_model());
+    for _ in 0..2 {
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(full.clone())));
+        assert_eq!(app.durable.active_channel, Some(active));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![focused]);
+        assert_eq!(app.workspace.focused(), Some(focused));
+        assert_eq!(app.card_state(focused).unwrap().kind, CardKind::Settings);
+        assert!(app.card_state(focused).unwrap().existence.is_open());
+        assert_eq!(app.card_state(healthy.id).unwrap().kind, healthy.kind);
+        assert!(matches!(
+            app.cards.get(&rejected.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+    }
+}
+
 fn mixed_managed_saved_scope(visible: bool) {
     use crate::app::workspace_model_sync::ModelUpdate;
     let (mut app, active, hidden, mut closed_owner, identity) = cached_chat();
@@ -1014,7 +1083,12 @@ fn mixed_managed_saved_scope(visible: bool) {
         Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
     }
     app.workspace = Cagents::rebuild_workspace(&app.durable);
+    let active_focus = (!visible).then(|| focus_active_settings_pane(&mut app, active));
     let original_focus = app.workspace.focused();
+    if let Some(focused) = active_focus {
+        assert_eq!(original_focus, Some(focused));
+        assert!(![closed_owner.id, stale.id, healthy.id].contains(&focused));
+    }
     let original_channel = app.durable.active_channel;
     app.shared_views = State::for_workspace(&app.durable);
     app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
