@@ -74,6 +74,107 @@ pub struct Delegation {
     pub run_state: Option<State>,
 }
 
+/// One coherent, resident-only provider publication. An absent publication is
+/// unknown, including when an older retained helper cannot supply this field.
+/// A missing active run never means the provider has no interactive/child work.
+/// Tracker ownership records an outbound request, not provider execution ACK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStatus {
+    pub activity: ActivityState,
+    pub generation: u64,
+    pub turn_generation: u64,
+    pub parent_busy: bool,
+    pub active_run: Option<RunId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStatus {
+    pub id: RunId,
+    pub state: State,
+    pub request_recorded: bool,
+    /// Owner-only, bounded diagnostic. Never a result body or provider prompt.
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+}
+
+/// Independent evidence, rather than a single badge synthesized from history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    pub observed: Option<ExecutionStatus>,
+    pub latest_run: Option<RunStatus>,
+    /// Only the caller/owner may see its actual mailbox queue. False proves no
+    /// queued message, not that an instruction was consumed or executed.
+    pub pending_message: Option<bool>,
+}
+
+impl Status {
+    pub fn explanation(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match &self.observed {
+            Some(observed) => {
+                let activity = match observed.activity {
+                    ActivityState::Working => "working",
+                    ActivityState::Waiting => "waiting",
+                    ActivityState::Idle => "idle",
+                    ActivityState::Unknown => "unknown",
+                };
+                lines.push(match observed.active_run {
+                    Some(run)
+                        if !observed.parent_busy && observed.activity == ActivityState::Working =>
+                    {
+                        format!("parent not busy; background work; tracked request {run}")
+                    }
+                    Some(run) => format!("tracked request {run} ({activity})"),
+                    None if !observed.parent_busy
+                        && observed.activity == ActivityState::Working =>
+                    {
+                        "parent not busy; background work; no tracked parent request recorded"
+                            .into()
+                    }
+                    None => {
+                        format!("provider {activity}; current work not linked to a tracked request")
+                    }
+                });
+            }
+            None => lines.push("current request identity unavailable".into()),
+        }
+        if let Some(run) = &self.latest_run {
+            let state = match run.state {
+                State::Accepted => "accepted",
+                State::Running => "running",
+                State::Waiting => "waiting for input",
+                State::Succeeded => "succeeded",
+                State::Failed => "failed",
+                State::Cancelled => "cancelled",
+                State::Interrupted => "outcome uncertain",
+            };
+            let confirmation = if run.request_recorded {
+                ""
+            } else {
+                "; provider request not recorded"
+            };
+            lines.push(format!(
+                "latest tracked run {} {state}{confirmation}",
+                run.id
+            ));
+            if let Some(diagnostic) = &run.diagnostic {
+                let mut summary = diagnostic
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>();
+                if super::truncate(&mut summary, 160) {
+                    summary.push('…');
+                }
+                lines.push(format!("last run error: {summary}"));
+            }
+        }
+        if self.pending_message == Some(true) {
+            lines.push("instruction queued; not delivered".into());
+        }
+        lines
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The live session ID. It addresses this session until it exits; a
@@ -94,6 +195,8 @@ pub struct Entry {
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
     pub state: ActivityState,
+    #[serde(default)]
+    pub status: Option<Status>,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
     pub worktree: Option<PathBuf>,
@@ -158,8 +261,16 @@ impl Entry {
         }
         if let Some(delegation) = &self.delegation {
             line.push_str(&format!("\n    agent {}", delegation.agent));
-            if let Some(state) = delegation.run_state {
+            if self.status.is_none()
+                && let Some(state) = delegation.run_state
+            {
                 line.push_str(&format!(", latest run {state:?}"));
+            }
+        }
+        if let Some(status) = &self.status {
+            for explanation in status.explanation() {
+                line.push_str("\n    ");
+                line.push_str(&explanation);
             }
         }
         line

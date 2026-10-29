@@ -107,6 +107,8 @@ pub(crate) struct Resident {
     pub waiting: bool,
     pub working: bool,
     pub activity: crate::agent::ActivityState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_status: Option<crate::agent_execution::directory::ExecutionStatus>,
 
     pub usage: chat::Usage,
     pub native_continuity: chat::NativeContinuity,
@@ -332,6 +334,7 @@ impl RemoteActor {
             waiting: false,
             working: false,
             activity: crate::agent::ActivityState::Idle,
+            execution_status: None,
 
             usage: Default::default(),
             native_continuity: Default::default(),
@@ -1251,6 +1254,9 @@ impl RemoteActor {
             state.waiting = false;
             state.working = false;
             state.activity = crate::agent::ActivityState::Unknown;
+            // The last sample is historical once this attachment loses
+            // authority. Directory readers must fall back to Unknown.
+            state.execution_status = None;
             state.owns_work = true;
             generation = state.generation;
         }
@@ -2108,7 +2114,8 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
-        let sampled_activity = state.activity();
+        let sampled_activity = self.actor.activity_for_snapshot(&state);
+        let execution_status = self.actor.execution_status();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -2179,6 +2186,7 @@ impl Server {
             waiting,
             working,
             activity,
+            execution_status,
             usage,
             requests,
             notification_content,
@@ -5636,6 +5644,20 @@ done"#;
     #[test]
     fn unavailable_proxy_settles_pending_input_and_stops_reporting_healthy_metadata() {
         let actor = RemoteActor::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.activity = crate::agent::ActivityState::Working;
+            state.busy = true;
+            state.working = true;
+            state.execution_status = Some(crate::agent_execution::directory::ExecutionStatus {
+                activity: state.activity,
+                generation: state.generation,
+                turn_generation: 1,
+                parent_busy: true,
+                active_run: Some(crate::model::RunId::new()),
+            });
+        }
         let response = actor.enqueue(None, Command::Interrupt).unwrap();
         actor.publish_unavailable("Retained actor attachment was superseded");
         let state = actor.state();
@@ -5643,6 +5665,10 @@ done"#;
         assert!(!state.idle);
         assert!(state.failure.is_some());
         assert_eq!(state.activity, crate::agent::ActivityState::Unknown);
+        assert!(
+            state.execution_status.is_none(),
+            "a lost attachment cannot report an old request as current"
+        );
         assert!(
             state.owns_work,
             "disconnection is not provider cleanup proof"
@@ -5672,6 +5698,390 @@ done"#;
             true
         ));
         assert!(!terminal_endpoint_error("timed out", true));
+    }
+
+    #[test]
+    fn hidden_retained_status_updates_request_identity_without_an_activity_edge() {
+        use crate::agent_execution::ProviderEvent;
+        use crate::chat::{
+            Event, ToolStatus,
+            protocol::{Adapter, Step},
+        };
+        use crate::model::RunId;
+        use std::collections::VecDeque;
+        struct Frames(VecDeque<Vec<Event>>);
+        impl Adapter for Frames {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Subagent {
+                            id: "background".into(),
+                            kind: String::new(),
+                            description: String::new(),
+                            status: Some(ToolStatus::Running),
+                            background: Some(true),
+                            model: None,
+                            waiting: None,
+                            detail: None,
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    events: self.0.pop_front().ok_or("fixture frames exhausted")?,
+                    ..Default::default()
+                })
+            }
+            fn command_for_run(&mut self, run: RunId, _: Command) -> Result<Step, String> {
+                // Like the adapters, record the outgoing request before a
+                // provider acknowledgment. This is correlation, not execution.
+                Ok(Step {
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: ProviderEvent::Started {
+                                key: format!("outgoing-{run}"),
+                            },
+                        },
+                        Event::TurnStarted,
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let first = RunId::new();
+        let next = RunId::new();
+        let mut adapter: Box<dyn Adapter> = Box::new(Frames(VecDeque::from([
+            vec![Event::Status {
+                busy: false,
+                detail: String::new(),
+            }],
+            // No Snapshot event or Activity edge: only the real Tracker settles.
+            vec![Event::Execution {
+                run: first,
+                event: ProviderEvent::Settled,
+            }],
+            vec![Event::Execution {
+                run: first,
+                event: ProviderEvent::Finished {
+                    outcome: crate::notifications::Kind::Cancelled,
+                },
+            }],
+            vec![],
+        ])));
+        let mut fixture = resident_fixture();
+        fixture.server.actor.close().unwrap();
+        let spec = ProcessSpec::from(&fixture.server.source.launch.recipe);
+        let mut initial = adapter.initialize().unwrap();
+        let store = super::super::super::preflight(&spec, &mut initial).unwrap();
+        fixture.server.actor = LocalHandle::start(
+            spec,
+            adapter,
+            initial,
+            store,
+            None,
+            fixture.server.notifier(),
+        )
+        .unwrap();
+        fixture.server.actor.check_update_readiness().unwrap();
+        assert!(!fixture.server.actor.0.visible.load(Ordering::Acquire));
+        let state = |server: &mut Server, after: u64| -> Option<Resident> {
+            serde_json::from_value(
+                server
+                    .invoke(Invocation {
+                        proof: server.proof.clone(),
+                        epoch: Some(server.epoch),
+                        method: "state".into(),
+                        args: json!([after]),
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let prompt = || Command::Prompt {
+            text: "inert outgoing request".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        };
+        fixture
+            .server
+            .actor
+            .command_for_run(first, prompt())
+            .unwrap();
+        fixture.server.actor.check_update_readiness().unwrap();
+        let started = state(&mut fixture.server, 0).unwrap();
+        let sample = started.execution_status.as_ref().unwrap();
+        assert_eq!(sample.active_run, Some(first));
+        assert!(sample.parent_busy);
+        assert_eq!(sample.activity, crate::agent::ActivityState::Working);
+        fixture.server.actor.command(Command::Compact).unwrap();
+        let parent_idle = state(&mut fixture.server, started.changed).unwrap();
+        assert_eq!(
+            parent_idle.execution_status.as_ref().unwrap().active_run,
+            Some(first)
+        );
+        assert!(!parent_idle.execution_status.as_ref().unwrap().parent_busy);
+        fixture.server.actor.command(Command::Compact).unwrap();
+        let settled = state(&mut fixture.server, parent_idle.changed)
+            .expect("Settled-only frame must advance retained visibility");
+        let sample = settled.execution_status.as_ref().unwrap();
+        assert_eq!(sample.activity, crate::agent::ActivityState::Working);
+        assert!(!sample.parent_busy);
+        assert_eq!(sample.active_run, None);
+        assert!(sample.generation > parent_idle.execution_status.as_ref().unwrap().generation);
+        assert!(settled.changed > parent_idle.changed);
+
+        fixture
+            .server
+            .actor
+            .command_for_run(next, prompt())
+            .unwrap();
+        fixture.server.actor.check_update_readiness().unwrap();
+        let next_started = state(&mut fixture.server, settled.changed).unwrap();
+        assert_eq!(
+            next_started.execution_status.as_ref().unwrap().active_run,
+            Some(next)
+        );
+        fixture.server.actor.command(Command::Compact).unwrap();
+        let late = state(&mut fixture.server, next_started.changed).unwrap();
+        assert_eq!(
+            late.execution_status.as_ref().unwrap().active_run,
+            Some(next),
+            "old cancellation must not replace the actual current request"
+        );
+        assert!(late.execution_status.as_ref().unwrap().parent_busy);
+        assert_eq!(
+            late.execution_status.as_ref().unwrap().activity,
+            crate::agent::ActivityState::Working
+        );
+        let revision = fixture.server.revision();
+        fixture.server.actor.command(Command::Compact).unwrap();
+        assert_eq!(
+            fixture.server.revision(),
+            revision,
+            "unchanged frame must not manufacture dirty publications"
+        );
+        assert!(state(&mut fixture.server, revision).is_none());
+        fixture.server.actor.close().unwrap();
+        assert!(
+            fixture.server.actor.execution_status().is_none(),
+            "a stopped actor no longer supplies current request observations"
+        );
+    }
+
+    #[test]
+    fn draining_actor_withdraws_current_status_before_original_process_cleanup() {
+        use crate::agent_execution::ProviderEvent;
+        use crate::chat::{
+            Event, ToolStatus,
+            protocol::{Adapter, Step},
+        };
+        struct FailingFrame {
+            run: Option<crate::model::RunId>,
+            settle: bool,
+        }
+        impl Adapter for FailingFrame {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command_for_run(
+                &mut self,
+                run: crate::model::RunId,
+                _: Command,
+            ) -> Result<Step, String> {
+                self.run = Some(run);
+                Ok(Step {
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: ProviderEvent::Started {
+                                key: "recorded-fixture-request".into(),
+                            },
+                        },
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: String::new(),
+                        },
+                        Event::Subagent {
+                            id: "background".into(),
+                            kind: String::new(),
+                            description: "Synthetic background work".into(),
+                            status: Some(ToolStatus::Running),
+                            background: Some(true),
+                            model: None,
+                            waiting: None,
+                            detail: None,
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                if std::mem::take(&mut self.settle) {
+                    return Ok(Step {
+                        events: vec![
+                            Event::Status {
+                                busy: false,
+                                detail: String::new(),
+                            },
+                            Event::TurnSettled,
+                            Event::Execution {
+                                run: self.run.ok_or("fixture request absent")?,
+                                event: ProviderEvent::Settled,
+                            },
+                        ],
+                        ..Default::default()
+                    });
+                }
+                Ok(Step {
+                    writes: vec![json!({"fixture": "fail-after-echo"})],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Err("Synthetic provider frame failure".into())
+            }
+        }
+        let state = |server: &mut Server, after: u64| -> Result<Option<Resident>, String> {
+            serde_json::from_value(server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: "state".into(),
+                args: json!([after]),
+            })?)
+            .map_err(|error| error.to_string())
+        };
+        for settled in [false, true] {
+            let mut fixture = resident_fixture();
+            fixture.server.actor.close().unwrap();
+            let marker = fixture._root.path().join("provider-terminating");
+            let mut spec = ProcessSpec::from(&fixture.server.source.launch.recipe);
+            spec.program = "/usr/bin/python3".into();
+            spec.arguments = vec![
+                "-u".into(),
+                "-c".into(),
+                r#"import pathlib, signal, sys
+def terminating(_signal, _frame):
+    pathlib.Path(sys.argv[1]).write_bytes(b'terminating')
+signal.signal(signal.SIGTERM, terminating)
+for line in sys.stdin:
+    sys.stdout.write(line)
+    sys.stdout.flush()
+while True:
+    signal.pause()
+"#
+                .into(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let mut adapter: Box<dyn Adapter> = Box::new(FailingFrame {
+                run: None,
+                settle: settled,
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = super::super::super::preflight(&spec, &mut initial).unwrap();
+            fixture.server.actor = LocalHandle::start(
+                spec,
+                adapter,
+                initial,
+                store,
+                None,
+                fixture.server.notifier(),
+            )
+            .unwrap();
+            let run = crate::model::RunId::new();
+            // Collect every observation before asserting, then always join and
+            // reap the actual original provider before any assertion can panic.
+            let observed = (|| -> Result<_, String> {
+                fixture.server.actor.check_update_readiness()?;
+                fixture.server.actor.command_for_run(
+                    run,
+                    Command::Prompt {
+                        text: "Inert correlated request".into(),
+                        attachments: Vec::new(),
+                        mode: chat::PromptMode::Send,
+                    },
+                )?;
+                if settled {
+                    fixture.server.actor.command(Command::Compact)?;
+                }
+                fixture.server.actor.check_update_readiness()?;
+                let before = state(&mut fixture.server, 0)?.ok_or("initial state absent")?;
+                let quiet = state(&mut fixture.server, before.changed)?;
+                let provider = fixture
+                    .server
+                    .actor
+                    .provider_process()
+                    .ok_or("original provider absent")?;
+                fixture.server.actor.command(Command::Compact)?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while std::fs::read(&marker).ok().as_deref() != Some(b"terminating") {
+                    if fixture.server.actor.is_completed() || Instant::now() >= deadline {
+                        return Err("original provider did not enter termination".into());
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let during = state(&mut fixture.server, before.changed)?;
+                let activity = fixture.server.actor.activity();
+                let execution = fixture.server.actor.execution_status();
+                let completed = fixture.server.actor.is_completed();
+                let current = provider.is_current();
+                let refused = matches!(
+                    fixture.server.actor.try_command(Command::Compact),
+                    Err(Rejection::Refused(_))
+                );
+                Ok((
+                    before, quiet, during, activity, execution, completed, current, refused,
+                    provider,
+                ))
+            })();
+            let closed = fixture.server.actor.close();
+            closed.unwrap();
+            let (before, quiet, during, activity, execution, completed, current, refused, provider) =
+                observed.unwrap();
+            assert!(quiet.is_none(), "unchanged retained state must start quiet");
+            assert_eq!(before.activity, crate::agent::ActivityState::Working);
+            assert_eq!(
+                before.execution_status.unwrap().active_run,
+                (!settled).then_some(run)
+            );
+            let during = during.expect("draining must advance the retained observation revision");
+            assert_eq!(during.activity, crate::agent::ActivityState::Unknown);
+            assert_eq!(during.close.activity, crate::agent::ActivityState::Unknown);
+            assert!(!during.working && !during.completed && !during.close.completed);
+            assert!(during.owns_work && during.close.owns_work);
+            assert!(during.execution_status.is_none());
+            assert_eq!(activity, crate::agent::ActivityState::Unknown);
+            assert!(execution.is_none());
+            assert!(!completed && current && refused);
+            assert!(fixture.server.actor.is_completed());
+            assert!(!provider.is_current(), "original provider must be reaped");
+        }
+    }
+
+    #[test]
+    fn legacy_retained_resident_has_unknown_request_identity() {
+        let remote = RemoteActor::fixture();
+        let mut wire = serde_json::to_value(remote.state().as_ref()).unwrap();
+        wire.as_object_mut().unwrap().remove("execution_status");
+        let older: Resident = serde_json::from_value(wire).unwrap();
+        assert!(older.execution_status.is_none());
+        assert!(
+            !serde_json::to_value(older)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("execution_status")
+        );
     }
 }
 

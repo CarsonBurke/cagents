@@ -2504,6 +2504,7 @@ mod tests {
             view_scope: Some(Placement::Channel(channel)),
             channel_repository: Some("/repo".into()),
             state: crate::agent::ActivityState::Idle,
+            status: None,
             directory: Some("/repo".into()),
             worktree: Some("/repo".into()),
             project: Some("/repo".into()),

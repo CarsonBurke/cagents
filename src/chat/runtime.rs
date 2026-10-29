@@ -200,6 +200,7 @@ struct Inner {
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    execution_status: Arc<Mutex<Option<crate::agent_execution::directory::ExecutionStatus>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -428,6 +429,7 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let execution_status = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -439,6 +441,7 @@ impl LocalHandle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            execution_status: execution_status.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -485,6 +488,7 @@ impl LocalHandle {
                     adapter,
                     state,
                     confirmed_session,
+                    execution_status,
                     store,
                     visible,
                     observe_next,
@@ -600,6 +604,7 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
+                actor.invalidate_execution_observation();
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -1246,11 +1251,34 @@ impl LocalHandle {
     }
     /// What the conversation is doing, read without loading its transcript.
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
-        self.0
-            .state
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.activity_for_snapshot(&state)
+    }
+
+    fn activity_for_snapshot(&self, state: &Snapshot) -> crate::agent::ActivityState {
+        // A stopped actor cannot observe the provider while original process
+        // cleanup is still pending. That pending ownership is not live activity.
+        if self.0.draining.load(Ordering::Acquire) {
+            crate::agent::ActivityState::Unknown
+        } else {
+            state.activity()
+        }
+    }
+
+    /// Last whole-frame request/activity publication; reads no transcript or
+    /// transport and does not claim the provider acknowledged an outbound run.
+    pub(crate) fn execution_status(
+        &self,
+    ) -> Option<crate::agent_execution::directory::ExecutionStatus> {
+        let status = self
+            .0
+            .execution_status
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .activity()
+            .clone();
+        (!self.0.draining.load(Ordering::Acquire))
+            .then_some(status)
+            .flatten()
     }
 
     /// Update preflights need activity without loading the transcript window.
@@ -1874,6 +1902,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    execution_status: Arc<Mutex<Option<crate::agent_execution::directory::ExecutionStatus>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2933,6 +2962,33 @@ impl Actor {
             self.dirty = true;
         }
         let activity = state.activity();
+        let active_run = self.execution.active();
+        let status_changed = {
+            let mut published = self
+                .execution_status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // Generation is an output of this publication, not an identity
+            // input: comparing it here would manufacture an endless edge.
+            let changed = published.as_ref().is_none_or(|previous| {
+                previous.activity != activity
+                    || previous.parent_busy != state.busy
+                    || previous.turn_generation != state.turn_generation
+                    || previous.active_run != active_run
+            });
+            if changed {
+                state.generation = state.generation.saturating_add(1);
+                self.dirty = true;
+            }
+            *published = Some(crate::agent_execution::directory::ExecutionStatus {
+                activity,
+                generation: state.generation,
+                turn_generation: state.turn_generation,
+                parent_busy: state.busy,
+                active_run,
+            });
+            changed
+        };
         let generation = state.generation;
         let waiting_fingerprint = if activity == ActivityState::Waiting {
             state.waiting_fingerprint()
@@ -2947,6 +3003,12 @@ impl Actor {
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
         drop(state);
+        if status_changed {
+            // A Settled-only frame may keep aggregate Working unchanged due
+            // to a background child. Wake the existing retained observation
+            // path only after the coherent cache is published.
+            (self.notify)(Update::Observed { generation });
+        }
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
         if activity_changed {
@@ -2973,6 +3035,27 @@ impl Actor {
         }
         if became_available {
             (self.notify)(Update::PromptAvailable);
+        }
+    }
+    fn invalidate_execution_observation(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.execution_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
+        self.dirty = true;
+        drop(state);
+        // Retained readers poll this revision even when a settled parent's
+        // background work means no terminal attention notification is emitted.
+        (self.notify)(Update::Observed { generation });
+        if self.activity != ActivityState::Unknown {
+            self.activity = ActivityState::Unknown;
+            (self.notify)(Update::Activity {
+                state: ActivityState::Unknown,
+                generation,
+            });
         }
     }
     fn touch(&mut self) {

@@ -591,6 +591,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().activity,
         }
     }
+    pub(crate) fn execution_status(
+        &self,
+    ) -> Option<crate::agent_execution::directory::ExecutionStatus> {
+        match &self.0 {
+            Owner::Local(local) => local.execution_status(),
+            Owner::Remote(remote) => remote.state().execution_status.clone(),
+        }
+    }
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         match &self.0 {
             Owner::Local(local) => local.update_activity(),
