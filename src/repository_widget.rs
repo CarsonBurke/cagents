@@ -1260,7 +1260,17 @@ impl EditorDocument {
                 continue;
             }
             let start = caret_for_offset(&self.content, span.start);
+            let snapshot = self.content.text_snapshot();
+            // Some protocol boundaries lie inside a native LFCR terminator.
+            // A rounded caret can still match `removed` (especially when it
+            // is empty), so verify both byte offsets before trusting it.
+            if snapshot.byte_offset(start) != Some(span.start) {
+                return None;
+            }
             let end = self.content.range_end(start, removed)?;
+            if snapshot.byte_offset(end) != Some(span.end) {
+                return None;
+            }
             if let Some(change) = self.content.replace_range_recorded(start, end, inserted) {
                 changes.push(change);
             }
@@ -19133,6 +19143,57 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn a_completion_on_an_empty_lfcr_line_preserves_exact_protocol_offsets() {
+        for empty_line_primary in [false, true] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\n\rb");
+            drop(runtime.take_lsp_intents());
+            let replacement = completion_edit(
+                LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 1)),
+                "B",
+            );
+            let insertion = completion_edit(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                "X",
+            );
+            let (primary, additional, caret, caret_offset) = if empty_line_primary {
+                (insertion, replacement, LspPosition::new(1, 1), 3)
+            } else {
+                (replacement, insertion, LspPosition::new(2, 1), 5)
+            };
+            runtime.set_editor_completions(vec![completion_item(primary, vec![additional])]);
+            let target = runtime.editor_completion_targets(card).remove(0);
+            assert!(runtime.apply_completion_target(card, &target));
+
+            let expected = "a\nX\rB";
+            assert_eq!(buffer_text(&runtime), expected);
+            assert_eq!(lsp_version(&runtime), 2);
+            assert_eq!(document_revision(&runtime), 1);
+            assert!(runtime.is_dirty());
+            assert_eq!(runtime.cursor_position(), Some(caret));
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!();
+            };
+            assert_eq!(
+                document
+                    .content
+                    .text_snapshot()
+                    .byte_offset(document.content.cursor().position),
+                Some(caret_offset),
+                "the native caret follows the primary edit's exact bytes"
+            );
+            assert_eq!(
+                runtime.take_lsp_intents(),
+                vec![LspIntent::Change {
+                    version: 2,
+                    text: expected.into(),
+                }],
+                "one accepted completion publishes the actual edited source"
+            );
+        }
     }
 
     #[test]
