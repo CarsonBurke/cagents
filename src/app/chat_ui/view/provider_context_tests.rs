@@ -387,9 +387,39 @@ fn provider_context_find_reveals_selected_scope_and_restores_disclosure() {
             runtime.item_expanded("provider-context"),
             "Find must reveal the actual matching context"
         );
-        // The glyph-level hit resolves against the full transcript layout,
-        // which this single-step harness does not render; native validation
-        // covers the highlight. Here, the reveal must expose the body to Find.
+        // Find reveals the closed body; the next navigation indexes it through
+        // the actual Catalog worker and binds the glyph-level hit.
+        preparation::drain_fixture(runtime);
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        let task = app.resume_current_find(target, false);
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use iced::futures::StreamExt;
+                let mut stream = iced::runtime::task::into_stream(task)
+                    .expect("actual prepared Catalog Find task");
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(action @ Action::FindIndexed(..)),
+                        )) = effect
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("actual Catalog worker reply");
+                })
+                .await
+                .unwrap()
+            });
+        drop(app.handle_chat_ui(reply));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(
+            runtime.find_navigation.current_hit().map(|hit| hit.0),
+            Some("provider-context")
+        );
         rendered(runtime, 520.0, true);
         let (catalog, _) = runtime.selection_document();
         assert!(
