@@ -64,6 +64,31 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // These console scenarios use a private checkout with a HEAD. Keep
+        // its Git identity, configuration and initial commit in this fixture.
+        for arguments in [
+            vec!["init", "--initial-branch=main", "--template="],
+            vec!["commit", "--allow-empty", "-m", "fixture"],
+        ] {
+            let output = Self::command(root.path(), Path::new("/usr/bin/git"))
+                .current_dir(root.path().join("project"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "private Git setup: {output:?}");
+        }
         let provider = root.path().join("bin/claude");
         fs::write(&provider, script).unwrap();
         fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();

@@ -540,6 +540,29 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
+/// Whether `path` names an inline image the host's transcript store decoded
+/// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
+/// Such a file lives only as long as that cache, so it is no path to hand to
+/// anyone else.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+    let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
+        part.and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix(prefix))
+            .map(str::to_owned)
+    };
+    let image = name(path.file_name(), "image-").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(digest, extension)| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && matches!(extension, "png" | "jpg" | "webp" | "gif")
+        })
+    });
+    image
+        && name(path.parent().and_then(|parent| parent.file_name()), "chat-")
+            .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,
@@ -1787,12 +1810,13 @@ pub enum ItemContent {
         #[serde(default)]
         reference: Option<ImageReference>,
     },
-    /// Something another agent, or the harness on its behalf, delivered to
-    /// this conversation: a subagent's report, a teammate's or another
-    /// session's message, or word that background work changed state.
+    /// Something another agent or the provider harness delivered to this
+    /// conversation: a report, a message, a background-work notice, or context
+    /// the provider added without attributing it to the user.
     ///
-    /// It arrives in the user's slot and the agent acts on it as on a
-    /// prompt, but the user did not write it. Typesetting it as their own
+    /// It can arrive in the user's slot and the agent acts on it as on a
+    /// prompt; provider context uses the System role. The user did not write
+    /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
     Delivery {
@@ -1807,8 +1831,8 @@ pub enum ItemContent {
         /// `Agent "Review" finished`, or the one a teammate wrote for its
         /// message. Empty when there is none.
         summary: String,
-        /// A report's or message's Markdown, or the output a notice quotes,
-        /// with the harness's framing removed.
+        /// A report/message with harness framing removed, a notice's quoted
+        /// output, or provider context retained verbatim without interpretation.
         body: String,
     },
 }
@@ -1819,8 +1843,8 @@ pub enum DeliveryKind {
     Report,
     /// A message from a teammate or another session.
     Message,
-    /// The harness reporting that background work - a command, a monitor or
-    /// an agent - finished or produced an event.
+    /// A provider/harness notice, including background-work events and
+    /// provider context. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -1973,6 +1997,23 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
+}
+
+impl Item {
+    /// Bodies whose complete canonical bytes can be copied through the owned
+    /// transcript source. Provider context uses the same field as ordinary
+    /// prose; other deliveries retain their existing presentation copy rules.
+    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+        match &self.content {
+            ItemContent::Text { text, .. } => Some(text),
+            ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                body,
+                ..
+            } if self.role == Role::System => Some(body),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {

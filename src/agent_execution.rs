@@ -76,6 +76,27 @@ impl Authority {
     }
 }
 
+/// Internal acceptance failures; these are never serialized onto the wire.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AcceptanceError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    MailboxFull(String),
+}
+
+impl From<String> for AcceptanceError {
+    fn from(value: String) -> Self {
+        Self::Invalid(value)
+    }
+}
+
+impl From<&str> for AcceptanceError {
+    fn from(value: &str) -> Self {
+        Self::Invalid(value.into())
+    }
+}
+
 /// A session and its successors: each relaunch, crash recovery or account
 /// recovery of a session gets a new ID but stays in its lineage, named by the
 /// first session's ID. Ownership and addresses that must outlive one process

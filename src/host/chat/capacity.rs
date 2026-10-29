@@ -1,4 +1,4 @@
-//! Resident actors and in-flight starts share one bounded admission budget.
+//! Resident actors, in-flight starts and retained startup custody share one budget.
 use super::*;
 
 pub(in crate::host) fn usage(state: &HostState) -> usize {
@@ -7,6 +7,20 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .chat_spawning
             .keys()
             .filter(|id| !state.chats.contains_key(id))
+            .count()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .count()
+}
+
+fn pending(state: &HostState) -> usize {
+    state.chat_spawning.len()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chat_spawning.contains_key(id))
             .count()
 }
 
@@ -18,7 +32,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
             format!(
                 "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
                 state.chats.len(),
-                state.chat_spawning.len(),
+                pending(state),
                 state.native_chat_capacity,
                 used,
             ),
@@ -507,14 +521,28 @@ mod tests {
     #[test]
     fn recovery_reservation_counts_existing_resident_once_above_lowered_limit() {
         let host = host();
-        let (_directory, source, _) = closed_history(&host);
+        let (directory, source, _) = closed_history(&host);
         let mut admission = Reservation::new(&host, &source).unwrap();
         assert!(admission.is_some());
         {
             let mut state = host.lock().unwrap();
             state.native_chat_capacity = 1;
             Reservation::install(&mut admission, &host, &mut state, &source).unwrap();
+            // Even an unclaimed context is custody until its exact owner
+            // reconciles it; a cached NoProvider outcome is not a release.
+            let context =
+                Arc::new(chat::protocol::ExecutionContext::capture(directory.path()).unwrap());
+            state.native_actor_startups.insert(
+                source.id,
+                retained_actor::Startup {
+                    source: source.clone(),
+                    requested: source.clone(),
+                    context,
+                    failed_close: None,
+                },
+            );
             assert_eq!(usage(&state), 1);
+            assert_eq!(status_from_state(&state).spawning, 1);
             assert!(require_available(&state).is_err());
         }
         drop(admission);
@@ -1698,7 +1726,7 @@ pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCap
 pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
     crate::terminal_ipc::ChatCapacity {
         resident: state.chats.len() as u32,
-        spawning: state.chat_spawning.len() as u32,
+        spawning: pending(state) as u32,
         limit: state.native_chat_capacity as u32,
         used: usage(&state) as u32,
         residents: state
