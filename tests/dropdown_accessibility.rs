@@ -718,24 +718,25 @@ fn dropdown_accessibility_native_preflight_prevents_batched_and_separate_sibling
             assert!(ui.focus_accessibility_action(&renderer, &request(notes, Action::Focus)));
             let mut messages = Vec::new();
             let mut queued = Vec::new();
+            // An accessibility client may activate each control directly,
+            // without sending Focus first. Use the actual native preflight
+            // for both separate events and a queued A/B action batch.
             for target in [a, b] {
-                for kind in [Action::Focus, activation] {
-                    let action = request(target, kind);
-                    assert!(
-                        ui.focus_accessibility_action(&renderer, &action),
-                        "same production native preflight"
+                let action = request(target, activation);
+                assert!(
+                    ui.focus_accessibility_action(&renderer, &action),
+                    "same production native preflight"
+                );
+                if batched {
+                    queued.push(event(action));
+                } else {
+                    ui.update(
+                        &[event(action)],
+                        mouse::Cursor::Unavailable,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
                     );
-                    if batched {
-                        queued.push(event(action));
-                    } else {
-                        ui.update(
-                            &[event(action)],
-                            mouse::Cursor::Unavailable,
-                            &mut renderer,
-                            &mut clipboard::Null,
-                            &mut messages,
-                        );
-                    }
                 }
             }
             if batched {
