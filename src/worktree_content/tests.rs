@@ -83,7 +83,14 @@ impl Fixture {
         let worktree = base.join("wt");
         git(
             &repository,
-            &["worktree", "add", "-q", "-b", "feature", worktree.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
         );
         Self {
             _root: root,
@@ -190,8 +197,14 @@ fn a_merged_then_reverted_branch_is_landed_by_ancestry() {
     commit(&fixture.worktree, "one");
     write(&fixture.repository, "main.txt", "main\n");
     commit(&fixture.repository, "main moves on");
-    git(&fixture.repository, &["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
-    git(&fixture.repository, &["revert", "--no-edit", "-m", "1", "HEAD"]);
+    git(
+        &fixture.repository,
+        &["merge", "-q", "--no-ff", "-m", "merge", "feature"],
+    );
+    git(
+        &fixture.repository,
+        &["revert", "--no-edit", "-m", "1", "HEAD"],
+    );
 
     // The commits stay in the target's history, where a revert can be undone.
     assert_eq!(fixture.inspect().verdict, Verdict::Landed);
@@ -396,7 +409,10 @@ fn files_outside_a_sparse_checkout_are_not_deletions() {
 #[test]
 fn assume_unchanged_edits_are_seen() {
     let fixture = Fixture::new();
-    git(&fixture.worktree, &["update-index", "--assume-unchanged", "a.txt"]);
+    git(
+        &fixture.worktree,
+        &["update-index", "--assume-unchanged", "a.txt"],
+    );
     write(&fixture.worktree, "a.txt", "hidden edit\n");
     assert_eq!(git(&fixture.worktree, &["status", "--porcelain"]), "");
 
@@ -411,7 +427,10 @@ fn assume_unchanged_edits_are_seen() {
 fn a_racily_clean_edit_is_seen() {
     let fixture = Fixture::new();
     git(&fixture.repository, &["config", "core.trustctime", "false"]);
-    git(&fixture.repository, &["config", "core.checkStat", "minimal"]);
+    git(
+        &fixture.repository,
+        &["config", "core.checkStat", "minimal"],
+    );
     let file = fixture.worktree.join("a.txt");
     let past = std::time::SystemTime::UNIX_EPOCH
         + Duration::from_secs(
@@ -531,7 +550,10 @@ fn a_custom_merge_driver_voids_the_proof() {
     commit(&fixture.worktree, "feature");
     write(&fixture.repository, "a.txt", "main\n");
     commit(&fixture.repository, "main");
-    git(&fixture.repository, &["config", "merge.ours.driver", "true"]);
+    git(
+        &fixture.repository,
+        &["config", "merge.ours.driver", "true"],
+    );
     write(
         &fixture.repository.join(".git/info"),
         "attributes",
@@ -567,7 +589,10 @@ fn primary_and_locked_worktrees_block() {
 #[test]
 fn per_worktree_refs_block() {
     let fixture = Fixture::new();
-    git(&fixture.worktree, &["update-ref", "refs/worktree/keep", "HEAD"]);
+    git(
+        &fixture.worktree,
+        &["update-ref", "refs/worktree/keep", "HEAD"],
+    );
 
     assert_eq!(
         blocker(&fixture.inspect()),
@@ -578,7 +603,10 @@ fn per_worktree_refs_block() {
 #[test]
 fn a_present_skip_worktree_file_blocks() {
     let fixture = Fixture::new();
-    git(&fixture.worktree, &["update-index", "--skip-worktree", "a.txt"]);
+    git(
+        &fixture.worktree,
+        &["update-index", "--skip-worktree", "a.txt"],
+    );
 
     assert_eq!(
         blocker(&fixture.inspect()),
@@ -702,9 +730,17 @@ fn a_snapshot_restores_index_worktree_and_untracked_files() {
         Err(ContentError::Changed)
     ));
 
-    let saved = snapshot(&request, inspection.token.as_deref().unwrap(), &cancellation).unwrap();
+    let saved = snapshot(
+        &request,
+        inspection.token.as_deref().unwrap(),
+        &cancellation,
+    )
+    .unwrap();
     assert!(saved.refname.starts_with(SNAPSHOT_REFS));
-    assert_eq!(git(&fixture.repository, &["rev-parse", &saved.refname]), saved.oid);
+    assert_eq!(
+        git(&fixture.repository, &["rev-parse", &saved.refname]),
+        saved.oid
+    );
     // The snapshot's objects went to the repository, so inspecting again is
     // still the same plan.
     assert_eq!(fixture.inspect(), inspection);
@@ -721,7 +757,14 @@ fn a_snapshot_restores_index_worktree_and_untracked_files() {
     let restored = fixture.repository.with_file_name("restored");
     git(
         &fixture.repository,
-        &["worktree", "add", "-q", "--detach", restored.to_str().unwrap(), &head],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            restored.to_str().unwrap(),
+            &head,
+        ],
     );
     git(&restored, &["stash", "apply", "--index", &saved.refname]);
     assert_eq!(
@@ -734,7 +777,10 @@ fn a_snapshot_restores_index_worktree_and_untracked_files() {
         "new\n"
     );
     assert_eq!(
-        git(&restored, &["status", "--porcelain", "--untracked-files=all"]),
+        git(
+            &restored,
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
         "MM a.txt\n?? notes/new.txt"
     );
 }
@@ -742,7 +788,10 @@ fn a_snapshot_restores_index_worktree_and_untracked_files() {
 #[test]
 fn a_snapshot_of_a_blocked_worktree_is_refused() {
     let fixture = Fixture::new();
-    git(&fixture.worktree, &["update-ref", "refs/worktree/keep", "HEAD"]);
+    git(
+        &fixture.worktree,
+        &["update-ref", "refs/worktree/keep", "HEAD"],
+    );
 
     assert!(matches!(
         snapshot(&fixture.request(), "any", &CancellationToken::new()),
@@ -790,7 +839,14 @@ fn a_worktree_nested_in_an_ignored_directory_blocks() {
     let inner = fixture.worktree.join(".worktrees/inner");
     git(
         &fixture.worktree,
-        &["worktree", "add", "-q", "-b", "inner", inner.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "inner",
+            inner.to_str().unwrap(),
+        ],
     );
 
     assert_eq!(
@@ -845,14 +901,24 @@ fn content_a_clean_filter_drops_is_unsaved() {
         &fixture.repository,
         &["config", "filter.strip.clean", "grep -v '^OUTPUT'"],
     );
-    git(&fixture.repository, &["config", "filter.strip.smudge", "cat"]);
+    git(
+        &fixture.repository,
+        &["config", "filter.strip.smudge", "cat"],
+    );
     write(&fixture.worktree, ".gitattributes", "*.nb filter=strip\n");
     write(&fixture.worktree, "n.nb", "cell\n");
     commit(&fixture.worktree, "notebook");
-    git(&fixture.repository, &["merge", "-q", "--ff-only", "feature"]);
+    git(
+        &fixture.repository,
+        &["merge", "-q", "--ff-only", "feature"],
+    );
     assert_eq!(fixture.inspect().verdict, Verdict::Landed);
 
-    write(&fixture.worktree, "n.nb", "cell\nOUTPUT computed for hours\n");
+    write(
+        &fixture.worktree,
+        "n.nb",
+        "cell\nOUTPUT computed for hours\n",
+    );
     let inspection = fixture.inspect();
     assert_eq!(inspection.verdict, DISCARD_ONLY);
     assert_eq!(inspection.filtered, vec!["n.nb".to_owned()]);
@@ -862,7 +928,10 @@ fn content_a_clean_filter_drops_is_unsaved() {
 fn a_lossless_filter_does_not_count_as_changes() {
     let fixture = Fixture::new();
     git(&fixture.repository, &["config", "filter.same.clean", "cat"]);
-    git(&fixture.repository, &["config", "filter.same.smudge", "cat"]);
+    git(
+        &fixture.repository,
+        &["config", "filter.same.smudge", "cat"],
+    );
     write(&fixture.worktree, ".gitattributes", "*.bin filter=same\n");
     write(&fixture.worktree, "data.bin", "data\n");
     commit(&fixture.worktree, "data");
@@ -892,7 +961,10 @@ fn a_custom_driver_behind_a_builtin_name_voids_the_proof() {
     commit(&fixture.worktree, "feature");
     write(&fixture.repository, "a.txt", "main\n");
     commit(&fixture.repository, "main");
-    git(&fixture.repository, &["config", "merge.text.driver", "true"]);
+    git(
+        &fixture.repository,
+        &["config", "merge.text.driver", "true"],
+    );
     write(
         &fixture.repository.join(".git/info"),
         "attributes",
@@ -996,7 +1068,11 @@ fn a_mount_inside_the_worktree_blocks() {
         command
     };
     if std::env::var_os(CHILD).is_none() {
-        if !unshare().arg("true").status().is_ok_and(|status| status.success()) {
+        if !unshare()
+            .arg("true")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
             eprintln!("skipped: no unprivileged mount namespace");
             return;
         }
@@ -1052,7 +1128,12 @@ fn a_mount_inside_the_worktree_blocks() {
     mount_command(&["umount".as_ref(), mount.as_os_str()]);
     let elsewhere = fixture.repository.parent().unwrap().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
-    mount_command(&["mount".as_ref(), "--bind".as_ref(), elsewhere.as_os_str(), mount.as_os_str()]);
+    mount_command(&[
+        "mount".as_ref(),
+        "--bind".as_ref(),
+        elsewhere.as_os_str(),
+        mount.as_os_str(),
+    ]);
     assert_eq!(
         blocker(&fixture.inspect()),
         &Blocker::MountPoint("cache/mounted/".into())
@@ -1108,7 +1189,10 @@ const LFS_CLEAN: &str = "sh -c 'f=$(mktemp); cat >\"$f\"; \
 #[test]
 fn lfs_files_are_judged_by_their_pointer_without_smudging() {
     let fixture = Fixture::new();
-    git(&fixture.repository, &["config", "filter.lfs.clean", LFS_CLEAN]);
+    git(
+        &fixture.repository,
+        &["config", "filter.lfs.clean", LFS_CLEAN],
+    );
     git(&fixture.repository, &["config", "filter.lfs.smudge", "cat"]);
     write(&fixture.worktree, ".gitattributes", "*.bin filter=lfs\n");
     write(&fixture.worktree, "asset.bin", "large asset\n");
@@ -1116,7 +1200,10 @@ fn lfs_files_are_judged_by_their_pointer_without_smudging() {
     let pointer = git(&fixture.worktree, &["cat-file", "blob", "HEAD:asset.bin"]);
     assert!(pointer.starts_with("version https://git-lfs"));
     // A smudge would fetch a missing object; inspection never runs one.
-    git(&fixture.repository, &["config", "filter.lfs.smudge", "false"]);
+    git(
+        &fixture.repository,
+        &["config", "filter.lfs.smudge", "false"],
+    );
 
     let inspection = fixture.inspect();
     assert_eq!(inspection.verdict, Verdict::CommitsKept);
@@ -1130,8 +1217,14 @@ fn lfs_files_are_judged_by_their_pointer_without_smudging() {
 #[test]
 fn a_filtered_file_outside_a_sparse_checkout_is_skipped() {
     let fixture = Fixture::new();
-    git(&fixture.repository, &["config", "filter.strip.clean", "cat"]);
-    git(&fixture.repository, &["config", "filter.strip.smudge", "cat"]);
+    git(
+        &fixture.repository,
+        &["config", "filter.strip.clean", "cat"],
+    );
+    git(
+        &fixture.repository,
+        &["config", "filter.strip.smudge", "cat"],
+    );
     write(&fixture.worktree, ".gitattributes", "*.nb filter=strip\n");
     write(&fixture.worktree, "e/n.nb", "cell\n");
     commit(&fixture.worktree, "notebook");
@@ -1161,7 +1254,10 @@ fn a_bare_repository_in_an_ignored_directory_is_unsaved() {
     write(&fixture.worktree, ".gitignore", "tmp/\n");
     commit(&fixture.worktree, "ignore tmp");
     let bare = fixture.worktree.join("tmp/remote.git");
-    git(&fixture.worktree, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(
+        &fixture.worktree,
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
 
     let inspection = fixture.inspect();
     assert_eq!(inspection.verdict, DISCARD_ONLY);

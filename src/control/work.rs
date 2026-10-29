@@ -146,7 +146,9 @@ impl ControlClient {
     /// Subscribes this connection to the Work board and returns it, with the
     /// revision later boards from [`Self::next_work_board`] supersede.
     pub fn watch_work(&mut self) -> Result<(u64, Board), ControlError> {
-        match self.request_with_deadline(ClientRequest::WatchWork, Instant::now() + BOARD_TIMEOUT)? {
+        match self
+            .request_with_deadline(ClientRequest::WatchWork, Instant::now() + BOARD_TIMEOUT)?
+        {
             ServerResponse::Work(Response::Watching { revision, board }) => Ok((revision, *board)),
             response => Err(unexpected_response("a Work board subscription", &response)),
         }
@@ -210,42 +212,57 @@ fn item_argument(item: String) -> String {
     item
 }
 
-fn send(request: Request, timeout: Duration) -> Result<Response, AppError> {
-    send_with(request, timeout, protocol_error)
+fn send(
+    context: &ServiceRequestContext,
+    request: Request,
+    timeout: Duration,
+) -> Result<Response, AppError> {
+    send_with(context, request, timeout, protocol_error)
 }
 
 fn send_with(
+    context: &ServiceRequestContext,
     request: Request,
     timeout: Duration,
     failed: impl FnOnce(ControlError) -> AppError,
 ) -> Result<Response, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = context.connect()?;
     // Inside a hosted session the daemon lets this read the board but never
     // change it, as it can tell once the connection names its authority.
-    let authority = Authority::from_environment();
-    if authority.token().is_some() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
-        client.authenticate(authority).map_err(protocol_error)?;
+    if context.scoped() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
+        client
+            .authenticate(context.authority.clone())
+            .map_err(protocol_error)?;
     }
     client.work(request, timeout).map_err(failed)
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: WorkCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
     match command {
-        WorkCommand::List(arguments) => list(arguments),
+        WorkCommand::List(arguments) => list(arguments, context),
         WorkCommand::Pin {
             item,
             column,
             project,
-        } => pin(item, Some(column), project),
-        WorkCommand::Unpin { item, project } => pin(item, None, project),
-        WorkCommand::Rm(arguments) => remove(arguments),
-        WorkCommand::Snapshots { project } => snapshots(project),
+        } => pin(item, Some(column), project, context),
+        WorkCommand::Unpin { item, project } => pin(item, None, project, context),
+        WorkCommand::Rm(arguments) => remove(arguments, context),
+        WorkCommand::Snapshots { project } => snapshots(project, context),
     }
 }
 
-fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
+fn remove(
+    arguments: RemoveArgs,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
     let scope = scope(arguments.project)?;
     let item = item_argument(arguments.item);
     let request = Request::RemovalPlan {
@@ -258,7 +275,7 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
     } else {
         PLAN_TIMEOUT
     };
-    let Response::RemovalPlan(plan) = send(request, timeout)? else {
+    let Response::RemovalPlan(plan) = send(context, request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let described = plan_human(&plan);
@@ -277,12 +294,16 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
         Keep::Nothing
     };
     plan.permits(keep, arguments.delete_branch)
-        .map_err(|reason| AppError::new("work_removal_refused", format!("{described}\n\n{reason}")))?;
+        .map_err(|reason| {
+            AppError::new("work_removal_refused", format!("{described}\n\n{reason}"))
+        })?;
     let token = match (arguments.token, plan.inspection.token.clone()) {
         (Some(expected), Some(current)) if expected != current => {
             return Err(AppError::new(
                 "work_removal_changed",
-                format!("{described}\n\nThe worktree changed since the plan with that token; review this plan and retry"),
+                format!(
+                    "{described}\n\nThe worktree changed since the plan with that token; review this plan and retry"
+                ),
             ));
         }
         (_, Some(current)) => current,
@@ -320,7 +341,8 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
         ),
         error => protocol_error(error),
     };
-    let Response::Removed(removed) = send_with(request, REMOVE_TIMEOUT, unanswered)? else {
+    let Response::Removed(removed) = send_with(context, request, REMOVE_TIMEOUT, unanswered)?
+    else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     Ok(CommandOutput {
@@ -330,11 +352,14 @@ fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
     })
 }
 
-fn snapshots(project: Option<PathBuf>) -> Result<CommandOutput, AppError> {
+fn snapshots(
+    project: Option<PathBuf>,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
     let request = Request::Snapshots {
         scope: scope(project)?,
     };
-    let Response::Snapshots(snapshots) = send(request, BOARD_TIMEOUT)? else {
+    let Response::Snapshots(snapshots) = send(context, request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = snapshots_human(&snapshots, crate::chat::now_ms().unwrap_or_default());
@@ -385,7 +410,10 @@ fn plan_human(plan: &RemovalPlan) -> String {
         "Changed on their way into Git, so no snapshot keeps them",
         &inspection.filtered,
     ));
-    lines.extend(listed("Repositories inside it, deleted whole", &inspection.nested));
+    lines.extend(listed(
+        "Repositories inside it, deleted whole",
+        &inspection.nested,
+    ));
     if inspection.ignored_total > 0 {
         let shown = inspection
             .ignored
@@ -461,7 +489,7 @@ fn snapshots_human(snapshots: &[SavedSnapshot], now_ms: u64) -> String {
     )
 }
 
-fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
+fn list(arguments: ListArgs, context: &ServiceRequestContext) -> Result<CommandOutput, AppError> {
     let request = Request::Board {
         scope: scope(arguments.project)?,
         fresh: arguments.fresh,
@@ -471,7 +499,7 @@ fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
     } else {
         BOARD_TIMEOUT
     };
-    let Response::Board(mut board) = send(request, timeout)? else {
+    let Response::Board(mut board) = send(context, request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     if let Some(column) = arguments.column {
@@ -489,13 +517,18 @@ fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
     })
 }
 
-fn pin(item: String, column: Option<Column>, project: Option<PathBuf>) -> Result<CommandOutput, AppError> {
+fn pin(
+    item: String,
+    column: Option<Column>,
+    project: Option<PathBuf>,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
     let request = Request::Pin {
         scope: scope(project)?,
         item: item_argument(item),
         column,
     };
-    let Response::Pinned(item) = send(request, BOARD_TIMEOUT)? else {
+    let Response::Pinned(item) = send(context, request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = match column {
@@ -507,7 +540,11 @@ fn pin(item: String, column: Option<Column>, project: Option<PathBuf>) -> Result
         ),
     };
     Ok(CommandOutput {
-        command: if column.is_some() { "work.pin" } else { "work.unpin" },
+        command: if column.is_some() {
+            "work.pin"
+        } else {
+            "work.unpin"
+        },
         data: json!({ "item": item }),
         human,
     })
@@ -536,7 +573,17 @@ fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> Strin
             column.label().to_uppercase(),
             items.len(),
             super::format::table(
-                ["CARD", "PROJECT", "ACTIVITY", "BASE", "CHANGES", "PULL REQUEST", "TICKET", "SESSIONS", "WORKTREE"],
+                [
+                    "CARD",
+                    "PROJECT",
+                    "ACTIVITY",
+                    "BASE",
+                    "CHANGES",
+                    "PULL REQUEST",
+                    "TICKET",
+                    "SESSIONS",
+                    "WORKTREE"
+                ],
                 rows,
                 "",
             )
@@ -553,10 +600,12 @@ fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> Strin
         .iter()
         .flat_map(|project| {
             let name = super::format::plain(&project.name);
-            let scan = project
-                .scan_error
-                .as_deref()
-                .map(|error| format!("{name}: Git could not be read: {}", super::format::plain(error)));
+            let scan = project.scan_error.as_deref().map(|error| {
+                format!(
+                    "{name}: Git could not be read: {}",
+                    super::format::plain(error)
+                )
+            });
             let forge = match &project.forge {
                 Forge::Unavailable { reason } => Some(format!(
                     "{name}: GitHub is unavailable: {}",
@@ -678,7 +727,9 @@ fn row(item: &Item, now_ms: u64) -> [String; 9] {
             .map(|session| {
                 format!(
                     "{} {}",
-                    session.provider.map_or("shell", |provider| provider.executable()),
+                    session
+                        .provider
+                        .map_or("shell", |provider| provider.executable()),
                     match session.state {
                         crate::agent::ActivityState::Working => "working",
                         crate::agent::ActivityState::Waiting => "waiting",
@@ -699,9 +750,10 @@ fn row(item: &Item, now_ms: u64) -> [String; 9] {
         pull_request,
         ticket,
         sessions,
-        item.worktree
-            .as_ref()
-            .map_or_else(|| "-".to_owned(), |worktree| worktree.path.display().to_string()),
+        item.worktree.as_ref().map_or_else(
+            || "-".to_owned(),
+            |worktree| worktree.path.display().to_string(),
+        ),
     ]
 }
 

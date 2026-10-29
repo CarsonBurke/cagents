@@ -5248,15 +5248,19 @@ fn project_list<'a>(
     modal_open: bool,
 ) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
+    let sticky_viewport = row_interaction::StickyViewport::default();
     if projects.is_empty() {
-        return project_scroll(empty(state, compact, modal_open), state.filter);
+        return project_scroll(
+            empty(state, compact, modal_open),
+            state.filter,
+            sticky_viewport,
+        );
     }
 
     // Search results are revealed while their input is available, including
     // the compact popover. Otherwise preserve explicit project collapses.
     let searching = (!compact || state.controls_expanded) && !state.query.trim().is_empty();
     let selection = state.drawn_selection();
-    let sticky_viewport = row_interaction::StickyViewport::default();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
         space::XS
     } else {
@@ -5278,7 +5282,7 @@ fn project_list<'a>(
         column.into(),
         projects.iter().map(|project| project.project.id).collect(),
         !modal_open && !compact,
-        sticky_viewport,
+        sticky_viewport.clone(),
     );
     if lists_kept_attention_rows(&projects) {
         column =
@@ -5292,6 +5296,7 @@ fn project_list<'a>(
             .width(Length::Fill)
             .into(),
         state.filter,
+        sticky_viewport,
     )
 }
 
@@ -5340,6 +5345,7 @@ fn hide_read_attention(compact: bool, modal_open: bool) -> Element<'static, Side
 fn project_scroll(
     content: Element<'_, SidebarAction>,
     filter: SidebarFilter,
+    viewport: row_interaction::StickyViewport,
 ) -> Element<'_, SidebarAction> {
     RowInteraction::filtered_scroll(
         widget::scrollable(content)
@@ -5350,6 +5356,7 @@ fn project_scroll(
             .height(Length::Fill)
             .into(),
         filter,
+        viewport,
     )
 }
 
@@ -10717,8 +10724,9 @@ struct FilteredProject<'a> {
     state: &'a SidebarState,
 }
 
-/// Cache each visible row's rank once; terminal redraws must not scan the
-/// complete durable order for every comparison.
+/// Cache each visible row's rank once. Newly created channels precede the
+/// saved mixed order; new worktrees follow it. Neither changes the relative
+/// order the user chose for existing destinations.
 pub(crate) fn apply_navigation_order<T>(
     rows: &mut [T],
     order: &[crate::workspace_model::NavigationItem],
@@ -10732,7 +10740,14 @@ pub(crate) fn apply_navigation_order<T>(
         .enumerate()
         .map(|(rank, item)| (item, rank))
         .collect();
-    rows.sort_by_cached_key(|row| ranks.get(&item(row)).copied().unwrap_or(usize::MAX));
+    rows.sort_by_cached_key(|row| {
+        let item = item(row);
+        match ranks.get(&item) {
+            Some(rank) => (1, *rank),
+            None if matches!(item, crate::workspace_model::NavigationItem::Channel(_)) => (0, 0),
+            None => (2, 0),
+        }
+    });
 }
 
 fn navigation_item(
@@ -11045,14 +11060,21 @@ pub(crate) fn worktrees_in_display_order<'a>(
 ///
 /// A channel created here holds a provisional rank one above the highest this
 /// window knows until the registry answers, so a channel created a moment ago
-/// sorts where its real rank will put it. `sort_by_key` is stable, so two rows
-/// that do share a rank keep the order the window built them in rather than
-/// swapping between frames.
+/// sorts where its real rank will put it. Equal assigned ranks keep their
+/// source order. At the pending sentinel, the later insertion is newer until
+/// an authoritative read supplies distinct ranks.
 pub(crate) fn channels_in_display_order<'a>(
     rows: impl IntoIterator<Item = &'a SidebarChannel>,
 ) -> Vec<&'a SidebarChannel> {
+    // A folded remote create can still carry the pending sentinel. Its stable
+    // insertion position is the only creation order known until the read.
     let mut rows = rows.into_iter().collect::<Vec<_>>();
     rows.sort_by_key(|channel| std::cmp::Reverse(channel.ordinal));
+    let pending = rows
+        .iter()
+        .take_while(|channel| channel.ordinal == crate::workspace_model::PENDING_ORDINAL)
+        .count();
+    rows[..pending].reverse();
     rows
 }
 
@@ -11384,7 +11406,61 @@ mod row_interaction {
     /// One coordinate shared by the list and its groups, refreshed on each widget
     /// callback, including operations/accessibility before the next draw.
     #[derive(Clone, Default)]
-    pub(super) struct StickyViewport(Rc<Cell<f32>>);
+    pub(super) struct StickyViewport(Rc<Cell<f32>>, Rc<Cell<Option<f32>>>);
+
+    impl StickyViewport {
+        fn content_top(&self, layout: Layout<'_>) -> f32 {
+            self.1.get().unwrap_or(layout.bounds().y) + layout.virtual_offset().y
+        }
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum HeaderPass {
+        Draw,
+        Drag,
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static HEADER_GEOMETRY: std::cell::RefCell<Option<(HeaderPass, Vec<Rectangle>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn capture_headers(pass: HeaderPass, collect: impl FnOnce()) -> Vec<Rectangle> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HEADER_GEOMETRY.with(|headers| {
+                    headers.replace(None);
+                });
+            }
+        }
+        HEADER_GEOMETRY.with(|headers| {
+            assert!(headers.replace(Some((pass, Vec::new()))).is_none());
+        });
+        let _reset = Reset;
+        collect();
+        HEADER_GEOMETRY.with(|headers| headers.take().unwrap().1)
+    }
+
+    #[cfg(test)]
+    fn record_header(pass: HeaderPass, layout: Layout<'_>) {
+        HEADER_GEOMETRY.with(|headers| {
+            if let Some((current, headers)) = headers.borrow_mut().as_mut()
+                && *current == pass
+            {
+                headers.push(layout.bounds() - layout.virtual_offset());
+            }
+        });
+    }
+
+    /// Widget-operation context is scoped to members of this actual group.
+    /// Header targets themselves do not inherit their own sticky obstruction.
+    pub(super) enum RevealInset {
+        Enter(f32),
+        Exit,
+    }
 
     fn sticky_header_bounds(group: Rectangle, height: f32, top: f32) -> Rectangle {
         Rectangle {
@@ -11405,7 +11481,10 @@ mod row_interaction {
             any_selected: bool,
             enabled: bool,
         },
-        FilteredScroll(SidebarFilter),
+        FilteredScroll {
+            filter: SidebarFilter,
+            viewport: StickyViewport,
+        },
         Search {
             enabled: bool,
         },
@@ -11502,10 +11581,11 @@ mod row_interaction {
         pub(super) fn filtered_scroll(
             content: Element<'a, SidebarAction>,
             filter: SidebarFilter,
+            viewport: StickyViewport,
         ) -> Element<'a, SidebarAction> {
             Element::new(Self {
                 children: vec![content],
-                kind: Kind::FilteredScroll(filter),
+                kind: Kind::FilteredScroll { filter, viewport },
             })
         }
 
@@ -11579,6 +11659,14 @@ mod row_interaction {
                 children: vec![base, actions],
                 kind: Kind::Actions { reserve },
             })
+        }
+
+        fn capture_viewport_origin(&self, layout: Layout<'_>) {
+            if let Kind::FilteredScroll { viewport, .. } = &self.kind {
+                // The scrollable is this wrapper's direct child. Its viewport
+                // origin is distinct from the padded project content origin.
+                viewport.1.set(Some(layout.child(0).bounds().y));
+            }
         }
 
         fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
@@ -11692,10 +11780,12 @@ mod row_interaction {
         fn state(&self) -> tree::State {
             tree::State::new(State {
                 scroll: match self.kind {
-                    Kind::FilteredScroll(active) => Some(Box::new(FilterScrollState {
-                        active,
-                        saved: [None, None, None],
-                    })),
+                    Kind::FilteredScroll { filter: active, .. } => {
+                        Some(Box::new(FilterScrollState {
+                            active,
+                            saved: [None, None, None],
+                        }))
+                    }
                     _ => None,
                 },
                 ..State::default()
@@ -11707,7 +11797,7 @@ mod row_interaction {
         }
 
         fn diff(&mut self, tree: &mut Tree) {
-            if let Kind::FilteredScroll(filter) = self.kind {
+            if let Kind::FilteredScroll { filter, .. } = self.kind {
                 let state = tree.state.downcast_mut::<State>();
                 let scroll = state.scroll.as_mut().expect("filtered scroll state");
                 if scroll.active != filter {
@@ -11818,10 +11908,9 @@ mod row_interaction {
             renderer: &Renderer,
             operation: &mut dyn Operation,
         ) {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
             }
             if matches!(self.kind, Kind::Group { .. })
                 && let Some(header) =
@@ -11834,19 +11923,36 @@ mod row_interaction {
             }
             operation.container(None, layout.bounds());
             operation.traverse(&mut |operation| {
-                for ((child, tree), layout) in
-                    self.children
-                        .iter_mut()
-                        .zip(&mut tree.children)
-                        .zip(child_layouts(
-                            &self.kind,
-                            tree.state.downcast_ref::<State>(),
-                            layout,
-                        ))
+                let header_height = matches!(self.kind, Kind::Group { .. }).then(|| {
+                    tree.state
+                        .downcast_ref::<State>()
+                        .header_node
+                        .as_ref()
+                        .expect("group has been laid out")
+                        .size()
+                        .height
+                });
+                for (index, ((child, tree), layout)) in self
+                    .children
+                    .iter_mut()
+                    .zip(&mut tree.children)
+                    .zip(child_layouts(
+                        &self.kind,
+                        tree.state.downcast_ref::<State>(),
+                        layout,
+                    ))
+                    .enumerate()
                 {
+                    let inset = header_height.filter(|_| index == 1);
+                    if let Some(height) = inset {
+                        operation.custom(None, layout.bounds(), &mut RevealInset::Enter(height));
+                    }
                     child
                         .as_widget_mut()
                         .operate(tree, layout, renderer, operation);
+                    if inset.is_some() {
+                        operation.custom(None, layout.bounds(), &mut RevealInset::Exit);
+                    }
                 }
             });
             self.focus(tree, layout, renderer);
@@ -12277,6 +12383,9 @@ mod row_interaction {
                                 cosmic::iced::Color::from(theme.cosmic().primary(false).base),
                             );
                         }
+                        // Witness the actual header draw under the scrollable's translation.
+                        #[cfg(test)]
+                        record_header(HeaderPass::Draw, header);
                         self.children[0].as_widget().draw(
                             &tree.children[0],
                             renderer,
@@ -12399,10 +12508,9 @@ mod row_interaction {
             tree: &Tree,
             cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
             }
             // The outer list translates every descendant together. Strip only
             // its ancestor offset here; nested scrollables add their own offsets.
@@ -12438,9 +12546,9 @@ mod row_interaction {
                 accessible.root_mut().iter_mut().for_each(&mut select);
                 accessible.children_mut().iter_mut().for_each(select);
             }
-            // libcosmic buttons report content-coordinate bounds; its scrollable
-            // forwards a virtual offset without translating their AccessKit nodes.
-            // Translate once at the list boundary, not per nested decorator.
+            // Descendants received zero ancestor offset above, so their bounds
+            // are still in list coordinates even when a button normally applies
+            // its virtual offset. Translate once at this outer list boundary.
             if matches!(self.kind, Kind::Reorder { project: None, .. }) {
                 let offset = layout.virtual_offset();
                 let translate = |node: &mut iced_accessibility::A11yNode| {
@@ -12467,10 +12575,16 @@ mod row_interaction {
             renderer: &Renderer,
             destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
         ) {
+            self.capture_viewport_origin(layout);
             if let Kind::Reorder { viewport, .. } = &self.kind {
-                viewport
-                    .0
-                    .set(layout.bounds().y + layout.virtual_offset().y);
+                viewport.0.set(viewport.content_top(layout));
+            }
+            #[cfg(test)]
+            if matches!(self.kind, Kind::Group { .. })
+                && let Some(header) =
+                    child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout).next()
+            {
+                record_header(HeaderPass::Drag, header);
             }
             for ((child, tree), layout) in self.children.iter().zip(&tree.children).zip(
                 child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout),
@@ -14124,6 +14238,7 @@ pub(crate) mod tests {
                     .height(height)
                     .into(),
                 filter,
+                row_interaction::StickyViewport::default(),
             )
         };
         let mut element = make(SidebarFilter::All, 1_000.0);
@@ -15938,6 +16053,515 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn new_channels_precede_saved_mixed_navigation_without_reordering_existing_destinations() {
+        use crate::workspace_model::NavigationItem;
+        let mut entry = project();
+        entry.worktrees = vec![worktree(20, "main", false), worktree(21, "feature", false)];
+        let old = ChannelId::new();
+        let ids: Vec<_> = (0..6).map(|_| ChannelId::new()).collect();
+        for (index, id) in std::iter::once(&old).chain(&ids).enumerate() {
+            entry.channels.push(SidebarChannel::new(
+                *id,
+                format!("Conversation {index}"),
+                false,
+                None,
+                false,
+                0,
+                false,
+                index as u32,
+            ));
+        }
+        entry.navigation_order = vec![
+            NavigationItem::Worktree(entry.worktrees[1].path.clone()),
+            NavigationItem::Channel(old),
+            NavigationItem::Worktree(entry.worktrees[0].path.clone()),
+        ];
+        let owner = entry.id;
+        let worktrees = [entry.worktrees[1].id, entry.worktrees[0].id];
+        let mut other = project();
+        other.id = project_id(99);
+        let unrelated = other.clone();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry, other]);
+        let mut state = SidebarState::default();
+        let mut expected = vec![SelectionRow::Project(owner)];
+        expected.extend(ids.iter().rev().copied().map(SelectionRow::Channel));
+        expected.extend([
+            SelectionRow::Worktree(owner, worktrees[0]),
+            SelectionRow::Channel(old),
+            SelectionRow::Worktree(owner, worktrees[1]),
+        ]);
+        let visible = visible_selection_rows(&model, &state, false);
+        assert_eq!(&visible[..expected.len()], expected.as_slice());
+        let cycle = workspace_cycle(&model, &state);
+        assert_eq!(
+            cycle[..6]
+                .iter()
+                .map(|action| match action {
+                    SidebarAction::OpenChannel { channel_id } => *channel_id,
+                    _ => panic!("a new channel must precede every saved worktree"),
+                })
+                .collect::<Vec<_>>(),
+            ids.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(model.projects[1], unrelated);
+        let mut active = model.clone();
+        active.projects[0].channels[0].activity = Some(crate::agent::ActivityState::Working);
+        active.projects[0].channels[0].unread = true;
+        assert_eq!(
+            visible_selection_rows(&active, &state, false),
+            visible,
+            "activity and unread state do not change creation or manual order"
+        );
+        // An intentional later drag can place the new destination anywhere.
+        let mut arranged = model.clone();
+        arranged.projects[0]
+            .navigation_order
+            .push(NavigationItem::Channel(ids[5]));
+        let rows = visible_selection_rows(&arranged, &state, false);
+        assert_eq!(rows[1], SelectionRow::Channel(ids[4]));
+        assert_eq!(rows[expected.len() - 1], SelectionRow::Channel(ids[5]));
+        state.query = "feature".into();
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![
+                SelectionRow::Project(owner),
+                SelectionRow::Worktree(owner, worktrees[0])
+            ],
+            "search relevance remains independent of manual and creation ordering"
+        );
+    }
+
+    #[test]
+    fn revealing_a_new_channel_scrolls_the_real_sidebar_without_taking_composer_focus() {
+        use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+            futures::StreamExt,
+        };
+        #[derive(Default)]
+        struct Probe {
+            offset: Option<f32>,
+            viewport: Option<Rectangle>,
+            focused: Option<Id>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = id.cloned();
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&stable_id("projects.scroll")) {
+                    self.offset = Some(translation.y);
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let mut first = project();
+        first.worktrees = (20..60)
+            .map(|id| worktree(id, &format!("branch-{id}"), false))
+            .collect();
+        let mut last = project();
+        last.id = project_id(99);
+        last.name = "Last project".into();
+        last.worktrees.clear();
+        last.channels.clear();
+        let channel = ChannelId::new();
+        last.channels.push(SidebarChannel::new(
+            channel,
+            "Newest conversation".into(),
+            true,
+            None,
+            false,
+            0,
+            true,
+            1,
+        ));
+        let label = last.channels[0].accessible_name.clone();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![first, last]);
+        let state = SidebarState::default();
+        let foreign = Id::new("new-channel-test-composer");
+        let content = widget::column::with_children(vec![
+            widget::container(project_list(&model, &state, false, false))
+                .height(180)
+                .into(),
+            widget::text_input("Draft", "Keep editing here")
+                .id(foreign.clone())
+                .on_input(SidebarAction::SearchChanged)
+                .into(),
+        ]);
+        let mut renderer = headless_renderer();
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(280.0, 240.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(foreign.clone()),
+        );
+        let mut before = Probe::default();
+        ui.operate(&renderer, &mut before);
+        assert_eq!(before.offset, Some(0.0));
+        assert_eq!(before.focused, Some(foreign.clone()));
+        let target = selection_row_focus_id(SelectionRow::Channel(channel));
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(reveal::<()>(target.clone())).unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(action) = stream.next().await {
+                let Action::Widget(mut operation) = action else {
+                    panic!("reveal is a native widget operation only")
+                };
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        operation::Outcome::None => break,
+                        _ => panic!("reveal must not emit an app or provider action"),
+                    }
+                }
+            }
+        });
+        let mut after = Probe::default();
+        ui.operate(&renderer, &mut after);
+        assert!(
+            after.offset.unwrap() > 0.0,
+            "the real project scrollable moved"
+        );
+        assert_eq!(after.focused, Some(foreign));
+        let nodes = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label.as_ref())
+            })
+            .expect("the actual channel button remains accessible")
+            .node()
+            .bounds()
+            .unwrap();
+        let viewport = after.viewport.unwrap();
+        assert!(
+            bounds.y0 >= f64::from(viewport.y) - 0.01
+                && bounds.y1 <= f64::from(viewport.y + viewport.height) + 0.01
+        );
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+        // A subsequent explicit keyboard-navigation command still takes focus.
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(focus_and_reveal::<()>(target.clone()))
+                .unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(Action::Widget(mut operation)) = stream.next().await {
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        });
+        let mut focused = Probe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.focused, Some(target));
+    }
+
+    #[test]
+    fn upward_reveal_keeps_the_channel_below_its_own_sticky_header_and_preserves_focus() {
+        use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+            futures::StreamExt,
+        };
+        #[derive(Default)]
+        struct Probe {
+            offset: f32,
+            viewport: Rectangle,
+            focused: Option<Id>,
+            bounds: std::collections::HashMap<Id, Rectangle>,
+            member_insets: Vec<f32>,
+            row_insets: std::collections::HashMap<Id, f32>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.bounds.insert(id.clone(), bounds);
+                    self.row_insets.insert(
+                        id.clone(),
+                        self.member_insets.last().copied().unwrap_or_default(),
+                    );
+                }
+                if state.is_focused() {
+                    self.focused = id.cloned();
+                }
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                match state.downcast_ref::<row_interaction::RevealInset>() {
+                    Some(row_interaction::RevealInset::Enter(height)) => {
+                        self.member_insets.push(*height)
+                    }
+                    Some(row_interaction::RevealInset::Exit) => {
+                        self.member_insets.pop();
+                    }
+                    None => {}
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&stable_id("projects.scroll")) {
+                    self.offset = translation.y;
+                    self.viewport = bounds;
+                }
+            }
+        }
+        let mut project = project();
+        let owner = project.id;
+        let header_label = project.chrome.open_name.clone();
+        project.worktrees = (20..60)
+            .map(|id| worktree(id, &format!("branch-{id}"), false))
+            .collect();
+        project.pull_requests.clear();
+        let channel = ChannelId::new();
+        project.channels.push(SidebarChannel::new(
+            channel,
+            "Newest conversation".into(),
+            true,
+            None,
+            false,
+            0,
+            true,
+            1,
+        ));
+        let label = project.channels[0].accessible_name.clone();
+        let preceding = SidebarProject::new(
+            project_id(98),
+            RepositoryId::new(),
+            "Preceding project".into(),
+            "/preceding/.git".into(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![preceding, project]);
+        let state = SidebarState::default();
+        let composer = Id::new("upward-reveal-composer");
+        let content = widget::column::with_children(vec![
+            widget::Space::new().height(37).into(),
+            widget::container(project_list(&model, &state, false, false))
+                .height(180)
+                .into(),
+            widget::text_input("Draft", "Keep editing here")
+                .id(composer.clone())
+                .on_input(SidebarAction::SearchChanged)
+                .into(),
+        ]);
+        let mut renderer = headless_renderer();
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(280.0, 280.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let target = selection_row_focus_id(SelectionRow::Channel(channel));
+        for focus in [false, true] {
+            ui.operate(
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    stable_id("projects.scroll"),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(640.0),
+                    },
+                ),
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(composer.clone()),
+            );
+            let mut before = Probe::default();
+            ui.operate(&renderer, &mut before);
+            assert!(before.offset > 0.0);
+            assert!(
+                before.viewport.y > 0.0,
+                "the real scroll viewport is translated below other UI"
+            );
+            let task = if focus {
+                focus_and_reveal::<()>(target.clone())
+            } else {
+                reveal::<()>(target.clone())
+            };
+            let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+            cosmic::iced::futures::executor::block_on(async {
+                while let Some(action) = stream.next().await {
+                    let Action::Widget(mut operation) = action else {
+                        panic!("widget operation only")
+                    };
+                    loop {
+                        ui.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            operation::Outcome::None => break,
+                            _ => panic!("no app or provider effect"),
+                        }
+                    }
+                }
+            });
+            let mut after = Probe::default();
+            ui.operate(&renderer, &mut after);
+            assert!(after.offset < before.offset);
+            assert_eq!(
+                after.focused,
+                Some(if focus {
+                    target.clone()
+                } else {
+                    composer.clone()
+                })
+            );
+            let nodes = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+            let bounds = |label: &str| {
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .find(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some(label)
+                    })
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap()
+            };
+            let header = bounds(header_label.as_ref());
+            let row = bounds(label.as_ref());
+            assert!(header.y1 > header.y0);
+            assert!(
+                row.y0 >= header.y1 - 0.01,
+                "the sticky header must not cover the revealed channel: {header:?} {row:?}; raw row={:?}, raw header={:?}, inset={:?}, offset={}, viewport={:?}, focus={focus}",
+                after.bounds.get(&target),
+                after
+                    .bounds
+                    .get(&selection_row_focus_id(SelectionRow::Project(owner))),
+                after.row_insets.get(&target),
+                after.offset,
+                after.viewport
+            );
+            assert!(row.y1 <= f64::from(after.viewport.y + after.viewport.height) + 0.01);
+            let raw_row = after.bounds[&target];
+            let raw_header = after.bounds[&selection_row_focus_id(SelectionRow::Project(owner))];
+            assert!((row.y0 - f64::from(raw_row.y - after.offset)).abs() < 0.01);
+            assert!((header.y0 - f64::from(raw_header.y - after.offset)).abs() < 0.01);
+            assert!((header.y0 - f64::from(after.viewport.y)).abs() < 0.01);
+            assert_eq!(after.row_insets[&target], raw_header.height);
+            // Accessibility and operation were checked before any paint. Now
+            // observe the real Group header draw, independent of either report.
+            let painted =
+                row_interaction::capture_headers(row_interaction::HeaderPass::Draw, || {
+                    ui.draw(
+                        &mut renderer,
+                        &cosmic::Theme::default(),
+                        &cosmic::iced::advanced::renderer::Style::default(),
+                        cosmic::iced::mouse::Cursor::Unavailable,
+                    );
+                });
+            assert!(
+                painted
+                    .iter()
+                    .any(|paint| (f64::from(paint.y) - header.y0).abs() < 0.01
+                        && (f64::from(paint.height) - (header.y1 - header.y0)).abs() < 0.01),
+                "actual painted header must match accessibility: {painted:?} {header:?}"
+            );
+            let dragged =
+                row_interaction::capture_headers(row_interaction::HeaderPass::Drag, || {
+                    drop(ui.dnd_rectangles(0, &renderer));
+                });
+            assert!(
+                dragged
+                    .iter()
+                    .any(|drag| (f64::from(drag.y) - header.y0).abs() < 0.01
+                        && (f64::from(drag.height) - (header.y1 - header.y0)).abs() < 0.01),
+                "actual drag-destination header must retain the viewport before AX refresh: {dragged:?} {header:?}"
+            );
+            let after_drag = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+            let drag_header = after_drag
+                .root()
+                .iter()
+                .chain(after_drag.children())
+                .find(|node| node.node().label() == Some(header_label.as_ref()))
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            assert_eq!(
+                drag_header, header,
+                "drag-destination traversal preserves the viewport origin"
+            );
+            if !focus {
+                ui = ui.relayout(Size::new(240.0, 280.0), &mut renderer);
+            }
+        }
+        // Project headers themselves need no member inset and keep their
+        // displayed sticky position when explicitly focused.
+        let header_target = selection_row_focus_id(SelectionRow::Project(owner));
+        let mut header_before = Probe::default();
+        ui.operate(&renderer, &mut header_before);
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(focus_and_reveal::<()>(header_target.clone()))
+                .unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(Action::Widget(mut operation)) = stream.next().await {
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        });
+        let mut focused = Probe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.focused, Some(header_target));
+        assert_eq!(
+            focused.offset, header_before.offset,
+            "an already visible sticky header must not scroll by a member inset"
+        );
+    }
+
+    #[test]
     fn manual_navigation_interleaves_channels_and_worktrees_for_keyboard_navigation() {
         use crate::workspace_model::NavigationItem;
         let mut entry = project();
@@ -17479,8 +18103,7 @@ pub(crate) mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
         assert_eq!(
-            focus.0,
-            after_press_focus.0,
+            focus.0, after_press_focus.0,
             "the post-press native focus survives the cache hit"
         );
         assert_eq!(
@@ -21003,14 +21626,40 @@ pub(crate) mod tests {
 
 /// Focus a navigation row and reveal it within the Projects scroll viewport.
 pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    reveal_navigation_row(id, true)
+}
+
+/// Reveal a newly selected destination without taking focus from its composer.
+pub fn reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    reveal_navigation_row(id, false)
+}
+
+fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced::Task<T> {
     use cosmic::iced::advanced::widget::{Operation, operation};
     struct FocusRow {
         id: Id,
         bounds: Option<cosmic::iced::Rectangle>,
+        focus: bool,
+        insets: Vec<f32>,
+        top_inset: f32,
     }
     impl<T: 'static> Operation<T> for FocusRow {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
             visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&Id>,
+            _: cosmic::iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            match state.downcast_ref::<row_interaction::RevealInset>() {
+                Some(row_interaction::RevealInset::Enter(height)) => self.insets.push(*height),
+                Some(row_interaction::RevealInset::Exit) => {
+                    self.insets.pop();
+                }
+                None => {}
+            }
         }
         fn focusable(
             &mut self,
@@ -21019,20 +21668,27 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             state: &mut dyn operation::Focusable,
         ) {
             if id == Some(&self.id) {
-                state.focus();
+                if self.focus {
+                    state.focus();
+                }
                 self.bounds = Some(bounds);
-            } else {
+                self.top_inset = self.insets.last().copied().unwrap_or_default();
+            } else if self.focus {
                 state.unfocus();
             }
         }
         fn finish(&self) -> operation::Outcome<T> {
             self.bounds.map_or(operation::Outcome::None, |bounds| {
-                operation::Outcome::Chain(Box::new(RevealRow { bounds }))
+                operation::Outcome::Chain(Box::new(RevealRow {
+                    bounds,
+                    top_inset: self.top_inset,
+                }))
             })
         }
     }
     struct RevealRow {
         bounds: cosmic::iced::Rectangle,
+        top_inset: f32,
     }
     impl<T> Operation<T> for RevealRow {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
@@ -21046,12 +21702,13 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             translation: cosmic::iced::Vector,
             state: &mut dyn operation::Scrollable,
         ) {
-            if id != Some(&stable_id("sidebar.projects.scroll")) {
+            if id != Some(&stable_id("projects.scroll")) {
                 return;
             }
             let row = self.bounds - translation;
-            let delta = if row.y < bounds.y {
-                row.y - bounds.y
+            let top = bounds.y + self.top_inset.min((bounds.height - row.height).max(0.0));
+            let delta = if row.y < top {
+                row.y - top
             } else if row.y + row.height > bounds.y + bounds.height {
                 row.y + row.height - bounds.y - bounds.height
             } else {
@@ -21066,5 +21723,11 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             }
         }
     }
-    cosmic::iced::advanced::widget::operate(FocusRow { id, bounds: None })
+    cosmic::iced::advanced::widget::operate(FocusRow {
+        id,
+        bounds: None,
+        focus,
+        insets: Vec::new(),
+        top_inset: 0.0,
+    })
 }

@@ -36,7 +36,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -78,7 +80,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -3486,6 +3488,154 @@ fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
 }
 
 #[test]
+fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
+    use crate::{
+        agent_execution::{
+            AcceptanceError, Lineage,
+            mailbox::{
+                Inbox, MAX_PENDING, Message, Outgoing, Party, Receipt, State as Delivery, To,
+            },
+        },
+        model::MessageId,
+        terminal::ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = crate::host::service::test_host();
+    host.lock()
+        .unwrap()
+        .install_model(Registry::at(&directory.path().join("mailbox.sqlite3")).unwrap());
+    let store = registry(&host).unwrap();
+    let recipient = Party {
+        lineage: Some(Lineage(TerminalId::new())),
+        session: None,
+        title: Some("Busy recipient".into()),
+    };
+    let message = |from, to, created_ms| Message {
+        id: MessageId::new(),
+        from,
+        to,
+        reply_to: None,
+        body: "Retain this fixture message".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms,
+    };
+    let incoming = message(recipient.clone(), Party::user(), 0);
+    store.lock().unwrap().post_message(&incoming).unwrap();
+    for at in 0..MAX_PENDING {
+        store
+            .lock()
+            .unwrap()
+            .post_message(&message(Party::user(), recipient.clone(), at as u64))
+            .unwrap();
+    }
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    let pending = || {
+        store
+            .lock()
+            .unwrap()
+            .peek_messages(recipient.lineage, &query)
+            .unwrap()
+    };
+    let before = pending();
+    let outgoing = Outgoing {
+        to: To::Sender(incoming.id.to_string()),
+        body: "A reply must wait for an actual mailbox slot".into(),
+        wait_ms: None,
+    };
+    // Synthetic User scope resolves normally in this temporary registry. This
+    // fixture neither removes inherited authority nor proves a deployed caller.
+    assert!(matches!(
+        process_request(
+            &host,
+            Authority::default(),
+            Operation::SendMessage(outgoing.clone())
+        ),
+        Err(AcceptanceError::MailboxFull(_))
+    ));
+    let invoke = |authority, outgoing| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority,
+                operation: Operation::SendMessage(outgoing),
+            },
+        )
+        .map(|(reply, _, _)| reply)
+    };
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert!(refusal.message.contains(&recipient.short().unwrap()));
+    assert!(refusal.message.contains(&MAX_PENDING.to_string()));
+    assert!(refusal.message.contains("once it has read them"));
+
+    let mut empty = outgoing.clone();
+    empty.body.clear();
+    let mut unknown = outgoing.clone();
+    unknown.to = To::Session(TerminalId::new().to_string());
+    let mut foreign_reply = outgoing.clone();
+    foreign_reply.to = To::Sender(MessageId::new().to_string());
+    for (authority, outgoing) in [
+        (Authority::default(), empty),
+        (Authority::default(), unknown),
+        (Authority::default(), foreign_reply),
+        // A fresh unregistered fixture token must not disclose queue capacity.
+        (
+            Authority::session(uuid::Uuid::new_v4().to_string()),
+            outgoing.clone(),
+        ),
+    ] {
+        let refusal = invoke(authority, outgoing).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!refusal.retryable);
+    }
+    assert_eq!(pending(), before, "no refusal inserts or consumes mail");
+    assert_eq!(
+        store.lock().unwrap().message(incoming.id).unwrap(),
+        Some(incoming.clone())
+    );
+    // Only an exact recipient receipt frees a slot. The service has no courier
+    // or provider here; explicit resubmission must durably fill just that slot.
+    store
+        .lock()
+        .unwrap()
+        .acknowledge_messages(
+            recipient.lineage,
+            None,
+            &Receipt {
+                ids: vec![before[0].id],
+            },
+            now(),
+        )
+        .unwrap();
+    let ServerResponse::Agent(Reply::Sent(sent)) =
+        invoke(Authority::default(), outgoing.clone()).unwrap()
+    else {
+        panic!("one exact read must permit one explicit reply");
+    };
+    assert_eq!(sent.message.reply_to, Some(incoming.id));
+    let after = pending();
+    assert_eq!(after.len(), MAX_PENDING);
+    assert!(after.contains(&sent.message));
+    assert!(before[1..].iter().all(|message| after.contains(message)));
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert_eq!(pending(), after);
+
+    host.lock().unwrap().execution_registry = None;
+    let refusal = invoke(Authority::default(), outgoing).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!refusal.retryable);
+}
+
+#[test]
 fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
     use crate::{
         agent_execution::{
@@ -4184,4 +4334,112 @@ fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted
     assert_eq!(handle.actor_identity(), Some(identity));
     assert!(handle.owns_work());
     assert!(!handle.is_completed());
+}
+
+#[test]
+fn execution_gates_reclaim_failed_and_repeated_close_churn() {
+    if isolated("execution_gates_reclaim_failed_and_repeated_close_churn").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    // Accept without dispatch: closing this agent exercises durable retirement
+    // without starting a provider, and subsequent closes use the repair path.
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    for _ in 0..256 {
+        assert!(close(&host, &Authority::default(), AgentId::new()).is_err());
+        assert!(
+            close(&host, &Authority::default(), accepted.agent.id)
+                .unwrap()
+                .closed
+        );
+        assert!(host.lock().unwrap().execution_gates.len() <= 1);
+    }
+    assert!(
+        host.lock()
+            .unwrap()
+            .execution_gates
+            .values()
+            .all(|gate| gate.upgrade().is_none())
+    );
+    assert!(!path.parent().unwrap().join("spawns").exists());
+}
+
+#[test]
+fn execution_gates_preserve_waiters_during_reclamation() {
+    if isolated("execution_gates_preserve_waiters_during_reclamation").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let agent = AgentId::new();
+    let holder = agent_gate(&host, agent);
+    let held = holder.lock().unwrap();
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let (finish, finished) = std::sync::mpsc::channel();
+    let other = host.clone();
+    let thread = std::thread::spawn(move || {
+        let gate = agent_gate(&other, agent);
+        ready.send(Arc::downgrade(&gate)).unwrap();
+        let _held = gate.lock().unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let waiter = waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    for _ in 0..256 {
+        drop(agent_gate(&host, AgentId::new()));
+        let current = agent_gate(&host, agent);
+        assert!(Arc::ptr_eq(&holder, &current));
+        assert!(current.try_lock().is_err());
+        assert!(host.lock().unwrap().execution_gates.len() <= 2);
+    }
+    drop(held);
+    drop(holder);
+    // Only the waiter now owns the gate. A fresh lookup must still join it.
+    let current = agent_gate(&host, agent);
+    assert!(Arc::ptr_eq(&waiter.upgrade().unwrap(), &current));
+    finish.send(()).unwrap();
+    thread.join().unwrap();
+    drop(current);
+    assert!(waiter.upgrade().is_none());
+    drop(agent_gate(&host, AgentId::new()));
+    assert!(!host.lock().unwrap().execution_gates.contains_key(&agent));
+}
+
+#[test]
+fn execution_gates_keep_existing_callers_after_successful_close() {
+    if isolated("execution_gates_keep_existing_callers_after_successful_close").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let pending = agent_gate(&host, accepted.agent.id);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    let next = agent_gate(&host, accepted.agent.id);
+    assert!(Arc::ptr_eq(&pending, &next));
+    let held = pending.lock().unwrap();
+    assert!(next.try_lock().is_err());
+    drop(held);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }
