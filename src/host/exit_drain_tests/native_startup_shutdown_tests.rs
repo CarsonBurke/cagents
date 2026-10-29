@@ -8,6 +8,7 @@ use crate::{
         protocol::{ExecutionContext, LaunchOutcome},
         runtime::startup_observation::{Event, Observation, Spawned},
     },
+    terminal_ipc::{SHUTDOWN_VERSION, ShutdownOperation, ShutdownOutcome},
 };
 use std::{
     io::Write,
@@ -457,9 +458,49 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
             host.lock().unwrap().request_shutdown();
             crate::daemon::wake();
         } else {
+            // Plain Stop correctly asks for confirmation while this owned
+            // start is pending. Confirm only this private fixture's actual
+            // fresh inventory through the SAME predetermined User stream.
+            let response = user.request(ClientRequest::Shutdown).unwrap();
+            eprintln!("Fixture User plain shutdown response: {response:?}");
             assert!(matches!(
-                user.request(ClientRequest::Shutdown).unwrap(),
-                ServerResponse::ShutdownAccepted
+                response,
+                ServerResponse::ShutdownOutcome(ShutdownOutcome::ConfirmationRequired {
+                    current_count: 1,
+                })
+            ));
+            let preflight = match user
+                .request(ClientRequest::ShutdownV1 {
+                    version: SHUTDOWN_VERSION,
+                    operation: ShutdownOperation::Preflight,
+                })
+                .unwrap()
+            {
+                ServerResponse::ShutdownPreflight(preflight) => preflight,
+                ServerResponse::ShutdownOutcome(outcome) => {
+                    panic!("fixture User shutdown preflight returned {outcome:?}")
+                }
+                _ => panic!("fixture User shutdown preflight returned an unexpected response"),
+            };
+            assert_eq!(preflight.capability.proof, user.proof);
+            assert_eq!(preflight.capability.live_terminals, 1);
+            // The returned capability is passed unchanged, never fabricated,
+            // printed, or replaced after a refusal.
+            let confirmed = user
+                .request(ClientRequest::ShutdownV1 {
+                    version: SHUTDOWN_VERSION,
+                    operation: ShutdownOperation::Confirm {
+                        capability: preflight.capability,
+                    },
+                })
+                .unwrap();
+            eprintln!("Fixture User confirmed shutdown response: {confirmed:?}");
+            assert!(matches!(
+                confirmed,
+                ServerResponse::ShutdownOutcome(ShutdownOutcome::Accepted {
+                    live_terminals_before: 1,
+                    termination_requested: true,
+                })
             ));
         }
         shutdown_stimulated = true;
