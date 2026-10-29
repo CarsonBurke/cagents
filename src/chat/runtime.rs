@@ -2152,16 +2152,23 @@ impl Actor {
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
+                        if closing.is_none() && self.adapter.initialization_pending() {
+                            return Err("Provider exited before completing initialization".into());
+                        }
                         return Ok(());
                     }
                     return Err(format!("Provider exited with {status}"));
                 }
                 return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
             }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
+            if (!self.first_frame || self.adapter.initialization_pending())
+                && self.started.elapsed() > IO_TIMEOUT
+            {
+                return Err(if self.first_frame {
+                    "Provider initialization timed out before handshake completion".into()
+                } else {
+                    "Provider initialization timed out without a JSON protocol frame".into()
+                });
             }
             if self
                 .write_started
@@ -2214,6 +2221,7 @@ impl Actor {
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
             } else if !self.first_frame
+                || self.adapter.initialization_pending()
                 || !self.output.is_empty()
                 || self.write_started.is_some()
                 || closing.is_some()
@@ -7186,6 +7194,103 @@ mod tests {
         );
         release.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    // Use the real Claude adapter and inherited process authority, but only a
+    // synthetic absolute executable: no discovery, account, or provider calls.
+    fn claude_initialization_pipe(body: &str) -> (tempfile::TempDir, LocalHandle) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(&provider, format!(
+            "#!/usr/bin/python3\nimport json, sys\nrequest = json.loads(sys.stdin.readline())\nassert request['type'] == 'control_request'\nassert request['request']['subtype'] == 'initialize'\n{body}"
+        )).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        (directory, handle)
+    }
+
+    fn finish_initialization_pipe(handle: &LocalHandle, timeout: Duration) -> Snapshot {
+        let deadline = Instant::now() + timeout;
+        while !handle.is_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let completed = handle.is_completed();
+        let snapshot = handle.snapshot(None).unwrap();
+        // Retire/reap the exact fixture before an assertion can fail.
+        handle.close().unwrap();
+        assert!(completed, "initialization fixture timed out: {snapshot:?}");
+        snapshot
+    }
+
+    #[test]
+    fn claude_advisories_do_not_disable_the_real_pipe_initialization_deadline() {
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'keep_alive'}), flush=True)\n\
+             print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             sys.stdin.read()\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        assert!(!snapshot.ready);
+        assert!(
+            snapshot.error.as_deref().is_some_and(
+                |error| error.contains("initialization timed out before handshake completion")
+            ),
+            "{snapshot:?}"
+        );
+        assert!(handle.failure().is_some());
+    }
+
+    #[test]
+    fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() {
+        for advisory in [false, true] {
+            for noise in [0, 1, 7] {
+                let body = format!(
+                    "if {advisory}:\n    print(json.dumps({{'type': 'future_advisory'}}), flush=True)\n\
+                     for _ in range({noise}):\n    print('wrapper diagnostic', flush=True)\n",
+                    advisory = if advisory { "True" } else { "False" },
+                );
+                let (_directory, handle) = claude_initialization_pipe(&body);
+                let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+                assert!(!snapshot.ready);
+                assert!(
+                    snapshot.error.as_deref().is_some_and(
+                        |error| error.contains("exited before completing initialization")
+                    ),
+                    "{snapshot:?}"
+                );
+            }
+        }
+
+        let (_directory, handle) = claude_initialization_pipe(
+            "print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
+             for _ in range(7):\n    print('wrapper diagnostic', flush=True)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+        );
+        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
+
+        let (_directory, handle) = claude_initialization_pipe("sys.stdin.read()\n");
+        handle.close().unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(!snapshot.ready);
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert!(handle.failure().is_none());
     }
 
     #[test]

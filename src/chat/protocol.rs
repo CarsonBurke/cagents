@@ -338,6 +338,11 @@ pub trait Adapter: Send {
         None
     }
     fn initialize(&mut self) -> Result<Step, String>;
+    /// Whether the initial handshake still needs its matching provider reply.
+    /// Advisory frames do not complete it; later readiness changes are separate.
+    fn initialization_pending(&self) -> bool {
+        false
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
