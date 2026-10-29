@@ -666,7 +666,7 @@ impl Cagents {
                 if self.shared_views.is_requested_transfer(operation) {
                     self.reject_pane_transfer(operation, error);
                 } else {
-                    self.shared_views.refused(operation);
+                    self.refuse_shared_view_edit(&scope, operation);
                     self.status = Some(TransientNotice::warning(format!(
                         "The pane change was not applied: {error}"
                     )));
