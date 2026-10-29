@@ -372,7 +372,7 @@ impl Cagents {
                 ),
             confirm
                 .id(health_action_id(state))
-                .on_press_maybe(available_action.map(Message::DaemonHealthUi)),
+                .on_press_maybe(available_action.clone().map(Message::DaemonHealthUi)),
         ));
         let overlay = dialog_ui::overlay(
             dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 560.0),
