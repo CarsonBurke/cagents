@@ -4885,7 +4885,11 @@ mod tests {
             assert!(messages(app.update(Message::Sidebar(SidebarAction::Refresh))).is_empty());
         }
         let outputs = messages(retry);
-        assert_eq!(outputs.len(), 1 + usize::from(with_healthy_row));
+        assert_eq!(
+            outputs.len(),
+            1 + usize::from(with_healthy_row),
+            "actual Sidebar Refresh outputs (healthy row: {with_healthy_row}): {outputs:#?}"
+        );
         let mut retried = None;
         let mut refreshed_healthy = false;
         for output in outputs {
