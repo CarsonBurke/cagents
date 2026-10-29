@@ -372,6 +372,41 @@ pub(super) fn write_shared_literal(text: Arc<str>) -> Task<Message> {
     })
 }
 
+/// A copy whose clipboard contents are produced later, off the UI thread. It
+/// joins the shared intent order: starting one supersedes older copies, and
+/// any newer copy (including a widget's own selection copy) supersedes it.
+#[derive(Clone)]
+pub(super) struct Intent {
+    context: ClipboardContext,
+    intent: u64,
+}
+
+impl Intent {
+    pub(super) fn begin() -> Self {
+        let context = current_context();
+        let intent = context.advance();
+        Self { context, intent }
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.context.is_current(self.intent)
+    }
+
+    /// Like [`clipboard_write`], the gate runs when the effect is polled.
+    pub(super) fn write_data(
+        self,
+        contents: impl iced::clipboard::mime::AsMimeTypes + Send + Sync + 'static,
+    ) -> Task<Message> {
+        let mut contents = Some(contents);
+        iced::Task::done(()).then(move |_| match contents.take() {
+            Some(contents) if self.is_current() => {
+                iced::clipboard::write_data(contents).map(cosmic::Action::App)
+            }
+            _ => Task::none(),
+        })
+    }
+}
+
 /// Check again when the returned task is polled, not just when completion is
 /// handled: clipboard intent or source authority may change while this effect
 /// is still pending. Keep both checks next to the emitted clipboard effect.
