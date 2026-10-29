@@ -195,7 +195,13 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 143 preserves this branch's version-127 contracts and appends typed
+/// AccountPreparation device request/reply variants. Its owning host requires
+/// explicit User connection scope and metadata admission. Matched executables
+/// are required; this does not adopt unrelated private protocol experiments.
+/// Create and installation-less observations remain pre-storage refusals in
+/// the metadata facade; transport does not complete the account setup flow.
+pub const PROTOCOL_VERSION: u16 = 143;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2090,6 +2096,185 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn account_preparation_appends_wire_tags_and_round_trips_complete_framed_intents() {
+        use crate::account::preparation::{
+            AccountPreparationOutcome as Outcome, AccountPreparationRecord as Record,
+            AccountPreparationReply, AccountPreparationRequest as Request, ExistingPendingBinding,
+            ExistingPendingRecord, ExistingPendingRequest, ExistingPendingState,
+            ExistingPendingTarget, Preparation, PreparationBinding, PreparationPayload,
+            PreparationRequest, PreparationState,
+        };
+        use crate::{
+            agent::Provider,
+            device_service::{Operation, Reply},
+        };
+        use uuid::Uuid;
+        let binding = PreparationBinding {
+            request_id: Uuid::from_u128(1),
+            installation_id: Uuid::from_u128(2),
+            key: Uuid::from_u128(3),
+            payload: PreparationPayload {
+                provider: Provider::Codex,
+                copy_codex_config: true,
+            },
+        };
+        let pending = ExistingPendingBinding {
+            installation_id: Uuid::from_u128(2),
+            provider: Provider::Claude,
+            key: Uuid::from_u128(4),
+            started_at: 1234,
+            generation_id: Uuid::from_u128(5),
+        };
+        let mut requests = vec![
+            Request::Preparation(PreparationRequest::Plan {
+                request_id: binding.request_id,
+                payload: binding.payload.clone(),
+            }),
+            Request::Preparation(PreparationRequest::Create {
+                binding: binding.clone(),
+            }),
+            Request::Preparation(PreparationRequest::CancelRetained {
+                binding: binding.clone(),
+            }),
+            Request::Preparation(PreparationRequest::Reconcile {
+                binding: binding.clone(),
+            }),
+        ];
+        let targets = [
+            ExistingPendingTarget::Observed {
+                provider: pending.provider,
+                key: pending.key,
+                started_at: pending.started_at,
+                expected_installation: None,
+            },
+            ExistingPendingTarget::Observed {
+                provider: pending.provider,
+                key: pending.key,
+                started_at: pending.started_at,
+                expected_installation: Some(pending.installation_id),
+            },
+            ExistingPendingTarget::Bound {
+                binding: pending.clone(),
+            },
+        ];
+        for (index, target) in targets.into_iter().enumerate() {
+            requests.push(Request::ExistingPending(ExistingPendingRequest::Resume {
+                target: target.clone(),
+            }));
+            requests.push(Request::ExistingPending(ExistingPendingRequest::Cancel {
+                operation_id: Uuid::from_u128(6 + index as u128),
+                target,
+            }));
+        }
+        let mut outcomes = vec![
+            Outcome::NotAttempted {
+                message: "Refused before storage".into(),
+            },
+            Outcome::ReconcileRequired {
+                message: "Storage result unknown".into(),
+                observed: None,
+            },
+        ];
+        for record in [
+            Record::Preparation(Preparation {
+                binding,
+                state: PreparationState::CancelledRetained,
+            }),
+            Record::ExistingPending(ExistingPendingRecord {
+                binding: pending,
+                state: ExistingPendingState::Registered,
+            }),
+        ] {
+            outcomes.push(Outcome::Confirmed {
+                record: record.clone(),
+            });
+            outcomes.push(Outcome::ReconcileRequired {
+                message: "Visible metadata is not a completed durability barrier".into(),
+                observed: Some(record),
+            });
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("preparation-codec-host"),
+            boot_id: BootId::new("preparation-codec-boot"),
+            host_incarnation: HostIncarnation::new("preparation-codec-incarnation"),
+        };
+        let mut request_codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+        let mut response_codec = FrameCodec::new(MAX_FRAME_BYTES);
+        assert_eq!(
+            postcard::to_allocvec(&Operation::AccountsRead).unwrap()[0],
+            3
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Operation::ReadImage {
+                root: "/device".into(),
+                path: "image.png".into(),
+            })
+            .unwrap()[0],
+            16
+        );
+        assert_eq!(postcard::to_allocvec(&Reply::Image(vec![])).unwrap()[0], 14);
+        let mut count = 0;
+        for (index, request) in requests.into_iter().enumerate() {
+            let operation = Operation::AccountPreparation {
+                request: request.clone(),
+            };
+            assert_eq!(postcard::to_allocvec(&operation).unwrap()[0], 18);
+            let envelope = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 100 + index as u64,
+                proof: Some(proof.clone()),
+                request: ClientRequest::DeviceOperation { operation },
+            };
+            let mut bytes = Vec::new();
+            request_codec.write(&mut bytes, &envelope).unwrap();
+            let mut cursor = Cursor::new(bytes);
+            assert_eq!(
+                request_codec.read::<ClientEnvelope>(&mut cursor).unwrap(),
+                Some(envelope)
+            );
+            assert!(
+                request_codec
+                    .read::<ClientEnvelope>(&mut cursor)
+                    .unwrap()
+                    .is_none()
+            );
+            for outcome in &outcomes {
+                let reply = Reply::AccountPreparation(AccountPreparationReply {
+                    request: request.clone(),
+                    outcome: outcome.clone(),
+                });
+                assert_eq!(postcard::to_allocvec(&reply).unwrap()[0], 15);
+                let envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(100 + index as u64),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::DeviceOperation { reply },
+                    },
+                };
+                let mut bytes = Vec::new();
+                response_codec.write(&mut bytes, &envelope).unwrap();
+                let mut cursor = Cursor::new(bytes);
+                assert_eq!(
+                    response_codec.read::<ServerEnvelope>(&mut cursor).unwrap(),
+                    Some(envelope)
+                );
+                assert!(
+                    response_codec
+                        .read::<ServerEnvelope>(&mut cursor)
+                        .unwrap()
+                        .is_none()
+                );
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 60,
+            "all ten request/target forms and six outcome forms must run"
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

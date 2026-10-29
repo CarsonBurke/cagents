@@ -79,6 +79,11 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
+    /// Retained setup metadata on the selected daemon. Appended wire tag;
+    /// this route grants no home creation, login, or registration authority.
+    AccountPreparation {
+        request: crate::account::preparation::AccountPreparationRequest,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -132,6 +137,8 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
+    /// Echoes the complete submitted intent with its metadata-only outcome.
+    AccountPreparation(crate::account::preparation::AccountPreparationReply),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -191,6 +198,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     match operation {
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
+        }
+        Operation::AccountPreparation { .. } => {
+            Err("Account preparation requires explicit user and daemon admission".into())
         }
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)

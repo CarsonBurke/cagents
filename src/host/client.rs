@@ -24,6 +24,8 @@ use super::{
 };
 
 #[cfg(test)]
+mod account_preparation_tests;
+#[cfg(test)]
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
@@ -622,6 +624,38 @@ pub(super) fn process_request(
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
+            let operation = match operation {
+                crate::device_service::Operation::AccountPreparation { request } => {
+                    // The shared control gate remains held through the Store's
+                    // metadata barrier: physical reservations, shutdown and
+                    // upgrade cannot cross this admitted operation. No
+                    // HostState guard is retained during filesystem work.
+                    super::account_lifecycle::ensure_idle(host)?;
+                    let reply = match (
+                        crate::account::registry::Store::installation(),
+                        crate::account::home::Homes::installation(),
+                    ) {
+                        (Some(store), Some(homes)) => {
+                            crate::account::preparation_api::MetadataPreparationApi::new(store, homes)
+                                .handle(request)
+                        }
+                        _ => crate::account::preparation::AccountPreparationReply {
+                            request,
+                            outcome: crate::account::preparation::AccountPreparationOutcome::NotAttempted {
+                                message: "The device account preparation store is unavailable".into(),
+                            },
+                        },
+                    };
+                    return Ok((
+                        ServerResponse::DeviceOperation {
+                            reply: crate::device_service::Reply::AccountPreparation(reply),
+                        },
+                        Vec::new(),
+                        false,
+                    ));
+                }
+                operation => operation,
+            };
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => {
                     return Err(ProtocolError::new(
