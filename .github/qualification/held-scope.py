@@ -163,8 +163,8 @@ try:
     }, indent=2) + '\n')
     lane = ['--locked', '--no-default-features', '--features', 'ui']
     if '--suites-only' not in sys.argv[3:]:
-        state_output = run('atspi-disabled-state-tests', ['cargo', 'test', '--locked', '--no-default-features',
-                           '--features', 'cagents/ui', '-p', 'accesskit_atspi_common', '--lib',
+        state_output = run('atspi-disabled-state-tests', ['cargo', 'test', '--locked',
+                           '-p', 'accesskit_atspi_common', '--lib',
                            'node::disabled_state_tests::', '--', '--test-threads=1', '--color=never'])
         state_text = state_output.read_text()
         for selector in ['disabled_action_controls_do_not_advertise_enabled_or_sensitive',
