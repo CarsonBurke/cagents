@@ -3061,7 +3061,7 @@ mod tests {
                         start: expected.clone()
                     }
                 );
-                let mut issued = super::super::fresh_session_draft(
+                let mut issued = super::super::fresh_session_configured(
                     Provider::Claude,
                     expected.id,
                     expected.working_directory,
@@ -3070,6 +3070,7 @@ mod tests {
                         permission_mode: Some("plan".into()),
                         ..Default::default()
                     },
+                    crate::settings::agents::LaunchDefaults::default(),
                 )
                 .unwrap();
                 issued.proof = Some(handoff_proof());
