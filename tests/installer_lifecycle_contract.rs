@@ -83,6 +83,34 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+// The CLI-only lane has no built host. Keep this process-boundary fixture
+// beside a private copy of the actual coordinator, as in installer_guard_contract.
+// It checks the real inherited fence and request, not host SQLite/provider panes.
+fn install_source_inspector_fixture(path: &Path) {
+    executable(
+        path,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys
+assert len(sys.argv) == 3 and sys.argv[1] == '--inspect-upgrade-source'
+request=json.loads(sys.argv[2])
+assert request == {'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
+    'proof':None, 'require_resumable':os.environ['FIXTURE_REQUIRE_RESUMABLE']=='true',
+    'reconcile_retained':False}
+assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
+verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
+    pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if verified.returncode:
+    sys.stderr.buffer.write(verified.stderr)
+    sys.exit(91)
+with (pathlib.Path(os.environ['HOME'])/'source-inspected').open('a') as inspected:
+    inspected.write(json.dumps(request)+'\n')
+print(json.dumps({'Ok':None}))
+"#,
+    );
+}
+
 // The fixture CLI records every destructive request, not merely its final
 // status: a stop/start pair would otherwise look like preserved sessions.
 fn upgrade_fixture(
@@ -140,6 +168,11 @@ fn coordinated_release_mode(
     stage_only: bool,
 ) {
     let home = tempfile::tempdir().unwrap();
+    let coordinator_bin = home.path().join("coordinator-bin");
+    fs::create_dir(&coordinator_bin).unwrap();
+    let real_cli = coordinator_bin.join("cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
+    install_source_inspector_fixture(&coordinator_bin.join("cagentsd"));
     let data = home.path().join("data with spaces");
     let prefix = data.join("cagents-install");
     let old_bin = prefix.join("versions/old/bin");
@@ -461,7 +494,12 @@ exec sh "$@""#,
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
-        .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+        .env("FIXTURE_REAL_CLI", &real_cli)
+        .env(
+            "FIXTURE_SOURCE_PROTOCOL",
+            cagents::terminal_ipc::PROTOCOL_VERSION.to_string(),
+        )
+        .env("FIXTURE_REQUIRE_RESUMABLE", restart.is_some().to_string())
         .env("FIXTURE_COORDINATOR", coordinator)
         .env("FIXTURE_STAGE_ONLY", stage_only.to_string())
         .env(
@@ -513,6 +551,27 @@ exec sh "$@""#,
         .unwrap();
     let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
+    let source_inspected = home.path().join("source-inspected");
+    if stage_only || !home.path().join("coordinator-used").exists() {
+        assert!(
+            !source_inspected.exists(),
+            "staging and pre-coordinator refusals must not inspect source panes"
+        );
+    } else {
+        let inspections = fs::read_to_string(source_inspected).unwrap_or_else(|error| {
+            panic!("source inspector was not reached: {error}; coordinator output: {output:?}")
+        });
+        assert_eq!(inspections.lines().count(), 1, "{inspections}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(inspections.trim()).unwrap(),
+            serde_json::json!({
+                "protocol": cagents::terminal_ipc::PROTOCOL_VERSION,
+                "proof": null,
+                "require_resumable": restart.is_some(),
+                "reconcile_retained": false,
+            })
+        );
+    }
     if outer_signal {
         assert_eq!(
             fs::read_to_string(home.path().join("outer-pid")).unwrap(),
