@@ -1,4 +1,66 @@
 // Included in the existing Registry automation tests; no provider or shell runs.
+#[test]
+fn precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners() {
+    use history::PrecheckRetirement;
+    let (mut registry, _directory, definition) = fixture();
+    let automation = registry
+        .create_automation(history_precheck_definition(definition), 1, test_identity())
+        .unwrap();
+    let (_, claim) = history_claim_manual(&mut registry, automation.id, 1, 2);
+    let id = claim.firing.id;
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    history_stop_precheck(&mut registry, &claim.firing, 3, false);
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 2).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::ReleasedPending
+    );
+    registry.db.execute(
+        "INSERT INTO automation_precheck_history_cleanup(firing,revision,evidence) VALUES(?1,2,'retired')",
+        [id.to_string()],
+    ).unwrap();
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    registry
+        .db
+        .execute(
+            "DELETE FROM automation_precheck_history_cleanup WHERE firing=?1",
+            [id.to_string()],
+        )
+        .unwrap();
+    registry
+        .confirm_retired_automation_precheck(id, 1, 4)
+        .unwrap();
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Acknowledged
+    );
+    registry
+        .remove_automation(automation.id, automation.revision, 5)
+        .unwrap();
+    registry
+        .maintain_removed_automation_history(6 + history::REMOVED_TTL_MS)
+        .unwrap();
+    assert_eq!(history_count(&registry, automation.id), 0);
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Missing
+    );
+    assert_eq!(
+        history_count(&registry, automation.id),
+        0,
+        "observation must not invent an ACK or firing"
+    );
+}
+
 fn history_occurrence(index: u64) -> Occurrence {
     Occurrence {
         due_ms: index * 60_000,

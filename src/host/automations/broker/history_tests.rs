@@ -9,7 +9,14 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
         workspace_model::ModelEdit,
     };
     use std::os::unix::fs::MetadataExt;
-    for use_startup_sweep in [false, true] {
+    for (use_startup_sweep, restart) in [
+        (false, 0),
+        (true, 0),
+        (false, 1),
+        (true, 1),
+        (false, 2),
+        (true, 2),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         model
@@ -73,8 +80,8 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
             host_incarnation: HostIncarnation::new("history-fixture"),
         });
         state.install_model(model);
-        let host = Arc::new(HostLock::new(state));
-        let registry = agent_execution::registry(&host).unwrap();
+        let mut host = Arc::new(HostLock::new(state));
+        let mut registry = agent_execution::registry(&host).unwrap();
         let fault_db = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
         let root = directory.path().join("prechecks");
         let request = Request {
@@ -87,7 +94,7 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
         // launch requires CAGENTS_TEST_RETAINED_ACTOR_HELPER; no skip/fallback.
         let worker = Worker::launch(&root, &request)
             .expect("Actual precheck test requires the pinned same-head cagentsd helper");
-        let handle = Handle(Arc::new(Inner {
+        let mut handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(&host),
             registry: registry.clone(),
             root: root.clone(),
@@ -207,9 +214,81 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
                 )
                 .unwrap();
             assert_eq!(markers, 0);
+            if restart != 1 {
+                model
+                    .set_automation_history_ack_failure_for_test(false)
+                    .unwrap();
+            }
+        }
+        let retirement = root.join(format!("{}.retired", claim.firing.id));
+        assert!(
+            retirement.exists(),
+            "durable custody must outlive proof deletion"
+        );
+        if restart == 2 {
+            // Crash on the other side: ACK commits, then the ordinary removed
+            // history sweep deletes the firing and its cascading SQLite ACK.
+            // The filesystem receipt is still the only cleanup work to replay.
+            let mut model = registry.lock().unwrap();
             model
-                .set_automation_history_ack_failure_for_test(false)
+                .confirm_retired_automation_precheck(claim.firing.id, claim.firing.revision, 4)
                 .unwrap();
+            model
+                .remove_automation(automation.id, automation.revision, 5)
+                .unwrap();
+            model
+                .maintain_removed_automation_history(
+                    6 + crate::automations::REMOVED_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
+                )
+                .unwrap();
+            assert!(model.automation_firing(claim.firing.id).is_err());
+            assert!(retirement.exists());
+        }
+        if restart != 0 {
+            let old_registry = Arc::downgrade(&registry);
+            let old_host = Arc::downgrade(&host);
+            let old_handle = Arc::downgrade(&handle.0);
+            drop(observer);
+            drop(handle);
+            drop(registry);
+            drop(host);
+            assert!(
+                old_registry.upgrade().is_none(),
+                "old Registry survived restart"
+            );
+            assert!(old_host.upgrade().is_none());
+            assert!(old_handle.upgrade().is_none());
+            // Reopening drops the original connection-local ACK fault. No
+            // Worker, Registry or owner Arc bridges this startup boundary.
+            let model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            let mut state = HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("history-restarted"),
+                boot_id: BootId::new("history-fixture"),
+                host_incarnation: HostIncarnation::new("history-restarted"),
+            });
+            state.install_model(model);
+            host = Arc::new(HostLock::new(state));
+            registry = agent_execution::registry(&host).unwrap();
+            handle = Handle(Arc::new(Inner {
+                host: Arc::downgrade(&host),
+                registry: registry.clone(),
+                root: root.clone(),
+                wake: Wake::default(),
+                workers: Mutex::new(BTreeMap::new()),
+                cleanup: Mutex::new(Some(std::fs::read_dir(&root).unwrap())),
+                attention: Mutex::default(),
+                notifications: Mutex::default(),
+            }));
+            assert!(handle.0.workers.lock().unwrap().is_empty());
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .active_automation_firings()
+                    .unwrap()
+                    .is_empty()
+            );
+            handle.sweep_prechecks().unwrap();
         }
         handle.tick(&host).unwrap();
         assert!(
@@ -220,12 +299,26 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
                 .unwrap()
                 .contains_key(&claim.firing.id)
         );
+        assert!(
+            !retirement.exists(),
+            "ACKed or compacted receipt was orphaned"
+        );
+        // A repeated cached census candidate must not manufacture a new
+        // missing-directory owner after the first pass removed both names.
+        handle
+            .retire_precheck(claim.firing.id, claim.firing.revision)
+            .unwrap();
+        assert!(handle.0.workers.lock().unwrap().is_empty());
         handle.tick(&host).unwrap();
         let model = registry.lock().unwrap();
-        assert_eq!(
-            model.automation_firing(claim.firing.id).unwrap().state,
-            FiringState::Skipped
-        );
+        if restart != 2 {
+            assert_eq!(
+                model.automation_firing(claim.firing.id).unwrap().state,
+                FiringState::Skipped
+            );
+        } else {
+            assert!(model.automation_firing(claim.firing.id).is_err());
+        }
         let markers: usize = fault_db
             .query_row(
                 "SELECT count(*) FROM automation_precheck_history_cleanup WHERE firing=?1",
@@ -233,7 +326,7 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(markers, 1);
+        assert_eq!(markers, usize::from(restart != 2));
         let runs: usize = fault_db
             .query_row("SELECT count(*) FROM agent_runs", [], |row| row.get(0))
             .unwrap();

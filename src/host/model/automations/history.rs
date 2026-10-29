@@ -5,6 +5,28 @@ use crate::automations::{HISTORY_RETAINED_ROWS, SkipReason, SkippedOccurrences, 
 pub(super) const REMOVED_TTL_MS: u64 =
     crate::automations::REMOVED_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrecheckRetirement {
+    ReleasedPending,
+    Acknowledged,
+    Missing,
+    Protected,
+}
+
+impl PrecheckRetirement {
+    pub(crate) fn is_protected(self) -> bool {
+        self == Self::Protected
+    }
+
+    pub(crate) fn needs_ack(self) -> bool {
+        self == Self::ReleasedPending
+    }
+
+    pub(crate) fn is_missing(self) -> bool {
+        self == Self::Missing
+    }
+}
+
 // SQL aliases f/a/r are shared by these two bounded writer entrypoints.
 const ELIGIBLE: &str = "(a.active_firing IS NULL OR a.active_firing<>f.id)
             AND json_extract(a.record,'$.blocked') IS NULL
@@ -312,6 +334,61 @@ pub(super) fn prune(
 }
 
 impl Registry {
+    /// Missing means the exact firing is genuinely absent, not active or
+    /// protected. A verified filesystem receipt may then be reclaimed, but
+    /// must not manufacture a cleanup ACK for another owner or revision.
+    pub(crate) fn automation_precheck_retirement(
+        &self,
+        id: Uuid,
+        revision: u64,
+    ) -> Result<PrecheckRetirement, String> {
+        let raw: Option<String> = self
+            .db
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(raw) = raw else {
+            return Ok(PrecheckRetirement::Missing);
+        };
+        let firing: Firing = decode(&raw)?;
+        let owner: Automation = decode(
+            &self
+                .db
+                .query_row(
+                    "SELECT record FROM automations WHERE id=?1",
+                    [firing.automation.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?,
+        )?;
+        if firing.revision != revision
+            || owner.active_firing == Some(id)
+            || owner.blocked.is_some()
+            || firing.state.is_active()
+            || firing.release_pending
+        {
+            return Ok(PrecheckRetirement::Protected);
+        }
+        let acknowledged: Option<u64> = self
+            .db
+            .query_row(
+                "SELECT revision FROM automation_precheck_history_cleanup WHERE firing=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(match acknowledged {
+            Some(exact) if exact == revision => PrecheckRetirement::Acknowledged,
+            Some(_) => PrecheckRetirement::Protected,
+            None => PrecheckRetirement::ReleasedPending,
+        })
+    }
+
     pub(crate) fn maintain_automation_history(&mut self, now_ms: u64) -> Result<(), String> {
         let tx = self
             .db
