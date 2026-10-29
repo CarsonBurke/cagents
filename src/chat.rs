@@ -540,6 +540,29 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
+/// Whether `path` names an inline image the host's transcript store decoded
+/// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
+/// Such a file lives only as long as that cache, so it is no path to hand to
+/// anyone else.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+    let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
+        part.and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix(prefix))
+            .map(str::to_owned)
+    };
+    let image = name(path.file_name(), "image-").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(digest, extension)| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && matches!(extension, "png" | "jpg" | "webp" | "gif")
+        })
+    });
+    image
+        && name(path.parent().and_then(|parent| parent.file_name()), "chat-")
+            .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,
