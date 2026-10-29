@@ -1052,6 +1052,7 @@ mod tests {
         acquire(runtime.path(), worktree.path(), true).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn root_operation_protection_uses_path_pins_for_write_search_only_parents() {
         use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
@@ -1066,12 +1067,30 @@ mod tests {
         for pin in &protection._directories {
             let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0);
-            #[cfg(target_os = "linux")]
             assert_ne!(flags & libc::O_PATH, 0);
-            #[cfg(target_os = "macos")]
-            assert_ne!(flags & libc::O_EVTONLY, 0);
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_operation_protection_uses_native_event_only_directory_pins() {
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+        let runtime = fixture_directory();
+        let tree = fixture_directory();
+        let directory = tree.path().join("parent");
+        std::fs::create_dir(&directory).unwrap();
+        // Ordinary Darwin O_EVTONLY still requires directory read access;
+        // it does not provide Linux O_PATH's write/search-only contract.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        let protection = protect_root_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        for pin in &protection._directories {
+            let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::O_EVTONLY, 0);
+        }
     }
 
     #[test]
