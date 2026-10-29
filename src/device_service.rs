@@ -1690,6 +1690,11 @@ fn request_as(
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_socket: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Reply, String> {
+    if matches!(&operation, Operation::AccountInstallationInitialize { .. }) {
+        return Err(
+            "Installation initialization requires the original captured control connection".into(),
+        );
+    }
     // Resolving a remote socket can launch its SSH bridge before authentication.
     // Device operations are reserved for User, so refuse scoped remote callers
     // before either resolver can create transport or start a remote daemon.
@@ -1951,6 +1956,35 @@ mod wire_tests {
         account::{Account, AccountHome},
         agent::Provider,
     };
+
+    #[test]
+    fn initialization_refuses_generic_route_resolution_before_connect_or_start() {
+        for remote in [false, true] {
+            for no_start in [false, true] {
+                for authority in [
+                    crate::agent_execution::Authority::default(),
+                    crate::agent_execution::Authority::session("invalid-private-fixture".into()),
+                ] {
+                    let result = request_as(
+                        Operation::AccountInstallationInitialize {
+                            request: crate::account::installation::InitializationRequest {
+                                request_id: uuid::Uuid::from_u128(601),
+                            },
+                        },
+                        authority,
+                        no_start,
+                        remote,
+                        || panic!("initializer resolved a fresh selected socket"),
+                        || panic!("initializer started or reconnected a daemon"),
+                    );
+                    assert_eq!(
+                        result.unwrap_err(),
+                        "Installation initialization requires the original captured control connection"
+                    );
+                }
+            }
+        }
+    }
 
     fn roundtrip<T>(value: &T)
     where
