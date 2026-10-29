@@ -5940,10 +5940,18 @@ impl RepositoryRuntime {
         self.document_reload_pending = false;
         self.document_reading = true;
         let identity = self.current_identity(card, selected.path.clone());
+        let retained_source = match &self.document {
+            DocumentState::Editable(document)
+            | DocumentState::Loading {
+                predecessor: Some(document),
+            } => Some(document.source.clone()),
+            _ => None,
+        };
         file_task(
             identity,
             self.document_tone,
             self.original_editor_root.clone(),
+            retained_source,
             Some(watch.clone()),
             true,
         )
@@ -6169,13 +6177,24 @@ impl RepositoryRuntime {
                             document.clear_document_watch_error();
                             return Task::none();
                         }
+                        // A missing or refused symlink target is classified
+                        // as read-only rather than an I/O error. It still
+                        // cannot replace the last readable editor buffer.
                         if result.is_err()
+                            || matches!(
+                                &result,
+                                Ok(LoadedFile {
+                                    content: FileContent::ReadOnly(ReadOnlyReason::Symlink { .. }),
+                                    ..
+                                })
+                            )
                             || document.dirty
                             || document.durability_warning().is_some()
                             || (document.error.is_some() && !document.error_from_document_watch)
                         {
                             document.note_document_watch_error(match &result {
                                 Err(error) => format!("File unavailable on disk: {error}. Your text is preserved. Reload to retry."),
+                                Ok(LoadedFile { source, content: FileContent::ReadOnly(reason @ ReadOnlyReason::Symlink { .. }) }) => format!("File unavailable on disk: {} Your text is preserved. Reload to retry.", read_only_detail(source, reason)),
                                 _ => "File changed on disk. Your edits are preserved. Reload or overwrite to resolve.".into(),
                             });
                             return Task::none();
@@ -7685,6 +7704,7 @@ impl RepositoryRuntime {
             }
             _ => None,
         };
+        let retained_source = predecessor.as_ref().map(|document| document.source.clone());
         self.document = DocumentState::Loading { predecessor };
         self.diffs.clear();
         self.basis_resolution = None;
@@ -7708,6 +7728,7 @@ impl RepositoryRuntime {
             identity,
             self.document_tone,
             self.original_editor_root.clone(),
+            retained_source,
             Some(watch),
             false,
         )
@@ -8319,6 +8340,7 @@ fn file_task(
     identity: AsyncIdentity,
     tone: crate::editor::PdfTone,
     original: Option<Arc<crate::fs_safety::Root>>,
+    retained_source: Option<PathBuf>,
     watch: Option<DocumentWatch>,
     background: bool,
 ) -> Task<RepositoryAction> {
@@ -8327,6 +8349,14 @@ fn file_task(
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut targets = vec![worktree.join(&path)];
+            // A dangling link read names the refused link, so it cannot
+            // rediscover its old target. Keep watching the retained buffer's
+            // source for recreation, including across a failed Reload.
+            if let Some(source) = retained_source
+                && !targets.contains(&worktree.join(&source))
+            {
+                targets.push(worktree.join(source));
+            }
             if let Some(watch) = &watch {
                 watch.arm(targets.clone());
             }
