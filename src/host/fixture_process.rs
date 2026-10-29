@@ -3,14 +3,18 @@
 //! A pid/start record is validation metadata. Signals use only descriptors
 //! retained after a live owner handshake; this module never discovers owners.
 //! Pins do not reap. The original Child owner remains the sole waiter.
-use crate::{chat::runtime::Handle, daemon::holder_registry::Process, model::HostSessionProof};
+use crate::{
+    chat::runtime::Handle,
+    daemon::holder_registry::Process,
+    model::{HostSessionProof, TerminalId},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     mem,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::{
             ffi::OsStrExt,
             fs::OpenOptionsExt,
@@ -26,6 +30,8 @@ use std::{
 const ENDPOINT: &str = "CAGENTS_TEST_FIXTURE_CUSTODY_ENDPOINT";
 const CASE: &str = "CAGENTS_TEST_FIXTURE_CUSTODY_CASE";
 const PARENT: &str = "CAGENTS_TEST_FIXTURE_CUSTODY_PARENT";
+const HOLDER_TERMINAL: &str = "CAGENTS_TEST_FIXTURE_HOLDER_TERMINAL";
+const HOLDER_STAGE: &str = "CAGENTS_TEST_FIXTURE_HOLDER_STAGE";
 const MAX_PACKET: usize = 1024;
 const MAX_PAIRS: usize = 32;
 const IO_BOUND: Duration = Duration::from_secs(2);
@@ -659,6 +665,469 @@ impl Drop for OriginalChild {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum OriginalHolderRole {
+    #[serde(rename = "original_terminal_holder")]
+    OriginalTerminalHolder,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum HolderStage {
+    #[serde(rename = "0")]
+    Stage0,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HolderBinding {
+    case: uuid::Uuid,
+    terminal: TerminalId,
+    stage: HolderStage,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HolderRegistration {
+    role: OriginalHolderRole,
+    binding: HolderBinding,
+    owner: Process,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HolderAck {
+    role: OriginalHolderRole,
+    binding: HolderBinding,
+}
+
+fn holder_context() -> io::Result<(PathBuf, i32, HolderBinding)> {
+    let path = std::env::var_os(ENDPOINT)
+        .ok_or_else(|| refused("original holder parent endpoint is required"))?;
+    let case = std::env::var(CASE)
+        .map_err(io::Error::other)?
+        .parse::<uuid::Uuid>()
+        .map_err(io::Error::other)?;
+    let terminal = std::env::var(HOLDER_TERMINAL)
+        .map_err(io::Error::other)?
+        .parse::<TerminalId>()
+        .map_err(io::Error::other)?;
+    let parent = std::env::var(PARENT)
+        .map_err(io::Error::other)?
+        .parse::<i32>()
+        .map_err(io::Error::other)?;
+    if case.is_nil()
+        || terminal.as_uuid().is_nil()
+        || std::env::var(HOLDER_STAGE).as_deref() != Ok("0")
+        || parent <= 0
+        || unsafe { libc::getppid() } != parent
+    {
+        return Err(refused(
+            "original holder case/stage0/terminal/parent binding is invalid",
+        ));
+    }
+    Ok((
+        PathBuf::from(path),
+        parent,
+        HolderBinding {
+            case,
+            terminal,
+            stage: HolderStage::Stage0,
+        },
+    ))
+}
+
+/// Fixture metadata only. This terminal ID does not authorize a signal or mint
+/// an owner; enrollment additionally requires the original Child and its fd.
+pub(crate) fn terminal_holder_terminal_from_environment() -> io::Result<TerminalId> {
+    Ok(holder_context()?.2.terminal)
+}
+
+// Separate exact-one transport. Actor send/receive still require their original
+// exact two descriptors and their unchanged Registration/16-byte ACK grammar.
+fn send_holder_registration(
+    stream: &UnixStream,
+    bytes: &[u8],
+    descriptor: &OwnedFd,
+) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET {
+        return Err(refused(
+            "original holder registration exceeds its packet bound",
+        ));
+    }
+    let mut control = [0usize; 16];
+    let mut vector = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    let mut message: libc::msghdr = unsafe { mem::zeroed() };
+    message.msg_iov = &mut vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as usize;
+        libc::CMSG_DATA(header)
+            .cast::<RawFd>()
+            .write(descriptor.as_raw_fd());
+    }
+    let length = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+    if length < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != bytes.len() {
+        return Err(refused("incomplete original holder registration packet"));
+    }
+    Ok(())
+}
+
+fn receive_holder_registration(stream: &UnixStream) -> io::Result<(HolderRegistration, OwnedFd)> {
+    let (bytes, descriptors) = receive_packet(stream)?;
+    let [descriptor]: [OwnedFd; 1] = descriptors.try_into().map_err(|_| {
+        refused("original terminal holder registration needs exactly one descriptor")
+    })?;
+    // The candidate remains close-only through role, stage and binding checks.
+    let registration = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    Ok((registration, descriptor))
+}
+
+fn original_holder_candidate(
+    child: &mut Child,
+    original_pidfd: BorrowedFd<'_>,
+) -> io::Result<(OwnedFd, Process)> {
+    require_waitable_children()?;
+    let descriptor = original_pidfd.try_clone_to_owned()?;
+    let owner = Process::read(child.id() as i32)?;
+    descriptor_matches(&descriptor, &owner)?;
+    if fs::read_link(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))?
+        != Path::new("anon_inode:[pidfd]")
+    {
+        return Err(refused(
+            "original holder requires its already captured pidfd",
+        ));
+    }
+    // This observes the caller's kernel Child relationship without collecting
+    // any status. No Process/JSON-only constructor can enter this path.
+    let mut information: libc::siginfo_t = unsafe { mem::zeroed() };
+    loop {
+        if unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                descriptor.as_raw_fd() as libc::id_t,
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    if unsafe { information.si_pid() } != 0 || exited(&descriptor)? {
+        return Err(refused(
+            "original holder exited before its spawn-time enrollment",
+        ));
+    }
+    descriptor_matches(&descriptor, &owner)?;
+    Ok((descriptor, owner))
+}
+
+fn holder_acknowledgment(
+    stream: &UnixStream,
+    binding: HolderBinding,
+    deadline: Instant,
+) -> io::Result<()> {
+    remaining_io(stream, deadline)?;
+    let (bytes, unexpected) = receive_packet(stream)?;
+    if Instant::now() >= deadline || !unexpected.is_empty() {
+        return Err(refused(
+            "original holder acknowledgment is late or carries descriptors",
+        ));
+    }
+    let ack: HolderAck = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if ack.role != OriginalHolderRole::OriginalTerminalHolder || ack.binding != binding {
+        return Err(refused(
+            "original holder acknowledgment has a foreign case/stage0/terminal",
+        ));
+    }
+    Ok(())
+}
+
+/// Called at the original holder's spawn owner before Request::Spawn and before
+/// the original Child can be reaped or transferred. Borrow both that SAME Child
+/// and its already captured pidfd. Never reconstruct either from discovery.
+/// Failure leaves the caller's original Child/fd and startup cleanup intact.
+/// Success only acknowledges parent-held signal custody, never a wait transfer.
+pub(crate) fn register_original_terminal_holder(
+    child: &mut Child,
+    original_pidfd: BorrowedFd<'_>,
+    terminal: TerminalId,
+    deadline: Instant,
+) -> io::Result<()> {
+    let (path, parent, binding) = holder_context()?;
+    if binding.terminal != terminal {
+        return Err(refused(
+            "original holder terminal differs from its issued stage0 binding",
+        ));
+    }
+    let (candidate, owner) = original_holder_candidate(child, original_pidfd)?;
+    let deadline = deadline.min(Instant::now() + IO_BOUND);
+    let stream = connect(&path, deadline)?;
+    let credentials = peer(&stream)?;
+    if credentials.pid != parent || credentials.uid != unsafe { libc::getuid() } {
+        return Err(refused(
+            "original holder endpoint is not its original parent",
+        ));
+    }
+    let bytes = serde_json::to_vec(&HolderRegistration {
+        role: OriginalHolderRole::OriginalTerminalHolder,
+        binding,
+        owner,
+    })
+    .map_err(io::Error::other)?;
+    remaining_io(&stream, deadline)?;
+    send_holder_registration(&stream, &bytes, &candidate)?;
+    holder_acknowledgment(&stream, binding, deadline)
+}
+
+struct OriginalHolderPin {
+    descriptor: OwnedFd,
+    owner: Process,
+    binding: HolderBinding,
+    armed: bool,
+}
+impl OriginalHolderPin {
+    fn confirm_exit_until(&mut self, deadline: Instant) -> io::Result<()> {
+        loop {
+            if exited(&self.descriptor)? {
+                self.armed = false;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(refused("original terminal holder exit remains unconfirmed"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for OriginalHolderPin {
+    fn drop(&mut self) {
+        if self.armed {
+            let result = signal(&self.descriptor)
+                .and_then(|()| self.confirm_exit_until(Instant::now() + CLEANUP_BOUND));
+            if let Err(error) = result {
+                eprintln!(
+                    "original holder cleanup is unconfirmed; outer custody required: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Owns only stage0's original daemon Child and one explicitly issued holder
+/// descriptor. Keeps that descriptor across later adopter stages; never recasts
+/// an adopter or discovery Record as a newly issued holder. Does not reap it.
+pub(crate) struct TerminalHolderParent {
+    original: Option<OriginalChild>,
+    holder: Option<OriginalHolderPin>,
+    listener: Option<UnixListener>,
+    socket_path: PathBuf,
+    binding: HolderBinding,
+    acknowledged: bool,
+}
+impl TerminalHolderParent {
+    pub(crate) fn spawn_stage0(
+        root: &Path,
+        terminal: TerminalId,
+        command: &mut Command,
+    ) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        if [ENDPOINT, CASE, PARENT, HOLDER_TERMINAL, HOLDER_STAGE]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(refused(
+                "inherited original-holder endpoint metadata cannot be replaced",
+            ));
+        }
+        require_waitable_children()?;
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.mode() & 0o077 != 0
+            || terminal.as_uuid().is_nil()
+        {
+            return Err(refused(
+                "original holder needs an owned private fixture root and nonnil terminal",
+            ));
+        }
+        let case = uuid::Uuid::new_v4();
+        let socket_path = root.join(format!("holder-{}.sock", case.simple()));
+        let listener = listener(&socket_path)?;
+        command
+            .env(ENDPOINT, &socket_path)
+            .env(CASE, case.to_string())
+            .env(PARENT, std::process::id().to_string())
+            .env(HOLDER_STAGE, "0")
+            .env(HOLDER_TERMINAL, terminal.to_string());
+        let original = OriginalChild::spawn(command)?;
+        Ok(Self {
+            original: Some(original),
+            holder: None,
+            listener: Some(listener),
+            socket_path,
+            binding: HolderBinding {
+                case,
+                terminal,
+                stage: HolderStage::Stage0,
+            },
+            acknowledged: false,
+        })
+    }
+
+    fn accept_with_before_ack(
+        &mut self,
+        mut stream: UnixStream,
+        deadline: Instant,
+        before_ack: impl FnOnce(&OriginalHolderPin) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.holder.is_some() || self.acknowledged {
+            return Err(refused(
+                "original holder is already enrolled; adopter re-registration is forbidden",
+            ));
+        }
+        let original = self
+            .original
+            .as_ref()
+            .ok_or_else(|| refused("original stage0 Child custody is unavailable"))?;
+        let credentials = peer(&stream)?;
+        if credentials.pid != original.child.id() as i32
+            || credentials.uid != unsafe { libc::getuid() }
+        {
+            return Err(refused(
+                "original holder registration peer is not the owned stage0 Child",
+            ));
+        }
+        let deadline = deadline.min(Instant::now() + IO_BOUND);
+        remaining_io(&stream, deadline)?;
+        let (registration, descriptor) = receive_holder_registration(&stream)?;
+        if registration.binding != self.binding
+            || registration.owner.pid == credentials.pid
+            || registration.owner.pid == std::process::id() as i32
+        {
+            return Err(refused(
+                "original holder registration has a foreign case/stage0/terminal/owner",
+            ));
+        }
+        descriptor_matches(&descriptor, &registration.owner)?;
+        if exited(&descriptor)? {
+            return Err(refused("original holder exited before parent enrollment"));
+        }
+        // Commit original custody BEFORE any ACK callback or socket write.
+        self.holder = Some(OriginalHolderPin {
+            descriptor,
+            owner: registration.owner,
+            binding: registration.binding,
+            armed: true,
+        });
+        before_ack(self.holder.as_ref().unwrap())?;
+        remaining_io(&stream, deadline)?;
+        let bytes = serde_json::to_vec(&HolderAck {
+            role: OriginalHolderRole::OriginalTerminalHolder,
+            binding: self.binding,
+        })
+        .map_err(io::Error::other)?;
+        stream.write_all(&bytes)?;
+        if Instant::now() >= deadline {
+            return Err(refused("original holder ACK write exceeded its deadline"));
+        }
+        self.acknowledged = true;
+        Ok(())
+    }
+
+    fn await_with_before_ack(
+        &mut self,
+        deadline: Instant,
+        before_ack: impl FnOnce(&OriginalHolderPin) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.holder.is_some() || self.acknowledged {
+            return Err(refused("original holder can enroll exactly once in stage0"));
+        }
+        // Enrollment is one-shot even after a peer/parser/Child-exit refusal.
+        // Closing the listener on return prevents a retry after the original
+        // daemon Child's PID could have been reaped.
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| refused("original holder enrollment cannot be retried"))?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(refused("original stage0 enrollment deadline expired"));
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    return self.accept_with_before_ack(stream, deadline, before_ack);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            let original = self
+                .original
+                .as_mut()
+                .ok_or_else(|| refused("original stage0 Child custody is unavailable"))?;
+            if original.child.try_wait()?.is_some() {
+                return Err(refused(
+                    "original stage0 Child exited before holder enrollment",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub(crate) fn await_registration_until(&mut self, deadline: Instant) -> io::Result<()> {
+        self.await_with_before_ack(deadline, |_| Ok(()))
+    }
+
+    /// The same original Child, available for deliberate crash/wait only AFTER
+    /// holder acknowledgment. No raw PID signal or replacement wait handle.
+    pub(crate) fn stage0_child_after_ack(&mut self) -> io::Result<&mut Child> {
+        if !self.acknowledged {
+            return Err(refused(
+                "stage0 crash is forbidden before holder acknowledgment",
+            ));
+        }
+        Ok(&mut self
+            .original
+            .as_mut()
+            .ok_or_else(|| refused("original stage0 Child is unavailable"))?
+            .child)
+    }
+
+    /// Caller first proves its stage2 semantic Close and unchanged discovery
+    /// oracles. This passive observation cannot manufacture those successes.
+    pub(crate) fn confirm_holder_exit_until(&mut self, deadline: Instant) -> io::Result<()> {
+        if !self.acknowledged {
+            return Err(refused(
+                "unacknowledged holder cannot satisfy the normal close oracle",
+            ));
+        }
+        self.holder
+            .as_mut()
+            .ok_or_else(|| refused("original holder pin is unavailable"))?
+            .confirm_exit_until(deadline)
+    }
+}
+impl Drop for TerminalHolderParent {
+    fn drop(&mut self) {
+        // First settle this exact daemon Child, then fallback only to the
+        // stored original holder descriptor. The holder is not our Child.
+        drop(self.original.take());
+        drop(self.holder.take());
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
 struct Parent {
     owners: Vec<Pins>,
     identities: Vec<[Process; 2]>,
@@ -889,5 +1358,378 @@ mod tests {
             owner.child.try_wait().unwrap().is_none(),
             "rejected transferred fds are close-only"
         );
+    }
+
+    fn holder_packet_pair() -> (UnixStream, UnixStream) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    descriptors.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let pair = unsafe {
+            (
+                UnixStream::from_raw_fd(descriptors[0]),
+                UnixStream::from_raw_fd(descriptors[1]),
+            )
+        };
+        pair.0.set_read_timeout(Some(IO_BOUND)).unwrap();
+        pair.1.set_read_timeout(Some(IO_BOUND)).unwrap();
+        pair
+    }
+
+    // Deliberately permits malformed/excessive packets only in these rejection
+    // tests. Neither production-shaped sender uses this function.
+    fn send_holder_test_packet(stream: &UnixStream, bytes: &[u8], descriptors: &[OwnedFd]) {
+        assert!(descriptors.len() <= 40 && bytes.len() <= MAX_PACKET + 32);
+        let descriptor_bytes = descriptors.len() * mem::size_of::<RawFd>();
+        let control_size = unsafe { libc::CMSG_SPACE(descriptor_bytes as u32) } as usize;
+        let mut control = vec![0usize; control_size.div_ceil(mem::size_of::<usize>())];
+        let mut vector = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        if !descriptors.is_empty() {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = control_size;
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(descriptor_bytes as u32) as usize;
+                let values = libc::CMSG_DATA(header).cast::<RawFd>();
+                for (index, descriptor) in descriptors.iter().enumerate() {
+                    values.add(index).write(descriptor.as_raw_fd());
+                }
+            }
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
+    }
+
+    fn close_only_witnesses(count: usize) -> (Vec<OwnedFd>, Vec<UnixStream>) {
+        let mut descriptors = Vec::new();
+        let mut witnesses = Vec::new();
+        for _ in 0..count {
+            let (delivered, witness) = UnixStream::pair().unwrap();
+            witness.set_read_timeout(Some(IO_BOUND)).unwrap();
+            descriptors.push(delivered.into());
+            witnesses.push(witness);
+        }
+        (descriptors, witnesses)
+    }
+    fn assert_all_closed(witnesses: Vec<UnixStream>) {
+        for mut witness in witnesses {
+            assert_eq!(
+                witness.read(&mut [0]).unwrap(),
+                0,
+                "rejected descriptor must close without enrollment"
+            );
+        }
+    }
+    fn holder_test_binding() -> HolderBinding {
+        HolderBinding {
+            case: uuid::Uuid::new_v4(),
+            terminal: TerminalId::new(),
+            stage: HolderStage::Stage0,
+        }
+    }
+    fn holder_test_registration(binding: HolderBinding) -> Vec<u8> {
+        serde_json::to_vec(&HolderRegistration {
+            role: OriginalHolderRole::OriginalTerminalHolder,
+            binding,
+            owner: Process { pid: 1, start: 1 },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn single_holder_candidate_rejects_another_child_and_preserves_original_wait_status() {
+        let mut original = child("exec /bin/sleep 30");
+        let mut other = child("exec /bin/sleep 30");
+        assert!(original_holder_candidate(&mut original.child, other.descriptor.as_fd()).is_err());
+        assert!(original.child.try_wait().unwrap().is_none());
+        assert!(other.child.try_wait().unwrap().is_none());
+        let mut completed = child("exit 7");
+        let deadline = Instant::now() + IO_BOUND;
+        while !exited(&completed.descriptor).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            original_holder_candidate(&mut completed.child, completed.descriptor.as_fd()).is_err()
+        );
+        assert_eq!(
+            completed.child.wait().unwrap().code(),
+            Some(7),
+            "WNOWAIT must leave original wait custody intact"
+        );
+    }
+
+    #[test]
+    fn single_holder_parser_rejects_malformed_extra_and_truncated_descriptors_close_only() {
+        let valid = holder_test_registration(holder_test_binding());
+        let actor = serde_json::to_vec(&Registration {
+            case: uuid::Uuid::new_v4(),
+            owners: [Process { pid: 1, start: 1 }, Process { pid: 2, start: 2 }],
+        })
+        .unwrap();
+        let mut wrong_stage: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        wrong_stage["binding"]["stage"] = serde_json::json!("1");
+        let cases = [
+            (b"not JSON".to_vec(), 1),
+            (actor, 1),
+            (serde_json::to_vec(&wrong_stage).unwrap(), 1),
+            (valid.clone(), 0),
+            (valid.clone(), 2),
+            (vec![b'x'; MAX_PACKET + 32], 1),
+            (valid.clone(), 40),
+        ];
+        for (bytes, count) in cases {
+            let (sender, receiver) = holder_packet_pair();
+            let (descriptors, witnesses) = close_only_witnesses(count);
+            send_holder_test_packet(&sender, &bytes, &descriptors);
+            drop(descriptors);
+            assert!(receive_holder_registration(&receiver).is_err());
+            assert_all_closed(witnesses);
+        }
+        // The old exact-two actor parser still rejects the new role/grammar,
+        // even when a negative counterexample supplies two distinct fds.
+        let (sender, receiver) = holder_packet_pair();
+        let (descriptors, witnesses) = close_only_witnesses(2);
+        send_holder_test_packet(&sender, &valid, &descriptors);
+        drop(descriptors);
+        assert!(receive_registration(&receiver).is_err());
+        assert_all_closed(witnesses);
+    }
+
+    #[test]
+    fn single_holder_ack_rejects_foreign_binding_extra_descriptors_and_eof() {
+        let binding = holder_test_binding();
+        for foreign_terminal in [false, true] {
+            let (sender, receiver) = holder_packet_pair();
+            let mut changed = binding;
+            if foreign_terminal {
+                changed.terminal = TerminalId::new();
+            } else {
+                changed.case = uuid::Uuid::new_v4();
+            }
+            let bytes = serde_json::to_vec(&HolderAck {
+                role: OriginalHolderRole::OriginalTerminalHolder,
+                binding: changed,
+            })
+            .unwrap();
+            send_holder_test_packet(&sender, &bytes, &[]);
+            assert!(holder_acknowledgment(&receiver, binding, Instant::now() + IO_BOUND).is_err());
+        }
+        let (sender, receiver) = holder_packet_pair();
+        let bytes = serde_json::to_vec(&HolderAck {
+            role: OriginalHolderRole::OriginalTerminalHolder,
+            binding,
+        })
+        .unwrap();
+        let (descriptors, witnesses) = close_only_witnesses(1);
+        send_holder_test_packet(&sender, &bytes, &descriptors);
+        drop(descriptors);
+        assert!(holder_acknowledgment(&receiver, binding, Instant::now() + IO_BOUND).is_err());
+        assert_all_closed(witnesses);
+        let (sender, receiver) = holder_packet_pair();
+        drop(sender);
+        assert!(holder_acknowledgment(&receiver, binding, Instant::now() + IO_BOUND).is_err());
+    }
+
+    const HOLDER_TEST_CHILD: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_CHILD";
+    const HOLDER_TEST_ROOT: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_ROOT";
+    fn holder_test_child_body(expect_ack: bool) {
+        let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+        let terminal = terminal_holder_terminal_from_environment().unwrap();
+        let mut original = child("exec /bin/sleep 30");
+        let result = register_original_terminal_holder(
+            &mut original.child,
+            original.descriptor.as_fd(),
+            terminal,
+            Instant::now() + Duration::from_secs(15),
+        );
+        if expect_ack {
+            result.unwrap();
+            assert_eq!(
+                fs::read(root.join("parent-stored-before-ack")).unwrap(),
+                b"stored"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "the child must not accept an ACK before the parent's failing pre-ACK callback"
+            );
+            assert!(
+                original.child.try_wait().unwrap().is_none(),
+                "handoff failure leaves the original Child untouched"
+            );
+        }
+        signal(&original.descriptor).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(original.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        fs::write(root.join("child-original-wait-completed"), b"waited").unwrap();
+    }
+    fn holder_child_command(root: &Path, mode: &str) -> Command {
+        let selected = thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &selected,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env(HOLDER_TEST_CHILD, mode)
+            .env(HOLDER_TEST_ROOT, root)
+            .stdin(Stdio::null())
+            .stdout(File::create(root.join("holder-child.stdout")).unwrap())
+            .stderr(File::create(root.join("holder-child.stderr")).unwrap());
+        command
+    }
+    fn assert_holder_child_success(
+        parent: &mut TerminalHolderParent,
+        root: &Path,
+        deadline: Instant,
+    ) {
+        loop {
+            if let Some(status) = parent.original.as_mut().unwrap().child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "{}",
+                    fs::read_to_string(root.join("holder-child.stderr")).unwrap()
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fs::read(root.join("child-original-wait-completed")).unwrap(),
+            b"waited"
+        );
+        assert!(
+            fs::read_to_string(root.join("holder-child.stdout"))
+                .unwrap()
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        );
+    }
+
+    #[test]
+    fn single_holder_parent_stores_original_before_ack_and_preserves_child_wait() {
+        if std::env::var(HOLDER_TEST_CHILD).as_deref() == Ok("ack") {
+            holder_test_child_body(true);
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let terminal = TerminalId::new();
+        let mut command = holder_child_command(root.path(), "ack");
+        let mut parent =
+            TerminalHolderParent::spawn_stage0(root.path(), terminal, &mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        parent
+            .await_with_before_ack(deadline, |stored| {
+                assert!(stored.armed && !exited(&stored.descriptor).unwrap());
+                assert_eq!(stored.binding.terminal, terminal);
+                descriptor_matches(&stored.descriptor, &stored.owner).unwrap();
+                fs::write(root.path().join("parent-stored-before-ack"), b"stored")
+            })
+            .unwrap();
+        assert!(parent.acknowledged && parent.holder.is_some());
+        assert_holder_child_success(&mut parent, root.path(), deadline);
+        parent.confirm_holder_exit_until(deadline).unwrap();
+        assert!(!parent.holder.as_ref().unwrap().armed);
+        assert!(
+            parent.await_registration_until(deadline).is_err(),
+            "an adopter cannot register the original again"
+        );
+    }
+
+    #[test]
+    fn single_holder_no_ack_keeps_stored_pin_and_original_child_cleanup_owner() {
+        if std::env::var(HOLDER_TEST_CHILD).as_deref() == Ok("no-ack") {
+            holder_test_child_body(false);
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut command = holder_child_command(root.path(), "no-ack");
+        let mut parent =
+            TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let error = parent
+            .await_with_before_ack(deadline, |stored| {
+                assert!(stored.armed);
+                Err(refused(
+                    "injected pre-ACK refusal after original pin storage",
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("pre-ACK"));
+        assert!(!parent.acknowledged && parent.holder.as_ref().unwrap().armed);
+        assert!(parent.stage0_child_after_ack().is_err());
+        assert!(parent.confirm_holder_exit_until(deadline).is_err());
+        assert_holder_child_success(&mut parent, root.path(), deadline);
+        assert!(exited(&parent.holder.as_ref().unwrap().descriptor).unwrap());
+    }
+
+    #[test]
+    fn single_holder_foreign_peer_closes_queued_descriptor_without_enrollment() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec /bin/sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut parent =
+            TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
+                .unwrap();
+        let sender = connect(&parent.socket_path, Instant::now() + IO_BOUND).unwrap();
+        let (descriptors, witnesses) = close_only_witnesses(1);
+        send_holder_registration(
+            &sender,
+            &holder_test_registration(parent.binding),
+            &descriptors[0],
+        )
+        .unwrap();
+        drop(descriptors);
+        assert!(
+            parent
+                .await_registration_until(Instant::now() + IO_BOUND)
+                .is_err()
+        );
+        assert!(parent.holder.is_none() && !parent.acknowledged);
+        assert!(parent.listener.is_none());
+        assert!(
+            parent
+                .await_registration_until(Instant::now() + IO_BOUND)
+                .is_err(),
+            "a refused stage0 peer cannot reopen enrollment"
+        );
+        assert!(
+            parent
+                .original
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        assert_all_closed(witnesses);
     }
 }
