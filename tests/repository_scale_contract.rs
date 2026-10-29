@@ -74,9 +74,14 @@ impl ProcessExecutor for IsolatedExecutor {
             })
             .ok()
             .map(|previous| previous + 1);
-        // At most 1024 command pairs plus 53 later powers of two, even if
-        // an unexpected retry loop runs until the unchanged outer deadline.
-        let report = sequence.filter(|sequence| *sequence <= 1024 || sequence.is_power_of_two());
+        // Failure capture retains only 64 KiB. At most 64 command pairs plus
+        // 57 later powers of two emit 121 * (142 + 260) = 48,642 bytes with
+        // maximal u64/usize (20 digits), u128 (39 digits), sparse-checkout /
+        // OutputLimit labels and Some(-2147483648) status fields. The 26
+        // phase pairs add at most 4,114:
+        // all new diagnostics total <= 52,756 bytes, below 65,536. Keep this
+        // bound in sync with both files' formats and fixed phase labels.
+        let report = sequence.filter(|sequence| *sequence <= 64 || sequence.is_power_of_two());
         let subcommand = git_subcommand(command);
         let argv_count = command.arguments.len() + 1;
         let stdin_bytes = command.stdin.as_ref().map_or(0, Vec::len);

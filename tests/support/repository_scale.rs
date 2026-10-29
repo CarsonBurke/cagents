@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The scale contract's 26 fixed phase pairs total at most 4,114 bytes with
+// maximal u128 elapsed digits and "panicking" results. Its executor documents
+// the combined diagnostic bound against the 64 KiB failure capture limit.
 pub(super) struct Phase {
     name: &'static str,
     started: Instant,
