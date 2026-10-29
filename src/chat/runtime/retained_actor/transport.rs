@@ -38,6 +38,9 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(test, target_os = "linux"))]
+#[path = "startup_observation.rs"]
+pub(crate) mod startup_observation;
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -832,16 +835,33 @@ impl RemoteActor {
         // process group or allowing the provider to appear after cancellation.
         let (publish, incoming) = std::sync::mpsc::sync_channel::<std::process::Child>(1);
         let watcher = owner.clone();
+        #[cfg(all(test, target_os = "linux"))]
+        let observation = startup_observation::matching(&source, spec.execution.as_ref());
+        #[cfg(all(test, target_os = "linux"))]
+        let reaper_observation = observation.clone();
         thread::Builder::new()
             .name("cagents-actor-owner".into())
             .spawn(move || {
                 if let Ok(mut child) = incoming.recv() {
+                    #[cfg(not(all(test, target_os = "linux")))]
                     let proved = child.wait().is_ok_and(|status| status.code() == Some(73));
+                    #[cfg(all(test, target_os = "linux"))]
+                    let waited = child.wait();
+                    #[cfg(all(test, target_os = "linux"))]
+                    let proved = waited
+                        .as_ref()
+                        .is_ok_and(|status| status.code() == Some(73));
                     if proved {
                         *watcher.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
                             chat::protocol::LaunchOutcome::TeardownProved;
                     }
                     watcher.finished.notify_all();
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some(observation) = reaper_observation {
+                        let _ = observation.try_send(startup_observation::Event::Reaped(
+                            waited.map_err(|error| error.to_string()),
+                        ));
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -851,6 +871,12 @@ impl RemoteActor {
                 return Err("Retained actor launch was cancelled before process creation".into());
             }
             let child = command.spawn().map_err(|error| error.to_string())?;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = observation {
+                let _ = observation.try_send(startup_observation::Event::Spawned(
+                    startup_observation::capture(&child),
+                ));
+            }
             *outcome = chat::protocol::LaunchOutcome::Uncertain;
             publish
                 .send(child)
