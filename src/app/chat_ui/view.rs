@@ -997,6 +997,12 @@ impl Cagents {
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime))
+                if runtime.awaiting_admission()
+                    && self.shared_views.quarantined.contains(&card) =>
+            {
+                runtime.fenced_admission_view()
+            }
             Some(CardRuntime::Chat(runtime)) => {
                 if runtime.awaiting_admission() {
                     return runtime.pending_admission_view_with_failure(

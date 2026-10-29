@@ -15,6 +15,21 @@ impl Runtime {
         failure: Option<&crate::app::shared_views::SharedChatAdmissionFailure>,
         retry_enabled: bool,
     ) -> Element<'_, Message> {
+        self.saved_conversation_view(failure, retry_enabled, false)
+    }
+
+    /// The saved descriptor failed its agent's proof, so this pane stays as
+    /// saved rather than waiting to connect, and can be closed in this window.
+    pub(super) fn fenced_admission_view(&self) -> Element<'_, Message> {
+        self.saved_conversation_view(None, false, true)
+    }
+
+    fn saved_conversation_view(
+        &self,
+        failure: Option<&crate::app::shared_views::SharedChatAdmissionFailure>,
+        retry_enabled: bool,
+        fenced: bool,
+    ) -> Element<'_, Message> {
         let text = self.unsent_text();
         let attachments = self.unsent_attachments();
         let mut rows: Vec<Element<'_, Message>> = vec![
@@ -22,13 +37,26 @@ impl Runtime {
             design::caption("Not connected")
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
-            design::body(
-                "This conversation is not connected. Saved content remains available here.",
-            )
+            design::body(if fenced {
+                crate::app::shared_views::FENCED_PANE_EXPLANATION
+            } else {
+                "This conversation is not connected. Saved content remains available here."
+            })
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill)
             .into(),
         ];
+        if fenced {
+            rows.push(
+                widget::button::custom(design::body("Close here"))
+                    .name("Close here")
+                    .id(card_control_id(self.target.card, "saved.fenced.close"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([space::S as u16, space::M as u16])
+                    .on_press(Message::CloseCard(self.target.card))
+                    .into(),
+            );
+        }
         if let Some(failure) = failure {
             // Admission owns the sanitized public message and opaque authority.
             // Presentation never inspects a session proof or creates a retry.
