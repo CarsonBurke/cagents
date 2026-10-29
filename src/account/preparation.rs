@@ -102,7 +102,7 @@ impl From<&ExistingPending> for ExistingPendingRecord {
 /// A request's complete retained identity and options. These identifiers do not
 /// confer authority over a home, provider process, or account registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PreparationRequest {
     Plan {
         request_id: Uuid,
@@ -120,34 +120,36 @@ pub enum PreparationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ExistingPendingRequest {
     Resume {
+        #[serde(with = "request_target_serde")]
         target: ExistingPendingTarget,
     },
     Cancel {
         operation_id: Uuid,
+        #[serde(with = "request_target_serde")]
         target: ExistingPendingTarget,
     },
 }
 
 /// Shared metadata only; dispatch and admission belong to the owning caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum AccountPreparationRequest {
     Preparation(PreparationRequest),
     ExistingPending(ExistingPendingRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum AccountPreparationRecord {
     Preparation(Preparation),
     ExistingPending(ExistingPendingRecord),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum AccountPreparationOutcome {
     /// The owning Store completed its durability barrier for this metadata.
     /// This does not confirm home creation, login, or current registration.
@@ -169,6 +171,83 @@ pub enum AccountPreparationOutcome {
 pub struct AccountPreparationReply {
     pub request: AccountPreparationRequest,
     pub outcome: AccountPreparationOutcome,
+}
+
+/// The new requests need an externally tagged target for positional codecs.
+/// Keep this field adapter separate from the existing stored target's format.
+mod request_target_serde {
+    use super::{ExistingPendingBinding, ExistingPendingTarget};
+    use crate::agent::Provider;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use uuid::Uuid;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Target {
+        Observed {
+            #[serde(with = "super::provider_name")]
+            provider: Provider,
+            key: Uuid,
+            started_at: u64,
+            expected_installation: Option<Uuid>,
+        },
+        Bound {
+            binding: ExistingPendingBinding,
+        },
+    }
+
+    impl From<&ExistingPendingTarget> for Target {
+        fn from(target: &ExistingPendingTarget) -> Self {
+            match target {
+                ExistingPendingTarget::Observed {
+                    provider,
+                    key,
+                    started_at,
+                    expected_installation,
+                } => Self::Observed {
+                    provider: *provider,
+                    key: *key,
+                    started_at: *started_at,
+                    expected_installation: *expected_installation,
+                },
+                ExistingPendingTarget::Bound { binding } => Self::Bound {
+                    binding: binding.clone(),
+                },
+            }
+        }
+    }
+
+    impl From<Target> for ExistingPendingTarget {
+        fn from(target: Target) -> Self {
+            match target {
+                Target::Observed {
+                    provider,
+                    key,
+                    started_at,
+                    expected_installation,
+                } => Self::Observed {
+                    provider,
+                    key,
+                    started_at,
+                    expected_installation,
+                },
+                Target::Bound { binding } => Self::Bound { binding },
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        target: &ExistingPendingTarget,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Target::from(target).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ExistingPendingTarget, D::Error> {
+        Target::deserialize(deserializer).map(Into::into)
+    }
 }
 
 mod provider_name {
@@ -212,19 +291,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replies_round_trip_the_complete_request_and_uncertain_observation() {
+    fn request_cases() -> Vec<AccountPreparationRequest> {
         let binding = binding();
-        let observed = ExistingPendingTarget::Observed {
-            provider: Provider::Claude,
-            key: Uuid::from_u128(4),
-            started_at: 1_234,
-            expected_installation: Some(Uuid::from_u128(2)),
-        };
-        let bound = ExistingPendingTarget::Bound {
-            binding: existing_binding(),
-        };
-        let requests = [
+        let mut requests = vec![
             AccountPreparationRequest::Preparation(PreparationRequest::Plan {
                 request_id: binding.request_id,
                 payload: binding.payload.clone(),
@@ -238,42 +307,75 @@ mod tests {
             AccountPreparationRequest::Preparation(PreparationRequest::Reconcile {
                 binding: binding.clone(),
             }),
-            AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Resume {
-                target: observed.clone(),
+        ];
+        let targets = [
+            ExistingPendingTarget::Observed {
+                provider: Provider::Claude,
+                key: Uuid::from_u128(4),
+                started_at: 1_234,
+                expected_installation: None,
+            },
+            ExistingPendingTarget::Observed {
+                provider: Provider::Claude,
+                key: Uuid::from_u128(4),
+                started_at: 1_234,
+                expected_installation: Some(Uuid::from_u128(2)),
+            },
+            ExistingPendingTarget::Bound {
+                binding: existing_binding(),
+            },
+        ];
+        for (index, target) in targets.into_iter().enumerate() {
+            requests.push(AccountPreparationRequest::ExistingPending(
+                ExistingPendingRequest::Resume {
+                    target: target.clone(),
+                },
+            ));
+            requests.push(AccountPreparationRequest::ExistingPending(
+                ExistingPendingRequest::Cancel {
+                    operation_id: Uuid::from_u128(6 + index as u128),
+                    target,
+                },
+            ));
+        }
+        requests
+    }
+
+    fn outcome_cases() -> Vec<AccountPreparationOutcome> {
+        let records = [
+            AccountPreparationRecord::Preparation(Preparation {
+                binding: binding(),
+                state: PreparationState::Registered,
             }),
-            AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Resume {
-                target: bound.clone(),
-            }),
-            AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Cancel {
-                operation_id: Uuid::from_u128(6),
-                target: observed,
-            }),
-            AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Cancel {
-                operation_id: Uuid::from_u128(7),
-                target: bound,
+            AccountPreparationRecord::ExistingPending(ExistingPendingRecord {
+                binding: existing_binding(),
+                state: ExistingPendingState::CancelledRetained,
             }),
         ];
-        let record = AccountPreparationRecord::Preparation(Preparation {
-            binding,
-            state: PreparationState::Registered,
-        });
-        let outcomes = [
-            AccountPreparationOutcome::Confirmed {
+        let mut outcomes = Vec::new();
+        for record in records {
+            outcomes.push(AccountPreparationOutcome::Confirmed {
                 record: record.clone(),
-            },
-            AccountPreparationOutcome::ReconcileRequired {
+            });
+            outcomes.push(AccountPreparationOutcome::ReconcileRequired {
                 message: "The directory barrier failed; reconcile the retained request".into(),
                 observed: Some(record),
-            },
-            AccountPreparationOutcome::ReconcileRequired {
-                message: "The storage result is unknown".into(),
-                observed: None,
-            },
-            AccountPreparationOutcome::NotAttempted {
-                message: "The caller refused admission before storage".into(),
-            },
-        ];
-        for request in requests {
+            });
+        }
+        outcomes.push(AccountPreparationOutcome::ReconcileRequired {
+            message: "The storage result is unknown".into(),
+            observed: None,
+        });
+        outcomes.push(AccountPreparationOutcome::NotAttempted {
+            message: "The caller refused admission before storage".into(),
+        });
+        outcomes
+    }
+
+    #[test]
+    fn replies_round_trip_the_complete_request_and_uncertain_observation() {
+        let outcomes = outcome_cases();
+        for request in request_cases() {
             for outcome in &outcomes {
                 let reply = AccountPreparationReply {
                     request: request.clone(),
@@ -285,6 +387,99 @@ mod tests {
                     reply
                 );
             }
+        }
+    }
+
+    #[test]
+    fn requests_round_trip_through_postcard_with_every_target_form() {
+        for request in request_cases() {
+            let bytes = postcard::to_allocvec(&request).unwrap();
+            let (decoded, rest) =
+                postcard::take_from_bytes::<AccountPreparationRequest>(&bytes).unwrap();
+            assert_eq!(decoded, request);
+            assert!(
+                rest.is_empty(),
+                "the decoder must consume the whole request"
+            );
+        }
+    }
+
+    #[test]
+    fn replies_round_trip_through_postcard_with_every_outcome() {
+        let outcomes = outcome_cases();
+        for request in request_cases() {
+            for outcome in &outcomes {
+                let reply = AccountPreparationReply {
+                    request: request.clone(),
+                    outcome: outcome.clone(),
+                };
+                let bytes = postcard::to_allocvec(&reply).unwrap();
+                let (decoded, rest) =
+                    postcard::take_from_bytes::<AccountPreparationReply>(&bytes).unwrap();
+                assert_eq!(decoded, reply);
+                assert!(rest.is_empty(), "the decoder must consume the whole reply");
+            }
+        }
+    }
+
+    #[test]
+    fn request_target_adapter_preserves_the_existing_stored_json_shape() {
+        let binding = existing_binding();
+        for target in [
+            ExistingPendingTarget::Observed {
+                provider: binding.provider,
+                key: binding.key,
+                started_at: binding.started_at,
+                expected_installation: Some(binding.installation_id),
+            },
+            ExistingPendingTarget::Bound {
+                binding: binding.clone(),
+            },
+        ] {
+            let (stored, adapted) = match &target {
+                ExistingPendingTarget::Observed {
+                    provider: _,
+                    key,
+                    started_at,
+                    expected_installation,
+                } => (
+                    serde_json::json!({
+                        "kind": "observed",
+                        "provider": "claude",
+                        "key": key,
+                        "started_at": started_at,
+                        "expected_installation": expected_installation,
+                    }),
+                    serde_json::json!({"observed": {
+                        "provider": "claude",
+                        "key": key,
+                        "started_at": started_at,
+                        "expected_installation": expected_installation,
+                    }}),
+                ),
+                ExistingPendingTarget::Bound { binding } => (
+                    serde_json::json!({"kind": "bound", "binding": binding}),
+                    serde_json::json!({"bound": {"binding": binding}}),
+                ),
+            };
+            assert_eq!(serde_json::to_value(&target).unwrap(), stored);
+            assert_eq!(
+                serde_json::from_value::<ExistingPendingTarget>(stored).unwrap(),
+                target
+            );
+            let request =
+                AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Resume {
+                    target,
+                });
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"existing_pending": {"resume": {"target": adapted}}})
+            );
+            assert_eq!(
+                serde_json::from_value::<AccountPreparationRequest>(value).unwrap(),
+                request
+            );
         }
     }
 
@@ -307,13 +502,20 @@ mod tests {
                 record: AccountPreparationRecord::ExistingPending((&record).into()),
             },
         };
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["cancellation_ids"],
+            serde_json::json!(record.cancellation_ids)
+        );
         let value = serde_json::to_value(&reply).unwrap();
         assert_eq!(
-            value["request"]["request"]["operation_id"],
-            operation_id.to_string()
+            value["request"],
+            serde_json::json!({"existing_pending": {"cancel": {
+                "operation_id": operation_id,
+                "target": {"bound": {"binding": record.binding}},
+            }}})
         );
         assert_eq!(
-            value["outcome"]["record"]["record"],
+            value["outcome"]["confirmed"]["record"]["existing_pending"],
             serde_json::json!({
                 "binding": {
                     "installation_id": record.binding.installation_id,
