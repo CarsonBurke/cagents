@@ -321,7 +321,8 @@ impl Cagents {
             // An old Insert refusal must not reclassify that newer source.
             if !self.workspace_model.views.iter().any(|view| {
                 view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
-            }) && self.retain_chat_after_creation_refusal(card, scope)
+            }) && (self.retain_chat_after_creation_refusal(card, scope)
+                || self.retain_draft_after_creation_refusal(card))
             {
                 self.retain_local_pane(card);
             }
@@ -1652,6 +1653,9 @@ impl Cagents {
             if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                 || self.shared_chat_has_local_work(id)
             {
+                // Each later read finds the same local pane absent again;
+                // only the read that first kept it here reports a close.
+                let newly_local = !self.shared_views.retained.contains(&id);
                 self.retain_local_pane(id);
                 if view.retired.contains(&id)
                     && !self.chat_start_pending(id)
@@ -1664,9 +1668,11 @@ impl Cagents {
                     }
                     self.sync_closed_chat_draft(id);
                 }
-                self.status = Some(TransientNotice::warning(
-                    "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
-                ));
+                if newly_local {
+                    self.status = Some(TransientNotice::warning(
+                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
+                    ));
+                }
                 continue;
             }
             self.detach_shared_pane(id);
@@ -5395,6 +5401,43 @@ mod tests {
                 "revoked creation must not be recreated"
             );
         }
+    }
+
+    #[test]
+    fn refused_draft_publication_is_kept_without_claiming_another_client_closed_it() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some(operation),
+                _ => None,
+            })
+            .unwrap();
+        app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(
+            super::super::chat_ui::chat_error_for_test(&app, card)
+                .is_some_and(|error| error.contains("could not be shared"))
+        );
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert!(app.status.is_none(), "nothing was closed in another client");
+        }
+        assert!(receiver.try_recv().is_err(), "a refusal is not republished");
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(String::as_str),
+            Some("first message")
+        );
     }
 
     #[test]
