@@ -1476,4 +1476,131 @@ mod tests {
         page.operate(&mut tree, Layout::new(&node), &renderer, &mut Focus(false));
         assert_eq!(paint(&mut renderer, &page, &tree), unfocused);
     }
+
+    #[test]
+    fn report_view_shapes_one_page_and_full_copy_preserves_publisher_readable_labels() {
+        use iced::futures::StreamExt;
+        #[derive(Default)]
+        struct TextProbe(Vec<String>);
+        impl Operation for TextProbe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _id: Option<&widget::Id>, _bounds: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        fn rendered(runtime: &Runtime, renderer: &cosmic::Renderer) -> (Vec<String>, f32) {
+            let item = runtime.active_item("owned-report").unwrap();
+            let mut element = runtime.report_output_view(item).unwrap();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(600.0, 900.0)),
+            );
+            let mut probe = TextProbe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), renderer, &mut probe);
+            (probe.0, node.size().height)
+        }
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, mut source) = fixture();
+        // This is already-readable, publisher-labeled synthetic data. It does
+        // not exercise raw capture, UTF-8 replacement, ANSI cleanup or omission
+        // accounting, which remain separate producer qualification gates.
+        let full = Arc::new(format!(
+            "Provider exited with status 7\n[Unreadable bytes are shown as �]\n{}\nLast retained line\n[7 raw output bytes were not retained]",
+            "猫 retained body\n".repeat(3_000),
+        ));
+        source.bytes = full.len() as u64;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.error = Some("Provider exited with status 7".into());
+        snapshot.text_copy_sources.conversation = vec![Some(source.clone())];
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        let request = begin(&mut app, target, &source);
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            request,
+            Ok(full.clone()),
+        )));
+        let renderer = crate::app::tests::headless_renderer();
+        let first = full[page_bounds(&full, 0).0].to_owned();
+        let (texts, height) = rendered(app.chat_runtime_mut(target).unwrap(), &renderer);
+        assert!(texts.contains(&first));
+        assert!(texts.iter().all(|text| text.len() <= PAGE_BYTES + 3));
+        assert!(
+            height < 400.0,
+            "the shaped page stays in a bounded viewport"
+        );
+        drop(app.handle_chat_ui(Action::ReportOutputPage(target, true)));
+        let second = full[page_bounds(&full, 1).0].to_owned();
+        let (texts, height) = rendered(app.chat_runtime_mut(target).unwrap(), &renderer);
+        assert!(texts.contains(&second));
+        assert!(!texts.contains(&first));
+        assert!(texts.iter().all(|text| text.len() <= PAGE_BYTES + 3));
+        assert!(height < 400.0);
+
+        let copy = text_copy::Request::for_test(handle, source.clone());
+        let task = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "owned-report".into(),
+            copy,
+            Ok((*full).clone()),
+        ));
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => stream.collect::<Vec<_>>().await,
+                        None => vec![],
+                    }
+                })
+                .await
+                .expect("copy effect and acknowledgement timer must settle")
+            });
+        let copied = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    target: iced::advanced::clipboard::Kind::Standard,
+                    contents,
+                }) => Some(contents),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            copied,
+            [(*full).clone()],
+            "copy must preserve the complete publisher-readable source, including its labels"
+        );
+        assert!(Arc::ptr_eq(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .ready
+                .as_ref()
+                .unwrap(),
+            &full
+        ));
+        drop(app.handle_chat_ui(Action::ToggleReportOutput(
+            target,
+            "owned-report".into(),
+            source,
+        )));
+        let (texts, _) = rendered(app.chat_runtime_mut(target).unwrap(), &renderer);
+        assert!(!texts.contains(&first) && !texts.contains(&second));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .ready
+                .is_none()
+        );
+    }
 }
