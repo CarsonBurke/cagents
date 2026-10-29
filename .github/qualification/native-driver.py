@@ -487,6 +487,20 @@ try:
         'requested_theme': 'Adwaita', 'index_sha256': digest(icon_root / 'index.theme'),
         'installed_resource_candidates': icon_resources,
     }, indent=2) + '\n')
+    font_paths = [Path(path) for path in subprocess.check_output(
+        ['dpkg-query', '-L', 'fonts-noto-cjk'], text=True).splitlines()
+        if Path(path).suffix.lower() in {'.ttc', '.ttf', '.otf'}]
+    assert font_paths and all(path.is_file() for path in font_paths)
+    japanese_font = Path(subprocess.check_output(
+        ['fc-match', '-f', '%{file}', 'sans:lang=ja'], text=True))
+    assert japanese_font in font_paths, 'Japanese fallback must resolve to installed CJK fonts'
+    (out / 'cjk-font-resources.json').write_text(json.dumps({
+        'package_version': subprocess.check_output(
+            ['dpkg-query', '-W', '-f=${Version}', 'fonts-noto-cjk'], text=True),
+        'japanese_fallback': str(japanese_font),
+        'installed_resources': [{'path': str(path), 'sha256': digest(path)} for path in font_paths],
+        'scope': 'Same installed desktop fonts for every before/after arm; rendered coverage still requires native image review.',
+    }, indent=2) + '\n')
     launcher = next(path for path in [Path('/usr/libexec/at-spi-bus-launcher'),
                                     Path('/usr/lib/at-spi2-core/at-spi-bus-launcher')] if path.exists())
     accessibility = subprocess.Popen([str(launcher), '--launch-immediately'], start_new_session=True)
@@ -701,8 +715,15 @@ try:
             capture(window, label + '-keyboard', (900, 700))
             if payload == 'long':
                 if variant == 'after':
-                    wait(lambda: any('Synthetic conversation entry 199.' in node.name and visible(node)
+                    delivered = 'healthy-long-snapshot-delivered items=200 first=synthetic-history-0 last=synthetic-history-199'
+                    wait(lambda: delivered in receipt.read_text().splitlines())
+                    wait(lambda: any('Synthetic conversation entry 0.' in node.name and visible(node)
                                      for node in live_tree(pid)))
+                    (out / (label + '-long-workload-admission.json')).write_text(json.dumps({
+                        'successful_snapshot_write_receipt': delivered,
+                        'visible_transcript_entry': 0,
+                        'scope': 'Exact healthy 200-item snapshot delivery and visible transcript admission; no latest-position or restoration correctness claim.',
+                    }, indent=2) + '\n')
                 capture(window, label + '-performance-wide', (1280, 800))
                 responsiveness(window, pid, fixture, root, label, pixel_helper)
             if variant == 'after' and not hidden:

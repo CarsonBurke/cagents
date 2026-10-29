@@ -460,6 +460,25 @@ fn client(
         let full_model_delivered = matches!(&response, ServerMessage::Response {
             response: ServerResponse::WorkspaceModel { .. },
         });
+        let healthy_long_snapshot = match &response {
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached { session, snapshot },
+            } if session == &healthy
+                && std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") =>
+            {
+                assert!(snapshot.ready);
+                assert_eq!(snapshot.session_id, healthy.launch.session_id);
+                assert_eq!(snapshot.items.len(), 200);
+                assert_eq!(snapshot.items.first().unwrap().id, "synthetic-history-0");
+                assert_eq!(snapshot.items.last().unwrap().id, "synthetic-history-199");
+                Some(format!(
+                    "healthy-long-snapshot-delivered items={} first={} last={}",
+                    snapshot.items.len(), snapshot.items.first().unwrap().id,
+                    snapshot.items.last().unwrap().id,
+                ))
+            }
+            _ => None,
+        };
         if terminal_ipc::write_frame(
             &mut *writer.lock().unwrap(),
             &ServerEnvelope {
@@ -474,6 +493,7 @@ fn client(
             break;
         }
         if full_model_delivered { record(&root, "full-model-delivered"); }
+        if let Some(receipt) = healthy_long_snapshot { record(&root, &receipt); }
         if let Some(chat_id) = visible_chat {
             if terminal_ipc::write_frame(&mut *writer.lock().unwrap(), &ServerEnvelope {
                 version: terminal_ipc::PROTOCOL_VERSION, request_id: None,
