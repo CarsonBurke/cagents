@@ -712,7 +712,12 @@ impl Claude {
         }
         Ok(item)
     }
-    fn task_rows_for_agent(&mut self, parent: Option<&str>, tool: &str) -> Vec<String> {
+    fn task_rows_for_agent(
+        &mut self,
+        parent: Option<&str>,
+        tool: &str,
+        step: &mut Step,
+    ) -> Vec<String> {
         let incoming = ScopedId::new(parent, tool);
         if self
             .tool_order
@@ -723,12 +728,46 @@ impl Claude {
             // while more than one scope could own the reported tool ID.
             return Vec::new();
         }
-        self.agent_task_calls
+        let candidates: Vec<_> = self
+            .agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
             .map(|(_, task)| format!("claude-task:{task}"))
-            .filter(|id| self.visible_task_rows.remove(id))
-            .collect()
+            .filter(|id| self.visible_task_rows.contains(id))
+            .collect();
+        let mut removed = Vec::new();
+        for id in candidates {
+            // ItemsRemoved deletes the visible canonical row. Preserve its
+            // authenticated lifecycle source before publishing that removal.
+            let retained = self.cached_tool(None, &id).and_then(|item| {
+                let item = item.ok_or("Original task description is unavailable")?;
+                if let Some(reader) = &self.item_reader {
+                    let mut live: Vec<_> = self
+                        .hidden_task_rows
+                        .iter()
+                        .filter(|id| id.len() <= 4096)
+                        .cloned()
+                        .collect();
+                    if !live.contains(&id) {
+                        live.push(id.clone());
+                    }
+                    reader.retain_hidden_task(&item, &live)?;
+                }
+                Ok(())
+            });
+            match retained {
+                Ok(()) => {
+                    self.hidden_task_rows.insert(id.clone());
+                    self.visible_task_rows.remove(&id);
+                    removed.push(id);
+                }
+                Err(message) => step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                }),
+            }
+        }
+        removed
     }
     fn remember_tool_input(
         &mut self,
@@ -1518,7 +1557,7 @@ impl Claude {
                             self.remember_tool_input(child, &tool_id, &block["input"])?;
                             if string(block, "name") == "Agent" {
                                 global_task_removals
-                                    .extend(self.task_rows_for_agent(child, &tool_id));
+                                    .extend(self.task_rows_for_agent(child, &tool_id, step));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -6305,6 +6344,256 @@ mod tests {
                     .get(&ScopedId::new(None, "agent"))
                     .map(|row| row.0),
                 Some(expected)
+            );
+        }
+    }
+    #[test]
+    fn late_agents_preserve_committed_task_source_before_removing_the_fallback_row() {
+        fn assert_no_source_errors(events: &[Event]) {
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Error { .. }
+                        | Event::Subagent {
+                            waiting: Some(true),
+                            ..
+                        }
+                )),
+                "unexpected source error: {events:?}"
+            );
+        }
+
+        fn receive_committed(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            frame: Value,
+        ) -> Vec<Event> {
+            let step = adapter.receive(frame).unwrap();
+            assert_no_source_errors(&step.events);
+            let events = step.events.clone();
+            for event in step.events {
+                assert_no_source_errors(&store.lock().unwrap().apply(event).unwrap());
+            }
+            adapter.committed();
+            events
+        }
+
+        fn evict_task(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            stage: &str,
+        ) {
+            for index in 0..3 {
+                receive_committed(
+                    adapter,
+                    store,
+                    scoped_call(
+                        None,
+                        &format!("{stage}-filler-{index}"),
+                        &format!("{stage}-filler-{index}"),
+                        "Write",
+                        json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                    ),
+                );
+            }
+            assert!(adapter.tools.get(None, "claude-task:task").is_none());
+        }
+
+        for parent in [None, Some("outer-agent")] {
+            for eviction in ["resident", "before", "after"] {
+                let store = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::chat::runtime::Store::new().unwrap(),
+                ));
+                let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+                let mut adapter = Claude::default();
+                adapter.bind_item_reader(reader.clone());
+                let task_id = "claude-task:task";
+                let key = super::super::CanonicalItemKey::new(None, task_id);
+                let description = "Inspect late Agent source";
+                let started = receive_committed(
+                    &mut adapter,
+                    &store,
+                    json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":description}),
+                );
+                assert!(
+                    started
+                        .iter()
+                        .any(|event| matches!(event, Event::Item(item) if item.id == task_id))
+                );
+                let original = reader.read(&key).unwrap().unwrap();
+                if eviction == "before" {
+                    evict_task(&mut adapter, &store, "before");
+                } else {
+                    assert!(adapter.tools.get(None, task_id).is_some());
+                }
+
+                let agent = receive_committed(
+                    &mut adapter,
+                    &store,
+                    scoped_call(
+                        parent,
+                        "late-launch",
+                        "agent",
+                        "Agent",
+                        json!({"run_in_background":true}),
+                    ),
+                );
+                assert!(agent.iter().any(
+                    |event| matches!(event, Event::ItemsRemoved { ids } if ids == &[task_id])
+                ));
+                assert!(!agent.iter().any(|event| matches!(
+                    event,
+                    Event::SubagentItemsRemoved { ids, .. } if ids.iter().any(|id| id == task_id)
+                )));
+                assert!(agent.iter().any(|event| match (event, parent) {
+                    (Event::Item(item), None) => item.id == "agent",
+                    (Event::SubagentItem { id, item }, Some(parent)) => {
+                        id == parent && item.id == "agent"
+                    }
+                    _ => false,
+                }));
+                assert!(reader.read(&key).unwrap().is_none());
+                assert_eq!(
+                    reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                    original.content
+                );
+                assert!(!adapter.visible_task_rows.contains(task_id));
+                assert!(adapter.hidden_task_rows.contains(task_id));
+                if eviction == "after" {
+                    evict_task(&mut adapter, &store, "after");
+                }
+
+                for summary in ["Checking tokens", "Checking completion"] {
+                    let progress = receive_committed(
+                        &mut adapter,
+                        &store,
+                        json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":summary}}),
+                    );
+                    assert!(!progress.iter().any(|event| matches!(
+                        event,
+                        Event::Item(item) | Event::SubagentItem { item, .. } if item.id == task_id
+                    )));
+                    assert!(reader.read(&key).unwrap().is_none());
+                    assert_eq!(
+                        reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                        ItemContent::Tool {
+                            name: "Subagent task".into(),
+                            input: description.into(),
+                            output: summary.into(),
+                            status: ToolStatus::Running,
+                        }
+                    );
+                }
+                let body = "Finished the exact late Agent review.";
+                let done = receive_committed(
+                    &mut adapter,
+                    &store,
+                    json!({"type":"system","subtype":"task_notification","uuid":"done","task_id":"task","status":"completed","summary":body}),
+                );
+                assert!(!done.iter().any(|event| matches!(
+                    event,
+                    Event::Item(item) | Event::SubagentItem { item, .. } if item.id == task_id
+                )));
+                assert!(done.iter().any(|event| matches!(
+                    event,
+                    Event::Item(Item {
+                        content: ItemContent::Delivery {
+                            kind: DeliveryKind::Report,
+                            summary,
+                            body: actual_body,
+                            ..
+                        },
+                        ..
+                    }) if summary == "Native subagent \"Inspect late Agent source\" finished"
+                        && actual_body == body
+                )));
+                assert_eq!(
+                    reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                    ItemContent::Tool {
+                        name: "Subagent task".into(),
+                        input: description.into(),
+                        output: body.into(),
+                        status: ToolStatus::Succeeded,
+                    }
+                );
+                assert!(reader.read(&key).unwrap().is_none());
+                assert!(!adapter.visible_task_rows.contains(task_id));
+            }
+        }
+    }
+    #[test]
+    fn late_agent_keeps_the_fallback_row_when_canonical_source_refuses_migration() {
+        for evict in [false, true] {
+            let store = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::chat::runtime::Store::new().unwrap(),
+            ));
+            let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+            let mut adapter = Claude::default();
+            adapter.bind_item_reader(reader.clone());
+            let task_id = "claude-task:task";
+            let key = super::super::CanonicalItemKey::new(None, task_id);
+            let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":"Original task source"})).unwrap();
+            commit_tool_fixture(&mut adapter, &store, started);
+            let mut rewritten = reader.read(&key).unwrap().unwrap();
+            rewritten.content = ItemContent::Tool {
+                name: "Other tool".into(),
+                input: "Rewritten canonical source".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            };
+            store
+                .lock()
+                .unwrap()
+                .apply(Event::Item(rewritten.clone()))
+                .unwrap();
+            if evict {
+                for index in 0..3 {
+                    let step = adapter
+                        .receive(scoped_call(
+                            None,
+                            &format!("filler-{index}"),
+                            &format!("filler-{index}"),
+                            "Write",
+                            json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                        ))
+                        .unwrap();
+                    commit_tool_fixture(&mut adapter, &store, step);
+                }
+                assert!(adapter.tools.get(None, task_id).is_none());
+            }
+            let agent = adapter
+                .receive(scoped_call(None, "launch", "agent", "Agent", json!({})))
+                .unwrap();
+            let errors: Vec<_> = agent
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Error {
+                        message,
+                        fatal: false,
+                    } => Some(message.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                errors,
+                [if evict {
+                    "Hidden task identity exceeds its retained lifecycle scope"
+                } else {
+                    "Cached tool invocation or body no longer matches its canonical source"
+                }]
+            );
+            assert!(!agent.events.iter().any(|event| matches!(
+                event,
+                Event::ItemsRemoved { ids } if ids.iter().any(|id| id == task_id)
+            )));
+            commit_tool_fixture(&mut adapter, &store, agent);
+            assert!(adapter.visible_task_rows.contains(task_id));
+            assert!(!adapter.hidden_task_rows.contains(task_id));
+            assert!(reader.read_hidden_task(task_id).unwrap().is_none());
+            assert_eq!(
+                reader.read(&key).unwrap().unwrap().content,
+                rewritten.content
             );
         }
     }
