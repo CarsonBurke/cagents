@@ -381,10 +381,6 @@ impl Store {
     }
 }
 
-pub(super) fn sync_registry_directory(directory: &Path) -> io::Result<()> {
-    super::super::durability::Directories::capture(directory)?.sync()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,6 +1288,59 @@ mod tests {
                 assert_consumed_replay_requires_sync(&fixture, &planned.binding);
             }
         }
+    }
+
+    #[test]
+    fn registered_preparation_replay_completes_a_failed_directory_barrier() {
+        let fixture = Fixture::new();
+        let planned = fixture.plan();
+        fixture.create(&planned.binding);
+        let barriers = std::cell::Cell::new(0);
+        let first = fixture.store.register_pending_with_io(
+            &fixture.homes,
+            fixture.account(&planned.binding),
+            &[],
+            false,
+            |_| Ok(()),
+            |_| {
+                barriers.set(barriers.get() + 1);
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            },
+        );
+        assert_eq!(first.unwrap_err().raw_os_error(), Some(libc::EIO));
+        let visible = fixture.store.load().unwrap();
+        assert_eq!(
+            visible.exact_preparation(&planned.binding).unwrap().state,
+            PreparationState::Registered
+        );
+        assert_eq!(visible.accounts.len(), 1);
+        assert!(visible.pending.is_empty());
+        let bytes = fs::read(fixture.store.path()).unwrap();
+        for fail in [true, false] {
+            let result = fixture.store.register_pending_with_io(
+                &fixture.homes,
+                fixture.account(&planned.binding),
+                &[],
+                false,
+                |_| Ok(()),
+                |namespace| {
+                    barriers.set(barriers.get() + 1);
+                    if fail {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        namespace.sync()
+                    }
+                },
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            } else {
+                assert_eq!(result.unwrap(), (visible.clone(), Ok(())));
+            }
+            assert_eq!(fixture.store.load().unwrap(), visible);
+            assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+        }
+        assert_eq!(barriers.get(), 3);
     }
 
     #[test]

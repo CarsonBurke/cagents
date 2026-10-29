@@ -1111,12 +1111,28 @@ impl Store {
         nonblocking: bool,
         validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        self.register_pending_with_io(homes, account, system, nonblocking, validate, |namespace| {
+            namespace.sync()
+        })
+    }
+
+    fn register_pending_with_io(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+        sync: impl FnMut(&super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
         let _lifecycle = if nonblocking {
             homes.try_lifecycle_lock()?
         } else {
             homes.lifecycle_lock()?
         };
-        self.update_checked_with_mode(
+        let key = account.key;
+        let provider = account.provider;
+        self.update_checked_with_io(
             |registry| {
                 validate(registry)?;
                 if registry.find(account.key).is_some_and(|existing| {
@@ -1140,6 +1156,12 @@ impl Store {
                 }
             },
             nonblocking,
+            |registry| {
+                registry
+                    .preparation_for_key(provider, key)
+                    .is_some_and(|entry| entry.state == PreparationState::Registered)
+            },
+            sync,
         )
     }
 
@@ -1225,6 +1247,16 @@ impl Store {
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
         nonblocking: bool,
     ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_io(change, nonblocking, |_| false, |namespace| namespace.sync())
+    }
+
+    fn update_checked_with_io<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+        nonblocking: bool,
+        sync_unchanged: impl FnOnce(&Registry) -> bool,
+        mut sync: impl FnMut(&super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<(Registry, T)> {
         let _lock = if nonblocking {
             self.try_lock()?
         } else {
@@ -1246,7 +1278,11 @@ impl Store {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
-            write(&self.directory, &path, &registry)?;
+            write_with_directory_sync(&self.directory, &path, &registry, |namespace| {
+                sync(namespace)
+            })?;
+        } else if sync_unchanged(&registry) {
+            sync(&super::durability::Directories::capture(&self.directory)?)?;
         }
         Ok((registry, result))
     }
