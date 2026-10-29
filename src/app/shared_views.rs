@@ -336,7 +336,10 @@ impl Cagents {
             // A single read can retain several panes. Record each transition
             // directly rather than overwriting the shell's one pending status.
             tracing::warn!(message = reason, "application notice");
-            self.notices.record(TransientNotice::warning(reason));
+            self.notices.record(
+                TransientNotice::warning(reason)
+                    .with_key(NoticeKey::RetentionIncident(id, uuid::Uuid::new_v4())),
+            );
         }
     }
 
@@ -5731,6 +5734,125 @@ mod tests {
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 assert_eq!(app.shared_views.retention_incidents.len(), 1);
             }
+        }
+    }
+
+    #[test]
+    fn retention_notice_stale_dismissal_cannot_hide_a_changed_same_reason_target() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            unreachable!()
+        };
+        let identity = &**runtime as *const RepositoryRuntime;
+        let text = runtime.editor_text();
+
+        let set_target = |app: &mut Cagents, path: &str| {
+            let CardKind::Repository(incoming) = &mut app.workspace_model.views[0].panes[0].kind
+            else {
+                unreachable!()
+            };
+            incoming.selected_file = Some(path.into());
+        };
+        set_target(&mut app, "replacement-a.txt");
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 1);
+        let first = app.notices.entries[0].clone();
+        let stale_dismissal = Message::DismissNotice(first.id);
+
+        set_target(&mut app, "replacement-b.txt");
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 2);
+        let second = app.notices.entries[1].clone();
+        assert_eq!(first.notice.message, second.notice.message);
+        assert_ne!(first.id, second.id);
+        drop(app.update(stale_dismissal));
+        assert_eq!(app.notices.entries.len(), 1);
+        assert_eq!(app.notices.entries[0].id, second.id);
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 1);
+        assert_eq!(app.notices.entries[0].repeats, 1);
+
+        // Returning to A is another transition, not permission to reuse its
+        // old dismiss target. B's queued dismissal must also leave A visible.
+        set_target(&mut app, "replacement-a.txt");
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 2);
+        let third = app.notices.entries[1].clone();
+        assert_eq!(third.notice.message, first.notice.message);
+        assert_ne!(third.id, first.id);
+        assert_ne!(third.id, second.id);
+        drop(app.update(Message::DismissNotice(second.id)));
+        drop(app.update(Message::DismissNotice(first.id)));
+        assert_eq!(app.notices.entries.len(), 1);
+        assert_eq!(app.notices.entries[0].id, third.id);
+        drop(app.update(Message::DismissNotice(third.id)));
+        retention_full_read(&mut app);
+        assert!(app.notices.is_empty());
+
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("notice dismissal must preserve the retained editor");
+        };
+        assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+        assert_eq!(runtime.editor_text(), text);
+        assert!(runtime.blocks_navigation());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert_eq!(app.shared_views.retention_incidents.len(), 1);
+        assert_eq!(
+            app.shared_views.retention_incidents[&pane.id].incoming,
+            Some(app.workspace_model.views[0].panes[0].kind.clone())
+        );
+    }
+
+    #[test]
+    fn retention_notice_identical_reasons_in_two_panes_keep_separate_dismissal_targets() {
+        let (mut app, channel, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        let second_id = CardId::new();
+        let mut second_runtime = RepositoryRuntime::dirty_fixture(second_id);
+        let CardKind::Repository(original) = &pane.kind else {
+            unreachable!()
+        };
+        second_runtime.descriptor = original.clone();
+        let mut second = app.card_state(pane.id).unwrap().clone();
+        second.id = second_id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(second);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(second_id);
+        app.cards
+            .insert(second_id, CardRuntime::Repository(Box::new(second_runtime)));
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 2);
+        let first = app.notices.entries[0].clone();
+        let second = app.notices.entries[1].clone();
+        assert_eq!(first.notice.message, second.notice.message);
+        assert_ne!(first.id, second.id);
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 2);
+        assert!(app.notices.entries.iter().all(|entry| entry.repeats == 1));
+        drop(app.update(Message::DismissNotice(first.id)));
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 1);
+        assert_eq!(app.notices.entries[0].id, second.id);
+        drop(app.update(Message::DismissNotice(second.id)));
+        retention_full_read(&mut app);
+        assert!(app.notices.is_empty());
+        assert_eq!(app.shared_views.retention_incidents.len(), 2);
+        for id in [pane.id, second_id] {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                panic!("both editors must remain retained");
+            };
+            assert!(runtime.is_dirty() && runtime.blocks_navigation());
+            assert!(app.card_state(id).unwrap().existence.is_open());
         }
     }
 
