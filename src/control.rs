@@ -2111,6 +2111,12 @@ where
         emit_error(cli.json, &AppError::new("device", error));
         return ExitCode::FAILURE;
     }
+    if let TopCommand::Settings { command } = &cli.command {
+        if let Err(error) = settings::remote_preflight(command, crate::device::is_remote()) {
+            emit_error(cli.json, &error);
+            return ExitCode::FAILURE;
+        }
+    }
     if crate::device::is_remote() && matches!(cli.command, TopCommand::Linear(_)) {
         emit_error(
             cli.json,

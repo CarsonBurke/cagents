@@ -21,11 +21,19 @@ pub enum SettingsCommand {
     Open,
 }
 
+pub(super) fn remote_preflight(command: &SettingsCommand, remote: bool) -> Result<(), AppError> {
+    if remote && matches!(command, SettingsCommand::Open) {
+        return Err(AppError::new(
+            "settings_remote_open",
+            "Open the path returned by settings path on the selected device",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn execute(command: SettingsCommand) -> Result<CommandOutput, AppError> {
     let open = matches!(command, SettingsCommand::Open);
-    if open && crate::device::is_remote() {
-        return Err(AppError::new("settings_remote_open", "Open the path returned by settings path on the selected device"));
-    }
+    remote_preflight(&command, crate::device::is_remote())?;
     let (name, operation) = match command {
         SettingsCommand::Get { key } => ("settings.get", Operation::Get { key }),
         SettingsCommand::Set { key, value } => ("settings.set", Operation::Set { key, value }),
@@ -57,6 +65,29 @@ pub(super) fn execute(command: SettingsCommand) -> Result<CommandOutput, AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_remote_open_is_refused_by_preflight() {
+        let error = remote_preflight(&SettingsCommand::Open, true).unwrap_err();
+        assert_eq!(error.kind, "settings_remote_open");
+        assert_eq!(
+            error.message,
+            "Open the path returned by settings path on the selected device"
+        );
+        remote_preflight(&SettingsCommand::Open, false).unwrap();
+        for command in [
+            SettingsCommand::Path,
+            SettingsCommand::Get {
+                key: "terminal_font_size".into(),
+            },
+            SettingsCommand::Set {
+                key: "terminal_font_size".into(),
+                value: "15".into(),
+            },
+        ] {
+            remote_preflight(&command, true).unwrap();
+        }
+    }
+
     #[test]
     fn settings_commands_parse_typed_values_and_paths() {
         for arguments in [vec!["cagents", "settings", "get", "terminal_font_size"],

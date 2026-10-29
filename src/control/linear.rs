@@ -417,13 +417,23 @@ fn convert(error: linear::Error) -> AppError {
     }
 }
 fn output(command: &'static str, data: Value) -> CommandOutput {
-    let human = human_output(&data);
+    let human = if matches!(
+        command,
+        "linear.issue" | "linear.comments" | "linear.relations" | "linear.children"
+    ) {
+        // These detail reads contain nested connections or complete free text.
+        // Preserve every requested field and cursor rather than using list rows.
+        serde_json::to_string_pretty(&data).expect("JSON values are serializable")
+    } else {
+        human_output(&data)
+    };
     CommandOutput {
         command,
         data,
         human,
     }
 }
+
 fn human_output(data: &Value) -> String {
     let text = |value: &Value| -> String {
         match value { Value::String(value) => value.clone(), Value::Number(value) => value.to_string(),
@@ -1362,6 +1372,57 @@ fn save_issue(save: Save, mut workspace: Option<String>) -> Result<Value, AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn human_issue_details_preserve_full_connections_and_cursors() {
+        let data = json!({
+            "identifier": "ENG-1",
+            "title": "Example",
+            "comments": {"nodes": [{"body": "Requested full comment"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "comment-next"}},
+            "attachments": {"nodes": [{"url": "https://example.invalid/file"}]},
+            "children": {"nodes": [{"identifier": "ENG-2"}]},
+            "relations": {"nodes": [{"relatedIssue": {"identifier": "ENG-3"}}]},
+            "inverseRelations": {"nodes": [{"issue": {"identifier": "ENG-4"}}]}
+        });
+        let rendered = output("linear.issue", data.clone());
+        assert_eq!(rendered.data, data);
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered.human).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn human_comment_relation_and_child_details_are_lossless() {
+        let comment = "complete comment body ".repeat(20);
+        for (command, data) in [
+            (
+                "linear.comments",
+                json!({"nodes": [{"id": "comment-1", "body": comment}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "next"}}),
+            ),
+            (
+                "linear.relations",
+                json!({"nodes": [{"id": "relation-1", "type": "related",
+                    "issue": {"identifier": "ENG-1"},
+                    "relatedIssue": {"identifier": "ENG-2"}}], "pageInfo": {"hasNextPage": true, "endCursor": "relation-next"}}),
+            ),
+            (
+                "linear.children",
+                json!({"nodes": [{"identifier": "ENG-2",
+                    "description": "The complete child issue description"}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "child-next"}}),
+            ),
+        ] {
+            let rendered = output(command, data.clone());
+            assert_eq!(rendered.data, data);
+            assert_eq!(
+                serde_json::from_str::<Value>(&rendered.human).unwrap(),
+                data
+            );
+        }
+    }
+
     #[test]
     fn dates_validate_calendar() {
         for d in ["2024-02-29", "2026-10-09"] {
