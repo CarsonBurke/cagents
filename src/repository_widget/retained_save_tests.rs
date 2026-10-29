@@ -485,7 +485,10 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
     };
     let euid = unsafe { libc::geteuid() };
     for parent in ["/tmp", "/var/tmp"] {
-        let directory = tempfile::tempdir_in(parent).unwrap();
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .unwrap();
         let private_metadata = std::fs::metadata(directory.path()).unwrap();
         assert_eq!(private_metadata.uid(), euid);
         assert_eq!(private_metadata.mode() & 0o7777, 0o700);
@@ -503,6 +506,7 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
         // this asserts the owned-sticky save contract, not a bootstrap route.
         let sticky_parent = tempfile::Builder::new()
             .prefix(".cagents-save-owned-sticky-parent-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(parent)
             .unwrap();
         let owned_metadata = std::fs::metadata(sticky_parent.path()).unwrap();
