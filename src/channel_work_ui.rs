@@ -320,6 +320,38 @@ pub struct State {
 }
 
 impl State {
+    /// Capture the same row-owned End action used by the loaded view.
+    #[cfg(test)]
+    pub(crate) fn fixture_end_action(&self, target: &Target) -> Option<Action> {
+        let view = self.view.as_ref()?;
+        let entry = view
+            .snapshot
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|entry| &entry.target == target && entry.bucket() == Bucket::Ongoing)?;
+        Some(Action::End(RowOwner {
+            view: view.owner,
+            id: entry.id,
+            target: entry.target.clone(),
+            revision: entry.revision,
+            bucket: entry.bucket(),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_check_action(&self) -> Option<Action> {
+        let owner = self.owner()?;
+        let pending = self.pending_for(owner.home)?;
+        (pending.delivery == Delivery::Unknown)
+            .then_some(Action::Check(owner, pending.mutation.operation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_loaded_snapshot(&self) -> Option<&Snapshot> {
+        self.view.as_ref()?.snapshot.as_ref()
+    }
+
     pub fn is_open(&self) -> bool {
         self.view.is_some()
     }

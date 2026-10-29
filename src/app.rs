@@ -293,6 +293,9 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// Publishing a local project or channel to the shared workspace.
+    SharedProject(ProjectId),
+    SharedChannel(ChannelId, ProjectId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5216,8 +5219,13 @@ pub struct Cagents {
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
+    /// Channel publications already queued for one registry and local owner.
+    workspace_model_publications: HashSet<(uuid::Uuid, ChannelId, ProjectId)>,
+    /// Exact passive reads, so an old failure cannot release a newer path's admission.
+    workspace_model_loads: HashMap<ProjectId, (PathBuf, u64)>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
-    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
+    workspace_model_tx: async_channel::Sender<workspace_model_sync::QueuedEdit>,
+    workspace_model_reopens: workspace_model_sync::ReopenTracking,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
     attention_focus_epoch: u64,
@@ -5608,9 +5616,19 @@ impl Cagents {
         }
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
-            if self.project_ui.is_reopening(&repository) {
+            if self.project_ui.is_reopening(&repository)
+                && !self.workspace_model_reopens.can_retry(&repository)
+            {
                 self.status = Some(TransientNotice::warning(
                     "This project is still opening. Try again when it finishes.",
+                ));
+                return Task::none();
+            }
+            if self.project_ui.removal_attempts.contains_key(&repository)
+                || self.project_ui.removing.contains_key(&repository)
+            {
+                self.status = Some(TransientNotice::warning(
+                    "Wait for this project to finish removal before reopening it.",
                 ));
                 return Task::none();
             }
@@ -5625,12 +5643,34 @@ impl Cagents {
                 ));
                 return Task::none();
             }
+            // Only this new explicit attempt replaces failed/deferred intent;
+            // passive reads retain its protection and never replay its edit.
+            let previous: Vec<_> = self
+                .project_ui
+                .reopening
+                .iter()
+                .filter(|(_, pending)| **pending == repository)
+                .map(|(project, _)| *project)
+                .collect();
+            for project in previous {
+                self.workspace_model_reopens.invalidate(project);
+                self.project_ui.reopening.remove(&project);
+            }
             self.project_ui.closed.remove(&repository);
+            self.workspace_model_reopens.invalidate(project_id);
             self.project_ui.reopening.insert(project_id, repository);
         }
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
+        if open_cards && let Some(repository) = self.project_ui.reopening.get(&project_id) {
+            self.workspace_model_reopens.begin(
+                project_id,
+                repository.clone(),
+                self.workspace_model.identity,
+                Some(generation),
+            );
+        }
         if let Some(previous) = self
             .repository_pr_cancellations
             .insert(project_id, CancellationToken::new())
@@ -12200,6 +12240,7 @@ impl Cagents {
     /// retiring, another client removing a shared pane - so this holds for
     /// all of them in one place, after every update, rather than in each.
     fn resolve_notices_for_closed_cards(&mut self) {
+        self.resolve_workspace_publication_notices();
         let closed = self
             .notices
             .entries
@@ -14158,8 +14199,11 @@ impl Application for Cagents {
             shared_views,
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_publications: HashSet::new(),
+            workspace_model_loads: HashMap::new(),
             workspace_model_rx,
             workspace_model_tx,
+            workspace_model_reopens: workspace_model_sync::ReopenTracking::default(),
             activation_rx,
             notification_ui: notification_ui::State::default(),
             attention_focus_epoch: 0,
@@ -14772,6 +14816,20 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                // Passive adoption names a canonical shared repository, not
+                // an arbitrary directory from which Git may find an ancestor.
+                // Explicit opens have no pending shared-model admission.
+                let result = result.and_then(|loaded| {
+                    if self.workspace_model_loads.get(&project_id).is_some_and(
+                        |(repository, expected)| {
+                            *expected == generation && repository != &loaded.project.repository
+                        },
+                    ) {
+                        Err("Shared project discovery resolved to a different repository.".into())
+                    } else {
+                        Ok(loaded)
+                    }
+                });
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -14783,6 +14841,7 @@ impl Application for Cagents {
                 match result {
                     Ok(loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
+                            self.finish_workspace_model_load(project_id, generation, true);
                             self.repository_generations.remove(&project_id);
                             return Task::none();
                         }
@@ -14912,10 +14971,12 @@ impl Application for Cagents {
                                 if let Some(repository) =
                                     self.project_ui.reopening.remove(&project_id)
                                 {
+                                    self.workspace_model_reopens.remap(project_id, existing_id);
                                     self.project_ui.reopening.insert(existing_id, repository);
                                     self.publish_project_opened(existing_id);
                                 }
                             }
+                            self.finish_workspace_model_load(project_id, generation, false);
                             return task;
                         }
                         if let Some(session) = &self.session {
@@ -15092,6 +15153,7 @@ impl Application for Cagents {
                         // Every window shares which projects exist, and a
                         // channel the shared model named in this repository
                         // could not be adopted until the project existed here.
+                        self.finish_workspace_model_load(project_id, generation, false);
                         self.publish_project_opened(project_id);
                         task = Task::batch([
                             task,
@@ -15102,7 +15164,9 @@ impl Application for Cagents {
                         ]);
                     }
                     Err(error) => {
-                        self.project_ui.reopening.remove(&project_id);
+                        if open_cards {
+                            self.inventory_failed_reopen(project_id);
+                        }
                         let unavailable = GitHubAvailability::Failed {
                             detail: error.clone(),
                         };
@@ -15119,6 +15183,7 @@ impl Application for Cagents {
                         self.status = Some(TransientNotice::error(error.clone()));
                         finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                         task = self.apply_closed_project_tombstones();
+                        self.finish_workspace_model_load(project_id, generation, true);
                     }
                 }
                 task
@@ -15666,13 +15731,17 @@ impl Application for Cagents {
                     }
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
-                        if targets.is_empty() {
+                        let shared = self.retry_unrepresented_shared_projects();
+                        if targets.is_empty() && shared.is_none() {
                             return cosmic::task::message(Message::OpenRepository);
                         }
-                        self.sidebar_model.data_state = SidebarDataState::Loading;
-                        Task::batch(targets.into_iter().map(|(repository, id)| {
+                        if !targets.is_empty() {
+                            self.sidebar_model.data_state = SidebarDataState::Loading;
+                        }
+                        let existing = targets.into_iter().map(|(repository, id)| {
                             self.repository_load_task(repository, Some(id), false)
-                        }))
+                        }).collect::<Vec<_>>();
+                        Task::batch(existing.into_iter().chain(shared))
                     }
                     SidebarAction::RefreshProject {
                         project_id,
@@ -29021,10 +29090,13 @@ mod tests {
             shared_views: shared_views::State::default(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_publications: HashSet::new(),
+            workspace_model_loads: HashMap::new(),
             workspace_model_rx: async_channel::unbounded().1,
             // Unbounded and unread: a fixture publishes into a queue nobody
             // drains, which is what keeps a test off the daemon entirely.
             workspace_model_tx: async_channel::unbounded().0,
+            workspace_model_reopens: workspace_model_sync::ReopenTracking::default(),
             activation_rx: async_channel::unbounded().1,
             notification_ui: notification_ui::State::default(),
             attention_focus_epoch: 0,

@@ -6,6 +6,93 @@ use crate::{
     sidebar::ProjectCommand,
 };
 
+#[cfg(test)]
+mod removal_authority_tests;
+
+/// The caller of a removal, retained through session checks and reconnects.
+struct ProjectRemovalContext {
+    authority: crate::agent_execution::Authority,
+    remote: bool,
+    no_start: bool,
+    expected_registry: Option<uuid::Uuid>,
+}
+
+impl ProjectRemovalContext {
+    fn capture() -> Self {
+        Self {
+            authority: crate::agent_execution::Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
+            expected_registry: None,
+        }
+    }
+
+    fn check_device(&self) -> Result<(), String> {
+        if self.expected_registry == Some(crate::workspace_model::NO_REGISTRY) {
+            return Err(
+                "Wait for the selected device to connect before removing this project.".into(),
+            );
+        }
+        if self.authority.token().is_some() && self.remote {
+            return Err(
+                "An inherited session capability cannot remove projects or worktrees on a remote device"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn existing_socket(&self) -> Result<PathBuf, String> {
+        self.check_device()?;
+        crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())
+    }
+
+    fn final_socket(&self) -> Result<PathBuf, String> {
+        self.check_device()?;
+        if self.authority.token().is_some() || self.no_start {
+            self.existing_socket()
+        } else {
+            crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())
+        }
+    }
+
+    fn connect_at(
+        &self,
+        socket: &Path,
+    ) -> Result<crate::control::ControlClient, crate::control::ControlError> {
+        let mut client = crate::control::ControlClient::connect(socket)?;
+        if self.authority.token().is_some() {
+            client.authenticate(self.authority.clone())?;
+        }
+        Ok(client)
+    }
+
+    fn check_registry(&self, model: &crate::workspace_model::WorkspaceModel) -> Result<(), String> {
+        if self
+            .expected_registry
+            .is_some_and(|expected| model.identity != expected)
+        {
+            return Err(
+                "The selected device's workspace changed. Try removing the project again.".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_registry(&self, client: &mut crate::control::ControlClient) -> Result<(), String> {
+        if self.expected_registry.is_some() {
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            self.check_registry(&model)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AutomaticAttempt {
     project: ProjectId,
@@ -58,6 +145,7 @@ pub struct State {
     remove_dialog: Option<ProjectRemoval>,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
+    pub(super) removal_attempts: HashMap<PathBuf, RemovalAttempt>,
     /// Projects closed by the shared model but still settling their channels.
     pub(super) closing: HashMap<ProjectId, PathBuf>,
     close_started: HashMap<ProjectId, Instant>,
@@ -89,6 +177,21 @@ struct Deletion {
 impl State {
     pub(super) fn is_reopening(&self, repository: &Path) -> bool {
         self.reopening.values().any(|path| path == repository)
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_started_for(&self, project: ProjectId) -> bool {
+        self.close_started.contains_key(&project)
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_in_flight_for(&self, project: ProjectId) -> bool {
+        self.close_in_flight.contains(&project)
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_cancellation_for(&self, project: ProjectId) -> Option<CancellationToken> {
+        self.close_cancellations.get(&project).cloned()
     }
 
     pub fn modal_open(&self) -> bool {
@@ -170,8 +273,24 @@ impl State {
     }
 }
 
+/// Identifies the confirmation that admitted this asynchronous removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalOrigin {
+    nonce: uuid::Uuid,
+    pub(super) registry: uuid::Uuid,
+    pub(super) project: ProjectId,
+    pub(super) repository: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RemovalAttempt {
+    pub(super) origin: RemovalOrigin,
+    reopens: Vec<super::workspace_model_sync::ReopenOrigin>,
+}
+
 #[derive(Debug, Clone)]
 struct ProjectRemoval {
+    registry: uuid::Uuid,
     project: ProjectId,
     repository: PathBuf,
     kind: ProjectKind,
@@ -218,7 +337,7 @@ pub enum Action {
     ConfirmDelete,
     ConfirmRemove,
     RemovedProject {
-        repository: PathBuf,
+        origin: RemovalOrigin,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
     },
     AwaitClosedProject(ProjectId, u64),
@@ -484,8 +603,13 @@ impl Cagents {
         let Some(row) = self.sidebar_model.project(project) else {
             return Some("The project is no longer open.".into());
         };
-        if self.project_ui.removing.contains_key(&row.repository)
-            || self.project_ui.closing.contains_key(&project)
+        if self
+            .project_ui
+            .removal_attempts
+            .contains_key(&row.repository)
+            || self.project_ui.removing.contains_key(&row.repository)
+            || (self.project_ui.closing.contains_key(&project)
+                && !self.project_ui.close_failed.contains(&project))
         {
             return Some("Project removal is already in progress.".into());
         }
@@ -530,6 +654,11 @@ impl Cagents {
         if self.project_ui.is_reopening(repository) {
             return Task::none();
         }
+        // A concurrent explicit open can install a different project ID while
+        // a passive read is still pending. Closing the repository retires both
+        // identities, so that old read cannot adopt a pre-close listing or
+        // release the reservation belonging to a later reopen.
+        self.retire_workspace_model_loads(Some(repository));
         self.project_ui.removing.remove(repository);
         if !self.project_ui.closed.insert(repository.to_path_buf()) {
             return self.complete_closed_projects();
@@ -601,7 +730,101 @@ impl Cagents {
         self.project_ui.removing.remove(repository);
     }
 
+    fn finish_project_removal(&mut self, origin: &RemovalOrigin) -> Option<RemovalAttempt> {
+        if !self
+            .project_ui
+            .removal_attempts
+            .get(&origin.repository)
+            .is_some_and(|attempt| attempt.origin == *origin)
+        {
+            return None;
+        }
+        self.project_ui.removing.remove(&origin.repository);
+        if !self.project_ui.closing.contains_key(&origin.project) {
+            self.project_ui.close_started.remove(&origin.project);
+        }
+        self.project_ui.removal_attempts.remove(&origin.repository)
+    }
+
+    pub(super) fn retire_foreign_project_operations(&mut self, registry: uuid::Uuid) {
+        if registry != self.workspace_model.identity {
+            // Passive discovery belongs to the model which admitted it. Its
+            // queued Git completion cannot introduce projects into a new one.
+            self.retire_workspace_model_loads(None);
+            // These closes were admitted by the previous registry. Even an
+            // already completed helper's queued callback must lose its local
+            // generation before the new registry can adopt the same path.
+            let closing = self
+                .project_ui
+                .closing
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for repository in closing {
+                self.cancel_shared_project_close(&repository);
+            }
+            self.project_ui.closed.clear();
+        }
+        let old = self
+            .project_ui
+            .removal_attempts
+            .values()
+            .filter(|attempt| attempt.origin.registry != registry)
+            .map(|attempt| attempt.origin.clone())
+            .collect::<Vec<_>>();
+        for origin in &old {
+            self.finish_project_removal(origin);
+        }
+        if !old.is_empty() {
+            self.status = Some(TransientNotice::warning(
+                "The workspace connection changed. Try removing the project again.",
+            ));
+        }
+    }
+
+    fn retire_stale_shared_project_close(&mut self, project: ProjectId) -> bool {
+        let Some(repository) = self.project_ui.closing.get(&project).cloned() else {
+            return true;
+        };
+        let still_closed = self.workspace_model.closed_projects.contains(&repository)
+            && self.workspace_model.project(&repository).is_none();
+        let same_owner = self
+            .sidebar_model
+            .project(project)
+            .is_some_and(|row| row.repository == repository);
+        if same_owner && still_closed {
+            return false;
+        }
+        self.cancel_shared_project_close(&repository);
+        if !still_closed {
+            self.project_ui.closed.remove(&repository);
+        }
+        true
+    }
+
+    pub(super) fn retire_stale_shared_project_closes(&mut self) {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return;
+        }
+        let projects = self.project_ui.closing.keys().copied().collect::<Vec<_>>();
+        for project in projects {
+            self.retire_stale_shared_project_close(project);
+        }
+        // A completed local close can also be superseded by a full snapshot
+        // after the observer missed the peer's reopen edge.
+        self.project_ui.closed.retain(|repository| {
+            self.workspace_model.closed_projects.contains(repository)
+                && self.workspace_model.project(repository).is_none()
+        });
+    }
+
     pub(super) fn complete_closed_projects(&mut self) -> Task<Message> {
+        // Reconciliation temporarily takes the model while retiring channels.
+        // Its empty placeholder grants neither close nor reopen authority.
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
+        self.retire_stale_shared_project_closes();
         let ready = self
             .project_ui
             .closing
@@ -612,6 +835,13 @@ impl Cagents {
                     && self.project_review_checkout_blocker(*project).is_none()
                     && !self.project_ui.close_failed.contains(project)
                     && !self.project_ui.close_in_flight.contains(project)
+                    && !self
+                        .project_ui
+                        .closing
+                        .get(project)
+                        .is_some_and(|repository| {
+                            self.project_ui.removal_attempts.contains_key(repository)
+                        })
                     && !self
                         .durable
                         .channels
@@ -653,10 +883,13 @@ impl Cagents {
             self.project_ui
                 .close_cancellations
                 .insert(project, cancellation.clone());
+            let mut context = ProjectRemovalContext::capture();
+            context.expected_registry = Some(self.workspace_model.identity);
             cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
+                    context.check_device()?;
                     let roots = project_session_roots(&repository, kind, roots);
-                    close_sessions_in_scope(&roots, Some(&repository), &project_sessions, Some(&cancellation))
+                    close_sessions_in_scope_with_context(&roots, Some(&repository), &project_sessions, Some(&cancellation), &context)
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -770,6 +1003,11 @@ impl Cagents {
                     if let Some(terminal) = &session.terminal {
                         record(terminal.id);
                     }
+                    if super::channel_ui::may_have_retained_owner(session) {
+                        // An unchanneled worktree pane can retain a provider
+                        // which the daemon's live actor inventory omits.
+                        ownership.retained_chats.push(session.clone());
+                    }
                 }
                 _ => {}
             }
@@ -786,6 +1024,23 @@ impl Cagents {
         // callback. Keep its owner and the committed close pending until it settles.
         if let Some(reason) = self.project_review_checkout_blocker(id) {
             self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
+        if self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(session)
+                    if super::channel_ui::may_have_retained_owner(session)
+                        && closure.ownership.contains(session.id, &session.launch.recipe.working_directory, &closure.scope)
+                        && !closure.ownership.chat_closed(session))
+        }) {
+            // A same-ID replacement can arrive after the worker acknowledged
+            // an older source. That receipt cannot retire the new conversation.
+            self.project_ui.close_in_flight.remove(&id);
+            self.project_ui.close_cancellations.remove(&id);
+            self.project_ui.close_failed.insert(id);
+            self.status = Some(TransientNotice::error(
+                "A project conversation changed before its close was confirmed. Review it and retry removal.",
+            ));
             return Task::none();
         }
         let Some(repository) = self.project_ui.closing.remove(&id) else {
@@ -1037,6 +1292,9 @@ impl Cagents {
                 if self.project_ui.close_generation.get(&project) != Some(&generation) {
                     return Task::none();
                 }
+                if self.retire_stale_shared_project_close(project) {
+                    return Task::none();
+                }
                 self.project_ui.close_in_flight.remove(&project);
                 self.project_ui.close_cancellations.remove(&project);
                 if !self.project_ui.closing.contains_key(&project) {
@@ -1231,7 +1489,12 @@ impl Cagents {
                         let Some(project) = self.sidebar_model.project(project_id) else {
                             return Task::none();
                         };
-                        if self.project_ui.removing.contains_key(&project.repository) {
+                        if self
+                            .project_ui
+                            .removal_attempts
+                            .contains_key(&project.repository)
+                            || self.project_ui.removing.contains_key(&project.repository)
+                        {
                             self.status = Some(TransientNotice::warning(
                                 "Project removal is already in progress.",
                             ));
@@ -1239,6 +1502,7 @@ impl Cagents {
                         }
                         let worktrees = project_worktree_roots(project);
                         self.project_ui.remove_dialog = Some(ProjectRemoval {
+                            registry: self.workspace_model.identity,
                             project: project_id,
                             repository: project.repository.clone(),
                             kind: project.kind,
@@ -1348,6 +1612,33 @@ impl Cagents {
                     ));
                     return self.project_dialog_closed();
                 }
+                if removal.registry == crate::workspace_model::NO_REGISTRY
+                    || removal.registry != self.workspace_model.identity
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "The workspace connection changed. Reconnect and try removing the project again.",
+                    ));
+                    return self.project_dialog_closed();
+                }
+                if self
+                    .project_ui
+                    .removal_attempts
+                    .contains_key(&removal.repository)
+                    || self.project_ui.removing.contains_key(&removal.repository)
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "Project removal is already in progress.",
+                    ));
+                    return self.project_dialog_closed();
+                }
+                if self.project_ui.is_reopening(&removal.repository)
+                    && !self.workspace_model_reopens.can_retry(&removal.repository)
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "Wait for this project to finish opening before removing it.",
+                    ));
+                    return self.project_dialog_closed();
+                }
                 if let Some(reason) = self.project_review_checkout_blocker(removal.project) {
                     self.status = Some(TransientNotice::warning(reason));
                     return self.project_dialog_closed();
@@ -1359,6 +1650,19 @@ impl Cagents {
                     return self.project_dialog_closed();
                 }
                 let repository = removal.repository.clone();
+                let origin = RemovalOrigin {
+                    nonce: uuid::Uuid::new_v4(),
+                    registry: removal.registry,
+                    project: removal.project,
+                    repository: repository.clone(),
+                };
+                self.project_ui.removal_attempts.insert(
+                    repository.clone(),
+                    RemovalAttempt {
+                        origin: origin.clone(),
+                        reopens: self.workspace_model_reopens.for_repository(&repository),
+                    },
+                );
                 removal.project_sessions = self.project_session_ownership(removal.project);
                 self.project_ui.close_failed.remove(&removal.project);
                 self.project_ui
@@ -1368,49 +1672,86 @@ impl Cagents {
                     .removing
                     .insert(repository.clone(), removal.worktrees.clone());
                 let close = cosmic::task::future(async move {
-                    let result =
-                        tokio::task::spawn_blocking(move || remove_project_from_cagents(&removal))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
-                    Message::ProjectUi(Action::RemovedProject { repository, result })
+                    let registry = origin.registry;
+                    let result = tokio::task::spawn_blocking(move || {
+                        remove_project_from_cagents(&removal, registry)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::ProjectUi(Action::RemovedProject { origin, result })
                 });
                 return Task::batch([close, self.project_dialog_closed()]);
             }
-            Action::RemovedProject { repository, result } => match result {
-                Ok(model) => {
-                    if model.sequence <= self.workspace_model.sequence {
-                        return if self.workspace_model.project(&repository).is_none() {
-                            self.close_shared_project(&repository)
-                        } else {
-                            Task::none()
-                        };
-                    }
-                    // The observer is a different client and may deliver this
-                    // edit before or after the command's own answer.
-                    return self.apply_workspace_model_update(
-                        super::workspace_model_sync::ModelUpdate::Edited {
-                            sequence: model.sequence,
-                            edit: crate::workspace_model::ModelEdit::CloseProject { repository },
-                        },
-                    );
+            Action::RemovedProject { origin, result } => {
+                if !self
+                    .project_ui
+                    .removal_attempts
+                    .get(&origin.repository)
+                    .is_some_and(|attempt| attempt.origin == origin)
+                {
+                    return Task::none();
                 }
-                Err(error) => {
-                    self.project_ui.removing.remove(&repository);
-                    if let Some(project) = self
-                        .sidebar_model
-                        .projects
-                        .iter()
-                        .find(|project| project.repository == repository)
-                        .map(|project| project.id)
-                    {
-                        self.project_ui.close_started.remove(&project);
-                    }
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not remove project: {error}"
-                    )));
+                // The callback retains the registry and nonce from confirmation.
+                // A late old-registry answer cannot settle a successor attempt.
+                if origin.registry != self.workspace_model.identity {
+                    self.finish_project_removal(&origin);
+                    return Task::none();
                 }
-            },
+                match result {
+                    Ok(model) => {
+                        if model.identity != origin.registry
+                            || model.project(&origin.repository).is_some()
+                            || !model.closed_projects.contains(&origin.repository)
+                        {
+                            self.finish_project_removal(&origin);
+                            self.status = Some(TransientNotice::warning(
+                                "The workspace changed before removal completed. Try removing the project again.",
+                            ));
+                            return Task::none();
+                        }
+                        let attempt = self
+                            .finish_project_removal(&origin)
+                            .expect("matching removal");
+                        // Failure and passive close never revoke the user's reopen
+                        // protection. Only this admitted removal's successful reply
+                        // may retire the exact intents captured at confirmation.
+                        self.finish_removed_project_reopens(&attempt.reopens);
+                        if model.sequence <= self.workspace_model.sequence {
+                            return if self
+                                .workspace_model
+                                .closed_projects
+                                .contains(&origin.repository)
+                                && self.workspace_model.project(&origin.repository).is_none()
+                            {
+                                self.close_shared_project(&origin.repository)
+                            } else {
+                                Task::none()
+                            };
+                        }
+                        return self.apply_workspace_model_update(
+                            super::workspace_model_sync::ModelUpdate::Edited {
+                                sequence: model.sequence,
+                                edit: crate::workspace_model::ModelEdit::CloseProject {
+                                    repository: origin.repository,
+                                },
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.finish_project_removal(&origin);
+                        if self.project_ui.closing.get(&origin.project) == Some(&origin.repository)
+                        {
+                            // A failed explicit retry does not authorize the
+                            // passive close lane to replay its refused effects.
+                            self.project_ui.close_failed.insert(origin.project);
+                        }
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not remove project: {error}"
+                        )));
+                    }
+                }
+            }
             Action::ConfirmDelete => {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
@@ -1705,7 +2046,11 @@ impl Cagents {
     /// worktree it is in is being deleted.
     pub(super) fn refuse_in_deleting_worktree(&mut self, directory: &Path) -> bool {
         if self.sidebar_model.projects.iter().any(|project| {
-            (self.project_ui.removing.contains_key(&project.repository)
+            (self
+                .project_ui
+                .removal_attempts
+                .contains_key(&project.repository)
+                || self.project_ui.removing.contains_key(&project.repository)
                 || self.project_ui.closing.contains_key(&project.id))
                 && self.project_session_scope(project.id).contains(directory)
         }) {
@@ -1724,7 +2069,11 @@ impl Cagents {
     pub(super) fn refuse_for_deleting_card(&mut self, card: CardId) -> bool {
         if self.card_state(card).is_some_and(|state| {
             self.sidebar_model.projects.iter().any(|project| {
-                (self.project_ui.removing.contains_key(&project.repository)
+                (self
+                    .project_ui
+                    .removal_attempts
+                    .contains_key(&project.repository)
+                    || self.project_ui.removing.contains_key(&project.repository)
                     || self.project_ui.closing.contains_key(&project.id))
                     && self.project_owns_card(
                         project.id,
@@ -2074,11 +2423,27 @@ fn close_sessions_in_scope(
     project_sessions: &ProjectSessionOwnership,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ProjectSessionClosure, String> {
+    close_sessions_in_scope_with_context(
+        worktrees,
+        project,
+        project_sessions,
+        cancellation,
+        &ProjectRemovalContext::capture(),
+    )
+}
+
+fn close_sessions_in_scope_with_context(
+    worktrees: &[PathBuf],
+    project: Option<&Path>,
+    project_sessions: &ProjectSessionOwnership,
+    cancellation: Option<&CancellationToken>,
+    context: &ProjectRemovalContext,
+) -> Result<ProjectSessionClosure, String> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err("Project removal was cancelled.".into());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let socket = context.existing_socket()?;
+    let mut client = match context.connect_at(&socket) {
         Ok(client) => client,
         // No daemon means no sessions to close.
         Err(crate::control::ControlError::Connect(error))
@@ -2087,7 +2452,7 @@ fn close_sessions_in_scope(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            return if project.is_some() {
+            return if project.is_some() || context.authority.token().is_some() {
                 Err("Cannot verify project ownership while the daemon is unavailable.".into())
             } else {
                 Ok(ProjectSessionClosure {
@@ -2110,6 +2475,7 @@ fn close_sessions_in_scope(
         let model = client.read_workspace_model().map_err(|error| {
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
+        context.check_registry(&model)?;
         let scope = shared_project_session_scope(worktrees, project, &model)?;
         let paths = crate::instance::window_database_paths().map_err(|error| {
             format!("Could not locate other windows before closing sessions: {error}")
@@ -2136,6 +2502,7 @@ fn close_sessions_in_scope(
         }
         scope
     } else {
+        context.verify_registry(&mut client)?;
         ProjectSessionScope::new(worktrees.to_vec(), Vec::new())
     };
     for session in client
@@ -2150,9 +2517,11 @@ fn close_sessions_in_scope(
             continue;
         }
         let id = session.id;
-        if let Err(error) = client.close_chat(session) {
-            client = crate::control::ControlClient::connect(&socket)
+        if let Err(error) = client.close_chat(session.clone()) {
+            client = context
+                .connect_at(&socket)
                 .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
+            context.verify_registry(&mut client)?;
             if client
                 .list_chats()
                 .map_err(|list| format!("Could not verify chat {id}: {list}"))?
@@ -2161,7 +2530,34 @@ fn close_sessions_in_scope(
             {
                 return Err(format!("Could not close chat {id}: {error}"));
             }
+            if super::channel_ui::may_have_retained_owner(&session) {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err("Project removal was cancelled.".into());
+                }
+                // A retained provider may survive disappearance from the live
+                // actor inventory. Demand its exact close receipt as well.
+                client
+                    .close_retained_chat(session.clone())
+                    .map_err(|error| format!("Could not confirm retained chat {id}: {error}"))?;
+            }
         }
+        if super::channel_ui::may_have_retained_owner(&session) {
+            project_sessions.record_chat_closed(session);
+        }
+    }
+    for session in project_sessions.retained_chats.clone() {
+        if !project_sessions.contains(session.id, &session.launch.recipe.working_directory, &scope)
+            || project_sessions.chat_closed(&session)
+        {
+            continue;
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Project removal was cancelled.".into());
+        }
+        client
+            .close_retained_chat(session.clone())
+            .map_err(|error| format!("Could not confirm retained chat {}: {error}", session.id))?;
+        project_sessions.record_chat_closed(session);
     }
     // A native chat may retain its source PTY. Close the actor first, then
     // inventory terminals again because that close may have retired the PTY.
@@ -2207,8 +2603,10 @@ fn close_sessions_in_scope(
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
-            client = crate::control::ControlClient::connect(&socket)
+            client = context
+                .connect_at(&socket)
                 .map_err(|reconnect| format!("Could not verify terminal {id}: {reconnect}"))?;
+            context.verify_registry(&mut client)?;
             if client
                 .list()
                 .map_err(|list| format!("Could not verify terminal {id}: {list}"))?
@@ -2253,9 +2651,26 @@ struct ProjectSessionOwnership {
     protected: HashSet<TerminalId>,
     directories: std::collections::HashMap<TerminalId, Vec<PathBuf>>,
     local_database: Option<PathBuf>,
+    /// Exact local owners survive an empty or non-owning daemon inventory.
+    retained_chats: Vec<crate::chat::Session>,
+    /// Only these exact sources received a positive teardown acknowledgement.
+    closed_chats: HashMap<TerminalId, Vec<crate::chat::Session>>,
 }
 
 impl ProjectSessionOwnership {
+    fn chat_closed(&self, session: &crate::chat::Session) -> bool {
+        self.closed_chats
+            .get(&session.id)
+            .is_some_and(|closed| closed.contains(session))
+    }
+
+    fn record_chat_closed(&mut self, session: crate::chat::Session) {
+        self.closed_chats
+            .entry(session.id)
+            .or_default()
+            .push(session);
+    }
+
     fn extend_saved(
         &mut self,
         owners: Vec<(TerminalId, crate::persistence::SavedSessionOwner)>,
@@ -2372,17 +2787,31 @@ fn project_session_roots(
 /// leaves all Git files and worktree directories untouched.
 fn remove_project_from_cagents(
     removal: &ProjectRemoval,
+    expected_registry: uuid::Uuid,
 ) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    let mut context = ProjectRemovalContext::capture();
+    context.expected_registry = Some(expected_registry);
+    remove_project_from_cagents_with_context(removal, &context)
+}
+
+fn remove_project_from_cagents_with_context(
+    removal: &ProjectRemoval,
+    context: &ProjectRemovalContext,
+) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    context.check_device()?;
     let roots = project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone());
-    close_sessions_in_scope(
+    close_sessions_in_scope_with_context(
         &roots,
         Some(&removal.repository),
         &removal.project_sessions,
         None,
+        context,
     )?;
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let socket = context.final_socket()?;
+    let mut client = context
+        .connect_at(&socket)
+        .map_err(|error| error.to_string())?;
+    context.verify_registry(&mut client)?;
     client
         .edit_workspace_model(crate::workspace_model::ModelEdit::CloseProject {
             repository: removal.repository.clone(),
@@ -3044,6 +3473,8 @@ mod tests {
             Some("feature".into()),
         );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.closed_projects.push(repository.clone());
         drop(app.close_shared_project(&repository));
         let generation = app.project_ui.close_generation[&project];
         drop(app.handle_project_action(Action::ProjectSessionsClosed(
@@ -3104,6 +3535,8 @@ mod tests {
             });
             drop(task);
             // Session closure may already have started before checkout acceptance.
+            app.workspace_model.identity = uuid::Uuid::new_v4();
+            app.workspace_model.closed_projects.push(repository.clone());
             drop(app.close_shared_project(&repository));
             let generation = app.project_ui.close_generation[&project];
             let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
@@ -3111,7 +3544,9 @@ mod tests {
             };
             let ticket = pane.review.fixture_existing_checkout_pending();
             let review_generation = pane.review.selection_generation();
+            app.workspace_model.identity = uuid::Uuid::new_v4();
             app.project_ui.remove_dialog = Some(ProjectRemoval {
+                registry: app.workspace_model.identity,
                 project,
                 repository: repository.clone(),
                 kind: Default::default(),
