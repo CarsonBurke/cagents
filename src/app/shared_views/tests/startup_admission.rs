@@ -628,6 +628,108 @@ fn managed_quarantine_uses_full_ownership_proof_and_pending_sources() {
 }
 
 #[test]
+fn managed_alias_duplicates_and_pending_resource_swaps_remain_quarantined() {
+    for mode in [
+        "duplicate",
+        "duplicate-update",
+        "duplicate-insert",
+        "resource-swap",
+        "two-issuers",
+    ] {
+        let (mut app, active, hidden, mut canonical, identity) = cached_chat();
+        current_owner(&mut canonical);
+        let alias = CardId::new();
+        let old = canonical.id;
+        app.card_state_mut(old).unwrap().id = alias;
+        app.card_state_mut(alias).unwrap().kind = canonical.kind.clone();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == hidden)
+            .unwrap()
+            .cards = vec![alias];
+        let mut local = canonical.clone();
+        local.id = alias;
+        let mut view = View::empty(hidden);
+        view.panes.push(local.clone());
+        let mut full = model(identity, active, hidden, view);
+        let owner = managed_owner(&canonical, hidden);
+        full.agents.push(owner.clone());
+        if mode.starts_with("duplicate") {
+            full.views[0].panes.push(local.clone());
+        }
+        let mut pending = Vec::new();
+        if mode == "duplicate-update" || mode == "resource-swap" {
+            let mut updated = local.clone();
+            updated.title = "Pending alias title".into();
+            if mode == "resource-swap" {
+                let CardKind::Chat(source) = &mut updated.kind else {
+                    unreachable!()
+                };
+                source.id = TerminalId::new();
+                Arc::make_mut(&mut app.durable)
+                    .quarantined_panes
+                    .insert(alias, local.kind.clone());
+            }
+            pending.push((
+                uuid::Uuid::new_v4(),
+                Scope::Channel(active),
+                Change::Update {
+                    before: local.clone(),
+                    pane: updated,
+                },
+            ));
+        }
+        if mode == "duplicate-insert" {
+            pending.push((
+                uuid::Uuid::new_v4(),
+                Scope::Channel(hidden),
+                Change::Insert {
+                    pane: local.clone(),
+                    before: None,
+                },
+            ));
+        }
+        if mode == "two-issuers" {
+            let mut other = owner;
+            other.id = crate::model::AgentId::new();
+            full.agents.push(other);
+            full.views[1].panes.push(canonical.clone());
+        }
+        let expected = if mode == "two-issuers" {
+            HashSet::from([alias, canonical.id])
+        } else {
+            HashSet::from([alias])
+        };
+        assert_eq!(
+            quarantined_managed_panes(&full, &app.durable, &HashSet::new(), &pending),
+            expected,
+            "{mode}"
+        );
+        app.shared_views = State::for_workspace(&app.durable);
+        app.shared_views.pending = pending;
+        app.shared_views
+            .initialized
+            .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+            alias,
+            "Keep duplicate-alias evidence".into(),
+        )]));
+        app.workspace_model = full;
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.quarantined.contains(&alias));
+        assert!(!app.chat_start_pending(alias));
+        assert_eq!(app.card_state(alias).unwrap().kind, local.kind);
+        assert_eq!(
+            app.persistent_workspace().chat_drafts[&alias],
+            "Keep duplicate-alias evidence"
+        );
+        assert!(app.shared_views.pending.is_empty());
+        assert!(app.shared_views.adoptions.is_empty());
+    }
+}
+
+#[test]
 fn exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract() {
     let (mut app, active, hidden, mut canonical, identity) = cached_chat();
     let saved = canonical.clone();
@@ -1217,6 +1319,29 @@ fn a_wrong_proof_alias_is_preserved_instead_of_retired_by_uuid_equality() {
 }
 
 #[test]
+fn unchanged_quarantine_refresh_preserves_the_durable_evidence_allocation() {
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    Arc::make_mut(&mut app.durable)
+        .quarantined_panes
+        .insert(pane.id, pane.kind.clone());
+    app.shared_views = State::for_workspace(&app.durable);
+    let snapshot = model(identity, active, hidden, View::empty(hidden));
+    let original = Arc::clone(&app.durable);
+    app.refresh_managed_pane_quarantine(&snapshot);
+    app.refresh_managed_pane_quarantine(&snapshot);
+    assert!(Arc::ptr_eq(&original, &app.durable));
+    assert_eq!(
+        app.durable.quarantined_panes.get(&pane.id),
+        Some(&pane.kind)
+    );
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+}
+
+#[test]
 fn retained_chat_tombstone_still_records_its_exact_closed_source() {
     let (mut app, active, hidden, pane, identity) = cached_chat();
     let CardKind::Chat(source) = &pane.kind else {
@@ -1244,7 +1369,13 @@ fn retained_chat_tombstone_still_records_its_exact_closed_source() {
     drop(app.reconcile_shared_views());
     assert_eq!(app.shared_views.closed_chats.get(&pane.id), Some(source));
     assert!(
-        app.chat_closed_elsewhere(pane.id),
+        matches!(app.card_state(pane.id).map(|card| &card.kind), Some(CardKind::Chat(current))
+            if chat_ui::closed_draft_source_matches(source, current))
+            && !app
+                .workspace_model
+                .views
+                .iter()
+                .any(|view| view.panes.iter().any(|shared| shared.id == pane.id)),
         "retained visibility cannot suppress authoritative chat retirement bookkeeping"
     );
     assert!(app.card_state(pane.id).unwrap().existence.is_open());
@@ -1440,7 +1571,77 @@ fn persisted_open_quarantine_survives_restart_initialization_and_a_registry_with
 }
 
 #[test]
+fn removing_an_earlier_clean_pane_keeps_quarantine_before_its_healthy_anchor() {
+    for removed_first in [false, true] {
+        let (mut app, active, hidden, mut rejected, identity) = cached_chat();
+        current_owner(&mut rejected);
+        app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+        let (_, _, _, browser) = fixture();
+        let mut healthy = browser.clone();
+        healthy.id = CardId::new();
+        let mut removed = browser;
+        removed.id = CardId::new();
+        if let CardKind::Browser(session) = &mut removed.kind {
+            session.id = crate::model::BrowserId::new();
+        }
+        install_held_pane(&mut app, hidden, &healthy);
+        install_held_pane(&mut app, hidden, &removed);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(hidden);
+        durable.local_only_cards.insert(removed.id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == hidden)
+            .unwrap()
+            .cards = if removed_first {
+            vec![removed.id, rejected.id, healthy.id]
+        } else {
+            vec![rejected.id, removed.id, healthy.id]
+        };
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.shared_views
+            .initialized
+            .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+        let mut view = View::empty(hidden);
+        view.panes = vec![rejected.clone(), healthy.clone()];
+        view.retired.push(removed.id);
+        let mut full = model(identity, active, hidden, view);
+        let mut owner = managed_owner(&rejected, hidden);
+        owner.closed = true;
+        full.agents.push(owner);
+        app.workspace_model = full;
+        for _ in 0..2 {
+            drop(app.reconcile_shared_views());
+            assert!(!app.card_state(removed.id).unwrap().existence.is_open());
+            assert_eq!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|row| row.id == hidden)
+                    .unwrap()
+                    .cards,
+                vec![rejected.id, healthy.id]
+            );
+            assert_eq!(
+                app.workspace.order().collect::<Vec<_>>(),
+                vec![rejected.id, healthy.id]
+            );
+            assert_eq!(app.card_state(rejected.id).unwrap().kind, rejected.kind);
+            assert_eq!(app.card_state(healthy.id).unwrap().kind, healthy.kind);
+        }
+    }
+}
+
+#[test]
 fn quarantined_retained_cards_do_not_duplicate_or_replace_a_retained_editor() {
+    for utility in [false, true] {
+        retained_order_fixture(utility);
+    }
+}
+
+fn retained_order_fixture(include_utility: bool) {
     let (mut app, active, hidden, mut rejected, identity) = cached_chat();
     current_owner(&mut rejected);
     app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
@@ -1479,6 +1680,27 @@ fn quarantined_retained_cards_do_not_duplicate_or_replace_a_retained_editor() {
         .unwrap()
         .cards = vec![rejected.id, editor, healthy.id];
     durable.active_channel = Some(hidden);
+    let mut expected = vec![rejected.id, editor, healthy.id];
+    if include_utility {
+        let utility = CardId::new();
+        durable.cards.push(CardState {
+            id: utility,
+            kind: CardKind::Settings,
+            title: "Settings".into(),
+            generation: durable.generation,
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+        });
+        expected.insert(1, utility);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards = expected.clone();
+    }
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.shared_views = State::for_workspace(&app.durable);
     app.shared_views
@@ -1503,16 +1725,21 @@ fn quarantined_retained_cards_do_not_duplicate_or_replace_a_retained_editor() {
         .iter()
         .find(|channel| channel.id == hidden)
         .unwrap();
+    assert_eq!(channel.cards, expected);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
+    drop(app.reconcile_shared_views());
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    drop(app.reconcile_shared_views());
     assert_eq!(
-        channel.cards.iter().copied().collect::<HashSet<_>>(),
-        HashSet::from([rejected.id, editor, healthy.id])
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards,
+        expected
     );
-    assert_eq!(channel.cards.len(), 3);
-    assert_eq!(
-        app.workspace.order().collect::<HashSet<_>>(),
-        HashSet::from([rejected.id, editor, healthy.id])
-    );
-    assert_eq!(app.workspace.order().count(), 3);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
     assert_eq!(app.card_state(editor).unwrap().kind, editor_kind);
     assert!(app.card_state(editor).unwrap().existence.is_open());
     assert_eq!(app.card_state(editor).unwrap().title, "Retained editor");

@@ -83,6 +83,20 @@ fn quarantined_managed_panes(
                 .or_insert(Some(agent.id));
         }
     }
+    let mut authoritative = HashMap::new();
+    for pane in model.views.iter().flat_map(|view| &view.panes) {
+        authoritative
+            .entry(pane.id)
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(pane));
+    }
+    let local_sources = workspace
+        .cards
+        .iter()
+        .map(|card| (card.id, &card.kind))
+        .collect::<HashMap<_, _>>();
+    let managed_source =
+        |kind: &CardKind| resource(kind).is_some_and(|key| issuers.contains_key(&key));
     let permits = |agent: &crate::agent_execution::Agent, pane: &Pane| {
         // An exact observed terminal end is display evidence only. Preserve
         // that existing exception, including archived automation consoles.
@@ -91,10 +105,24 @@ fn quarantined_managed_panes(
             && display_index.permits_projection(agent, pane)
     };
     let refused = |pane: &Pane| {
+        let issuer = resource(&pane.kind).and_then(|key| issuers.get(&key));
+        if issuer == Some(&None)
+            || (authoritative.get(&pane.id) == Some(&None)
+                && (managed.contains_key(&pane.id) || managed_source(&pane.kind)))
+        {
+            return true;
+        }
         if let Some(owner) = managed.get(&pane.id) {
             return owner.is_none_or(|agent| !permits(agent, pane));
         }
-        if let Some(owner) = resource(&pane.kind).and_then(|key| issuers.get(&key)) {
+        let source = authoritative
+            .get(&pane.id)
+            .and_then(|pane| pane.map(|pane| &pane.kind))
+            .or_else(|| local_sources.get(&pane.id).copied());
+        if source.is_some_and(|source| managed_source(source) && source != &pane.kind) {
+            return true;
+        }
+        if let Some(owner) = issuer {
             let Some(owner) = owner else {
                 return true;
             };
@@ -105,13 +133,6 @@ fn quarantined_managed_panes(
         }
         false
     };
-    let mut authoritative = HashMap::new();
-    for pane in model.views.iter().flat_map(|view| &view.panes) {
-        authoritative
-            .entry(pane.id)
-            .and_modify(|owner| *owner = None)
-            .or_insert(Some(pane));
-    }
     for pane in model.views.iter().flat_map(|view| &view.panes) {
         if refused(pane) {
             rejected.insert(pane.id);
@@ -134,6 +155,14 @@ fn quarantined_managed_panes(
         | Change::InsertIfEmpty { pane }
         | Change::Update { pane, .. } = change
             && refused(pane)
+        {
+            rejected.insert(pane.id);
+            quarantined.insert(pane.id);
+        }
+        if let Change::Update { before, pane } = change
+            && !managed.contains_key(&pane.id)
+            && managed_source(&before.kind)
+            && before.kind != pane.kind
         {
             rejected.insert(pane.id);
             quarantined.insert(pane.id);
@@ -198,6 +227,45 @@ fn quarantined_managed_panes(
 
 const QUARANTINED_PANE_MESSAGE: &str = "This saved agent pane could not be verified and may remain unavailable. Its saved session and drafts are kept. Other panes can reconnect. You can check again or remove this saved pane from this window.";
 
+/// Canonical order is the backbone. Local evidence keeps its relative order
+/// beside the nearest surviving canonical successor (or its last predecessor).
+fn merge_preserved_pane_order(
+    current: &[CardId],
+    canonical: &[CardId],
+    preserved: &HashSet<CardId>,
+) -> Vec<CardId> {
+    let canonical_ids = canonical.iter().copied().collect::<HashSet<_>>();
+    let mut before = HashMap::<CardId, Vec<CardId>>::new();
+    let mut segment = Vec::new();
+    let mut predecessor = None;
+    for id in current {
+        if canonical_ids.contains(id) {
+            if !segment.is_empty() {
+                before.entry(*id).or_default().append(&mut segment);
+            }
+            predecessor = Some(*id);
+        } else if preserved.contains(id) {
+            segment.push(*id);
+        }
+    }
+    let mut visible = Vec::new();
+    if predecessor.is_none() {
+        visible.append(&mut segment);
+    }
+    for id in canonical {
+        if let Some(mut local) = before.remove(id) {
+            visible.append(&mut local);
+        }
+        visible.push(*id);
+        if predecessor == Some(*id) {
+            visible.append(&mut segment);
+        }
+    }
+    let mut seen = HashSet::new();
+    visible.retain(|id| seen.insert(*id));
+    visible
+}
+
 fn shared_resource(kind: &CardKind) -> Option<(u8, uuid::Uuid)> {
     match kind {
         CardKind::Chat(session) => Some((0, session.id.as_uuid())),
@@ -231,6 +299,12 @@ pub(super) struct PaneRecheck {
     pub endpoint: (Option<(String, String)>, Option<std::ffi::OsString>),
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct QuarantineAction {
+    pub nonce: uuid::Uuid,
+    source: CardKind,
+}
+
 #[derive(Default)]
 pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
@@ -260,7 +334,10 @@ pub(super) struct State {
     /// Saved evidence stays durable, but grants no attachment or edit authority.
     pub quarantined: HashSet<CardId>,
     closed_managed: HashSet<CardId>,
+    /// An open local alias has no open canonical destination to adopt into.
+    preserved_aliases: HashSet<CardId>,
     pub rechecking: HashMap<CardId, PaneRecheck>,
+    pub quarantine_actions: HashMap<CardId, QuarantineAction>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
@@ -337,8 +414,42 @@ impl State {
 }
 
 impl Cagents {
+    pub(super) fn pane_is_quarantined(&self, card: CardId) -> bool {
+        self.shared_views.quarantined.contains(&card)
+            || self.durable.quarantined_panes.contains_key(&card)
+    }
+
+    pub(super) fn quarantine_action_allowed(&self, card: CardId) -> bool {
+        !self.workspace_inputs_blocked()
+            && !self.update_prepared
+            && !self.modal_is_open()
+            && self.pane_is_quarantined(card)
+            && self
+                .card_state(card)
+                .is_some_and(|card| card.existence.is_open())
+    }
+
+    pub(super) fn quarantine_copy_allowed(&self, card: CardId, nonce: uuid::Uuid) -> bool {
+        self.quarantine_action_allowed(card)
+            && self
+                .shared_views
+                .quarantine_actions
+                .get(&card)
+                .is_some_and(|action| {
+                    action.nonce == nonce
+                        && self
+                            .card_state(card)
+                            .is_some_and(|card| card.kind == action.source)
+                })
+    }
+
     pub(super) fn quarantined_pane_view(&self, card: CardId) -> Element<'_, Message> {
         let checking = self.shared_views.rechecking.contains_key(&card);
+        let action = self
+            .shared_views
+            .quarantine_actions
+            .get(&card)
+            .map(|action| action.nonce);
         let draft = self.quarantined_pane_draft(card).unwrap_or("");
         let preview_end = draft
             .char_indices()
@@ -352,11 +463,17 @@ impl Cagents {
                 "Check session again"
             })
             .id(card_control_id(card, "quarantine.check"))
-            .on_press_maybe((!checking).then_some(Message::RecheckQuarantinedPane(card)))
+            .on_press_maybe(
+                (!checking && action.is_some()).then_some(Message::RecheckQuarantinedPane(card)),
+            )
             .into(),
             crate::ui_controls::button::secondary("Copy saved draft")
                 .id(card_control_id(card, "quarantine.copy"))
-                .on_press_maybe((!draft.is_empty()).then_some(Message::CopyQuarantinedDraft(card)))
+                .on_press_maybe(
+                    action
+                        .filter(|_| !draft.is_empty())
+                        .map(|nonce| Message::CopyQuarantinedDraft(card, nonce)),
+                )
                 .into(),
             crate::ui_controls::button::secondary("Remove saved pane")
                 .id(card_control_id(card, "quarantine.remove"))
@@ -367,14 +484,9 @@ impl Cagents {
         let mut content = vec![
             design::title("Saved pane unavailable").into(),
             design::body(QUARANTINED_PANE_MESSAGE).into(),
-            controls.into(),
+            crate::ui_controls::owned((card, action), controls).into(),
         ];
-        if matches!(
-            self.card_state(card).map(|card| &card.kind),
-            Some(CardKind::Terminal(_))
-        ) {
-            content.push(design::caption("Removed saved terminals cannot be reopened here. Copy any saved draft or attachment locations before removing this pane.").into());
-        }
+        content.push(design::caption("Removed unverified panes cannot be reopened here. Copy any saved draft or attachment locations before removing this pane.").into());
         if !draft.is_empty() {
             content.push(design::heading("Saved draft").into());
             content.push(
@@ -390,10 +502,16 @@ impl Cagents {
         if attachments > 0 {
             content.push(design::caption(format!("{attachments} saved attachments are kept. Copy their saved file locations to find them on the device where they were added.")).into());
             content.push(
-                crate::ui_controls::button::secondary("Copy saved attachment locations")
-                    .id(card_control_id(card, "quarantine.attachments"))
-                    .on_press(Message::CopyQuarantinedAttachmentPaths(card))
-                    .into(),
+                crate::ui_controls::owned(
+                    (card, action, "attachments"),
+                    crate::ui_controls::button::secondary("Copy saved attachment locations")
+                        .id(card_control_id(card, "quarantine.attachments"))
+                        .on_press_maybe(
+                            action
+                                .map(|nonce| Message::CopyQuarantinedAttachmentPaths(card, nonce)),
+                        ),
+                )
+                .into(),
             );
         }
         widget::scrollable(
@@ -409,8 +527,7 @@ impl Cagents {
         .into()
     }
     pub(super) fn recheck_quarantined_pane(&mut self, card: CardId) -> Task<Message> {
-        if !self.shared_views.quarantined.contains(&card)
-            || self.shared_views.rechecking.contains_key(&card)
+        if !self.quarantine_action_allowed(card) || self.shared_views.rechecking.contains_key(&card)
         {
             return Task::none();
         }
@@ -505,6 +622,7 @@ impl Cagents {
         durable.worktree_focus.retain(|_, id| *id != card);
         self.worktree_focus.retain(|_, id| *id != card);
         self.shared_views.rechecking.remove(&card);
+        self.shared_views.quarantine_actions.remove(&card);
         self.persist();
         self.status = Some(TransientNotice::success(
             "Saved pane removed from this window. Its saved session and drafts remain stored.",
@@ -534,8 +652,21 @@ impl Cagents {
             .copied()
             .collect::<Vec<_>>();
         self.shared_views.quarantined = next;
-        let mut evidence = self.durable.quarantined_panes.clone();
-        evidence.retain(|id, _| self.shared_views.quarantined.contains(id));
+        let removed_evidence = self
+            .durable
+            .quarantined_panes
+            .keys()
+            .filter(|id| !self.shared_views.quarantined.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let mut missing_evidence = self
+            .shared_views
+            .quarantined
+            .iter()
+            .filter(|id| !self.durable.quarantined_panes.contains_key(id))
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut added_evidence = Vec::new();
         for (id, kind) in self
             .durable
             .cards
@@ -548,12 +679,16 @@ impl Cagents {
                     .flat_map(|view| view.panes.iter().map(|pane| (pane.id, &pane.kind))),
             )
         {
-            if self.shared_views.quarantined.contains(&id) {
-                evidence.entry(id).or_insert_with(|| kind.clone());
+            if missing_evidence.remove(&id) {
+                added_evidence.push((id, kind.clone()));
             }
         }
-        if evidence != self.durable.quarantined_panes {
-            Arc::make_mut(&mut self.durable).quarantined_panes = evidence;
+        if !removed_evidence.is_empty() || !added_evidence.is_empty() {
+            let evidence = &mut Arc::make_mut(&mut self.durable).quarantined_panes;
+            for id in removed_evidence {
+                evidence.remove(&id);
+            }
+            evidence.extend(added_evidence);
         }
         let managed = model
             .agents
@@ -581,6 +716,7 @@ impl Cagents {
         }
         for id in released {
             self.shared_views.rechecking.remove(&id);
+            self.shared_views.quarantine_actions.remove(&id);
             // Re-enter ordinary admission; a stale failure cannot strand an
             // exact owner after fresh, complete authoritative validation.
             self.cards.remove(&id);
@@ -610,7 +746,25 @@ impl Cagents {
     }
 
     pub(super) fn present_quarantined_pane(&mut self, id: CardId) {
-        self.quarantine_shared_chat(id);
+        let payload_replaced = self.quarantine_shared_chat(id);
+        let changed = payload_replaced
+            || self
+                .shared_views
+                .quarantine_actions
+                .get(&id)
+                .is_none_or(|action| {
+                    self.card_state(id)
+                        .is_none_or(|card| card.kind != action.source)
+                });
+        if changed && let Some(source) = self.card_state(id).map(|card| card.kind.clone()) {
+            self.shared_views.quarantine_actions.insert(
+                id,
+                QuarantineAction {
+                    nonce: uuid::Uuid::new_v4(),
+                    source,
+                },
+            );
+        }
         self.lifecycle.remove(id);
         self.restored_agent_attaches.retain(|card| *card != id);
         if self
@@ -1841,6 +1995,7 @@ impl Cagents {
         adopt: bool,
     ) {
         self.shared_views.blocked.clear();
+        self.shared_views.preserved_aliases.clear();
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -1908,13 +2063,21 @@ impl Cagents {
         let mut adoptions = Vec::new();
         for view in views {
             for shared in &view.panes {
-                if self.shared_views.quarantined.contains(&shared.id)
-                    || self.shared_views.closed_managed.contains(&shared.id)
-                {
+                if self.shared_views.quarantined.contains(&shared.id) {
                     continue;
                 }
                 let aliases = shared_resource(&shared.kind)
                     .and_then(|resource| aliases_by_resource.get(&resource));
+                if self.shared_views.closed_managed.contains(&shared.id) {
+                    self.shared_views.preserved_aliases.extend(
+                        aliases
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|id| *id != shared.id),
+                    );
+                    continue;
+                }
                 for alias in aliases
                     .into_iter()
                     .flatten()
@@ -2080,22 +2243,13 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        let quarantined_positions = current
-            .iter()
-            .enumerate()
-            .filter_map(|(index, id)| {
-                self.shared_views
-                    .quarantined
-                    .contains(id)
-                    .then_some((index, *id))
-            })
-            .collect::<Vec<_>>();
         let mut retained_upgrades = Vec::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
             }
             if self.shared_views.quarantined.contains(&id)
+                || self.shared_views.preserved_aliases.contains(&id)
                 || (self.shared_views.retained.contains(&id) && !view.retired.contains(&id))
                 || owned.contains(&id)
                 || self
@@ -2320,28 +2474,27 @@ impl Cagents {
             }
         }
         let retained = current
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|id| {
-                !self.shared_views.quarantined.contains(id)
-                    && (self.shared_views.retained.contains(id)
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open())
+                    && (self.shared_views.quarantined.contains(id)
+                        || self.shared_views.preserved_aliases.contains(id)
+                        || self.shared_views.retained.contains(id)
                         || (view.panes.is_empty() && self.chat_is_unused_default(*id))
                         || self
                             .card_state(*id)
                             .is_some_and(|card| card.kind.is_utility()))
             })
-            .collect::<Vec<_>>();
-        let mut visible = view
+            .collect::<HashSet<_>>();
+        let canonical = view
             .panes
             .iter()
             .filter(|pane| !self.shared_views.closed_managed.contains(&pane.id))
             .map(|pane| pane.id)
-            .chain(retained)
             .collect::<Vec<_>>();
-        for (index, id) in quarantined_positions {
-            visible.insert(index.min(visible.len()), id);
-        }
-        let mut seen = HashSet::new();
-        visible.retain(|id| seen.insert(*id));
+        let visible = merge_preserved_pane_order(&current, &canonical, &retained);
         if let Some(index) = index {
             let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
             channel.cards = visible.clone();
@@ -2497,11 +2650,11 @@ impl Cagents {
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
-        let visible = visible.iter().copied().collect::<HashSet<_>>();
+        let visible_ids = visible.iter().copied().collect::<HashSet<_>>();
         let removed = self
             .workspace
             .order()
-            .filter(|id| !visible.contains(id))
+            .filter(|id| !visible_ids.contains(id))
             .collect::<Vec<_>>();
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
@@ -2583,6 +2736,17 @@ impl Cagents {
                         updates.push(update);
                     }
                 }
+            }
+        }
+        // Utility cards have no shared Pane descriptor but participate in the
+        // same preserved ordering. Settling only descriptor indices would move
+        // them to the end of the strip on every projection.
+        for (index, id) in visible.iter().copied().enumerate() {
+            if self.workspace.card(id).is_some()
+                && self.workspace.order().nth(index) != Some(id)
+                && let Ok(update) = self.workspace.reorder(id, index)
+            {
+                updates.push(update);
             }
         }
         if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
@@ -5449,6 +5613,12 @@ mod tests {
 
     #[test]
     fn a_closed_managed_canonical_cannot_retire_an_exact_open_terminal_alias_or_its_draft() {
+        for draft in [false, true] {
+            closed_canonical_alias_fixture(draft);
+        }
+    }
+
+    fn closed_canonical_alias_fixture(has_draft: bool) {
         use crate::agent_execution::{Agent, Origin, Placement, Spec, Surface, Target};
         let (mut app, channel, _, mut canonical) = fixture();
         canonical.kind = moving_terminal_kind();
@@ -5509,10 +5679,12 @@ mod tests {
         owner.cards.push(alias);
         owner.focused = Some(alias);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
-        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
-            alias,
-            "Keep the exact alias draft open".into(),
-        )]));
+        if has_draft {
+            app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+                alias,
+                "Keep the exact alias draft open".into(),
+            )]));
+        }
         drop(app.reconcile_shared_views());
         assert!(app.shared_views.closed_managed.contains(&canonical.id));
         assert!(
@@ -5531,11 +5703,49 @@ mod tests {
         let saved = app.persistent_workspace();
         assert_eq!(
             saved.chat_drafts.get(&alias).map(String::as_str),
-            Some("Keep the exact alias draft open")
+            has_draft.then_some("Keep the exact alias draft open")
         );
         assert!(
             !saved.chat_drafts.contains_key(&canonical.id),
             "the draft must not move into closed history"
+        );
+    }
+
+    #[test]
+    fn preserved_pane_order_anchors_to_survivors_after_retirement_and_reordering() {
+        let [removed, quarantined, editor, healthy, other] = std::array::from_fn(|_| CardId::new());
+        for current in [
+            vec![removed, quarantined, healthy],
+            vec![quarantined, removed, healthy],
+        ] {
+            assert_eq!(
+                merge_preserved_pane_order(&current, &[healthy], &HashSet::from([quarantined])),
+                vec![quarantined, healthy]
+            );
+        }
+        assert_eq!(
+            merge_preserved_pane_order(
+                &[quarantined, editor, healthy],
+                &[healthy],
+                &HashSet::from([quarantined, editor])
+            ),
+            vec![quarantined, editor, healthy]
+        );
+        assert_eq!(
+            merge_preserved_pane_order(
+                &[healthy, quarantined, editor],
+                &[other, healthy],
+                &HashSet::from([quarantined, editor])
+            ),
+            vec![other, healthy, quarantined, editor]
+        );
+        assert_eq!(
+            merge_preserved_pane_order(
+                &[removed, quarantined, editor],
+                &[],
+                &HashSet::from([quarantined, editor])
+            ),
+            vec![quarantined, editor]
         );
     }
 

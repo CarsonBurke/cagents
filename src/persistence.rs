@@ -238,6 +238,9 @@ pub struct SavedConversation {
     pub title: String,
     pub session: crate::chat::Session,
     pub open: bool,
+    /// Rejection evidence from the source workspace, including other stored
+    /// workspaces. It never authorizes a new actor or a new pane identity.
+    pub quarantined: bool,
     pub updated_at_unix_ms: i64,
 }
 
@@ -1932,10 +1935,11 @@ impl StateStore {
     }
 
     pub fn saved_conversations(&self) -> Result<Vec<SavedConversation>> {
-        let inner = self.lock_inner()?;
+        let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let mut statement = inner.connection.prepare(
-            "SELECT card_id, title, content_json, existence_json, updated_at_unix_ms
+        let transaction = inner.connection.transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT card_id, title, content_json, existence_json, updated_at_unix_ms, workspace_id
              FROM cards WHERE kind_tag = 'chat'
              ORDER BY updated_at_unix_ms DESC, card_id",
         )?;
@@ -1946,12 +1950,36 @@ impl StateStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut conversations = Vec::new();
+        let mut quarantined = HashMap::<WorkspaceId, HashSet<CardId>>::new();
         for row in rows {
+            let (id, title, content, existence, updated_at_unix_ms, workspace) = row?;
+            let workspace = parse_id("saved conversation workspace", &workspace)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = quarantined.entry(workspace) {
+                let key = format!("workspace:{workspace}:navigation:quarantined_panes");
+                let bytes: Option<u64> = transaction
+                    .query_row(
+                        "SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key=?1",
+                        [&key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if bytes.is_some_and(|bytes| bytes > 4 * 1024 * 1024) {
+                    return Err(StoreError::InvalidState(
+                        "Saved pane admission metadata exceeds the history inspection limit".into(),
+                    ));
+                }
+                let sources: HashMap<CardId, CardKind> = metadata(&transaction, &key)?
+                    .map(|value| from_json("saved pane admission metadata", &value))
+                    .transpose()?
+                    .unwrap_or_default();
+                entry.insert(sources.into_keys().collect());
+            }
             let parsed: Result<Option<SavedConversation>> = (|| {
-                let (id, title, content, existence, updated_at_unix_ms) = row?;
+                let card = parse_id("card", &id)?;
                 let session: crate::chat::Session = from_json("saved conversation", &content)?;
                 if !session.has_valid_native_continuity() {
                     return Err(StoreError::InvalidState(
@@ -1962,10 +1990,11 @@ impl StateStore {
                     return Ok(None);
                 }
                 Ok(Some(SavedConversation {
-                    card: parse_id("card", &id)?,
+                    card,
                     title,
                     session,
                     open: from_json::<Existence>("conversation existence", &existence)?.is_open(),
+                    quarantined: quarantined[&workspace].contains(&card),
                     updated_at_unix_ms,
                 }))
             })();
@@ -2773,6 +2802,7 @@ pub(crate) fn read_open_migration_sessions_with_budget(
             HashMap<CardId, CardKind>,
         ),
     >::new();
+    let mut inspected_boot: Option<Option<String>> = None;
     while let Some(row) = rows.next()? {
         budget.check_deadline()?;
         let existence: String = row.get(3)?;
@@ -2805,9 +2835,48 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         };
         if let Some(rejected) = quarantined.get(&card) {
             if rejected != &session {
-                return Err(StoreError::InvalidState(
-                    "A quarantined saved pane no longer matches its rejected source".into(),
-                ));
+                let restored_boot = if matches!(
+                    &session,
+                    CardKind::Terminal(TerminalSession {
+                        continuity: TerminalContinuity::RelaunchAvailable { .. },
+                        ..
+                    })
+                ) {
+                    if inspected_boot.is_none() {
+                        budget.check_deadline()?;
+                        // This is only a local restore-normalization witness,
+                        // never proof that a hosted actor may be resumed.
+                        let bytes: Option<u64> = transaction
+                            .query_row(
+                                "SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key='last_boot_id'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        let boot = if let Some(bytes @ 1..=128) = bytes {
+                            if bytes > budget.remaining_bytes {
+                                return Err(StoreError::InvalidState(
+                                    "Saved pane inventory exceeds the migration inspection limit"
+                                        .into(),
+                                ));
+                            }
+                            budget.remaining_bytes -= bytes;
+                            metadata(&transaction, "last_boot_id")?
+                        } else {
+                            None
+                        };
+                        budget.check_deadline()?;
+                        inspected_boot = Some(boot);
+                    }
+                    inspected_boot.as_ref().and_then(|boot| boot.as_deref())
+                } else {
+                    None
+                };
+                if !quarantined_migration_source_matches(rejected, &session, restored_boot) {
+                    return Err(StoreError::InvalidState(
+                        "A quarantined saved pane no longer matches its rejected source".into(),
+                    ));
+                }
             }
             // This is saved rejection evidence, not an actor to resolve or
             // resume. Actual live daemon inventory is qualified independently.
@@ -2832,6 +2901,59 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     }
     budget.check_deadline()?;
     Ok(sessions)
+}
+
+/// Restoring a terminal can discard its live continuity claim without changing
+/// the rejected source it preserves. Admit only those deterministic downgrades;
+/// the marker's original proof and every other descriptor field stay exact.
+#[cfg(any(feature = "host", test))]
+fn quarantined_migration_source_matches(
+    rejected: &CardKind,
+    saved: &CardKind,
+    restored_boot: Option<&str>,
+) -> bool {
+    if rejected == saved {
+        return true;
+    }
+    let (CardKind::Terminal(rejected), CardKind::Terminal(saved)) = (rejected, saved) else {
+        return false;
+    };
+    if rejected.id != saved.id
+        || rejected.launch != saved.launch
+        || rejected.transcript_path != saved.transcript_path
+        || rejected.resume_hint != saved.resume_hint
+        || rejected.recovery_origin != saved.recovery_origin
+        || rejected.predecessor != saved.predecessor
+        || rejected.owned_codex_listener != saved.owned_codex_listener
+    {
+        return false;
+    }
+    let Some(proof) = rejected
+        .continuity
+        .live_proof()
+        .filter(HostSessionProof::is_complete)
+    else {
+        return false;
+    };
+    match &saved.continuity {
+        TerminalContinuity::DetachedSameBoot {
+            host_session_id,
+            boot_id,
+            host_incarnation,
+        } => {
+            matches!(&rejected.continuity, TerminalContinuity::Live { .. })
+                && host_session_id == &proof.host_session_id
+                && boot_id == &proof.boot_id
+                && host_incarnation == &proof.host_incarnation
+        }
+        TerminalContinuity::RelaunchAvailable { recipe, last_exit } => {
+            recipe == &rejected.launch
+                && last_exit.is_none()
+                && restored_boot
+                    .is_some_and(|boot| !boot.is_empty() && boot != proof.boot_id.as_str())
+        }
+        _ => false,
+    }
 }
 
 /// Decode the exact row inside an existing read-only inspection transaction.
@@ -7954,6 +8076,368 @@ mod tests {
                     "inspection never rewrites {surface}/{marker} evidence"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata() {
+        for marker in ["exact", "mismatch", "malformed", "oversized", "absent"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("quarantined-history.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut rejected, source) = agent_workspace(crate::agent::Provider::Claude);
+            let id = rejected.cards[0].id;
+            rejected.cards[0].kind = CardKind::Chat(source.clone());
+            rejected.cards[0].existence = Existence::Closed {
+                tombstone: Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("removed unverified pane".into()),
+                },
+            };
+            rejected.focused = None;
+            let mut evidence = source;
+            if marker == "mismatch" {
+                evidence.id = TerminalId::new();
+            }
+            if marker != "absent" {
+                rejected
+                    .quarantined_panes
+                    .insert(id, CardKind::Chat(evidence));
+            }
+            SaveLane::default().save(&store, &rejected).unwrap();
+            let other = WorkspaceState::default();
+            SaveLane::default().save(&store, &other).unwrap();
+            if matches!(marker, "malformed" | "oversized") {
+                let inner = store.lock_inner().unwrap();
+                inner
+                    .connection
+                    .execute(
+                        "UPDATE metadata SET value=?2 WHERE key=?1",
+                        params![
+                            format!("workspace:{}:navigation:quarantined_panes", rejected.id),
+                            if marker == "malformed" {
+                                "{broken".to_owned()
+                            } else {
+                                " ".repeat(4 * 1024 * 1024 + 1)
+                            }
+                        ],
+                    )
+                    .unwrap();
+            }
+            let before = logical_ui_rows(&store.lock_inner().unwrap().connection);
+            let entries = store.saved_conversations();
+            if matches!(marker, "malformed" | "oversized") {
+                assert!(entries.is_err(), "{marker} cannot hide known denial");
+            } else {
+                let entry = entries
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.card == id)
+                    .unwrap();
+                assert_eq!(
+                    entry.quarantined,
+                    marker != "absent",
+                    "even a mismatched source remains rejected"
+                );
+                assert!(!entry.open);
+            }
+            assert_eq!(
+                logical_ui_rows(&store.lock_inner().unwrap().connection),
+                before
+            );
+            assert!(
+                store
+                    .load_workspace(other.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .quarantined_panes
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave() {
+        for mode in [
+            "dirty-same-boot",
+            "clean-same-boot-without-proof",
+            "clean-different-boot",
+            "detached-different-boot",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory
+                .path()
+                .join("quarantined-terminal-restart.sqlite3");
+            let original_boot = boot("quarantined-terminal-original-boot");
+            let mut workspace = workspace_with_terminal(&original_boot);
+            let card = workspace.cards[0].id;
+            let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+                unreachable!()
+            };
+            terminal.recovery_origin = Some(TerminalId::new());
+            terminal.predecessor = Some(TerminalId::new());
+            if mode == "detached-different-boot" {
+                let proof = terminal.continuity.live_proof().unwrap();
+                terminal.continuity = TerminalContinuity::DetachedSameBoot {
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
+                };
+            }
+            let rejected = workspace.cards[0].kind.clone();
+            workspace.quarantined_panes.insert(card, rejected.clone());
+            workspace
+                .chat_drafts
+                .insert(card, "Keep the rejected terminal's draft".into());
+            let mut healthy = workspace.cards[0].clone();
+            healthy.id = CardId::new();
+            let CardKind::Terminal(healthy_terminal) = &mut healthy.kind else {
+                unreachable!()
+            };
+            healthy_terminal.id = TerminalId::new();
+            workspace.cards.push(healthy.clone());
+            {
+                let store = StateStore::open(&path, original_boot.clone()).unwrap();
+                SaveLane::default().save(&store, &workspace).unwrap();
+                if mode != "dirty-same-boot" {
+                    store.shutdown().unwrap();
+                }
+            }
+            let rebooted = mode.ends_with("different-boot");
+            let current_boot = if rebooted {
+                boot("quarantined-terminal-new-boot")
+            } else {
+                original_boot
+            };
+            let store = StateStore::open(&path, current_boot.clone()).unwrap();
+            assert_eq!(store.recovery_report().boot_changed, rebooted, "{mode}");
+            assert_eq!(
+                store.recovery_report().dirty_shutdown,
+                mode == "dirty-same-boot",
+                "{mode}"
+            );
+            let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            assert_eq!(restored.quarantined_panes.get(&card), Some(&rejected));
+            let CardKind::Terminal(restored_terminal) = &restored.cards[0].kind else {
+                unreachable!()
+            };
+            if rebooted {
+                assert!(matches!(
+                    &restored_terminal.continuity,
+                    TerminalContinuity::RelaunchAvailable { recipe, last_exit: None }
+                        if recipe == &restored_terminal.launch
+                ));
+            } else {
+                assert!(matches!(
+                    &restored_terminal.continuity,
+                    TerminalContinuity::DetachedSameBoot { .. }
+                ));
+                let CardKind::Terminal(original) = &rejected else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    restored_terminal.continuity.live_proof(),
+                    original.continuity.live_proof(),
+                    "same-boot downgrade keeps the complete rejected proof"
+                );
+            }
+            assert_ne!(
+                restored.cards[0].kind, rejected,
+                "{mode} exercises a downgrade"
+            );
+            let expected_healthy = restored
+                .cards
+                .iter()
+                .find(|candidate| candidate.id == healthy.id)
+                .unwrap()
+                .kind
+                .clone();
+            let mut lane = SaveLane {
+                workspace: restored.generation,
+                cards: restored
+                    .cards
+                    .iter()
+                    .map(|card| (card.id, card.generation))
+                    .collect(),
+            };
+            lane.save(&store, &restored).unwrap();
+            store.shutdown().unwrap();
+            drop(store);
+
+            let before = fs::read(&path).unwrap();
+            assert_eq!(
+                read_open_migration_sessions(&path).unwrap(),
+                vec![(healthy.id, expected_healthy)],
+                "{mode}: only unrelated live inventory requires qualification"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let store = StateStore::open(&path, current_boot).unwrap();
+            let loaded = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            assert_eq!(loaded.quarantined_panes.get(&card), Some(&rejected));
+            assert_eq!(loaded.chat_drafts, workspace.chat_drafts);
+            assert!(!loaded.local_only_cards.contains(&card));
+            assert!(
+                loaded
+                    .cards
+                    .iter()
+                    .any(|candidate| { candidate.id == card && candidate.existence.is_open() })
+            );
+        }
+    }
+
+    #[test]
+    fn quarantined_terminal_migration_rejects_changes_beyond_restore_downgrades() {
+        for change in [
+            "id",
+            "launch",
+            "transcript",
+            "resume-hint",
+            "origin",
+            "predecessor",
+            "owned-listener",
+            "host-session",
+            "proof-boot",
+            "incarnation",
+            "incomplete-original-proof",
+            "relaunch-recipe",
+            "relaunch-exit",
+            "relaunch-same-boot",
+            "relaunch-missing-boot",
+            "relaunch-empty-boot",
+            "relaunch-oversized-boot",
+            "detached-to-live",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory
+                .path()
+                .join("quarantine-terminal-mismatch.sqlite3");
+            let original_boot = boot("quarantined-terminal-original-boot");
+            let store = StateStore::open(&path, boot("quarantined-terminal-new-boot")).unwrap();
+            let mut workspace = workspace_with_terminal(&original_boot);
+            let card = workspace.cards[0].id;
+            let CardKind::Terminal(original) = &workspace.cards[0].kind else {
+                unreachable!()
+            };
+            let proof = original.continuity.live_proof().unwrap();
+            let mut rejected = original.clone();
+            let mut saved = original.clone();
+            saved.continuity = TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            };
+            match change {
+                "id" => saved.id = TerminalId::new(),
+                "launch" => saved.launch.arguments.push("--different".into()),
+                "transcript" => saved.transcript_path = Some("/different/transcript".into()),
+                "resume-hint" => saved.resume_hint = Some("different-conversation".into()),
+                "origin" => saved.recovery_origin = Some(TerminalId::new()),
+                "predecessor" => saved.predecessor = Some(TerminalId::new()),
+                "owned-listener" => {
+                    rejected.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                        socket: PathBuf::from("/saved/rejected/control.sock"),
+                        allocator: rejected.continuity.live_proof().unwrap(),
+                    });
+                }
+                "host-session" => {
+                    let TerminalContinuity::DetachedSameBoot {
+                        host_session_id, ..
+                    } = &mut saved.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *host_session_id = "different-host-session".into();
+                }
+                "proof-boot" => {
+                    let TerminalContinuity::DetachedSameBoot { boot_id, .. } =
+                        &mut saved.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *boot_id = boot("different-proof-boot");
+                }
+                "incarnation" => {
+                    let TerminalContinuity::DetachedSameBoot {
+                        host_incarnation, ..
+                    } = &mut saved.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *host_incarnation = "different-incarnation".into();
+                }
+                "incomplete-original-proof" => {
+                    let TerminalContinuity::Live {
+                        host_incarnation, ..
+                    } = &mut rejected.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *host_incarnation = "".into();
+                    let TerminalContinuity::DetachedSameBoot {
+                        host_incarnation, ..
+                    } = &mut saved.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *host_incarnation = "".into();
+                }
+                "detached-to-live" => {
+                    rejected.continuity = saved.continuity.clone();
+                    saved.continuity = original.continuity.clone();
+                }
+                _ => {
+                    let mut recipe = saved.launch.clone();
+                    if change == "relaunch-recipe" {
+                        recipe.arguments.push("--different".into());
+                    }
+                    saved.continuity = TerminalContinuity::RelaunchAvailable {
+                        recipe,
+                        last_exit: (change == "relaunch-exit").then_some(
+                            crate::model::TerminalExit {
+                                code: Some(0),
+                                signal: None,
+                                occurred_at_unix_ms: 1,
+                            },
+                        ),
+                    };
+                }
+            }
+            workspace
+                .quarantined_panes
+                .insert(card, CardKind::Terminal(rejected.clone()));
+            workspace.cards[0].kind = CardKind::Terminal(saved);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            if change.starts_with("relaunch-") && change.ends_with("-boot") {
+                let inner = store.lock_inner().unwrap();
+                if change == "relaunch-missing-boot" {
+                    inner
+                        .connection
+                        .execute("DELETE FROM metadata WHERE key='last_boot_id'", [])
+                        .unwrap();
+                } else {
+                    let witness = match change {
+                        "relaunch-same-boot" => original_boot.as_str().to_owned(),
+                        "relaunch-empty-boot" => String::new(),
+                        "relaunch-oversized-boot" => "x".repeat(129),
+                        _ => unreachable!(),
+                    };
+                    inner
+                        .connection
+                        .execute(
+                            "UPDATE metadata SET value=?1 WHERE key='last_boot_id'",
+                            [witness],
+                        )
+                        .unwrap();
+                }
+            }
+            drop(store);
+            let before = fs::read(&path).unwrap();
+            assert!(
+                read_open_migration_sessions(&path).is_err(),
+                "{change}: source mismatch cannot become inert migration evidence"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
         }
     }
 

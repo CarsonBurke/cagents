@@ -641,10 +641,7 @@ impl Cagents {
         else {
             return Task::none();
         };
-        if cards
-            .iter()
-            .any(|card| self.shared_views.quarantined.contains(card))
-        {
+        if cards.iter().any(|card| self.pane_is_quarantined(*card)) {
             self.status = Some(TransientNotice::warning(
                 "Remove the unverified saved panes from this channel before deleting it. Their saved sessions and drafts will remain stored.",
             ));
@@ -789,6 +786,7 @@ impl Cagents {
                 _ => false,
             };
             !self.pane_transfer_pending(*card)
+                && !self.pane_is_quarantined(*card)
                 && !self
                     .durable
                     .channels
@@ -840,12 +838,12 @@ impl Cagents {
                 freed_utility = true;
                 continue;
             }
-            if passive
-                && (self.shared_views.quarantined.contains(&card)
-                    || self.shared_chat_has_local_work(card)
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+            if self.pane_is_quarantined(card)
+                || (passive
+                    && (self.shared_chat_has_local_work(card)
+                        || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())))
             {
-                if !self.shared_views.quarantined.contains(&card) {
+                if !self.pane_is_quarantined(card) {
                     self.retain_local_pane(card);
                 }
                 let scope = self
@@ -1965,6 +1963,50 @@ mod tests {
     /// A channel's conversations are reachable nowhere else, so deleting one
     /// has to take them with it, say so first, and leave the workspace on a
     /// scope that still exists.
+    #[test]
+    fn quarantine_arriving_during_channel_close_preserves_source_and_payload_on_success() {
+        let (mut app, channel, _, card) = channel_with_a_conversation();
+        let source = app.card_state(card).unwrap().kind.clone();
+        let image = crate::chat::Attachment {
+            path: "/saved/channel-close.png".into(),
+            reference: Some(crate::chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 1,
+                device: uuid::Uuid::new_v4(),
+                name: "channel-close.png".into(),
+                sha256: "0".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::from([(card, "Keep the racing channel draft".into())]),
+            HashMap::from([(card, vec![image.clone()])]),
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.delete_channel(channel));
+        let operation = app.channel_ui.close_operation(channel);
+        while rx.try_recv().is_ok() {}
+        app.shared_views.quarantined.insert(card);
+        Arc::make_mut(&mut app.durable)
+            .quarantined_panes
+            .insert(card, source.clone());
+        app.present_quarantined_pane(card);
+        let denied = app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(())));
+        assert!(iced::runtime::task::into_stream(denied).is_none());
+        assert!(app.durable.channels.iter().any(|row| row.id == channel));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.card_state(card).unwrap().kind, source);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&card], "Keep the racing channel draft");
+        assert_eq!(saved.chat_draft_attachments[&card], vec![image]);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if id == channel))
+        );
+    }
+
     #[test]
     fn deleting_the_active_channel_retires_its_chats_and_lands_on_a_survivor() {
         let (mut app, doomed, survivor, conversation) = channel_with_a_conversation();

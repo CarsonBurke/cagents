@@ -2749,6 +2749,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
+        | Message::RecheckQuarantinedPane(_)
+        | Message::CopyQuarantinedDraft(..)
+        | Message::CopyQuarantinedAttachmentPaths(..)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -4524,8 +4527,8 @@ pub enum Message {
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
     RecheckQuarantinedPane(CardId),
-    CopyQuarantinedDraft(CardId),
-    CopyQuarantinedAttachmentPaths(CardId),
+    CopyQuarantinedDraft(CardId, uuid::Uuid),
+    CopyQuarantinedAttachmentPaths(CardId, uuid::Uuid),
     QuarantinedPaneChecked {
         card: CardId,
         check: shared_views::PaneRecheck,
@@ -6424,6 +6427,9 @@ impl Cagents {
         source: CardState,
         owner: Option<PathBuf>,
     ) -> Task<Message> {
+        if self.refuse_quarantined_pane_recreation(source.id) {
+            return Task::none();
+        }
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
@@ -6553,6 +6559,22 @@ impl Cagents {
             Task::none()
         };
         Task::batch([start, viewport, title])
+    }
+
+    fn refuse_quarantined_pane_recreation(&mut self, card: CardId) -> bool {
+        if !self.pane_is_quarantined(card) {
+            return false;
+        }
+        let message = if self
+            .card_state(card)
+            .is_some_and(|card| card.existence.is_open())
+        {
+            "This saved pane could not be verified. Use Check session again before cloning or reopening it."
+        } else {
+            "This saved pane could not be verified and cannot be reopened here. Its saved data remains stored."
+        };
+        self.status = Some(TransientNotice::warning(message));
+        true
     }
 
     fn pull_request_pane(&self, view: &crate::model::PullRequestView) -> PullRequestPane {
@@ -16824,13 +16846,15 @@ impl Application for Cagents {
             }
             Message::RetryCard(card) => self.retry_card(card),
             Message::RecheckQuarantinedPane(card) => self.recheck_quarantined_pane(card),
-            Message::CopyQuarantinedDraft(card) => {
+            Message::CopyQuarantinedDraft(card, nonce) => {
+                if !self.quarantine_copy_allowed(card, nonce) { return Task::none(); }
                 if let Some(text) = self.quarantined_pane_draft(card).filter(|text| !text.is_empty()).map(str::to_owned) {
+                    chat_ui::invalidate_copy_intent();
                     self.status = Some(TransientNotice::success("Copied saved draft"));
                     iced::clipboard::write(text).map(cosmic::Action::App)
                 } else { Task::none() }
             },
-            Message::CopyQuarantinedAttachmentPaths(card) => self.copy_quarantined_attachment_paths(card),
+            Message::CopyQuarantinedAttachmentPaths(card, nonce) => self.copy_quarantined_attachment_paths(card, nonce),
             Message::QuarantinedPaneChecked { card, check, result } => {
                 if self.shared_views.rechecking.get(&card) != Some(&check) { return Task::none(); }
                 self.shared_views.rechecking.remove(&card);
@@ -26318,6 +26342,75 @@ mod tests {
                     last_exit: None,
                 },
             }),
+        }
+    }
+
+    #[test]
+    fn quarantined_saved_panes_cannot_clone_or_reopen_with_fresh_identity() {
+        for chat in [false, true] {
+            for durable_marker in [false, true] {
+                let mut app = context_inspector_test_app(true);
+                app.context_inspector_open = false;
+                let source_id = app.workspace.focused().unwrap();
+                if chat {
+                    app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(
+                        chat::fresh_session(
+                            crate::agent::Provider::Claude,
+                            TerminalId::new(),
+                            PathBuf::from("/tmp"),
+                            &crate::account::Account::system(crate::agent::Provider::Claude),
+                        )
+                        .unwrap(),
+                    );
+                }
+                let source = app.card_state(source_id).unwrap().clone();
+                if durable_marker {
+                    Arc::make_mut(&mut app.durable)
+                        .quarantined_panes
+                        .insert(source_id, source.kind.clone());
+                } else {
+                    app.shared_views.quarantined.insert(source_id);
+                }
+                let original_ids = app
+                    .durable
+                    .cards
+                    .iter()
+                    .map(|card| card.id)
+                    .collect::<Vec<_>>();
+                let original_strip = app.workspace.order().collect::<Vec<_>>();
+                let original_starts = app.terminal_starts.lock().unwrap().clone();
+                drop(app.clone_focused_pane());
+                drop(app.duplicate_pane_in_scope(source.clone(), None));
+                app.recently_closed
+                    .push((source.clone(), app.active_workspace_destination()));
+                drop(app.run_workspace_command(
+                    workspace_widget::GlobalShortcut::ReopenPane,
+                    keyboard::Modifiers::empty(),
+                ));
+                assert_eq!(
+                    app.durable
+                        .cards
+                        .iter()
+                        .map(|card| card.id)
+                        .collect::<Vec<_>>(),
+                    original_ids
+                );
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), original_strip);
+                assert_eq!(app.workspace.focused(), Some(source_id));
+                assert_eq!(app.card_state(source_id).unwrap().kind, source.kind);
+                assert_eq!(*app.terminal_starts.lock().unwrap(), original_starts);
+                assert!(!app.chat_start_pending(source_id));
+                assert_eq!(
+                    app.recently_closed.len(),
+                    1,
+                    "a refusal retains the saved entry"
+                );
+                assert!(
+                    app.status
+                        .as_ref()
+                        .is_some_and(|notice| { notice.message.contains("Check session again") })
+                );
+            }
         }
     }
 

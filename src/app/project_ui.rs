@@ -249,7 +249,7 @@ impl Cagents {
         let scope = self.project_session_scope(project);
         self.durable.cards.iter().any(|card| {
             card.existence.is_open()
-                && self.shared_views.quarantined.contains(&card.id)
+                && self.pane_is_quarantined(card.id)
                 && self.project_owns_card(project, card, &scope)
         })
     }
@@ -257,7 +257,7 @@ impl Cagents {
     fn worktree_has_quarantined_panes(&self, path: &Path) -> bool {
         self.durable.cards.iter().any(|card| {
             card.existence.is_open()
-                && self.shared_views.quarantined.contains(&card.id)
+                && self.pane_is_quarantined(card.id)
                 && (card_belongs_to(card, path)
                     || self
                         .durable
@@ -808,6 +808,13 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        if self.project_has_quarantined_panes(id) {
+            self.project_ui.close_failed.insert(id);
+            self.status = Some(TransientNotice::warning(
+                "A saved pane could not be verified while this project was closing. Its saved data is kept; review the pane before removing the project.",
+            ));
+            return Task::none();
+        }
         // An accepted checkout can begin after session census but before this
         // callback. Keep its owner and the committed close pending until it settles.
         if let Some(reason) = self.project_review_checkout_blocker(id) {
@@ -1541,6 +1548,7 @@ impl Cagents {
                         .collect::<HashSet<_>>();
                     let ids = capture.cards.iter().filter(|owner| {
                         current.contains(&owner.state.id) && card_belongs_to(&owner.state, &target.path)
+                            && !self.pane_is_quarantined(owner.state.id)
                             // Loaded and dirty buffers remain available for recovery.
                             && !matches!(self.cards.get(&owner.state.id), Some(CardRuntime::Repository(runtime))
                                 if runtime.selected_path().is_some() || runtime.blocks_navigation())
@@ -1570,6 +1578,11 @@ impl Cagents {
                     // so it moves to the repository rather than stay filed
                     // under a row that no longer exists, where no strip would
                     // show it again.
+                    let quarantined = current
+                        .iter()
+                        .copied()
+                        .filter(|id| self.pane_is_quarantined(*id))
+                        .collect::<Vec<_>>();
                     let durable = Arc::make_mut(&mut self.durable);
                     for id in &ids {
                         durable.card_scopes.remove(id);
@@ -1582,6 +1595,10 @@ impl Cagents {
                         {
                             *scope = target.repository.clone();
                         }
+                    }
+                    for id in quarantined {
+                        durable.card_scopes.insert(id, target.repository.clone());
+                        self.worktree_owners.insert(id, target.repository.clone());
                     }
                     let emptied = self.close_emptied_channels(&ids);
                     self.worktree_offsets.remove(&target.path);
@@ -2710,6 +2727,88 @@ mod tests {
                     runtime.editor_text().as_deref(),
                     Some("replacement buffer\n")
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn quarantine_arriving_during_project_or_worktree_close_preserves_saved_payload() {
+        removal_callback_test(|| {
+            for worktree in [false, true] {
+                for filed in [false, true] {
+                    let (mut app, _root, target) = removal_lsp_app();
+                    let mut card = super::super::tests::terminal_card_state();
+                    let id = card.id;
+                    card.kind = CardKind::Chat(
+                        crate::chat::fresh_session(
+                            crate::agent::Provider::Claude,
+                            TerminalId::new(),
+                            target.path.clone(),
+                            &crate::account::Account::system(crate::agent::Provider::Claude),
+                        )
+                        .unwrap(),
+                    );
+                    let source = card.kind.clone();
+                    let image = crate::chat::Attachment {
+                        path: "/saved/project-close.png".into(),
+                        reference: Some(crate::chat::ImageReference {
+                            id: uuid::Uuid::new_v4(),
+                            number: 1,
+                            device: uuid::Uuid::new_v4(),
+                            name: "project-close.png".into(),
+                            sha256: "0".repeat(64),
+                            extension: "png".into(),
+                        }),
+                    };
+                    Arc::make_mut(&mut app.durable).cards.push(card);
+                    if filed {
+                        Arc::make_mut(&mut app.durable)
+                            .card_scopes
+                            .insert(id, target.path.clone());
+                    }
+                    app.chat_ui = chat_ui::State::with_draft_attachments(
+                        HashMap::from([(id, "Keep the racing removal draft".into())]),
+                        HashMap::from([(id, vec![image.clone()])]),
+                    );
+                    let capture = app.capture_worktree_removal(&target);
+                    if !worktree {
+                        drop(app.close_shared_project(&target.repository));
+                    }
+                    app.shared_views.quarantined.insert(id);
+                    Arc::make_mut(&mut app.durable)
+                        .quarantined_panes
+                        .insert(id, source.clone());
+                    app.present_quarantined_pane(id);
+                    if worktree {
+                        drop(app.handle_project_action(Action::Deleted {
+                            target: target.clone(),
+                            capture,
+                            result: Ok(()),
+                        }));
+                        assert_eq!(app.durable.card_scopes.get(&id), Some(&target.repository));
+                        assert_eq!(app.worktree_owners.get(&id), Some(&target.repository));
+                    } else {
+                        let generation = app.project_ui.close_generation[&target.project];
+                        let denied = app.handle_project_action(Action::ProjectSessionsClosed(
+                            target.project,
+                            generation,
+                            Ok(ProjectSessionClosure::for_roots(vec![
+                                target.repository.clone(),
+                                target.path.clone(),
+                            ])),
+                        ));
+                        assert!(iced::runtime::task::into_stream(denied).is_none());
+                        assert!(app.sidebar_model.project(target.project).is_some());
+                    }
+                    assert!(app.card_state(id).unwrap().existence.is_open());
+                    assert_eq!(app.card_state(id).unwrap().kind, source);
+                    assert!(matches!(app.cards.get(&id), Some(CardRuntime::Failed(_))));
+                    let saved = app.persistent_workspace();
+                    assert_eq!(saved.chat_drafts[&id], "Keep the racing removal draft");
+                    assert_eq!(saved.chat_draft_attachments[&id], vec![image]);
+                    assert_eq!(saved.quarantined_panes.get(&id), Some(&source));
+                    assert!(app.terminal_starts.lock().unwrap().is_empty());
+                }
             }
         });
     }
