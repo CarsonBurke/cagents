@@ -555,6 +555,7 @@ pub(super) fn forget_startup(
         .is_some_and(|pending| &pending.source == source && Arc::ptr_eq(&pending.context, context))
     {
         state.native_actor_startups.remove(&source.id);
+        state.inventory_generation += 1;
     }
 }
 
