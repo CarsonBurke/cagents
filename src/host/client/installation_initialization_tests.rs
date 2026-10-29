@@ -313,3 +313,66 @@ fn initialization_original_control_client_and_foreign_versions_never_retarget_st
         assert!(!fixture.root.path().join("unused-homes").exists());
     }
 }
+
+#[test]
+fn initialization_rejects_actual_legacy_coding_config_tag_twenty_before_storage() {
+    for version in [107u16, 133u16] {
+        let fixture = Fixture::new();
+        let (mut stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let host = Arc::clone(&fixture.host);
+        let store = fixture.store.clone();
+        let homes = Homes::at(fixture.root.path().join("unused-homes"));
+        let source = SeedSelection {
+            system: fixture.root.path().join("unused-system"),
+            claude_global: None,
+        };
+        let serving = thread::spawn(move || {
+            with_fixture(store, homes, source, || super::serve(peer, 72, host))
+        });
+        // Exact data-only Postcard layout from the incompatible107/133
+        // branches: DeviceOperation64, CodingConfigCreate20, CreateRequest's
+        // Observation(account, host, physical home, presence, email), network.
+        // Tuples concatenate the same fields without adopting those old DTOs.
+        let legacy = (
+            version,
+            1u64,
+            None::<HostSessionProof>,
+            (
+                64u8,
+                20u8,
+                (
+                    (
+                        "codex/00000000-0000-4000-8000-000000000001",
+                        HostSessionProof {
+                            host_session_id: HostSessionId::new("coding-config-fixture"),
+                            boot_id: BootId::new("fixture-boot"),
+                            host_incarnation: HostIncarnation::new("fixture-incarnation"),
+                        },
+                        (4u64, 9u64),
+                        0u8,
+                        "selected@example.test",
+                    ),
+                    true,
+                ),
+            ),
+        );
+        FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+            .write(&mut stream, &legacy)
+            .unwrap();
+        match FrameCodec::new(MAX_FRAME_BYTES)
+            .read::<ServerEnvelope>(&mut stream)
+            .unwrap()
+        {
+            None => {} // bounded pure payload decoding refused the old shape
+            Some(reply) => assert!(
+                matches!(reply.message, ServerMessage::Error(error) if error.code == ProtocolErrorCode::UnsupportedVersion)
+            ),
+        }
+        serving.join().unwrap();
+        assert!(!fixture.root.path().join("registry").exists());
+        assert!(!fixture.root.path().join("unused-homes").exists());
+    }
+}

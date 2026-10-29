@@ -1,6 +1,71 @@
 //! Identity-only writer. Existing unsafe entries are refused, never repaired.
 use super::*;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+
+fn record_bytes(file: &fs::File) -> io::Result<Vec<u8>> {
+    // Positional reads do not depend on or change the retained descriptor's
+    // cursor. Rechecking the held bytes detects in-place replacement too.
+    let mut bytes = vec![0; (MAX_BYTES + 1) as usize];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let count = file.read_at(&mut bytes[filled..], filled as u64)?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+    if filled as u64 > MAX_BYTES {
+        return Err(io::Error::other("The installation metadata is too large"));
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+fn verify_record_file(path: &Path, file: &fs::File, expected: &[u8], uid: u32) -> io::Result<()> {
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !held.is_file()
+        || !named.is_file()
+        || held.uid() != uid
+        || named.uid() != uid
+        || held.nlink() != 1
+        || named.nlink() != 1
+        || held.mode() & 0o077 != 0
+        || named.mode() & 0o077 != 0
+        || record_stamp(&held) != record_stamp(&named)
+        || record_bytes(file)? != expected
+    {
+        return Err(io::Error::other("The installation metadata changed"));
+    }
+    // Bind the completed positional read to the same safe named entry.
+    let after = fs::symlink_metadata(path)?;
+    let held_after = file.metadata()?;
+    if !after.is_file()
+        || after.uid() != uid
+        || after.nlink() != 1
+        || after.mode() & 0o077 != 0
+        || record_stamp(&held) != record_stamp(&after)
+        || record_stamp(&held) != record_stamp(&held_after)
+    {
+        return Err(io::Error::other("The installation metadata changed"));
+    }
+    Ok(())
+}
+
+fn record_stamp(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64, u32, u64, u32) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.mode(),
+        metadata.nlink(),
+        metadata.uid(),
+    )
+}
 
 impl Store {
     pub(crate) fn try_initialize_installation_id(&self) -> io::Result<Uuid> {
@@ -77,13 +142,9 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let mut registry = if let Some(file) = &existing {
-            let mut bytes = Vec::new();
-            file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_BYTES {
-                return Err(unsafe_entry());
-            }
-            let text = std::str::from_utf8(&bytes).map_err(|_| unsafe_entry())?;
+        let existing_bytes = existing.as_ref().map(record_bytes).transpose()?;
+        let mut registry = if let Some(bytes) = &existing_bytes {
+            let text = std::str::from_utf8(bytes).map_err(|_| unsafe_entry())?;
             let registry: Registry = toml::from_str(text).map_err(|_| unsafe_entry())?;
             registry.validate_preparations()?;
             registry
@@ -96,17 +157,12 @@ impl Store {
         let verify_record = || {
             verify()?;
             match (&existing, fs::symlink_metadata(&path)) {
-                (Some(file), Ok(named)) => {
-                    let held = file.metadata()?;
-                    if !named.is_file()
-                        || named.uid() != uid
-                        || named.nlink() != 1
-                        || named.mode() & 0o077 != 0
-                        || (held.dev(), held.ino()) != (named.dev(), named.ino())
-                    {
-                        return Err(unsafe_entry());
-                    }
-                }
+                (Some(file), Ok(_)) => verify_record_file(
+                    &path,
+                    file,
+                    existing_bytes.as_deref().ok_or_else(unsafe_entry)?,
+                    uid,
+                )?,
                 (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
                 _ => return Err(unsafe_entry()),
             }
@@ -122,6 +178,12 @@ impl Store {
         registry.installation = Some(id);
         registry.version = VERSION;
         registry.revision = registry.revision.checked_add(1).ok_or_else(unsafe_entry)?;
+        let mut expected = toml::to_string_pretty(&registry)
+            .map_err(|_| unsafe_entry())?
+            .into_bytes();
+        if expected.last() != Some(&b'\n') {
+            expected.push(b'\n');
+        }
         write_with_io(
             &self.directory,
             &path,
@@ -132,8 +194,11 @@ impl Store {
             },
             |_| {
                 verify()?;
+                let published = crate::secure_file::open_existing_private_file_readonly(&path)?;
+                verify_record_file(&path, &published, &expected, uid)?;
                 sync(&namespace)?;
-                verify()
+                verify()?;
+                verify_record_file(&path, &published, &expected, uid)
             },
         )?;
         Ok(id)
@@ -381,5 +446,68 @@ mod tests {
             fs::metadata(&store.directory).unwrap().mode() & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn initialization_never_confirms_a_changed_published_or_unchanged_record() {
+        for existing in [false, true] {
+            for fault in ["in-place", "rename", "mode", "hardlink", "remove"] {
+                let root = tempfile::tempdir().unwrap();
+                let store = Store::at(root.path().join("registry"));
+                if existing {
+                    store.try_initialize_installation_id().unwrap();
+                }
+                let changed = Uuid::from_u128(801);
+                let changed_bytes = format!("version=6\ninstallation='{changed}'\n").into_bytes();
+                let path = store.path();
+                let mut expected = Vec::new();
+                let result = store.initialize_installation_with_io(
+                    || Ok(()),
+                    |namespace| {
+                        match fault {
+                            "in-place" => fs::write(&path, &changed_bytes)?,
+                            "rename" => {
+                                let replacement = store.directory.join("replacement");
+                                fs::write(&replacement, &changed_bytes)?;
+                                fs::set_permissions(
+                                    &replacement,
+                                    fs::Permissions::from_mode(0o600),
+                                )?;
+                                fs::rename(replacement, &path)?;
+                            }
+                            "mode" => {
+                                fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?
+                            }
+                            "hardlink" => fs::hard_link(&path, root.path().join("alias"))?,
+                            "remove" => fs::remove_file(&path)?,
+                            _ => unreachable!(),
+                        }
+                        expected = fs::read(&path).unwrap_or_default();
+                        namespace.sync()
+                    },
+                );
+                assert!(
+                    result.is_err(),
+                    "existing={existing}/{fault} must not confirm"
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap_or_default(),
+                    expected,
+                    "no repair or replacement"
+                );
+                if matches!(fault, "in-place" | "rename") {
+                    assert_eq!(expected, changed_bytes);
+                }
+                if fault == "mode" {
+                    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+                }
+                if fault == "hardlink" {
+                    assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
+                }
+                if fault == "remove" {
+                    assert!(!path.exists());
+                }
+            }
+        }
     }
 }

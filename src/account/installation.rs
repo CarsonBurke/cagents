@@ -35,7 +35,8 @@ impl InitializationReply {
     /// Callers also require the original wire proof/version/correlation and
     /// dedicated reply kind. A mismatch never settles the request owner.
     pub fn matches(&self, request: InitializationRequest) -> bool {
-        self.request_id == request.request_id
+        !request.request_id.is_nil()
+            && self.request_id == request.request_id
             && !matches!(self.outcome, InitializationOutcome::Confirmed { installation_id } if request.request_id.is_nil() || installation_id.is_nil())
     }
 }
@@ -113,6 +114,15 @@ mod tests {
                 }
             }
             .matches(request)
+        );
+        assert!(
+            !InitializationReply {
+                request_id: Uuid::nil(),
+                outcome: InitializationOutcome::Unknown
+            }
+            .matches(InitializationRequest {
+                request_id: Uuid::nil()
+            })
         );
     }
 
