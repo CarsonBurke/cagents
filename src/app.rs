@@ -10341,12 +10341,13 @@ impl Cagents {
                             .align_y(Alignment::Center)
                             .spacing(space::S)
                             .into(),
-                            widget::selectable_text(
-                                "This pane's saved session doesn't match what its agent now reports, so cagents keeps it unchanged instead of reconnecting it, and it can't be moved or closed until they match. Other panes in this view are not affected.",
-                            )
-                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                            .width(Length::Fill)
-                            .into(),
+                            widget::selectable_text(shared_views::FENCED_PANE_EXPLANATION)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                                .width(Length::Fill)
+                                .into(),
+                            widget::button::standard("Close here")
+                                .on_press(Message::CloseCard(id))
+                                .into(),
                         ])
                         .spacing(space::L),
                     )

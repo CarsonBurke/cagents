@@ -764,8 +764,8 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
 }
 
 #[test]
-fn fenced_managed_chat_keeps_its_text_and_refuses_every_close_route() {
-    if isolated("fenced_managed_chat_keeps_its_text_and_refuses_every_close_route") {
+fn fenced_managed_chat_keeps_its_text_and_closes_only_here() {
+    if isolated("fenced_managed_chat_keeps_its_text_and_closes_only_here") {
         return;
     }
     use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Target};
@@ -813,29 +813,21 @@ fn fenced_managed_chat_keeps_its_text_and_refuses_every_close_route() {
     assert!(app.chat_awaiting_admission(pane.id));
     let visible = visible_text(&app, pane.id);
     assert!(
-        visible.contains(text) && visible.contains("doesn't match what its agent now reports"),
+        visible.contains(text)
+            && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
+            && visible.contains("Close here"),
         "{visible}"
     );
-    // The tab's close button routes a chat through the chat close.
-    for close in [
-        Message::CloseCard(pane.id),
-        Message::CloseCardUnasked(pane.id),
-    ] {
-        let task = app.update(close);
-        settle(&mut app, task);
-        assert!(app.card_state(pane.id).unwrap().existence.is_open());
-        assert!(app.workspace.order().any(|id| id == pane.id));
-    }
-    assert_eq!(
-        app.persistent_workspace()
-            .chat_drafts
-            .get(&pane.id)
-            .map(String::as_str),
-        Some(text)
-    );
+    // The tab's close button routes a chat through the chat close. A fenced
+    // pane closes here only: its stale session is never asked to close.
+    let task = app.update(Message::CloseCard(pane.id));
+    settle(&mut app, task);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(!app.workspace.order().any(|id| id == pane.id));
+    assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
     assert!(
         daemon.requests().is_empty(),
-        "a fenced pane must not reconnect its stale session"
+        "a fenced pane must not reconnect or close its stale session"
     );
 }
 

@@ -38,6 +38,9 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
 /// Canonical managed panes whose saved descriptor no longer matches the
 /// registry's actor, or whose card is ambiguous. Each one stays inert alone:
 /// it neither projects nor publishes, while its scope's other panes proceed.
+/// What a fenced pane tells its reader, whatever its kind.
+pub(super) const FENCED_PANE_EXPLANATION: &str = "cagents can't confirm that this pane's saved session is the one its agent is running now, so the pane stays as saved and won't reconnect. Other panes in this view work normally. Closing it here leaves your other windows unchanged.";
+
 pub(super) fn quarantined_managed_panes(
     model: &crate::workspace_model::WorkspaceModel,
     views: &[View],
@@ -792,6 +795,12 @@ impl Cagents {
             ));
             return Task::none();
         }
+        if self.shared_views.quarantined.contains(&card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane can't move to another channel until its saved session is confirmed.",
+            ));
+            return Task::none();
+        }
         let Some((scope, expected_revision)) = self.pane_channel_transfer(card, channel) else {
             self.status = Some(TransientNotice::warning(
                 "Choose another channel in the pane's project",
@@ -1069,9 +1078,6 @@ impl Cagents {
         }
     }
 
-    /// A transfer can commit before a later metadata edit reaches the daemon.
-    /// Keep that edit over the new owner and give its retry a distinct receipt:
-    /// the original old-scope operation can still acknowledge a harmless no-op.
     /// Fenced cards for the model this client holds now. A snapshot installed
     /// since the last projection may have fenced a pane already, before
     /// reconciliation recomputes the projected set and its local aliases.
@@ -1082,6 +1088,9 @@ impl Cagents {
         fenced
     }
 
+    /// A transfer can commit before a later metadata edit reaches the daemon.
+    /// Keep that edit over the new owner and give its retry a distinct receipt:
+    /// the original old-scope operation can still acknowledge a harmless no-op.
     pub(super) fn retarget_transferred_pane_updates(&mut self, acknowledged: Option<CardId>) {
         let moving: HashSet<_> = self
             .shared_views
@@ -1942,6 +1951,10 @@ impl Cagents {
 
     /// Passive removal detaches surfaces; it never calls a host close request.
     fn detach_shared_pane(&mut self, id: CardId) {
+        self.detach_shared_pane_as(id, "pane closed in another client");
+    }
+
+    pub(super) fn detach_shared_pane_as(&mut self, id: CardId, reason: &str) {
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
             .pending_terminal_creations
@@ -1964,7 +1977,7 @@ impl Cagents {
             }
         }
         if let Some(card) = self.card_state_mut(id) {
-            card.existence = super::project_ui::removed_existence("pane closed in another client");
+            card.existence = super::project_ui::removed_existence(reason);
         }
         // The strip handed this pane's focus to a neighbour above, with no
         // viewport update to tell the saved state.

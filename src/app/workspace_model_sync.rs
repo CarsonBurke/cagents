@@ -3041,7 +3041,7 @@ mod tests {
             );
 
             // Repeated snapshots, evidence matching only in part, and local
-            // edits publish nothing for it. Close is refused, not lost.
+            // edits publish nothing for it.
             model.agents[0].session = Some(HostedSession::Terminal(partial.clone()));
             model.agents[0].console = Some(partial.clone());
             for _ in 0..2 {
@@ -3051,17 +3051,23 @@ mod tests {
             }
             app.card_state_mut(managed).unwrap().width_fraction = 0.9;
             app.publish_view_changes();
-            // The tab's close button routes a chat through its own close.
-            for close in [
-                Message::CloseCard(managed),
-                Message::CloseCardUnasked(managed),
-            ] {
-                drop(app.update(close));
-                assert!(app.card_state(managed).unwrap().existence.is_open());
-            }
-            drop(app.begin_chat_close(managed));
-            assert!(app.card_state(managed).unwrap().existence.is_open());
-            assert!(app.workspace.order().any(|id| id == managed));
+            // Deleting its channel would ask the daemon to close only the
+            // sibling's session, never the fenced pane's unconfirmed one.
+            assert_eq!(
+                app.channel_sessions_to_close(&[sibling, managed]),
+                vec![app.card_state(sibling).unwrap().kind.clone()]
+            );
+            // Closing it here asks nothing of its agent and shares nothing;
+            // it stays closed here while its session is unconfirmed.
+            drop(app.update(Message::CloseCard(managed)));
+            assert!(!app.card_state(managed).unwrap().existence.is_open());
+            assert!(!app.workspace.order().any(|id| id == managed));
+            assert!(app.card_state(sibling).unwrap().existence.is_open());
+            model.sequence += 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            assert!(app.shared_views.quarantined.contains(&managed));
+            assert!(!app.card_state(managed).unwrap().existence.is_open());
+            app.publish_view_changes();
             let edits = drain(&published);
             assert!(
                 !edits
@@ -3072,14 +3078,19 @@ mod tests {
                 ModelEdit::ChangeView { change, .. } if change_mentions(change, managed))));
 
             // Matching registry evidence ends the fence; the canonical
-            // descriptor then projects normally.
+            // descriptor then reopens here, and the close made while fenced
+            // never becomes a shared removal.
             agent.session = Some(HostedSession::Terminal(current.clone()));
             agent.console = Some(current.clone());
             model.agents = vec![agent.clone()];
             model.sequence += 1;
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            app.publish_view_changes();
             assert!(app.shared_views.quarantined.is_empty());
+            assert!(!drain(&published).iter().any(|edit| matches!(edit,
+                ModelEdit::ChangeView { change, .. } if change_mentions(change, managed))));
             let card = app.card_state(managed).unwrap();
+            assert!(card.existence.is_open());
             assert_eq!(card.kind, canonical.kind);
             assert_eq!(card.title, canonical.title);
             assert_eq!(
