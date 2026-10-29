@@ -3087,16 +3087,17 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
+            // The adapter owns request lifetimes. A parent's terminal outcome
+            // does not expire a surviving child's decision or optional question.
+            // Only its scoped RequestResolved events remove those controls.
             match outcome {
                 Kind::Cancelled => {
-                    state.requests.clear();
                     state.waiting = false;
                     state.busy = false;
                     let all = state.capabilities.interrupt_stops_background;
                     finish_snapshot_work(state, ToolStatus::Stopped, all);
                 }
                 Kind::Failed => {
-                    state.requests.clear();
                     state.waiting = false;
                     state.busy = false;
                     finish_snapshot_work(state, ToolStatus::Failed, false);
@@ -4070,6 +4071,14 @@ mod tests {
                 &mut state,
                 &mut indices,
                 Event::TurnFinished { key: None, outcome },
+            );
+            assert_eq!(state.requests.len(), 1, "the adapter owns decision expiry");
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::RequestResolved {
+                    id: "pending".into(),
+                },
             );
             assert!(state.requests.is_empty());
             assert!(!state.waiting);
