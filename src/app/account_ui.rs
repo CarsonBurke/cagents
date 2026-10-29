@@ -2865,18 +2865,17 @@ impl Cagents {
         let provider = state.account.provider;
         let mut learned = None;
         match outcome {
-            // Another window's cached answer can be older than what this
-            // window already shows, and then says nothing new.
+            // A delayed probe or cached answer can predate live figures.
+            // Keep the newer reading unless its future stamp indicates that
+            // the clock was set back, as when accepting live reports.
             Outcome::Answered { snapshot, .. }
-                if snapshot.source == UsageSource::Cache
-                    && state
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|current| snapshot.observed_at < current.observed_at) =>
+                if state.snapshot.as_ref().is_some_and(|current| {
+                    snapshot.observed_at < current.observed_at
+                        && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+                }) =>
             {
                 state.schedule.abandon();
             }
-            // A probe's own answer is always the newest.
             Outcome::Answered {
                 identity, snapshot, ..
             } => {
@@ -6908,6 +6907,175 @@ mod app_tests {
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         assert_eq!(state.identity, None);
         assert!(!state.schedule.in_flight(NOW));
+    }
+
+    #[test]
+    fn a_delayed_probe_cannot_rewind_live_exhaustion_or_readmit_an_alternate() {
+        // A delay longer than clock slack still cannot rewind a reading
+        // stamped in the present; only a future current stamp signals rollback.
+        for (source, delay) in [
+            (UsageSource::Probe, 1_000),
+            (UsageSource::Probe, schedule::CLOCK_SLACK + 1_000),
+            (UsageSource::Cache, 1_000),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 1938);
+            let recipe = recipe_on(&app, &id);
+            let t2 = now_ms();
+            let t1 = t2 - delay;
+            let current = Account::system(Provider::Claude);
+            app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                Some(UsageSnapshot::state(UsageStatus::Limited, "", t2));
+            let key = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .account
+                .registry_key()
+                .unwrap();
+            let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+            identity.plan = Some("current plan".into());
+            let previous = account::claude::parse_usage(
+                &serde_json::json!({
+                    "subscription_type": "current quota plan",
+                    "rate_limits": {"limits": [{"kind": "session", "percent": 20.0}]},
+                }),
+                t1 - 1_000,
+            );
+            let owner = {
+                let state = app.account_ui.account_mut(&id).unwrap();
+                state.identity = Some(identity.clone());
+                state.snapshot = Some(previous.clone());
+                state.schedule.succeed(previous.observed_at);
+                state.schedule.start(Trigger::Focus, t1);
+                state.owner
+            };
+            assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+            let mut delayed = previous;
+            delayed.source = source;
+            delayed.observed_at = t1;
+            let mut old_identity = identity.clone();
+            old_identity.plan = Some("older plan".into());
+            let held = Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: Some(old_identity),
+                    snapshot: delayed,
+                },
+            });
+            let rejection = LiveReport::Claude(
+                account::claude::parse_rate_limit_event(&serde_json::json!({
+                    "status": "rejected",
+                    "unifiedWindows": {"five_hour": {"utilization": 1.0}},
+                }))
+                .unwrap(),
+            );
+            // The real reducers run; returned tasks stay unpolled, so no
+            // provider, daemon or durable account operation is executed.
+            drop(app.account_reported(Provider::Claude, &recipe, vec![(rejection, t2)]));
+            let state = app.account_ui.account(&id).unwrap();
+            let live = state.snapshot.clone().unwrap();
+            assert_eq!(live.status, UsageStatus::Limited);
+            assert_eq!(live.source, UsageSource::Live);
+            assert_eq!(live.observed_at, t2);
+            assert_eq!(state.owner, owner);
+            assert!(state.schedule.in_flight(t2));
+            assert!(app.automatic_account(&current).is_none());
+
+            drop(app.update(held));
+
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref(), Some(&live), "{source:?}");
+            assert_eq!(state.identity.as_ref(), Some(&identity), "{source:?}");
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert!(!state.schedule.in_flight(t2));
+            assert!(!state.schedule.should_probe(
+                Trigger::Tick,
+                t2 + schedule::REFRESH_INTERVAL - 1,
+                true,
+            ));
+            assert!(state.schedule.should_probe(
+                Trigger::Tick,
+                t2 + schedule::REFRESH_INTERVAL,
+                true,
+            ));
+            assert!(app.automatic_account(&current).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn probes_after_live_usage_accept_newer_readings_and_clock_rollback() {
+        for clock_rolled_back in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 1939);
+            let recipe = recipe_on(&app, &id);
+            let now = now_ms();
+            let live_at = if clock_rolled_back {
+                now + 10 * schedule::CLOCK_SLACK
+            } else {
+                now - 1_000
+            };
+            {
+                let state = app.account_ui.account_mut(&id).unwrap();
+                state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", live_at - 1));
+                state.schedule.succeed(live_at - 1);
+                state.schedule.start(Trigger::Focus, now);
+            }
+            let rejection = LiveReport::Claude(
+                account::claude::parse_rate_limit_event(&serde_json::json!({"status": "rejected"}))
+                    .unwrap(),
+            );
+            drop(app.account_reported(Provider::Claude, &recipe, vec![(rejection, live_at)]));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+            assert_eq!(state.snapshot.as_ref().unwrap().observed_at, live_at);
+            let owner = state.owner;
+            let key = state.account.registry_key().unwrap();
+            let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+            identity.plan = Some("fresh probe plan".into());
+            let current = Account::system(Provider::Claude);
+            app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+            app.account_ui.account_mut(&id).unwrap().failure = Some("previous failure".into());
+            let fresh = account::claude::parse_usage(
+                &serde_json::json!({
+                    "rate_limits": {"limits": [{"kind": "session", "percent": 30.0}]},
+                }),
+                now,
+            );
+
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: Some(identity.clone()),
+                    snapshot: fresh.clone(),
+                },
+            })));
+
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref(), Some(&fresh), "{clock_rolled_back}");
+            assert_eq!(state.identity.as_ref(), Some(&identity));
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert!(!state.schedule.in_flight(now));
+            assert_eq!(state.schedule.failures(), 0);
+            assert!(!state.schedule.should_probe(
+                Trigger::Tick,
+                now + schedule::REFRESH_INTERVAL - 1,
+                true,
+            ));
+            assert!(state.schedule.should_probe(
+                Trigger::Tick,
+                now + schedule::REFRESH_INTERVAL,
+                true,
+            ));
+            assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+        }
     }
 
     fn claude_report(used: f64) -> LiveReport {
