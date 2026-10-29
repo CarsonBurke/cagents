@@ -6789,9 +6789,15 @@ impl Cagents {
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         self.release_draft_start_capture(card);
-        // The runtime is about to be dropped, so its unsent text is captured
-        // here rather than lost. `chat_forget` is the single place a chat
-        // runtime stops existing while its card lives on.
+        self.stash_unsent_chat(card);
+        self.chat_ui.phases.remove(&card);
+        self.observe_agent_activity_for_card(card, None);
+    }
+
+    /// Captures the unsent text and images of `card`'s chat runtime, which is
+    /// about to be dropped while the card lives on, so whatever runtime the
+    /// card builds next opens with them rather than losing them.
+    pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
             let (draft, images) = runtime.persistent_draft();
             if images.is_empty() {
@@ -6805,8 +6811,6 @@ impl Cagents {
                 self.chat_ui.drafts.insert(card, draft);
             }
         }
-        self.chat_ui.phases.remove(&card);
-        self.observe_agent_activity_for_card(card, None);
     }
 
     /// A first save that will not start its provider may still have

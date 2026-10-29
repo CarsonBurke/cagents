@@ -2295,6 +2295,10 @@ impl Cagents {
                             (a, b) => a == b,
                         };
                         if !same_session {
+                            // Text the reader has not sent yet belongs to the
+                            // card, not the session, so the replacement opens
+                            // with it.
+                            self.stash_unsent_chat(pane.id);
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
                             // Card identity survives a session replacement, but
@@ -6466,5 +6470,109 @@ mod tests {
         );
         assert!(!app.card_state(pane.id).unwrap().existence.is_open());
         drop((first, second));
+    }
+
+    /// Unsent composer text belongs to the card. Another client replacing an
+    /// unstarted chat's identity, then moving the card to another channel, must
+    /// leave the text in the composer and in what autosave writes.
+    #[test]
+    fn unsent_text_survives_replaced_identity_and_transfer() {
+        use crate::app::workspace_model_sync::ModelUpdate;
+        const TEXT: &str = "unsent fixture draft\n  keeps its spacing ";
+        for (replace, transfer) in [(true, false), (true, true), (false, true)] {
+            let case = format!("replace={replace} transfer={transfer}");
+            let (mut app, a, b, _) = fixture();
+            app.active_workspace = Some(PathBuf::from("/repo"));
+            Arc::make_mut(&mut app.durable).active_channel = Some(a);
+            drop(app.new_native_chat(crate::agent::Provider::Claude, Some("/repo".into())));
+            let card = app.workspace.focused().unwrap();
+            let target = match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime.target,
+                _ => panic!("{case}: a new chat opens a draft runtime"),
+            };
+            drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(TEXT.into())),
+                ),
+            ))));
+            let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+            app.shared_views.pending.clear();
+            let mut model = app.workspace_model.clone();
+            model.views = vec![View::empty(a), View::empty(b)];
+            model.channels = [a, b]
+                .into_iter()
+                .map(|id| crate::workspace_model::ModelChannel {
+                    id,
+                    repository: PathBuf::from("/repo"),
+                    title: "view".into(),
+                    title_source: Default::default(),
+                    ordinal: 1,
+                })
+                .collect();
+            model.views[0].panes.push(pane.clone());
+            let mut apply =
+                |app: &mut Cagents, model: &mut crate::workspace_model::WorkspaceModel, scope| {
+                    model.sequence += 1;
+                    for view in &mut model.views {
+                        view.revision += 1;
+                    }
+                    drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                        scope,
+                        operation: None,
+                        model: model.clone(),
+                    }));
+                };
+            apply(&mut app, &mut model, Scope::Channel(a));
+            if replace {
+                let CardKind::Chat(session) = &mut pane.kind else {
+                    unreachable!()
+                };
+                session.id = TerminalId::new();
+                assert!(session.is_unstarted(), "{case}");
+                model.views[0].panes = vec![pane.clone()];
+                apply(&mut app, &mut model, Scope::Channel(a));
+            }
+            if transfer {
+                model.views[0].panes.clear();
+                model.views[1].panes = vec![pane.clone()];
+                apply(&mut app, &mut model, Scope::Channel(b));
+                // A repeated delivery must not open the draft a second time
+                // without its text.
+                apply(&mut app, &mut model, Scope::Channel(b));
+            }
+            let home = if transfer { b } else { a };
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == home)
+                    .is_some_and(|channel| channel.cards == [card]),
+                "{case}: the card follows the view"
+            );
+            assert!(app.card_state(card).unwrap().existence.is_open(), "{case}");
+            match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => {
+                    assert_eq!(runtime.unsent_text(), TEXT, "{case}: composer");
+                    assert_eq!(
+                        Some(&runtime.session.id),
+                        match &pane.kind {
+                            CardKind::Chat(session) => Some(&session.id),
+                            _ => None,
+                        },
+                        "{case}: the runtime follows the canonical identity"
+                    );
+                }
+                _ => panic!("{case}: the card keeps a chat runtime"),
+            }
+            assert_eq!(
+                app.persistent_workspace()
+                    .chat_drafts
+                    .get(&card)
+                    .map(String::as_str),
+                Some(TEXT),
+                "{case}: autosave"
+            );
+        }
     }
 }
