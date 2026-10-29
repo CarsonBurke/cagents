@@ -4838,7 +4838,6 @@ mod tests {
             kind: ProjectKind::Folder,
             ordinal: 3,
         });
-        app.project_ui.closed.insert(closed_repository.clone());
         if with_healthy_row {
             model.projects.push(ModelProject {
                 repository: healthy_repository.clone(),
@@ -4853,6 +4852,23 @@ mod tests {
         else {
             panic!("the shared project must admit its actual first read");
         };
+        // Apply the observer's real close event before the failed load returns.
+        // A local marker alone contradicts an open authoritative project and
+        // is correctly retired by the failed-load completion's close sweep.
+        let close = app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+            sequence: app.workspace_model.sequence + 1,
+            edit: ModelEdit::CloseProject {
+                repository: closed_repository.clone(),
+            },
+        }));
+        assert!(messages(close).is_empty());
+        assert!(app.workspace_model.project(&closed_repository).is_none());
+        assert!(
+            app.workspace_model
+                .closed_projects
+                .contains(&closed_repository)
+        );
+        assert!(app.project_ui.closed.contains(&closed_repository));
         let failed =
             first_message(failed).expect("the corrupted HEAD must fail actual Git loading");
         let Message::RepositoryLoaded {
@@ -4876,6 +4892,7 @@ mod tests {
         );
         assert!(!app.workspace_model_opens.contains(&repository));
         assert!(!app.workspace_model_loads.contains_key(&failed_id));
+        assert!(app.project_ui.closed.contains(&closed_repository));
 
         // The visible Try again control emits this action. Do not synthesize a
         // later ModelUpdate::Read: repairing disk alone produces no model edge.
