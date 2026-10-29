@@ -65,11 +65,18 @@ jobs:
           path: setup-main
           persist-credentials: false
 
-      - name: Check out corrected PR 1627
+      - name: Check out corrected PR 1354
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 6eadcfb540183c48f06f3dfc891c194e74c6f48a
-          path: product-1627
+          ref: 0c4acfd90313595ef9842e5eccc86d49131e0352
+          path: product-1354
+          persist-credentials: false
+
+      - name: Check out corrected PR 1564
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ce673dd7530238c218fe133e83c266c2f5ade6da
+          path: product-1564
           persist-credentials: false
 
       - name: Check out corrected PR 1726
@@ -77,6 +84,13 @@ jobs:
         with:
           ref: 59f6a9c84f02891a8cc6e6642701074cad92763a
           path: product-1726
+          persist-credentials: false
+
+      - name: Check out corrected PR 1627
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 6eadcfb540183c48f06f3dfc891c194e74c6f48a
+          path: product-1627
           persist-credentials: false
 
       - name: Check out corrected PR 1912
@@ -117,9 +131,9 @@ jobs:
           action = workspace / "setup-main/.github/actions/setup-linux-build/action.yml"
           assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
           assert manifest["never_merge"] is True
-          assert [p["pr"] for p in manifest["products"]] == [1627, 1726, 1912]
-          assert sum(len(p["selectors"]) for p in manifest["products"]) == 15
-          assert len({selector for p in manifest["products"] for selector in p["selectors"]}) == 15
+          assert [p["pr"] for p in manifest["products"]] == [1354, 1564, 1726, 1627, 1912]
+          assert sum(len(p["selectors"]) for p in manifest["products"]) == 21
+          assert len({selector for p in manifest["products"] for selector in p["selectors"]}) == 21
           for product in manifest["products"]:
               root = workspace / ("product-" + str(product["pr"]))
               record = source(root, product["head"], product["tree"])

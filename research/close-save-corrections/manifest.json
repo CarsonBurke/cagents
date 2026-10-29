@@ -6,25 +6,44 @@
   "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
   "products": [
     {
-      "pr": 1627,
-      "head": "6eadcfb540183c48f06f3dfc891c194e74c6f48a",
-      "tree": "f6ef3b56065f695d479cf7aa6016bc8fc9f465da",
-      "feature": "host",
-      "binary": "cagentsd",
+      "pr": 1354,
+      "head": "0c4acfd90313595ef9842e5eccc86d49131e0352",
+      "tree": "a52e5c9fbc2627c9a06e319c6525d5b0b533f2d3",
+      "feature": "ui",
+      "binary": "cagents-ui",
       "selectors": [
-        "host::chat::native_recovery::paired_projection_tests::failed_reattachment_keeps_original_provider_exit_diagnostic"
+        "interaction::context_menu::tests::tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge",
+        "interaction::context_menu::tests::keyboard_menu_selects_enabled_actions_without_pointer_motion",
+        "interaction::context_menu::tests::generated_menu_actions_retain_their_captured_local_message_for_keyboard"
       ],
       "source_paths": [
-        "src/host/mod.rs",
-        "src/host/chat.rs",
-        "src/host/chat/native_recovery.rs",
-        "src/host/chat/native_recovery/paired_projection_tests.rs",
-        "src/chat/runtime.rs",
-        "src/chat/native_holder/transport.rs",
-        "src/daemon/holder_registry.rs",
+        "src/interaction.rs",
+        "src/interaction/context_menu.rs",
+        "vendor/libcosmic/src/widget/menu/menu_inner.rs",
+        "vendor/libcosmic/src/widget/menu/menu_tree.rs",
+        "vendor/libcosmic/src/widget/wrapper.rs",
         ".cargo/config.toml"
       ],
-      "fixture_contract": "The selected parent self-execs the same test ELF in a private /var/tmp fixture with its existing 90-second outer bound. An offline same-ELF Codex protocol peer intentionally exits 7; native/terminal holder and /bin/cat pair lifecycle roles remain internal fixture processes. No separate cagentsd helper is consumed. Child results and injected provider exit are not additional selected parents. No commercial provider is launched."
+      "fixture_contract": "Production menu widgets and overlays driven by headless renderers, with local captured messages and explicit Named/Character keyboard events. Line/pixel wheel selection, keyboard navigation and one-time generated-message capture are tested without opening a native window, compositor, daemon, provider or executable helper."
+    },
+    {
+      "pr": 1564,
+      "head": "ce673dd7530238c218fe133e83c266c2f5ade6da",
+      "tree": "14b4ddb62e37bcdfba470e2e578c1fe8776e51d7",
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::chat_ui::tests::preview_pressure_admits_newer_images_only_after_retained_trees_release_pixels",
+        "app::chat_ui::images::tests::managed_gallery_cannot_open_a_different_local_hint_externally",
+        "app::chat_ui::images::tests::inline_image_gallery_never_offers_a_filesystem_external_link"
+      ],
+      "source_paths": [
+        "src/app.rs",
+        "src/app/chat_ui.rs",
+        "src/app/chat_ui/images.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "Headless image-preview/widget lifetime and gallery action tests use synthetic local image data and reduced application state. They do not launch a native window, external opener, provider or executable helper; commercial delivery, OS clipboard and native interaction remain separate."
     },
     {
       "pr": 1726,
@@ -47,6 +66,27 @@
         ".cargo/config.toml"
       ],
       "fixture_contract": "Direct headless app reducers and temporary Settings/SQLite stores; synthetic pane descriptors and dropped engine futures do not launch a native window, terminal, provider or executable helper. The source is an independently reviewed deliberate composition with one resolved shared_views.rs conflict, preserving reported titles and no-op durable allocation identity; it is not an ordinary conflict-free merge."
+    },
+    {
+      "pr": 1627,
+      "head": "6eadcfb540183c48f06f3dfc891c194e74c6f48a",
+      "tree": "f6ef3b56065f695d479cf7aa6016bc8fc9f465da",
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "host::chat::native_recovery::paired_projection_tests::failed_reattachment_keeps_original_provider_exit_diagnostic"
+      ],
+      "source_paths": [
+        "src/host/mod.rs",
+        "src/host/chat.rs",
+        "src/host/chat/native_recovery.rs",
+        "src/host/chat/native_recovery/paired_projection_tests.rs",
+        "src/chat/runtime.rs",
+        "src/chat/native_holder/transport.rs",
+        "src/daemon/holder_registry.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "The selected parent self-execs the same test ELF in a private /var/tmp fixture with its existing 90-second outer bound. An offline same-ELF Codex protocol peer intentionally exits 7; native/terminal holder and /bin/cat pair lifecycle roles remain internal fixture processes. No separate cagentsd helper is consumed. Child results and injected provider exit are not additional selected parents. No commercial provider is launched."
     },
     {
       "pr": 1912,
@@ -77,7 +117,7 @@
   ],
   "limits": [
     "Temporary hosted research only; close without merging after retaining immutable evidence.",
-    "Three exact owning executable checks and fifteen distinct exact headless library parents only; planned counts are not execution results.",
+    "Five exact owning executable checks and twenty-one distinct exact headless library parents only; planned counts are not execution results.",
     "Formatting is UNRUN and not established by this workflow. Separate exact-head formatter evidence and full PR formatting gates are not waived.",
     "No whole feature suite, native interaction, screenshots, performance, integrated-browser, commercial provider or merge acceptance. The #1627 offline self-exec lifecycle fixture is narrower than native/product acceptance.",
     "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
