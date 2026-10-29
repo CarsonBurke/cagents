@@ -41,6 +41,8 @@ pub mod omp;
 pub mod preferences;
 pub mod preparation;
 #[cfg(any(feature = "ui", feature = "host"))]
+pub mod preparation_api;
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
