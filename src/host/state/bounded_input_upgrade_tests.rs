@@ -161,13 +161,19 @@ impl OriginalProcesses {
         for process in [&record.root, &record.holder] {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
             assert!(fd >= 0, "cannot pin original fixture process");
-            pins.fds.push(unsafe { File::from_raw_fd(fd as i32) });
-            assert!(
-                process.is_current(),
-                "fixture epoch changed during capability capture"
-            );
+            let candidate = unsafe { File::from_raw_fd(fd as i32) };
+            pins.retain_after_open(candidate, || process.is_current());
         }
         pins
+    }
+    fn retain_after_open(&mut self, candidate: File, is_current: impl FnOnce() -> bool) {
+        // An unvalidated descriptor is close-only, including during unwind.
+        // Earlier accepted pins keep their existing failure-cleanup authority.
+        assert!(
+            is_current(),
+            "fixture epoch changed during capability capture"
+        );
+        self.fds.push(candidate);
     }
     fn settle(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -180,35 +186,83 @@ impl OriginalProcesses {
         }
         self.armed = false;
     }
-}
-impl Drop for OriginalProcesses {
-    fn drop(&mut self) {
+    fn cleanup_with(&self, mut signal: impl FnMut(&File, libc::c_int)) {
         if self.armed {
             for fd in &self.fds {
                 if !exited(fd) {
-                    // Failure-only cleanup for the original pinned fixture.
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            fd.as_raw_fd(),
-                            libc::SIGCONT,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            fd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
+                    signal(fd, libc::SIGCONT);
+                    signal(fd, libc::SIGKILL);
                 }
             }
         }
     }
+}
+impl Drop for OriginalProcesses {
+    fn drop(&mut self) {
+        self.cleanup_with(|fd, signal| {
+            // Failure-only cleanup for an already validated original fixture.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn rejected_process_pin_closes_candidate_and_preserves_prior_cleanup_authority() {
+    use std::{io::Read, os::fd::OwnedFd, os::unix::net::UnixStream};
+
+    // Synthetic socket descriptors exercise actual enrollment, closure, polling
+    // and cleanup selection. No process is spawned or signalled by this oracle.
+    struct Unsignalled(OriginalProcesses);
+    impl Drop for Unsignalled {
+        fn drop(&mut self) {
+            // Even a failed assertion cannot invoke pidfd syscalls on fixtures.
+            self.0.armed = false;
+        }
+    }
+    let mut pins = Unsignalled(OriginalProcesses {
+        fds: Vec::new(),
+        armed: true,
+    });
+    let (accepted, mut accepted_peer) = UnixStream::pair().unwrap();
+    accepted_peer.set_nonblocking(true).unwrap();
+    let accepted = File::from(OwnedFd::from(accepted));
+    let accepted_fd = accepted.as_raw_fd();
+    pins.0.retain_after_open(accepted, || true);
+
+    let (candidate, mut rejected_peer) = UnixStream::pair().unwrap();
+    rejected_peer.set_nonblocking(true).unwrap();
+    let candidate = File::from(OwnedFd::from(candidate));
+    let rejected_fd = candidate.as_raw_fd();
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pins.0.retain_after_open(candidate, || false);
+    }));
+    assert!(refusal.is_err());
+    let mut byte = [0];
+    assert_eq!(rejected_peer.read(&mut byte).unwrap(), 0);
+    assert!(matches!(
+        accepted_peer.read(&mut byte),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(pins.0.armed);
+    assert_eq!(pins.0.fds.len(), 1);
+    assert_eq!(pins.0.fds[0].as_raw_fd(), accepted_fd);
+
+    let mut signals = Vec::new();
+    pins.0
+        .cleanup_with(|fd, signal| signals.push((fd.as_raw_fd(), signal)));
+    assert_eq!(
+        signals,
+        vec![(accepted_fd, libc::SIGCONT), (accepted_fd, libc::SIGKILL)]
+    );
+    assert!(signals.iter().all(|(fd, _)| *fd != rejected_fd));
 }
 fn proof(name: &str) -> HostSessionProof {
     HostSessionProof {
