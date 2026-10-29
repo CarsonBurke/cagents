@@ -46,7 +46,10 @@ impl Directories {
         self.sync_with(|file| file.sync_all())
     }
 
-    fn sync_with(&self, mut sync: impl FnMut(&fs::File) -> io::Result<()>) -> io::Result<()> {
+    pub(super) fn sync_with(
+        &self,
+        mut sync: impl FnMut(&fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.revalidate()?;
         for (_, file) in &self.0 {
             sync(file)?;

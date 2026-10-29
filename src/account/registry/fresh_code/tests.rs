@@ -1,7 +1,7 @@
 use super::*;
 use crate::account::fresh_code::{CodeAttempt, CodeMethod};
 use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 // Frozen version-6 bytes, independent of the version-7 writer/owner serializer.
 const V6: &str = r#"version = 6
@@ -481,5 +481,442 @@ fn late_probe_cannot_register_after_current_cancel_and_duplicate_retains_home() 
             );
             assert!(registry.find(owner.binding.key).is_none());
         }
+    }
+}
+
+#[test]
+fn registration_postrename_ancestor_failure_replays_the_exact_result_without_rewrite() {
+    for duplicate in [false, true] {
+        let fixture = Fixture::new();
+        let owner = fixture.store.code_started(&fixture.claim()).unwrap();
+        let managed = fixture_registration(&owner);
+        let system = if duplicate {
+            vec![(Provider::Codex, managed.identity())]
+        } else {
+            Vec::new()
+        };
+        let before_inode = fs::metadata(fixture.store.path()).unwrap().ino();
+        let mut ancestor_calls = 0;
+        let first_unknown = fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed.clone(),
+                &system,
+                |_| Ok(()),
+                |namespace| {
+                    namespace.sync_with(|directory| {
+                        ancestor_calls += 1;
+                        if ancestor_calls == 2 {
+                            Err(io::Error::from_raw_os_error(libc::EIO))
+                        } else {
+                            directory.sync_all()
+                        }
+                    })
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(first_unknown.raw_os_error(), Some(libc::EIO));
+        assert_eq!(ancestor_calls, 2);
+        let inode = fs::metadata(fixture.store.path()).unwrap().ino();
+        assert_ne!(inode, before_inode, "the result really passed rename");
+        let visible = fixture.store.fresh_code_observation().unwrap();
+        let record = visible
+            .registration_record(owner.binding.request_id)
+            .unwrap()
+            .clone();
+        assert_eq!(record.started, owner);
+        assert_eq!(record.managed, managed);
+        if duplicate {
+            assert_eq!(
+                record.outcome,
+                RegistrationOutcome::DuplicateRetained {
+                    existing: Account::system(Provider::Codex).id(),
+                    account: DuplicateAccount::System {
+                        identity: managed.identity()
+                    }
+                }
+            );
+        } else {
+            assert_eq!(record.outcome, RegistrationOutcome::Registered);
+        }
+        // Read visibility is metadata, not a successful barrier receipt.
+        assert_eq!(
+            fixture
+                .store
+                .observe_fresh_code(&fixture.request)
+                .unwrap()
+                .unwrap(),
+            record.settled_owner()
+        );
+        let bytes = fixture.bytes();
+        let revision = visible.revision();
+        let replay_unknown = fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed.clone(),
+                &system,
+                |_| Ok(()),
+                |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(replay_unknown.raw_os_error(), Some(libc::EIO));
+        assert_eq!(first_unknown.raw_os_error(), Some(libc::EIO));
+        assert_eq!(fixture.bytes(), bytes);
+        assert_eq!(fs::metadata(fixture.store.path()).unwrap().ino(), inode);
+
+        let mut live_checks = 0;
+        let mut barrier_calls = 0;
+        let actual = fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed,
+                &system,
+                |_| {
+                    live_checks += 1;
+                    Ok(())
+                },
+                |namespace| {
+                    barrier_calls += 1;
+                    namespace.sync()
+                },
+            )
+            .unwrap();
+        assert_eq!(barrier_calls, 1);
+        assert_eq!(live_checks, 2);
+        match actual {
+            CodeRegistration::Registered(saved) => {
+                assert!(!duplicate);
+                assert_eq!(saved, record.settled_owner());
+            }
+            CodeRegistration::DuplicateRetained { owner, existing } => {
+                assert!(duplicate);
+                assert_eq!(owner, record.settled_owner());
+                assert_eq!(existing, Account::system(Provider::Codex).id());
+            }
+        }
+        assert_eq!(fixture.bytes(), bytes);
+        assert_eq!(fs::metadata(fixture.store.path()).unwrap().ino(), inode);
+        let after = fixture.store.fresh_code_observation().unwrap();
+        assert_eq!(after.revision(), revision);
+        assert_eq!(
+            after.registration_record(owner.binding.request_id),
+            Some(&record)
+        );
+    }
+}
+
+#[test]
+fn registration_replay_refuses_changed_original_inputs_phase_and_current_cancel() {
+    let fixture = Fixture::new();
+    let owner = fixture.store.code_started(&fixture.claim()).unwrap();
+    let managed = fixture_registration(&owner);
+    let system = [(Provider::Codex, managed.identity())];
+    assert!(
+        fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed.clone(),
+                &system,
+                |_| Ok(()),
+                |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            )
+            .is_err()
+    );
+    let first = fixture
+        .store
+        .fresh_code_observation()
+        .unwrap()
+        .registration_record(owner.binding.request_id)
+        .unwrap()
+        .clone();
+    let mut wrong_owners = Vec::new();
+    let mut changed = owner.clone();
+    changed.binding.request_id = Uuid::from_u128(300);
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.binding.installation_id = Uuid::from_u128(301);
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.binding.key = Uuid::from_u128(302);
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.binding.payload.copy_codex_config = !changed.binding.payload.copy_codex_config;
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.attempt.id = Uuid::from_u128(303);
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.attempt.terminal_id = TerminalId::from_uuid(Uuid::from_u128(304));
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.host.host_incarnation = HostIncarnation::new("another-original-host");
+    wrong_owners.push(changed);
+    let mut changed = owner.clone();
+    changed.state = CodeState::DuplicateRetained;
+    wrong_owners.push(changed);
+    for wrong in wrong_owners {
+        let before = fixture.bytes();
+        assert!(
+            fixture
+                .store
+                .register_fresh_code_with_sync(
+                    &fixture.homes,
+                    &wrong,
+                    managed.clone(),
+                    &system,
+                    |_| panic!("changed original owner reached live replay validation"),
+                    |_| panic!("changed original owner reached the durability barrier"),
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.bytes(), before);
+    }
+    for change_system in [false, true] {
+        let mut wrong = managed.clone();
+        let mut changed_system = system.to_vec();
+        if change_system {
+            changed_system[0].1.organization = Some("changed-system-identity".into());
+        } else {
+            wrong.email = Some("different-original-report@example.test".into());
+        }
+        let before = fixture.bytes();
+        assert!(
+            fixture
+                .store
+                .register_fresh_code_with_sync(
+                    &fixture.homes,
+                    &owner,
+                    wrong,
+                    &changed_system,
+                    |_| panic!("changed original input reached live replay validation"),
+                    |_| panic!("changed original input reached the durability barrier"),
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.bytes(), before);
+    }
+    fixture
+        .store
+        .cancel_preparation(&fixture.homes, &owner.binding)
+        .unwrap();
+    let before = fixture.bytes();
+    assert!(
+        fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed,
+                &system,
+                |_| panic!("current Cancel reached live replay validation"),
+                |_| panic!("current Cancel reached the durability barrier"),
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.bytes(), before);
+    let after = fixture.store.fresh_code_observation().unwrap();
+    assert_eq!(
+        after.registration_record(owner.binding.request_id),
+        Some(&first)
+    );
+    assert_eq!(
+        after.preparation(owner.binding.request_id).unwrap().state,
+        PreparationState::CancelledRetained
+    );
+}
+
+#[test]
+fn duplicate_replay_returns_the_first_actual_account_and_refuses_changed_target_or_outcome() {
+    let fixture = Fixture::new();
+    let owner = fixture.store.code_started(&fixture.claim()).unwrap();
+    let managed = fixture_registration(&owner);
+    let mut first = managed.clone();
+    first.key = Uuid::from_u128(401);
+    let mut second = managed.clone();
+    second.key = Uuid::from_u128(402);
+    fixture
+        .store
+        .update(|registry| {
+            // Existing linked rows may name the same login. This fixed
+            // metadata fixture makes recomputing the first duplicate visible.
+            first.linked_home = Some(PathBuf::from("/private-fixture/first"));
+            second.linked_home = Some(PathBuf::from("/private-fixture/second"));
+            registry.accounts.extend([first.clone(), second]);
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed.clone(),
+                &[],
+                |_| Ok(()),
+                |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            )
+            .is_err()
+    );
+    let first_id = Account::managed(first.provider, first.key, PathBuf::new()).id();
+    fixture
+        .store
+        .update(|registry| registry.accounts.reverse())
+        .unwrap();
+    let before = fixture.bytes();
+    let inode = fs::metadata(fixture.store.path()).unwrap().ino();
+    let CodeRegistration::DuplicateRetained { existing, .. } = fixture
+        .store
+        .register_fresh_code(&fixture.homes, &owner, managed.clone(), &[], |_| Ok(()))
+        .unwrap()
+    else {
+        panic!("only the stored first duplicate can be returned");
+    };
+    assert_eq!(existing, first_id);
+    assert_eq!(fixture.bytes(), before);
+    assert_eq!(fs::metadata(fixture.store.path()).unwrap().ino(), inode);
+
+    for changed in ["identity", "home"] {
+        fixture
+            .store
+            .update(|registry| {
+                let target = registry
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.key == first.key)
+                    .unwrap();
+                *target = first.clone();
+                if changed == "identity" {
+                    target.email = Some("changed-current-duplicate@example.test".into());
+                } else {
+                    target.linked_home = Some(PathBuf::from("/private-fixture/retargeted"));
+                }
+            })
+            .unwrap();
+        let before = fixture.bytes();
+        assert!(
+            fixture
+                .store
+                .register_fresh_code_with_sync(
+                    &fixture.homes,
+                    &owner,
+                    managed.clone(),
+                    &[],
+                    |_| panic!("changed duplicate reached live replay validation"),
+                    |_| panic!("changed duplicate reached the durability barrier"),
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.bytes(), before);
+    }
+
+    let mut corrupt = fixture.store.fresh_code_observation().unwrap();
+    corrupt.fresh_code_registrations[0].outcome = RegistrationOutcome::Registered;
+    fs::write(
+        fixture.store.path(),
+        toml::to_string_pretty(&corrupt).unwrap(),
+    )
+    .unwrap();
+    let before = fixture.bytes();
+    assert!(
+        fixture
+            .store
+            .register_fresh_code_with_sync(
+                &fixture.homes,
+                &owner,
+                managed,
+                &[],
+                |_| panic!("mismatched stored outcome reached live validation"),
+                |_| panic!("mismatched stored outcome reached the barrier"),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture.bytes(),
+        before,
+        "corruption cannot repair its own outcome"
+    );
+}
+
+#[test]
+fn replay_refuses_file_or_ancestor_replacement_and_final_live_validation_failure() {
+    for changed in ["file", "ancestor", "live"] {
+        let fixture = Fixture::new();
+        let owner = fixture.store.code_started(&fixture.claim()).unwrap();
+        let managed = fixture_registration(&owner);
+        assert!(
+            fixture
+                .store
+                .register_fresh_code_with_sync(
+                    &fixture.homes,
+                    &owner,
+                    managed.clone(),
+                    &[],
+                    |_| Ok(()),
+                    |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+                )
+                .is_err()
+        );
+        let first_bytes = fixture.bytes();
+        let retained = fixture._directory.path().join("retained-first-outcome");
+        let mut live_checks = 0;
+        let result = fixture.store.register_fresh_code_with_sync(
+            &fixture.homes,
+            &owner,
+            managed,
+            &[],
+            |_| {
+                live_checks += 1;
+                if changed == "live" && live_checks == 2 {
+                    Err(io::Error::from_raw_os_error(libc::EACCES))
+                } else {
+                    Ok(())
+                }
+            },
+            |namespace| {
+                namespace.sync()?;
+                if changed == "file" {
+                    fs::rename(fixture.store.path(), &retained)?;
+                    fs::write(fixture.store.path(), &first_bytes)?;
+                    fs::set_permissions(fixture.store.path(), fs::Permissions::from_mode(0o600))?;
+                } else if changed == "ancestor" {
+                    fs::rename(&fixture.store.directory, &retained)?;
+                    fs::create_dir(&fixture.store.directory)?;
+                    fs::set_permissions(
+                        &fixture.store.directory,
+                        fs::Permissions::from_mode(0o700),
+                    )?;
+                    fs::write(fixture.store.path(), &first_bytes)?;
+                    fs::set_permissions(fixture.store.path(), fs::Permissions::from_mode(0o600))?;
+                }
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a passed sync alone cannot acknowledge replay"
+        );
+        if changed == "live" {
+            assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EACCES));
+            assert_eq!(live_checks, 2);
+        } else {
+            assert_eq!(live_checks, 1);
+            let original = if changed == "file" {
+                retained
+            } else {
+                retained.join(FILE_NAME)
+            };
+            assert_eq!(fs::read(original).unwrap(), first_bytes);
+        }
+        assert_eq!(fixture.bytes(), first_bytes);
     }
 }

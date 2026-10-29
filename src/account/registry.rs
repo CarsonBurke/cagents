@@ -147,6 +147,8 @@ pub struct Registry {
     existing_pending: Vec<ExistingPending>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fresh_code_owners: Vec<super::fresh_code::CodeOwner>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fresh_code_registrations: Vec<fresh_code::RegistrationRecord>,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -900,8 +902,10 @@ impl std::fmt::Display for LaunchAccountError {
 
 impl std::error::Error for LaunchAccountError {}
 
-/// Keep this lease only across the child-spawn step, never a provider turn or
-/// handshake. Removal uses the same lifecycle lock before forgetting a home.
+/// Keep this lease across the child-spawn boundary. A bound start retains it
+/// through an ambiguous spawn acknowledgment until its original owner proves
+/// no entry or supplies the actual issued root. It never covers a provider
+/// login turn. Removal uses the same lifecycle lock before forgetting a home.
 pub struct LaunchAccountLease {
     _lock: crate::instance::OwnedLock,
 }
@@ -1475,6 +1479,21 @@ fn write_with_io(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync: impl FnOnce(&super::durability::Directories) -> io::Result<()>,
 ) -> io::Result<()> {
+    write_with_published_io(directory, path, registry, before_publish, |namespace, _| {
+        sync(namespace)
+    })
+}
+
+/// The receipt is the actual file returned by the successful rename, rather
+/// than a pathname reopened afterward. Internal result replay uses this pin
+/// to fence replacement across its file and ancestor durability barrier.
+fn write_with_published_io(
+    directory: &Path,
+    path: &Path,
+    registry: &Registry,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync: impl FnOnce(&super::durability::Directories, &fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     registry.validate_preparations()?;
     let namespace = super::durability::Directories::capture(directory)?;
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
@@ -1496,8 +1515,8 @@ fn write_with_io(
     before_publish()?;
     // The rename replaces whatever is at `path` - a link included - rather
     // than writing through it.
-    temporary.persist(path).map_err(|error| error.error)?;
-    sync(&namespace)
+    let published = temporary.persist(path).map_err(|error| error.error)?;
+    sync(&namespace, &published)
 }
 
 /// A provider written as its executable name, which is what a reader
