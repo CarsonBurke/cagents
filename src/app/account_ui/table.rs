@@ -638,31 +638,33 @@ fn line<'a>(
     actions: Element<'a, Message>,
     height: f32,
 ) -> Element<'a, Message> {
-    let mut items: Vec<Element<'a, Message>> = vec![
-        widget::container(account)
-            .width(Length::Fill)
-            .center_y(Length::Fill)
-            .into(),
-    ];
-    items.extend(cells.into_iter().map(|(width, cell)| {
-        widget::container(cell)
-            .width(width)
-            .center_y(Length::Fill)
-            .into()
-    }));
+    let mut items: Vec<Element<'a, Message>> =
+        vec![widget::container(account).width(Length::Fill).into()];
+    items.extend(
+        cells
+            .into_iter()
+            .map(|(width, cell)| widget::container(cell).width(width).into()),
+    );
     items.push(
         widget::container(actions)
             .width(ACTIONS_WIDTH)
             .align_x(iced::alignment::Horizontal::Right)
-            .center_y(Length::Fill)
             .into(),
     );
+    let content = widget::row::with_children(items)
+        .spacing(COLUMN_SPACING)
+        .align_y(Alignment::Center)
+        .height(Length::Shrink);
+    // The spacer sets the padded minimum; natural-height cells can still grow.
     widget::container(
-        widget::row::with_children(items)
-            .spacing(COLUMN_SPACING)
-            .height(Length::Shrink),
+        widget::row::with_children(vec![
+            iced::widget::Space::new()
+                .height((height - 2.0 * space::XS).max(0.0))
+                .into(),
+            content.into(),
+        ])
+        .align_y(Alignment::Center),
     )
-    .min_height(height)
     .padding([space::XS, space::M])
     .into()
 }
@@ -1141,7 +1143,7 @@ fn menu<'a>(
                     "Account name to confirm deletion",
                     &state.table.confirm_delete,
                 )
-                .on_input(|text| action(Action::RemovalDeleteInput(text)))
+                .on_input(move |text| action(Action::RemovalDeleteInput(text)))
                 .into(),
             );
             content.push(
