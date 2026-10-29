@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "never_merge": true,
+  "pr": 1354,
+  "prerequisite": "Do not publish/dispatch until the exact corrected compiler gate and independent control source review succeed. This file grants no waiver.",
+  "before": {
+    "head": "c727f886628897c1749290213e9d65037253095a",
+    "tree": "6d4f36e2b4dd48fc9744305d34c78469384edcc5"
+  },
+  "after": {
+    "head": "0c4acfd90313595ef9842e5eccc86d49131e0352",
+    "tree": "a52e5c9fbc2627c9a06e319c6525d5b0b533f2d3"
+  },
+  "primitives": {
+    "head": "b0089c26473c7dcef6970b3c90ee9785481ff9df",
+    "blobs": {
+      ".github/qualification/native-driver.py": "d34ad4d8adfd40f7965d0a35f0c6a45abf39f350",
+      ".github/workflows/qualify-held-scope.yml": "2ef72526a7134dbc1982c9a8d069381d40e18b08"
+    },
+    "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+    "adaptation": "Only hosted guards, bounded PID-filtered AT-SPI traversal, Openbox/AT-SPI bootstrap, lossless pixel conversion and owned-descendant cleanup are adapted. Capture is split from geometry, cleanup adds stamped identities. No held-pane fixture/helper/schema/pin/claims or HOME override transfers."
+  },
+  "settings": "schema_version = 3\napp_theme = \"dark\"\nui_scale = 1.5\nterminal_font_size = 14.0\nshow_status_bar = false\ncheck_for_updates = false\n",
+  "editor_executables": [
+    "ceditor",
+    "code",
+    "codium",
+    "cursor",
+    "zed",
+    "subl"
+  ],
+  "editor_labels": [
+    "ceditor",
+    "VS Code",
+    "VSCodium",
+    "Cursor",
+    "Zed",
+    "Sublime Text"
+  ],
+  "menu_labels": [
+    "Open folder",
+    "New terminal",
+    "New channel",
+    "New worktree",
+    "Copy path",
+    "Move project up",
+    "Move project down",
+    "Reset sidebar order",
+    "ceditor",
+    "VS Code",
+    "VSCodium",
+    "Cursor",
+    "Zed",
+    "Sublime Text",
+    "Remove project\u2026"
+  ],
+  "cases": [
+    "wide-return",
+    "wide-space",
+    "wide-click",
+    "wide-limits",
+    "wide-tooltip",
+    "narrow-return",
+    "narrow-space",
+    "narrow-click",
+    "narrow-limits",
+    "narrow-tooltip"
+  ],
+  "source_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "build.rs",
+    "scripts/run-development",
+    "src/bin/cagents-ui.rs",
+    "src/settings.rs",
+    "src/instance.rs",
+    "src/control.rs",
+    "src/sidebar.rs",
+    "src/app/project_ui.rs",
+    "vendor/libcosmic/src/widget/menu/menu_inner.rs",
+    "vendor/iced-winit/src/conversion.rs",
+    "vendor/iced-winit/src/window/state.rs"
+  ],
+  "limits": [
+    "Source-only temporary research control; never merge. No local Cargo, native app, helper, provider, fixture or workflow execution is authorized while preparing it.",
+    "Actual scripts/run-development --browserless builds matched CLI/HOST/UI separately with development features in one shared dev-runtime target, CARGO_BUILD_JOBS=2, serial arms. It does not establish integrated-browser or whole-feature suite acceptance.",
+    "Inherited HOME and CODEX_HOME remain unchanged. Only private XDG/TMP app state, editor-stub PATH prefix and task-specific Cargo/Rustup cache variables are used. Inherited authority and scale variables are never stripped or fabricated.",
+    "Physical windows/captures must actually measure1280x800 and900x600, with identical supported ui_scale1.5 settings and Xvfb96DPI configuration. Current internal native scale factor is UNMEASURED; no derived current600x400 viewport is claimed. Initial winit scale guess is supporting startup evidence only.",
+    "Twelve same-path synthetic real Git projects are opened through matched --no-start CLI in reverse12\u219201 order because production ordering is newest-first. No remotes, provider or synthetic IPC fixture is used.",
+    "Baseline is a whole-feature comparison with14 action rows versus product15; it is not an isolated reproduction of the later wheel regression. Actual failed baseline cases remain failures and later baseline cases remain UNRUN; separate after app state restores initial comparability without repairing the failed trial.",
+    "Pure native pixel capture after wheel never resizes, moves, focuses or repairs pointer. Return/space/click use actual XTest input; only native X11 line-wheel buttons4/5 are covered, not pixel/touchpad/physical-keyboard/Wayland/touch/submenu/right-edge menu behavior.",
+    "Safe Remove confirmation is observed only and cancelled; no destructive confirmation is activated. Name/path must lie within the bounded native modal content region, with initially focused Cancel. Independent actual-image review must validate that bounded region.",
+    "Tooltip five-image states and every native UX claim require independent review. Missing tooltip accessibility labels do not establish absence. No source or machine result alone grants native UX acceptance.",
+    "No live commercial provider, concurrent-agent workload, performance/frame/GPU/resource improvement, FW16 compositor or full-PR merge acceptance is established. Remaining PR gates are not waived.",
+    "Actual logs, exits, source/executable/config/fixture hashes, PID-filtered accessibility, ordered input/keycode receipts, geometry, native WebPs and cleanup failures are retained. Missing captures are explicit; no placeholder or invented pass.",
+    "Owned process identities are captured before waits and revalidated before signals; normal UI close and matched guarded private daemon stop precede final owned cleanup. Cleanup failure refuses the next arm/build. Screenshots remain artifacts only, off product branches."
+  ],
+  "previous_product_head": "7c0022e23ea8548dea4df050f68d76fba94bca53",
+  "product_successor_note": "Public independently reviewed test-only E0282 correction of Vec<keyboard::Key> inference. Production/native behavior is unchanged; compiler gate still must succeed at this exact successor."
+}

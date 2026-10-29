@@ -1,0 +1,182 @@
+name: Research actual native project menu
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/qualify-project-menu-native.yml
+      - .github/qualification/native-menu-driver.py
+      - .github/qualification/project-menu-native-manifest.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-menu-native-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'research/project-menu-native-qualification-b9'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUSTUP_TOOLCHAIN: 1.93.0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require naturally hosted User context before effects
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          names = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+          assert not names, 'Inherited names refused unchanged: ' + ', '.join(names)
+          assert not any(name in os.environ for name in ('WAYLAND_DISPLAY', 'WAYLAND_SOCKET'))
+          PY
+          evidence="$RUNNER_TEMP/project-menu-native-evidence"
+          install -d -m 700 "$evidence"
+          printf '%s\n' "MENU_EVIDENCE_ROOT=$evidence" "CARGO_TARGET_DIR=$RUNNER_TEMP/project-menu-native-target" >> "$GITHUB_ENV"
+
+      - name: Check out the exact research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+
+      - name: Check out immutable published bootstrap primitives
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: b0089c26473c7dcef6970b3c90ee9785481ff9df
+          path: published
+          persist-credentials: false
+
+      - name: Check out the exact captured-main baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: c727f886628897c1749290213e9d65037253095a
+          path: before
+          persist-credentials: false
+
+      - name: Check out the exact corrected product
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 0c4acfd90313595ef9842e5eccc86d49131e0352
+          path: after
+          persist-credentials: false
+
+      - name: Verify immutable sources and borrowed primitive provenance
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          out = pathlib.Path(os.environ['MENU_EVIDENCE_ROOT'])
+          control, published = workspace / 'control', workspace / 'published'
+          manifest = control / '.github/qualification/project-menu-native-manifest.json'
+          data = json.loads(manifest.read_text())
+          def git(root, *args):
+              return subprocess.check_output(['git', '--no-optional-locks', '-C', str(root), *args], text=True).strip()
+          def source(root, head, tree=None):
+              record = dict(head=git(root, 'rev-parse', 'HEAD'), tree=git(root, 'rev-parse', 'HEAD^{tree}'),
+                            status=git(root, 'status', '--porcelain=v1', '--untracked-files=all'))
+              assert record['head'] == head and (tree is None or record['tree'] == tree) and record['status'] == '', record
+              assert not any(line.startswith('160000 ') for line in git(root, 'ls-files', '--stage').splitlines())
+              return record
+          records = {'control': source(control, os.environ['EXPECTED_CONTROL_SHA']),
+                     'published': source(published, data['primitives']['head']), 'products': {}}
+          assert data['never_merge'] is True
+          for arm in ('before', 'after'):
+              pin = data[arm]
+              records['products'][arm] = source(workspace / arm, pin['head'], pin['tree'])
+          for relative, blob in data['primitives']['blobs'].items():
+              assert git(published, 'rev-parse', 'HEAD:' + relative) == blob
+              shutil.copyfile(published / relative, out / ('published-' + pathlib.Path(relative).name))
+          setup = published / '.github/actions/setup-linux/action.yml'
+          assert hashlib.sha256(setup.read_bytes()).hexdigest() == data['primitives']['setup_sha256']
+          shutil.copyfile(setup, out / 'published-setup-action.yml')
+          shutil.copyfile(manifest, out / 'manifest.json')
+          records['control']['sha256'] = {path: hashlib.sha256((control / path).read_bytes()).hexdigest() for path in
+              ('.github/workflows/qualify-project-menu-native.yml', '.github/qualification/native-menu-driver.py', '.github/qualification/project-menu-native-manifest.json')}
+          records['setup_sha256'] = hashlib.sha256(setup.read_bytes()).hexdigest()
+          (out / 'source-preflight.json').write_text(json.dumps(records, indent=2) + '\n')
+          PY
+
+      - name: Install published checksum-verified Rust and Zig setup
+        uses: ./published/.github/actions/setup-linux
+
+      - name: Install native evidence tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 x11-utils x11-xserver-utils
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            clang --version
+            /usr/bin/python3 --version
+          } > "$MENU_EVIDENCE_ROOT/tools.txt"
+
+      - name: Collect serial actual native before and after evidence
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=45s 12600s xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 "$GITHUB_WORKSPACE/control/.github/qualification/native-menu-driver.py" "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/after" > "$MENU_EVIDENCE_ROOT/native-wrapper.stdout" 2> "$MENU_EVIDENCE_ROOT/native-wrapper.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$MENU_EVIDENCE_ROOT/native-wrapper.exit"
+          exit "$status"
+
+      - name: Retain final source state and recompute every artifact checksum
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'project-menu-native-evidence'
+          out.mkdir(mode=0o700, exist_ok=True)
+          records, failures = {}, []
+          manifest = out / 'manifest.json'
+          if manifest.exists():
+              data = json.loads(manifest.read_text())
+              for arm in ('before', 'after'):
+                  record = {}
+                  for key, args in [('head', ['rev-parse', 'HEAD']), ('tree', ['rev-parse', 'HEAD^{tree}']), ('status', ['status', '--porcelain=v1', '--untracked-files=all'])]:
+                      result = subprocess.run(['git', '--no-optional-locks', '-C', str(workspace / arm), *args], text=True, capture_output=True)
+                      record[key] = dict(exit=result.returncode, stdout=result.stdout.strip(), stderr=result.stderr)
+                  records[arm] = record
+                  if any(item['exit'] for item in record.values()) or record['head']['stdout'] != data[arm]['head'] or record['tree']['stdout'] != data[arm]['tree'] or record['status']['stdout']:
+                      failures.append(arm)
+          else:
+              records['audit'] = 'UNAVAILABLE before source preflight'
+          (out / 'sources-after.json').write_text(json.dumps(dict(sources=records, failures=failures), indent=2) + '\n')
+          with (out / 'sha256.txt').open('w') as stream:
+              for path in sorted(out.rglob('*')):
+                  if path.is_file() and path.name != 'sha256.txt':
+                      h = hashlib.sha256()
+                      with path.open('rb') as source:
+                          for block in iter(lambda: source.read(1024 * 1024), b''):
+                              h.update(block)
+                      stream.write(h.hexdigest() + '  ' + str(path.relative_to(out)) + '\n')
+          assert not failures, failures
+          PY
+
+      - name: Retain raw native evidence and honest missing states
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: project-menu-native-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/project-menu-native-evidence/
+          if-no-files-found: error
+          retention-days: 14
