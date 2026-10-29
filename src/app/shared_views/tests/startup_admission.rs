@@ -955,6 +955,299 @@ fn sibling_chat(pane: &Pane, title: &str) -> Pane {
 }
 
 #[test]
+fn ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    for invalid in ["wrong-proof", "duplicate-issuer", "masked-membership"] {
+        let (mut app, active, hidden, mut rejected, identity) = cached_chat();
+        current_owner(&mut rejected);
+        app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+        let healthy = sibling_chat(&rejected, "Healthy ranked sibling");
+        install_held_pane(&mut app, hidden, &healthy);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+            rejected.id,
+            "Keep the rejected ranked draft intact".into(),
+        )]));
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model.identity = identity;
+        let mut view = View::empty(hidden);
+        view.revision = 7;
+        view.panes = vec![rejected.clone(), healthy.clone()];
+        let mut full = model(identity, active, hidden, view);
+        full.sequence = 10;
+        full.channels[1].ordinal = 17;
+        let mut issuer = managed_owner(&rejected, hidden);
+        match invalid {
+            "wrong-proof" => {
+                let Some(crate::agent_execution::HostedSession::Chat(source)) = &mut issuer.session
+                else {
+                    unreachable!()
+                };
+                source.proof.as_mut().unwrap().host_incarnation = "different-issued-host".into();
+            }
+            "duplicate-issuer" => full.agents.push(issuer.clone()),
+            "masked-membership" => {
+                full.views[0].panes.push(rejected.clone());
+                // Optimism may hide one membership from projection, but must
+                // never hide raw ambiguity from proof admission.
+                app.shared_views.pending.push((
+                    uuid::Uuid::new_v4(),
+                    Scope::Channel(active),
+                    Change::Remove { id: rejected.id },
+                ));
+            }
+            _ => unreachable!(),
+        }
+        full.agents
+            .extend([issuer, managed_owner(&healthy, hidden)]);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+            channel: hidden,
+            model: full.clone(),
+        }));
+        assert_eq!(app.shared_views.snapshot_sequence, 10, "{invalid}");
+        assert_eq!(app.workspace_model.views, full.views, "{invalid}");
+        assert_eq!(app.workspace_model.agents, full.agents, "{invalid}");
+        let channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == hidden)
+            .unwrap();
+        assert_eq!(channel.ordinal, 17, "{invalid}");
+        assert!(channel.shared, "{invalid}");
+        assert_eq!(
+            app.shared_views.quarantined,
+            HashSet::from([rejected.id]),
+            "{invalid}"
+        );
+        assert!(app.shared_views.blocked.is_empty(), "{invalid}");
+        assert_eq!(
+            app.card_state(rejected.id).unwrap().kind,
+            rejected.kind,
+            "{invalid}"
+        );
+        assert_eq!(
+            app.quarantined_pane_draft(rejected.id),
+            Some("Keep the rejected ranked draft intact")
+        );
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::SeedView { scope, panes, closed }
+                if *scope == Scope::Channel(hidden) && panes == &vec![healthy.clone()] && closed.is_empty()
+        )), "healthy-only SeedView must be real, not an empty publication: {invalid}");
+        assert!(!edits.iter().any(|edit| match edit {
+            ModelEdit::SeedView { panes, closed, .. } => closed.contains(&rejected.id)
+                || panes.iter().any(|pane| pane.id == rejected.id),
+            ModelEdit::ChangeView { change, .. } => change_card(change) == Some(rejected.id),
+            _ => false,
+        }), "{invalid}");
+        drop(app.initialize_runtimes());
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(hidden),
+            operation: None,
+            model: full,
+        }));
+        let CardKind::Chat(healthy_source) = &healthy.kind else {
+            unreachable!()
+        };
+        assert!(
+            app.chat_start_matches(healthy.id, healthy_source),
+            "{invalid}"
+        );
+        assert!(!app.chat_awaiting_admission(healthy.id), "{invalid}");
+        assert!(!app.chat_start_pending(rejected.id), "{invalid}");
+        assert!(
+            !app.shared_views
+                .validated_managed
+                .contains_key(&rejected.id),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn ranked_snapshot_retires_verified_pane_behind_newer_metadata() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, mut retired, pane) = validated_retirement_fixture();
+    let Scope::Channel(channel) = retired.views[1].scope else {
+        unreachable!()
+    };
+    let mut previous = app.workspace_model.clone();
+    // A provider-learned thread belongs to canonical pane A, while the
+    // issuer's original B still has no thread. Rank admission must bind both.
+    let Some(crate::agent_execution::HostedSession::Chat(issuer)) = &mut previous.agents[0].session
+    else {
+        unreachable!()
+    };
+    issuer.launch.session_id = None;
+    retired.agents[0] = previous.agents[0].clone();
+    app.acknowledge_view_edit(Scope::Channel(channel), None);
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+        channel,
+        model: previous.clone(),
+    }));
+    assert!(!app.pane_is_quarantined(pane.id));
+    drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        sequence: previous.sequence,
+        edit: ModelEdit::CreateChannel {
+            id: channel,
+            repository: "/fixture-project".into(),
+            title: "Late creation echo".into(),
+            title_source: Default::default(),
+        },
+    }));
+    drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        sequence: 100,
+        edit: ModelEdit::RetitleChannel {
+            id: channel,
+            title: "Newer manual title".into(),
+        },
+    }));
+    retired.agents[0].closed = true;
+    for _ in 0..2 {
+        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+            channel,
+            model: retired.clone(),
+        }));
+        assert_eq!(app.workspace_model.sequence, 100);
+        assert_eq!(
+            app.workspace_model.channel(channel).unwrap().title,
+            "Newer manual title"
+        );
+        assert_eq!(app.shared_views.snapshot_sequence, 11);
+        assert_eq!(app.workspace_model.views, retired.views);
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.pane_is_quarantined(pane.id));
+    }
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(previous.clone())));
+    drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+        channel,
+        model: previous,
+    }));
+    assert_eq!(app.workspace_model.views, retired.views);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(!app.pane_is_quarantined(pane.id));
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Insert { pane: inserted, .. }, .. }
+                if inserted.id == pane.id
+        ))
+    );
+}
+
+#[test]
+fn ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial() {
+    use crate::{
+        app::workspace_model_sync::ModelUpdate,
+        model::BootId,
+        persistence::{SnapshotBase, StateStore},
+    };
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let attachment = crate::chat::Attachment {
+        path: "/retained/ranked-image.png".into(),
+        reference: Some(crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 1,
+            device: uuid::Uuid::new_v4(),
+            name: "ranked-image.png".into(),
+            sha256: "0".repeat(64),
+            extension: "png".into(),
+        }),
+    };
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        HashMap::from([(pane.id, "Closed ranked draft café 🌿".into())]),
+        HashMap::from([(pane.id, vec![attachment.clone()])]),
+    );
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut full = model(identity, active, hidden, view);
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    full.agents.push(owner);
+    app.workspace_model = full.clone();
+    app.refresh_managed_pane_quarantine(&full);
+    drop(app.begin_chat_close(pane.id));
+    let saved = app.persistent_workspace();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ranked-denial.sqlite3");
+    let store = StateStore::open(&path, BootId::new("ranked-denial")).unwrap();
+    store
+        .save_workspace(
+            &saved,
+            SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    drop(store);
+    let store = StateStore::open(&path, BootId::new("ranked-denial-reload")).unwrap();
+    app.durable = Arc::new(store.load_workspace(saved.id, None).unwrap().unwrap());
+    app.shared_views = State::for_workspace(&app.durable);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        app.durable.chat_drafts.clone(),
+        app.durable.chat_draft_attachments.clone(),
+    );
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    full.sequence += 1;
+    full.agents[0].closed = false;
+    full.channels[1].ordinal = 17;
+    drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+        channel: hidden,
+        model: full.clone(),
+    }));
+    assert_eq!(app.shared_views.snapshot_sequence, full.sequence);
+    assert_eq!(app.workspace_model.agents, full.agents);
+    assert_eq!(app.workspace_model.views, full.views);
+    let ranked = app
+        .durable
+        .channels
+        .iter()
+        .find(|entry| entry.id == hidden)
+        .unwrap();
+    assert_eq!(ranked.ordinal, 17);
+    assert!(ranked.shared);
+    let title = app.workspace_model.channel(hidden).unwrap().title.clone();
+    drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+        sequence: full.sequence,
+        edit: ModelEdit::CreateChannel {
+            id: hidden,
+            repository: "/fixture-project".into(),
+            title: "Late create echo".into(),
+            title_source: Default::default(),
+        },
+    }));
+    assert_eq!(app.workspace_model.channel(hidden).unwrap().title, title);
+    let restored = app.persistent_workspace();
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    assert!(restored.local_only_cards.contains(&pane.id));
+    assert_eq!(restored.quarantined_panes[&pane.id], pane.kind);
+    assert_eq!(
+        restored.chat_drafts[&pane.id],
+        "Closed ranked draft café 🌿"
+    );
+    assert_eq!(restored.chat_draft_attachments[&pane.id], vec![attachment]);
+    assert!(!app.chat_start_pending(pane.id));
+    assert!(!app.workspace.order().any(|id| id == pane.id));
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| match edit {
+            ModelEdit::SeedView { panes, closed, .. } =>
+                closed.contains(&pane.id) || panes.iter().any(|source| source.id == pane.id),
+            ModelEdit::ChangeView { change, .. } => change_card(&change) == Some(pane.id),
+            _ => false,
+        })
+    );
+}
+
+#[test]
 fn managed_quarantine_uses_full_ownership_proof_and_pending_sources() {
     for invalid in [
         "closed",
