@@ -2024,6 +2024,7 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
                 signal: None,
                 success: false,
                 stdout: vec![],
+                stdout_truncated: false,
                 stderr: stderr.clone(),
             })
         });

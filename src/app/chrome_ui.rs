@@ -3531,7 +3531,16 @@ impl Cagents {
                 width,
                 self.modal_is_open(),
             )
-            .map(Message::Sidebar),
+            .map({
+                let origin = self.discard_ui.source().map(|source| source.id);
+                move |action| match origin {
+                    Some(source) => Message::SidebarSnapshot {
+                        source,
+                        action: Box::new(action),
+                    },
+                    None => Message::Sidebar(action),
+                }
+            }),
             ContextTab::PullRequest => self.pull_request_panel(width),
             ContextTab::Details => model.map_or_else(
                 || {

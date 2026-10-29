@@ -114,10 +114,11 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// is explicit - the section says how many rows it withheld and the quick
 /// filter narrows to them - rather than a silent truncation.
 pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
-/// How many change rows one `Changes` group renders at once, bounded for the
-/// same reason as the file tree. "Stage all" and "Unstage all" act on exactly
-/// the rows that are visible, so the bound is never a hidden side effect.
-const MAX_VISIBLE_CHANGE_ROWS: usize = 200;
+/// Read-only sidebar summaries never authorize complete-set mutations.
+pub(crate) const STATUS_DISPLAY_LIMIT: usize = 10_000;
+/// Only viewport rows plus overscan are mounted; bulk commands retain the full group.
+const MAX_VISIBLE_CHANGE_ROWS: usize =
+    crate::change_list::VIEW_ROWS + 2 * crate::change_list::OVERSCAN;
 /// How many open pull requests one listing asks `gh` for.
 ///
 /// Defined here, beside the only surfaces that render a number out of the
@@ -763,6 +764,9 @@ pub struct SidebarWorktree {
     pub locked: bool,
     pub dirty: Option<DirtyState>,
     pub untracked_omitted: bool,
+    pub listing_truncated: bool,
+    untracked_complete: bool,
+    pub status_error: Option<String>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -785,9 +789,18 @@ impl SidebarWorktree {
         ahead: Option<u64>,
         behind: Option<u64>,
     ) -> Self {
+        let untracked_complete = dirty.is_some();
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
-        let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
+        let status = status_summary(
+            detached,
+            locked,
+            dirty.as_ref(),
+            false,
+            false,
+            ahead,
+            behind,
+        );
         let accessible_name = format!(
             "Open worktree {label}, {}, {status}",
             branch.as_deref().unwrap_or(&path_label)
@@ -823,6 +836,9 @@ impl SidebarWorktree {
             locked,
             dirty,
             untracked_omitted: false,
+            listing_truncated: false,
+            untracked_complete,
+            status_error: None,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -867,6 +883,9 @@ impl SidebarWorktree {
             behind,
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
+        row.listing_truncated = status.is_some_and(|status| status.listing_truncated);
+        row.untracked_complete =
+            status.is_some_and(|status| !status.untracked_omitted && !status.listing_truncated);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -894,21 +913,67 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
+    /// A successful bound read can repair a missed HEAD event without a new
+    /// worktree listing. This changes presentation only, never path/identity or
+    /// the retained authority used by mutation workers.
+    pub fn apply_status_head(&mut self, head: &crate::repository::HeadState) {
+        let (branch, detached) = match head {
+            crate::repository::HeadState::Branch { name, .. } => (Some(name.as_str()), false),
+            crate::repository::HeadState::Unborn { branch } => (branch.as_deref(), false),
+            crate::repository::HeadState::Detached { .. } => (None, true),
+            crate::repository::HeadState::Unknown => return,
+        };
+        if self.branch.as_deref() != branch || self.detached != detached {
+            self.clear_pull_request();
+            self.head_repository = None;
+            self.branch = branch.map(str::to_owned);
+            self.detached = detached;
+            self.chrome.folded_branch = self.branch.as_deref().map(fold);
+            self.refresh_status_chrome();
+        }
+    }
+
+    pub fn apply_status_error(&mut self, error: Option<&str>) {
+        let error = error.map(|error| error.chars().take(512).collect::<String>());
+        if self.status_error != error {
+            self.status_error = error;
+            self.refresh_status_chrome();
+        }
+    }
+
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        if self.untracked_omitted == status.untracked_omitted
-            && self.dirty.as_ref() == Some(&status.dirty)
+        // Only a successful complete full read can authorize reuse of its
+        // untracked count. A tracked-only cap is independent of that saved
+        // completeness; a capped full read or read error invalidates it.
+        let mut dirty = status.dirty.clone();
+        let reuse_untracked =
+            status.untracked_omitted && self.untracked_complete && self.status_error.is_none();
+        let untracked_complete =
+            reuse_untracked || !status.untracked_omitted && !status.listing_truncated;
+        let untracked_omitted = status.untracked_omitted && !reuse_untracked;
+        if reuse_untracked {
+            dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
+        }
+        if self.status_error.is_none()
+            && self.untracked_omitted == untracked_omitted
+            && self.untracked_complete == untracked_complete
+            && self.listing_truncated == status.listing_truncated
+            && self.dirty.as_ref() == Some(&dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
-        self.dirty = Some(status.dirty.clone());
-        self.untracked_omitted = status.untracked_omitted;
+        self.untracked_complete = untracked_complete;
+        self.status_error = None;
+        self.dirty = Some(dirty);
+        self.untracked_omitted = untracked_omitted;
+        self.listing_truncated = status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -964,6 +1029,31 @@ impl SidebarWorktree {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_tooltip_for_test(&self) -> &str {
+        &self.chrome.tooltip
+    }
+
+    fn status_description(&self) -> String {
+        let mut status = status_summary(
+            self.detached,
+            self.locked,
+            self.dirty.as_ref(),
+            self.untracked_omitted,
+            self.listing_truncated,
+            self.ahead,
+            self.behind,
+        );
+        if let Some(error) = &self.status_error {
+            status = if self.dirty.is_some() {
+                format!("Git status unavailable: {error}. Last known: {status}")
+            } else {
+                format!("Git status unavailable: {error}")
+            };
+        }
+        status
+    }
+
     fn refresh_status_chrome(&mut self) {
         let label = worktree_display_name(&self.path, self.branch.as_deref(), self.detached);
         if label != self.chrome.label.as_ref() {
@@ -971,30 +1061,30 @@ impl SidebarWorktree {
             self.chrome.delete_name = format!("Delete merged worktree {label}").into_boxed_str();
             self.chrome.label = label.into();
         }
-        self.chrome.dirty_badge =
-            self.dirty
-                .as_ref()
-                .filter(|dirty| dirty.is_dirty())
-                .map(|dirty| {
-                    format!(
-                        "{} {}changes",
-                        dirty_count(dirty),
-                        if self.untracked_omitted {
-                            "tracked "
-                        } else {
-                            ""
-                        }
-                    )
-                    .into_boxed_str()
-                });
-        let mut status = status_summary(
-            self.detached,
-            self.locked,
-            self.dirty.as_ref(),
-            self.untracked_omitted,
-            self.ahead,
-            self.behind,
-        );
+        self.chrome.dirty_badge = self
+            .dirty
+            .as_ref()
+            .filter(|dirty| dirty.is_dirty() || self.listing_truncated)
+            .map(|dirty| {
+                format!(
+                    "{}{} {}changes",
+                    dirty_count(dirty),
+                    if self.listing_truncated { "+" } else { "" },
+                    if self.untracked_omitted {
+                        "tracked "
+                    } else {
+                        ""
+                    }
+                )
+                .into_boxed_str()
+            });
+        if self.status_error.is_some() {
+            self.chrome.dirty_badge = Some(match self.chrome.dirty_badge.take() {
+                Some(badge) => format!("Last known: {badge}").into_boxed_str(),
+                None => "Git status unavailable".into(),
+            });
+        }
+        let mut status = self.status_description();
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
             let state = match pr.state {
@@ -1643,13 +1733,6 @@ impl ChangeRow {
             .conflict
             .map(conflict_label)
             .unwrap_or_else(|| change_kind_label(entry.kind));
-        // Which end of the label the row may throw away, decided once.
-        //
-        // A repository path is elided from the front, because its tail is the
-        // file and `…/src/lib.rs` still names one; so is a rename, whose tail
-        // is the name the file now has. A file in the worktree root is nothing
-        // but its name and has no head to spare.
-        let ellipsize_start = entry.old_path.is_some() || label.contains('/');
         let chrome = ChangeRowChrome {
             accessible_name: if counts.is_empty() {
                 format!("{status} {label}")
@@ -1664,7 +1747,6 @@ impl ChangeRow {
             status: status.into_boxed_str(),
             counts_split: counts.find(' '),
             counts: counts.into_boxed_str(),
-            ellipsize_start,
             stage_id: stable_id(format!("panel.change.stage.{key}")),
             unstage_id: stable_id(format!("panel.change.unstage.{key}")),
             discard_id: stable_id(format!("panel.change.discard.{key}")),
@@ -1695,9 +1777,6 @@ struct ChangeRowChrome {
     status: Box<str>,
     counts: Box<str>,
     counts_split: Option<usize>,
-    /// True when the label's tail is what identifies it; see
-    /// [`ChangeRow::new`].
-    ellipsize_start: bool,
     stage_id: Id,
     unstage_id: Id,
     discard_id: Id,
@@ -1747,7 +1826,7 @@ impl ChangeGroup {
             .iter()
             .map(|row| row.entry.path.clone())
             .collect::<Vec<_>>();
-        let tree = file_rows(&paths);
+        let tree = change_file_rows(&paths);
         let mut path_order: Vec<usize> = (0..paths.len()).collect();
         path_order.sort_unstable_by(|left, right| paths[*left].cmp(&paths[*right]));
         Self {
@@ -1897,7 +1976,7 @@ impl BranchChangesModel {
             head: comparison.head,
             merge_base: comparison.merge_base,
             rows,
-            tree: file_rows(&paths),
+            tree: change_file_rows(&paths),
         }
     }
 }
@@ -2008,6 +2087,27 @@ pub struct SourceControlModel {
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
     file_rows_from_tree(build_file_tree(paths))
+}
+
+fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
+    crate::change_list::compact_tree(build_file_tree(paths))
+        .into_iter()
+        .map(|entry| {
+            let kind = if entry.directory { "folder" } else { "file" };
+            FileRow {
+                chrome: FileRowChrome {
+                    folded: fold(&entry.path.display()),
+                    accessible_name: format!("Open {kind} {}", entry.path.display())
+                        .into_boxed_str(),
+                    label: entry.label.into_boxed_str(),
+                },
+                path: entry.path,
+                depth: entry.depth,
+                directory: entry.directory,
+                ignored: false,
+            }
+        })
+        .collect()
 }
 
 fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
@@ -2142,6 +2242,14 @@ impl SourceControlModel {
 
     /// Builds the panel from a loaded snapshot.
     pub fn ready(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot) -> Self {
+        Self::ready_for_tab(key, snapshot, true)
+    }
+
+    pub fn ready_for_tab(
+        key: ActiveWorktreeKey,
+        snapshot: &RepositorySnapshot,
+        browse_files: bool,
+    ) -> Self {
         let worktree_id = key.worktree_id;
         // The header's label and the branch a push names come from the same
         // `HEAD` and are not the same value: the label is a lossy decoding of
@@ -2189,10 +2297,14 @@ impl SourceControlModel {
             paths.extend(snapshot.files.ignored.iter().cloned());
             &paths
         };
-        let mut files = file_rows_from_tree(build_file_tree_with_directories(
-            paths,
-            &snapshot.files.ignored_directories,
-        ));
+        let mut files = if browse_files {
+            file_rows_from_tree(build_file_tree_with_directories(
+                paths,
+                &snapshot.files.ignored_directories,
+            ))
+        } else {
+            Vec::new()
+        };
         let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
         let ignored_directories: BTreeSet<_> = snapshot
             .files
@@ -2876,7 +2988,8 @@ pub struct SidebarState {
     expanded_directories: BTreeSet<RepoPath>,
     /// Change review starts open; only folders the user folded are stored.
     collapsed_change_directories: BTreeMap<ChangeTreeScope, BTreeSet<RepoPath>>,
-    change_pages: BTreeMap<ChangeTreeScope, usize>,
+    change_first_rows: BTreeMap<ChangeTreeScope, usize>,
+    change_scroll_epoch: u64,
     files_page: usize,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
@@ -3817,7 +3930,8 @@ impl SidebarState {
         self.files_filter_open = false;
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
-        self.change_pages.clear();
+        self.change_first_rows.clear();
+        self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
         self.files_page = 0;
         // Every section is one worktree's change area now, not a view of the
         // panel, so none of their disclosures carry to the next worktree.
@@ -3891,6 +4005,8 @@ impl SidebarState {
             }
             SidebarAction::ToggleSection { section, .. } => {
                 toggle_membership(&mut self.toggled_sections, *section);
+                self.change_first_rows.clear();
+                self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
             }
             SidebarAction::ToggleSourceControlPanel { .. } => self.panel_open = !self.panel_open,
             SidebarAction::FilesPage { page, .. } => self.files_page = *page,
@@ -3906,8 +4022,18 @@ impl SidebarState {
                     self.files_query.clear();
                 }
             }
-            SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
-            SidebarAction::SetChangesTab { tab, .. } => self.changes_tab = *tab,
+            SidebarAction::SetChangeListMode { mode, .. } => {
+                self.change_list_mode = *mode;
+                self.change_first_rows.clear();
+                self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
+            }
+            SidebarAction::SetChangesTab { tab, .. } => {
+                if self.changes_tab != *tab {
+                    self.changes_tab = *tab;
+                    self.change_first_rows.clear();
+                    self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
+                }
+            }
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
@@ -3915,7 +4041,8 @@ impl SidebarState {
                 }
             }
             SidebarAction::ToggleChangeDirectory { scope, path, .. } => {
-                self.change_pages.remove(scope);
+                self.change_first_rows.clear();
+                self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
                 let collapsed = self.collapsed_change_directories.entry(*scope).or_default();
                 if !collapsed.remove(path) {
                     collapsed.insert(path.clone());
@@ -3993,8 +4120,16 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
-            SidebarAction::ChangePage { scope, page, .. } => {
-                self.change_pages.insert(*scope, *page);
+            SidebarAction::ChangeViewport {
+                key,
+                scope,
+                first_row,
+                epoch,
+            } => {
+                if self.active_worktree.as_ref() == Some(key) && self.change_scroll_epoch == *epoch
+                {
+                    self.change_first_rows.insert(*scope, *first_row);
+                }
             }
             SidebarAction::RequestDiscard { key, request } => {
                 self.discard = Some(DiscardConfirmation {
@@ -4105,10 +4240,11 @@ pub enum SidebarAction {
         area: ChangeArea,
         command: ChangeGroupCommand,
     },
-    ChangePage {
+    ChangeViewport {
         key: ActiveWorktreeKey,
         scope: ChangeTreeScope,
-        page: usize,
+        first_row: usize,
+        epoch: u64,
     },
     NavigateRow {
         row: SelectionRow,
@@ -6410,6 +6546,7 @@ fn compact_project_identity(
                 worktree.locked,
                 worktree.dirty.as_ref(),
                 worktree.untracked_omitted,
+                worktree.listing_truncated,
                 worktree.ahead,
                 worktree.behind
             )
@@ -7123,6 +7260,47 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// indicator, and "something is running here" is what the rail is for. The
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
+fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
+    if worktree.status_error.is_some()
+        || worktree
+            .dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.conflicted > 0)
+    {
+        Icon::Warning
+    } else {
+        Icon::Changes
+    }
+}
+
+fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
+    if worktree.status_error.is_some() {
+        BadgeTone::Warning
+    } else if worktree
+        .dirty
+        .as_ref()
+        .is_some_and(|dirty| dirty.conflicted > 0)
+    {
+        BadgeTone::Danger
+    } else {
+        BadgeTone::Warning
+    }
+}
+
+fn worktree_change_count(worktree: &SidebarWorktree) -> String {
+    if worktree.status_error.is_some() {
+        return "?".to_owned();
+    }
+    let count = worktree.dirty.as_ref().map_or(0, dirty_count);
+    if count > 999 {
+        "999+".to_owned()
+    } else if worktree.listing_truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
+}
+
 fn worktree_indicator(
     worktree: &SidebarWorktree,
     agent_update: bool,
@@ -7142,9 +7320,13 @@ fn worktree_indicator(
         ));
     }
     if compact && show_changes_icons {
-        return indicators
-            .dirty
-            .map(|label| status_icon(Icon::Changes, label.to_owned(), BadgeTone::Warning));
+        return indicators.dirty.map(|label| {
+            status_icon(
+                worktree_change_icon(worktree),
+                label.to_owned(),
+                worktree_change_tone(worktree),
+            )
+        });
     }
     None
 }
@@ -7225,10 +7407,16 @@ fn worktree_view<'a>(
     if !compact && !deleting {
         let indicators = worktree_indicators(worktree);
         if show_changes_icons && let Some(label) = indicators.dirty {
-            content = content.push(status_icon(
-                Icon::Changes,
+            content = content.push(crate::interaction::tooltip(
+                widget::row::with_capacity(2)
+                    .spacing(2)
+                    .align_y(Alignment::Center)
+                    .push(toned_icon(
+                        worktree_change_icon(worktree),
+                        worktree_change_tone(worktree),
+                    ))
+                    .push(design::caption(worktree_change_count(worktree))),
                 label.to_owned(),
-                BadgeTone::Warning,
             ));
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
@@ -8565,6 +8753,14 @@ fn panel_section<'a>(
     } else {
         header.into()
     };
+    let header = RowInteraction::change_target(
+        header,
+        SidebarAction::ToggleSection {
+            key: key.clone(),
+            section,
+        },
+        None,
+    );
     let mut column = widget::column::with_capacity(2).push(header);
     if expanded {
         column = column.push(widget::container(body()).padding([0.0, 0.0, space::S, 0.0]));
@@ -8918,17 +9114,23 @@ fn visible_change_rows<'a>(
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
 ) -> (Vec<&'a FileRow>, usize) {
-    change_row_page(rows, collapsed, flat, 0)
+    change_viewport_rows(rows, collapsed, flat, 0)
 }
 
-/// Mount one bounded page, while retaining the complete change model.
-fn change_row_page<'a>(
+/// Construct only the rows near this group's scroll position.
+fn change_viewport_rows<'a>(
     rows: &'a [FileRow],
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
-    page: usize,
+    first: usize,
 ) -> (Vec<&'a FileRow>, usize) {
-    let mut visible = Vec::with_capacity(rows.len().min(MAX_VISIBLE_CHANGE_ROWS));
+    if !flat && collapsed.is_none_or(BTreeSet::is_empty) {
+        let range = crate::change_list::visible_range(rows.len(), first);
+        return (rows[range].iter().collect(), rows.len());
+    }
+    let mut visible = Vec::with_capacity(MAX_VISIBLE_CHANGE_ROWS);
+    let start = first.saturating_sub(crate::change_list::OVERSCAN);
+    let end = first.saturating_add(crate::change_list::VIEW_ROWS + crate::change_list::OVERSCAN);
     let mut count = 0;
     let mut skip_below = None;
     for row in rows {
@@ -8941,9 +9143,7 @@ fn change_row_page<'a>(
             }
             skip_below = None;
         }
-        if count >= page.saturating_mul(MAX_VISIBLE_CHANGE_ROWS)
-            && visible.len() < MAX_VISIBLE_CHANGE_ROWS
-        {
+        if (start..end).contains(&count) {
             visible.push(row);
         }
         count += 1;
@@ -8951,56 +9151,60 @@ fn change_row_page<'a>(
             skip_below = Some(row.depth);
         }
     }
-    if visible.is_empty() && count > 0 && page > 0 {
-        return change_row_page(rows, collapsed, flat, (count - 1) / MAX_VISIBLE_CHANGE_ROWS);
+    let clamped = first.min(count.saturating_sub(crate::change_list::VIEW_ROWS));
+    if clamped != first {
+        return change_viewport_rows(rows, collapsed, flat, clamped);
     }
     (visible, count)
 }
 
-fn change_pager<'a>(
+fn virtual_changes<'a>(
     state: &SidebarState,
     key: &ActiveWorktreeKey,
     scope: ChangeTreeScope,
+    rows: Vec<crate::sticky_tree::Row<'a, SidebarAction>>,
     total: usize,
-    modal_open: bool,
+    _modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    if total <= MAX_VISIBLE_CHANGE_ROWS {
-        return cosmic::iced::widget::Space::new().height(0).into();
-    }
-    let last = total.saturating_sub(1) / MAX_VISIBLE_CHANGE_ROWS;
-    let page = state
-        .change_pages
-        .get(&scope)
-        .copied()
-        .unwrap_or(0)
-        .min(last);
-    let action = |target| {
-        gated(
-            SidebarAction::ChangePage {
-                key: key.clone(),
-                scope,
-                page: target,
-            },
-            modal_open,
-        )
-    };
-    widget::row::with_children(vec![
-        crate::ui_controls::button::secondary("Previous")
-            .on_press_maybe((page > 0).then(|| action(page - 1)).flatten())
+    let range = crate::change_list::visible_range(
+        total,
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
+    );
+    let content = widget::column::with_children(vec![
+        widget::Space::new()
+            .height(range.start as f32 * PANEL_ROW_HEIGHT)
             .into(),
-        design::caption(format!(
-            "{}–{} of {total}",
-            page * MAX_VISIBLE_CHANGE_ROWS + 1,
-            ((page + 1) * MAX_VISIBLE_CHANGE_ROWS).min(total)
+        crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT),
+        widget::Space::new()
+            .height(total.saturating_sub(range.end) as f32 * PANEL_ROW_HEIGHT)
+            .into(),
+    ]);
+    let key = key.clone();
+    let callback_key = key.clone();
+    let epoch = state.change_scroll_epoch;
+    let scroll: Element<'a, SidebarAction> = widget::scrollable(content)
+        .id(stable_id(format!(
+            "changes.scroll.{}.{scope:?}.{}",
+            key.worktree_id, state.change_scroll_epoch
+        )))
+        .on_scroll(move |viewport| SidebarAction::ChangeViewport {
+            key: callback_key.clone(),
+            scope,
+            epoch,
+            first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize,
+        })
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            crate::design::scrollbar(),
         ))
-        .into(),
-        crate::ui_controls::button::secondary("Next")
-            .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
-            .into(),
-    ])
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .into()
+        .height(Length::Fixed(
+            (total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT)
+                .max(PANEL_ROW_HEIGHT),
+        ))
+        .width(Length::Fill)
+        .into();
+    // A scrollable ID only identifies operations; it does not reset State.
+    // Replace the native child Tree when layout coordinates are reset.
+    RowInteraction::change_scroll(scroll, key, scope, epoch)
 }
 
 /// The tree/flat switch for a list of changed files, as one action that
@@ -9160,39 +9364,50 @@ fn branch_changes_section<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Branch;
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, total) = change_row_page(
+    let (tree, total) = change_viewport_rows(
         &branch.tree,
         collapsed,
         flat,
-        state.change_pages.get(&scope).copied().unwrap_or(0),
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
     );
     let mut rows = Vec::with_capacity(tree.len());
     for file in tree {
         if file.directory {
             let folded = collapsed.is_some_and(|paths| paths.contains(&file.path));
+            let action = SidebarAction::ToggleChangeDirectory {
+                key: source.key.clone(),
+                scope,
+                path: file.path.clone(),
+            };
             rows.push(crate::sticky_tree::Row {
                 depth: file.depth,
                 directory: true,
-                element: panel_row(
-                    format!(
-                        "{} folder {}",
-                        if folded { "Expand" } else { "Collapse" },
-                        file.path.display()
+                element: RowInteraction::change_target(
+                    panel_row(
+                        format!(
+                            "{} folder {}",
+                            if folded { "Expand" } else { "Collapse" },
+                            file.path.display()
+                        ),
+                        file.depth,
+                        widget::row::with_children(vec![
+                            crate::file_icon::folder(!folded).into(),
+                            design::body(&*file.chrome.label)
+                                .width(Length::Fill)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .into(),
+                        ])
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center),
+                        Some(action.clone()),
+                        false,
+                        modal_open,
                     ),
-                    file.depth,
-                    widget::row::with_children(vec![
-                        crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).into(),
-                    ])
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center),
-                    Some(SidebarAction::ToggleChangeDirectory {
-                        key: source.key.clone(),
-                        scope,
-                        path: file.path.clone(),
-                    }),
-                    false,
-                    modal_open,
+                    action,
+                    None,
                 ),
             });
             continue;
@@ -9209,7 +9424,15 @@ fn branch_changes_section<'a>(
             ChangeKind::Deleted => BadgeTone::Danger,
             _ => BadgeTone::Warning,
         };
-        rows.push(crate::sticky_tree::Row { depth: file.depth, directory: false, element: panel_row(
+        let action = SidebarAction::OpenBranchFile {
+            key: source.key.clone(),
+            path: row.entry.path.clone(),
+            old_path: row.entry.old_path.clone(),
+            base_ref: branch.base_ref.clone(),
+            head: branch.head.clone(),
+            merge_base: branch.merge_base.clone(),
+        };
+        rows.push(crate::sticky_tree::Row { depth: file.depth, directory: false, element: RowInteraction::change_target(panel_row(
             &*row.label, if flat { 0 } else { file.depth },
             widget::row::with_children(vec![
                 crate::file_icon::icon(row.entry.path.as_path()).into(),
@@ -9217,26 +9440,25 @@ fn branch_changes_section<'a>(
                     row.entry.path.file_name()
                 } else { Cow::Borrowed(&*row.label) })
                     .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
                     .width(Length::Fill).into(),
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
             ]).spacing(space::XS).align_y(Alignment::Center),
-            Some(SidebarAction::OpenBranchFile {
-                key: source.key.clone(),
-                path: row.entry.path.clone(),
-                old_path: row.entry.old_path.clone(),
-                base_ref: branch.base_ref.clone(),
-                head: branch.head.clone(),
-                merge_base: branch.merge_base.clone(),
-            }),
+            Some(action.clone()),
             matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
             modal_open,
-        ) });
+        ), action, None) });
     }
-    column = column.push(crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT));
     column
-        .push(change_pager(state, &source.key, scope, total, modal_open))
+        .push(virtual_changes(
+            state,
+            &source.key,
+            scope,
+            rows,
+            total,
+            modal_open,
+        ))
         .into()
 }
 
@@ -9249,11 +9471,11 @@ fn change_group_view<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Area(group.area);
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, total) = change_row_page(
+    let (tree, total) = change_viewport_rows(
         &group.tree,
         collapsed,
         flat,
-        state.change_pages.get(&scope).copied().unwrap_or(0),
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
     );
     // The disclosure header above this view already carries the group's name,
     // its count, and its commands; the body is only the rows.
@@ -9261,51 +9483,67 @@ fn change_group_view<'a>(
     for file in tree {
         if file.directory {
             let folded = collapsed.is_some_and(|paths| paths.contains(&file.path));
+            let action = SidebarAction::ToggleChangeDirectory {
+                key: source.key.clone(),
+                scope,
+                path: file.path.clone(),
+            };
             rows.push(crate::sticky_tree::Row {
                 depth: file.depth,
                 directory: true,
-                element: panel_row(
-                    format!(
-                        "{} folder {}",
-                        if folded { "Expand" } else { "Collapse" },
-                        file.path.display()
+                element: RowInteraction::change_target(
+                    panel_row(
+                        format!(
+                            "{} folder {}",
+                            if folded { "Expand" } else { "Collapse" },
+                            file.path.display()
+                        ),
+                        file.depth,
+                        widget::row::with_children(vec![
+                            crate::file_icon::folder(!folded).into(),
+                            design::body(&*file.chrome.label)
+                                .width(Length::Fill)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .into(),
+                        ])
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center),
+                        Some(action.clone()),
+                        false,
+                        modal_open,
                     ),
-                    file.depth,
-                    widget::row::with_children(vec![
-                        crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).into(),
-                    ])
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center),
-                    Some(SidebarAction::ToggleChangeDirectory {
-                        key: source.key.clone(),
-                        scope,
-                        path: file.path.clone(),
-                    }),
-                    false,
-                    modal_open,
+                    action,
+                    None,
                 ),
             });
         } else if let Some(row) = group.visible_path(&file.path) {
             rows.push(crate::sticky_tree::Row {
                 depth: file.depth,
                 directory: false,
-                element: change_row_view(
-                    state,
-                    source,
-                    group.area,
-                    row,
-                    modal_open,
-                    if flat { 0 } else { file.depth },
-                    !flat,
+                element: RowInteraction::change_target(
+                    change_row_view(
+                        state,
+                        source,
+                        group.area,
+                        row,
+                        modal_open,
+                        if flat { 0 } else { file.depth },
+                        !flat,
+                    ),
+                    SidebarAction::OpenChange {
+                        key: source.key.clone(),
+                        path: row.entry.path.clone(),
+                        area: group.area,
+                    },
+                    Some(row.selection()),
                 ),
             });
         }
     }
-    let mut column =
-        widget::column::with_children(vec![crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT)]);
-    column = column.push(change_pager(state, &source.key, scope, total, modal_open));
-    column.into()
+    virtual_changes(state, &source.key, scope, rows, total, modal_open)
 }
 
 fn change_row_view<'a>(
@@ -9384,11 +9622,9 @@ fn change_row_view<'a>(
                 Cow::Borrowed(&*chrome.label)
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(if chrome.ellipsize_start {
-                cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
-            } else {
-                cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
-            })
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                EllipsizeHeightLimit::Lines(1),
+            ))
             .width(Length::Fill)
             .into(),
             widget::container(status)
@@ -9406,6 +9642,7 @@ fn change_row_view<'a>(
         selected,
         modal_open,
     );
+    let identity = crate::interaction::tooltip(identity, chrome.label.to_string());
     let commands = row_commands(source, area, row, modal_open);
     if commands.is_empty() {
         return identity;
@@ -10349,7 +10586,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
     }
     if untracked > 0 {
         detail.push(format!(
-            "{untracked} untracked {} will be deleted from the worktree",
+            "{untracked} untracked {} will be moved to the system Trash",
             if untracked == 1 { "file" } else { "files" }
         ));
     }
@@ -10359,7 +10596,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            design::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Tracked contents are backed up. Undo discard is available for 60 seconds and preserves files changed afterwards.").into(),
             crate::app::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
@@ -10600,19 +10837,24 @@ fn status_summary(
     locked: bool,
     dirty: Option<&DirtyState>,
     untracked_omitted: bool,
+    listing_truncated: bool,
     ahead: Option<u64>,
     behind: Option<u64>,
 ) -> String {
     let mut parts = Vec::with_capacity(4);
     match dirty {
-        Some(dirty) if dirty.is_dirty() => parts.push(format!(
-            "{} {}changes",
+        Some(dirty) if dirty.is_dirty() || listing_truncated => parts.push(format!(
+            "{}{} {}changes",
             dirty_count(dirty),
+            if listing_truncated { "+" } else { "" },
             if untracked_omitted { "tracked " } else { "" }
         )),
         Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
-        Some(_) => parts.push("clean".to_owned()),
+        Some(_) => parts.push("No changes".to_owned()),
         None => parts.push("status unavailable".to_owned()),
+    }
+    if listing_truncated {
+        parts.push("listing limited".to_owned());
     }
     if detached {
         parts.push("detached".to_owned());
@@ -11396,7 +11638,14 @@ mod row_interaction {
         }
     }
 
+    type ChangeTarget = (SidebarAction, Option<super::PathSelection>);
+    type ChangeScrollTarget = (super::ActiveWorktreeKey, super::ChangeTreeScope, u64);
+
     enum Kind {
+        /// Only virtual Changes rows opt into semantic reconciliation. The
+        /// native scrollable remains outside this subtree and keeps its offset.
+        ChangeTarget(Box<ChangeTarget>),
+        ChangeScroll(Box<ChangeScrollTarget>),
         Selectable {
             row: super::SelectionRow,
             /// This row is in the explicit multi-selection.
@@ -11430,6 +11679,8 @@ mod row_interaction {
 
     #[derive(Default)]
     struct State {
+        change_target: Option<Box<ChangeTarget>>,
+        change_scroll_target: Option<Box<ChangeScrollTarget>>,
         modifiers: keyboard::Modifiers,
         selection_bounds: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
@@ -11483,6 +11734,29 @@ mod row_interaction {
     }
 
     impl<'a> RowInteraction<'a> {
+        pub(super) fn change_scroll(
+            content: Element<'a, SidebarAction>,
+            key: super::ActiveWorktreeKey,
+            scope: super::ChangeTreeScope,
+            epoch: u64,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::ChangeScroll(Box::new((key, scope, epoch))),
+            })
+        }
+
+        pub(super) fn change_target(
+            content: Element<'a, SidebarAction>,
+            action: SidebarAction,
+            selection: Option<super::PathSelection>,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::ChangeTarget(Box::new((action, selection))),
+            })
+        }
+
         pub(super) fn selectable(
             content: Element<'a, SidebarAction>,
             row: super::SelectionRow,
@@ -11691,6 +11965,14 @@ mod row_interaction {
 
         fn state(&self) -> tree::State {
             tree::State::new(State {
+                change_scroll_target: match &self.kind {
+                    Kind::ChangeScroll(target) => Some(target.clone()),
+                    _ => None,
+                },
+                change_target: match &self.kind {
+                    Kind::ChangeTarget(target) => Some(target.clone()),
+                    _ => None,
+                },
                 scroll: match self.kind {
                     Kind::FilteredScroll(active) => Some(Box::new(FilterScrollState {
                         active,
@@ -11707,6 +11989,34 @@ mod row_interaction {
         }
 
         fn diff(&mut self, tree: &mut Tree) {
+            if let Kind::ChangeScroll(target) = &self.kind {
+                let state = tree.state.downcast_mut::<State>();
+                if state.change_scroll_target.as_deref() != Some(target.as_ref()) {
+                    // The pinned keyed Column keeps positional children when
+                    // their count is unchanged. Explicitly replace native
+                    // scroll state when its model coordinates or owner change.
+                    *state = State {
+                        change_scroll_target: Some(target.clone()),
+                        ..State::default()
+                    };
+                    tree.children = self.children.iter().map(Tree::new).collect();
+                    return;
+                }
+            }
+            if let Kind::ChangeTarget(target) = &self.kind {
+                let state = tree.state.downcast_mut::<State>();
+                if state.change_target.as_deref() != Some(target.as_ref()) {
+                    // A position now represents a different file, directory,
+                    // worktree, area or comparison. Do not transfer a held
+                    // native button press, focus or tooltip to that target.
+                    *state = State {
+                        change_target: Some(target.clone()),
+                        ..State::default()
+                    };
+                    tree.children = self.children.iter().map(Tree::new).collect();
+                    return;
+                }
+            }
             if let Kind::FilteredScroll(filter) = self.kind {
                 let state = tree.state.downcast_mut::<State>();
                 let scroll = state.scroll.as_mut().expect("filtered scroll state");
@@ -13533,6 +13843,7 @@ pub(crate) mod tests {
                 prunable_reason: None,
             },
             Some(&StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: crate::repository::HeadState::Unknown,
                 tracking: TrackingState::NoUpstream,
@@ -13722,8 +14033,9 @@ pub(crate) mod tests {
     #[test]
     fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
         let renderer = headless_renderer();
-        let mut worktree = worktree(3, "feature", false);
-        worktree.chrome.dirty_badge = Some("3 changed files".into());
+        let worktree = worktree(3, "feature", true);
+        let expected_name = worktree_accessible_name(&worktree, WorktreeRowState::default());
+        assert!(expected_name.contains("1 changes"));
         fn badge_count(node: &layout::Node) -> usize {
             usize::from(
                 node.children().is_empty()
@@ -13764,11 +14076,14 @@ pub(crate) mod tests {
                 counts[1] + 1,
                 "only the changes badge is removed"
             );
-            assert_eq!(
-                accessible_names(&renderer, row(true)),
-                accessible_names(&renderer, row(false)),
-                "dirty status remains available to assistive technology"
-            );
+            for show in [true, false] {
+                let names = accessible_names(&renderer, row(show));
+                assert_eq!(
+                    names.first().map(String::as_str),
+                    Some(expected_name.as_ref()),
+                    "the row keeps its full dirty-status description, compact={compact}, show={show}"
+                );
+            }
             assert!(worktree_indicator(&worktree, true, None, compact, false).is_some());
         }
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
@@ -19336,6 +19651,7 @@ pub(crate) mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             status: StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: HeadState::Branch {
                     name: "main".into(),
@@ -19415,6 +19731,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn changes_tab_does_not_build_the_files_tree() {
+        let snapshot = snapshot();
+        let changes = SourceControlModel::ready_for_tab(main_key(), &snapshot, false);
+        assert!(changes.files.is_empty());
+        let files = SourceControlModel::ready_for_tab(main_key(), &snapshot, true);
+        assert!(!files.files.is_empty());
+        assert_eq!(changes.groups, files.groups);
+    }
+
+    #[test]
     fn ignored_files_and_folders_are_muted_without_affecting_change_review() {
         let mut snapshot = snapshot();
         snapshot.files.ignored = vec![repo_path("build/nested/output.log"), repo_path("debug.log")];
@@ -19475,19 +19801,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn change_pages_reach_every_file_and_bulk_commands_cover_the_entire_group() {
+    fn change_viewports_reach_every_file_and_bulk_commands_cover_the_entire_group() {
         let paths: Vec<_> = (0..501)
             .map(|index| repo_path(&format!("file-{index:04}.rs")))
             .collect();
         let tree = file_rows(&paths);
-        let mut visited = Vec::new();
-        for page in 0..3 {
-            let (rows, total) = change_row_page(&tree, None, true, page);
+        let mut visited = BTreeSet::new();
+        for first in (0..501).step_by(crate::change_list::VIEW_ROWS) {
+            let (rows, total) = change_viewport_rows(&tree, None, true, first);
             assert_eq!(total, 501);
             assert!(rows.len() <= MAX_VISIBLE_CHANGE_ROWS);
             visited.extend(rows.into_iter().map(|row| row.path.clone()));
         }
-        assert_eq!(visited, paths);
+        assert_eq!(visited.into_iter().collect::<Vec<_>>(), paths);
         let mut source = source_control();
         let group = ChangeGroup::new(
             source.key.worktree_id,
@@ -19521,10 +19847,1041 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tracked_only_refresh_preserves_complete_untracked_count_until_next_full_read() {
+        let mut row = worktree(11, "feature/changes", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        full.dirty.unstaged = 2;
+        row.apply_status(&full);
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        tracked.dirty.unstaged = 3;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15 changes"));
+        assert!(!row.chrome.tooltip.contains("tracked changes"));
+        row.apply_status(&StatusSnapshot::default());
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("No changes"));
+        assert!(row.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn capped_tracked_reads_keep_independent_complete_untracked_authority() {
+        let mut row = worktree(11, "feature/cap", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        full.dirty.unstaged = 2;
+        row.apply_status(&full);
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            listing_truncated: true,
+            ..Default::default()
+        };
+        tracked.dirty.unstaged = 3;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(row.untracked_complete);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15+ changes"));
+        assert_eq!(worktree_change_count(&row), "15+");
+        assert!(row.status_description().contains("listing limited"));
+        tracked.listing_truncated = false;
+        row.apply_status(&tracked);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15 changes"));
+        assert!(row.untracked_complete);
+        let mut partial_full = StatusSnapshot {
+            listing_truncated: true,
+            ..Default::default()
+        };
+        partial_full.dirty.untracked = 1;
+        row.apply_status(&partial_full);
+        assert!(!row.untracked_complete);
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.untracked_omitted);
+        assert!(!row.untracked_complete);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("3 tracked changes"));
+        row.apply_status(&full);
+        assert!(row.untracked_complete);
+        assert!(!row.untracked_omitted);
+        assert!(!row.listing_truncated);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+    }
+
+    #[test]
+    fn capped_zero_and_failed_reads_never_publish_a_complete_clean_claim() {
+        let mut row = worktree(11, "feature/large-record", false);
+        row.apply_status(&StatusSnapshot {
+            listing_truncated: true,
+            ..Default::default()
+        });
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("0+ changes"));
+        assert_eq!(worktree_change_count(&row), "0+");
+        assert!(!row.status_description().contains("No changes"));
+        row.apply_status_error(Some("status unavailable"));
+        assert_eq!(worktree_change_count(&row), "?");
+        assert!(row.status_description().contains("Last known: 0+ changes"));
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..Default::default()
+        };
+        tracked.dirty.unstaged = 1;
+        row.apply_status(&tracked);
+        assert!(row.status_error.is_none());
+        assert!(!row.untracked_complete);
+        assert!(row.untracked_omitted);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("1 tracked changes"));
+        row.apply_status(&StatusSnapshot::default());
+        assert!(row.untracked_complete);
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(row.status_description().contains("No changes"));
+    }
+
+    #[test]
+    fn failed_status_marks_cached_clean_as_last_known_and_identical_success_clears_it() {
+        let mut row = SidebarWorktree::new(
+            WorktreeId::new(),
+            "/repo".into(),
+            Some("main".into()),
+            false,
+            false,
+            Some(DirtyState::default()),
+            None,
+            None,
+        );
+        row.apply_status_error(Some("index unavailable"));
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(matches!(worktree_change_tone(&row), BadgeTone::Warning));
+        assert!(
+            row.chrome
+                .dirty_badge
+                .as_deref()
+                .unwrap()
+                .contains("Git status unavailable")
+        );
+        assert!(row.chrome.tooltip.contains("Last known: No changes"));
+        assert!(
+            row.chrome
+                .accessible_name
+                .contains("Git status unavailable")
+        );
+        assert!(
+            row.status_description().contains("index unavailable"),
+            "compact hover uses the same availability"
+        );
+        row.apply_status(&StatusSnapshot::default());
+        assert!(
+            row.status_error.is_none(),
+            "even an identical successful clean read clears error provenance"
+        );
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(!row.chrome.tooltip.contains("Git status unavailable"));
+        assert!(row.chrome.tooltip.contains("No changes"));
+
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        row.apply_status(&full);
+        row.apply_status_error(Some("full refresh failed"));
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        tracked.dirty.unstaged = 1;
+        row.apply_status(&tracked);
+        assert!(
+            row.status_error.is_none(),
+            "the tracked status read itself succeeded"
+        );
+        assert!(
+            row.untracked_omitted,
+            "failed refresh invalidates authority to reuse the old complete untracked count"
+        );
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("1 tracked changes"));
+        row.apply_status(&full);
+        assert!(!row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(row.chrome.tooltip.contains("12 changes"));
+    }
+
+    #[test]
+    fn conflicted_rows_have_a_distinct_change_glyph_and_tone() {
+        let mut row = worktree(11, "feature/conflict", false);
+        let mut status = StatusSnapshot::default();
+        status.dirty.conflicted = 1;
+        row.apply_status(&status);
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(matches!(worktree_change_tone(&row), BadgeTone::Danger));
+        status.dirty.conflicted = 0;
+        status.dirty.unstaged = 1;
+        row.apply_status(&status);
+        assert!(matches!(worktree_change_icon(&row), Icon::Changes));
+    }
+
+    #[test]
+    fn change_count_uses_a_bounded_label_and_does_not_report_unknown_as_current() {
+        let mut row = worktree(11, "feature/count", false);
+        let mut status = StatusSnapshot::default();
+        status.dirty.unstaged = 12;
+        row.apply_status(&status);
+        assert_eq!(worktree_change_count(&row), "12");
+        status.dirty.unstaged = 3323;
+        row.apply_status(&status);
+        assert_eq!(worktree_change_count(&row), "999+");
+        assert!(row.status_description().contains("3323 changes"));
+        row.apply_status_error(Some("status failed"));
+        assert_eq!(worktree_change_count(&row), "?");
+    }
+
+    #[test]
+    fn forty_thousand_change_rows_mount_only_the_scrolled_viewport_controls() {
+        let mut source = source_control();
+        source.groups = vec![ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Unstaged,
+            (0..40_000)
+                .map(|index| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            repo_path(&format!("file-{index:05}.rs")),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        )];
+        let group = &source.groups[0];
+        let first = group.rows.first().unwrap().chrome.stage_id.to_string();
+        let last = group.rows.last().unwrap().chrome.stage_id.to_string();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let ids = control_ids(&change_group_view(&state, &source, group, false));
+        assert!(ids.contains(&first));
+        assert!(!ids.contains(&last));
+        assert!(
+            ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8,
+            "mounted {} controls",
+            ids.len()
+        );
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: state.change_scroll_epoch,
+        });
+        let ids = control_ids(&change_group_view(&state, &source, group, false));
+        assert!(!ids.contains(&first));
+        assert!(ids.contains(&last));
+        assert!(
+            ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8,
+            "mounted {} controls",
+            ids.len()
+        );
+        assert_eq!(
+            group.rows.len(),
+            40_000,
+            "virtualization retains the complete command model"
+        );
+        let old_epoch = state.change_scroll_epoch;
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: source.key.clone(),
+            mode: FileListMode::Flat,
+        });
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: old_epoch,
+        });
+        assert!(
+            state.change_first_rows.is_empty(),
+            "old layout callbacks cannot undo a list-mode scroll reset"
+        );
+        assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: state.change_scroll_epoch,
+        });
+        assert!(
+            state.change_first_rows.is_empty(),
+            "old worktree scroll callbacks cannot move the newly bound pane"
+        );
+    }
+
+    #[test]
+    fn changing_change_layout_resets_the_native_scroll_state_with_its_coordinates() {
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+        };
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = Some(translation.y);
+            }
+        }
+        let mut source = source_control();
+        source.groups = vec![ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Unstaged,
+            (0..200)
+                .map(|index| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            repo_path(&format!("file-{index:04}.rs")),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        )];
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let group = &source.groups[0];
+        let scope = ChangeTreeScope::Area(group.area);
+        let renderer = headless_renderer();
+        let mut element = change_group_view(&state, &source, group, false);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(380.0, 500.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let id = stable_id(format!(
+            "changes.scroll.{}.{scope:?}.{}",
+            source.key.worktree_id, state.change_scroll_epoch
+        ));
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                id,
+                operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(640.0),
+                },
+            ),
+        );
+        let mut before = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        assert_eq!(before.0, Some(640.0));
+        drop(element);
+        let epoch = state.change_scroll_epoch;
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope,
+            epoch,
+            first_row: (640.0 / PANEL_ROW_HEIGHT) as usize,
+        });
+        assert!(state.change_first_rows[&scope] > 0);
+        element = change_group_view(&state, &source, group, false);
+        tree.diff(&mut element);
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut unchanged = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut unchanged);
+        assert_eq!(
+            unchanged.0,
+            Some(640.0),
+            "ordinary rebuilds retain scrolling"
+        );
+        assert_eq!(state.change_scroll_epoch, epoch);
+        drop(element);
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: source.key.clone(),
+            mode: FileListMode::Flat,
+        });
+        assert_ne!(state.change_scroll_epoch, epoch);
+        assert!(!state.change_first_rows.contains_key(&scope));
+        element = change_group_view(&state, &source, group, false);
+        tree.diff(&mut element);
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut after = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(
+            after.0,
+            Some(0.0),
+            "native offset and mounted row coordinates must reset together"
+        );
+    }
+
+    #[test]
+    fn change_group_headers_do_not_transfer_held_stage_all_presses_to_another_area() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{
+                Shell, clipboard,
+                widget::{Operation, operation},
+            },
+            mouse,
+        };
+        struct Bounds {
+            target: Id,
+            button: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.target) {
+                    self.button = Some(bounds);
+                }
+            }
+        }
+        let mut source = source_control();
+        let group = |area, name: &str| {
+            ChangeGroup::new(
+                source.key.worktree_id,
+                area,
+                vec![ChangeRow::new(
+                    source.key.worktree_id,
+                    &changed(
+                        repo_path(name),
+                        area,
+                        if area == ChangeArea::Untracked {
+                            ChangeKind::Untracked
+                        } else {
+                            ChangeKind::Modified
+                        },
+                        None,
+                    ),
+                )],
+            )
+        };
+        let original = group(ChangeArea::Unstaged, "original.rs");
+        let replacement = group(ChangeArea::Untracked, "replacement.rs");
+        source.groups = vec![original];
+        let state = panel_state(&panel_model());
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(380.0, 600.0));
+        let mut element = changes_section(&state, &source, false);
+        let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds {
+            target: source.groups[0].chrome.stage_all_id.clone(),
+            button: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let pointer = bounds
+            .button
+            .expect("original Stage all header is mounted")
+            .center();
+        let send = |element: &mut Element<'_, SidebarAction>,
+                    tree: &mut Tree,
+                    node: &layout::Node,
+                    event: Event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(node),
+                mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        send(
+            &mut element,
+            &mut tree,
+            &node,
+            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+        );
+        assert!(send(&mut element, &mut tree, &node, press.clone()).is_empty());
+        assert_eq!(
+            send(&mut element, &mut tree, &node, release.clone()),
+            vec![SidebarAction::ChangeGroup {
+                key: source.key.clone(),
+                area: ChangeArea::Unstaged,
+                command: ChangeGroupCommand::Stage
+            }]
+        );
+        assert!(send(&mut element, &mut tree, &node, press.clone()).is_empty());
+        drop(element);
+        // A disappears and B takes the same header position, just as empty
+        // groups omitted by changes_section shift later groups upwards.
+        source.groups = vec![replacement];
+        element = changes_section(&state, &source, false);
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds {
+            target: source.groups[0].chrome.stage_all_id.clone(),
+            button: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        assert_eq!(
+            bounds
+                .button
+                .expect("replacement header is mounted")
+                .center(),
+            pointer
+        );
+        assert!(
+            send(&mut element, &mut tree, &node, release.clone()).is_empty(),
+            "held Stage all must not transfer to the different area"
+        );
+        send(
+            &mut element,
+            &mut tree,
+            &node,
+            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+        );
+        assert!(send(&mut element, &mut tree, &node, press).is_empty());
+        let fresh = send(&mut element, &mut tree, &node, release);
+        assert_eq!(
+            fresh,
+            vec![SidebarAction::ChangeGroup {
+                key: source.key.clone(),
+                area: ChangeArea::Untracked,
+                command: ChangeGroupCommand::Stage
+            }]
+        );
+        let SidebarAction::Stage { selection, .. } =
+            resolve_group_command(&source, &fresh[0]).unwrap()
+        else {
+            panic!("expected current whole-group Stage");
+        };
+        assert_eq!(
+            selection,
+            vec![PathSelection::new(repo_path("replacement.rs"))]
+        );
+    }
+
+    #[test]
+    fn collapsing_groups_and_switching_tabs_remount_at_matching_native_and_model_coordinates() {
+        use cosmic::iced::{
+            Event, Rectangle, Vector,
+            advanced::{
+                Shell, clipboard,
+                widget::{Operation, operation},
+            },
+            mouse, window,
+        };
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = Some(translation.y);
+            }
+        }
+        fn body<'a>(
+            state: &'a SidebarState,
+            source: &'a SourceControlModel,
+        ) -> Element<'a, SidebarAction> {
+            match state.changes_tab {
+                ChangesTab::Changes => changes_section(state, source, false),
+                ChangesTab::Branch => branch_changes_section(state, source, false),
+                ChangesTab::History => history_section(state, source, false),
+            }
+        }
+        let renderer = headless_renderer();
+        for switch_tab in [false, true] {
+            let mut source = source_control();
+            source.groups = vec![ChangeGroup::new(
+                source.key.worktree_id,
+                ChangeArea::Unstaged,
+                (0..200)
+                    .map(|index| {
+                        ChangeRow::new(
+                            source.key.worktree_id,
+                            &changed(
+                                repo_path(&format!("file-{index:04}.rs")),
+                                ChangeArea::Unstaged,
+                                ChangeKind::Modified,
+                                None,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )];
+            let mut state = panel_state(&panel_model());
+            state.apply(&SidebarAction::SetChangeListMode {
+                key: source.key.clone(),
+                mode: FileListMode::Flat,
+            });
+            let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+            state.apply(&SidebarAction::ChangeViewport {
+                key: source.key.clone(),
+                scope,
+                epoch: state.change_scroll_epoch,
+                first_row: 20,
+            });
+            let old_epoch = state.change_scroll_epoch;
+            let limits = layout::Limits::new(Size::ZERO, Size::new(380.0, 600.0));
+            let mut element = body(&state, &source);
+            let mut tree = Tree::new(&element);
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let id = stable_id(format!(
+                "changes.scroll.{}.{scope:?}.{old_epoch}",
+                source.key.worktree_id
+            ));
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    id,
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(20.0 * PANEL_ROW_HEIGHT),
+                    },
+                ),
+            );
+            drop(element);
+            // Selecting the current tab and redrawing the same group is a no-op.
+            state.apply(&SidebarAction::SetChangesTab {
+                key: source.key.clone(),
+                tab: ChangesTab::Changes,
+            });
+            assert_eq!(state.change_scroll_epoch, old_epoch);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut before = Offset::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+            assert_eq!(before.0, Some(20.0 * PANEL_ROW_HEIGHT));
+            assert!(
+                control_ids(&element)
+                    .contains(&source.groups[0].rows[23].chrome.stage_id.to_string())
+            );
+            drop(element);
+            let away = if switch_tab {
+                SidebarAction::SetChangesTab {
+                    key: source.key.clone(),
+                    tab: ChangesTab::Branch,
+                }
+            } else {
+                SidebarAction::ToggleSection {
+                    key: source.key.clone(),
+                    section: PanelSection::Unstaged,
+                }
+            };
+            state.apply(&away);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut absent = Offset::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut absent);
+            assert_eq!(
+                absent.0, None,
+                "the real section/tab switch unmounted its virtual scrollable"
+            );
+            drop(element);
+            let back = if switch_tab {
+                SidebarAction::SetChangesTab {
+                    key: source.key.clone(),
+                    tab: ChangesTab::Changes,
+                }
+            } else {
+                away
+            };
+            state.apply(&back);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut first_layout = Offset::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut first_layout,
+            );
+            assert_eq!(
+                first_layout.0,
+                Some(0.0),
+                "first native layout must match the mounted top rows"
+            );
+            assert!(
+                control_ids(&element)
+                    .contains(&source.groups[0].rows[0].chrome.stage_id.to_string())
+            );
+            let mut callbacks = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(window::Event::RedrawRequested(std::time::Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut callbacks),
+                &Rectangle::with_size(Size::new(380.0, 600.0)),
+            );
+            drop(element);
+            for callback in callbacks {
+                if matches!(callback, SidebarAction::ChangeViewport { .. }) {
+                    state.apply(&callback);
+                }
+            }
+            state.apply(&SidebarAction::ChangeViewport {
+                key: source.key.clone(),
+                scope,
+                epoch: old_epoch,
+                first_row: 20,
+            });
+            assert_eq!(
+                state.change_first_rows.get(&scope).copied().unwrap_or(0),
+                0,
+                "redraw notifications and delayed old-layout callbacks must keep the top model coordinates"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_change_rows_do_not_transfer_a_held_stage_press_to_recycled_targets() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{
+                Shell, clipboard,
+                widget::{Operation, operation},
+            },
+            mouse,
+        };
+
+        #[derive(Default)]
+        struct Bounds {
+            target: Option<Id>,
+            button: Option<Rectangle>,
+            offset: f32,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == self.target.as_ref() {
+                    self.button = Some(bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.offset = translation.y;
+            }
+        }
+        struct Frame {
+            source: SourceControlModel,
+            state: SidebarState,
+            renderer: cosmic::Renderer,
+            tree: Tree,
+        }
+        impl Frame {
+            fn visit(
+                &mut self,
+                events: &[Event],
+                cursor: Point,
+                scroll: Option<f32>,
+                target: Option<Id>,
+            ) -> (Vec<SidebarAction>, Bounds) {
+                let mut element =
+                    change_group_view(&self.state, &self.source, &self.source.groups[0], false);
+                self.tree.diff(&mut element);
+                let viewport = Rectangle::with_size(Size::new(
+                    380.0,
+                    crate::change_list::VIEW_ROWS as f32 * PANEL_ROW_HEIGHT,
+                ));
+                let node = element.as_widget_mut().layout(
+                    &mut self.tree,
+                    &self.renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if let Some(y) = scroll {
+                    let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+                    let id = stable_id(format!(
+                        "changes.scroll.{}.{scope:?}.{}",
+                        self.source.key.worktree_id, self.state.change_scroll_epoch
+                    ));
+                    element.as_widget_mut().operate(
+                        &mut self.tree,
+                        Layout::new(&node),
+                        &self.renderer,
+                        &mut operation::scrollable::scroll_to::<()>(
+                            id,
+                            operation::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(y),
+                            },
+                        ),
+                    );
+                }
+                let mut published = Vec::new();
+                for event in events {
+                    element.as_widget_mut().update(
+                        &mut self.tree,
+                        event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(cursor),
+                        &self.renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut published),
+                        &viewport,
+                    );
+                }
+                let mut bounds = Bounds {
+                    target,
+                    ..Bounds::default()
+                };
+                element.as_widget_mut().operate(
+                    &mut self.tree,
+                    Layout::new(&node),
+                    &self.renderer,
+                    &mut bounds,
+                );
+                if let Some(button) = bounds.button.as_mut() {
+                    button.y -= bounds.offset;
+                }
+                drop(element);
+                for action in &published {
+                    if matches!(action, SidebarAction::ChangeViewport { .. }) {
+                        self.state.apply(action);
+                    }
+                }
+                (published, bounds)
+            }
+        }
+        for transition in ["scroll", "replace", "rename-source"] {
+            let mut source = source_control();
+            source.groups = vec![ChangeGroup::new(
+                source.key.worktree_id,
+                ChangeArea::Unstaged,
+                (0..200)
+                    .map(|index| {
+                        ChangeRow::new(
+                            source.key.worktree_id,
+                            &changed(
+                                repo_path(&format!("file-{index:04}.rs")),
+                                ChangeArea::Unstaged,
+                                ChangeKind::Modified,
+                                None,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )];
+            let mut state = panel_state(&panel_model());
+            state.apply(&SidebarAction::SetChangeListMode {
+                key: source.key.clone(),
+                mode: FileListMode::Flat,
+            });
+            let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+            state.apply(&SidebarAction::ChangeViewport {
+                key: source.key.clone(),
+                scope,
+                epoch: state.change_scroll_epoch,
+                first_row: 20,
+            });
+            let mut frame = Frame {
+                source,
+                state,
+                renderer: headless_renderer(),
+                tree: Tree::empty(),
+            };
+            let original = frame.source.groups[0].rows[23].clone();
+            let original_action = SidebarAction::Stage {
+                key: frame.source.key.clone(),
+                selection: vec![original.selection()],
+            };
+            let (_, bounds) = frame.visit(
+                &[],
+                Point::ORIGIN,
+                Some(20.0 * PANEL_ROW_HEIGHT),
+                Some(original.chrome.stage_id.clone()),
+            );
+            assert_eq!(bounds.offset, 20.0 * PANEL_ROW_HEIGHT);
+            let pointer = bounds
+                .button
+                .expect("original Stage control is mounted")
+                .center();
+            assert!(
+                (0.0..(crate::change_list::VIEW_ROWS as f32 * PANEL_ROW_HEIGHT))
+                    .contains(&pointer.y)
+            );
+            let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+            let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+            frame.visit(
+                &[Event::Mouse(mouse::Event::CursorMoved {
+                    position: pointer,
+                })],
+                pointer,
+                None,
+                None,
+            );
+            let (control, _) = frame.visit(&[press.clone(), release.clone()], pointer, None, None);
+            assert_eq!(
+                control,
+                vec![original_action],
+                "ordinary click must stage the actual original row"
+            );
+            let (held, _) = frame.visit(&[press.clone()], pointer, None, None);
+            assert!(held.is_empty(), "Stage is a release action");
+            if transition == "scroll" {
+                let (scroll, _) = frame.visit(
+                    &[Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Pixels {
+                            x: 0.0,
+                            y: -20.0 * PANEL_ROW_HEIGHT,
+                        },
+                    })],
+                    pointer,
+                    None,
+                    None,
+                );
+                assert!(scroll.iter().any(|action| matches!(action, SidebarAction::ChangeViewport { first_row, .. } if *first_row > 20)));
+            } else {
+                let rows = frame.source.groups[0]
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let mut entry = row.entry.clone();
+                        if entry.path == original.entry.path {
+                            if transition == "replace" {
+                                entry.path = repo_path("file-0023-replacement.rs");
+                            } else {
+                                entry.old_path = Some(repo_path("old-name.rs"));
+                                entry.kind = ChangeKind::Renamed;
+                            }
+                        }
+                        ChangeRow::new(frame.source.key.worktree_id, &entry)
+                    })
+                    .collect();
+                frame.source.groups = vec![ChangeGroup::new(
+                    frame.source.key.worktree_id,
+                    ChangeArea::Unstaged,
+                    rows,
+                )];
+            }
+            let first = frame.state.change_first_rows[&scope];
+            let replacement = frame.source.groups[0].rows[first + 3].clone();
+            let (_, after) = frame.visit(
+                &[],
+                pointer,
+                None,
+                Some(replacement.chrome.stage_id.clone()),
+            );
+            assert_eq!(
+                after.offset,
+                first as f32 * PANEL_ROW_HEIGHT,
+                "semantic row replacement must preserve the native scroll offset"
+            );
+            let replacement_pointer = after.button.expect("replacement Stage is mounted").center();
+            assert_eq!(
+                replacement_pointer, pointer,
+                "the recycled button really occupies the held screen position"
+            );
+            let (released, _) = frame.visit(&[release.clone()], pointer, None, None);
+            assert!(
+                released.is_empty(),
+                "held Stage must not act on replacement target ({transition})"
+            );
+            frame.visit(
+                &[Event::Mouse(mouse::Event::CursorMoved {
+                    position: pointer,
+                })],
+                pointer,
+                None,
+                None,
+            );
+            let (fresh, _) = frame.visit(&[press, release], pointer, None, None);
+            assert_eq!(
+                fresh,
+                vec![SidebarAction::Stage {
+                    key: frame.source.key.clone(),
+                    selection: vec![replacement.selection()]
+                }],
+                "a fresh gesture must still stage the current target ({transition})"
+            );
+        }
+    }
+
+    #[test]
     fn partial_status_does_not_claim_untracked_files_are_clean() {
         let mut worktree =
             SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
         let mut status = StatusSnapshot {
+            listing_truncated: false,
             untracked_omitted: true,
             ..StatusSnapshot::default()
         };
@@ -19540,6 +20897,43 @@ pub(crate) mod tests {
         status.untracked_omitted = false;
         worktree.apply_status(&status);
         assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
+    }
+
+    #[test]
+    fn failed_status_revokes_full_untracked_count_until_a_new_full_read() {
+        let mut row =
+            SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut status = StatusSnapshot::default();
+        status.dirty.untracked = 12;
+        row.apply_status(&status);
+        assert!(!row.untracked_omitted);
+        row.apply_status_error(Some("index unreadable"));
+        assert!(row.status_tooltip_for_test().contains("Last known:"));
+        status.untracked_omitted = true;
+        status.dirty.untracked = 0;
+        row.apply_status(&status);
+        assert!(
+            row.status_error.is_none(),
+            "successful tracked read clears its error"
+        );
+        assert!(
+            row.untracked_omitted,
+            "the stale full count is no longer authoritative"
+        );
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        status.untracked_omitted = false;
+        status.dirty.untracked = 3;
+        row.apply_status(&status);
+        assert!(!row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 3);
+        status.untracked_omitted = true;
+        status.dirty.untracked = 0;
+        row.apply_status(&status);
+        assert!(
+            !row.untracked_omitted,
+            "ordinary tracked reads preserve a trustworthy full count"
+        );
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 3);
     }
 
     #[test]

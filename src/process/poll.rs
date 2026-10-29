@@ -96,19 +96,30 @@ struct PipeCapture<R> {
     captured: PipeRead,
     error: Option<String>,
     limit: usize,
+    listing: Option<record_capture::NulPrefix>,
 }
 
 impl<R: Read + AsFd> PipeCapture<R> {
-    fn new(pipe: R, limit: usize) -> Self {
+    fn new(pipe: Option<R>, limit: usize, records: Option<usize>) -> Self {
         Self {
-            pipe: Some(pipe),
+            pipe,
             captured: PipeRead {
                 output: Vec::with_capacity(limit.min(8192)),
                 limit_exceeded: false,
+                stdout_truncated: false,
             },
             error: None,
             limit,
+            listing: records.map(|records| record_capture::NulPrefix::new(records, limit)),
         }
+    }
+
+    fn finish(self) -> PipeRead {
+        PipeRead::finish(
+            self.captured.output,
+            self.listing,
+            self.captured.limit_exceeded,
+        )
     }
 
     fn descriptor(&self) -> i32 {
@@ -131,6 +142,10 @@ impl<R: Read + AsFd> PipeCapture<R> {
                 }
                 Ok(read) => {
                     drained += read;
+                    if let Some(listing) = &mut self.listing {
+                        listing.push(&buffer[..read]);
+                        continue;
+                    }
                     let remaining = self.limit.saturating_sub(self.captured.output.len());
                     self.captured
                         .output
@@ -211,10 +226,11 @@ pub(super) fn execute(
     })?;
     let identity = child_identity(&child);
     let setup = (|| {
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("stdout pipe was unavailable"))?;
+        let stdout = match child.stdout.take() {
+            Some(pipe) => Some(pipe),
+            None if spec.stdout_file.is_some() => None,
+            None => return Err(io::Error::other("stdout pipe was unavailable")),
+        };
         let stderr = child
             .stderr
             .take()
@@ -223,7 +239,9 @@ pub(super) fn execute(
         if spec.stdin.is_some() && stdin.is_none() {
             return Err(io::Error::other("stdin pipe was unavailable"));
         }
-        set_nonblocking(stdout.as_fd())?;
+        if let Some(stdout) = &stdout {
+            set_nonblocking(stdout.as_fd())?;
+        }
         set_nonblocking(stderr.as_fd())?;
         if let Some(stdin) = &stdin {
             set_nonblocking(stdin.as_fd())?;
@@ -258,8 +276,10 @@ pub(super) fn execute(
     let mut child = PolledChild::new(child, identity);
     let _registration =
         cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
-    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
-    let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
+    // A retained stdout file has no pipe and ignores byte/record capture caps.
+    let records = stdout.as_ref().and(spec.stdout_record_limit);
+    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit, records);
+    let mut stderr = PipeCapture::new(Some(stderr), spec.stderr_limit, None);
     let input = spec.stdin.as_deref().unwrap_or_default();
     let mut written = 0;
     if input.is_empty() {
@@ -388,14 +408,14 @@ pub(super) fn execute(
         wait_error = Some(error);
         terminal_kind.get_or_insert(ProcessFailureKind::Io);
     }
-    let pipe_error = match (stdout.error, stderr.error) {
+    let pipe_error = match (stdout.error.take(), stderr.error.take()) {
         (Some(out), Some(err)) => Some(format!("stdout: {out}; stderr: {err}")),
         (Some(error), None) => Some(format!("stdout: {error}")),
         (None, Some(error)) => Some(format!("stderr: {error}")),
         (None, None) => None,
     };
-    let stdout_read = stdout.captured;
-    let stderr_read = stderr.captured;
+    let stdout_read = stdout.finish();
+    let stderr_read = stderr.finish();
     if let Some(kind) = terminal_kind {
         let message = match kind {
             ProcessFailureKind::Cancelled => "operation was cancelled".into(),
@@ -447,11 +467,9 @@ pub(super) fn execute(
             started: true,
         });
     }
-    Ok(ProcessOutput::from_parts(
-        status,
-        stdout_read.output,
-        stderr_read.output,
-    ))
+    let mut output = ProcessOutput::from_parts(status, stdout_read.output, stderr_read.output);
+    output.stdout_truncated = stdout_read.stdout_truncated;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -555,6 +573,64 @@ mod tests {
             fs::read(selected.join("payload")).unwrap(),
             b"replacement must survive\n"
         );
+    }
+
+    #[test]
+    fn polled_nul_prefix_drains_output_while_feeding_large_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        let count = directory.path().join("stdin-count");
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 2097152 /dev/zero; printf warning >&2; wc -c > \"$COUNT\"",
+            ])
+            .env("COUNT", count.as_os_str())
+            .stdin(input.clone())
+            .stdout_record_limit(7)
+            .output_limits(32, 7)
+            .timeout(Duration::from_secs(5));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, [0; 7]);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stderr, b"warning");
+        assert_eq!(
+            fs::read_to_string(count)
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn polled_stdout_file_keeps_stdin_stderr_and_ignores_capture_caps() {
+        use std::os::unix::fs::FileExt;
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "cat; printf warning >&2"])
+            .stdin(input.clone())
+            .stdout_record_limit(0)
+            .output_limits(1, 7)
+            .stdout_file(file.clone(), input.len() as u64 + 1)
+            .unwrap()
+            .timeout(Duration::from_secs(5));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert!(output.stdout.is_empty());
+        assert!(!output.stdout_truncated);
+        assert_eq!(output.stderr, b"warning");
+        assert_eq!(file.metadata().unwrap().len(), input.len() as u64);
+        let mut actual = vec![0; input.len()];
+        file.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, input);
     }
 
     #[test]

@@ -132,6 +132,11 @@ impl RecoverySlot {
             creation_guard: None,
         })
     }
+    pub(crate) fn belongs_to(&self, context: &RecoveryContext) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(&held.0, &context.0))
+    }
     pub(crate) fn with_creation_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
         // Only fresh pre-effect slots enter this constructor. The same guard
         // then travels through the factory, producer and recovery authority.

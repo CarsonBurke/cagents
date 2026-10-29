@@ -612,6 +612,14 @@ mod tests {
 
     #[test]
     fn unlocked_worker_without_receipt_is_never_inferred_successful() {
+        // A parallel fork can retain the lease until exec despite CLOEXEC.
+        // Isolate before creating it so dropping the sole owner is decisive.
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::unlocked_worker_without_receipt_is_never_inferred_successful"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let firing = Uuid::new_v4();
         let directory = root.path().join(firing.to_string());

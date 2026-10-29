@@ -1,6 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
 mod poll;
+mod record_capture;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -77,10 +78,13 @@ pub struct CommandSpec {
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
+    /// Opt-in NUL-record prefix capture; drain excess without killing Git.
+    pub stdout_record_limit: Option<usize>,
     pub stderr_limit: usize,
     // Borrowed only during execute; the journal service holds the owning file.
     pub(crate) inherited_lease: Option<i32>,
     inherited_files: Vec<InheritedFile>,
+    stdout_file: Option<(InheritedFile, libc::rlim_t)>,
 }
 
 impl CommandSpec {
@@ -94,9 +98,11 @@ impl CommandSpec {
             stdin: None,
             timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             stdout_limit: DEFAULT_STDOUT_LIMIT,
+            stdout_record_limit: None,
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
             inherited_files: Vec::new(),
+            stdout_file: None,
         }
     }
 
@@ -154,6 +160,61 @@ impl CommandSpec {
         Ok(self)
     }
 
+    /// Streams child stdout directly to this retained regular O_RDWR file.
+    ///
+    /// The file's current offset is shared with the caller. The caller owns
+    /// size/content validation and partial-output recovery. The child has a
+    /// regular-file growth limit of `max_file_bytes` (or its existing
+    /// soft/hard limit when smaller); exceeding it preserves the actual partial file.
+    /// This child-only limit also applies to its other regular-file writes.
+    /// The caller must not change the shared offset/flags while it runs. `ProcessOutput`
+    /// stdout stays empty; stdout byte/record capture limits do not apply.
+    /// Stderr, cancellation and process cleanup retain their normal bounds.
+    /// This does not certify descendant-family absence or authorize file removal.
+    pub(crate) fn stdout_file(
+        mut self,
+        file: Arc<std::fs::File>,
+        max_file_bytes: u64,
+    ) -> io::Result<Self> {
+        validate_inherited_fd(file.as_raw_fd())?;
+        // SAFETY: fcntl reads flags on the live descriptor owned by this Arc.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: lseek only observes the live file description offset.
+        let offset = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) };
+        if offset == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let metadata = file.metadata()?;
+        if flags & libc::O_ACCMODE != libc::O_RDWR
+            || flags & libc::O_APPEND != 0
+            || !metadata.is_file()
+            || metadata.len() != 0
+            || offset != 0
+            || max_file_bytes == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout sink must be a fresh regular O_RDWR file at offset zero without append, with a positive file-size budget",
+            ));
+        }
+        let max_file_bytes = libc::rlim_t::try_from(max_file_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout file-size budget is not representable",
+            )
+        })?;
+        self.stdout_file = Some((InheritedFile(file), max_file_bytes));
+        Ok(self)
+    }
+
+    pub fn stdout_record_limit(mut self, records: usize) -> Self {
+        self.stdout_record_limit = Some(records);
+        self
+    }
+
     pub fn to_command(&self) -> Command {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
@@ -207,7 +268,39 @@ impl CommandSpec {
         } else {
             Stdio::null()
         });
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some((file, max_file_bytes)) = &self.stdout_file {
+            command.stdout(Stdio::null());
+            let file = file.clone();
+            let max_file_bytes = *max_file_bytes;
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: only async-signal-safe resource-limit/descriptor syscalls
+                // run in the child. The
+                // prepared Command owns this Arc through spawn, even after the
+                // spec is dropped. Parent CLOEXEC and descriptors stay unchanged.
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                        if libc::getrlimit(libc::RLIMIT_FSIZE, limit.as_mut_ptr()) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let mut limit = limit.assume_init();
+                        limit.rlim_cur = max_file_bytes.min(limit.rlim_cur).min(limit.rlim_max);
+                        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::dup2(file.0.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        } else {
+            command.stdout(Stdio::piped());
+        }
+        command.stderr(Stdio::piped());
         command
     }
 }
@@ -327,6 +420,8 @@ pub struct ProcessOutput {
     pub signal: Option<i32>,
     pub success: bool,
     pub stdout: Vec<u8>,
+    #[serde(default)]
+    pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
 }
 
@@ -337,6 +432,7 @@ impl ProcessOutput {
             signal: exit_signal(&status),
             success: status.success(),
             stdout,
+            stdout_truncated: false,
             stderr,
         }
     }
@@ -834,6 +930,24 @@ fn terminate_process_tree(
 struct PipeRead {
     output: Vec<u8>,
     limit_exceeded: bool,
+    stdout_truncated: bool,
+}
+impl PipeRead {
+    fn finish(
+        output: Vec<u8>,
+        listing: Option<record_capture::NulPrefix>,
+        limit_exceeded: bool,
+    ) -> Self {
+        let (output, stdout_truncated) = match listing {
+            Some(listing) => listing.finish(),
+            None => (output, false),
+        };
+        Self {
+            output,
+            limit_exceeded,
+            stdout_truncated,
+        }
+    }
 }
 
 /// Puts `descriptor` into non-blocking mode, so a read or write reports
@@ -878,6 +992,114 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdout_file_streams_past_capture_limit_to_retained_inode() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selected");
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+        let spec = CommandSpec::new("/usr/bin/head")
+            .args(["-c", "4096", "/dev/zero"])
+            .output_limits(1, 128)
+            .stdout_file(file.clone(), 4097)
+            .unwrap();
+        let clone = spec.clone();
+        assert_eq!(spec, clone);
+        std::fs::rename(&path, directory.path().join("original")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let output = SystemProcessExecutor
+            .execute(&spec, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert!(output.stdout.is_empty());
+        assert_eq!(file.metadata().unwrap().len(), 4096);
+        let mut bytes = [1; 4096];
+        assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn stdout_file_child_size_limit_preserves_partial_and_parent_limit() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        // SAFETY: getrlimit initializes this plain OS limit structure.
+        let parent_limit = || unsafe {
+            let mut value = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, value.as_mut_ptr()), 0);
+            let value = value.assume_init();
+            (value.rlim_cur, value.rlim_max)
+        };
+        let before = parent_limit();
+        let output = SystemProcessExecutor
+            .execute(
+                &CommandSpec::new("/usr/bin/head")
+                    .args(["-c", "4096", "/dev/zero"])
+                    .stdout_file(file.clone(), 32)
+                    .unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(!output.success);
+        assert!(output.stdout.is_empty());
+        assert!(file.metadata().unwrap().len() > 0);
+        assert!(file.metadata().unwrap().len() <= 32);
+        assert_eq!(parent_limit(), before);
+    }
+
+    #[test]
+    fn stdout_file_timeout_retains_partial_without_stdout_capture() {
+        use std::os::unix::fs::FileExt;
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let failure = SystemProcessExecutor
+            .execute(
+                &CommandSpec::new("/bin/sh")
+                    .args(["-c", "printf partial; sleep 5"])
+                    .timeout(Duration::from_millis(100))
+                    .stdout_file(file.clone(), 64)
+                    .unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::TimedOut);
+        assert!(failure.started);
+        assert!(failure.stdout.is_empty());
+        let mut bytes = [0; 7];
+        assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"partial");
+    }
+
+    #[test]
+    fn stdout_file_prepared_command_keeps_owner_and_rejects_nonfresh_files() {
+        use std::os::unix::fs::FileExt;
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf exact; printf bounded-error >&2"])
+            .stdout_file(file.clone(), 64)
+            .unwrap();
+        let mut command = spec.to_command();
+        drop(spec);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"bounded-error");
+        let mut bytes = [0; 5];
+        assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"exact");
+        assert!(CommandSpec::new("/bin/true").stdout_file(file, 64).is_err());
+        assert!(
+            CommandSpec::new("/bin/true")
+                .stdout_file(Arc::new(tempfile::tempfile().unwrap()), 0)
+                .is_err()
+        );
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -1255,6 +1477,109 @@ sys.exit(7)
         assert!(output.success);
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_always_ready_stdout_observes_cleanup_between_read_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("prefix-drained");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let observed = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !observed.exists() {
+                assert!(Instant::now() < deadline, "capped stdout did not drain");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cancel.cancel();
+        });
+        // The first MiB cannot fit in the pipe. The marker therefore proves
+        // the real executor drained beyond its one-record prefix before the
+        // child continues writing an always-readable stream. Cancellation
+        // must win between bounded poll turns without treating the cap as an
+        // output-limit failure or retaining a reader helper thread.
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 1048576 /dev/zero; printf ready > \"$MARKER\"; while :; do head -c 1048576 /dev/zero; done"])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(1)
+            .output_limits(32, 128)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert!(failure.started);
+        assert_eq!(failure.stdout, [0]);
+        assert!(failure.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_listing_cap_drains_oversized_stdout_without_killing_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("listing-finished");
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf finished > \"$MARKER\"",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(10_000)
+            .timeout(Duration::from_secs(10));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout, vec![0; 10_000]);
+        assert_eq!(std::fs::read(marker).unwrap(), b"finished");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_listing_still_obeys_cancellation_and_stderr_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("drained");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let observed = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if observed.exists() {
+                    cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("listing did not finish draining before cancellation");
+        });
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(100)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert_eq!(failure.stdout.len(), 100);
+
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
+            .stdout_record_limit(100)
+            .output_limits(1024, 32);
+        let failure = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
+        assert!(failure.message.contains("stderr exceeded"));
     }
 
     #[cfg(unix)]

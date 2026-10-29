@@ -156,6 +156,12 @@ impl Root {
         metadata_of_descriptor(&self.directory)
     }
 
+    /// Enumerates this already-open directory, even if its old name is moved
+    /// or replaced. Child names must still be resolved beneath the root.
+    pub fn read_dir(&self) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
     /// Address this retained directory from a synchronous child without
     /// inheriting a descriptor. The caller must keep this root alive until
     /// that child exits; `/proc/self` would name the child's different FD table.
@@ -271,7 +277,7 @@ impl ResolveError {
         }
     }
 
-    fn io(path: &Path, error: &io::Error) -> Self {
+    pub(crate) fn io(path: &Path, error: &io::Error) -> Self {
         // `EACCES`, `EPERM` and `EROFS` are the three ways the kernel says "not
         // by you": the permission bits refuse it, a file attribute or a missing
         // capability refuses it, or the whole filesystem is mounted read-only.
@@ -452,6 +458,41 @@ pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> 
         format!("/proc/self/fd/{}", directory.descriptor()),
         std::fs::Permissions::from_mode(mode),
     )
+}
+
+/// Removes only an empty directory beneath the held root; never follows links.
+pub fn remove_empty_directory_beneath(root: &Root, relative: &Path) -> Result<bool, ResolveError> {
+    let (parent, name) = open_parent_beneath(root, relative)?;
+    let leaf = c_component(&name, &parent.path)?;
+    // SAFETY: both the held parent and leaf remain live through unlinkat.
+    let result = unsafe { libc::unlinkat(parent.descriptor(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+    ) {
+        return Ok(false);
+    }
+    Err(ResolveError::io(&parent.path.join(name), &error))
+}
+
+/// Creates a literal symlink entry inside its retained parent.
+pub fn symlink_within(directory: &Root, target: &Path, name: &OsStr) -> Result<(), ResolveError> {
+    let leaf = c_component(name, &directory.path)?;
+    let target = c_path(target).map_err(|error| ResolveError::io(&directory.path, &error))?;
+    // SAFETY: both C strings and the held directory outlive symlinkat.
+    let result = unsafe { libc::symlinkat(target.as_ptr(), directory.descriptor(), leaf.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ))
+    }
 }
 
 /// Removes only an empty direct child through its retained parent.
@@ -1042,6 +1083,55 @@ impl AccessAcl {
         }
         Ok(())
     }
+}
+
+/// Restores authenticated uid/gid on the same created inode before publication.
+pub(crate) fn restore_ownership(destination: &File, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let target = destination.metadata()?;
+    if uid == target.uid() && gid == target.gid() {
+        return Ok(());
+    }
+    // SAFETY: destination is a live descriptor; uid and gid come from the
+    // authenticated source policy. No pathname is resolved again here.
+    let status = unsafe { libc::fchown(destination.as_raw_fd(), uid, gid) };
+    if status < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot preserve file ownership: {error}"),
+        ));
+    }
+    let installed = destination.metadata()?;
+    if installed.uid() != uid || installed.gid() != gid {
+        return Err(io::Error::other(
+            "the filesystem did not preserve file ownership",
+        ));
+    }
+    Ok(())
+}
+
+/// Captures the observable original access ACL through its retained descriptor.
+pub(crate) fn capture_access_acl(source: &File) -> io::Result<Option<Vec<u8>>> {
+    // Recovery requires an observable policy: unsupported is not absence.
+    read_attribute(source, c"system.posix_acl_access")
+}
+
+/// Restores an original access ACL, including positively recorded absence.
+pub(crate) fn restore_access_acl(destination: &File, value: Option<&[u8]>) -> io::Result<()> {
+    let name = c"system.posix_acl_access";
+    if let Some(value) = value {
+        return write_attribute(destination, name, value);
+    }
+    // SAFETY: the descriptor is live and the attribute name is static.
+    let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+    if status < 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's

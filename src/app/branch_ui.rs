@@ -386,6 +386,7 @@ mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             status: StatusSnapshot {
+                listing_truncated: false,
                 head: HeadState::Detached {
                     oid: "ab".repeat(20),
                 },

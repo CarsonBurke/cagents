@@ -5,6 +5,15 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod authority;
+#[path = "repository_recovery.rs"]
+mod recovery;
+pub use authority::{WorktreeAuthority, WorktreeExecutor};
+use recovery::TrashReceipt;
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryResolution, RecoverOriginalFile, RecoverableDiscard,
+};
+
 mod managed_worktrees;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
@@ -13,7 +22,7 @@ pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read},
@@ -29,6 +38,7 @@ pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
+mod status_limit;
 #[cfg(test)]
 pub(crate) mod test_fixture;
 pub use pr_checkout::{
@@ -656,8 +666,10 @@ pub fn pull_request_refs(
 
 /// Independent source-control and file-browser demand. Neither collapsed changes
 /// nor background branch/HEAD checks need an untracked scan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotOptions {
+    /// Opt-in read-only UI cap. Safety and whole-group reads remain uncapped.
+    pub status_limit: Option<usize>,
     pub untracked_changes: bool,
     pub untracked_files: bool,
 }
@@ -665,8 +677,413 @@ pub struct SnapshotOptions {
 impl Default for SnapshotOptions {
     fn default() -> Self {
         Self {
+            status_limit: None,
             untracked_changes: true,
             untracked_files: true,
+        }
+    }
+}
+
+/// One bound panel's cache. Dropping it on a binding change releases retained
+/// file lists and untracked measurements rather than keeping every visited tree.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    digest: Option<[u8; 32]>,
+    dirty: bool,
+    fsmonitor: Option<OsString>,
+    fsmonitor_checked: bool,
+    options: Option<SnapshotOptions>,
+    metadata: Option<(
+        WorkingFiles,
+        Vec<RemoteRecord>,
+        Vec<LocalRefRecord>,
+        Vec<RemoteRefRecord>,
+        Vec<RemoteHead>,
+    )>,
+    numstats: BTreeMap<(ChangeArea, RepoPath), CachedNumstat>,
+    numstats_ready: bool,
+    numstat_policy: Option<NumstatPolicy>,
+    numstat_policy_stale: bool,
+    numstat_attributes: BTreeMap<PathBuf, Option<FileIdentity>>,
+    publication_config: BTreeMap<String, String>,
+    publication_dependencies: Option<PublicationDependencies>,
+    publication_system_root: Option<PublicationSystemRoot>,
+    last_status: Option<StatusSnapshot>,
+    status_attempt_failed: bool,
+    lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
+    observed: BTreeMap<RepoPath, Option<FileIdentity>>,
+    browse_root: Option<FileIdentity>,
+    admin: BTreeMap<PathBuf, Option<FileIdentity>>,
+}
+
+/// Read a small Git control file without waiting for FIFO/device producers.
+/// Git permits locator symlinks; follow them but require the opened target to
+/// be a bounded regular file. Missing optional files remain distinct from
+/// malformed or unreadable metadata; a failed prepass must not certify a cache.
+fn read_git_metadata_file(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Git metadata is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Git metadata exceeds its size limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+#[derive(Debug)]
+struct PublicationSystemRoot {
+    path: Option<PathBuf>,
+    known: bool,
+}
+
+#[derive(Debug)]
+struct PublicationDependencies {
+    files: BTreeMap<PathBuf, Option<FileIdentity>>,
+    origins_present: bool,
+    opaque: bool,
+    checked: Instant,
+}
+
+impl PublicationDependencies {
+    fn files_changed(&self) -> bool {
+        self.files.iter().any(|(path, previous)| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata))
+                != *previous
+        })
+    }
+
+    fn reconciliation_due(&self) -> bool {
+        self.opaque && self.checked.elapsed() >= Duration::from_secs(60)
+    }
+}
+
+/// Resolve administrative metadata locally, including linked worktree gitfiles.
+fn local_git_dir(worktree: &Path) -> io::Result<Option<PathBuf>> {
+    let path = worktree.join(".git");
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(Some(path)),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let Some(bytes) = read_git_metadata_file(&path, 4096)? else {
+        return Ok(None);
+    };
+    let value = bytes
+        .strip_prefix(b"gitdir: ")
+        .map(trim_one_line_ending)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid .git locator"))?;
+    let directory = bytes_to_path(value);
+    Ok(Some(if directory.is_absolute() {
+        directory
+    } else {
+        worktree.join(directory)
+    }))
+}
+
+struct SnapshotAdmin {
+    git_dir: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+    fingerprint: BTreeMap<PathBuf, Option<FileIdentity>>,
+}
+
+type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
+
+type NumstatBases = BTreeMap<(ChangeArea, RepoPath), [u8; 32]>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct NumstatPolicy {
+    attributes: Vec<PathBuf>,
+    reusable: bool,
+    reconcile_unchanged: bool,
+}
+
+/// Only records actually returned by Git are authoritative. In particular,
+/// omitted records in a capped listing must not become cached binary counts.
+#[derive(Debug, Clone)]
+struct CachedNumstat {
+    old_path: Option<RepoPath>,
+    kind: ChangeKind,
+    conflict: Option<ConflictKind>,
+    submodule: bool,
+    identity: Option<FileIdentity>,
+    basis: Option<[u8; 32]>,
+    added: Option<u64>,
+    removed: Option<u64>,
+}
+
+impl CachedNumstat {
+    fn matches(
+        &self,
+        entry: &ChangedPath,
+        identity: Option<FileIdentity>,
+        basis: Option<[u8; 32]>,
+    ) -> bool {
+        basis.is_some() && self.basis == basis && self.old_path == entry.old_path && self.kind == entry.kind
+            && self.conflict == entry.conflict && self.submodule == entry.submodule
+            // Porcelain's HEAD/index object and mode fields own staged
+            // counts; working bytes are a separate unstaged dependency.
+            && (entry.area == ChangeArea::Staged || (self.identity == identity
+                && (identity.is_some() || entry.kind == ChangeKind::Deleted)))
+    }
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// Filesystem-only metadata observations keep the missed-event fallback
+/// authoritative without extra Git commands on an unchanged snapshot.
+fn snapshot_admin_fingerprint(
+    worktree: &Path,
+    cancellation: &CancellationToken,
+) -> io::Result<SnapshotAdmin> {
+    let cancelled = || {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Git metadata observation cancelled",
+        )
+    };
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
+    let Some(git_dir) = local_git_dir(worktree)? else {
+        return Ok(SnapshotAdmin {
+            git_dir: None,
+            common_dir: None,
+            fingerprint: BTreeMap::new(),
+        });
+    };
+    let git_dir = fs::canonicalize(&git_dir)?;
+    let common = match read_git_metadata_file(&git_dir.join("commondir"), 4096)? {
+        Some(bytes) => fs::canonicalize(git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))?,
+        None => git_dir.clone(),
+    };
+    snapshot_admin_fingerprint_roots(git_dir, common, cancellation)
+}
+
+/// Metadata keys remain anchored to the SAME retained private/common roots.
+/// Their descriptor spellings stay alive with the source actor and its cache.
+fn snapshot_admin_fingerprint_roots(
+    git_dir: PathBuf,
+    common: PathBuf,
+    cancellation: &CancellationToken,
+) -> io::Result<SnapshotAdmin> {
+    let cancelled = || {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Git metadata observation cancelled",
+        )
+    };
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
+    let mut paths = BTreeMap::new();
+    for root in [&git_dir, &common] {
+        // Lock creation/removal changes directory times without changing Git
+        // state. For the admin roots only their directory identity matters.
+        let identity = fs::metadata(root).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(root.clone(), identity);
+    }
+    for name in [
+        "HEAD",
+        "index",
+        "commondir",
+        "config.worktree",
+        "FETCH_HEAD",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        let path = git_dir.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    for name in [
+        "config",
+        "packed-refs",
+        "info/exclude",
+        "refs/stash",
+        "logs/refs/stash",
+    ] {
+        let path = common.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    let mut pending = vec![common.join("refs"), git_dir.join("refs")];
+    while let Some(path) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        if paths.contains_key(&path) {
+            continue;
+        }
+        // Child identities below detect real ref additions/removals. Ignore
+        // directory times, which also change for unpublished *.lock files.
+        let identity = fs::metadata(&path).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(path.clone(), identity);
+        if let Ok(entries) = fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path();
+                    paths.insert(
+                        path.clone(),
+                        fs::symlink_metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    );
+                }
+            }
+        }
+    }
+    Ok(SnapshotAdmin {
+        git_dir: Some(git_dir),
+        common_dir: Some(common),
+        fingerprint: paths,
+    })
+}
+
+/// Replacement objects can change the bytes behind an unchanged object id.
+/// Packed refs are conservatively a count dependency since they can publish or
+/// remove replacements alongside unrelated branch refs.
+fn snapshot_count_admin_changed(
+    previous: &BTreeMap<PathBuf, Option<FileIdentity>>,
+    current: &BTreeMap<PathBuf, Option<FileIdentity>>,
+) -> bool {
+    let replacement_base = std::env::var_os("GIT_REPLACE_REF_BASE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("refs/replace"));
+    let relevant = |path: &&PathBuf| {
+        path.file_name().is_some_and(|name| name == "packed-refs")
+            || path
+                .ancestors()
+                .any(|ancestor| ancestor.ends_with(&replacement_base))
+    };
+    let previous: BTreeMap<_, _> = previous.iter().filter(|(path, _)| relevant(path)).collect();
+    let current: BTreeMap<_, _> = current.iter().filter(|(path, _)| relevant(path)).collect();
+    previous != current
+}
+
+impl SnapshotCache {
+    pub fn status_attempt_failed(&self) -> bool {
+        self.status_attempt_failed
+    }
+
+    /// Last successful display proof, including unchanged reads; never mutation authority.
+    pub fn row_status(&self) -> Option<&StatusSnapshot> {
+        self.last_status.as_ref()
+    }
+
+    /// The publication remote proven by the last successful snapshot read.
+    /// This display identity never grants permission to mutate a worktree.
+    pub fn publication_remote(&self) -> Option<&RemoteRecord> {
+        let branch = self.last_status.as_ref()?.branch()?;
+        let (_, remotes, ..) = self.metadata.as_ref()?;
+        select_branch_remote(remotes, &self.publication_config, branch)
+    }
+
+    /// Ignored-folder expansion is independent of porcelain status. Observe
+    /// its directory membership too, so the slow fallback repairs missed events.
+    pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
+        let Ok(root) = fs_safety::Root::open(worktree) else {
+            return;
+        };
+        self.browse_root = fs::symlink_metadata(worktree)
+            .ok()
+            .map(|metadata| file_identity(&metadata));
+        for path in files
+            .paths
+            .iter()
+            .chain(&files.ignored)
+            .chain(&files.directories)
+            .chain(&files.ignored_directories)
+        {
+            for ancestor in path.as_path().ancestors() {
+                let Ok(path) = RepoPath::parse(ancestor) else {
+                    continue;
+                };
+                if self.observed.contains_key(&path) {
+                    continue;
+                }
+                let metadata = fs_safety::metadata_beneath(&root, path.as_path())
+                    .ok()
+                    .map(|metadata| file_identity(&metadata));
+                self.observed.insert(path, metadata);
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self, metadata: bool) {
+        self.dirty = true;
+        if metadata {
+            self.metadata = None;
+            // Refresh metadata/policy while retaining measured counts. Each
+            // row also fences its exact HEAD/index basis; unrelated refs and
+            // unchanged index entries need not remeasure working content.
+            self.numstat_policy_stale = true;
+            self.publication_config.clear();
+            self.publication_dependencies = None;
+            self.fsmonitor_checked = false;
         }
     }
 }
@@ -676,6 +1093,9 @@ pub struct StatusSnapshot {
     /// This read deliberately skipped untracked files; zero is not authoritative.
     #[serde(default)]
     pub untracked_omitted: bool,
+    /// Listed paths and counts are lower bounds, never complete mutation input.
+    #[serde(default)]
+    pub listing_truncated: bool,
     pub head: HeadState,
     pub tracking: TrackingState,
     pub dirty: DirtyState,
@@ -687,6 +1107,19 @@ pub struct StatusSnapshot {
 }
 
 impl StatusSnapshot {
+    /// Scalar display facts without retaining any changed paths. This is never
+    /// sufficient to authorize a mutation or destructive operation.
+    pub fn display_summary(&self) -> Self {
+        Self {
+            untracked_omitted: self.untracked_omitted,
+            listing_truncated: self.listing_truncated,
+            head: self.head.clone(),
+            tracking: self.tracking.clone(),
+            dirty: self.dirty.clone(),
+            entries: Vec::new(),
+        }
+    }
+
     /// Entries in one area, in Git's reporting order.
     pub fn area(&self, area: ChangeArea) -> impl Iterator<Item = &ChangedPath> {
         self.entries.iter().filter(move |entry| entry.area == area)
@@ -858,6 +1291,12 @@ pub struct RefListing {
 /// The files one worktree offers, split by whether Git tracks them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkingFiles {
+    /// Paths omitted by the display cap: absence is not authoritative.
+    #[serde(default)]
+    pub listing_truncated: bool,
+    /// Explicitly demanded directories, retained independently of a prefix.
+    #[serde(default)]
+    pub directories: Vec<RepoPath>,
     /// Tracked and untracked paths together, excluding ignored ones,
     /// deduplicated and sorted: the file tree shows both.
     pub paths: Vec<RepoPath>,
@@ -1724,6 +2163,14 @@ pub fn parse_worktree_list(output: &[u8]) -> Result<Vec<WorktreeRecord>, GitPars
 }
 
 pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
+    parse_status_details(output, false).map(|(status, _)| status)
+}
+
+fn parse_status_details(
+    output: &[u8],
+    collect_bases: bool,
+) -> Result<(StatusSnapshot, NumstatBases), GitParseError> {
+    let mut bases = NumstatBases::new();
     let fields = nul_fields(output, "git status")?;
     let mut oid: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -1791,10 +2238,16 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
         match field[0] {
             b'1' => {
                 let record = parse_changed_record(field, index, 9)?;
+                if collect_bases {
+                    collect_numstat_bases(&mut bases, &record, index)?;
+                }
                 push_changed_entries(&mut entries, &mut dirty, &record, None, index)?;
             }
             b'2' => {
                 let record = parse_changed_record(field, index, 10)?;
+                if collect_bases {
+                    collect_numstat_bases(&mut bases, &record, index)?;
+                }
                 // The rename or copy source is its own NUL-delimited field
                 // immediately after the record.
                 index += 1;
@@ -1891,13 +2344,17 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
         },
         (upstream, _) => TrackingState::Unknown { upstream },
     };
-    Ok(StatusSnapshot {
-        untracked_omitted: false,
-        head,
-        tracking,
-        dirty,
-        entries,
-    })
+    Ok((
+        StatusSnapshot {
+            untracked_omitted: false,
+            listing_truncated: false,
+            head,
+            tracking,
+            dirty,
+            entries,
+        },
+        bases,
+    ))
 }
 
 /// The fields of a porcelain-v2 `1` or `2` record that this service uses.
@@ -1905,6 +2362,40 @@ struct ChangedRecord<'a> {
     xy: &'a [u8],
     submodule: bool,
     path: &'a [u8],
+    head_mode: &'a [u8],
+    index_mode: &'a [u8],
+    head_oid: &'a [u8],
+    index_oid: &'a [u8],
+}
+
+fn collect_numstat_bases(
+    bases: &mut NumstatBases,
+    record: &ChangedRecord<'_>,
+    index: usize,
+) -> Result<(), GitParseError> {
+    use sha2::Digest;
+    let path = repo_path_field(record.path, "git status", index)?;
+    for (code, area) in [
+        (record.xy[0], ChangeArea::Staged),
+        (record.xy[1], ChangeArea::Unstaged),
+    ] {
+        if code == b'.' {
+            continue;
+        }
+        let mut hash = sha2::Sha256::new();
+        for field in [record.index_mode, record.index_oid] {
+            hash.update(field);
+            hash.update([0]);
+        }
+        if area == ChangeArea::Staged {
+            for field in [record.head_mode, record.head_oid] {
+                hash.update(field);
+                hash.update([0]);
+            }
+        }
+        bases.insert((area, path.clone()), hash.finalize().into());
+    }
+    Ok(())
 }
 
 fn parse_changed_record<'a>(
@@ -1925,6 +2416,10 @@ fn parse_changed_record<'a>(
         xy,
         submodule: fields[2].first() == Some(&b'S'),
         path: fields[count - 1],
+        head_mode: fields[3],
+        index_mode: fields[4],
+        head_oid: fields[6],
+        index_oid: fields[7],
     })
 }
 
@@ -2480,6 +2975,181 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
     Ok(remotes.into_values().collect())
 }
 
+fn parse_publication_config(
+    output: &[u8],
+) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>), GitParseError> {
+    let values = String::from_utf8_lossy(output)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n'))
+        .filter(|(key, _)| {
+            *key == "remote.pushdefault"
+                || (key.starts_with("branch.")
+                    && (key.ends_with(".pushremote") || key.ends_with(".remote")))
+        })
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    let mut remote_records = Vec::new();
+    for record in nul_fields(output, "git publication config")? {
+        if record.starts_with(b"remote.") {
+            remote_records.extend_from_slice(record);
+            remote_records.push(0);
+        }
+    }
+    Ok((parse_remote_config(&remote_records)?, values))
+}
+
+/// One immutable observation per path binds every occurrence in a config read.
+/// A later include candidate must not overwrite a consumed origin's version.
+fn observe_publication_path(
+    files: &mut BTreeMap<PathBuf, Option<FileIdentity>>,
+    path: PathBuf,
+) -> bool {
+    files
+        .entry(path.clone())
+        .or_insert_with(|| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata))
+        })
+        .is_some()
+}
+
+fn parse_observed_publication_config(
+    worktree: &Path,
+    output: &[u8],
+    system_root: Option<&Path>,
+    system_known: bool,
+) -> Result<
+    (
+        Vec<RemoteRecord>,
+        BTreeMap<String, String>,
+        PublicationDependencies,
+    ),
+    GitParseError,
+> {
+    let mut files = BTreeMap::new();
+    let mut observe = |path: PathBuf| {
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+        let path = if path.is_absolute() {
+            path
+        } else {
+            worktree.join(path)
+        };
+        observe_publication_path(&mut files, path)
+    };
+    // A previously absent root config has no --show-origin record. Observe
+    // those defaults too, so adding the first relevant setting invalidates.
+    for name in ["GIT_CONFIG", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
+        if let Some(path) = std::env::var_os(name) {
+            observe(PathBuf::from(path));
+        }
+    }
+    if let Some(path) = system_root {
+        observe(path.to_owned());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        observe(PathBuf::from(&home).join(".gitconfig"));
+        observe(PathBuf::from(home).join(".config/git/config"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        observe(PathBuf::from(xdg).join("git/config"));
+    }
+    let fields = nul_fields(output, "git config origins")?;
+    if fields.len() % 2 != 0 {
+        return Err(malformed(
+            "git config origins",
+            fields.len(),
+            "origin is missing its value",
+        ));
+    }
+    let mut plain = Vec::new();
+    let mut opaque = !system_known;
+    let mut origins_present = true;
+    for pair in fields.chunks_exact(2) {
+        let origin = pair[0];
+        let record = pair[1];
+        let origin_file = origin.strip_prefix(b"file:").map(|path| {
+            let path = bytes_to_path(path);
+            if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            }
+        });
+        if let Some(path) = &origin_file {
+            // Unlike an absent include candidate, a consumed origin must have
+            // a real version. None before and after cannot certify bytes Git
+            // read from a transient file created only during its query.
+            origins_present &= observe(path.clone());
+        }
+        let split = record.iter().position(|byte| *byte == b'\n');
+        let (key, value) = split
+            .map(|split| (&record[..split], &record[split + 1..]))
+            .unwrap_or((record, &[]));
+        if key == b"include.path" || (key.starts_with(b"includeif.") && key.ends_with(b".path")) {
+            // Include values are relative to their declaring file, not cwd.
+            // Observe missing/empty targets as well as consumed origin files.
+            let path = if let Some(relative) = value.strip_prefix(b"~/") {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(bytes_to_path(relative)))
+            } else if value.starts_with(b"~") || value.starts_with(b"%(prefix)") {
+                None
+            } else {
+                let path = bytes_to_path(value);
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    origin_file
+                        .as_ref()
+                        .and_then(|origin| origin.parent())
+                        .map(|parent| parent.join(path))
+                }
+            };
+            if let Some(path) = path {
+                observe(path);
+            } else {
+                opaque = true;
+            }
+        }
+        if key.starts_with(b"remote.") || key.starts_with(b"branch.") {
+            plain.extend_from_slice(record);
+            plain.push(0);
+        }
+    }
+    let (remotes, values) = parse_publication_config(&plain)?;
+    Ok((
+        remotes,
+        values,
+        PublicationDependencies {
+            files,
+            origins_present,
+            opaque,
+            checked: Instant::now(),
+        },
+    ))
+}
+
+/// Keep cached snapshot and direct branch lookups on the same selection policy.
+fn select_branch_remote<'a>(
+    remotes: &'a [RemoteRecord],
+    values: &BTreeMap<String, String>,
+    branch: &str,
+) -> Option<&'a RemoteRecord> {
+    let selected = values
+        .get(&format!("branch.{branch}.pushremote"))
+        .or_else(|| values.get("remote.pushdefault"))
+        .or_else(|| values.get(&format!("branch.{branch}.remote")));
+    match selected {
+        Some(name) => remotes.iter().find(|remote| remote.name == *name),
+        None => remotes
+            .iter()
+            .find(|remote| remote.name == "origin")
+            .or_else(|| (remotes.len() == 1).then(|| &remotes[0])),
+    }
+}
+
 /// Parses a NUL-delimited path list, deduplicated and sorted.
 ///
 /// `git ls-files -c` prints one line per index stage, so an unmerged path
@@ -2787,11 +3457,28 @@ fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> DiffSide {
 /// Measures untracked text without one Git process (or allocation) per file.
 /// The same descriptor-relative resolver and per-side limit as the diff reader
 /// apply; failed, changing, and budget-exhausted reads leave honest unknowns.
+#[cfg(test)]
 fn measure_untracked(
     worktree: &Path,
     entries: &mut [ChangedPath],
     cancellation: &CancellationToken,
 ) {
+    measure_untracked_cached(worktree, entries, cancellation, &mut BTreeMap::new());
+}
+
+fn measure_untracked_cached(
+    worktree: &Path,
+    entries: &mut [ChangedPath],
+    cancellation: &CancellationToken,
+    cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>,
+) {
+    let current = entries
+        .iter()
+        .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
+        .take(MAX_UNTRACKED_STATUS_FILES)
+        .map(|entry| &entry.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    cache.retain(|path, _| current.contains(path));
     let mut untracked = entries
         .iter_mut()
         .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
@@ -2809,9 +3496,22 @@ fn measure_untracked(
         if cancellation.is_cancelled() || remaining == 0 {
             break;
         }
-        if let Some(lines) =
+        let identity = fs_safety::metadata_beneath(&root, entry.path.as_path())
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| file_identity(&metadata));
+        let cached = identity.and_then(|identity| {
+            cache
+                .get(&entry.path)
+                .filter(|(previous, _)| *previous == identity)
+                .map(|(_, lines)| *lines)
+        });
+        if let Some(lines) = cached.or_else(|| {
             untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
-        {
+        }) {
+            if let Some(identity) = identity {
+                cache.insert(entry.path.clone(), (identity, lines));
+            }
             entry.added_lines = Some(lines);
             entry.removed_lines = Some(0);
         }
@@ -3376,6 +4076,9 @@ pub enum RepositoryError {
 pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
+    authority: Option<WorktreeAuthority>,
+    // Original executor stays private when a scoped service materializes a blob.
+    creation_executor: Arc<dyn ProcessExecutor>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3385,10 +4088,15 @@ impl RepositoryService<SystemProcessExecutor> {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self {
+    pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self
+    where
+        E: 'static,
+    {
         Self {
             git: git.into(),
+            creation_executor: executor.clone(),
             executor,
+            authority: None,
         }
     }
 
@@ -3475,7 +4183,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         known_files: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<WorkingFiles, RepositoryError> {
-        let output = self.run_checked(
+        self.ignored_files_with_limit(worktree, known_files, None, cancellation)
+    }
+
+    pub fn ignored_files_with_limit(
+        &self,
+        worktree: &Path,
+        known_files: &[RepoPath],
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
             &self.git_read(
                 worktree,
                 [
@@ -3487,10 +4205,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "-z",
                 ],
             ),
+            limit,
+            status_limit::Format::Files,
             cancellation,
         )?;
         let parsed = (|| {
-            let mut files = WorkingFiles::default();
+            let mut files = WorkingFiles {
+                listing_truncated: truncated,
+                ..WorkingFiles::default()
+            };
             for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
                 .into_iter()
                 .enumerate()
@@ -3589,6 +4312,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// the index and also works on an unborn branch, where Git compares against
     /// the empty tree.
     pub fn numstat_command(&self, worktree: &Path, staged: bool) -> CommandSpec {
+        self.git_read(worktree, Self::numstat_arguments(staged))
+    }
+
+    fn numstat_arguments(staged: bool) -> Vec<OsString> {
         let mut arguments = vec![OsString::from("diff")];
         if staged {
             arguments.push(OsString::from("--cached"));
@@ -3599,7 +4326,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             OsString::from("--find-renames"),
             OsString::from("--no-color"),
         ]);
-        self.git_read(worktree, arguments)
+        arguments
     }
 
     pub fn discover(
@@ -3649,6 +4376,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // metadata.
                 self.worktree_root_of(selected_path, &git_dir, cancellation)?
             })
+        };
+        // Canonical CLI creator concern4aa: inherited FD spellings describe
+        // the actual read but never replace stable original display identity.
+        let (common_dir, git_dir, worktree_root) = if let Some(authority) = &self.authority {
+            if selected_path != authority.path() {
+                return Err(
+                    ValidationError::InvalidWorktree(selected_path.display().to_string()).into(),
+                );
+            }
+            authority.validate()?;
+            (
+                authority.stable_common_metadata_path().to_owned(),
+                authority.stable_private_metadata_path().to_owned(),
+                worktree_root.map(|_| authority.path().to_owned()),
+            )
+        } else {
+            (common_dir, git_dir, worktree_root)
         };
         Ok(RepositoryInfo {
             id: RepositoryId(stable_path_uuid(&common_dir)),
@@ -3769,6 +4513,81 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    fn listing_output(
+        &self,
+        command: &CommandSpec,
+        limit: Option<usize>,
+        format: status_limit::Format,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProcessOutput, bool), RepositoryError> {
+        let command = if let Some(limit) = limit {
+            let physical_records = match format {
+                status_limit::Format::Status => limit.saturating_mul(2).saturating_add(16),
+                status_limit::Format::Numstat => limit.saturating_mul(3),
+                status_limit::Format::Files => limit,
+            };
+            command
+                .clone()
+                .output_limits(64 * 1024 * 1024, command.stderr_limit)
+                .stdout_record_limit(physical_records)
+        } else {
+            command.clone()
+        };
+        let mut output = self.run_checked(&command, cancellation)?;
+        let Some(limit) = limit else {
+            return Ok((output, false));
+        };
+        let (length, truncated) =
+            match status_limit::prefix(&output.stdout, limit, output.stdout_truncated, format) {
+                Ok((prefix, truncated)) => (prefix.len(), truncated),
+                Err(error) => {
+                    return Err(RepositoryError::InvalidGitOutput {
+                        error,
+                        process: output,
+                    });
+                }
+            };
+        output.stdout.truncate(length);
+        output.stdout_truncated = truncated;
+        Ok((output, truncated))
+    }
+
+    /// A bounded read-only status projection for sidebar/watch presentation.
+    /// Counts are lower bounds when `listing_truncated` is true. This result
+    /// must never authorize all-path mutations or deletion safety decisions;
+    /// those callers continue to use the complete `status` read.
+    pub fn status_projection(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        self.status_listing(
+            worktree,
+            untracked,
+            Some(limit.clamp(1, 100_000)),
+            cancellation,
+        )
+    }
+
+    fn status_listing(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        let command = self.status_command_with_untracked(worktree, untracked);
+        let (output, truncated) =
+            self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
+        let parsed = parse_status(&output.stdout);
+        let mut status = invalid_output(parsed, output)?;
+        status.untracked_omitted = !untracked;
+        status.listing_truncated = truncated;
+        Ok(status)
+    }
+
     /// Everything the source-control surfaces need about one worktree.
     pub fn snapshot(
         &self,
@@ -3786,39 +4605,672 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status =
-            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
-        for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
-            let parsed = parse_numstat(&output.stdout);
-            let records = invalid_output(parsed, output)?;
-            merge_numstat(&mut status.entries, area, &records);
-        }
-        measure_untracked(worktree, &mut status.entries, cancellation);
+        self.snapshot_cached(
+            worktree,
+            options,
+            cancellation,
+            &mut SnapshotCache::default(),
+        )
+        .map(|snapshot| snapshot.expect("a fresh cache always returns a snapshot"))
+    }
 
-        let files_command = if options.untracked_files {
-            self.working_files_command(worktree)
-        } else {
-            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+    /// Only status runs for an unchanged refresh; callers invalidate content on
+    /// file events, since porcelain does not encode modified file contents.
+    pub fn snapshot_cached(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+        cache: &mut SnapshotCache,
+    ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        cache.status_attempt_failed = false;
+        let observe = || -> io::Result<SnapshotAdmin> {
+            if let Some(source) = &self.authority {
+                if source.path() != worktree {
+                    return Err(io::Error::other(
+                        "Snapshot cache belongs to another original source",
+                    ));
+                }
+                source.validate().map_err(io::Error::other)?;
+                snapshot_admin_fingerprint_roots(
+                    source.private_metadata_path(),
+                    source.common_metadata_path(),
+                    cancellation,
+                )
+            } else {
+                snapshot_admin_fingerprint(worktree, cancellation)
+            }
         };
-        let output = self.run_checked(&files_command, cancellation)?;
-        let parsed = parse_working_files(&output.stdout);
-        let files = invalid_output(parsed, output)?;
-
-        let remotes = self.remotes(worktree, cancellation)?;
-
-        let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
-        let parsed = parse_refs(&output.stdout);
-        let refs = invalid_output(parsed, output)?;
-
-        Ok(RepositorySnapshot {
+        let observation = observe().map_err(|error| {
+            cache.invalidate(true);
+            if cancellation.is_cancelled() {
+                RepositoryError::from(process_failure(
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Cancelled,
+                    "Git metadata observation cancelled",
+                    false,
+                ))
+            } else {
+                RepositoryError::from(ValidationError::Io(format!(
+                    "Cannot observe Git metadata for {}: {error}",
+                    worktree.display()
+                )))
+            }
+        })?;
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
+        let _git_dir = observation.git_dir;
+        let common_dir = observation.common_dir;
+        let admin = observation.fingerprint;
+        if cache
+            .publication_dependencies
+            .as_ref()
+            .is_some_and(PublicationDependencies::files_changed)
+        {
+            cache.invalidate(true);
+        } else if cache.metadata.is_some()
+            && cache
+                .publication_dependencies
+                .as_ref()
+                .is_some_and(PublicationDependencies::reconciliation_due)
+        {
+            // Opaque ~user/installation-prefix include targets cannot be
+            // fingerprinted before Git resolves them. Reconcile only this
+            // bound panel once a minute; identical config keeps the model.
+            let (remotes, selection, dependencies) = self.observed_publication_configuration(
+                worktree,
+                cancellation,
+                &cache.admin,
+                &mut cache.publication_system_root,
+            )?;
+            let (_, previous, ..) = cache.metadata.as_mut().unwrap();
+            if *previous != remotes || cache.publication_config != selection {
+                *previous = remotes;
+                cache.publication_config = selection;
+                cache.dirty = true;
+            }
+            cache.publication_dependencies = Some(dependencies);
+        }
+        if !cache.admin.is_empty() && cache.admin != admin {
+            if snapshot_count_admin_changed(&cache.admin, &admin) {
+                cache.numstats.clear();
+                cache.numstats_ready = false;
+            }
+            cache.invalidate(true);
+        }
+        if cache.options != Some(options) {
+            cache.invalidate(true);
+            cache.options = Some(options);
+        }
+        // Attribute changes can alter line counts without changing porcelain.
+        // Observe all known dependencies even when the watcher missed an event.
+        let mut attributes_changed = false;
+        for (path, previous) in &mut cache.numstat_attributes {
+            let current = fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata));
+            attributes_changed |= current != *previous;
+            *previous = current;
+        }
+        if attributes_changed {
+            cache.numstats.clear();
+            cache.numstats_ready = false;
+            cache.numstat_policy = None;
+            cache.numstat_attributes.clear();
+            cache.dirty = true;
+        }
+        if !cache.fsmonitor_checked {
+            let mut command = self.git_read(
+                worktree,
+                ["config", "--show-scope", "--get", "core.fsmonitor"],
+            );
+            // `git config` never refreshes an index or invokes fsmonitor. Read
+            // its scope without the safety override that normal commands use.
+            remove_fsmonitor_override(&mut command);
+            let output = self.run(&command, cancellation)?;
+            cache.fsmonitor = if output.success {
+                trusted_fsmonitor_with_roots(&output.stdout, worktree, &observation_root)
+            } else if output.exit_code == Some(1) {
+                None
+            } else {
+                return Err(git_failure(&command, output).into());
+            };
+            cache.fsmonitor_checked = true;
+        }
+        let (output, truncated) = self
+            .listing_output(
+                &snapshot_fsmonitor(
+                    self.status_command_with_untracked(worktree, options.untracked_changes),
+                    cache.fsmonitor.as_deref(),
+                ),
+                options.status_limit,
+                status_limit::Format::Status,
+                cancellation,
+            )
+            .inspect_err(|_| cache.status_attempt_failed = true)?;
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(&output.stdout);
+        digest.update([u8::from(truncated)]);
+        let digest: [u8; 32] = digest.finalize().into();
+        let mut observations_fresh = false;
+        if !cache.dirty
+            && cache.digest == Some(digest)
+            && cache.metadata.is_some()
+            && cache
+                .numstat_policy
+                .as_ref()
+                .is_none_or(|policy| !policy.reconcile_unchanged)
+        {
+            let root = fs_safety::Root::open(&observation_root).ok();
+            let mut unchanged = true;
+            // Keep the observation pass for a changed snapshot, rather than
+            // stat every changed path again before measuring its line counts.
+            for (path, previous) in &mut cache.observed {
+                let current = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                unchanged &= current == *previous;
+                *previous = current;
+            }
+            observations_fresh = true;
+            let root_unchanged = !options.untracked_files
+                || fs::symlink_metadata(&observation_root)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+                    == cache.browse_root;
+            if unchanged && root_unchanged {
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err(process_failure(
+                        &CommandSpec::new(&self.git),
+                        ProcessFailureKind::Cancelled,
+                        "source-control read cancelled",
+                        false,
+                    )
+                    .into());
+                }
+                return Ok(None);
+            }
+        }
+        cache.dirty = true;
+        let (mut status, bases) =
+            invalid_output(parse_status_details(&output.stdout, true), output)
+                .inspect_err(|_| cache.status_attempt_failed = true)?;
+        status.untracked_omitted = !options.untracked_changes;
+        status.listing_truncated = truncated;
+        let root = fs_safety::Root::open(&observation_root).ok();
+        // Capture identities before the readers. A concurrent write after a
+        // diff must remain detectable by the next missed-event reconciliation.
+        let mut observed = BTreeMap::new();
+        for entry in &status.entries {
+            observed.entry(entry.path.clone()).or_insert_with(|| {
+                if observations_fresh && let Some(identity) = cache.observed.get(&entry.path) {
+                    return *identity;
+                }
+                root.as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata))
+            });
+        }
+        if status
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.area, ChangeArea::Staged | ChangeArea::Unstaged))
+        {
+            if cache.numstat_policy.is_none() || cache.numstat_policy_stale {
+                let policy = self.numstat_policy(worktree, cancellation)?;
+                if cache
+                    .numstat_policy
+                    .as_ref()
+                    .is_some_and(|previous| previous != &policy)
+                {
+                    cache.numstats.clear();
+                    cache.numstats_ready = false;
+                    cache.numstat_attributes.clear();
+                }
+                cache.numstat_policy = Some(policy);
+                cache.numstat_policy_stale = false;
+            }
+            // Shared ancestors are inserted once, keeping large flat lists
+            // cheap. A bounded dependency graph degrades to complete reads.
+            let policy = cache.numstat_policy.as_mut().unwrap();
+            let mut dependencies = policy.attributes.clone();
+            if let Some(directory) = &common_dir {
+                dependencies.push(directory.join("info/attributes"));
+            }
+            for entry in &status.entries {
+                for path in std::iter::once(&entry.path).chain(entry.old_path.iter()) {
+                    for parent in path
+                        .as_path()
+                        .parent()
+                        .into_iter()
+                        .flat_map(Path::ancestors)
+                    {
+                        let dependency = observation_root.join(parent).join(".gitattributes");
+                        if cache.numstat_attributes.contains_key(&dependency) {
+                            break;
+                        }
+                        if cache.numstat_attributes.len() + dependencies.len() >= 8192 {
+                            policy.reusable = false;
+                            policy.reconcile_unchanged = true;
+                            break;
+                        }
+                        // Insert before visiting the next file, so common
+                        // ancestors do not accumulate in the pending vector.
+                        let identity = fs::metadata(&dependency)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata));
+                        cache.numstat_attributes.insert(dependency, identity);
+                    }
+                }
+            }
+            for dependency in dependencies.drain(..) {
+                let identity = fs::metadata(&dependency)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata));
+                cache
+                    .numstat_attributes
+                    .entry(dependency)
+                    .or_insert(identity);
+            }
+            if !policy.reusable {
+                cache.numstats_ready = false;
+            }
+        }
+        let numstats = self.snapshot_numstats(
+            worktree,
+            &mut status,
+            options,
+            cancellation,
+            cache,
+            &observed,
+            &bases,
+        )?;
+        measure_untracked_cached(
+            &observation_root,
+            &mut status.entries,
+            cancellation,
+            &mut cache.lines,
+        );
+        if options.untracked_files
+            && let Some((files, ..)) = cache.metadata.as_mut()
+        {
+            let (output, truncated) = self.listing_output(
+                &self.working_files_command(worktree),
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
+            *files = invalid_output(parse_working_files(&output.stdout), output)?;
+            files.listing_truncated = truncated;
+        }
+        if cache.metadata.is_none() {
+            let files_command = if options.untracked_files {
+                self.working_files_command(worktree)
+            } else {
+                self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+            };
+            let (output, truncated) = self.listing_output(
+                &files_command,
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
+            let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
+            files.listing_truncated = truncated;
+            let (remotes, publication_config, dependencies) = self
+                .observed_publication_configuration(
+                    worktree,
+                    cancellation,
+                    &admin,
+                    &mut cache.publication_system_root,
+                )?;
+            cache.publication_config = publication_config;
+            cache.publication_dependencies = Some(dependencies);
+            let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
+            let refs = invalid_output(parse_refs(&output.stdout), output)?;
+            cache.metadata = Some((files, remotes, refs.local, refs.remote, refs.remote_heads));
+        }
+        let (files, remotes, local_refs, remote_refs, remote_heads) =
+            cache.metadata.as_ref().unwrap();
+        cache.observed = observed;
+        cache.numstats = numstats;
+        cache.numstats_ready = true;
+        cache.browse_root = options
+            .untracked_files
+            .then(|| {
+                fs::symlink_metadata(&observation_root)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            })
+            .flatten();
+        cache.admin = admin;
+        cache.last_status = Some(status.display_summary());
+        cache.digest = Some(digest);
+        cache.dirty = false;
+        Ok(Some(RepositorySnapshot {
             status,
-            files,
-            remotes,
-            local_refs: refs.local,
-            remote_refs: refs.remote,
-            remote_heads: refs.remote_heads,
-        })
+            files: files.clone(),
+            remotes: remotes.clone(),
+            local_refs: local_refs.clone(),
+            remote_refs: remote_refs.clone(),
+            remote_heads: remote_heads.clone(),
+        }))
+    }
+
+    /// Reusing counts requires observing Git's attribute inputs. Drivers can
+    /// depend on arbitrary external state, so keep their existing full reads.
+    fn numstat_policy(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<NumstatPolicy, RepositoryError> {
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
+        let mut policy = NumstatPolicy {
+            attributes: Vec::new(),
+            reusable: true,
+            reconcile_unchanged: false,
+        };
+        if std::env::var_os("GIT_REPLACE_REF_BASE")
+            .is_some_and(|prefix| !prefix.is_empty() && prefix != "refs/replace/")
+        {
+            // Custom bases can be opaque namespaces or prefixes without a
+            // directory boundary. Do not depend on ordinary refs/ watches.
+            policy.reusable = false;
+            policy.reconcile_unchanged = true;
+        }
+        for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
+            let output = self.run(&self.git_read(worktree, ["var", variable]), cancellation)?;
+            // Older Git cannot expose the installation's attribute paths.
+            // Retain its existing unchanged-digest contract, while declining
+            // incremental reuse whenever a changed snapshot needs counts.
+            if !output.success {
+                policy.reusable = false;
+                if variable == "GIT_ATTR_GLOBAL" {
+                    let command = self.git_read(
+                        worktree,
+                        ["config", "--path", "--get", "core.attributesFile"],
+                    );
+                    let output = self.run(&command, cancellation)?;
+                    if output.success {
+                        let path = bytes_to_path(trim_one_line_ending(&output.stdout));
+                        if !path.as_os_str().is_empty() {
+                            policy.attributes.push(path);
+                        }
+                    } else if output.exit_code == Some(1) {
+                        if let Some(xdg) =
+                            std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+                        {
+                            policy
+                                .attributes
+                                .push(PathBuf::from(xdg).join("git/attributes"));
+                        } else if let Some(home) = std::env::var_os("HOME") {
+                            policy
+                                .attributes
+                                .push(PathBuf::from(home).join(".config/git/attributes"));
+                        }
+                    } else {
+                        return Err(git_failure(&command, output).into());
+                    }
+                }
+                // Legacy Git cannot report an installation-specific system
+                // attribute location. Its preexisting unchanged semantics stay
+                // intact; changed snapshots still use complete count reads.
+                continue;
+            }
+            let path = bytes_to_path(trim_one_line_ending(&output.stdout));
+            if !path.as_os_str().is_empty() {
+                policy.attributes.push(if path.is_absolute() {
+                    path
+                } else {
+                    observation_root.join(path)
+                });
+            }
+        }
+        // Only configuration names and the dependency-bearing values are
+        // requested; unrelated values (tokens, remote credentials) stay unread.
+        let command = self.git_read(worktree, ["config", "-z", "--show-origin", "--get-regexp", r"^(include(if\..*)?\.path|diff\..*\.(textconv|command)|diff\.external|filter\..*\.(clean|process))$"]);
+        let output = self.run(&command, cancellation)?;
+        if output.success {
+            let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+            for pair in fields.chunks(2) {
+                if pair.len() != 2 || pair[0].is_empty() {
+                    continue;
+                }
+                let mut record = pair[1].splitn(2, |byte| *byte == b'\n');
+                let key = record.next().unwrap_or_default();
+                let Some(value) = record.next() else {
+                    policy.reusable = false;
+                    policy.reconcile_unchanged = true;
+                    continue;
+                };
+                if key.starts_with(b"diff.") || key.starts_with(b"filter.") {
+                    policy.reusable = false;
+                    policy.reconcile_unchanged = true;
+                    continue;
+                }
+                let Some(origin) = pair[0].strip_prefix(b"file:") else {
+                    policy.reusable = false;
+                    policy.reconcile_unchanged = true;
+                    continue;
+                };
+                let origin = observation_root.join(bytes_to_path(origin));
+                let include = bytes_to_path(value);
+                if value.starts_with(b"~") && !value.starts_with(b"~/")
+                    || value.starts_with(b"%(prefix)")
+                {
+                    policy.reusable = false;
+                    policy.reconcile_unchanged = true;
+                    continue;
+                }
+                let include = if let Some(home) = std::env::var_os("HOME")
+                    && let Ok(relative) = include.strip_prefix("~")
+                {
+                    PathBuf::from(home).join(relative)
+                } else if include.is_absolute() {
+                    include
+                } else {
+                    origin.parent().unwrap_or(&observation_root).join(include)
+                };
+                policy.attributes.push(include);
+            }
+        } else if output.exit_code != Some(1) {
+            return Err(git_failure(&command, output).into());
+        }
+        let command = self.git_read(
+            worktree,
+            ["config", "-z", "--show-origin", "--name-only", "--list"],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+        for pair in fields.chunks(2) {
+            if pair.len() != 2 || pair[0].is_empty() {
+                continue;
+            }
+            if let Some(origin) = pair[0].strip_prefix(b"file:") {
+                policy
+                    .attributes
+                    .push(observation_root.join(bytes_to_path(origin)));
+            }
+        }
+        // Nonexistent standard configuration files have no --show-origin row.
+        // Creating one must still invalidate an otherwise unchanged snapshot.
+        policy.attributes.push(
+            std::env::var_os("GIT_CONFIG_SYSTEM")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/gitconfig")),
+        );
+        if let Some(path) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+            policy.attributes.push(PathBuf::from(path));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            policy
+                .attributes
+                .push(PathBuf::from(&home).join(".gitconfig"));
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(home).join(".config"));
+            policy.attributes.push(xdg.join("git/config"));
+        }
+        for dependency in &mut policy.attributes {
+            if dependency.is_relative() {
+                *dependency = observation_root.join(&*dependency);
+            }
+        }
+        policy.attributes.sort();
+        policy.attributes.dedup();
+        if policy.attributes.len() > 8192 {
+            policy.reusable = false;
+            policy.reconcile_unchanged = true;
+            policy.attributes.truncate(8192);
+        }
+        Ok(policy)
+    }
+
+    /// A few edited files must not reread every modified file in a large
+    /// worktree. Reuse only measured, unchanged rows and query the remaining
+    /// literal paths in small argument batches. Cold/policy changes and large
+    /// content batches retain the complete bounded listing policy.
+    fn snapshot_numstats(
+        &self,
+        worktree: &Path,
+        status: &mut StatusSnapshot,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+        cache: &SnapshotCache,
+        observed: &BTreeMap<RepoPath, Option<FileIdentity>>,
+        bases: &NumstatBases,
+    ) -> Result<BTreeMap<(ChangeArea, RepoPath), CachedNumstat>, RepositoryError> {
+        const MAX_TARGETS: usize = 128;
+        const MAX_TARGET_BYTES: usize = 32 * 1024;
+        const BATCH_BYTES: usize = 16 * 1024;
+        let mut next = BTreeMap::new();
+        for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
+            let (simple, added, deleted) = status
+                .entries
+                .iter()
+                .filter(|entry| entry.area == area)
+                .fold((true, false, false), |(simple, added, deleted), entry| {
+                    (
+                        simple
+                            && matches!(
+                                entry.kind,
+                                ChangeKind::Modified | ChangeKind::Added | ChangeKind::Deleted
+                            )
+                            && entry.conflict.is_none()
+                            && !entry.submodule,
+                        added || entry.kind == ChangeKind::Added,
+                        deleted || entry.kind == ChangeKind::Deleted,
+                    )
+                });
+            // Commands explicitly select --find-renames, not copy detection.
+            // Without an addition/deletion pair, rename detection cannot
+            // change another row's count. A capped prefix cannot prove the
+            // opposite half is absent, so keep its non-modification reads full.
+            let reusable = cache.numstats_ready
+                && simple
+                && !(added && deleted)
+                && !(status.listing_truncated && (added || deleted));
+            let mut paths = BTreeSet::new();
+            let mut pending = 0usize;
+            for entry in status.entries.iter_mut().filter(|entry| entry.area == area) {
+                let key = (area, entry.path.clone());
+                let identity = observed.get(&entry.path).copied().flatten();
+                if reusable
+                    && let Some(previous) = cache.numstats.get(&key)
+                    && previous.matches(entry, identity, bases.get(&key).copied())
+                {
+                    entry.added_lines = previous.added;
+                    entry.removed_lines = previous.removed;
+                    next.insert(key, previous.clone());
+                    continue;
+                }
+                pending += 1;
+                paths.insert(entry.path.clone());
+                if let Some(old) = &entry.old_path {
+                    paths.insert(old.clone());
+                }
+            }
+            if cache.numstats_ready && pending == 0 {
+                continue;
+            }
+            let bytes = paths.iter().fold(0usize, |bytes, path| {
+                bytes.saturating_add(path.as_bytes().len() + 1)
+            });
+            let scoped = reusable
+                && pending <= MAX_TARGETS
+                && bytes <= MAX_TARGET_BYTES
+                && paths.iter().all(|path| path.as_bytes().len() < BATCH_BYTES);
+            let mut commands = Vec::new();
+            if scoped {
+                let mut batch = Vec::new();
+                let mut batch_bytes = 0usize;
+                for path in paths {
+                    let bytes = path.as_bytes().len() + 1;
+                    if !batch.is_empty() && batch_bytes + bytes > BATCH_BYTES {
+                        let mut args = Self::numstat_arguments(staged);
+                        args.push("--".into());
+                        args.append(&mut batch);
+                        commands.push(self.git_literal_read(worktree, args));
+                        batch_bytes = 0;
+                    }
+                    batch.push(path.as_path().as_os_str().to_owned());
+                    batch_bytes += bytes;
+                }
+                if !batch.is_empty() {
+                    let mut args = Self::numstat_arguments(staged);
+                    args.push("--".into());
+                    args.append(&mut batch);
+                    commands.push(self.git_literal_read(worktree, args));
+                }
+            } else {
+                commands.push(self.numstat_command(worktree, staged));
+            }
+            let mut records = Vec::new();
+            for command in commands {
+                let (output, _) = self.listing_output(
+                    &snapshot_fsmonitor(command, cache.fsmonitor.as_deref()),
+                    options.status_limit,
+                    status_limit::Format::Numstat,
+                    cancellation,
+                )?;
+                records.extend(invalid_output(parse_numstat(&output.stdout), output)?);
+            }
+            let records: BTreeMap<_, _> = records
+                .into_iter()
+                .map(|record| (record.path.clone(), record))
+                .collect();
+            for entry in status.entries.iter_mut().filter(|entry| entry.area == area) {
+                let Some(record) = records.get(&entry.path) else {
+                    continue;
+                };
+                entry.added_lines = record.added;
+                entry.removed_lines = record.removed;
+                next.insert(
+                    (area, entry.path.clone()),
+                    CachedNumstat {
+                        old_path: entry.old_path.clone(),
+                        kind: entry.kind,
+                        conflict: entry.conflict,
+                        submodule: entry.submodule,
+                        identity: observed.get(&entry.path).copied().flatten(),
+                        basis: bases.get(&(area, entry.path.clone())).copied(),
+                        added: record.added,
+                        removed: record.removed,
+                    },
+                );
+            }
+        }
+        Ok(next)
     }
 
     /// The remotes configured for one worktree.
@@ -4726,6 +6178,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
+    /// Low-level irreversible compatibility operation. Product discard uses
+    /// `discard_recoverable` and retains its typed receipt.
     /// Restores tracked paths from the index and deletes untracked files.
     ///
     /// This destroys work that exists nowhere else, so it refuses to run
@@ -4862,11 +6316,228 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(report_discard(applied, failures))
     }
 
+    fn discard_recovery_mutation(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
+        native_batch: &mut Option<recovery::native_trash::Batch>,
+        live: &recovery::LiveDiscardRecovery,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recovery_mutation_observing(
+            request,
+            cancellation,
+            trashed,
+            captured_root,
+            captured_versions,
+            native_batch,
+            live,
+            &mut |_| {},
+        )
+    }
+
+    fn discard_recovery_mutation_observing(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
+        native_batch: &mut Option<recovery::native_trash::Batch>,
+        live: &recovery::LiveDiscardRecovery,
+        after_native_acquire: &mut impl FnMut(&RepoPath),
+    ) -> Result<MutationOutcome, RepositoryError> {
+        // The caller already holds the original context/Protection in the
+        // nonserializable receipt; never reacquire a path-only substitute.
+        if !request.confirmed {
+            return Err(ValidationError::ConfirmationRequired.into());
+        }
+        if !request.worktree.is_absolute() {
+            return Err(
+                ValidationError::InvalidWorktree(request.worktree.display().to_string()).into(),
+            );
+        }
+        let tracked =
+            self.matchable_pathspecs(&request.worktree, &request.tracked, cancellation)?;
+        let mut untracked: Vec<RepoPath> = Vec::with_capacity(request.untracked.len());
+        let mut seen = HashSet::new();
+        for path in &request.untracked {
+            if seen.insert(path.clone()) {
+                untracked.push(path.clone());
+            }
+        }
+        if tracked.is_empty() && untracked.is_empty() {
+            return Err(ValidationError::EmptySelection.into());
+        }
+
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
+        let mut applied = Vec::new();
+        if !tracked.is_empty() {
+            let command =
+                self.git_pathspec_mutation(&request.worktree, ["restore", "--worktree"], &tracked);
+            // A `restore` that reports a refusal changed nothing, and one that
+            // failed inside its write loop changed an amount only the user can
+            // establish. Neither leaves a half of the request that this may
+            // finish on its own: unlinking the untracked half afterwards would
+            // destroy files as part of an operation the caller is being told
+            // did not happen, or is being told to go and check.
+            match self.run_mutation(
+                &command,
+                tracked,
+                MutationScope::AtomicRefusal,
+                cancellation,
+            ) {
+                MutationOutcome::Applied { mut paths } => applied.append(&mut paths),
+                outcome => return Ok(outcome),
+            }
+        }
+        if untracked.is_empty() {
+            return Ok(MutationOutcome::Applied { paths: applied });
+        }
+
+        // This is Git's actual worktree index, including linked worktrees.
+        // Hold its standard lock while classifying and unlinking: otherwise a
+        // terminal's `git add` can make a selected path tracked after the read.
+        let mut index_lock = match self.discard_index_lock(&request.worktree, cancellation) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Ok(report_discard(
+                    applied,
+                    discard_failures(&untracked, format!("cannot protect the index: {error}")),
+                ));
+            }
+        };
+        let mut failures = (|| {
+            // The confirmation may have outlived the snapshot. Re-establish
+            // tracking under the lock, before deleting any untracked file.
+            let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation)
+            {
+                Ok(paths) => paths.into_iter().collect::<HashSet<_>>(),
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("could not verify that the path is still untracked: {error}"),
+                    );
+                }
+            };
+            let root = match captured_root.try_clone() {
+                Ok(root) => root,
+                Err(error) => {
+                    return discard_failures(
+                        &untracked,
+                        format!("{}: {error}", request.worktree.display()),
+                    );
+                }
+            };
+            if let Err(reason) = recovery::verify_recovery_root(captured_root) {
+                return discard_failures(&untracked, reason);
+            }
+            // A refused directory does not prevent independent selected files
+            // being attempted. Cancellation or loss of the index lock ends the
+            // remaining batch, whose paths are still known untouched.
+            let mut failures = Vec::new();
+            for (position, path) in untracked.iter().enumerate() {
+                let protected = if live.needs_resolution() {
+                    Err(
+                        "An earlier native Trash move needs recovery; this path was not changed"
+                            .to_owned(),
+                    )
+                } else if cancellation.is_cancelled() {
+                    Err("discard cancelled before deletion".to_owned())
+                } else {
+                    index_lock.check()
+                };
+                if let Err(reason) = protected {
+                    failures.extend(discard_failures(&untracked[position..], reason));
+                    break;
+                }
+                if tracked_now.contains(path) {
+                    failures.push(MutationFailure::Path {
+                        path: path.clone(),
+                        reason: "the path is tracked now but was untracked when it was selected"
+                            .into(),
+                    });
+                    continue;
+                }
+                match native_batch
+                    .as_mut()
+                    .ok_or_else(|| "No reserved native Trash batch".to_owned())
+                    .and_then(|batch| {
+                        batch.discard_observing(path, live, cancellation, || {
+                            after_native_acquire(path)
+                        })
+                    }) {
+                    Ok(receipt) => {
+                        if let Some(reason) = &receipt.warning {
+                            failures.push(MutationFailure::Path {
+                                path: path.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
+                        trashed.push(receipt);
+                        applied.push(path.clone());
+                    }
+                    Err(reason) => failures.push(MutationFailure::Path {
+                        path: path.clone(),
+                        reason,
+                    }),
+                }
+            }
+            failures
+        })();
+        if let Err(reason) = index_lock.release() {
+            let cleanup = format!("could not release the discard index lock: {reason}");
+            if applied.is_empty()
+                && let Some(MutationFailure::Path { reason, .. }) = failures.first_mut()
+            {
+                // A wholly refused discard presents its first path failure.
+                // Keep lock cleanup diagnostics visible there as well.
+                reason.push_str("; ");
+                reason.push_str(&cleanup);
+            } else {
+                failures.push(MutationFailure::Rejected { reason: cleanup });
+            }
+        }
+        if live.is_uncertain() {
+            return Ok(MutationOutcome::OutcomeUnknown {
+                failure: MutationFailure::Reconciliation {
+                    reason: format!(
+                        "Native Trash acquisition or publication remains unresolved; {} earlier paths were confirmed changed. The original receipt retains live recovery authority. {}",
+                        applied.len(),
+                        failures
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                },
+            });
+        }
+        Ok(report_discard(applied, failures))
+    }
+
     fn discard_index_lock(
         &self,
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<GitFileLock, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            authority.validate()?;
+            if authority.path() != worktree {
+                return Err(
+                    ValidationError::InvalidWorktree(worktree.display().to_string()).into(),
+                );
+            }
+            return authority.discard_index_lock();
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
@@ -5135,6 +6806,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         branch: &ValidatedBranchName,
         cancellation: &CancellationToken,
     ) -> Result<Option<RemoteRecord>, RepositoryError> {
+        let (remotes, config) = self.publication_configuration(worktree, cancellation)?;
+        Ok(select_branch_remote(&remotes, &config, branch.as_str()).cloned())
+    }
+
+    fn publication_configuration(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>), RepositoryError> {
         let command = self.git_read(
             worktree,
             ["config", "-z", "--get-regexp", r"^(remote|branch)\."],
@@ -5142,28 +6822,137 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run(&command, cancellation)?;
         if !output.success {
             return if output.exit_code == Some(1) {
-                Ok(None)
+                Ok((Vec::new(), BTreeMap::new()))
             } else {
                 Err(git_failure(&command, output).into())
             };
         }
-        let config = String::from_utf8_lossy(&output.stdout).into_owned();
-        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
-        let values: BTreeMap<_, _> = config
-            .split('\0')
-            .filter_map(|entry| entry.split_once('\n'))
-            .collect();
-        let selected = values
-            .get(format!("branch.{}.pushremote", branch.as_str()).as_str())
-            .or_else(|| values.get("remote.pushdefault"))
-            .or_else(|| values.get(format!("branch.{}.remote", branch.as_str()).as_str()));
-        Ok(match selected {
-            Some(name) => remotes.into_iter().find(|remote| remote.name == *name),
-            None => remotes
-                .iter()
-                .find(|remote| remote.name == "origin")
-                .cloned()
-                .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone())),
+        invalid_output(parse_publication_config(&output.stdout), output)
+    }
+
+    fn observed_publication_configuration(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+        admin: &BTreeMap<PathBuf, Option<FileIdentity>>,
+        system_root: &mut Option<PublicationSystemRoot>,
+    ) -> Result<
+        (
+            Vec<RemoteRecord>,
+            BTreeMap<String, String>,
+            PublicationDependencies,
+        ),
+        RepositoryError,
+    > {
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
+        if system_root.is_none() {
+            let command = self.git_read(worktree, ["var", "GIT_CONFIG_SYSTEM"]);
+            let output = self.run(&command, cancellation)?;
+            let disabled = std::env::var_os("GIT_CONFIG_SYSTEM")
+                .is_some_and(|value| value.is_empty())
+                || std::env::var("GIT_CONFIG_NOSYSTEM")
+                    .ok()
+                    .is_some_and(|value| {
+                        let value = value.trim().to_ascii_lowercase();
+                        matches!(value.as_str(), "true" | "yes" | "on")
+                            || value.parse::<i64>().is_ok_and(|value| value != 0)
+                    });
+            let path = if output.success {
+                let path = trim_one_line_ending(&output.stdout);
+                (!path.is_empty()).then(|| bytes_to_path(path))
+            } else {
+                None
+            };
+            *system_root = Some(PublicationSystemRoot {
+                path,
+                known: output.success || disabled,
+            });
+        }
+        let root = system_root.as_ref().unwrap();
+        let system = root.path.as_deref();
+        let system_known = root.known;
+        let (_, _, mut seed) =
+            parse_observed_publication_config(&observation_root, b"", system, system_known)?;
+        for path in admin.keys().filter(|path| {
+            matches!(
+                path.file_name().and_then(OsStr::to_str),
+                Some("config" | "config.worktree")
+            )
+        }) {
+            seed.files.insert(
+                path.clone(),
+                fs::metadata(path)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata)),
+            );
+        }
+        let base: Vec<_> = seed.files.keys().cloned().collect();
+        let mut known = seed.files;
+        for _ in 0..3 {
+            if cancellation.is_cancelled() {
+                return Err(process_failure(
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Cancelled,
+                    "publication config read cancelled",
+                    false,
+                )
+                .into());
+            }
+            let before: BTreeMap<_, _> = known
+                .keys()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        fs::metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    )
+                })
+                .collect();
+            let command = self.git_read(
+                worktree,
+                [
+                    "config",
+                    "-z",
+                    "--show-origin",
+                    "--get-regexp",
+                    r"^(remote|branch|include|includeif)\.",
+                ],
+            );
+            let output = self.run(&command, cancellation)?;
+            if !output.success && output.exit_code != Some(1) {
+                return Err(git_failure(&command, output).into());
+            }
+            let (remotes, selection, mut after) = invalid_output(
+                parse_observed_publication_config(
+                    &observation_root,
+                    &output.stdout,
+                    system,
+                    system_known,
+                ),
+                output,
+            )?;
+            for path in &base {
+                after.files.entry(path.clone()).or_insert_with(|| {
+                    fs::metadata(path)
+                        .ok()
+                        .map(|metadata| file_identity(&metadata))
+                });
+            }
+            if before == after.files && after.origins_present {
+                return Ok((remotes, selection, after));
+            }
+            // New origins need discovery followed by a fenced read. A post-read
+            // stat alone must never certify old values with a new file version.
+            known = after.files;
+        }
+        Err(RepositoryError::InvalidOutput {
+            field: "publication configuration",
+            reason: "configuration changed while reading; retry the refresh".into(),
         })
     }
 
@@ -6136,6 +7925,91 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
+/// A repository may request Git's builtin monitor (boolean true), but it may
+/// not select a hook program. Programs explicitly configured by the user in
+/// global/system configuration may retain authority when their absolute
+/// executable is outside repository content and contains no shell syntax.
+#[cfg(test)]
+fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
+    trusted_fsmonitor_with_roots(output, worktree, worktree)
+}
+fn trusted_fsmonitor_with_roots(
+    output: &[u8],
+    worktree: &Path,
+    held_worktree: &Path,
+) -> Option<OsString> {
+    let text = std::str::from_utf8(output).ok()?.trim_end_matches('\n');
+    let (scope, value) = text.split_once('\t')?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(OsString::from("true")),
+        "false" | "no" | "off" | "0" | "" => None,
+        _ if matches!(scope, "global" | "system" | "command") => {
+            // Git interprets hook values as commands. Relative commands and
+            // shell syntax can select code supplied by the current checkout.
+            let is_command_path = |path: &Path| {
+                path.is_absolute()
+                    && path
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
+            };
+            if !is_command_path(Path::new(value)) {
+                return None;
+            }
+            let executable = fs::canonicalize(value).ok()?;
+            let named_worktree = worktree;
+            let canonical_worktree =
+                fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+            let held_worktree =
+                fs::canonicalize(held_worktree).unwrap_or_else(|_| held_worktree.to_path_buf());
+            // Git receives the canonical path as a command string, so a safe
+            // symlink name must not introduce shell syntax through its target.
+            if !is_command_path(&executable)
+                || executable.starts_with(named_worktree)
+                || executable.starts_with(&canonical_worktree)
+                || executable.starts_with(&held_worktree)
+                || executable
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| parent.join(".git").exists())
+            {
+                return None;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&executable).ok()?;
+            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .then(|| executable.into_os_string())
+        }
+        _ => None,
+    }
+}
+
+fn remove_fsmonitor_override(command: &mut CommandSpec) {
+    if let Some(index) = command
+        .arguments
+        .iter()
+        .position(|argument| argument == OsStr::new("core.fsmonitor=false"))
+    {
+        command.arguments.remove(index);
+        command.arguments.remove(index - 1);
+    }
+}
+
+fn snapshot_fsmonitor(mut command: CommandSpec, configured: Option<&OsStr>) -> CommandSpec {
+    if let Some(configured) = configured
+        && let Some(argument) = command
+            .arguments
+            .iter_mut()
+            .find(|argument| **argument == OsStr::new("core.fsmonitor=false"))
+    {
+        let mut value = OsString::from("core.fsmonitor=");
+        value.push(configured);
+        *argument = value;
+    }
+    command
+}
+
 /// The ten NUL-separated fields [`parse_history`] expects, in order.
 const HISTORY_FORMAT: &str = "%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%s%x00%b";
 
@@ -6779,18 +8653,706 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
             self.commands.lock().unwrap().push(command.clone());
+            if command
+                .arguments
+                .ends_with(&[OsString::from("var"), OsString::from("GIT_CONFIG_SYSTEM")])
+            {
+                return success(b"/etc/gitconfig\n");
+            }
             self.outputs.lock().unwrap().pop().unwrap()
         }
     }
 
+    #[test]
+    fn ui_listing_cap_preserves_a_snapshot_when_status_exceeds_sixteen_megabytes() {
+        let mut stdout = b"# branch.head main\0# branch.oid (initial)\0".to_vec();
+        let path = "x".repeat(200);
+        for index in 0..90_000 {
+            stdout.extend_from_slice(format!("? {index}-{path}\0").as_bytes());
+        }
+        assert!(stdout.len() > 16 * 1024 * 1024);
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(&stdout)]));
+        let service = RepositoryService::new("git", executor.clone());
+        let status = service
+            .status_projection(Path::new("/repo"), true, 10_000, &CancellationToken::new())
+            .unwrap();
+        assert!(status.listing_truncated);
+        assert_eq!(status.entries.len(), 10_000);
+        let command = &executor.commands.lock().unwrap()[0];
+        assert_eq!(command.stdout_record_limit, Some(20_016));
+        assert_eq!(command.stdout_limit, 64 * 1024 * 1024);
+    }
+
     fn success(stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(0),
             signal: None,
             success: true,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         })
+    }
+
+    #[test]
+    fn snapshot_fsmonitor_honours_user_configuration_without_trusting_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+        let trusted = directory.path().join("monitor");
+        fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(b"local\ttrue\n", &worktree),
+            Some("true".into())
+        );
+        for scope in ["global", "system", "command"] {
+            let config = format!("{scope}\t{}\n", trusted.display());
+            assert_eq!(
+                trusted_fsmonitor(config.as_bytes(), &worktree),
+                Some(trusted.clone().into_os_string())
+            );
+        }
+        for config in [
+            "local\t./malicious-hook\n",
+            "worktree\t./malicious-hook\n",
+            "global\t./hooks/monitor\n",
+            "global\t/bin/true;./hook\n",
+            "local\tfalse\n",
+        ] {
+            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), None);
+        }
+        fs::create_dir(worktree.join(".git")).unwrap();
+        let untrusted = worktree.join("monitor");
+        fs::copy(&trusted, &untrusted).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(
+                format!("global\t{}\n", untrusted.display()).as_bytes(),
+                &worktree
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_fsmonitor_rejects_unsafe_canonical_symlink_targets() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+        let names = [
+            OsString::from("monitor space"),
+            OsString::from("monitor;marker"),
+            OsString::from("monitor$(marker)"),
+            OsString::from("monitor'quoted"),
+            OsString::from("monitor\nline"),
+            OsString::from_vec(b"monitor-\xff".to_vec()),
+            OsString::from("monitor-safe"),
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            let target = directory.path().join(name);
+            fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            let link = directory.path().join(format!("safe-link-{index}"));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let config = format!("global\t{}\n", link.display());
+            let expected = (target.file_name() == Some(OsStr::new("monitor-safe")))
+                .then(|| target.into_os_string());
+            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), expected);
+        }
+    }
+
+    fn snapshot_status(entries: &[u8]) -> Vec<u8> {
+        let mut status = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+        status.extend_from_slice(entries);
+        status
+    }
+
+    // FakeExecutor answers the installation-only GIT_CONFIG_SYSTEM query
+    // directly while recording it. These rows describe repository commands;
+    // total command assertions still count that one cold installation query.
+    fn cached_snapshot_outputs(
+        entries: &[u8],
+        files: &[u8],
+    ) -> Vec<Result<ProcessOutput, ProcessFailure>> {
+        vec![
+            exit(1, b""), // no configured fsmonitor
+            success(&snapshot_status(entries)),
+            success(b""), // staged numstat
+            success(b""), // unstaged numstat
+            success(files),
+            exit(1, b""), // no remotes
+            success(b""), // no refs
+        ]
+    }
+
+    #[test]
+    fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.push(success(&snapshot_status(b"")));
+        let mut metadata_outputs = cached_snapshot_outputs(b"", b"");
+        metadata_outputs.drain(2..4);
+        outputs.extend(metadata_outputs);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        cache.invalidate(true);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 14);
+    }
+
+    #[test]
+    fn snapshot_cache_notices_truncation_even_when_the_retained_prefix_is_identical() {
+        let mut outputs = cached_snapshot_outputs(b"? first.txt\0", b"");
+        outputs.push(success(&snapshot_status(b"? first.txt\0? second.txt\0")));
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor);
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::new();
+        let options = SnapshotOptions {
+            status_limit: Some(1),
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let first = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status.entries.len(), 1);
+        assert!(!first.status.listing_truncated);
+        let next = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .expect("a newly truncated snapshot must update its lower-bound notice");
+        assert_eq!(next.status.entries, first.status.entries);
+        assert!(next.status.listing_truncated);
+    }
+
+    #[test]
+    fn snapshot_publication_remote_matches_direct_selection_without_an_extra_process() {
+        let branch = ValidatedBranchName::parse("main").unwrap();
+        for (config, expected) in [
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\nfork\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\norigin\0branch.main.pushremote\nfork\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0remote.pushdefault\nfork\0branch.main.remote\norigin\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\n.\0",
+                None,
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\nmissing\0",
+                None,
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0",
+                Some("origin"),
+            ),
+            (
+                "remote.fork.url\nhttps://github.com/new/repo.git\0",
+                Some("fork"),
+            ),
+            (
+                "remote.first.url\nhttps://github.com/first/repo.git\0remote.second.url\nhttps://github.com/second/repo.git\0",
+                None,
+            ),
+            ("", None),
+        ] {
+            let direct = fake_service(vec![success(config.as_bytes())])
+                .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+                .unwrap();
+            let status = b"# branch.oid (initial)\0# branch.head main\0";
+            let mut outputs = (0..7).map(|_| success(b"")).collect::<Vec<_>>();
+            outputs[1] = success(status);
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            fs::create_dir(root.join(".git")).unwrap();
+            let config_path = root.join(".git/config");
+            fs::write(&config_path, "").unwrap();
+            let mut observed = Vec::new();
+            for record in config
+                .as_bytes()
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+            {
+                observed.extend_from_slice(format!("file:{}\0", config_path.display()).as_bytes());
+                observed.extend_from_slice(record);
+                observed.push(0);
+            }
+            outputs[5] = success(&observed);
+            outputs.push(success(status));
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let service = RepositoryService::new("git", executor.clone());
+            let mut cache = SnapshotCache::default();
+            let cancel = CancellationToken::new();
+            assert!(
+                service
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                cache
+                    .publication_remote()
+                    .map(|remote| remote.name.as_str()),
+                expected
+            );
+            assert_eq!(cache.publication_remote(), direct.as_ref());
+            assert_eq!(executor.commands.lock().unwrap().len(), 8);
+            assert!(
+                service
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(cache.publication_remote(), direct.as_ref());
+            assert_eq!(
+                executor.commands.lock().unwrap().len(),
+                9,
+                "unchanged publication proof must use only the existing status process"
+            );
+        }
+        let config = "remote.origin.url\nhttps://github.com/first/repo.git\0remote.origin.url\nhttps://github.com/second/repo.git\0remote.origin.pushurl\nhttps://github.com/push-first/repo.git\0remote.origin.pushurl\nhttps://github.com/push-second/repo.git\0";
+        let direct = fake_service(vec![success(config.as_bytes())])
+            .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            direct.fetch_url.as_deref(),
+            Some("https://github.com/first/repo.git")
+        );
+        assert_eq!(
+            direct.push_url.as_deref(),
+            Some("https://github.com/push-first/repo.git")
+        );
+    }
+
+    #[test]
+    fn publication_origins_observe_absent_and_empty_include_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        let config = root.join(".git/config");
+        fs::write(&config, "[include]\n path = publication.inc\n").unwrap();
+        let observed = format!("file:{}\0include.path\npublication.inc\0", config.display());
+        let (_, _, absent) = parse_observed_publication_config(
+            root,
+            observed.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+            true,
+        )
+        .unwrap();
+        let included = root.join(".git/publication.inc");
+        assert_eq!(absent.files.get(&included), Some(&None));
+        assert!(!absent.opaque);
+        assert!(!absent.files_changed());
+        fs::write(&included, "").unwrap();
+        assert!(
+            absent.files_changed(),
+            "creation of a missing include must invalidate"
+        );
+        let (_, _, empty) = parse_observed_publication_config(
+            root,
+            observed.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+            true,
+        )
+        .unwrap();
+        assert!(!empty.files_changed());
+        fs::write(&included, "[branch \"main\"]\n pushRemote = fork\n").unwrap();
+        assert!(
+            empty.files_changed(),
+            "an empty include still carries file provenance"
+        );
+        let opaque = format!(
+            "file:{}\0include.path\n~other-user/config\0",
+            config.display()
+        );
+        let (_, _, mut dependencies) = parse_observed_publication_config(
+            root,
+            opaque.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+            true,
+        )
+        .unwrap();
+        assert!(dependencies.opaque);
+        assert!(!dependencies.reconciliation_due());
+        dependencies.checked = Instant::now() - Duration::from_secs(61);
+        assert!(
+            dependencies.reconciliation_due(),
+            "opaque targets receive bounded reconciliation"
+        );
+    }
+
+    #[test]
+    fn repeated_origin_and_candidate_visits_keep_one_dependency_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("include.inc");
+        let mut first_absent = BTreeMap::new();
+        assert!(!observe_publication_path(&mut first_absent, path.clone()));
+        fs::write(&path, "[branch \"main\"]\n pushRemote = transient\n").unwrap();
+        assert!(
+            !observe_publication_path(&mut first_absent, path.clone()),
+            "an absent candidate cannot acquire certification from a later consumed visit"
+        );
+        assert_eq!(first_absent.get(&path), Some(&None));
+        let mut consumed = BTreeMap::new();
+        assert!(observe_publication_path(&mut consumed, path.clone()));
+        let consumed_version = consumed[&path];
+        fs::remove_file(&path).unwrap();
+        assert!(
+            observe_publication_path(&mut consumed, path.clone()),
+            "a later inactive include candidate must not overwrite the origin's Some version"
+        );
+        assert_eq!(consumed[&path], consumed_version);
+        assert_ne!(
+            first_absent, consumed,
+            "the complete before/after fence must reject transient origins"
+        );
+    }
+
+    #[test]
+    fn disabled_system_config_is_known_absence_without_periodic_queries() {
+        let root = Path::new("/publication-known-absence");
+        let (_, _, mut disabled) =
+            parse_observed_publication_config(root, b"", None, true).unwrap();
+        disabled.checked = Instant::now() - Duration::from_secs(61);
+        assert!(!disabled.opaque);
+        assert!(
+            !disabled.reconciliation_due(),
+            "explicitly disabled system config is not an unknown installation"
+        );
+        let (_, _, mut unknown) =
+            parse_observed_publication_config(root, b"", None, false).unwrap();
+        unknown.checked = Instant::now() - Duration::from_secs(61);
+        assert!(
+            unknown.reconciliation_due(),
+            "unsupported path discovery must retain bounded reconciliation"
+        );
+    }
+
+    #[test]
+    fn snapshot_cache_distinguishes_status_failures_from_later_or_prepass_errors() {
+        let options = SnapshotOptions {
+            status_limit: None,
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let failure = || {
+            Ok(ProcessOutput {
+                stdout_truncated: false,
+                exit_code: Some(128),
+                signal: None,
+                success: false,
+                stdout: Vec::new(),
+                stderr: b"fixture failure".to_vec(),
+            })
+        };
+        let valid = b"# branch.oid (initial)\0# branch.head main\0";
+        for (checked, outputs, expected) in [
+            (false, vec![failure()], false), // config prepass, before status
+            (true, vec![failure()], true),   // actual status command
+            (true, vec![success(b"invalid status\0")], true), // status parser
+            (true, vec![success(valid), failure()], false), // numstat, after status
+        ] {
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let git = RepositoryService::new("git", executor);
+            let mut cache = SnapshotCache {
+                options: Some(options),
+                fsmonitor_checked: checked,
+                status_attempt_failed: true,
+                ..Default::default()
+            };
+            assert!(
+                git.snapshot_cached(
+                    Path::new("/snapshot-status-failure"),
+                    options,
+                    &CancellationToken::new(),
+                    &mut cache
+                )
+                .is_err()
+            );
+            assert_eq!(
+                cache.status_attempt_failed(),
+                expected,
+                "classification must reset before every attempt, not leak an older failure"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_cache_status_or_content_change_reuses_metadata() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        for _ in 0..2 {
+            outputs.push(success(&snapshot_status(b"? new.txt\0")));
+        }
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        git.snapshot_cached(
+            root,
+            SnapshotOptions {
+                status_limit: None,
+                untracked_changes: true,
+                untracked_files: false,
+            },
+            &cancel,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        let changed = git
+            .snapshot_cached(
+                root,
+                SnapshotOptions {
+                    status_limit: None,
+                    untracked_changes: true,
+                    untracked_files: false,
+                },
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.status.entries.len(), 1);
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        cache.invalidate(false);
+        assert!(
+            git.snapshot_cached(
+                root,
+                SnapshotOptions {
+                    status_limit: None,
+                    untracked_changes: true,
+                    untracked_files: false
+                },
+                &cancel,
+                &mut cache
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn snapshot_cache_fallback_detects_content_changes_with_identical_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "abc\n").unwrap();
+        let mut outputs = cached_snapshot_outputs(b"? new.txt\0", b"? new.txt\0");
+        outputs.extend([
+            success(&snapshot_status(b"? new.txt\0")),
+            success(&snapshot_status(b"? new.txt\0")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            status_limit: None,
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        let first = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status.entries[0].added_lines, Some(1));
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        // Same size and same porcelain; only descriptor metadata detects this
+        // when the native event was lost.
+        fs::write(&file, "a\nb\n").unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let second = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status.entries[0].added_lines, Some(2));
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.extend([
+            success(&snapshot_status(b"")),
+            success(b"? new.txt\0"),
+            success(&snapshot_status(b"")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            status_limit: None,
+            untracked_changes: false,
+            untracked_files: true,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap();
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        fs::write(directory.path().join("new.txt"), "new\n").unwrap();
+        fs::File::open(directory.path())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let next = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.files.paths, vec![path("new.txt")]);
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let gitdir = directory.path().join(".git");
+        fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let first = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
+        fs::write(gitdir.join("index.lock"), "temporary").unwrap();
+        fs::remove_file(gitdir.join("index.lock")).unwrap();
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
+        fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
+        fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
+        fs::write(
+            gitdir.join("config"),
+            "[remote \"origin\"]\nurl = example\n",
+        )
+        .unwrap();
+        let configured =
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint;
+        assert_ne!(first, configured);
+        fs::write(gitdir.join("index"), "new-index").unwrap();
+        let indexed = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
+        assert_ne!(configured, indexed);
+        fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
+        fs::File::open(gitdir.join("refs/heads/feature"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let created = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
+        assert_ne!(indexed, created);
+        fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
+        assert_ne!(
+            created,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
+    }
+
+    #[test]
+    fn untracked_measurement_cache_invalidates_size_mtime_and_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "one\n").unwrap();
+        let mut cache = BTreeMap::new();
+        let measure = |cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>| {
+            let mut entries = parse_status(&snapshot_status(b"? new.txt\0"))
+                .unwrap()
+                .entries;
+            measure_untracked_cached(
+                directory.path(),
+                &mut entries,
+                &CancellationToken::default(),
+                cache,
+            );
+            entries[0].added_lines.unwrap()
+        };
+        assert_eq!(measure(&mut cache), 1);
+        let original = cache[&path("new.txt")].0;
+        assert_eq!(measure(&mut cache), 1);
+        fs::write(&file, "one\ntwo\n").unwrap();
+        assert_eq!(measure(&mut cache), 2);
+        assert_ne!(cache[&path("new.txt")].0, original);
+        let second = cache[&path("new.txt")].0;
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "one two\n").unwrap();
+        fs::rename(replacement, &file).unwrap();
+        assert_eq!(measure(&mut cache), 1);
+        assert_ne!(cache[&path("new.txt")].0, second);
     }
 
     #[test]
@@ -6872,6 +9434,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn snapshot_porcelain_count_bases_separate_head_from_index_without_public_overhead() {
+        let record = |head: &str, index: &str| {
+            snapshot_status(
+                format!("1 MM N... 100644 100644 100644 {head} {index} name\0").as_bytes(),
+            )
+        };
+        let (status, none) = parse_status_details(&record("aaa", "bbb"), false).unwrap();
+        assert_eq!(status.entries.len(), 2);
+        assert!(none.is_empty());
+        let (_, initial) = parse_status_details(&record("aaa", "bbb"), true).unwrap();
+        let (_, head) = parse_status_details(&record("ccc", "bbb"), true).unwrap();
+        let (_, index) = parse_status_details(&record("aaa", "ddd"), true).unwrap();
+        let staged = (ChangeArea::Staged, path("name"));
+        let working = (ChangeArea::Unstaged, path("name"));
+        assert_ne!(initial[&staged], head[&staged]);
+        assert_eq!(initial[&working], head[&working]);
+        assert_ne!(initial[&staged], index[&staged]);
+        assert_ne!(initial[&working], index[&working]);
     }
 
     #[test]
@@ -7014,6 +9597,1478 @@ mod tests {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn original_discard_reader_cache_uses_held_metadata_and_rejects_replaced_private_root() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "base\n").unwrap();
+            git(root, &["add", "--all"]);
+            git(root, &["commit", "-m", "base"]);
+            fs::write(root.join("tracked"), "precious\n").unwrap();
+            let authority = WorktreeAuthority::capture(root).unwrap();
+            let private_head = authority.private_metadata_path().join("HEAD");
+            let common_config = authority.common_metadata_path().join("config");
+            let scoped = service().with_worktree_authority(authority).unwrap();
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            assert!(
+                scoped
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(cache.admin.contains_key(&private_head));
+            assert!(cache.admin.contains_key(&common_config));
+            assert!(
+                scoped
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+            fs::rename(root.join(".git"), root.join("original-git")).unwrap();
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::write(root.join(".git/config"), "foreign metadata\n").unwrap();
+            assert!(
+                scoped
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .is_err()
+            );
+            assert!(
+                !cache.status_attempt_failed(),
+                "original-source refusal is not a failed status command"
+            );
+            assert_eq!(
+                fs::read(root.join(".git/config")).unwrap(),
+                b"foreign metadata\n"
+            );
+            assert_eq!(fs::read(root.join("tracked")).unwrap(), b"precious\n");
+            fs::remove_file(root.join(".git/config")).unwrap();
+            fs::remove_dir(root.join(".git")).unwrap();
+            fs::rename(root.join("original-git"), root.join(".git")).unwrap();
+            assert!(
+                scoped
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn original_discard_cache_enrichment_stays_on_held_root_during_temporary_name_replacement()
+        {
+            struct SwapAfterStatus {
+                inner: Arc<WorktreeExecutor<IsolatedExecutor>>,
+                root: PathBuf,
+                saved: PathBuf,
+                armed: AtomicBool,
+                swapped: Mutex<bool>,
+            }
+            impl SwapAfterStatus {
+                fn restore(&self) {
+                    let mut swapped = self.swapped.lock().unwrap();
+                    if *swapped {
+                        fs::remove_file(self.root.join("untracked")).unwrap();
+                        fs::remove_dir(&self.root).unwrap();
+                        fs::rename(&self.saved, &self.root).unwrap();
+                        *swapped = false;
+                    }
+                }
+            }
+            impl ProcessExecutor for SwapAfterStatus {
+                fn execute(
+                    &self,
+                    command: &CommandSpec,
+                    cancellation: &CancellationToken,
+                ) -> Result<ProcessOutput, ProcessFailure> {
+                    // Restore before the next original executor validates its
+                    // source. Only the intervening filesystem enrichments see
+                    // the public replacement; Git always reads original A.
+                    self.restore();
+                    let output = self.inner.execute(command, cancellation)?;
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "status")
+                        && self.armed.swap(false, Ordering::AcqRel)
+                    {
+                        fs::rename(&self.root, &self.saved).unwrap();
+                        fs::create_dir(&self.root).unwrap();
+                        fs::write(self.root.join("untracked"), "foreign\n".repeat(30)).unwrap();
+                        *self.swapped.lock().unwrap() = true;
+                    }
+                    Ok(output)
+                }
+            }
+            impl Drop for SwapAfterStatus {
+                fn drop(&mut self) {
+                    self.restore();
+                }
+            }
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("checkout");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("untracked"), "original\n").unwrap();
+            let authority = WorktreeAuthority::capture(&root).unwrap();
+            let scoped = service()
+                .with_worktree_authority(authority.clone())
+                .unwrap();
+            let executor = Arc::new(SwapAfterStatus {
+                inner: scoped.executor.clone(),
+                root: root.clone(),
+                saved: parent.path().join("original"),
+                armed: AtomicBool::new(false),
+                swapped: Mutex::new(false),
+            });
+            // Same canonical scope/executor; the outer fixture only controls
+            // timing after an actual completed status command.
+            let reader = RepositoryService {
+                git: scoped.git.clone(),
+                executor: executor.clone(),
+                creation_executor: scoped.creation_executor.clone(),
+                authority: scoped.authority.clone(),
+            };
+            let options = SnapshotOptions {
+                untracked_changes: true,
+                untracked_files: true,
+                status_limit: None,
+            };
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            reader
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            fs::write(root.join("untracked"), "original\nsecond\n").unwrap();
+            let original = fs::metadata(root.join("untracked")).unwrap();
+            executor.armed.store(true, Ordering::Release);
+            let snapshot = reader
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            authority.validate().unwrap();
+            assert!(!*executor.swapped.lock().unwrap());
+            let entry = snapshot
+                .status
+                .entries
+                .iter()
+                .find(|entry| entry.path == path("untracked"))
+                .unwrap();
+            assert_eq!(
+                entry.added_lines,
+                Some(2),
+                "never the replacement's30 lines"
+            );
+            assert_eq!(
+                cache.observed[&path("untracked")],
+                Some(file_identity(&original))
+            );
+            assert_eq!(
+                fs::read(root.join("untracked")).unwrap(),
+                b"original\nsecond\n"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn original_discard_reader_keeps_relative_config_and_both_monitor_exclusions_under_substitution()
+         {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("checkout");
+            let saved = parent.path().join("original");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("config"), "original config\n").unwrap();
+            fs::write(root.join("tool"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(root.join("tool"), fs::Permissions::from_mode(0o700)).unwrap();
+            let authority = WorktreeAuthority::capture(&root).unwrap();
+            let held = authority.anchored_read_path();
+            let original = fs::metadata(root.join("config")).unwrap();
+            fs::rename(&root, &saved).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("config"), "foreign config\n").unwrap();
+            fs::write(root.join("tool"), "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(root.join("tool"), fs::Permissions::from_mode(0o700)).unwrap();
+            let (_, _, dependencies) = parse_observed_publication_config(
+                &held,
+                b"file:config\0remote.origin.url\nhttps://example.invalid/original.git\0",
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                dependencies.files[&held.join("config")],
+                Some(file_identity(&original))
+            );
+            for inside in [&root, &saved] {
+                let configured = format!("global\t{}\n", inside.join("tool").display());
+                assert_eq!(
+                    trusted_fsmonitor_with_roots(configured.as_bytes(), &root, &held),
+                    None
+                );
+            }
+            let outside = parent.path().join("trusted-monitor");
+            fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+            let configured = format!("global\t{}\n", outside.display());
+            assert_eq!(
+                trusted_fsmonitor_with_roots(configured.as_bytes(), &root, &held),
+                Some(outside.into_os_string())
+            );
+            assert_eq!(fs::read(root.join("config")).unwrap(), b"foreign config\n");
+            fs::remove_file(root.join("config")).unwrap();
+            fs::remove_file(root.join("tool")).unwrap();
+            fs::remove_dir(&root).unwrap();
+            fs::rename(saved, &root).unwrap();
+            authority.validate().unwrap();
+        }
+
+        #[derive(Default)]
+        struct RecordingExecutor {
+            commands: Mutex<Vec<CommandSpec>>,
+            legacy_attribute_vars: bool,
+        }
+
+        impl ProcessExecutor for RecordingExecutor {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.commands.lock().unwrap().push(command.clone());
+                if self.legacy_attribute_vars
+                    && command.arguments.windows(2).any(|pair| {
+                        pair[0] == "var"
+                            && (pair[1] == "GIT_ATTR_SYSTEM" || pair[1] == "GIT_ATTR_GLOBAL")
+                    })
+                {
+                    return exit(129, b"");
+                }
+                IsolatedExecutor.execute(command, cancellation)
+            }
+        }
+
+        fn measured(
+            snapshot: &RepositorySnapshot,
+            name: &str,
+            area: ChangeArea,
+        ) -> (Option<u64>, Option<u64>) {
+            let entry = snapshot
+                .status
+                .entries
+                .iter()
+                .find(|entry| entry.path == path(name) && entry.area == area)
+                .unwrap();
+            (entry.added_lines, entry.removed_lines)
+        }
+
+        fn assert_numstat_child(mut command: std::process::Command, evidence: tempfile::TempDir) {
+            struct OriginalChild {
+                child: std::process::Child,
+                reaped: bool,
+            }
+            impl Drop for OriginalChild {
+                fn drop(&mut self) {
+                    if !self.reaped {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                    }
+                }
+            }
+            let stdout_path = evidence.path().join("stdout.log");
+            let stderr_path = evidence.path().join("stderr.log");
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(fs::File::create(&stdout_path).unwrap())
+                .stderr(fs::File::create(&stderr_path).unwrap());
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let path = evidence.keep();
+                    panic!(
+                        "could not spawn numstat child: {error}; private evidence: {}",
+                        path.display()
+                    );
+                }
+            };
+            let mut original = OriginalChild {
+                child,
+                reaped: false,
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let result = loop {
+                match original.child.try_wait() {
+                    Ok(Some(status)) => {
+                        original.reaped = true;
+                        break Ok(status);
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        break Err("numstat child exceeded its 30-second deadline".to_owned());
+                    }
+                    Err(error) => break Err(format!("could not observe numstat child: {error}")),
+                }
+            };
+            if !original.reaped {
+                let _ = original.child.kill();
+                original.reaped = original.child.wait().is_ok();
+            }
+            let read_output = |path: &Path| {
+                let file = fs::File::open(path).unwrap();
+                assert!(file.metadata().unwrap().is_file());
+                let mut output = Vec::new();
+                file.take(64 * 1024).read_to_end(&mut output).unwrap();
+                String::from_utf8_lossy(&output).into_owned()
+            };
+            let stdout = read_output(&stdout_path);
+            let stderr = read_output(&stderr_path);
+            if !result.as_ref().is_ok_and(|status| status.success())
+                || !stdout.contains("test result: ok. 1 passed;")
+            {
+                let path = evidence.keep();
+                panic!(
+                    "numstat child failed: {result:?}; private evidence: {}\nstdout (first 64 KiB):\n{stdout}\nstderr (first 64 KiB):\n{stderr}",
+                    path.display()
+                );
+            }
+        }
+
+        #[test]
+        fn snapshot_metadata_prepass_rejects_special_locators_and_owns_cancellation() {
+            const CHILD: &str = "CAGENTS_TEST_METADATA_LOCATOR_CHILD";
+            const TEST: &str = "repository::tests::git_contracts::snapshot_metadata_prepass_rejects_special_locators_and_owns_cancellation";
+            if std::env::var_os(CHILD).is_none() {
+                let evidence = tempfile::tempdir().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, evidence.path());
+                assert_numstat_child(command, evidence);
+                return;
+            }
+            let evidence = PathBuf::from(std::env::var_os(CHILD).unwrap());
+            let fifo = |path: &Path| {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: this is a NUL-terminated owned fixture path.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            };
+            for case in [
+                "gitfile-fifo",
+                "commondir-fifo",
+                "gitfile-symlink-fifo",
+                "commondir-symlink-fifo",
+                "gitfile-symlink-device",
+                "gitfile-oversize",
+            ] {
+                let root = evidence.join(case);
+                fs::create_dir_all(&root).unwrap();
+                let marker = root.join(".git");
+                match case {
+                    "gitfile-fifo" => fifo(&marker),
+                    "commondir-fifo" => {
+                        fs::create_dir(&marker).unwrap();
+                        fifo(&marker.join("commondir"));
+                    }
+                    "gitfile-symlink-fifo" => {
+                        let target = root.join("locator");
+                        fifo(&target);
+                        std::os::unix::fs::symlink(target, &marker).unwrap();
+                    }
+                    "commondir-symlink-fifo" => {
+                        fs::create_dir(&marker).unwrap();
+                        let target = root.join("locator");
+                        fifo(&target);
+                        std::os::unix::fs::symlink(target, marker.join("commondir")).unwrap();
+                    }
+                    "gitfile-symlink-device" => {
+                        std::os::unix::fs::symlink("/dev/null", &marker).unwrap();
+                    }
+                    _ => fs::write(&marker, vec![b'x'; 4097]).unwrap(),
+                }
+                let executor = Arc::new(FakeExecutor::default());
+                let git = RepositoryService::new("git", executor.clone());
+                let mut cache = SnapshotCache::default();
+                assert!(
+                    git.snapshot_cached(
+                        &root,
+                        SnapshotOptions::default(),
+                        &CancellationToken::default(),
+                        &mut cache
+                    )
+                    .is_err(),
+                    "{case}"
+                );
+                assert!(
+                    cache.dirty,
+                    "failed metadata never certifies an unchanged cache"
+                );
+                assert!(
+                    executor.commands.lock().unwrap().is_empty(),
+                    "invalid prepass must fail before Git: {case}"
+                );
+                let cancel = CancellationToken::default();
+                cancel.cancel();
+                let failure = git
+                    .snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        failure,
+                        RepositoryError::Process(ProcessFailure {
+                            kind: ProcessFailureKind::Cancelled,
+                            started: false,
+                            ..
+                        })
+                    ),
+                    "{case}: {failure:?}"
+                );
+                assert!(executor.commands.lock().unwrap().is_empty());
+            }
+            let root = evidence.join("recovery");
+            fs::create_dir_all(root.join(".git")).unwrap();
+            let mut outputs = cached_snapshot_outputs(b"", b"");
+            let mut recovered = cached_snapshot_outputs(b"", b"");
+            recovered.drain(2..4);
+            outputs.extend(recovered);
+            outputs.push(success(&snapshot_status(b"")));
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let git = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::default();
+            let mut cache = SnapshotCache::default();
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            let before = executor.commands.lock().unwrap().len();
+            let marker = root.join(".git/commondir");
+            fifo(&marker);
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .is_err()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), before);
+            fs::remove_file(marker).unwrap();
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some(),
+                "restoring identical metadata must publish after a failed prepass"
+            );
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[cfg(feature = "ui")]
+        #[test]
+        fn snapshot_metadata_symlink_layouts_remain_git_compatible() {
+            const TEST: &str = "repository::tests::git_contracts::snapshot_metadata_symlink_layouts_remain_git_compatible";
+            if !crate::git_watch::tests::fixture_isolated(TEST) {
+                return;
+            }
+            use std::os::unix::fs::symlink;
+            for layout in ["directory", "gitfile", "commondir"] {
+                let directory = tempfile::tempdir().unwrap();
+                let primary = directory.path().join("primary");
+                fs::create_dir(&primary).unwrap();
+                let private = directory.path().join("private");
+                if layout == "gitfile" {
+                    git(
+                        &primary,
+                        &[
+                            "init",
+                            "--template=",
+                            "-b",
+                            "main",
+                            "--separate-git-dir",
+                            private.to_str().unwrap(),
+                        ],
+                    );
+                } else {
+                    git(&primary, &["init", "--template=", "-b", "main"]);
+                }
+                fs::write(primary.join("file"), "base\n").unwrap();
+                git(&primary, &["add", "file"]);
+                git(&primary, &["commit", "-m", "base"]);
+                let root = if layout == "commondir" {
+                    let linked = directory.path().join("linked");
+                    git(
+                        &primary,
+                        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+                    );
+                    let admin = PathBuf::from(
+                        String::from_utf8(git_output(
+                            &linked,
+                            &["rev-parse", "--absolute-git-dir"],
+                        ))
+                        .unwrap()
+                        .trim(),
+                    );
+                    fs::rename(admin.join("commondir"), admin.join("common-target")).unwrap();
+                    symlink("common-target", admin.join("commondir")).unwrap();
+                    linked
+                } else {
+                    if layout == "directory" {
+                        fs::rename(primary.join(".git"), &private).unwrap();
+                        symlink("../private", primary.join(".git")).unwrap();
+                    } else {
+                        fs::rename(primary.join(".git"), directory.path().join("git-locator"))
+                            .unwrap();
+                        symlink("../git-locator", primary.join(".git")).unwrap();
+                    }
+                    primary
+                };
+                fs::write(root.join("file"), "first\n").unwrap();
+                let executor = Arc::new(RecordingExecutor::default());
+                let service = RepositoryService::new("git", executor.clone());
+                let cancel = CancellationToken::new();
+                let status = service.status(&root, &cancel).unwrap();
+                assert_eq!(status.dirty.unstaged, 1, "Git accepts {layout}");
+                let options = SnapshotOptions::default();
+                let mut cache = SnapshotCache::default();
+                let first = service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(first.status.dirty, status.dirty, "{layout}");
+                assert_eq!(
+                    measured(&first, "file", ChangeArea::Unstaged),
+                    (Some(1), Some(1)),
+                    "{layout}"
+                );
+                executor.commands.lock().unwrap().clear();
+                assert!(
+                    service
+                        .snapshot_cached(&root, options, &cancel, &mut cache)
+                        .unwrap()
+                        .is_none(),
+                    "{layout}"
+                );
+                assert_eq!(
+                    executor.commands.lock().unwrap().len(),
+                    1,
+                    "{layout}: unchanged runs only status"
+                );
+                fs::write(root.join("file"), "second\nline\n").unwrap();
+                let changed = service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    measured(&changed, "file", ChangeArea::Unstaged),
+                    (Some(2), Some(1)),
+                    "{layout}: missed-event content repair"
+                );
+            }
+        }
+
+        #[test]
+        fn cached_numstat_reads_only_changed_literal_paths_and_repairs_missed_events() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let names: Vec<_> = (0..40)
+                .map(|index| format!("file-{index:02}"))
+                .chain([
+                    ":(glob)*".into(),
+                    "space name".into(),
+                    "line\nname".into(),
+                    "binary".into(),
+                ])
+                .collect();
+            for name in &names {
+                fs::write(
+                    root.join(name),
+                    if name == "binary" {
+                        b"\0base\n".as_slice()
+                    } else {
+                        b"base\n".as_slice()
+                    },
+                )
+                .unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            for name in &names {
+                fs::write(
+                    root.join(name),
+                    if name == "binary" {
+                        b"\0first\n".as_slice()
+                    } else {
+                        b"first\n".as_slice()
+                    },
+                )
+                .unwrap();
+            }
+            let executor = Arc::new(RecordingExecutor::default());
+            let git = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let mut cache = SnapshotCache::default();
+            let initial = git
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&initial, "binary", ChangeArea::Unstaged),
+                (None, None)
+            );
+            assert!(
+                cache
+                    .numstats
+                    .contains_key(&(ChangeArea::Unstaged, path("binary"))),
+                "a measured binary is different from an omitted count"
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join(":(glob)*"), "one\ntwo\nthree\n").unwrap();
+            cache.invalidate(false);
+            let changed = git
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&changed, ":(glob)*", ChangeArea::Unstaged),
+                (Some(3), Some(1))
+            );
+            assert_eq!(
+                measured(&changed, "file-00", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(counts.len(), 1);
+            assert_eq!(commands.len(), 2, "only status and one scoped count read");
+            assert_eq!(counts[0].arguments[0], "--literal-pathspecs");
+            let separator = counts[0]
+                .arguments
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap();
+            assert_eq!(
+                &counts[0].arguments[separator + 1..],
+                &[OsString::from(":(glob)*")]
+            );
+            executor.commands.lock().unwrap().clear();
+            // No watcher invalidation: equal porcelain must still notice bytes
+            // changed in a path that was already modified.
+            fs::write(root.join("file-00"), "one\ntwo\n").unwrap();
+            let fallback = git
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&fallback, "file-00", ChangeArea::Unstaged),
+                (Some(2), Some(1))
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 2);
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("new-untracked"), "new\ntext\n").unwrap();
+            let created = git
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&created, "new-untracked", ChangeArea::Untracked),
+                (Some(2), Some(0))
+            );
+            assert_eq!(
+                executor.commands.lock().unwrap().len(),
+                1,
+                "unchanged tracked counts need no Git diff for an untracked creation"
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::remove_file(root.join("file-00")).unwrap();
+            let deleted = git
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&deleted, "file-00", ChangeArea::Unstaged),
+                (Some(0), Some(1))
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            assert_eq!(commands.len(), 2);
+            let counts = commands
+                .iter()
+                .find(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .unwrap();
+            let separator = counts.arguments.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(
+                &counts.arguments[separator + 1..],
+                &[OsString::from("file-00")]
+            );
+        }
+
+        #[test]
+        fn cached_numstat_keeps_staged_counts_until_index_publication_and_bounds_path_batches() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let repeated = "d".repeat(240);
+            let names: Vec<_> = (0..9)
+                .map(|index| {
+                    let mut name = format!("group-{index}");
+                    for _ in 0..10 {
+                        name.push('/');
+                        name.push_str(&repeated);
+                    }
+                    name.push_str("/file");
+                    name
+                })
+                .collect();
+            for name in &names {
+                fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+                fs::write(root.join(name), "base\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            for name in &names {
+                fs::write(root.join(name), "staged\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            for name in &names {
+                fs::write(root.join(name), "working\n").unwrap();
+            }
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            executor.commands.lock().unwrap().clear();
+            for name in &names {
+                fs::write(root.join(name), "working\nsecond\n").unwrap();
+            }
+            cache.invalidate(false);
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            for name in &names {
+                assert_eq!(
+                    measured(&changed, name, ChangeArea::Staged),
+                    (Some(1), Some(1))
+                );
+                assert_eq!(
+                    measured(&changed, name, ChangeArea::Unstaged),
+                    (Some(2), Some(1))
+                );
+            }
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(
+                counts.len(),
+                2,
+                "long literal targets share bounded argument batches"
+            );
+            for command in counts {
+                assert!(!command.arguments.iter().any(|arg| arg == "--cached"));
+                assert_eq!(command.arguments[0], "--literal-pathspecs");
+                let separator = command
+                    .arguments
+                    .iter()
+                    .position(|arg| arg == "--")
+                    .unwrap();
+                assert!(
+                    command.arguments[separator + 1..]
+                        .iter()
+                        .map(|path| path.as_encoded_bytes().len() + 1)
+                        .sum::<usize>()
+                        <= 16 * 1024
+                );
+            }
+            executor.commands.lock().unwrap().clear();
+            git(root, &["add", "-A"]);
+            let staged = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            for name in &names {
+                assert_eq!(
+                    measured(&staged, name, ChangeArea::Staged),
+                    (Some(2), Some(1))
+                );
+            }
+            let commands = executor.commands.lock().unwrap();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(
+                counts.len(),
+                2,
+                "published index remeasures changed staged bases in bounded batches"
+            );
+            assert!(
+                counts
+                    .iter()
+                    .all(|command| command.arguments.iter().any(|arg| arg == "--cached"))
+            );
+        }
+
+        #[test]
+        fn cached_numstat_fences_each_object_basis_across_refs_index_and_head_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["first", "second"] {
+                fs::write(root.join(name), "base\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            for name in ["first", "second"] {
+                fs::write(root.join(name), "changed\n").unwrap();
+            }
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            executor.commands.lock().unwrap().clear();
+            git(root, &["branch", "unrelated"]);
+            let refs = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert!(
+                refs.local_refs
+                    .iter()
+                    .any(|reference| reference.name.as_str() == "refs/heads/unrelated")
+            );
+            assert_eq!(
+                measured(&refs, "first", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            assert!(
+                !executor
+                    .commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command.arguments.iter().any(|arg| arg == "--numstat")),
+                "unrelated refs refresh metadata without discarding measured content"
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("first"), "one\ntwo\n").unwrap();
+            git(root, &["add", "first"]);
+            let staged = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&staged, "first", ChangeArea::Staged),
+                (Some(2), Some(1))
+            );
+            assert_eq!(
+                measured(&staged, "second", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(counts.len(), 1);
+            assert!(counts[0].arguments.iter().any(|arg| arg == "--cached"));
+            assert_eq!(counts[0].arguments.last(), Some(&OsString::from("first")));
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("first"), "working\nthree\nfour\n").unwrap();
+            let working = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&working, "first", ChangeArea::Staged),
+                (Some(2), Some(1))
+            );
+            assert_eq!(
+                measured(&working, "first", ChangeArea::Unstaged),
+                (Some(3), Some(2))
+            );
+            executor.commands.lock().unwrap().clear();
+            git(root, &["commit", "-m", "partial"]);
+            let committed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&committed, "first", ChangeArea::Unstaged),
+                (Some(3), Some(2))
+            );
+            assert_eq!(
+                measured(&committed, "second", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            assert!(
+                !executor
+                    .commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command.arguments.iter().any(|arg| arg == "--numstat")),
+                "HEAD publication does not change an unchanged index-to-working basis"
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join(".git/info/attributes"), "second -diff\n").unwrap();
+            let attributes = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&attributes, "second", ChangeArea::Unstaged),
+                (None, None)
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(
+                counts.len(),
+                2,
+                "semantic attribute changes still invalidate every measured basis"
+            );
+            assert!(
+                counts
+                    .iter()
+                    .all(|command| !command.arguments.iter().any(|arg| arg == "--"))
+            );
+        }
+
+        #[test]
+        fn cached_numstat_explicit_rename_policy_scopes_additions_with_copy_config() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let original: String = (0..100).map(|index| format!("line {index}\n")).collect();
+            fs::write(root.join("a"), &original).unwrap();
+            git(root, &["add", "a"]);
+            git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "status.renames", "false"]);
+            git(root, &["config", "diff.renames", "copies"]);
+            fs::write(root.join("a"), format!("{original}extra\n")).unwrap();
+            git(root, &["add", "a"]);
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let initial = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&initial, "a", ChangeArea::Staged),
+                (Some(1), Some(0))
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("b"), &original).unwrap();
+            git(root, &["add", "b"]);
+            let added = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&added, "a", ChangeArea::Staged),
+                (Some(1), Some(0))
+            );
+            assert_eq!(
+                measured(&added, "b", ChangeArea::Staged),
+                (Some(100), Some(0))
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands
+                .iter()
+                .filter(|command| command.arguments.iter().any(|arg| arg == "--numstat"))
+                .collect();
+            assert_eq!(counts.len(), 1);
+            assert!(
+                counts[0]
+                    .arguments
+                    .iter()
+                    .any(|arg| arg == "--find-renames")
+            );
+            assert_eq!(counts[0].arguments.last(), Some(&OsString::from("b")));
+            let full = service
+                .run_checked(&service.numstat_command(root, true), &cancel)
+                .unwrap();
+            let full = parse_numstat(&full.stdout).unwrap();
+            let full = full.iter().find(|entry| entry.path == path("b")).unwrap();
+            assert_eq!(
+                measured(&added, "b", ChangeArea::Staged),
+                (full.added, full.removed)
+            );
+        }
+
+        #[test]
+        fn cached_numstat_keeps_full_reads_when_status_hides_rename_pairs() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["original", "other"] {
+                fs::write(root.join(name), "base\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "status.renames", "false"]);
+            git(root, &["mv", "original", "renamed"]);
+            fs::write(root.join("other"), "first\n").unwrap();
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let initial = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert!(
+                initial
+                    .status
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == ChangeKind::Added)
+            );
+            assert!(
+                initial
+                    .status
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == ChangeKind::Deleted)
+            );
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("other"), "one\ntwo\n").unwrap();
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&changed, "renamed", ChangeArea::Staged),
+                (Some(0), Some(0))
+            );
+            assert_eq!(
+                measured(&changed, "other", ChangeArea::Unstaged),
+                (Some(2), Some(1))
+            );
+            let commands = executor.commands.lock().unwrap().clone();
+            let staged = commands
+                .iter()
+                .find(|command| command.arguments.iter().any(|arg| arg == "--cached"))
+                .unwrap();
+            assert!(
+                !staged.arguments.iter().any(|arg| arg == "--"),
+                "hidden rename candidates need complete detection"
+            );
+        }
+
+        #[test]
+        fn cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process() {
+            const CHILD: &str = "CAGENTS_NUMSTAT_REPLACEMENT_TEST_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                cached_numstat_observes_loose_and_packed_replacement_objects();
+                return;
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "repository::tests::git_contracts::cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process", "--nocapture"])
+                .env(CHILD, "1").env("GIT_REPLACE_REF_BASE", "refs/replacement-")
+                .env_remove("GIT_NO_REPLACE_OBJECTS");
+            assert_numstat_child(command, tempfile::tempdir().unwrap());
+        }
+
+        #[test]
+        fn cached_numstat_observes_loose_and_packed_replacement_objects() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let outside = tempfile::tempdir().unwrap();
+            let replacement_file = outside.path().join("replacement");
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "base\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "working\n").unwrap();
+            let service = service();
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let initial = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&initial, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            let original = String::from_utf8(git_output(root, &["rev-parse", "HEAD:tracked"]))
+                .unwrap()
+                .trim()
+                .to_owned();
+            fs::write(&replacement_file, "one\ntwo\n").unwrap();
+            let replacement = String::from_utf8(git_output(
+                root,
+                &["hash-object", "-w", replacement_file.to_str().unwrap()],
+            ))
+            .unwrap()
+            .trim()
+            .to_owned();
+            git(root, &["replace", &original, &replacement]);
+            let replaced = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&replaced, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(2))
+            );
+            git(root, &["pack-refs", "--all"]);
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            git(root, &["replace", "-d", &original]);
+            let removed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&removed, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+        }
+
+        #[test]
+        fn cached_numstat_reconciles_external_clean_filter_inputs() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let outside = tempfile::tempdir().unwrap();
+            let state = outside.path().join("filter-state");
+            git(root, &["init", "-b", "main"]);
+            fs::write(&state, "base\n").unwrap();
+            let quoted = state.to_string_lossy().replace('\'', "'\\''");
+            let clean = format!("cat >/dev/null; cat '{quoted}'");
+            git(root, &["config", "filter.fixture.clean", &clean]);
+            fs::write(root.join(".gitattributes"), "tracked filter=fixture\n").unwrap();
+            fs::write(root.join("tracked"), "initial-input\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "working-input\n").unwrap();
+            fs::write(&state, "first\n").unwrap();
+            let service = service();
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let initial = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&initial, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            let before = fs::metadata(root.join("tracked")).unwrap();
+            fs::write(&state, "one\ntwo\n").unwrap();
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                file_identity(&before),
+                file_identity(&fs::metadata(root.join("tracked")).unwrap())
+            );
+            assert_eq!(
+                measured(&changed, "tracked", ChangeArea::Unstaged),
+                (Some(2), Some(1))
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn cached_numstat_expands_missing_includes_with_a_non_utf8_home() {
+            const CHILD: &str = "CAGENTS_NUMSTAT_NON_UTF8_HOME_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                use std::os::unix::ffi::OsStringExt;
+                let directory = tempfile::tempdir().unwrap();
+                let home = directory
+                    .path()
+                    .join(OsString::from_vec(b"home-\xff".to_vec()));
+                fs::create_dir(&home).unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args([
+                        "--exact",
+                        "repository::tests::git_contracts::cached_numstat_expands_missing_includes_with_a_non_utf8_home",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", &home);
+                assert_numstat_child(command, directory);
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let outside = tempfile::tempdir().unwrap();
+            let attributes = outside.path().join("attributes");
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "before\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "include.path", "~/late-config"]);
+            fs::write(root.join("tracked"), "after\n").unwrap();
+            let service = service();
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let first = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&first, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            let status_before = git_output(root, &["status", "--porcelain=v2", "--branch", "-z"]);
+            fs::write(&attributes, "tracked -diff\n").unwrap();
+            fs::write(
+                home.join("late-config"),
+                format!("[core]\nattributesFile = {}\n", attributes.display()),
+            )
+            .unwrap();
+            assert_eq!(
+                status_before,
+                git_output(root, &["status", "--porcelain=v2", "--branch", "-z"])
+            );
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .expect("publishing the home-relative include invalidates unchanged porcelain");
+            assert_eq!(
+                measured(&changed, "tracked", ChangeArea::Unstaged),
+                (None, None)
+            );
+            assert!(
+                service
+                    .snapshot_cached(root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn cached_numstat_legacy_git_observes_configured_external_attributes() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let outside = tempfile::tempdir().unwrap();
+            let attributes = outside.path().join("attributes");
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "base\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "changed\n").unwrap();
+            fs::write(&attributes, "tracked diff\n").unwrap();
+            git(
+                root,
+                &[
+                    "config",
+                    "core.attributesFile",
+                    attributes.to_str().unwrap(),
+                ],
+            );
+            let executor = Arc::new(RecordingExecutor {
+                legacy_attribute_vars: true,
+                ..Default::default()
+            });
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let initial = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&initial, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            fs::write(&attributes, "tracked -diff\n").unwrap();
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&changed, "tracked", ChangeArea::Unstaged),
+                (None, None)
+            );
+            executor.commands.lock().unwrap().clear();
+            assert!(
+                service
+                    .snapshot_cached(root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn cached_numstat_observes_attributes_and_configuration_without_watcher_events() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["first", "second"] {
+                fs::write(root.join(name), "base\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            for name in ["first", "second"] {
+                fs::write(root.join(name), "changed\n").unwrap();
+            }
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new();
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let mut cache = SnapshotCache::default();
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            fs::write(root.join(".gitattributes"), "first -diff\n").unwrap();
+            let binary = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&binary, "first", ChangeArea::Unstaged),
+                (None, None)
+            );
+            fs::remove_file(root.join(".gitattributes")).unwrap();
+            fs::write(root.join(".git/info/attributes"), "second -diff\n").unwrap();
+            let common = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&common, "first", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            assert_eq!(
+                measured(&common, "second", ChangeArea::Unstaged),
+                (None, None)
+            );
+            fs::remove_file(root.join(".git/info/attributes")).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let attributes = outside.path().join("attributes");
+            let include = outside.path().join("included-config");
+            git(root, &["config", "include.path", include.to_str().unwrap()]);
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            // Publishing a previously missing include must replace the old
+            // attribute policy even though porcelain has not changed.
+            fs::write(
+                &include,
+                format!("[core]\nattributesFile = {}\n", attributes.display()),
+            )
+            .unwrap();
+            fs::write(&attributes, "first -diff\n").unwrap();
+            let included = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&included, "first", ChangeArea::Unstaged),
+                (None, None)
+            );
+            fs::write(&attributes, "first diff\n").unwrap();
+            let text = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&text, "first", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
+            executor.commands.lock().unwrap().clear();
+            assert!(
+                service
+                    .snapshot_cached(root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                executor.commands.lock().unwrap().len(),
+                1,
+                "unchanged dependencies need only status"
+            );
+            git(root, &["config", "diff.custom.textconv", "cat"]);
+            service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !cache.numstat_policy.as_ref().unwrap().reusable,
+                "custom drivers can depend on external inputs"
+            );
+            assert!(cache.numstat_policy.as_ref().unwrap().reconcile_unchanged);
+            assert!(
+                service
+                    .snapshot_cached(root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_some(),
+                "custom drivers retain conservative missed-input reconciliation"
+            );
+        }
+
         #[test]
         fn ignored_file_listing_preserves_collapsed_folders_and_git_rules() {
             let directory = tempfile::tempdir().unwrap();
@@ -7125,6 +11180,7 @@ mod tests {
                 .snapshot_with_options(
                     root,
                     SnapshotOptions {
+                        status_limit: None,
                         untracked_changes: false,
                         untracked_files: false,
                     },
@@ -7758,6 +11814,7 @@ mod tests {
 
     fn exit(code: i32, stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(code),
             signal: None,
             success: code == 0,
@@ -9977,6 +14034,7 @@ mod tests {
                     success(b""),
                     success(format!("{endpoint}\n").as_bytes()),
                     Ok(ProcessOutput {
+                        stdout_truncated: false,
                         exit_code: Some(128),
                         signal: None,
                         success: false,
@@ -10388,6 +14446,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_unsupported_attribute_variables_keep_the_unchanged_status_shortcut() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = snapshot_status(b"1 M. N... 100644 100644 100644 a b tracked\0");
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![
+            exit(1, b""),
+            success(&status),
+            exit(129, b""),
+            exit(129, b""), // older Git does not expose attribute paths
+            exit(1, b""),   // no explicit legacy global attributes file
+            exit(1, b""),
+            success(b""),
+            success(b"1\t1\ttracked\0"),
+            success(b""),
+            success(b"H tracked\0"),
+            exit(1, b""),
+            success(b""),
+            success(&status),
+        ]));
+        let service = RepositoryService::new("git", executor.clone());
+        let cancel = CancellationToken::new();
+        let mut cache = SnapshotCache::default();
+        assert!(
+            service
+                .snapshot_cached(
+                    directory.path(),
+                    SnapshotOptions::default(),
+                    &cancel,
+                    &mut cache
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(!cache.numstat_policy.as_ref().unwrap().reusable);
+        assert!(!cache.numstat_policy.as_ref().unwrap().reconcile_unchanged);
+        let before = executor.commands.lock().unwrap().len();
+        assert!(
+            service
+                .snapshot_cached(
+                    directory.path(),
+                    SnapshotOptions::default(),
+                    &cancel,
+                    &mut cache
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn cached_numstat_never_promotes_an_omitted_record_to_a_binary_measurement() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut status, bases) = parse_status_details(&snapshot_status(b"1 .M N... 100644 100644 100644 a b binary\x001 .M N... 100644 100644 100644 a b omitted\0"), true).unwrap();
+        let service = fake_service(vec![success(b"-\t-\tbinary\0")]);
+        let cancel = CancellationToken::new();
+        let mut cache = SnapshotCache::default();
+        cache.numstats_ready = true;
+        let observed = BTreeMap::from([
+            (path("binary"), Some((1, 1, 1, 1, 1, 1, 1))),
+            (path("omitted"), Some((1, 2, 1, 1, 1, 1, 1))),
+        ]);
+        let counts = service
+            .snapshot_numstats(
+                directory.path(),
+                &mut status,
+                SnapshotOptions::default(),
+                &cancel,
+                &cache,
+                &observed,
+                &bases,
+            )
+            .unwrap();
+        assert!(counts.contains_key(&(ChangeArea::Unstaged, path("binary"))));
+        assert!(!counts.contains_key(&(ChangeArea::Unstaged, path("omitted"))));
+    }
+
+    #[test]
     fn snapshot_collects_status_counts_files_remotes_and_refs() {
         let worktree = tempfile::tempdir().unwrap();
         let mut status = status_headers();
@@ -10410,7 +14545,12 @@ mod tests {
         refs.extend_from_slice(oid(1).as_str().as_bytes());
         refs.extend_from_slice(b"\0\0\0*\n");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
+            success(b"/etc/gitattributes\n"),
+            success(b"/nonexistent/cagents-test-attributes\n"),
+            exit(1, b""), // no custom diff drivers/includes
+            success(b""), // configuration origins
             success(b"4\t1\tsrc/main.rs\0"),
             success(b""),
             success(b"H src/main.rs\0H Cargo.toml\0"),
@@ -10442,9 +14582,9 @@ mod tests {
         assert!(snapshot.remotes.is_empty());
         assert_eq!(snapshot.local_refs.len(), 1);
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[1].arguments.contains(&OsString::from("--cached")));
-        assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
-        assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+        assert!(commands[6].arguments.contains(&OsString::from("--cached")));
+        assert!(!commands[7].arguments.contains(&OsString::from("--cached")));
+        assert_eq!(commands[8].arguments.last(), Some(&OsString::from("-z")));
     }
 
     #[test]
@@ -10534,6 +14674,7 @@ mod tests {
         let mut status = status_headers();
         status.extend_from_slice(b"? new.txt\0");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
             success(b""),
             success(b""),
@@ -10746,6 +14887,7 @@ mod tests {
             return;
         }
         let refusal = Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(128),
             signal: None,
             success: false,

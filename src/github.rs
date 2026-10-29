@@ -3301,6 +3301,7 @@ mod tests {
 
     fn success(stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(0),
             signal: None,
             success: true,
@@ -3695,6 +3696,7 @@ mod tests {
     #[test]
     fn nonzero_create_after_launch_is_conservatively_unknown() {
         let output = Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(1),
             signal: None,
             success: false,
@@ -3723,6 +3725,7 @@ mod tests {
     fn a_pr_without_checks_is_empty_but_other_stderr_is_an_error() {
         let output = |stderr: &[u8]| {
             Ok(ProcessOutput {
+                stdout_truncated: false,
                 exit_code: Some(1),
                 signal: None,
                 success: false,
@@ -3749,6 +3752,7 @@ mod tests {
     fn failed_checks_are_data_but_command_errors_are_not_empty_checks() {
         let output = |stdout: &[u8]| {
             Ok(ProcessOutput {
+                stdout_truncated: false,
                 exit_code: Some(1),
                 signal: None,
                 success: false,
@@ -4001,6 +4005,7 @@ mod tests {
 
     fn failed(exit_code: i32, stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
         Ok(ProcessOutput {
+            stdout_truncated: false,
             exit_code: Some(exit_code),
             signal: None,
             success: false,

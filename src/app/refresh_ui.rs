@@ -24,6 +24,15 @@ pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
+    pub(super) source_reload_pending: bool,
+    pub(super) source_cache: Option<(
+        PathBuf,
+        Arc<std::sync::Mutex<crate::repository::SnapshotCache>>,
+    )>,
+    pub(super) source_invalidated: Arc<std::sync::atomic::AtomicU8>,
+    pub(super) source_last_refresh: Instant,
+    pub(super) source_expanded: Vec<RepoPath>,
+    pub(super) source_ignored_errors: std::collections::BTreeMap<RepoPath, String>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     schedule: ProjectSchedule,
     last_pull_request: Instant,
@@ -37,6 +46,12 @@ impl Default for State {
             focused: false,
             source_generation: 0,
             source_cancel: None,
+            source_reload_pending: false,
+            source_cache: None,
+            source_invalidated: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            source_last_refresh: Instant::now(),
+            source_expanded: Vec::new(),
+            source_ignored_errors: Default::default(),
             projects: HashMap::new(),
             schedule: ProjectSchedule::default(),
             last_pull_request: Instant::now(),
@@ -254,18 +269,6 @@ impl Cagents {
                 tasks.push(repository_task(runtime.refresh_visible(card)));
             }
         }
-        if self.context_inspector_open
-            && matches!(self.context_tab, ContextTab::Files | ContextTab::Changes)
-            && self.refresh_ui.source_cancel.is_none()
-            && let Some(key) = self
-                .sidebar_model
-                .source_control
-                .as_ref()
-                .filter(|source| !source.busy())
-                .map(|source| source.key.clone())
-        {
-            tasks.push(self.reload_source_control(&key));
-        }
         let now = Instant::now();
         if let Some(card) = self.workspace.focused()
             && matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_)))
@@ -338,6 +341,7 @@ impl Cagents {
     }
 
     pub(super) fn cancel_source_read(&mut self) {
+        self.refresh_ui.source_reload_pending = false;
         if let Some(cancel) = self.refresh_ui.source_cancel.take() {
             cancel.cancel();
         }
@@ -356,7 +360,7 @@ impl Cagents {
             return self.device_project_read_task(path, project_id, generation, kind);
         }
         self.refresh_ui.schedule.started(project_id, Instant::now());
-        self.refresh_ui.git.forget(project_id);
+        self.refresh_ui.git.begin_repository_load(project_id);
         let cancellation = CancellationToken::default();
         if let Some(previous) = self
             .refresh_ui
