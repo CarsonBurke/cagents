@@ -10324,6 +10324,39 @@ impl Cagents {
             Some(CardRuntime::Loading) if self.terminal_retry_pending(id) => self
                 .terminal_retry_view(id)
                 .expect("retry presentation exists"),
+            // A fenced pane never attaches, so it must not look like it is
+            // still starting, nor offer a retry that would use its stale session.
+            Some(CardRuntime::Loading) | None if self.shared_views.quarantined.contains(&id) => {
+                widget::container(
+                    widget::container(
+                        widget::column::with_children(vec![
+                            widget::row::with_children(vec![
+                                Icon::Warning
+                                    .handle()
+                                    .icon()
+                                    .size(design::STATUS_ICON_SIZE)
+                                    .into(),
+                                design::title(labels.unavailable).into(),
+                            ])
+                            .align_y(Alignment::Center)
+                            .spacing(space::S)
+                            .into(),
+                            widget::selectable_text(
+                                "This pane's saved session doesn't match what its agent now reports, so cagents keeps it unchanged instead of reconnecting it, and it can't be moved or closed until they match. Other panes in this view are not affected.",
+                            )
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .into(),
+                        ])
+                        .spacing(space::L),
+                    )
+                    .class(cosmic::theme::Container::Secondary)
+                    .max_width(520)
+                    .padding(space::XL),
+                )
+                .center(Length::Fill)
+                .into()
+            }
             Some(CardRuntime::Loading) | None => widget::container(
                 widget::container(
                     widget::column::with_children(vec![

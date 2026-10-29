@@ -885,6 +885,9 @@ impl Cagents {
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        // A quarantined pane keeps its canonical descriptor and placement:
+        // this client neither seeds, closes, moves nor rewrites it.
+        let quarantined = self.fenced_panes();
         for (destination, desired) in &panes {
             for (index, pane) in desired.iter().enumerate() {
                 if let Some(source) = previous_owners
@@ -893,7 +896,7 @@ impl Cagents {
                     .filter(|source| source != destination)
                 {
                     if !self.shared_views.initialized.contains(&source)
-                        || self.shared_views.quarantined.contains(&pane.id)
+                        || quarantined.contains(&pane.id)
                         || self.shared_views.blocked.contains(&source)
                         || self.shared_views.blocked.contains(destination)
                     {
@@ -934,9 +937,6 @@ impl Cagents {
                 }
             }
         }
-        // A quarantined pane keeps its canonical descriptor and placement:
-        // this client neither seeds, closes, moves nor rewrites it.
-        let quarantined = self.shared_views.quarantined.clone();
         for scope in scopes {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -1072,6 +1072,16 @@ impl Cagents {
     /// A transfer can commit before a later metadata edit reaches the daemon.
     /// Keep that edit over the new owner and give its retry a distinct receipt:
     /// the original old-scope operation can still acknowledge a harmless no-op.
+    /// Fenced cards for the model this client holds now. A snapshot installed
+    /// since the last projection may have fenced a pane already, before
+    /// reconciliation recomputes the projected set and its local aliases.
+    fn fenced_panes(&self) -> HashSet<CardId> {
+        let mut fenced =
+            quarantined_managed_panes(&self.workspace_model, &self.workspace_model.views);
+        fenced.extend(self.shared_views.quarantined.iter().copied());
+        fenced
+    }
+
     pub(super) fn retarget_transferred_pane_updates(&mut self, acknowledged: Option<CardId>) {
         let moving: HashSet<_> = self
             .shared_views
@@ -1086,12 +1096,18 @@ impl Cagents {
         let mut edits = Vec::new();
         let mut discarded = HashSet::new();
         let mut stale_actor = false;
+        let fenced = self.fenced_panes();
         for (operation, scope, change) in &mut self.shared_views.pending {
             let Change::Update { before, pane } = change else {
                 continue;
             };
             let card = pane.id;
             if !moving.contains(&card) {
+                continue;
+            }
+            if fenced.contains(&card) {
+                // A fenced pane's owner cannot be verified; nothing retries.
+                discarded.insert(*operation);
                 continue;
             }
             let mut owners = self
@@ -1543,6 +1559,7 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         let mut retained_upgrades = Vec::new();
+        let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
@@ -1773,20 +1790,23 @@ impl Cagents {
         }
         // A quarantined pane stays where and as this client shows it; without
         // a local card here, there is nothing this client may show for it.
-        let strip = view
+        let local_pane = |id: CardId| {
+            let card = self.card_state(id)?;
+            let mut local = Pane::from_card(card, self.durable.card_scopes.get(&id).cloned())?;
+            local.user_title = self.chrome_ui.user_titles.get(&id).cloned();
+            Some(local)
+        };
+        let mut strip = view
             .panes
             .iter()
             .filter_map(|pane| {
                 if !self.shared_views.quarantined.contains(&pane.id) {
-                    return Some(pane.clone());
+                    Some(pane.clone())
+                } else if local_members.contains(&pane.id) {
+                    local_pane(pane.id)
+                } else {
+                    None
                 }
-                if !local_members.contains(&pane.id) {
-                    return None;
-                }
-                let card = self.card_state(pane.id)?;
-                let mut local = Pane::from_card(card, pane.scope.clone())?;
-                local.user_title = self.chrome_ui.user_titles.get(&pane.id).cloned();
-                Some(local)
             })
             .collect::<Vec<_>>();
         let shared = strip.iter().map(|pane| pane.id).collect::<HashSet<_>>();
@@ -1801,11 +1821,36 @@ impl Cagents {
                         .is_some_and(|card| card.kind.is_utility())
             })
             .collect::<Vec<_>>();
-        let visible = strip
-            .iter()
-            .map(|pane| pane.id)
-            .chain(retained)
-            .collect::<Vec<_>>();
+        let mut visible = strip.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        let mut fenced = Vec::new();
+        for id in retained {
+            if !self.shared_views.quarantined.contains(&id) || shared.contains(&id) {
+                visible.push(id);
+                continue;
+            }
+            // A fenced card the view does not place keeps its local place:
+            // after the nearest card it followed here.
+            let before = local_order
+                .iter()
+                .position(|prior| *prior == id)
+                .unwrap_or(local_order.len());
+            let place = local_order[..before]
+                .iter()
+                .rev()
+                .find_map(|prior| visible.iter().position(|placed| placed == prior))
+                .map_or(0, |index| index + 1);
+            visible.insert(place, id);
+            fenced.extend(local_pane(id));
+        }
+        // The strip shows fenced cards too, in their visible order.
+        for pane in fenced {
+            let place = visible
+                .iter()
+                .take(visible.iter().position(|id| *id == pane.id).unwrap_or(0))
+                .filter(|id| strip.iter().any(|placed| placed.id == **id))
+                .count();
+            strip.insert(place, pane);
+        }
         if let Some(index) = index {
             let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
             channel.cards = visible.clone();

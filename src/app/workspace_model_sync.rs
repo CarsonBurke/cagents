@@ -2862,17 +2862,21 @@ mod tests {
     /// A managed pane whose saved proof no longer matches its registry actor
     /// is fenced by itself. Its scope still seeds and projects its other
     /// panes, while the fenced pane keeps this window's card, presentation and
-    /// place and is never seeded, rewritten, moved or closed from here.
+    /// place and is never seeded, rewritten, moved or closed from here. With
+    /// `elsewhere`, the view placing it belongs to another channel while this
+    /// window still shows it here.
     #[test]
     fn stale_managed_pane_is_fenced_alone_while_its_scope_seeds_and_projects() {
         use crate::agent_execution::{
             Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
         };
         use crate::workspace_model::views::{Pane, Scope, View};
-        for closed in [false, true] {
+        for (closed, elsewhere) in [(false, false), (true, false), (false, true)] {
             let (mut app, project, repository) = app_with_project();
             let channel = ChannelId::new();
+            let other = ChannelId::new();
             let scope = Scope::Channel(channel);
+            let owner = Scope::Channel(if elsewhere { other } else { channel });
             let sibling = app.durable.cards[0].id;
             let CardKind::Terminal(mut registered) =
                 super::super::tests::terminal_card_state().kind
@@ -2880,14 +2884,16 @@ mod tests {
                 unreachable!()
             };
             registered.launch.working_directory = "/repo".into();
-            let live = |boot: &str| TerminalContinuity::Live {
+            let live = |boot: &str, incarnation: &str| TerminalContinuity::Live {
                 host_session_id: crate::model::HostSessionId::new("managed-host"),
                 boot_id: crate::model::BootId::new(boot),
-                host_incarnation: crate::model::HostIncarnation::new("managed-incarnation"),
+                host_incarnation: crate::model::HostIncarnation::new(incarnation),
             };
-            registered.continuity = live("previous-boot");
+            registered.continuity = live("previous-boot", "managed-incarnation");
             let mut current = registered.clone();
-            current.continuity = live("current-boot");
+            current.continuity = live("current-boot", "managed-incarnation");
+            let mut partial = registered.clone();
+            partial.continuity = live("current-boot", "another-incarnation");
             let mut agent = Agent {
                 id: crate::model::AgentId::new(),
                 name: None,
@@ -2923,6 +2929,7 @@ mod tests {
             local_channel.cards = vec![sibling, managed];
             local_channel.focused = Some(sibling);
             durable.channels.push(local_channel);
+            durable.channels.push(local(other, project, "Other", 1));
             durable.active_channel = Some(channel);
             app.chrome_ui
                 .user_titles
@@ -2936,9 +2943,12 @@ mod tests {
                 kind: CardKind::Terminal(current.clone()),
                 scope: Some("/repo".into()),
             };
-            let mut model = registry(vec![shared(channel, &repository, "Channel", 0)]);
+            let mut model = registry(vec![
+                shared(channel, &repository, "Channel", 0),
+                shared(other, &repository, "Other", 1),
+            ]);
             model.views.push(View {
-                scope: scope.clone(),
+                scope: owner.clone(),
                 revision: 3,
                 panes: vec![canonical.clone()],
                 retired: vec![],
@@ -2969,14 +2979,25 @@ mod tests {
 
             // The host appends the seeded sibling after the saved pane.
             let sibling_pane = Pane::from_card(app.card_state(sibling).unwrap(), None).unwrap();
-            model.views[0].panes.push(sibling_pane);
-            model.views[0].revision += 1;
-            model.sequence += 1;
-            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-                scope: scope.clone(),
-                operation: None,
-                model: model.clone(),
-            }));
+            if elsewhere {
+                model.views.push(View {
+                    scope: scope.clone(),
+                    revision: 1,
+                    panes: vec![sibling_pane],
+                    retired: vec![],
+                });
+            } else {
+                model.views[0].panes.push(sibling_pane);
+                model.views[0].revision += 1;
+            }
+            for seeded in [&scope, &Scope::Channel(other)] {
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: seeded.clone(),
+                    operation: None,
+                    model: model.clone(),
+                }));
+            }
             let members = &app
                 .durable
                 .channels
@@ -2984,7 +3005,21 @@ mod tests {
                 .find(|entry| entry.id == channel)
                 .unwrap()
                 .cards;
-            assert_eq!(members, &vec![managed, sibling], "canonical order");
+            // Canonical order where its view places it; its local place
+            // otherwise, after the sibling it followed here.
+            let order = if elsewhere {
+                vec![sibling, managed]
+            } else {
+                vec![managed, sibling]
+            };
+            assert_eq!(members, &order);
+            assert!(
+                !app.durable
+                    .channels
+                    .iter()
+                    .any(|entry| entry.id == other && entry.cards.contains(&managed)),
+                "a fenced pane is not also shown where its view places it"
+            );
             assert!(app.shared_views.attached.contains(&sibling));
             assert!(!app.shared_views.attached.contains(&managed));
             let card = app.card_state(managed).unwrap();
@@ -2996,10 +3031,7 @@ mod tests {
                 app.chrome_ui.user_titles.get(&managed).map(String::as_str),
                 Some("Kept user title")
             );
-            assert_eq!(
-                app.workspace.order().collect::<Vec<_>>(),
-                vec![managed, sibling]
-            );
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
             assert!(
                 app.persistent_workspace()
                     .cards
@@ -3008,13 +3040,20 @@ mod tests {
                 "the saved workspace keeps the fenced pane"
             );
 
-            // Repeated snapshots and local edits publish nothing for it.
+            // Repeated snapshots, evidence matching only in part, and local
+            // edits publish nothing for it. Close is refused, not lost.
+            model.agents[0].session = Some(HostedSession::Terminal(partial.clone()));
+            model.agents[0].console = Some(partial.clone());
             for _ in 0..2 {
                 model.sequence += 1;
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                assert!(app.shared_views.quarantined.contains(&managed));
             }
             app.card_state_mut(managed).unwrap().width_fraction = 0.9;
             app.publish_view_changes();
+            drop(app.begin_card_close(managed));
+            assert!(app.card_state(managed).unwrap().existence.is_open());
+            assert!(app.workspace.order().any(|id| id == managed));
             let edits = drain(&published);
             assert!(
                 !edits
@@ -3023,7 +3062,6 @@ mod tests {
             );
             assert!(!edits.iter().any(|edit| matches!(edit,
                 ModelEdit::ChangeView { change, .. } if change_mentions(change, managed))));
-            app.card_state_mut(managed).unwrap().width_fraction = kept.width_fraction;
 
             // Matching registry evidence ends the fence; the canonical
             // descriptor then projects normally.
@@ -3036,6 +3074,21 @@ mod tests {
             let card = app.card_state(managed).unwrap();
             assert_eq!(card.kind, canonical.kind);
             assert_eq!(card.title, canonical.title);
+            assert_eq!(
+                card.width_fraction, canonical.width_fraction,
+                "an edit made while fenced was never shared; the view's own wins"
+            );
+            let in_channel = |id: ChannelId| {
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .cards
+                    .contains(&managed)
+            };
+            assert_eq!(in_channel(channel), !elsewhere);
+            assert_eq!(in_channel(other), elsewhere);
             assert_eq!(
                 app.chrome_ui.user_titles.get(&managed).map(String::as_str),
                 Some("Canonical user title")
