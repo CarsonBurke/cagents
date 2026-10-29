@@ -730,6 +730,87 @@ fn managed_alias_duplicates_and_pending_resource_swaps_remain_quarantined() {
 }
 
 #[test]
+fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledgement() {
+    use crate::agent_execution::Surface;
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut canonical, identity) = cached_chat();
+    let mut owner = managed_owner(&canonical, hidden);
+    canonical.kind = moving_terminal_kind();
+    let CardKind::Terminal(issued) = &mut canonical.kind else {
+        unreachable!()
+    };
+    issued.launch.working_directory = "/fixture-project".into();
+    owner.spec.target.directory = issued.launch.working_directory.clone();
+    owner.session = None;
+    owner.console = Some(issued.clone());
+    owner.spec.surface = Surface::Terminal;
+    let old = canonical.id;
+    let mut alias = canonical.clone();
+    alias.id = CardId::new();
+    app.card_state_mut(old).unwrap().id = alias.id;
+    app.card_state_mut(alias.id).unwrap().kind = alias.kind.clone();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable
+        .channels
+        .iter_mut()
+        .find(|row| row.id == hidden)
+        .unwrap()
+        .cards = vec![alias.id];
+    let mut view = View::empty(hidden);
+    view.panes.push(alias.clone());
+    let mut full = model(identity, active, hidden, view);
+    full.agents.push(owner);
+    app.workspace_model = full.clone();
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    app.shared_views
+        .baseline
+        .insert(Scope::Channel(active), Vec::new());
+    app.shared_views
+        .baseline
+        .insert(Scope::Channel(hidden), vec![alias.clone()]);
+    // Completed/Exited use this production reducer and persist the resulting
+    // descriptor. A Completed placeholder keeps this fixture free of actors.
+    app.cards.insert(alias.id, CardRuntime::Completed);
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    app.retire_ended_terminal(alias.id, 17, None, false);
+    app.persist();
+    let observed = app.card_state(alias.id).unwrap().kind.clone();
+    assert!(exact_issued_terminal_end(&alias.kind, &observed));
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Update { before, pane }, .. } if before.kind == alias.kind && pane.kind == observed)));
+    assert!(app.shared_views.pending.iter().any(
+        |(_, _, change)| matches!(change, Change::Update { pane, .. } if pane.kind == observed)
+    ));
+    let mut changed_proof = app.shared_views.pending.clone();
+    for (_, _, change) in &mut changed_proof {
+        if let Change::Update { before, .. } = change
+            && let CardKind::Terminal(source) = &mut before.kind
+            && let TerminalContinuity::Live {
+                host_incarnation, ..
+            } = &mut source.continuity
+        {
+            *host_incarnation = "foreign-observer".into();
+        }
+    }
+    assert!(
+        quarantined_managed_panes(&full, &app.durable, &HashSet::new(), &changed_proof)
+            .contains(&alias.id),
+        "an end cannot launder a changed captured host proof"
+    );
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(full)));
+    assert!(!app.pane_is_quarantined(alias.id));
+    assert_eq!(app.card_state(alias.id).unwrap().kind, observed);
+    assert!(!matches!(
+        app.cards.get(&alias.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(app.terminal_starts.lock().unwrap().is_empty());
+}
+
+#[test]
 fn exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract() {
     let (mut app, active, hidden, mut canonical, identity) = cached_chat();
     let saved = canonical.clone();

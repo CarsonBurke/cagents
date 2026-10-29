@@ -35,6 +35,34 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
+/// The terminal event reducer records an observed end without replacing the
+/// issued session. This permits display only; every other source field stays
+/// exact, and normal managed projection validation still follows this check.
+fn exact_issued_terminal_end(before: &CardKind, current: &CardKind) -> bool {
+    let (CardKind::Terminal(before), CardKind::Terminal(current)) = (before, current) else {
+        return false;
+    };
+    before
+        .continuity
+        .live_proof()
+        .is_some_and(|proof| proof.is_complete())
+        && match &current.continuity {
+            TerminalContinuity::Exited { .. } => true,
+            TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: Some(_),
+            } => recipe == &before.launch,
+            _ => false,
+        }
+        && before.id == current.id
+        && before.launch == current.launch
+        && before.transcript_path == current.transcript_path
+        && before.resume_hint == current.resume_hint
+        && before.owned_codex_listener == current.owned_codex_listener
+        && before.recovery_origin == current.recovery_origin
+        && before.predecessor == current.predecessor
+}
+
 /// Classify against the complete snapshot, before filtering panes or adopting
 /// aliases. Filtering first would turn duplicate ownership into apparent proof.
 fn quarantined_managed_panes(
@@ -119,7 +147,11 @@ fn quarantined_managed_panes(
             .get(&pane.id)
             .and_then(|pane| pane.map(|pane| &pane.kind))
             .or_else(|| local_sources.get(&pane.id).copied());
-        if source.is_some_and(|source| managed_source(source) && source != &pane.kind) {
+        if source.is_some_and(|source| {
+            managed_source(source)
+                && source != &pane.kind
+                && !exact_issued_terminal_end(source, &pane.kind)
+        }) {
             return true;
         }
         if let Some(owner) = issuer {
@@ -163,6 +195,7 @@ fn quarantined_managed_panes(
             && !managed.contains_key(&pane.id)
             && managed_source(&before.kind)
             && before.kind != pane.kind
+            && !(exact_issued_terminal_end(&before.kind, &pane.kind) && !refused(before))
         {
             rejected.insert(pane.id);
             quarantined.insert(pane.id);
@@ -5709,6 +5742,81 @@ mod tests {
             !saved.chat_drafts.contains_key(&canonical.id),
             "the draft must not move into closed history"
         );
+    }
+
+    #[test]
+    fn observed_terminal_end_exception_preserves_every_issued_source_field() {
+        let before = moving_terminal_kind();
+        let mut ended = before.clone();
+        let CardKind::Terminal(current) = &mut ended else {
+            unreachable!()
+        };
+        transition_terminal_to_relaunchable(current, terminal_exit(17, None));
+        assert!(exact_issued_terminal_end(&before, &ended));
+        for change in [
+            "id",
+            "launch",
+            "transcript",
+            "resume",
+            "origin",
+            "predecessor",
+            "listener",
+            "relaunch-recipe",
+            "no-exit",
+        ] {
+            let mut altered = ended.clone();
+            let CardKind::Terminal(current) = &mut altered else {
+                unreachable!()
+            };
+            match change {
+                "id" => current.id = TerminalId::new(),
+                "launch" => current.launch.arguments.push("--different".into()),
+                "transcript" => current.transcript_path = Some("/other/transcript".into()),
+                "resume" => current.resume_hint = Some("other-thread".into()),
+                "origin" => current.recovery_origin = Some(TerminalId::new()),
+                "predecessor" => current.predecessor = Some(TerminalId::new()),
+                "listener" => {
+                    current.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                        socket: "/other/control.sock".into(),
+                        allocator: HostSessionProof {
+                            host_session_id: "other".into(),
+                            boot_id: "other".into(),
+                            host_incarnation: "other".into(),
+                        },
+                    })
+                }
+                "relaunch-recipe" => {
+                    let TerminalContinuity::RelaunchAvailable { recipe, .. } =
+                        &mut current.continuity
+                    else {
+                        unreachable!()
+                    };
+                    recipe.arguments.push("--different".into());
+                }
+                "no-exit" => {
+                    let TerminalContinuity::RelaunchAvailable { last_exit, .. } =
+                        &mut current.continuity
+                    else {
+                        unreachable!()
+                    };
+                    *last_exit = None;
+                }
+                _ => unreachable!(),
+            }
+            assert!(!exact_issued_terminal_end(&before, &altered), "{change}");
+        }
+        let mut unproved = before;
+        let CardKind::Terminal(current) = &mut unproved else {
+            unreachable!()
+        };
+        let TerminalContinuity::Live {
+            host_incarnation, ..
+        } = &mut current.continuity
+        else {
+            unreachable!()
+        };
+        *host_incarnation = "".into();
+        assert!(!exact_issued_terminal_end(&unproved, &ended));
     }
 
     #[test]

@@ -1287,6 +1287,132 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_unreadable_history_cannot_reappear_from_matching_provider_transcripts() {
+        use crate::persistence::{SnapshotBase, StateStore};
+        for corruption in [
+            "session-json",
+            "existence-json",
+            "invalid-continuity",
+            "missing-name",
+            "changed-source",
+            "unnamed-original",
+        ] {
+            for held in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let account = crate::account::Account {
+                    provider: Provider::Claude,
+                    home: crate::account::AccountHome::Linked {
+                        key: uuid::Uuid::new_v4(),
+                        path: root.path().join("claude"),
+                    },
+                };
+                let seed = chat::fresh_session(
+                    Provider::Claude,
+                    TerminalId::new(),
+                    root.path().into(),
+                    &account,
+                )
+                .unwrap();
+                let thread = uuid::Uuid::new_v4().to_string();
+                let mut source = seed.clone();
+                source.launch.session_id =
+                    (corruption != "unnamed-original").then(|| thread.clone());
+                let projects = provider_root(&seed).join("projects/project");
+                std::fs::create_dir_all(&projects).unwrap();
+                std::fs::write(projects.join(format!("{thread}.jsonl")), format!("{}\n", serde_json::json!({"type":"user","sessionId":thread,"cwd":root.path(),"message":{"content":"Retained source transcript"}}))).unwrap();
+                let path = root.path().join("history.sqlite3");
+                let store =
+                    StateStore::open(&path, crate::model::BootId::new("history-boot")).unwrap();
+                let mut workspace = WorkspaceState::default();
+                let mut card = crate::app::tests::terminal_card_state();
+                let id = card.id;
+                card.kind = CardKind::Chat(source.clone());
+                card.existence = crate::app::project_ui::removed_existence("removed saved pane");
+                workspace.cards.push(card);
+                if held {
+                    workspace
+                        .quarantined_panes
+                        .insert(id, CardKind::Chat(source.clone()));
+                }
+                let bases = std::collections::BTreeMap::new();
+                store
+                    .save_workspace(
+                        &workspace,
+                        SnapshotBase {
+                            workspace: 0,
+                            cards: &bases,
+                        },
+                    )
+                    .unwrap();
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                if corruption == "existence-json" {
+                    connection
+                        .execute(
+                            "UPDATE cards SET existence_json='{broken' WHERE card_id=?1",
+                            [id.to_string()],
+                        )
+                        .unwrap();
+                } else if corruption != "unnamed-original" {
+                    let mut changed = source;
+                    match corruption {
+                        "invalid-continuity" => {
+                            changed.native_continuity =
+                                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                        }
+                        "missing-name" => changed.launch.session_id = None,
+                        "changed-source" => {
+                            changed.id = TerminalId::new();
+                            changed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                        }
+                        _ => {}
+                    }
+                    let content = if corruption == "session-json" {
+                        "{broken".to_owned()
+                    } else {
+                        serde_json::to_string(&changed).unwrap()
+                    };
+                    connection
+                        .execute(
+                            "UPDATE cards SET content_json=?2 WHERE card_id=?1",
+                            rusqlite::params![id.to_string(), content],
+                        )
+                        .unwrap();
+                }
+                drop(connection);
+                let saved = store.saved_conversations();
+                assert_eq!(
+                    saved.is_err(),
+                    held,
+                    "{corruption}/{held}: only a known denied row makes ordinary per-row failure fatal"
+                );
+                let mut progress = Vec::new();
+                index(
+                    saved.map_err(|error| error.to_string()),
+                    vec![seed],
+                    &catalog::Cache::default(),
+                    &AtomicBool::new(false),
+                    |event| {
+                        progress.push(event);
+                        true
+                    },
+                );
+                if held {
+                    assert_eq!(
+                        progress.len(),
+                        1,
+                        "{corruption}: known denial stops catalog fallback"
+                    );
+                    assert!(
+                        matches!(&progress[0], Progress::Saved { entries, error: Some(_), .. } if entries.is_empty())
+                    );
+                } else {
+                    assert!(progress.iter().any(|event| matches!(event, Progress::Found { conversations, .. } if conversations.iter().any(|found| found.id == thread))), "{corruption}: matching real transcript proves the fallback fixture, ordinary readable catalog behavior stays available");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retained_claude_resume_waits_for_preparation_and_keeps_its_exact_allocation() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);

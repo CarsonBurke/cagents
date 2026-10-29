@@ -1954,7 +1954,7 @@ impl StateStore {
             ))
         })?;
         let mut conversations = Vec::new();
-        let mut quarantined = HashMap::<WorkspaceId, HashSet<CardId>>::new();
+        let mut quarantined = HashMap::<WorkspaceId, HashMap<CardId, CardKind>>::new();
         for row in rows {
             let (id, title, content, existence, updated_at_unix_ms, workspace) = row?;
             let workspace = parse_id("saved conversation workspace", &workspace)?;
@@ -1976,11 +1976,23 @@ impl StateStore {
                     .map(|value| from_json("saved pane admission metadata", &value))
                     .transpose()?
                     .unwrap_or_default();
-                entry.insert(sources.into_keys().collect());
+                entry.insert(sources);
             }
+            let card = parse_id("card", &id);
+            let known_denial = card
+                .as_ref()
+                .is_ok_and(|card| quarantined[&workspace].contains_key(card));
             let parsed: Result<Option<SavedConversation>> = (|| {
-                let card = parse_id("card", &id)?;
+                let card = card?;
                 let session: crate::chat::Session = from_json("saved conversation", &content)?;
+                if quarantined[&workspace].get(&card).is_some_and(
+                    |rejected| !matches!(rejected, CardKind::Chat(source) if source == &session),
+                ) {
+                    return Err(StoreError::InvalidState(
+                        "A quarantined saved conversation no longer matches its rejected source"
+                            .into(),
+                    ));
+                }
                 if !session.has_valid_native_continuity() {
                     return Err(StoreError::InvalidState(
                         "Invalid saved native continuity".into(),
@@ -1994,13 +2006,19 @@ impl StateStore {
                     title,
                     session,
                     open: from_json::<Existence>("conversation existence", &existence)?.is_open(),
-                    quarantined: quarantined[&workspace].contains(&card),
+                    quarantined: quarantined[&workspace].contains_key(&card),
                     updated_at_unix_ms,
                 }))
             })();
             match parsed {
                 Ok(Some(conversation)) => conversations.push(conversation),
+                Ok(None) if known_denial => {
+                    return Err(StoreError::InvalidState(
+                        "A quarantined saved conversation has no readable named identity".into(),
+                    ));
+                }
                 Ok(None) => {}
+                Err(error) if known_denial => return Err(error),
                 Err(error) => tracing::warn!(%error, "Skipping unreadable saved conversation"),
             }
         }
@@ -8127,7 +8145,7 @@ mod tests {
             }
             let before = logical_ui_rows(&store.lock_inner().unwrap().connection);
             let entries = store.saved_conversations();
-            if matches!(marker, "malformed" | "oversized") {
+            if matches!(marker, "mismatch" | "malformed" | "oversized") {
                 assert!(entries.is_err(), "{marker} cannot hide known denial");
             } else {
                 let entry = entries

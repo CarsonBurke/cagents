@@ -26354,7 +26354,7 @@ mod tests {
                 let source_id = app.workspace.focused().unwrap();
                 if chat {
                     app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(
-                        chat::fresh_session(
+                        crate::chat::fresh_session(
                             crate::agent::Provider::Claude,
                             TerminalId::new(),
                             PathBuf::from("/tmp"),
