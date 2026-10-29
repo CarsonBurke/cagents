@@ -4081,6 +4081,11 @@ impl Claude {
             "content_block_start" => {
                 let block = &event["content_block"];
                 let block_type = required(block, "type")?;
+                // Overflow still requires valid known protocol fields.
+                if matches!(block_type, "tool_use" | "server_tool_use") {
+                    required(block, "id")?;
+                    required(block, "name")?;
+                }
                 let stream = self
                     .streams
                     .get_mut(&parent)
@@ -5773,6 +5778,104 @@ mod tests {
             "a full block budget must not hide a missing type"
         );
         assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+    }
+
+    #[test]
+    fn known_stream_tool_metadata_is_validated_before_the_block_budget() {
+        for (retained_type, count) in [
+            ("future_content", 0),
+            ("future_content", MAX_TOOLS - 1),
+            ("future_content", MAX_TOOLS),
+            ("text", MAX_TOOLS),
+        ] {
+            for block_type in ["tool_use", "server_tool_use"] {
+                for field in ["id", "name"] {
+                    for value in [
+                        None,
+                        Some(Value::Null),
+                        Some(json!(false)),
+                        Some(json!(7)),
+                        Some(json!({})),
+                        Some(json!([])),
+                        Some(json!("")),
+                    ] {
+                        let mut adapter = Claude::default();
+                        adapter
+                            .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                            .unwrap();
+                        for index in 0..count {
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":retained_type,"text":""}})))
+                                .unwrap();
+                        }
+                        let mut block = json!({"type":block_type,"id":"tool","name":"Bash"});
+                        if let Some(value) = &value {
+                            block[field] = value.clone();
+                        } else {
+                            block.as_object_mut().unwrap().remove(field);
+                        }
+                        assert_eq!(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":count,
+                                    "content_block":block})))
+                                .err(),
+                            Some(format!("Claude protocol frame is missing {field}")),
+                            "accepted {block_type} with {field}={value:?} after {count} {retained_type} blocks"
+                        );
+                        assert_eq!(adapter.blocks.len() + adapter.ignored_blocks.len(), count);
+                        assert!(!adapter.streams[""].truncated);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_tools_still_overflow_the_block_budget_nonfatally() {
+        for retained_type in ["future_content", "text"] {
+            for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+                for block_type in ["tool_use", "server_tool_use"] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":retained_type,"text":""}})))
+                            .unwrap();
+                    }
+                    let mut events = Vec::new();
+                    for index in count..MAX_TOOLS + 2 {
+                        events.extend(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":block_type,"id":format!("tool-{index}"),"name":"Bash"}})))
+                                .unwrap()
+                                .events,
+                        );
+                        assert_eq!(
+                            adapter.blocks.len() + adapter.ignored_blocks.len(),
+                            MAX_TOOLS
+                        );
+                    }
+                    assert_eq!(errors(&events).len(), 1);
+                    assert!(events.iter().any(|event| matches!(event,
+                        Event::Error { message, fatal: false }
+                            if message.contains("too many streaming blocks")
+                    )));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Item(_)))
+                            .count(),
+                        MAX_TOOLS - count
+                    );
+                    assert!(adapter.busy && adapter.streams[""].truncated);
+                }
+            }
+        }
     }
 
     #[test]
