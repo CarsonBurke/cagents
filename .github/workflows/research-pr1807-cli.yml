@@ -17,8 +17,8 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: 5cf8ef88662526bd792e36d9e50b307d087330f1
-  EXPECTED_PRODUCT_TREE: 38fcf762e013f30e5368614f099195a071fb0bf6
+  EXPECTED_PRODUCT_SHA: 9b8ff336596aa29c97a2285bfd0c1d8f143f1519
+  EXPECTED_PRODUCT_TREE: 7ca55d5d699847a3878a9595ee9e5b8dba664a21
 
 jobs:
   cli:
@@ -54,7 +54,7 @@ jobs:
       - name: Check out the literal product
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 5cf8ef88662526bd792e36d9e50b307d087330f1
+          ref: 9b8ff336596aa29c97a2285bfd0c1d8f143f1519
           path: product
           persist-credentials: false
 
