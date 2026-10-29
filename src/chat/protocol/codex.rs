@@ -3304,10 +3304,22 @@ fn unique_answer<'a>(answers: &'a [Answer], field: &str) -> Result<&'a Answer, S
 fn decision_label(id: &str, value: &Value) -> String {
     match approval_role(id) {
         Some(ApprovalRole::PolicyAllow) if value.get("acceptWithExecpolicyAmendment").is_some() => {
-            return "Always allow this command prefix".into();
+            return format!(
+                "Always allow command prefix {}",
+                value["acceptWithExecpolicyAmendment"]["execpolicy_amendment"]
+            );
         }
-        Some(ApprovalRole::PolicyAllow) => return "Always allow this host".into(),
-        Some(ApprovalRole::PolicyDeny) => return "Always deny this host".into(),
+        Some(ApprovalRole::PolicyAllow | ApprovalRole::PolicyDeny) => {
+            return format!(
+                "Always {} host {}",
+                if approval_role(id) == Some(ApprovalRole::PolicyAllow) {
+                    "allow"
+                } else {
+                    "deny"
+                },
+                value["applyNetworkPolicyAmendment"]["network_policy_amendment"]["host"]
+            );
+        }
         _ => {}
     }
     match value.as_str().unwrap_or(id) {

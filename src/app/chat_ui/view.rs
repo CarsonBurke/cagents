@@ -4454,7 +4454,7 @@ fn answers_view<'a>(
     let answers = ordered_answers(request);
     let primary = primary_answer(request).map(|choice| &choice.id);
     let bindings = available.then(|| approval_bindings(request)).flatten();
-    widget::row::with_children(
+    widget::flex_row(
         answers
             .into_iter()
             .map(|choice| {
@@ -4470,20 +4470,44 @@ fn answers_view<'a>(
                 } else {
                     choice.label.clone()
                 };
-                let control = if primary == Some(&choice.id) {
-                    crate::ui_controls::button::primary(label)
+                let control: Element<'a, Message> = if matches!(
+                    approval_role(choice),
+                    Some(ApprovalRole::PolicyAllow | ApprovalRole::PolicyDeny)
+                ) {
+                    // A durable rule's exact scope must remain visible without
+                    // hover, including long argv/hosts in narrow conversations.
+                    let control = widget::button::custom(
+                        design::heading(label.clone())
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill),
+                    )
+                    .name(label)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([step::GAP_S, step::GAP_M])
+                    .width(Length::Shrink)
+                    .on_press_maybe(message);
+                    match surface {
+                        RequestSurface::Permissions => control
+                            .id(answer_control_id(target, request, choice))
+                            .into(),
+                        RequestSurface::Transcript => control.into(),
+                    }
                 } else {
-                    crate::ui_controls::button::secondary(label)
-                }
-                .on_press_maybe(message);
-                // Custom IDs retain state globally in iced. The transcript
-                // and popup render the same answers simultaneously, so only
-                // the popup copy receives its keyboard-navigation ID.
-                let control: Element<'a, Message> = match surface {
-                    RequestSurface::Permissions => control
-                        .id(answer_control_id(target, request, choice))
-                        .into(),
-                    RequestSurface::Transcript => control.into(),
+                    let control = if primary == Some(&choice.id) {
+                        crate::ui_controls::button::primary(label)
+                    } else {
+                        crate::ui_controls::button::secondary(label)
+                    }
+                    .on_press_maybe(message);
+                    // Custom IDs retain state globally in iced. The transcript
+                    // and popup render the same answers simultaneously, so only
+                    // the popup copy receives its keyboard-navigation ID.
+                    match surface {
+                        RequestSurface::Permissions => control
+                            .id(answer_control_id(target, request, choice))
+                            .into(),
+                        RequestSurface::Transcript => control.into(),
+                    }
                 };
                 if choice.description.is_empty() {
                     control
@@ -4498,11 +4522,10 @@ fn answers_view<'a>(
             })
             .collect::<Vec<_>>(),
     )
-    .spacing(step::GAP_S)
-    .align_y(Alignment::Center)
+    .spacing(step::GAP_S as u16)
+    .align_items(Alignment::Center)
     // Answers wrap rather than run off the edge of a narrow pane: an
     // answer a reader cannot see is an answer they do not have.
-    .wrap()
     .into()
 }
 
@@ -7337,7 +7360,7 @@ mod tests {
             let step = adapter
                 .receive(json!({"id":71,"method":method,"params":{
                     "threadId":"thread-exact","turnId":"turn","itemId":"tool",
-                    "command":"python scripts/cancel_job.py","cwd":home,
+                    "command":"python scripts/cancel_job.py --force","cwd":home,
                     "availableDecisions":decisions,"permissions":{"network":{"enabled":true}}
                 }}))
                 .unwrap();
@@ -7361,6 +7384,41 @@ mod tests {
             focus: Option<&str>,
             key: keyboard::key::Named,
         ) -> (Vec<Message>, Vec<String>) {
+            dispatch_with_modifiers(
+                renderer,
+                request,
+                surface,
+                available,
+                focus,
+                key,
+                keyboard::Modifiers::empty(),
+                640.0,
+            )
+        }
+
+        fn dispatch_with_modifiers(
+            renderer: &cosmic::Renderer,
+            request: &chat::Request,
+            surface: RequestSurface,
+            available: bool,
+            focus: Option<&str>,
+            key: keyboard::key::Named,
+            modifiers: keyboard::Modifiers,
+            width: f32,
+        ) -> (Vec<Message>, Vec<String>) {
+            #[derive(Default)]
+            struct VisibleText(Vec<(String, iced::Rectangle)>);
+            impl iced::advanced::widget::Operation for VisibleText {
+                fn text(&mut self, _id: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                    self.0.push((text.to_owned(), bounds));
+                }
+                fn traverse(
+                    &mut self,
+                    operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    operate(self);
+                }
+            }
             let target = Target {
                 card: CardId::new(),
                 generation: 7,
@@ -7368,7 +7426,7 @@ mod tests {
             let answers = Answers::new();
             let mut element = request_view(target, request, &answers, available, surface);
             let mut tree = Tree::new(element.as_widget());
-            let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 900.0));
+            let viewport = iced::Rectangle::with_size(iced::Size::new(width, 900.0));
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 renderer,
@@ -7379,6 +7437,63 @@ mod tests {
                 &tree,
                 iced::mouse::Cursor::Unavailable,
             );
+            let mut visible = VisibleText::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), renderer, &mut visible);
+            let mut control_bounds = Vec::new();
+            for choice in &request.actions {
+                let control = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| {
+                        node.node().role() == Role::Button
+                            && node.node().label().is_some_and(|label| {
+                                label == choice.label.as_str()
+                                    || label.strip_suffix(" (Esc)") == Some(choice.label.as_str())
+                                    || label.strip_suffix(" (Enter)") == Some(choice.label.as_str())
+                            })
+                    })
+                    .expect("every actual answer button and its exact name must be exposed");
+                let bounds = control
+                    .node()
+                    .bounds()
+                    .expect("actual answer button has bounds");
+                assert!(
+                    bounds.x0 >= -0.01
+                        && bounds.y0 >= -0.01
+                        && bounds.x1 <= f64::from(width) + 0.01
+                        && bounds.y1 <= f64::from(viewport.height) + 0.01
+                        && bounds.x1 > bounds.x0
+                        && bounds.y1 > bounds.y0,
+                    "answer {choice:?} must stay reachable at width {width}: {bounds:?}"
+                );
+                if matches!(
+                    approval_role(choice),
+                    Some(ApprovalRole::PolicyAllow | ApprovalRole::PolicyDeny)
+                ) {
+                    let (_, text) = visible.0.iter().find(|(text, _)| text == &choice.label)
+                        .expect("the exact durable scope must be rendered text, not only an accessible name or tooltip");
+                    assert!(
+                        f64::from(text.x) >= bounds.x0 - 0.01
+                            && f64::from(text.y) >= bounds.y0 - 0.01
+                            && f64::from(text.x + text.width) <= bounds.x1 + 0.01
+                            && f64::from(text.y + text.height) <= bounds.y1 + 0.01,
+                        "complete policy label must fit inside its actual button: {text:?} / {bounds:?}"
+                    );
+                }
+                control_bounds.push(bounds);
+            }
+            for (index, first) in control_bounds.iter().enumerate() {
+                for second in &control_bounds[index + 1..] {
+                    assert!(
+                        (first.x1.min(second.x1) - first.x0.max(second.x0)) <= 0.01
+                            || (first.y1.min(second.y1) - first.y0.max(second.y0)) <= 0.01,
+                        "wrapping must not overlap decision controls: {first:?} / {second:?}"
+                    );
+                }
+            }
             let buttons: Vec<_> = accessible
                 .root()
                 .iter()
@@ -7444,7 +7559,7 @@ mod tests {
                         keyboard::key::NativeCode::Unidentified,
                     ),
                     location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
+                    modifiers,
                     text: None,
                     repeat: false,
                 }),
@@ -7566,6 +7681,68 @@ mod tests {
                     }
                 }
             }
+            for (decision, label) in [
+                (
+                    json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["python"]}}),
+                    "Always allow command prefix [\"python\"]",
+                ),
+                (
+                    json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"cancel.example","action":"allow"}}}),
+                    "Always allow host \"cancel.example\"",
+                ),
+                (
+                    json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"allow.example","action":"deny"}}}),
+                    "Always deny host \"allow.example\"",
+                ),
+                (
+                    json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["python","/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py","--option with spaces"]}}),
+                    "Always allow command prefix [\"python\",\"/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py\",\"--option with spaces\"]",
+                ),
+            ] {
+                for width in [360.0, 640.0] {
+                    let (mut adapter, request) = request(
+                        &home,
+                        "item/commandExecution/requestApproval",
+                        &[json!("accept"), decision.clone(), json!("cancel")],
+                    );
+                    assert!(
+                        request
+                            .description
+                            .contains("python scripts/cancel_job.py --force")
+                    );
+                    let (messages, names) = dispatch_with_modifiers(
+                        &renderer,
+                        &request,
+                        surface,
+                        true,
+                        Some(label),
+                        keyboard::key::Named::Enter,
+                        keyboard::Modifiers::empty(),
+                        width,
+                    );
+                    assert!(
+                        names.iter().any(|name| name == label),
+                        "both the rendered button and its accessible name must disclose exact scope at {width}"
+                    );
+                    let [Message::ChatUi(Action::Answer(_, id, choice))] = messages.as_slice()
+                    else {
+                        panic!(
+                            "the narrow policy control must remain reachable through native focus and Enter"
+                        );
+                    };
+                    assert_eq!(
+                        adapter
+                            .command(Command::Answer {
+                                request_id: id.clone(),
+                                action: choice.clone(),
+                                answers: Vec::new(),
+                            })
+                            .unwrap()
+                            .writes,
+                        vec![json!({"id":71,"result":{"decision":decision}})]
+                    );
+                }
+            }
             let (_, mut legacy) = request(
                 &home,
                 "item/commandExecution/requestApproval",
@@ -7654,6 +7831,27 @@ mod tests {
                     )
                     .0
                     .is_empty()
+                );
+            }
+            for modifiers in [
+                keyboard::Modifiers::SHIFT,
+                keyboard::Modifiers::CTRL,
+                keyboard::Modifiers::SHIFT | keyboard::Modifiers::CTRL,
+            ] {
+                assert!(
+                    dispatch_with_modifiers(
+                        &renderer,
+                        &request,
+                        surface,
+                        true,
+                        Some("card"),
+                        keyboard::key::Named::Enter,
+                        modifiers,
+                        360.0
+                    )
+                    .0
+                    .is_empty(),
+                    "modified Enter, including Shift+Enter, cannot implicitly grant from the card"
                 );
             }
             let (messages, _) = dispatch(
