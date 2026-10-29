@@ -870,6 +870,94 @@ mod tests {
     }
 
     #[test]
+    fn a_noop_drag_keeps_new_channels_above_saved_order_in_fold_peers_and_restart() {
+        use crate::workspace_model::NavigationItem;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("navigation.sqlite3");
+        let mut registry = Registry::at(&database).unwrap();
+        registry.apply(&open("/repo")).unwrap();
+        let old = ChannelId::new();
+        registry
+            .apply(&create(old, "/repo", "Saved conversation"))
+            .unwrap();
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(old);
+        let manual = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: vec![old.clone(), worktree.clone()],
+        };
+        let saved = registry.apply(&manual).unwrap().model;
+        assert_eq!(
+            saved.navigation_orders[0].items,
+            vec![worktree.clone(), old.clone()]
+        );
+        let newest = ChannelId::new();
+        let create = create(newest, "/repo", "New conversation");
+        let created = registry.apply(&create).unwrap().model;
+        let newest = NavigationItem::Channel(newest);
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        // This is precisely the visible list after creation. Dropping W before
+        // its existing next sibling O is visually unchanged, including N above.
+        let visible = vec![
+            newest.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree.clone(),
+        ];
+        let drag = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: visible.clone(),
+        };
+        let applied = registry.apply(&drag).unwrap();
+        assert_eq!(applied.model.navigation_orders[0].items, visible);
+        assert_eq!(
+            applied.model.channels, created.channels,
+            "drag changes no channel identity, title or rank"
+        );
+        let mut folded = saved;
+        folded.fold(created.sequence, &create);
+        folded.fold(applied.model.sequence, &drag);
+        assert_eq!(folded.navigation_orders, applied.model.navigation_orders);
+        let repeated = registry.apply(&drag).unwrap();
+        assert!(!repeated.changed);
+        assert_eq!(repeated.model.sequence, applied.model.sequence);
+        let mut peer = Registry::at(&database).unwrap();
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert_eq!(
+            registry.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        // An intentional later move of N is still authoritative.
+        let move_newest = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: newest.clone(),
+            before: None,
+            fallback: visible,
+        };
+        let moved = registry.apply(&move_newest).unwrap();
+        assert!(moved.changed);
+        assert_eq!(
+            moved.model.navigation_orders[0].items,
+            vec![worktree, old, added_worktree, newest]
+        );
+        folded.fold(moved.model.sequence, &move_newest);
+        assert_eq!(folded.navigation_orders, moved.model.navigation_orders);
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            moved.model.navigation_orders
+        );
+    }
+
+    #[test]
     fn inferred_names_upgrade_once_and_manual_renames_win_even_when_text_matches() {
         let (mut registry, _) = registry();
         registry.apply(&open("/project")).unwrap();
