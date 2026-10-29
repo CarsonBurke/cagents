@@ -1082,13 +1082,59 @@ fn ranked_snapshot_retires_verified_pane_behind_newer_metadata() {
     };
     issuer.launch.session_id = None;
     retired.agents[0] = previous.agents[0].clone();
-    app.acknowledge_view_edit(Scope::Channel(channel), None);
     let (tx, rx) = async_channel::unbounded();
     app.workspace_model_tx = tx;
     drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
         channel,
         model: previous.clone(),
     }));
+    let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let seeds = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            ModelEdit::SeedView {
+                scope,
+                panes,
+                closed,
+            } if *scope == Scope::Channel(channel) => Some((panes, closed)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(seeds[0].0, &vec![pane.clone()]);
+    assert!(seeds[0].1.is_empty());
+    assert!(!edits.iter().any(|edit| matches!(edit,
+        ModelEdit::ChangeView { change, .. } if change_card(change) == Some(pane.id)
+    )));
+    assert!(app.shared_views.seeding.contains(&Scope::Channel(channel)));
+    assert!(
+        !app.shared_views
+            .initialized
+            .contains(&Scope::Channel(channel))
+    );
+    assert!(
+        !app.shared_views
+            .pending
+            .iter()
+            .any(|(_, _, change)| change_card(change) == Some(pane.id))
+    );
+    drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(channel),
+        operation: None,
+        model: previous.clone(),
+    }));
+    assert!(
+        app.shared_views
+            .initialized
+            .contains(&Scope::Channel(channel))
+    );
+    assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+    assert!(
+        !app.shared_views
+            .pending
+            .iter()
+            .any(|(_, _, change)| change_card(change) == Some(pane.id))
+    );
     assert!(!app.pane_is_quarantined(pane.id));
     drop(app.apply_workspace_model_update(ModelUpdate::Edited {
         sequence: previous.sequence,
@@ -1106,6 +1152,27 @@ fn ranked_snapshot_retires_verified_pane_behind_newer_metadata() {
             title: "Newer manual title".into(),
         },
     }));
+    assert!(!app.shared_chat_has_local_work(pane.id));
+    assert!(
+        app.shared_views
+            .initialized
+            .contains(&Scope::Channel(channel))
+    );
+    assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+    assert!(
+        !app.shared_views
+            .pending
+            .iter()
+            .any(|(_, _, change)| change_card(change) == Some(pane.id))
+    );
+    let witness = app.shared_views.validated_managed.get(&pane.id).unwrap();
+    assert_eq!(witness.registry, previous.identity);
+    assert_eq!(witness.scope, Scope::Channel(channel));
+    assert_eq!(witness.source, pane.kind);
+    assert_eq!(Some(&witness.issuer), previous.agents[0].session.as_ref());
+    assert_eq!(witness.snapshot_sequence, 10);
+    assert_eq!(witness.revision, 7);
+    assert!(!app.pane_is_quarantined(pane.id));
     retired.agents[0].closed = true;
     for _ in 0..2 {
         drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
