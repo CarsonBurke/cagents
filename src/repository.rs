@@ -149,6 +149,28 @@ pub fn nested_worktree_paths<'a>(
         .filter(move |candidate| *candidate != path && candidate.starts_with(path))
 }
 
+/// Why Git's listing `records` forbids removing the worktree at `path`: it
+/// contains other worktrees that `git worktree remove` would delete with it.
+///
+/// A record Git marks prunable is skipped only once its directory is gone, as
+/// then nothing of it remains to lose. One still on disk, such as a worktree
+/// whose `.git` file was removed, keeps its files, and so keeps blocking; so
+/// does any path whose absence cannot be confirmed.
+pub fn nested_worktrees_refusal_in(path: &Path, records: &[WorktreeRecord]) -> Option<String> {
+    let present = records.iter().filter(|record| {
+        record.prunable_reason.is_none()
+            || !std::fs::symlink_metadata(&record.path).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+    });
+    nested_worktrees_refusal(
+        nested_worktree_paths(path, present.map(|record| record.path.as_path())).count(),
+    )
+}
+
 /// Why a worktree containing `nested` other worktrees cannot be removed, or
 /// `None` when it contains none.
 pub fn nested_worktrees_refusal(nested: usize) -> Option<String> {

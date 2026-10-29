@@ -2504,20 +2504,7 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if records.first().is_some_and(|primary| primary.id == id) || record.bare {
         return Err(PRIMARY_WORKTREE_KEPT.into());
     }
-    if let Some(reason) = crate::repository::nested_worktrees_refusal(
-        nested_worktree_paths(
-            &target.path,
-            records
-                .iter()
-                // A prunable record whose directory is gone loses nothing;
-                // one that is still on disk would go with this worktree.
-                .filter(|record| {
-                    record.prunable_reason.is_none() || record.path.symlink_metadata().is_ok()
-                })
-                .map(|record| record.path.as_path()),
-        )
-        .count(),
-    ) {
+    if let Some(reason) = crate::repository::nested_worktrees_refusal_in(&target.path, &records) {
         return Err(reason);
     }
     if record.lock.locked {
