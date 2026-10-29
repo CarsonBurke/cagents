@@ -46,6 +46,7 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    pub(super) diagnostics: super::child_diagnostics::Backing,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
@@ -81,6 +82,19 @@ pub(crate) struct Store {
 impl Store {
     pub(super) fn directory(&self) -> &std::path::Path {
         &self.directory
+    }
+    pub(super) fn diagnostic_source(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::chat::TextCopySource>, String> {
+        self.copy_parent_source(id)
+    }
+    pub(super) fn diagnostic_boundary(&self, id: &str, offset: usize) -> Result<bool, String> {
+        let byte = self.field(id, 0, offset, offset + 1)?;
+        let Some(byte) = byte.first() else {
+            return Err("Original diagnostic range is unavailable".into());
+        };
+        Ok(byte & 0xc0 != 0x80)
     }
     #[cfg(test)]
     pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
@@ -134,6 +148,7 @@ impl Store {
         if self.child_files_seen
             || self.file_index_incomplete
             || !self.presented_children.is_empty()
+            || !self.diagnostics.is_empty()
         {
             return Ok(false);
         }
@@ -207,15 +222,25 @@ impl Store {
     }
 
     pub fn new() -> Result<Self, String> {
+        Self::with_budget(false)
+    }
+    pub(super) fn diagnostic_backing() -> Result<Self, String> {
+        Self::with_budget(true)
+    }
+    fn with_budget(diagnostic: bool) -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
         #[cfg(not(test))]
         let root = crate::daemon::RuntimePaths::discover()
             .map_err(|e| e.to_string())?
             .directory;
-        Self::at(root)
+        Self::at_with_budget(root, diagnostic)
     }
+    #[cfg(test)]
     fn at(root: PathBuf) -> Result<Self, String> {
+        Self::at_with_budget(root, false)
+    }
+    fn at_with_budget(root: PathBuf, diagnostic: bool) -> Result<Self, String> {
         let (directory, lease) = crate::transcript_cache::create(&root)
             .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
@@ -227,14 +252,50 @@ impl Store {
                 .open(&path)
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
+            if diagnostic {
+                // One private backing per actor, not one connection per child.
+                // Limit the database before schema or payload writes. DELETE
+                // journal mode avoids an independently growing WAL/SHM pair.
+                db.execute_batch("PRAGMA page_size=4096; PRAGMA max_page_count=3072; PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA journal_size_limit=0; PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=ON;")
+                    .map_err(|error| error.to_string())?;
+                let mode: String = db
+                    .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let page: u64 = db
+                    .pragma_query_value(None, "page_size", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                let pages: u64 = db
+                    .pragma_query_value(None, "max_page_count", |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                if mode != "delete" || page != 4096 || pages != 3072 {
+                    return Err("Diagnostic backing limits could not be established".into());
+                }
+                for (pragma, expected) in [
+                    ("cache_size", -256i64),
+                    ("mmap_size", 0),
+                    ("journal_size_limit", 0),
+                    ("temp_store", 2),
+                ] {
+                    let actual: i64 = db
+                        .pragma_query_value(None, pragma, |row| row.get(0))
+                        .map_err(|error| error.to_string())?;
+                    if actual != expected {
+                        return Err(format!(
+                            "Diagnostic backing {pragma} limit could not be established"
+                        ));
+                    }
+                }
+            } else {
+                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
+            }
+            db.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
+                diagnostics: Default::default(),
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
@@ -285,7 +346,7 @@ impl Store {
     /// holds identity alone. Returns a non-fatal warning instead of an error when an
     /// item's identity still cannot be cached intact: a single unrepresentable item
     /// must never end the conversation.
-    fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
+    pub(super) fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
         self.put_at(item, older, None)
     }
     fn put_at(
@@ -752,6 +813,7 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -1632,6 +1694,32 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn diagnostic_backing_establishes_aggregate_disk_and_cache_limits_before_data() {
+        let store = Store::diagnostic_backing().unwrap();
+        let mode: String = store
+            .db
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        for (pragma, expected) in [
+            ("page_size", 4096i64),
+            ("max_page_count", 3072),
+            ("cache_size", -256),
+            ("mmap_size", 0),
+            ("journal_size_limit", 0),
+            ("temp_store", 2),
+        ] {
+            let actual: i64 = store
+                .db
+                .pragma_query_value(None, pragma, |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{pragma}");
+        }
+        assert!(!store.directory.join("transcript.sqlite-wal").exists());
+        assert!(!store.directory.join("transcript.sqlite-shm").exists());
+    }
 
     #[test]
     fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {

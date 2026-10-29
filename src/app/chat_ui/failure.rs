@@ -12,6 +12,87 @@ enum Source {
     Snapshot,
 }
 
+/// Child originals are read only through their published owned-source proof.
+/// Resident details remain an explicitly bounded diagnostic preview.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CopyPlan {
+    parts: Vec<(Source, Option<chat::TextCopySource>, String)>,
+}
+
+fn child_source<'a>(snapshot: &'a Snapshot, source: &Source) -> Option<&'a str> {
+    match source {
+        Source::ChildItem(child, id) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)?
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .and_then(|item| match &item.content {
+                ItemContent::Text { text, .. } => Some(text.as_str()),
+                ItemContent::Delivery { body, .. } => Some(body.as_str()),
+                ItemContent::Tool { output, .. } => Some(output.as_str()),
+                _ => None,
+            }),
+        Source::ChildDetail(child) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)
+            .map(|agent| agent.detail.as_str()),
+        _ => None,
+    }
+}
+
+fn child_copy_source(snapshot: &Snapshot, child: &str, id: &str) -> Option<chat::TextCopySource> {
+    let index = snapshot
+        .subagents
+        .iter()
+        .find(|agent| agent.id == child)?
+        .items
+        .iter()
+        .position(|item| item.id == id)?;
+    snapshot
+        .text_copy_sources
+        .children
+        .get(child)?
+        .get(index)?
+        .clone()
+        .filter(|source| source.scope == (chat::TextCopyScope::Subagent { id: child.into() }))
+}
+
+impl CopyPlan {
+    pub(super) fn is_current(&self, snapshot: &Snapshot) -> bool {
+        self.parts
+            .iter()
+            .all(|(identity, source, text)| match (identity, source) {
+                (Source::ChildItem(child, item), Some(source)) => {
+                    child_copy_source(snapshot, child, item).as_ref() == Some(source)
+                }
+                (_, None) => child_source(snapshot, identity) == Some(text.as_str()),
+                _ => false,
+            })
+    }
+
+    pub(super) fn read(&self, handle: &ClientHandle) -> Result<String, String> {
+        let mut originals = Vec::new();
+        let mut bytes = 0usize;
+        for (_, source, literal) in &self.parts {
+            let text = match source {
+                Some(source) => handle.copy_text(source.clone())?,
+                None => literal.clone(),
+            };
+            if !originals.contains(&text) {
+                bytes = bytes.saturating_add(text.len()).saturating_add(7);
+                if bytes > chat::TEXT_COPY_LIMIT_BYTES {
+                    return Err("Diagnostic originals exceed the clipboard limit".into());
+                }
+                originals.push(text);
+            }
+        }
+        Ok(originals.join("\n\n---\n\n"))
+    }
+}
+
 pub(super) struct Incident {
     pub key: String,
     pub summary: String,
@@ -518,6 +599,93 @@ struct Preview {
 }
 
 impl Runtime {
+    pub(super) fn failure_originals_retained(&self, key: &str) -> Option<bool> {
+        let incident = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)?;
+        let mut retained = false;
+        let mut complete = true;
+        for source in &incident.sources {
+            if let Source::ChildItem(child, id) = source {
+                let item = self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == child)
+                    .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
+                if item.is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }) {
+                    retained = true;
+                    complete &= child_copy_source(&self.snapshot, child, id).is_some();
+                }
+            } else if !matches!(source, Source::ChildDetail(_)) {
+                complete = false;
+            }
+        }
+        retained.then_some(complete)
+    }
+
+    pub(super) fn failure_copy_plan(&self, key: &str) -> Result<Option<CopyPlan>, String> {
+        let Some(incident) = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+        else {
+            return Ok(None);
+        };
+        let retained = incident.sources.iter().any(|source| match source {
+            Source::ChildItem(child, id) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+                .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                .is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }),
+            _ => false,
+        });
+        if !retained {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        for identity in &incident.sources {
+            let text = child_source(&self.snapshot, identity)
+                .ok_or("Original diagnostic unavailable in this view")?;
+            let source = match identity {
+                Source::ChildItem(child, id) => {
+                    let item = self
+                        .snapshot
+                        .subagents
+                        .iter()
+                        .find(|agent| &agent.id == child)
+                        .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                        .ok_or("Original diagnostic item is unavailable")?;
+                    if chat::failure::provider_error_text(Provider::Codex, item).is_some() {
+                        Some(child_copy_source(&self.snapshot, child, id).ok_or(
+                            "Original diagnostic unavailable: it was refused, changed or evicted",
+                        )?)
+                    } else {
+                        None
+                    }
+                }
+                Source::ChildDetail(_) => None,
+                _ => return Err("Original diagnostic unavailable in this view".into()),
+            };
+            let literal = if source.is_none() {
+                text.into()
+            } else {
+                String::new()
+            };
+            parts.push((identity.clone(), source, literal));
+        }
+        Ok(Some(CopyPlan { parts }))
+    }
+
     pub(super) fn reconcile_failure_ui(&mut self) -> bool {
         if self.failure_ui.local_error.as_deref() == self.error.as_deref() {
             return false;
@@ -805,7 +973,15 @@ impl Runtime {
                     .max_height(240)
                     .into(),
                 );
-                if omitted {
+                let retained = self.failure_originals_retained(&incident.key);
+                if let Some(available) = retained {
+                    let caption = if !available {
+                        "Diagnostic preview only. Original unavailable: it was refused, changed or evicted."
+                    } else {
+                        "Diagnostic preview only. Copy details retrieves the retained originals."
+                    };
+                    rows.push(design::caption(caption).width(Length::Fill).into());
+                } else if omitted {
                     rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
                 }
             }

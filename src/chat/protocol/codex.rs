@@ -6342,6 +6342,127 @@ mod tests {
     }
 
     #[test]
+    fn large_child_originals_survive_actor_reads_and_old_completion_cannot_settle_next_turn() {
+        let (parent, mut frames) = child_error_runtime_fixture();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\nrequest-id: large-original\n{}\nTAIL original λ",
+            "猫 café diagnostic\n".repeat(20_000)
+        );
+        frames.push(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","error":{"message":raw},"willRetry":false}}));
+        let failed = json!({"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"failed","error":{"message":raw},"items":[]}}});
+        frames.push(failed.clone());
+        frames.push(json!({"method":"thread/status/changed","params":{"threadId":"child-thread","status":{"type":"idle"}}}));
+        frames.push(json!({"method":"thread/closed","params":{"threadId":"child-thread"}}));
+        frames.push(json!({"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"next-child","status":"inProgress","items":[]}}}));
+        frames.push(failed);
+        frames.push(parent_question_after_child_error());
+        let (receipts, state, originals) =
+            crate::chat::runtime::notification_frames_with_probe_for_test(
+                Box::new(parent),
+                frames,
+                false,
+                |state, read| -> Result<Vec<String>, String> {
+                    let child = state
+                        .subagents
+                        .iter()
+                        .find(|child| child.id == "child-thread")
+                        .ok_or("missing child")?;
+                    let sources = state
+                        .text_copy_sources
+                        .children
+                        .get("child-thread")
+                        .ok_or("missing child authority")?;
+                    let mut originals = Vec::new();
+                    for (index, item) in child.items.iter().enumerate() {
+                        if chat::failure::provider_error_text(Provider::Codex, item).is_none() {
+                            continue;
+                        }
+                        let source = sources
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .ok_or("original not retained")?;
+                        let mut raw = String::new();
+                        loop {
+                            let page = read(source, raw.len() as u64)?;
+                            if page.source != *source || page.offset != raw.len() as u64 {
+                                return Err("wrong page identity".into());
+                            }
+                            raw.push_str(&page.text);
+                            if page.done {
+                                break;
+                            }
+                            if page.text.is_empty() {
+                                return Err("empty original page".into());
+                            }
+                        }
+                        originals.push(raw);
+                    }
+                    Ok(originals)
+                },
+            );
+        assert_child_error_parent_and_sibling(&state);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            receipts[0].1.preview,
+            "Parent choice · Continue parent work?"
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "child-thread")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Running);
+        assert!(!child.waiting);
+        assert!(child.items.len() <= 64);
+        assert!(
+            child
+                .items
+                .iter()
+                .map(|item| item.content.byte_len())
+                .sum::<usize>()
+                <= 64 * 1024
+        );
+        let originals = originals.unwrap();
+        assert_eq!(originals, vec![raw.clone(), raw.clone(), raw]);
+    }
+
+    #[test]
+    fn sparse_child_diagnostic_shapes_preserve_exact_fallback_without_lifecycle_claims() {
+        for flag in [
+            Value::Null,
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(1),
+            json!("true"),
+            json!("false"),
+            json!([]),
+            json!({}),
+        ] {
+            for error in [
+                Value::Null,
+                json!("diagnostic string"),
+                json!({"code":429,"requestId":"exact λ"}),
+                json!({"message":17}),
+            ] {
+                let (mut parent, _) = child_error_runtime_fixture();
+                let observed = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","willRetry":flag,"error":error}})).unwrap();
+                let [Event::SubagentItem { id, item }] = observed.events.as_slice() else {
+                    panic!("only an exact child diagnostic is allowed");
+                };
+                assert_eq!(id, "child-thread");
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Codex, item),
+                    Some(error.to_string().as_str())
+                );
+                assert!(observed.writes.is_empty());
+                assert!(!parent.busy && !parent.children["child-thread"].busy);
+            }
+        }
+    }
+
+    #[test]
     fn provider_warnings_are_readable_advisory_timeline_items() {
         for (method, params, expected) in [
             (
