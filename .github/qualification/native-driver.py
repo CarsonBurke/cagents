@@ -30,6 +30,13 @@ receipts = []
 children = []
 stopped = set()
 viewport = (1280, 800)
+
+
+def cancelled(signum, frame):
+    raise RuntimeError('Native qualification cancelled; closing owned descendants')
+
+
+signal.signal(signal.SIGTERM, cancelled)
 # Retain orphaned descendants so escaped process groups remain observable and
 # can be closed before the shared target is used by another phase.
 libc = ctypes.CDLL(None, use_errno=True)
@@ -44,7 +51,7 @@ def run(args, **kwargs):
     process = subprocess.Popen(args, start_new_session=True, **kwargs)
     try:
         code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
         stop(process)
         raise
     if code:

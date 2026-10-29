@@ -16,6 +16,13 @@ receipts = json.loads((evidence / "commands.json").read_text()) if (evidence / "
 failures = []
 
 
+def cancelled(signum, frame):
+    raise RuntimeError('Qualification cancelled; closing the active command')
+
+
+signal.signal(signal.SIGTERM, cancelled)
+
+
 def user_context():
     if 'CAGENTS_AGENT_AUTHORITY' in os.environ:
         raise RuntimeError('Inherited caller authority is present; qualification refused')
@@ -55,6 +62,19 @@ def run(name, arguments, cargo_json=False, required=True):
             except ProcessLookupError:
                 pass
             raise RuntimeError(f'{name} timed out; qualification aborted before any later build')
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=10)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=10)
+            raise
         result = subprocess.CompletedProcess(arguments, code)
     receipts.append({'name': name, 'argv': arguments, 'exit_code': result.returncode,
                      'elapsed_seconds': time.monotonic() - started})
