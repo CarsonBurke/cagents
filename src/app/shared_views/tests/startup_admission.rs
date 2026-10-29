@@ -1247,6 +1247,156 @@ fn hidden_mixed_managed_saved_scope_recovers_healthy_panes_only() {
 }
 
 #[test]
+fn saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source() {
+    assert!(
+        std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),
+        "This process-local health fixture requires a genuine User invocation before isolation"
+    );
+    if isolated("saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source")
+    {
+        return;
+    }
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    let mut invalid = model(identity, active, hidden, view);
+    invalid.agents.push(owner);
+    app.workspace_model = invalid.clone();
+    drop(app.reconcile_shared_views());
+    let key = NoticeKey::SavedPaneCheck(pane.id);
+    let result = |app: &Cagents| {
+        app.notices
+            .recent()
+            .find(|entry| entry.notice.key == Some(key))
+            .map(|entry| entry.notice.clone())
+    };
+
+    // This is the only test in its private User child. Exercise the actual
+    // selected-socket health monitor without a socket, provider or authority
+    // replacement; an ordinary failure must really be suppressed first.
+    let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
+    let failure = crate::control::ControlError::ConnectionClosed;
+    let details = failure.to_string();
+    crate::daemon_health::connection::<()>(&socket, &Err(failure), crate::daemon_health::begin());
+    assert!(crate::daemon_health::current().unavailable());
+    assert!(crate::daemon_health::replaces_notice(&details));
+    app.status =
+        Some(TransientNotice::warning("Ordinary transport failure").with_details(&details));
+    drop(app.update(Message::ExpireNotices));
+    assert!(
+        !app.notices
+            .recent()
+            .any(|entry| entry.notice.message == "Ordinary transport failure")
+    );
+    drop(app.recheck_quarantined_pane(pane.id));
+    let first = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: first,
+        result: Err(details.clone()),
+    }));
+    let notice = result(&app).expect("an explicit check must retain its own failed result");
+    assert_eq!(notice.details.as_deref(), Some(details.as_str()));
+    assert_eq!(
+        notice.message,
+        "Could not check this saved session. Its pane and drafts are retained."
+    );
+    app.notices
+        .record(TransientNotice::success("Copied saved draft"));
+    crate::daemon_health::connection(&socket, &Ok(()), crate::daemon_health::begin());
+    drop(app.update(Message::DaemonHealth(
+        crate::daemon_health::State::Responsive,
+    )));
+    assert_eq!(result(&app), Some(notice.clone()));
+    assert!(app.pane_is_quarantined(pane.id));
+    assert!(!app.chat_start_pending(pane.id));
+
+    app.update_prepared = true;
+    drop(app.recheck_quarantined_pane(pane.id));
+    assert_eq!(result(&app), Some(notice));
+    app.update_prepared = false;
+    drop(app.recheck_quarantined_pane(pane.id));
+    assert!(
+        result(&app).is_none(),
+        "only an accepted retry clears its previous result"
+    );
+    let second = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: second.clone(),
+        result: Ok(invalid.clone()),
+    }));
+    assert!(
+        result(&app)
+            .unwrap()
+            .message
+            .starts_with("This saved pane is still unverified.")
+    );
+    let mut fresh = invalid.clone();
+    fresh.sequence += 1;
+    fresh.agents[0].closed = false;
+    app.refresh_managed_pane_quarantine(&fresh);
+    assert!(!app.pane_is_quarantined(pane.id));
+    assert!(
+        result(&app).is_none(),
+        "passive authoritative repair resolves the old result"
+    );
+
+    app.refresh_managed_pane_quarantine(&invalid);
+    drop(app.recheck_quarantined_pane(pane.id));
+    let replaced = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: replaced.clone(),
+        result: Err(details.clone()),
+    }));
+    assert!(result(&app).is_some());
+    let CardKind::Chat(source) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+        unreachable!()
+    };
+    source.id = TerminalId::new();
+    app.present_quarantined_pane(pane.id);
+    assert!(
+        result(&app).is_none(),
+        "a replacement source cannot inherit the old result"
+    );
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: replaced,
+        result: Err(details.clone()),
+    }));
+    assert!(
+        result(&app).is_none(),
+        "a duplicate prior completion cannot restore it"
+    );
+
+    drop(app.recheck_quarantined_pane(pane.id));
+    let removed = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: removed,
+        result: Err(details),
+    }));
+    assert!(result(&app).is_some());
+    let nonce = app.shared_views.quarantine_actions[&pane.id].nonce;
+    drop(app.update(Message::RemoveQuarantinedPane(pane.id, nonce)));
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(result(&app).is_none());
+    assert!(app.notices.recent().any(|entry| entry.notice.key.is_none()
+        && entry.notice.message
+            == "Saved pane removed from this window. Its saved session and drafts remain stored."));
+    assert!(
+        app.notices
+            .recent()
+            .any(|entry| entry.notice.message == "Copied saved draft")
+    );
+}
+
+#[test]
 fn stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence() {
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
     current_owner(&mut pane);

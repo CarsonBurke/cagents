@@ -287,6 +287,8 @@ impl NoticeSeverity {
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
+    /// The user's explicit verification of an unavailable saved pane.
+    SavedPaneCheck(CardId),
     /// Saving the account that one sign-in produced.
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
@@ -12255,7 +12257,7 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key {
-                Some(key @ NoticeKey::ChatAttach(card))
+                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::SavedPaneCheck(card)))
                     if self
                         .card_state(card)
                         .is_none_or(|state| !state.existence.is_open()) =>
@@ -16873,12 +16875,12 @@ impl Application for Cagents {
                     Ok(model) if model.identity == self.workspace_model.identity => {
                         let task = self.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(model));
                         if self.shared_views.quarantined.contains(&card) {
-                            self.status = Some(TransientNotice::warning("This saved pane is still unverified. Its session and drafts are retained."));
+                            self.status = Some(TransientNotice::warning("This saved pane is still unverified. Its session and drafts are retained.").with_key(NoticeKey::SavedPaneCheck(card)));
                         }
                         task
                     }
-                    Ok(_) => { self.status = Some(TransientNotice::warning("The session owner changed. The saved pane and drafts are retained.")); Task::none() }
-                    Err(error) => { self.status = Some(TransientNotice::warning("Could not check this saved session. Its pane and drafts are retained.").with_details(error)); Task::none() }
+                    Ok(_) => { self.status = Some(TransientNotice::warning("The session owner changed. The saved pane and drafts are retained.").with_key(NoticeKey::SavedPaneCheck(card))); Task::none() }
+                    Err(error) => { self.status = Some(TransientNotice::warning("Could not check this saved session. Its pane and drafts are retained.").with_details(error).with_key(NoticeKey::SavedPaneCheck(card))); Task::none() }
                 }
             }
             Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
@@ -18074,11 +18076,15 @@ impl Application for Cagents {
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
         if let Some(notice) = self.status.take() {
-            if crate::daemon_health::replaces_notice(&notice.message)
-                || notice
-                    .details
-                    .as_deref()
-                    .is_some_and(crate::daemon_health::replaces_notice)
+            // A later successful background poll does not settle an explicit
+            // pane check. Keep that operation's result until it is retried,
+            // repaired or dismissed, even when transport health also reports it.
+            if !matches!(notice.key, Some(NoticeKey::SavedPaneCheck(_)))
+                && (crate::daemon_health::replaces_notice(&notice.message)
+                    || notice
+                        .details
+                        .as_deref()
+                        .is_some_and(crate::daemon_health::replaces_notice))
             {
                 // The banner speaks for this outcome now, so an earlier report
                 // under the same key would only be giving an outdated reason.

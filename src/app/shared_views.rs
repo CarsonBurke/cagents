@@ -591,6 +591,7 @@ impl Cagents {
         let Some(source) = self.card_state(card).map(|card| card.kind.clone()) else {
             return Task::none();
         };
+        self.resolve_notice(NoticeKey::SavedPaneCheck(card));
         let check = PaneRecheck {
             request: uuid::Uuid::new_v4(),
             registry: self.workspace_model.identity,
@@ -680,6 +681,7 @@ impl Cagents {
         self.worktree_focus.retain(|_, id| *id != card);
         self.shared_views.rechecking.remove(&card);
         self.shared_views.quarantine_actions.remove(&card);
+        self.resolve_notice(NoticeKey::SavedPaneCheck(card));
         self.persist();
         self.status = Some(TransientNotice::success(
             "Saved pane removed from this window. Its saved session and drafts remain stored.",
@@ -774,6 +776,7 @@ impl Cagents {
         for id in released {
             self.shared_views.rechecking.remove(&id);
             self.shared_views.quarantine_actions.remove(&id);
+            self.resolve_notice(NoticeKey::SavedPaneCheck(id));
             // Re-enter ordinary admission; a stale failure cannot strand an
             // exact owner after fresh, complete authoritative validation.
             self.cards.remove(&id);
@@ -814,6 +817,7 @@ impl Cagents {
                         .is_none_or(|card| card.kind != action.source)
                 });
         if changed && let Some(source) = self.card_state(id).map(|card| card.kind.clone()) {
+            self.resolve_notice(NoticeKey::SavedPaneCheck(id));
             self.shared_views.quarantine_actions.insert(
                 id,
                 QuarantineAction {
