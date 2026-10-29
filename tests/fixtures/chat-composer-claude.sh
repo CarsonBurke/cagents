@@ -161,8 +161,13 @@ while IFS= read -r frame; do
                 fi
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
-                assistant=$(jq -cn --arg turn "$turn" \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
+                # A Markdown file in the config directory can stand in for the
+                # answer, so rendering and long-transcript checks need no live
+                # provider.
+                reply="I’m checking the submission logs and comparing the failed run with the last successful version."
+                if [ -f "$config/fixture-reply.md" ]; then reply=$(cat "$config/fixture-reply.md"); fi
+                assistant=$(jq -cn --arg turn "$turn" --arg text "$reply" \
+                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:$text}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
