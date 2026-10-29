@@ -3015,8 +3015,11 @@ mod tests {
         use crate::agent_execution::{
             Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
         };
-        use crate::workspace_model::views::{Pane, Scope, View};
-        for (closed, elsewhere) in [(false, false), (true, false), (false, true)] {
+        use crate::workspace_model::views::{Change, Pane, Scope, View};
+        for ((closed, elsewhere), close_it) in [(false, false), (true, false), (false, true)]
+            .into_iter()
+            .flat_map(|variant| [(variant, false), (variant, true)])
+        {
             let (mut app, project, repository) = app_with_project();
             let channel = ChannelId::new();
             let other = ChannelId::new();
@@ -3202,29 +3205,52 @@ mod tests {
                 app.channel_sessions_to_close(&[sibling, managed]),
                 vec![app.card_state(sibling).unwrap().kind.clone()]
             );
-            // Closing it here asks nothing of its agent and shares nothing;
-            // it stays closed here while its session is unconfirmed.
-            drop(app.update(Message::CloseCard(managed)));
-            assert!(!app.card_state(managed).unwrap().existence.is_open());
-            assert!(!app.workspace.order().any(|id| id == managed));
-            assert!(app.card_state(sibling).unwrap().existence.is_open());
-            model.sequence += 1;
-            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-            assert!(app.shared_views.quarantined.contains(&managed));
-            assert!(!app.card_state(managed).unwrap().existence.is_open());
-            app.publish_view_changes();
-            let edits = drain(&published);
-            assert!(
-                !edits
-                    .iter()
-                    .any(|edit| matches!(edit, ModelEdit::SeedView { .. }))
-            );
-            assert!(!edits.iter().any(|edit| matches!(edit,
-                ModelEdit::ChangeView { change, .. } if change_mentions(change, managed))));
+            let mentions = |edits: Vec<ModelEdit>| {
+                assert!(!edits.iter().any(|edit| matches!(edit,
+                    ModelEdit::SeedView { panes, closed: removed, .. }
+                        if removed.contains(&managed) || panes.iter().any(|pane| pane.id == managed))));
+                edits
+                    .into_iter()
+                    .filter_map(|edit| match edit {
+                        ModelEdit::ChangeView { scope, change, .. }
+                            if change_mentions(&change, managed) =>
+                        {
+                            Some((scope, change))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if close_it {
+                // Closing it asks nothing of its agent. It leaves the view that
+                // holds it, wherever this window showed it, and recently closed
+                // can reopen it.
+                drop(app.update(Message::CloseCard(managed)));
+                assert!(app.terminal_close.is_none(), "no terminal is stopped");
+                drop(app.update(Message::CommitClose(managed)));
+                assert!(!app.card_state(managed).unwrap().existence.is_open());
+                assert!(!app.workspace.order().any(|id| id == managed));
+                assert!(app.card_state(sibling).unwrap().existence.is_open());
+                assert!(
+                    app.recently_closed
+                        .iter()
+                        .any(|(card, _)| card.id == managed)
+                );
+                assert_eq!(
+                    mentions(drain(&published)),
+                    vec![(owner.clone(), Change::Remove { id: managed })]
+                );
+                // Snapshots that still hold the pane before the removal is
+                // acknowledged neither reopen it nor remove it again.
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                app.publish_view_changes();
+                assert!(!app.card_state(managed).unwrap().existence.is_open());
+                assert!(mentions(drain(&published)).is_empty());
+            }
 
-            // Matching registry evidence ends the fence; the canonical
-            // descriptor then reopens here, and the close made while fenced
-            // never becomes a shared removal.
+            // Matching registry evidence ends the fence. An open fenced pane
+            // takes the canonical descriptor; a closed one stays closed.
             agent.session = Some(HostedSession::Terminal(current.clone()));
             agent.console = Some(current.clone());
             model.agents = vec![agent.clone()];
@@ -3232,9 +3258,13 @@ mod tests {
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
             app.publish_view_changes();
             assert!(app.shared_views.quarantined.is_empty());
-            assert!(!drain(&published).iter().any(|edit| matches!(edit,
-                ModelEdit::ChangeView { change, .. } if change_mentions(change, managed))));
+            assert!(mentions(drain(&published)).is_empty());
             let card = app.card_state(managed).unwrap();
+            if close_it {
+                assert!(!card.existence.is_open(), "an explicit close is final");
+                assert!(!app.workspace.order().any(|id| id == managed));
+                continue;
+            }
             assert!(card.existence.is_open());
             assert_eq!(card.kind, canonical.kind);
             assert_eq!(card.title, canonical.title);

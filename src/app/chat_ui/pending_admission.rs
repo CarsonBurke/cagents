@@ -34,9 +34,13 @@ impl Runtime {
         let attachments = self.unsent_attachments();
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::heading("Saved conversation").into(),
-            design::caption("Not connected")
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            design::caption(if fenced {
+                "Agent connection unavailable"
+            } else {
+                "Not connected"
+            })
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into(),
             design::body(if fenced {
                 crate::app::shared_views::FENCED_PANE_EXPLANATION
             } else {
@@ -48,8 +52,8 @@ impl Runtime {
         ];
         if fenced {
             rows.push(
-                widget::button::custom(design::body("Close here"))
-                    .name("Close here")
+                widget::button::custom(design::body("Close"))
+                    .name("Close")
                     .id(card_control_id(self.target.card, "saved.fenced.close"))
                     .class(crate::ui_controls::control_style(false, None))
                     .padding([space::S as u16, space::M as u16])

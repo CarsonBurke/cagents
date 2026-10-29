@@ -121,27 +121,18 @@ impl Cagents {
                 .is_some_and(|session| self.terminal_close_attempts.contains(&session.id))
     }
 
-    /// Closes a fenced pane, whatever its kind, in this window only. Its saved
-    /// session is unconfirmed, so its agent is asked to close nothing and
-    /// nothing is shared: other windows keep the pane, and its canonical pane
-    /// reopens here once the session is confirmed.
-    pub(super) fn close_fenced_card_here(&mut self, card: CardId) -> Option<Task<Message>> {
+    /// Closes a fenced pane, whatever its kind, like any other pane - it
+    /// leaves the shared view and can be reopened from recently closed - but
+    /// asks nothing of its agent. Its saved session is unconfirmed, so no
+    /// session may be stopped on its behalf.
+    pub(super) fn close_fenced_card(&mut self, card: CardId) -> Option<Task<Message>> {
         if !self.shared_views.quarantined.contains(&card) {
             return None;
         }
         Arc::make_mut(&mut self.durable)
             .pending_chat_admissions
             .remove(&card);
-        self.chat_discard(card);
-        self.detach_shared_pane_as(
-            card,
-            "closed in this window while its session was unconfirmed",
-        );
-        self.status = Some(TransientNotice::success(
-            "Closed in this window. Other windows keep this pane, and it reopens here once its session is confirmed.",
-        ));
-        self.persist();
-        Some(self.sync_chrome())
+        Some(self.request_card_removal(card))
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
@@ -189,7 +180,7 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
-        if let Some(closed) = self.close_fenced_card_here(card) {
+        if let Some(closed) = self.close_fenced_card(card) {
             return closed;
         }
         if self.pane_transfer_pending(card) {

@@ -764,8 +764,8 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
 }
 
 #[test]
-fn fenced_managed_chat_keeps_its_text_and_closes_only_here() {
-    if isolated("fenced_managed_chat_keeps_its_text_and_closes_only_here") {
+fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
+    if isolated("fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session") {
         return;
     }
     use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Target};
@@ -815,24 +815,33 @@ fn fenced_managed_chat_keeps_its_text_and_closes_only_here() {
     assert!(
         visible.contains(text)
             && visible.contains(crate::app::shared_views::FENCED_PANE_EXPLANATION)
-            && visible.contains("Close here"),
+            && visible.contains("Agent connection unavailable")
+            && visible.contains("Close"),
         "{visible}"
     );
     // The tab's close button routes a chat through the chat close. A fenced
-    // pane closes here only: its stale session is never asked to close.
+    // pane closes like any other, but no session is asked to stop.
     let task = app.update(Message::CloseCard(pane.id));
     settle(&mut app, task);
     assert!(!app.card_state(pane.id).unwrap().existence.is_open());
     assert!(!app.workspace.order().any(|id| id == pane.id));
     assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
-    // Later snapshots, still fenced, leave it closed here.
+    assert!(
+        app.recently_closed
+            .iter()
+            .any(|(card, _)| card.id == pane.id)
+    );
+    assert!(app.shared_views.pending.iter().any(|(_, scope, change)| {
+        *scope == Scope::Channel(hidden) && *change == Change::Remove { id: pane.id }
+    }));
+    // Snapshots that still hold it before the removal is acknowledged leave
+    // it closed.
     for _ in 0..2 {
         model.sequence += 1;
         let read = app.apply_workspace_model_update(
             crate::app::workspace_model_sync::ModelUpdate::Read(model.clone()),
         );
         settle(&mut app, read);
-        assert!(app.shared_views.quarantined.contains(&pane.id));
         assert!(!app.card_state(pane.id).unwrap().existence.is_open());
         assert!(!app.workspace.order().any(|id| id == pane.id));
     }
