@@ -842,7 +842,7 @@ fn equal_full_reads_and_view_acknowledgements_reconcile_but_stale_reads_do_not()
         ..WorkspaceModel::default()
     };
     drop(app.update(Message::WorkspaceModelObserved(
-        workspace_model_sync::ModelUpdate::Connected(model.clone()),
+        workspace_model_sync::ModelUpdate::connected_fixture(model.clone()),
     )));
     reset();
     let durable = Arc::clone(&app.durable);
@@ -886,7 +886,7 @@ fn a_folded_agents_edge_does_not_hide_the_same_sequence_full_inventory() {
         ..WorkspaceModel::default()
     };
     drop(app.update(Message::WorkspaceModelObserved(
-        workspace_model_sync::ModelUpdate::Connected(model),
+        workspace_model_sync::ModelUpdate::connected_fixture(model),
     )));
     drop(app.update(Message::WorkspaceModelObserved(
         workspace_model_sync::ModelUpdate::Edited {
@@ -958,7 +958,7 @@ fn older_complete_inventory_after_newer_metadata_edge_still_projects() {
         ..WorkspaceModel::default()
     };
     drop(app.update(Message::WorkspaceModelObserved(
-        workspace_model_sync::ModelUpdate::Connected(initial.clone()),
+        workspace_model_sync::ModelUpdate::connected_fixture(initial.clone()),
     )));
     drop(app.update(Message::WorkspaceModelObserved(
         workspace_model_sync::ModelUpdate::Edited {
