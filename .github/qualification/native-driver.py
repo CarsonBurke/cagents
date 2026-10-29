@@ -174,13 +174,13 @@ def capture(window, name, size, *, neutral_pointer=False):
         # An outer-border leave can retain the previous client hover. The
         # fixture has no provider chips in the middle of its 24px status strip.
         point = (size[0] // 2, size[1] - 13)
-        focus = subprocess.check_output(['xdotool', 'getwindowfocus'], text=True).strip()
-        assert int(subprocess.check_output(['xdotool', 'getwindowpid', focus], text=True)) == pid
+        focus = subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip()
+        assert int(subprocess.check_output(['xdotool', 'getwindowpid', focus], text=True, timeout=5)) == pid
         run(['xdotool', 'mousemove', '--sync', *map(str, point)])
         location = dict(line.split('=', 1) for line in subprocess.check_output(
-            ['xdotool', 'getmouselocation', '--shell'], text=True).splitlines())
+            ['xdotool', 'getmouselocation', '--shell'], text=True, timeout=5).splitlines())
         assert (int(location['X']), int(location['Y'])) == point
-        assert subprocess.check_output(['xdotool', 'getwindowfocus'], text=True).strip() == focus
+        assert subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip() == focus
         event({'event': 'comparison-pointer-parked', 'capture': name, 'point': list(point),
                'actual_pointer': location, 'unchanged_input_focus': focus, 'focus_pid': pid})
     time.sleep(.6)
