@@ -1577,6 +1577,10 @@ fn queued_failed_remove_cannot_close_an_exactly_repaired_chat() {
 
 #[test]
 fn keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click() {
+    assert!(
+        std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),
+        "This isolated widget fixture requires a genuine User invocation; inherited caller authority must not be cleared"
+    );
     if isolated("keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click") {
         return;
     }
@@ -1800,7 +1804,10 @@ fn keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click() {
     );
     assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
     assert_eq!(app.quarantined_pane_draft(pane.id), Some(draft));
-    assert_eq!(app.chat_ui.draft_attachments[&pane.id], attachments);
+    assert_eq!(
+        app.persistent_workspace().chat_draft_attachments[&pane.id],
+        attachments
+    );
     assert_eq!(app.shared_views.quarantine_actions[&pane.id].nonce, nonce);
 }
 
