@@ -371,7 +371,7 @@ fn exercise_refusal() {
     let (mut app, home, loaded) = fixture();
     let cards = app.durable.cards.clone();
     let focused = app.workspace.focused();
-    let drafts = app.persistent_workspace().chat_drafts;
+    let drafts = app.persistent_workspace().chat_drafts.clone();
     let task = initial(&mut app, home);
     let socket = app.channel_work.routes[&home].socket.clone();
     change_synthetic_capability();

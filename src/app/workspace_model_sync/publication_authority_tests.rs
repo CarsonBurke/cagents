@@ -17,6 +17,7 @@ use crate::{
         views::{Change, Scope},
     },
 };
+use cosmic::Application;
 use std::{
     cell::{Cell, RefCell},
     io,
@@ -736,9 +737,8 @@ fn title_fixture(
     ModelEdit,
     async_channel::Receiver<QueuedEdit>,
 ) {
-    use crate::model::{
-        CardKind, ChannelTitleSource, ProjectChannel, ProjectId, RepositoryId, TerminalId,
-    };
+    use crate::model::{CardKind, ChannelTitleSource, ProjectChannel, ProjectId, TerminalId};
+    use crate::repository::RepositoryId;
     use crate::workspace_model::{
         ModelChannel, ModelProject,
         views::{Pane, View},
@@ -1184,8 +1184,7 @@ fn creation_fixture() -> (
     async_channel::Receiver<QueuedEdit>,
 ) {
     use crate::{
-        app::channel_ui::Action,
-        model::{ProjectId, RepositoryId},
+        app::channel_ui::Action, model::ProjectId, repository::RepositoryId,
         sidebar::SidebarProject,
     };
     let directory = tempfile::tempdir().unwrap();
@@ -1546,7 +1545,8 @@ fn local_retirement_resolves_publication_notice_without_waiting_for_another_mode
 #[test]
 fn publication_notice_does_not_follow_same_id_into_a_successor_project() {
     use crate::app::{Message, NoticeKey};
-    use crate::model::{ProjectId, RepositoryId};
+    use crate::model::ProjectId;
+    use crate::repository::RepositoryId;
     let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
     let _ = requests.try_recv().unwrap().edit;
     let old_edit = requests.try_recv().unwrap().edit;
@@ -1805,7 +1805,8 @@ fn refused_publication_settles_on_ack_and_republishes_into_a_replacement_registr
 #[test]
 fn refused_publication_does_not_block_a_successor_or_new_explicit_channel() {
     use crate::app::{Message, NoticeKey};
-    use crate::model::{ProjectId, RepositoryId};
+    use crate::model::ProjectId;
+    use crate::repository::RepositoryId;
     let (_directory, mut app, project, channel, repository, requests, canonical) =
         publication_reconciliation_fixture();
     refuse_creation_publications(&mut app, &requests);
@@ -1867,7 +1868,8 @@ fn refused_publication_does_not_block_a_successor_or_new_explicit_channel() {
 
 #[test]
 fn refused_title_with_failed_canonical_read_restores_only_its_still_owned_candidate() {
-    use crate::model::{ChannelTitleSource, ProjectId, RepositoryId};
+    use crate::model::{ChannelTitleSource, ProjectId};
+    use crate::repository::RepositoryId;
     for authority in [
         Authority::default(),
         Authority::session("fixture-title-read-failure".into()),
@@ -2070,7 +2072,8 @@ fn channel_publication_model(mut model: WorkspaceModel, edit: &ModelEdit) -> Wor
 #[test]
 fn delayed_channel_ack_cannot_turn_replaced_registry_or_project_silence_into_local_deletion() {
     use crate::app::Message;
-    use crate::model::{ProjectId, RepositoryId};
+    use crate::model::ProjectId;
+    use crate::repository::RepositoryId;
     for changed in ["registry", "project"] {
         let (_directory, mut app, _project, channel, repository, requests, canonical) =
             publication_reconciliation_fixture();
@@ -3265,7 +3268,7 @@ fn a_provisional_picker_reopen_shields_existing_shared_channels_before_inventory
     let loaded = crate::app::load_project(
         &repository,
         Some(provisional),
-        tokio_util::sync::CancellationToken::default(),
+        crate::process::CancellationToken::default(),
         Some(ProjectKind::Folder),
     )
     .unwrap();
@@ -3425,7 +3428,7 @@ fn model_updates_before_first_inventory_reply_keep_the_explicit_origin_and_first
     let loaded = crate::app::load_project(
         &path,
         Some(provisional),
-        tokio_util::sync::CancellationToken::default(),
+        crate::process::CancellationToken::default(),
         Some(ProjectKind::Folder),
     )
     .unwrap();
@@ -3908,7 +3911,8 @@ fn observer_close_callbacks_lose_their_generation_across_registry_replacement_an
             Message,
             project_ui::{Action, ProjectSessionClosure},
         },
-        model::{ProjectId, RepositoryId},
+        model::ProjectId,
+        repository::RepositoryId,
         sidebar::SidebarProject,
     };
     for successor in ["open", "closed", "aba-closed"] {
@@ -4027,9 +4031,7 @@ fn queued_observer_close_fixture() -> (
     u64,
 ) {
     use crate::{
-        app::Message,
-        model::{ProjectId, RepositoryId},
-        sidebar::SidebarProject,
+        app::Message, model::ProjectId, repository::RepositoryId, sidebar::SidebarProject,
     };
     let directory = tempfile::tempdir().unwrap();
     let repository = directory.path().canonicalize().unwrap();
@@ -4130,7 +4132,7 @@ fn a_current_inventory_replacing_the_project_repository_fences_old_close_launch_
     let loaded = crate::app::load_project(
         &successor,
         Some(project),
-        tokio_util::sync::CancellationToken::default(),
+        crate::process::CancellationToken::default(),
         Some(ProjectKind::Folder),
     )
     .unwrap();
@@ -4172,7 +4174,8 @@ fn retiring_an_unrelated_shared_channel_during_read_keeps_the_real_project_close
             Message, channel_ui,
             project_ui::{Action, ProjectSessionClosure},
         },
-        model::{ProjectId, RepositoryId},
+        model::ProjectId,
+        repository::RepositoryId,
         sidebar::SidebarProject,
     };
     let (directory, mut app, project, repository, closed, generation) =
@@ -4375,7 +4378,7 @@ fn prepublication_inventory_failure_keeps_loaded_and_provisional_retry_work_prot
         let loaded = crate::app::load_project(
             &repository,
             Some(project),
-            tokio_util::sync::CancellationToken::default(),
+            crate::process::CancellationToken::default(),
             Some(ProjectKind::Folder),
         )
         .unwrap();

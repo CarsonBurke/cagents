@@ -1039,8 +1039,7 @@ impl Cagents {
             self.project_ui.close_cancellations.remove(&id);
             self.project_ui.close_failed.insert(id);
             self.status = Some(TransientNotice::error(
-                "A project conversation changed before its close was confirmed. Review it and retry removal."
-                    .into(),
+                "A project conversation changed before its close was confirmed. Review it and retry removal.",
             ));
             return Task::none();
         }
