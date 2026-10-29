@@ -315,43 +315,66 @@ def resource_sample(pid):
 
 
 def responsiveness(window, pid, fixture, root, label, helper):
-    node = wait(lambda: next((node for node in live_tree(pid)
-                             if node.name == 'Attention' and node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                             and visible(node)), None))
+    def attention_control():
+        nodes = [node for node in live_tree(pid)
+                 if node.name == 'Attention' and node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)]
+        assert len(nodes) <= 1, f'The common control must have one native target, found {len(nodes)}'
+        return nodes[0] if nodes else None
+    node = wait(attention_control)
     bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
-    assert 0 <= bounds.x and 0 <= bounds.y and bounds.x + bounds.width <= 1280
-    samples = []
-    for phase in ['quiet', 'model-updates']:
-        if phase == 'model-updates':
-            (root / 'performance-stream').touch()
-            wait(lambda: 'performance-update-0-' in (root / 'receipts.txt').read_text())
-        output = out / (label + '-' + phase + '-pixel-response.jsonl')
-        with output.open('w') as log:
-            probe = subprocess.Popen([str(helper), window, str(bounds.x), str(bounds.y),
-                                      str(bounds.width), str(bounds.height), '60'],
-                                     stdout=log, start_new_session=True)
-        children.append(probe)
-        deadline = time.monotonic() + 40
-        while probe.poll() is None or (phase == 'model-updates' and 'performance-stream-complete' not in (root / 'receipts.txt').read_text()):
-            assert time.monotonic() < deadline, 'Pixel probe exceeded deadline'
-            samples.append({'phase': phase, 'ui': resource_sample(pid), 'fixture': resource_sample(fixture.pid)})
-            time.sleep(.5)
-        assert probe.returncode == 0, 'Common-control hover calibration or response probe failed'
-        rows = [json.loads(line) for line in output.read_text().splitlines()]
-        assert rows[0]['calibrated'] and len(rows) == 61
-        assert not any(row.get('timeout') for row in rows[1:]), 'Common-chrome response stalled for at least one second'
-        if phase == 'model-updates':
-            updates = [line.split('-') for line in (root / 'receipts.txt').read_text().splitlines()
-                       if line.startswith('performance-update-')]
-            assert len(updates) == 150 and [int(row[2]) for row in updates] == list(range(150))
-            assert all(int(a[3]) < int(b[3]) and int(a[9]) < int(b[9])
-                       for a, b in zip(updates, updates[1:]))
-    (out / (label + '-responsiveness-resources.json')).write_text(json.dumps({
-        'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
-        'synthetic_workload': '200-item healthy transcript, 32 managed registry entries (30 idle peers), 150 channel-title events at nominal 5Hz',
-        'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe covers the first approximately 8 seconds, resources cover the full 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
-        'probe_sha256': digest(helper), 'samples': samples,
+    assert 0 <= bounds.x and 0 <= bounds.y and bounds.x + bounds.width <= 1280 and bounds.y + bounds.height <= 800
+    (out / (label + '-probe-target.json')).write_text(json.dumps({
+        'name': node.name, 'role': node.getRoleName(),
+        'enabled': node.getState().contains(pyatspi.STATE_ENABLED),
+        'desktop_bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
+        'focused': node.getState().contains(pyatspi.STATE_FOCUSED), 'window': window,
     }, indent=2) + '\n')
+    assert node.getState().contains(pyatspi.STATE_ENABLED), 'The common control is disabled'
+    samples = []
+    completed_phases = []
+    try:
+        for phase in ['quiet', 'model-updates']:
+            if phase == 'model-updates':
+                (root / 'performance-stream').touch()
+                wait(lambda: 'performance-update-0-' in (root / 'receipts.txt').read_text())
+            output = out / (label + '-' + phase + '-pixel-response.jsonl')
+            with output.open('w') as log, (out / (label + '-' + phase + '-probe.log')).open('w') as errors:
+                probe = subprocess.Popen([str(helper), window, str(bounds.x), str(bounds.y),
+                                          str(bounds.width), str(bounds.height), '60', str(output.with_suffix(''))],
+                                         stdout=log, stderr=errors, start_new_session=True)
+            children.append(probe)
+            deadline = time.monotonic() + 40
+            while probe.poll() is None or (phase == 'model-updates' and 'performance-stream-complete' not in (root / 'receipts.txt').read_text()):
+                assert time.monotonic() < deadline, 'Pixel probe exceeded deadline'
+                samples.append({'phase': phase, 'ui': resource_sample(pid), 'fixture': resource_sample(fixture.pid)})
+                time.sleep(.5)
+            if probe.returncode:
+                try:
+                    run(['import', '-screen', '-window', window, str(out / (label + '-' + phase + '-probe-failed.png'))])
+                except Exception as error:
+                    (out / (label + '-' + phase + '-probe-diagnostic-error.txt')).write_text(repr(error) + '\n')
+            assert probe.returncode == 0, 'Common-control hover calibration or response probe failed'
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            assert rows[0]['calibrated'] and len(rows) == 61
+            assert all(row['timeout'] is False and 0 <= row['seconds'] < 1
+                       and 0 <= row['max_poll_gap_seconds'] < 1 for row in rows[1:]), (
+                           'Common-chrome response or observation stalled for at least one second')
+            if phase == 'model-updates':
+                updates = [line.split('-') for line in (root / 'receipts.txt').read_text().splitlines()
+                           if line.startswith('performance-update-')]
+                assert len(updates) == 150 and [int(row[2]) for row in updates] == list(range(150))
+                assert all(int(a[3]) < int(b[3]) and int(a[9]) < int(b[9])
+                           for a, b in zip(updates, updates[1:]))
+            completed_phases.append(phase)
+    finally:
+        (out / (label + '-responsiveness-resources.json')).write_text(json.dumps({
+            'qualified': sys.exc_info()[0] is None and completed_phases == ['quiet', 'model-updates'],
+            'completed_phases': completed_phases,
+            'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
+            'synthetic_workload': '200-item healthy transcript, 32 managed registry entries (30 idle peers), 150 channel-title events at nominal 5Hz',
+            'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe covers the first approximately 8 seconds, resources cover the full 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
+            'probe_sha256': digest(helper), 'samples': samples,
+        }, indent=2) + '\n')
 
 
 try:
