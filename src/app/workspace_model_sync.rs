@@ -507,6 +507,7 @@ impl Cagents {
             || model.sequence >= self.workspace_model.sequence
         {
             self.shared_views.snapshot_sequence = model.sequence;
+            self.refresh_managed_pane_quarantine(&model);
             self.workspace_model = model;
             return true;
         }
@@ -514,6 +515,7 @@ impl Cagents {
             return false;
         }
         self.shared_views.snapshot_sequence = model.sequence;
+        self.refresh_managed_pane_quarantine(&model);
         // Preserve newer folded metadata, including explicit project/channel
         // removal, while accepting the complete, newer collection evidence.
         self.workspace_model.views = std::mem::take(&mut model.views);
@@ -813,6 +815,9 @@ impl Cagents {
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
+        // Local/pending source changes also need fencing before any passive
+        // project/channel retirement can retain or detach their evidence.
+        self.refresh_managed_pane_quarantine(&model);
         let mut tasks = Vec::new();
         let mut changed = false;
         // Projects first, so a channel's owner exists by the time the channel is
@@ -898,11 +903,22 @@ impl Cagents {
         // Admission uses this incoming snapshot, not a blocked flag left by a
         // previous projection. Defer fresh actors while their scope is truly
         // blocked, before creating a local card or attachment Task.
-        self.shared_views.blocked =
-            super::shared_views::blocked_managed_view_scopes(&model, &model.views);
+        let owned = model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect();
+        self.prepare_shared_aliases(&model.views, &owned, false);
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         let mut new_managed_panes = Vec::new();
         for agent in &model.agents {
+            if self
+                .shared_views
+                .quarantined
+                .contains(&CardId::from_uuid(agent.id.as_uuid()))
+            {
+                continue;
+            }
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
             if matches!(
@@ -938,7 +954,7 @@ impl Cagents {
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
-        tasks.push(self.reconcile_shared_views());
+        tasks.push(self.reconcile_shared_views_after_admission());
         if changed {
             self.sort_durable_channels();
             self.refresh_sidebar_channels();
@@ -1020,6 +1036,10 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         let placement = &display.scope;
         if !session.has_complete_proof()
+            || self
+                .shared_views
+                .quarantined
+                .contains(&CardId::from_uuid(agent.id.as_uuid()))
             || agent.closed
             || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
         {
@@ -2372,24 +2392,14 @@ mod tests {
                 model.agents.push(conflict_agent);
                 model.sequence += 1;
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-                assert!(app.shared_views.blocked.contains(&scope));
-                model.agents.push(agent.clone());
-                model.sequence += 1;
-                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-                assert!(
-                    app.card_state(card).is_none(),
-                    "a truly blocked scope must not create a fresh card or Starting Task"
+                assert!(app.shared_views.blocked.is_empty());
+                assert_eq!(
+                    app.shared_views.quarantined.len(),
+                    1,
+                    "one invalid pane cannot block a healthy first adoption"
                 );
-                assert!(!app.chat_start_pending(card));
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
-                    matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
-                // The next authoritative read removes the conflict while the
-                // previous projection's blocked flag is still set locally.
-                model.views[0].panes.clear();
-                model.agents.retain(|existing| existing.id == agent.id);
-            } else {
-                model.agents.push(agent.clone());
             }
+            model.agents.push(agent.clone());
             model.sequence += 1;
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
@@ -3062,7 +3072,8 @@ mod tests {
             };
             let incoming = std::mem::take(&mut app.workspace_model);
             drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
-            assert!(!app.shared_views.blocked.is_empty());
+            assert_eq!(app.shared_views.quarantined.len(), 1);
+            assert!(app.shared_views.blocked.is_empty());
             assert!(
                 app.durable
                     .channels
@@ -3107,7 +3118,7 @@ mod tests {
             );
             if state != "removed" {
                 assert!(
-                    !app.shared_views.blocked.is_empty(),
+                    app.shared_views.quarantined.contains(&pane.id),
                     "ordinary projection must not bypass the managed replacement/ambiguity fence"
                 );
             }

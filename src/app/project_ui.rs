@@ -245,6 +245,27 @@ pub enum Action {
 }
 
 impl Cagents {
+    fn project_has_quarantined_panes(&self, project: ProjectId) -> bool {
+        let scope = self.project_session_scope(project);
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && self.shared_views.quarantined.contains(&card.id)
+                && self.project_owns_card(project, card, &scope)
+        })
+    }
+
+    fn worktree_has_quarantined_panes(&self, path: &Path) -> bool {
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && self.shared_views.quarantined.contains(&card.id)
+                && (card_belongs_to(card, path)
+                    || self
+                        .durable
+                        .card_scopes
+                        .get(&card.id)
+                        .is_some_and(|scope| scope.starts_with(path)))
+        })
+    }
     /// Capture the original registrations before selection, waiting or worker I/O.
     pub(super) fn capture_worktree_removal(&self, target: &Target) -> WorktreeRemovalCapture {
         let channels = self.removal_card_channels();
@@ -620,6 +641,11 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         Task::batch(ready.into_iter().map(|project| {
+            if self.project_has_quarantined_panes(project) {
+                self.project_ui.close_failed.insert(project);
+                self.status = Some(TransientNotice::warning("Remove this project's unverified saved panes before closing it. Their history and drafts will be retained."));
+                return Task::none();
+            }
             let Some(row) = self.sidebar_model.project(project) else {
                 return Task::none();
             };
@@ -1352,6 +1378,12 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(reason));
                     return self.project_dialog_closed();
                 }
+                if self.project_has_quarantined_panes(removal.project) {
+                    self.status = Some(TransientNotice::warning(
+                        "Remove this project's unverified saved panes before removing the project. Their history and drafts will be retained.",
+                    ));
+                    return self.project_dialog_closed();
+                }
                 if self.project_has_unsaved_editors(removal.project) {
                     self.status = Some(TransientNotice::warning(
                         "Save or close this project's unsaved editor buffers before removing it.",
@@ -1626,6 +1658,12 @@ impl Cagents {
     /// nothing the user does in the meantime lands in a directory whose
     /// sessions are being closed.
     fn start_worktree_deletion(&mut self, target: Target) -> Task<Message> {
+        if self.worktree_has_quarantined_panes(&target.path) {
+            self.status = Some(TransientNotice::warning(
+                "Remove this worktree's unverified saved panes before deleting it. Their history and drafts will be retained.",
+            ));
+            return Task::none();
+        }
         let Some(id) = target.worktree else {
             return Task::none();
         };
@@ -1658,6 +1696,17 @@ impl Cagents {
         target: Target,
         capture: WorktreeRemovalCapture,
     ) -> Task<Message> {
+        if self.worktree_has_quarantined_panes(&target.path) {
+            if let Some(deletion) = target
+                .worktree
+                .and_then(|id| self.project_ui.deletions.get_mut(&id))
+            {
+                deletion.failure =
+                    Some("Remove the unverified saved panes before deleting this worktree.".into());
+            }
+            self.sync_worktree_operation_rows();
+            return Task::none();
+        }
         if self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && card_belongs_to(card, &target.path)

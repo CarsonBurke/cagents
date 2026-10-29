@@ -478,6 +478,744 @@ fn model(
     }
 }
 
+fn managed_owner(pane: &Pane, channel: ChannelId) -> crate::agent_execution::Agent {
+    use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target};
+    let CardKind::Chat(session) = &pane.kind else {
+        panic!("chat fixture")
+    };
+    let placement = Placement::Channel(channel);
+    Agent {
+        id: crate::model::AgentId::from_uuid(pane.id.as_uuid()),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: session.launch.provider,
+            account: None,
+            target: Target {
+                repository: "/fixture-project".into(),
+                directory: session.launch.recipe.working_directory.clone(),
+                placement: Some(placement.clone()),
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement,
+        session: Some(HostedSession::Chat(session.clone())),
+        console: None,
+        created_ms: 0,
+        closed: false,
+    }
+}
+
+fn install_held_pane(app: &mut Cagents, channel: ChannelId, pane: &Pane) {
+    let durable = Arc::make_mut(&mut app.durable);
+    durable
+        .channels
+        .iter_mut()
+        .find(|owner| owner.id == channel)
+        .unwrap()
+        .cards
+        .push(pane.id);
+    durable.cards.push(CardState {
+        id: pane.id,
+        generation: durable.generation,
+        title: pane.title.clone(),
+        width_fraction: pane.width_fraction,
+        kind: pane.kind.clone(),
+        existence: Existence::Open,
+        exposure: Exposure::Offscreen,
+        residency: Residency::Cold,
+    });
+}
+
+fn sibling_chat(pane: &Pane, title: &str) -> Pane {
+    let mut sibling = pane.clone();
+    sibling.id = CardId::new();
+    sibling.title = title.into();
+    let CardKind::Chat(session) = &mut sibling.kind else {
+        panic!("chat fixture")
+    };
+    session.id = TerminalId::new();
+    session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    sibling
+}
+
+#[test]
+fn managed_quarantine_uses_full_ownership_proof_and_pending_sources() {
+    for invalid in [
+        "closed",
+        "wrong-proof",
+        "retired",
+        "ambiguous",
+        "duplicate-issuer",
+        "pending-source",
+    ] {
+        let (mut app, active, hidden, mut pane, identity) = cached_chat();
+        current_owner(&mut pane);
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+        let mut owner = managed_owner(&pane, hidden);
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let mut authoritative = model(identity, active, hidden, view);
+        let mut pending = Vec::new();
+        match invalid {
+            "closed" => owner.closed = true,
+            "wrong-proof" => {
+                let crate::agent_execution::HostedSession::Chat(source) =
+                    owner.session.as_mut().unwrap()
+                else {
+                    unreachable!()
+                };
+                source.proof.as_mut().unwrap().host_incarnation = "replacement-owner".into();
+            }
+            "retired" => {
+                authoritative.views[1].panes.clear();
+                authoritative.views[1].retired.push(pane.id);
+            }
+            "ambiguous" => {
+                let mut duplicate = authoritative.views[1].clone();
+                duplicate.scope = Scope::Channel(active);
+                authoritative.views.push(duplicate);
+            }
+            "duplicate-issuer" => {
+                let mut duplicate = owner.clone();
+                duplicate.closed = true;
+                authoritative.agents.push(duplicate);
+            }
+            "pending-source" => {
+                let mut foreign = pane.clone();
+                let CardKind::Chat(session) = &mut foreign.kind else {
+                    unreachable!()
+                };
+                session.proof.as_mut().unwrap().host_incarnation = "foreign-pending-owner".into();
+                pending.push((
+                    uuid::Uuid::new_v4(),
+                    Scope::Channel(hidden),
+                    Change::Update {
+                        before: pane.clone(),
+                        pane: foreign,
+                    },
+                ));
+            }
+            _ => unreachable!(),
+        }
+        authoritative.agents.push(owner);
+        assert_eq!(
+            quarantined_managed_panes(&authoritative, &app.durable, &HashSet::new(), &pending),
+            HashSet::from([pane.id]),
+            "{invalid}"
+        );
+        app.shared_views.pending = pending;
+        app.workspace_model = authoritative;
+        drop(app.reconcile_shared_views());
+        assert!(
+            app.shared_views.blocked.is_empty(),
+            "{invalid} is pane-local"
+        );
+        assert!(app.shared_views.quarantined.contains(&pane.id));
+        assert!(
+            !app.chat_start_pending(pane.id),
+            "{invalid} must not dispatch attachment"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(
+            app.shared_views.pending.is_empty(),
+            "a rejected pending source cannot survive as an overlay"
+        );
+    }
+}
+
+#[test]
+fn exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract() {
+    let (mut app, active, hidden, mut canonical, identity) = cached_chat();
+    let saved = canonical.clone();
+    current_owner(&mut canonical);
+    let mut view = View::empty(hidden);
+    view.panes.push(canonical.clone());
+    let mut authoritative = model(identity, active, hidden, view);
+    authoritative.agents.push(managed_owner(&canonical, hidden));
+    app.workspace_model = authoritative;
+    app.shared_views = State::for_workspace(&app.durable);
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.reconcile_shared_views());
+    assert!(
+        app.shared_views.quarantined.is_empty(),
+        "exact canonical proof may replace an old cached open source"
+    );
+    assert_eq!(
+        app.card_state(saved.id).unwrap().kind,
+        saved.kind,
+        "seed preparation cannot overwrite recovery evidence"
+    );
+    let seeds = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(seeds.iter().any(
+        |edit| matches!(edit, ModelEdit::SeedView { panes, .. } if panes.contains(&canonical))
+    ));
+
+    app.card_state_mut(saved.id).unwrap().kind = canonical.kind.clone();
+    app.card_state_mut(saved.id).unwrap().existence =
+        super::super::super::project_ui::removed_existence("explicit close");
+    app.shared_views = State::for_workspace(&app.durable);
+    drop(app.reconcile_shared_views());
+    assert!(app.shared_views.quarantined.is_empty());
+    let seeds = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        seeds.iter().any(
+            |edit| matches!(edit, ModelEdit::SeedView { closed, .. } if closed.contains(&saved.id))
+        ),
+        "a valid explicit close still reaches the strict host"
+    );
+    app.acknowledge_view_edit(Scope::Channel(hidden), None);
+    drop(app.reconcile_shared_views());
+    assert!(
+        !app.card_state(saved.id).unwrap().existence.is_open(),
+        "old canonical membership cannot resurrect closed local history"
+    );
+}
+
+fn mixed_managed_saved_scope(visible: bool) {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut closed_owner, identity) = cached_chat();
+    current_owner(&mut closed_owner);
+    closed_owner.title = "Unavailable saved agent".into();
+    closed_owner.width_fraction = 0.37;
+    app.card_state_mut(closed_owner.id).unwrap().kind = closed_owner.kind.clone();
+    app.card_state_mut(closed_owner.id).unwrap().title = closed_owner.title.clone();
+    app.card_state_mut(closed_owner.id).unwrap().width_fraction = closed_owner.width_fraction;
+    let stale = sibling_chat(&closed_owner, "Stale saved proof");
+    let closed_history = sibling_chat(&closed_owner, "Closed saved history");
+    let healthy = sibling_chat(&closed_owner, "Healthy saved conversation");
+    for pane in [&stale, &closed_history, &healthy] {
+        install_held_pane(&mut app, hidden, pane);
+    }
+    app.card_state_mut(closed_history.id).unwrap().existence =
+        super::super::super::project_ui::removed_existence("previously closed");
+    let CardKind::Chat(expected) = &healthy.kind else {
+        unreachable!()
+    };
+    let daemon = ScriptedDaemon::with_owner(expected.clone());
+    let mut closed_agent = managed_owner(&closed_owner, hidden);
+    closed_agent.closed = true;
+    let mut stale_agent = managed_owner(&stale, hidden);
+    let crate::agent_execution::HostedSession::Chat(source) = stale_agent.session.as_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    source.proof.as_mut().unwrap().host_incarnation = "replacement-proof".into();
+    let mut history_agent = managed_owner(&closed_history, hidden);
+    history_agent.closed = true;
+    let mut view = View::empty(hidden);
+    view.panes = vec![
+        closed_owner.clone(),
+        stale.clone(),
+        closed_history.clone(),
+        healthy.clone(),
+    ];
+    let mut authoritative = model(identity, active, hidden, view);
+    authoritative.agents = vec![
+        closed_agent,
+        stale_agent,
+        history_agent,
+        managed_owner(&healthy, hidden),
+    ];
+    if visible {
+        Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    }
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    let original_focus = app.workspace.focused();
+    let original_channel = app.durable.active_channel;
+    app.shared_views = State::for_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
+        (closed_owner.id, "Retained failed draft".into()),
+        (stale.id, "Retained stale draft".into()),
+    ]));
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    assert!(daemon.requests().is_empty());
+    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
+    settle(&mut app, connected);
+    let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let Some(ModelEdit::SeedView { panes, closed, .. }) = edits.iter().find(|edit| matches!(edit, ModelEdit::SeedView { scope: Scope::Channel(id), .. } if *id == hidden)) else { panic!("healthy scope must reach SeedView") };
+    assert_eq!(panes, &vec![healthy.clone()]);
+    assert!(
+        closed.is_empty(),
+        "invalid closed history cannot become host removal authority"
+    );
+    assert_eq!(
+        app.shared_views.quarantined,
+        HashSet::from([closed_owner.id, stale.id, closed_history.id])
+    );
+    assert!(app.shared_views.blocked.is_empty());
+    for channel in [active, hidden] {
+        let ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(channel),
+            operation: None,
+            model: authoritative.clone(),
+        });
+        settle(&mut app, ack);
+    }
+    assert_eq!(
+        daemon.requests(),
+        vec![expected.clone()],
+        "only the healthy exact source attaches"
+    );
+    let Some(CardRuntime::Chat(healthy_runtime)) = app.cards.get(&healthy.id) else {
+        panic!("healthy sibling must own a native chat runtime")
+    };
+    assert_eq!(healthy_runtime.session, *expected);
+    assert_eq!(
+        healthy_runtime.restored_pane_ready(),
+        Ok(true),
+        "the healthy sibling must actually recover, not merely dispatch an attach"
+    );
+    assert_eq!(app.durable.active_channel, original_channel);
+    assert_eq!(
+        app.workspace.focused(),
+        original_focus,
+        "recovery must not steal focus, including from another active scope"
+    );
+    assert_eq!(
+        app.card_state(closed_owner.id).unwrap().kind,
+        closed_owner.kind
+    );
+    assert_eq!(app.card_state(stale.id).unwrap().kind, stale.kind);
+    assert!(
+        !app.card_state(closed_history.id)
+            .unwrap()
+            .existence
+            .is_open()
+    );
+    assert!(matches!(
+        app.cards.get(&closed_owner.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert_eq!(
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards,
+        vec![closed_owner.id, stale.id, healthy.id]
+    );
+    if visible {
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![closed_owner.id, stale.id, healthy.id]
+        );
+    }
+    assert!(
+        app.startup_pane_check().is_err(),
+        "recovery ends with a pane failure instead of waiting forever"
+    );
+    let saved = app.persistent_workspace();
+    assert_eq!(saved.chat_drafts[&closed_owner.id], "Retained failed draft");
+    assert_eq!(saved.chat_drafts[&stale.id], "Retained stale draft");
+    assert!(
+        !saved.local_only_cards.contains(&closed_owner.id),
+        "open quarantine never bypasses startup admission"
+    );
+    for message in [
+        Message::RetryCard(closed_owner.id),
+        Message::ChatUi(chat_ui::Action::StartFresh(stale.id)),
+        Message::MovePaneToChannel {
+            card: stale.id,
+            channel: active,
+        },
+    ] {
+        let task = app.update(message);
+        settle(&mut app, task);
+    }
+    let delete = app.delete_channel(hidden);
+    settle(&mut app, delete);
+    assert!(!app.channel_ui.is_deleting(hidden));
+    assert_eq!(daemon.requests(), vec![expected.clone()]);
+    let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !edits.iter().any(|edit| match edit {
+            ModelEdit::ChangeView { change, .. } => change_card(change).is_some_and(|card| [
+                closed_owner.id,
+                stale.id,
+                closed_history.id
+            ]
+            .contains(&card)),
+            ModelEdit::DeleteChannel { id } => *id == hidden,
+            _ => false,
+        }),
+        "quarantine is absent from both baseline and desired publication"
+    );
+}
+
+#[test]
+fn active_mixed_managed_saved_scope_recovers_healthy_panes_only() {
+    assert!(
+        crate::agent_execution::Authority::from_environment()
+            .token()
+            .is_none(),
+        "provider-effect qualification requires a genuine User invocation; inherited session authority must not be cleared"
+    );
+    if isolated("active_mixed_managed_saved_scope_recovers_healthy_panes_only") {
+        return;
+    }
+    mixed_managed_saved_scope(true);
+}
+
+#[test]
+fn hidden_mixed_managed_saved_scope_recovers_healthy_panes_only() {
+    assert!(
+        crate::agent_execution::Authority::from_environment()
+            .token()
+            .is_none(),
+        "provider-effect qualification requires a genuine User invocation; inherited session authority must not be cleared"
+    );
+    if isolated("hidden_mixed_managed_saved_scope_recovers_healthy_panes_only") {
+        return;
+    }
+    mixed_managed_saved_scope(false);
+}
+
+#[test]
+fn stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence() {
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    let mut invalid = model(identity, active, hidden, view);
+    invalid.agents.push(owner);
+    app.workspace_model = invalid.clone();
+    drop(app.reconcile_shared_views());
+    drop(app.recheck_quarantined_pane(pane.id));
+    let first = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.recheck_quarantined_pane(pane.id));
+    assert_eq!(app.shared_views.rechecking[&pane.id], first);
+    let mut fresh = invalid.clone();
+    fresh.sequence += 1;
+    fresh.agents[0].closed = false;
+    app.refresh_managed_pane_quarantine(&fresh);
+    assert!(!app.shared_views.quarantined.contains(&pane.id));
+    app.refresh_managed_pane_quarantine(&invalid);
+    drop(app.recheck_quarantined_pane(pane.id));
+    let second = app.shared_views.rechecking[&pane.id].clone();
+    assert_ne!(first.request, second.request);
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: first,
+        result: Ok(fresh.clone()),
+    }));
+    assert_eq!(app.shared_views.rechecking[&pane.id], second);
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert_eq!(app.workspace_model.sequence, invalid.sequence);
+    let mut wrong_registry = fresh.clone();
+    wrong_registry.identity = uuid::Uuid::new_v4();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: second,
+        result: Ok(wrong_registry),
+    }));
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+
+    drop(app.recheck_quarantined_pane(pane.id));
+    let old_source = app.shared_views.rechecking[&pane.id].clone();
+    let CardKind::Chat(changed) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+        unreachable!()
+    };
+    changed.id = TerminalId::new();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: old_source,
+        result: Ok(fresh.clone()),
+    }));
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert_eq!(
+        app.workspace_model.sequence, invalid.sequence,
+        "a replaced source cannot borrow the previous check's result"
+    );
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+
+    drop(app.recheck_quarantined_pane(pane.id));
+    let mut different_endpoint = app.shared_views.rechecking[&pane.id].clone();
+    different_endpoint.endpoint.0 = Some(("different-device".into(), "cagents".into()));
+    app.shared_views
+        .rechecking
+        .insert(pane.id, different_endpoint.clone());
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: different_endpoint,
+        result: Ok(fresh.clone()),
+    }));
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert_eq!(
+        app.workspace_model.sequence, invalid.sequence,
+        "another endpoint cannot install model evidence"
+    );
+    drop(app.recheck_quarantined_pane(pane.id));
+    let exact = app.shared_views.rechecking[&pane.id].clone();
+    drop(app.update(Message::QuarantinedPaneChecked {
+        card: pane.id,
+        check: exact,
+        result: Ok(fresh),
+    }));
+    assert!(!app.shared_views.quarantined.contains(&pane.id));
+    assert!(
+        !matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(_))),
+        "fresh exact validation clears the fixed failure and re-enters normal admission"
+    );
+}
+
+#[test]
+fn local_removal_preserves_closed_history_and_draft_receipts_across_reload() {
+    use crate::persistence::{SnapshotBase, StateStore};
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == hidden)
+        .unwrap()
+        .focused = Some(pane.id);
+    Arc::make_mut(&mut app.durable)
+        .card_scopes
+        .insert(pane.id, "/fixture-project".into());
+    let attachment = crate::chat::Attachment {
+        path: "/retained/saved-image.png".into(),
+        reference: Some(crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 1,
+            device: uuid::Uuid::new_v4(),
+            name: "retained-image.png".into(),
+            sha256: "0".repeat(64),
+            extension: "png".into(),
+        }),
+    };
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        HashMap::from([(pane.id, "Saved payload before quarantine".into())]),
+        HashMap::from([(pane.id, vec![attachment.clone()])]),
+    );
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut authoritative = model(identity, active, hidden, view);
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    authoritative.agents.push(owner);
+    app.workspace_model = authoritative;
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.initialize_runtimes());
+    drop(app.reconcile_shared_views());
+    assert_eq!(
+        app.quarantined_pane_draft(pane.id),
+        Some("Saved payload before quarantine")
+    );
+    assert_eq!(app.quarantined_pane_attachment_count(pane.id), 1);
+    while rx.try_recv().is_ok() {}
+    drop(app.begin_card_close(pane.id));
+    let saved = app.persistent_workspace();
+    let closed = saved.cards.iter().find(|card| card.id == pane.id).unwrap();
+    assert!(!closed.existence.is_open());
+    assert_eq!(closed.kind, pane.kind);
+    assert_eq!(
+        saved.card_scopes[&pane.id],
+        PathBuf::from("/fixture-project")
+    );
+    assert!(saved.local_only_cards.contains(&pane.id));
+    assert_eq!(
+        saved
+            .channels
+            .iter()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .focused,
+        None,
+        "removing a hidden focused pane must leave a savable channel"
+    );
+    assert_eq!(
+        saved.chat_drafts[&pane.id],
+        "Saved payload before quarantine"
+    );
+    assert_eq!(
+        saved.chat_draft_attachments[&pane.id],
+        vec![attachment.clone()]
+    );
+    assert!(
+        !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| match edit {
+            ModelEdit::SeedView { closed, panes, .. } =>
+                closed.contains(&pane.id) || panes.iter().any(|source| source.id == pane.id),
+            ModelEdit::ChangeView { change, .. } => change_card(&change) == Some(pane.id),
+            _ => false,
+        })
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("quarantined-history.sqlite3");
+    let store = StateStore::open(&path, crate::model::BootId::new("saved-history")).unwrap();
+    store
+        .save_workspace(
+            &saved,
+            SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    drop(store);
+    let store = StateStore::open(&path, crate::model::BootId::new("saved-history-reload")).unwrap();
+    let restored = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert!(restored.local_only_cards.contains(&pane.id));
+    assert_eq!(
+        restored.chat_drafts[&pane.id],
+        "Saved payload before quarantine"
+    );
+    assert_eq!(restored.chat_draft_attachments[&pane.id], vec![attachment]);
+    let history = store
+        .saved_conversations()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.card == pane.id)
+        .expect("removed local pane remains selectable in real History storage");
+    assert!(!history.open);
+    assert_eq!(
+        history.session,
+        match &pane.kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        }
+    );
+    app.durable = Arc::new(restored);
+    app.shared_views = State::for_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        app.durable.chat_drafts.clone(),
+        app.durable.chat_draft_attachments.clone(),
+    );
+    let snapshot = app.persistent_workspace();
+    assert_eq!(
+        snapshot.chat_draft_attachments[&pane.id].len(),
+        1,
+        "closed receipt survives the first save after restart"
+    );
+    drop(app.reconcile_shared_views());
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+
+    let mut replacement = app.workspace_model.clone();
+    replacement.identity = uuid::Uuid::new_v4();
+    replacement.sequence = 0;
+    drop(app.apply_workspace_model_update(
+        crate::app::workspace_model_sync::ModelUpdate::Connected(replacement),
+    ));
+    let replacement_saved = app.persistent_workspace();
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(replacement_saved.local_only_cards.contains(&pane.id));
+    assert_eq!(
+        replacement_saved.chat_drafts[&pane.id],
+        "Saved payload before quarantine"
+    );
+    assert_eq!(
+        replacement_saved.chat_draft_attachments[&pane.id].len(),
+        1,
+        "registry replacement cannot strip dismissed history payload"
+    );
+}
+
+#[test]
+fn a_missing_shared_channel_keeps_quarantined_evidence_without_open_local_only_admission() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+        pane.id,
+        "Draft survives missing channel".into(),
+    )]));
+    let mut incoming = model(identity, active, hidden, View::empty(hidden));
+    incoming.channels.retain(|channel| channel.id != hidden);
+    incoming
+        .views
+        .retain(|view| view.scope != Scope::Channel(hidden));
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    incoming.agents.push(owner);
+    drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+    assert!(
+        !app.durable
+            .channels
+            .iter()
+            .any(|channel| channel.id == hidden)
+    );
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    let saved = app.persistent_workspace();
+    assert_eq!(
+        saved.chat_drafts[&pane.id],
+        "Draft survives missing channel"
+    );
+    assert_eq!(
+        saved.card_scopes[&pane.id],
+        PathBuf::from("/fixture-project")
+    );
+    assert!(
+        !saved.local_only_cards.contains(&pane.id),
+        "inert open evidence cannot acquire the local-only startup exemption"
+    );
+    let restored_admission = State::for_workspace(&saved);
+    assert!(
+        restored_admission.attached.contains(&pane.id),
+        "the next window must still wait for exact authority"
+    );
+}
+
+#[test]
+fn a_wrong_proof_alias_is_preserved_instead_of_retired_by_uuid_equality() {
+    let (mut app, active, hidden, mut canonical, identity) = cached_chat();
+    let alias = CardId::new();
+    let original = app.card_state(canonical.id).unwrap().kind.clone();
+    app.card_state_mut(canonical.id).unwrap().id = alias;
+    let durable = Arc::make_mut(&mut app.durable);
+    durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == hidden)
+        .unwrap()
+        .cards = vec![alias];
+    current_owner(&mut canonical);
+    let mut view = View::empty(hidden);
+    view.panes.push(canonical.clone());
+    let mut authoritative = model(identity, active, hidden, view);
+    authoritative.agents.push(managed_owner(&canonical, hidden));
+    app.workspace_model = authoritative;
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+        alias,
+        "Alias draft must stay with its proof".into(),
+    )]));
+    drop(app.reconcile_shared_views());
+    assert!(app.shared_views.quarantined.contains(&alias));
+    assert!(!app.shared_views.quarantined.contains(&canonical.id));
+    assert!(app.shared_views.blocked.is_empty());
+    assert!(app.card_state(alias).unwrap().existence.is_open());
+    assert_eq!(app.card_state(alias).unwrap().kind, original);
+    assert_eq!(
+        app.persistent_workspace().chat_drafts[&alias],
+        "Alias draft must stay with its proof"
+    );
+    assert!(!app.chat_start_pending(alias));
+    assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+}
+
 /// Drive the real initial-model and SeedView acknowledgement reducer routes.
 /// A Connected metadata snapshot alone does not yet admit the cached pane.
 fn admit(

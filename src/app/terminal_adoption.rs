@@ -235,6 +235,7 @@ impl Cagents {
                 .iter()
                 .filter(|card| {
                     card.existence.is_open()
+                        && !self.shared_views.quarantined.contains(&card.id)
                         && self.shared_views.attached.contains(&card.id)
                         && matches!(&card.kind, CardKind::Terminal(saved) if saved.id == session.id)
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))

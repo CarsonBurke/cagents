@@ -4523,6 +4523,14 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
+    RecheckQuarantinedPane(CardId),
+    CopyQuarantinedDraft(CardId),
+    CopyQuarantinedAttachmentPaths(CardId),
+    QuarantinedPaneChecked {
+        card: CardId,
+        check: shared_views::PaneRecheck,
+        result: Result<crate::workspace_model::WorkspaceModel, String>,
+    },
     /// Enter pressed on an ended terminal's final screen.
     RelaunchFromEndedScreen(CardId),
     #[cfg(feature = "integrated-browser")]
@@ -5837,6 +5845,7 @@ impl Cagents {
         explicit_retry: bool,
     ) -> Task<Message> {
         if self.shared_views.defaults.contains_key(&card)
+            || self.shared_views.quarantined.contains(&card)
             || self.durable.pending_terminal_creations.contains(&card)
             || (self.shared_views.attached.contains(&card)
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
@@ -5990,6 +5999,12 @@ impl Cagents {
         result: Result<StartedTerminal, String>,
         current_operation: bool,
     ) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            if let Ok(started) = result {
+                self.retire_terminal_surface(started.handle, false);
+            }
+            return self.finish_terminal_start(card);
+        }
         tracing::debug!(target: "cagents::pane_open", stage = "started", ?card, ok = result.is_ok());
         let accept = current_operation && can_accept_terminal_start(
             self.durable.cards.iter().find(|state| state.id == card),
@@ -8537,6 +8552,9 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            return Task::none();
+        }
         // A card whose close is already accepted never starts anything again.
         if self
             .card_state(card)
@@ -10226,6 +10244,7 @@ impl Cagents {
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, ended_terminal(card))
             }
+            Some(CardRuntime::Failed(_)) if self.shared_views.quarantined.contains(&id) => self.quarantined_pane_view(id),
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -16797,6 +16816,32 @@ impl Application for Cagents {
                 )
             }
             Message::RetryCard(card) => self.retry_card(card),
+            Message::RecheckQuarantinedPane(card) => self.recheck_quarantined_pane(card),
+            Message::CopyQuarantinedDraft(card) => {
+                if let Some(text) = self.quarantined_pane_draft(card).filter(|text| !text.is_empty()).map(str::to_owned) {
+                    self.status = Some(TransientNotice::success("Copied saved draft"));
+                    iced::clipboard::write(text).map(cosmic::Action::App)
+                } else { Task::none() }
+            },
+            Message::CopyQuarantinedAttachmentPaths(card) => self.copy_quarantined_attachment_paths(card),
+            Message::QuarantinedPaneChecked { card, check, result } => {
+                if self.shared_views.rechecking.get(&card) != Some(&check) { return Task::none(); }
+                self.shared_views.rechecking.remove(&card);
+                if self.workspace_model.identity != check.registry || !self.shared_views.quarantined.contains(&card)
+                    || shared_views::pane_recheck_endpoint() != check.endpoint
+                    || self.card_state(card).is_none_or(|card| card.kind != check.source) { return Task::none(); }
+                match result {
+                    Ok(model) if model.identity == self.workspace_model.identity => {
+                        let task = self.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(model));
+                        if self.shared_views.quarantined.contains(&card) {
+                            self.status = Some(TransientNotice::warning("This saved pane is still unverified. Its session and drafts are retained."));
+                        }
+                        task
+                    }
+                    Ok(_) => { self.status = Some(TransientNotice::warning("The session owner changed. The saved pane and drafts are retained.")); Task::none() }
+                    Err(error) => { self.status = Some(TransientNotice::warning("Could not check this saved session. Its pane and drafts are retained.").with_details(error)); Task::none() }
+                }
+            }
             Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {

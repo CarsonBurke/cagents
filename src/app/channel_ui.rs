@@ -641,6 +641,15 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if cards
+            .iter()
+            .any(|card| self.shared_views.quarantined.contains(card))
+        {
+            self.status = Some(TransientNotice::warning(
+                "Remove the unverified saved panes from this channel before deleting it. Their history and drafts will be retained.",
+            ));
+            return Task::none();
+        }
         if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
             self.status = Some(TransientNotice::warning(
                 "Wait for the pane move to finish before deleting this channel.",
@@ -832,10 +841,13 @@ impl Cagents {
                 continue;
             }
             if passive
-                && (self.shared_chat_has_local_work(card)
+                && (self.shared_views.quarantined.contains(&card)
+                    || self.shared_chat_has_local_work(card)
                     || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
             {
-                self.retain_local_pane(card);
+                if !self.shared_views.quarantined.contains(&card) {
+                    self.retain_local_pane(card);
+                }
                 let scope = self
                     .durable
                     .card_scopes

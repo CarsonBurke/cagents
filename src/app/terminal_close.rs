@@ -166,6 +166,9 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            return self.dismiss_quarantined_pane(card);
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -366,6 +369,9 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if self.shared_views.quarantined.contains(&id) {
+            return Some(self.dismiss_quarantined_pane(id));
+        }
         if let Some(reason) = self.review_checkout_blocker(id) {
             if self
                 .workspace
