@@ -1992,6 +1992,38 @@ impl Cagents {
         Adoption::Applied
     }
 
+    /// Retry shared projects that failed before they acquired a sidebar row.
+    /// A known project remains a retry target while its folder is unavailable
+    /// or its exact read is pending; neither state asks for a new picker open.
+    pub(super) fn retry_unrepresented_shared_projects(&mut self) -> Option<Task<Message>> {
+        if self.workspace_model.identity == NO_REGISTRY {
+            return None;
+        }
+        let projects = self
+            .workspace_model
+            .projects
+            .iter()
+            .filter(|project| {
+                !self.project_ui.closed.contains(&project.repository)
+                    && self.project_for_repository(&project.repository).is_none()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if projects.is_empty() {
+            return None;
+        }
+        let mut tasks = Vec::new();
+        for project in projects {
+            if let Adoption::Opening(task) = self.adopt_shared_project(&project) {
+                tasks.push(task);
+            }
+        }
+        if !tasks.is_empty() && self.sidebar_model.projects.is_empty() {
+            self.sidebar_model.data_state = SidebarDataState::Loading;
+        }
+        Some(Task::batch(tasks))
+    }
+
     /// Opens a project this window does not have.
     fn adopt_shared_project(&mut self, shared: &ModelProject) -> Adoption {
         if self.project_ui.closed.contains(&shared.repository) {
@@ -4718,6 +4750,204 @@ mod tests {
         );
         assert_eq!(app.active_workspace, None);
         assert_eq!(app.workspace.focused(), None);
+    }
+
+    #[test]
+    fn sidebar_refresh_retries_a_repaired_shared_project_before_opening_a_picker() {
+        sidebar_refresh_after_shared_git_repair(false);
+    }
+
+    #[test]
+    fn sidebar_refresh_retries_a_repaired_shared_project_alongside_existing_rows() {
+        sidebar_refresh_after_shared_git_repair(true);
+    }
+
+    fn sidebar_refresh_after_shared_git_repair(with_healthy_row: bool) {
+        use crate::repository_widget::text_editor;
+        use cosmic::iced::futures::StreamExt;
+
+        fn messages(task: Task<Message>) -> Vec<Message> {
+            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut messages = Vec::new();
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                            action
+                        {
+                            messages.push(message);
+                        }
+                    }
+                    messages
+                })
+        }
+
+        let checkout = git_checkout().expect("the retry fixture requires Git");
+        let healthy = git_checkout().expect("the retry fixture requires Git");
+        let closed = tempfile::tempdir().unwrap();
+        let repository = canonical_repository(&checkout.path().join(".git")).unwrap();
+        let healthy_repository = canonical_repository(&healthy.path().join(".git")).unwrap();
+        let closed_repository = closed.path().canonicalize().unwrap();
+        let head = repository.join("HEAD");
+        let original_head = std::fs::read(&head).unwrap();
+        std::fs::write(&head, b"not a Git reference\n").unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let published = intercept_publishes(&mut app);
+
+        // Keep real unsaved editing and a native caret alive in another pane.
+        // No terminal or provider is launched by the fixture or the retry.
+        let card = app.workspace.focused().unwrap();
+        let (mut editor, _) = RepositoryRuntime::open_fixture(card, "draft.txt", "saved draft");
+        drop(editor.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
+        let draft = editor.editor_text().unwrap();
+        let caret = editor.cursor_position();
+        assert!(editor.is_dirty());
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(editor.descriptor.clone());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(editor)));
+        let cards = app.durable.cards.clone();
+        let focused = app.workspace.focused();
+        let active = app.active_workspace.clone();
+
+        let healthy_id = with_healthy_row.then(|| {
+            let loaded =
+                first_message(app.repository_load_task(healthy_repository.clone(), None, false))
+                    .expect("the healthy row must come from its actual Git listing");
+            drop(app.update(loaded));
+            app.project_for_repository(&healthy_repository).unwrap()
+        });
+        let channel = ChannelId::new();
+        let mut model = registry(vec![shared(channel, &repository, "repaired project", 1)]);
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repaired checkout".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        });
+        model.projects.push(ModelProject {
+            repository: closed_repository.clone(),
+            name: "locally closed folder".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 3,
+        });
+        app.project_ui.closed.insert(closed_repository.clone());
+        if with_healthy_row {
+            model.projects.push(ModelProject {
+                repository: healthy_repository.clone(),
+                name: "healthy checkout".into(),
+                kind: ProjectKind::Git,
+                ordinal: 2,
+            });
+        }
+        app.workspace_model = model;
+        let Adoption::Opening(failed) =
+            app.open_shared_repository(&repository, Some(ProjectKind::Git))
+        else {
+            panic!("the shared project must admit its actual first read");
+        };
+        let failed =
+            first_message(failed).expect("the corrupted HEAD must fail actual Git loading");
+        let Message::RepositoryLoaded {
+            project_id: failed_id,
+            generation: failed_generation,
+            open_cards: false,
+            result: Err(_),
+        } = &failed
+        else {
+            panic!("the passive first read must fail: {failed:?}");
+        };
+        let (failed_id, failed_generation) = (*failed_id, *failed_generation);
+        assert!(messages(app.update(failed)).is_empty());
+        assert_eq!(
+            app.sidebar_model.projects.len(),
+            usize::from(with_healthy_row)
+        );
+        assert_eq!(
+            matches!(app.sidebar_model.data_state, SidebarDataState::Error(_)),
+            !with_healthy_row
+        );
+        assert!(!app.workspace_model_opens.contains(&repository));
+        assert!(!app.workspace_model_loads.contains_key(&failed_id));
+
+        // The visible Try again control emits this action. Do not synthesize a
+        // later ModelUpdate::Read: repairing disk alone produces no model edge.
+        std::fs::write(&head, original_head).unwrap();
+        let retry = app.update(Message::Sidebar(SidebarAction::Refresh));
+        if !with_healthy_row {
+            assert!(messages(app.update(Message::Sidebar(SidebarAction::Refresh))).is_empty());
+        }
+        let outputs = messages(retry);
+        assert_eq!(outputs.len(), 1 + usize::from(with_healthy_row));
+        let mut retried = None;
+        let mut refreshed_healthy = false;
+        for output in outputs {
+            let Message::RepositoryLoaded {
+                open_cards: false,
+                project_id,
+                generation,
+                result: Ok(loaded),
+            } = &output
+            else {
+                panic!("Try again must load passively, without opening a picker: {output:?}");
+            };
+            if loaded.project.repository == repository {
+                assert_ne!(*project_id, failed_id);
+                assert!(*generation > failed_generation);
+                assert_eq!(
+                    app.workspace_model_loads[project_id],
+                    (repository.clone(), *generation)
+                );
+                assert!(retried.replace(*project_id).is_none());
+            } else {
+                assert_eq!(Some(*project_id), healthy_id);
+                assert_eq!(loaded.project.repository, healthy_repository);
+                refreshed_healthy = true;
+            }
+            drop(app.update(output));
+        }
+        let retried = retried.expect("actual Refresh must retry the repaired shared project");
+        assert_eq!(refreshed_healthy, with_healthy_row);
+        assert_eq!(app.project_for_repository(&repository), Some(retried));
+        assert_eq!(
+            app.sidebar_model.projects.len(),
+            1 + usize::from(with_healthy_row)
+        );
+        assert_eq!(app.sidebar_model.data_state, SidebarDataState::Ready);
+        assert!(app.workspace_model_loads.is_empty());
+        assert!(app.project_for_repository(&closed_repository).is_none());
+        assert!(app.project_ui.closed.contains(&closed_repository));
+        assert!(!app.workspace_model_opens.contains(&closed_repository));
+        let adopted = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap();
+        assert_eq!(adopted.project_id, retried);
+        assert!(adopted.cards.is_empty());
+        assert_eq!(app.durable.cards, cards, "retry creates no actor or pane");
+        assert_eq!(app.cards.len(), cards.len());
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, active);
+        let Some(CardRuntime::Repository(editor)) = app.cards.get(&card) else {
+            panic!("retry must retain the original editor");
+        };
+        assert_eq!(editor.editor_text().as_deref(), Some(draft.as_str()));
+        assert_eq!(editor.cursor_position(), caret);
+        assert!(editor.is_dirty());
+        assert!(
+            !drain(&published)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::ReopenProject { .. }))
+        );
     }
 
     #[test]

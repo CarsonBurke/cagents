@@ -15470,13 +15470,17 @@ impl Application for Cagents {
                     }
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
-                        if targets.is_empty() {
+                        let shared = self.retry_unrepresented_shared_projects();
+                        if targets.is_empty() && shared.is_none() {
                             return cosmic::task::message(Message::OpenRepository);
                         }
-                        self.sidebar_model.data_state = SidebarDataState::Loading;
-                        Task::batch(targets.into_iter().map(|(repository, id)| {
+                        if !targets.is_empty() {
+                            self.sidebar_model.data_state = SidebarDataState::Loading;
+                        }
+                        let existing = targets.into_iter().map(|(repository, id)| {
                             self.repository_load_task(repository, Some(id), false)
-                        }))
+                        }).collect::<Vec<_>>();
+                        Task::batch(existing.into_iter().chain(shared))
                     }
                     SidebarAction::RefreshProject {
                         project_id,
