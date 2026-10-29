@@ -4114,15 +4114,32 @@ impl Cagents {
             let registered = match store.clone() {
                 Some(store) => tokio::task::spawn_blocking(move || match registration_homes {
                     Some(homes) => store.register_pending(&homes, managed, &system),
-                    None => store.update(|registry| registry.register(managed, &system)),
+                    None => store
+                        .update(|registry| registry.register(managed, &system))
+                        .and_then(|(registry, result)| match result {
+                            Ok(()) => Ok((registry, Ok(()))),
+                            Err(registry::RegistrationError::Duplicate(existing)) => {
+                                Ok((registry, Err(existing)))
+                            }
+                            Err(error @ registry::RegistrationError::RetainedPreparation) => Err(
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error),
+                            ),
+                        }),
                 })
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result.map_err(|error| error.to_string())),
                 None => {
                     let mut registry = fallback;
-                    let result = registry.register(managed, &system);
-                    Ok((registry, result))
+                    match registry.register(managed, &system) {
+                        Ok(()) => Ok((registry, Ok(()))),
+                        Err(registry::RegistrationError::Duplicate(existing)) => {
+                            Ok((registry, Err(existing)))
+                        }
+                        Err(error @ registry::RegistrationError::RetainedPreparation) => {
+                            Err(error.to_string())
+                        }
+                    }
                 }
             };
             let result = match registered {
