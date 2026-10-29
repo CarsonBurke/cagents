@@ -192,7 +192,8 @@ try:
                      'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner',
                      'ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume',
                      'keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click',
-                     'saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source']:
+                     'saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source',
+                     'quarantined_pane_removal_restores_the_surviving_native_control']:
             test = 'app::shared_views::tests::startup_admission::' + name
             output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
