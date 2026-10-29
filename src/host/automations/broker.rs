@@ -601,7 +601,19 @@ impl Handle {
                 return Ok(true);
             }
             Ok(Status::Complete(outcome)) => {
-                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
+                let (accepted, released) = {
+                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    let accepted = registry.finish_automation_precheck(firing.id, outcome, now)?;
+                    let released = accepted.is_none()
+                        && registry.retired_automation_precheck(firing.id)?.is_some();
+                    (accepted, released)
+                };
+                if released {
+                    // The last precheck may have cancelled the idle deadline.
+                    // Reconsider it only after durable ownership is released,
+                    // with neither registry nor worker/HostState locks held.
+                    crate::daemon::wake();
+                }
                 if let Some(accepted) = accepted {
                     let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
                     match service::validate_target(host, &automation.definition, &automation.target_identity) {
@@ -770,6 +782,305 @@ mod tests {
         });
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_precheck_wakes_parked_accept_loop_and_arms_idle_exit() {
+        use std::{
+            fs::{self, OpenOptions},
+            os::{
+                fd::AsRawFd,
+                unix::fs::{MetadataExt, OpenOptionsExt},
+            },
+            path::Path,
+            process::{Child, Command, Stdio},
+            time::Instant,
+        };
+
+        const ROOT: &str = "CAGENTS_TEST_PRECHECK_IDLE_ROOT";
+        const TEST: &str = "host::automations::broker::tests::completed_precheck_wakes_parked_accept_loop_and_arms_idle_exit";
+
+        fn publish(path: &Path, value: &impl serde::Serialize) {
+            let temporary = path.with_file_name(format!(
+                ".{}-{}",
+                path.file_name().unwrap().to_str().unwrap(),
+                Uuid::new_v4()
+            ));
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .unwrap();
+            serde_json::to_writer(&file, value).unwrap();
+            file.sync_all().unwrap();
+            fs::rename(temporary, path).unwrap();
+            fs::File::open(path.parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+
+        if let Some(root) = std::env::var_os(ROOT) {
+            use crate::{
+                automations::{DirectoryIdentity, SkipReason},
+                host::{automations::precheck::Outcome, model::Registry},
+                model::ProjectKind,
+                workspace_model::ModelEdit,
+            };
+
+            let root = PathBuf::from(root);
+            // Preserve the actual inherited admission. A refusal is evidence
+            // that this fixture cannot run, never permission to become User.
+            let admission = crate::host::DaemonAdmission {
+                _guard: crate::instance::DaemonAdmissionGuard::acquire()
+                    .expect("inherited daemon admission refused in private precheck fixture"),
+            };
+            let project = root.join("project");
+            let metadata = fs::metadata(&project).unwrap();
+            let mut registry = Registry::open().unwrap();
+            registry
+                .apply(&ModelEdit::OpenProject {
+                    repository: project.clone(),
+                    name: "Precheck idle fixture".into(),
+                    kind: ProjectKind::Folder,
+                })
+                .unwrap();
+            let definition = serde_json::from_value(serde_json::json!({
+                "name":"Precheck idle fixture", "prompt":"must never launch a provider",
+                "agent":{"provider":"Omp","account":null,"target":{"repository":project,"directory":project,"channel":null},"surface":"Chat","model":null,"permission_mode":null},
+                "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+                "session_mode":"fresh","precheck":{"command":"exit 7","timeout_seconds":5}
+            })).unwrap();
+            let automation = registry
+                .create_automation(
+                    definition,
+                    100,
+                    DirectoryIdentity {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                )
+                .unwrap();
+            assert!(!automation.enabled && automation.next.is_none());
+            // Direct registry setup is a synthetic manual request fixture;
+            // it does not validate delegated management permissions.
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            let firing = claim.firing;
+            assert!(claim.accepted.is_none());
+            let data = crate::instance::project_dirs().unwrap();
+            let worker = data
+                .data_dir()
+                .join("automation-prechecks")
+                .join(firing.id.to_string());
+            crate::secure_file::prepare_private_directory(&worker).unwrap();
+            let lease = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(worker.join("lease"))
+                .unwrap();
+            // SAFETY: lease is a live fixture-owned descriptor. This owner
+            // retains it until publishing the exact nonzero cleanup receipt.
+            assert_eq!(
+                unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            drop(registry);
+            let owner_root = root.clone();
+            let owner = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !owner_root.join("release-precheck").exists() {
+                    assert!(Instant::now() < deadline, "precheck owner was not released");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Synthetic nonzero receipt: this exercises the real recovery,
+                // broker and accept loop, not shell execution or supervisor
+                // teardown. No provider or child capability is consumed.
+                let outcome = Outcome::Stopped {
+                    state: FiringState::Skipped,
+                    skip: Some(SkipReason::PrecheckExit),
+                    diagnostic: "Precheck exited with status 7 (fixture)".into(),
+                };
+                publish(
+                    &worker.join("receipt"),
+                    &serde_json::json!({
+                        "firing": firing.id, "revision": firing.revision, "outcome": outcome,
+                    }),
+                );
+                drop(lease);
+            });
+            // SAFETY: gettid has no preconditions. Identify the exact thread
+            // that will execute the production daemon accept loop below.
+            let thread = unsafe { libc::syscall(libc::SYS_gettid) };
+            publish(
+                &root.join("ready"),
+                &serde_json::json!({
+                    "thread": thread, "firing": firing.id,
+                    "database": data.data_dir().join("workspace-model.sqlite3"),
+                }),
+            );
+            crate::host::run(admission).unwrap();
+            owner.join().unwrap();
+            let registry = Registry::open().unwrap();
+            let automation = registry.automation(automation.id).unwrap();
+            let detail = registry.automation_run_detail(firing.id).unwrap();
+            assert!(!automation.enabled && automation.next.is_none());
+            assert!(automation.active_firing.is_none() && detail.run.is_none());
+            assert_eq!(detail.firing.state, FiringState::Skipped);
+            assert_eq!(detail.firing.skip, Some(SkipReason::PrecheckExit));
+            return;
+        }
+
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().unwrap().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        fn poll_timeout(path: &Path) -> Option<u32> {
+            let state = match fs::read_to_string(path) {
+                Ok(state) => state,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => {
+                    panic!("cannot observe the owned accept thread's actual poll: {error}")
+                }
+            };
+            let mut fields = state.split_whitespace();
+            if fields.next()?.parse::<i64>().ok()? != libc::SYS_poll {
+                return None;
+            }
+            let timeout = fields.nth(2)?.strip_prefix("0x")?;
+            u64::from_str_radix(timeout, 16)
+                .ok()
+                .map(|timeout| timeout as u32)
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "home", "run", "data", "config", "cache", "state", "tmp", "project",
+        ] {
+            crate::secure_file::prepare_private_directory(&root.path().join(name)).unwrap();
+        }
+        let log = fs::File::create(root.path().join("daemon.log")).unwrap();
+        // Environment and opaque capabilities are inherited unchanged. Only
+        // private fixture paths, rendezvous and the existing idle duration
+        // setting differ. Two seconds establishes no production timing claim.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(ROOT, root.path())
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("TMPDIR", root.path().join("tmp"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", root.path().join("absent-bus").display()),
+            )
+            .env("CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS", "2")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        let mut child = OwnedChild(command.spawn().unwrap());
+        let logs = || fs::read_to_string(root.path().join("daemon.log")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ready = loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "fixture exited before ready: {}",
+                logs()
+            );
+            if let Ok(bytes) = fs::read(root.path().join("ready")) {
+                break serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not become ready: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let syscall = PathBuf::from(format!(
+            "/proc/{}/task/{}/syscall",
+            child.0.id(),
+            ready["thread"]
+        ));
+        let socket = root
+            .path()
+            .join("run")
+            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join("cagentsd.sock");
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "fixture exited before parking: {}",
+                logs()
+            );
+            if socket.exists() && poll_timeout(&syscall) == Some(u32::MAX) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual accept loop did not park indefinitely: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let database = rusqlite::Connection::open_with_flags(
+            ready["database"].as_str().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        // No connection or signal follows this release. Read-only SQLite and
+        // /proc observations cannot wake the real daemon accept pipe.
+        publish(&root.path().join("release-precheck"), &true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut armed = false;
+        loop {
+            let (active, state): (Option<String>, String) = database.query_row(
+                "SELECT a.active_firing,f.state FROM automations a JOIN automation_firings f ON f.automation=a.id WHERE f.id=?1",
+                [ready["firing"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            let released = active.is_none() && state == "skipped";
+            armed |= released
+                && poll_timeout(&syscall).is_some_and(|timeout| (1..=2_000).contains(&timeout));
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "private daemon failed: {}", logs());
+                assert!(
+                    released,
+                    "daemon exited before committed precheck ownership release"
+                );
+                assert!(armed, "no actual idle deadline poll was observed");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "precheck released={released}, idle deadline observed={armed}; accept loop did not exit: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
