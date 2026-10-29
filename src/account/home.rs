@@ -116,6 +116,14 @@ impl Homes {
         super::managed_home_identity(&self.root, path)
     }
 
+    /// Existing physical aliases participate in eligibility, not provenance
+    /// or permission to remove a home.
+    pub(crate) fn canonical_managed_identity(&self, path: &Path) -> Option<(Provider, Uuid)> {
+        let root = self.root.canonicalize().ok()?;
+        let path = path.canonicalize().ok()?;
+        super::managed_home_identity(&root, &path)
+    }
+
     /// Serializes account creation/removal with the actual child-spawn
     /// boundary. Never wait for this while holding the daemon's state lock.
     pub(crate) fn lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
@@ -230,7 +238,7 @@ impl Homes {
             }
             link_shared(provider, system_home, &path, codex_config);
         }
-        created.revalidate()?;
+        created.sync_completed()?;
         Ok((key, path))
     }
 
@@ -389,7 +397,8 @@ fn write_configuration(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn copy_configuration(source: &Path, destination: &Path) -> io::Result<()> {
