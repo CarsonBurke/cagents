@@ -12,9 +12,19 @@ impl Runtime {
         let text = self.unsent_text();
         let mut children = Vec::new();
         if fenced {
+            // Matches the fenced presentation of a pane with no chat runtime.
+            children.push(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Warning, design::STATUS_ICON_SIZE),
+                    design::title("Agent connection unavailable").into(),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .into(),
+            );
             children.push(design::body(super::super::shared_views::FENCED_PANE_EXPLANATION).into());
             children.push(
-                widget::button::standard("Close here")
+                widget::button::standard("Close")
                     .on_press(Message::CloseCard(self.target.card))
                     .into(),
             );

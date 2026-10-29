@@ -10345,7 +10345,7 @@ impl Cagents {
                                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                                 .width(Length::Fill)
                                 .into(),
-                            widget::button::standard("Close here")
+                            widget::button::standard("Close")
                                 .on_press(Message::CloseCard(id))
                                 .into(),
                         ])
@@ -16541,6 +16541,19 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
+                // A fenced pane's close already asked nothing of its session;
+                // routing it back through a close would request it again.
+                if self.shared_views.quarantined.contains(&id) {
+                    if !self
+                        .card_state(id)
+                        .is_some_and(|card| card.existence.is_open())
+                    {
+                        return Task::none();
+                    }
+                    return self
+                        .commit_card_removal(id, None)
+                        .unwrap_or_else(Task::none);
+                }
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
