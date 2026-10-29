@@ -4647,6 +4647,7 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
 /// This proves path spelling only, not the identity of a former directory.
 fn validate_history_anchor(path: &Path, label: &str, missing: bool) -> Result<(), String> {
     if !path.is_absolute()
+        || path.as_os_str() != path.components().collect::<PathBuf>().as_os_str()
         || path.components().any(|part| {
             matches!(
                 part,
@@ -4655,7 +4656,7 @@ fn validate_history_anchor(path: &Path, label: &str, missing: bool) -> Result<()
         })
     {
         return Err(format!(
-            "Saved Claude history requires an absolute recorded {label} without traversal"
+            "Saved Claude history requires a normalized absolute recorded {label} without traversal"
         ));
     }
     crate::secure_file::reject_symlink_components(path).map_err(|error| {

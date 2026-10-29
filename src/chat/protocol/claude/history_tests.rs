@@ -393,6 +393,74 @@ fn fresh_system_account_keeps_implicit_home_history_readable() {
     let (_, mut adapter) = create_history(&session.launch).unwrap();
     assert_all_history(adapter.as_mut(), "A");
     assert_eq!(session, issued);
+    // The process itself has readable A at HOME/.claude. If either removed
+    // or explicitly unset recorded selectors fall back to that environment,
+    // construction would succeed instead of returning this exact refusal.
+    let probe = history_open_probe(&PathBuf::from(std::env::var_os("HOME").unwrap()));
+    for unset in [false, true] {
+        let mut missing = session.launch.clone();
+        if unset {
+            missing
+                .recipe
+                .unset_environment
+                .extend(["CLAUDE_CONFIG_DIR".into(), "HOME".into()]);
+        } else {
+            missing.recipe.environment.remove("CLAUDE_CONFIG_DIR");
+            missing.recipe.environment.remove("HOME");
+        }
+        let recorded = missing.clone();
+        let error = create_history(&missing)
+            .err()
+            .expect("recorded selectors must not fall back to the process account");
+        assert_eq!(
+            error,
+            "Saved Claude history has no recorded effective account directory or HOME"
+        );
+        assert!(probe.paths().is_empty());
+        assert_eq!(missing, recorded);
+    }
+}
+
+#[test]
+fn history_requires_lexically_normalized_recorded_namespaces() {
+    let fixture = Namespaces::new(false, true);
+    let config = PathBuf::from(&fixture.launch.recipe.environment["CLAUDE_CONFIG_DIR"]);
+    for present in [false, true] {
+        if present {
+            std::fs::create_dir(&fixture.original).unwrap();
+        }
+        for (path, account) in [(&fixture.original, false), (&config, true)] {
+            let parent = path.parent().unwrap().to_str().unwrap();
+            let name = path.file_name().unwrap().to_str().unwrap();
+            for raw in [
+                format!("{parent}/./{name}"),
+                format!("{parent}//{name}"),
+                format!("{parent}/{name}/"),
+            ] {
+                let mut launch = fixture.launch.clone();
+                if account {
+                    launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), raw);
+                } else {
+                    launch.recipe.working_directory = raw.into();
+                    // This alternate raw spelling has a valid same-UUID B
+                    // transcript. Neither Path equality nor components alone
+                    // may turn that legacy ambiguity into a selected source.
+                    write_namespace(&config, &launch.recipe.working_directory, "B");
+                }
+                let issued = launch.clone();
+                let probe = history_open_probe(fixture.root.path());
+                let error = create_history(&launch)
+                    .err()
+                    .expect("raw namespace aliases must refuse");
+                assert!(error.contains("normalized absolute recorded"), "{error}");
+                assert!(probe.paths().is_empty());
+                assert_eq!(launch, issued);
+            }
+        }
+    }
 }
 
 #[test]
