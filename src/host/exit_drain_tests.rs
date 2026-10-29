@@ -52,6 +52,26 @@ fn private_runtime(name: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn private_runtime_case(name: &str, case: Option<&str>) -> Option<PathBuf> {
+    private_runtime_options(name, case, false)
+}
+
+fn private_runtime_retained_actor(name: &str) -> Option<PathBuf> {
+    let helper = PathBuf::from(
+        std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+            .expect("real startup exit fixture requires the same-head cagentsd executable"),
+    );
+    assert!(
+        helper.is_absolute(),
+        "same-head helper path must be absolute"
+    );
+    private_runtime_options(name, None, true)
+}
+
+fn private_runtime_options(
+    name: &str,
+    case: Option<&str>,
+    retained_actor: bool,
+) -> Option<PathBuf> {
     const CASE: &str = "CAGENTS_EXIT_DRAIN_TEST_CASE";
     if let Some(root) = std::env::var_os(ROOT) {
         assert_eq!(std::env::var(TEST).as_deref(), Ok(name));
@@ -82,7 +102,10 @@ pub(super) fn private_runtime_case(name: &str, case: Option<&str>) -> Option<Pat
     // Leave the actual caller's opaque delegation inherited. Only a public
     // equality-derived presence boolean crosses this fixture's boundary.
     for (key, _) in std::env::vars_os() {
-        if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+        if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && !(retained_actor
+                && key == std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER"))
+        {
             command.env_remove(key);
         }
     }
@@ -115,6 +138,13 @@ pub(super) fn private_runtime_case(name: &str, case: Option<&str>) -> Option<Pat
         .stderr(Stdio::from(File::create(&stderr).unwrap()));
     if let Some(case) = case {
         command.env(CASE, case);
+    }
+    if retained_actor {
+        fs::create_dir(root.join("home/.claude")).unwrap();
+        fs::create_dir(root.join("project")).unwrap();
+        command
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
     }
     let mut child = TestChild(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -613,4 +643,5 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     drop(lease);
 }
 
+mod native_startup_shutdown_tests;
 mod startup_recovery_tests;

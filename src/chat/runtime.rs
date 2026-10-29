@@ -28,6 +28,8 @@ mod handle;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use retained_actor::transport::startup_observation;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };

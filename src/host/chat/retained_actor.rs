@@ -19,6 +19,21 @@ pub(in crate::host) struct Startup {
     pub(super) failed_close: Option<super::CloseTarget>,
 }
 
+#[cfg(test)]
+impl Startup {
+    pub(in crate::host) fn matches_for_test(
+        &self,
+        source: &Session,
+        requested: &Session,
+        context: &Arc<chat::protocol::ExecutionContext>,
+    ) -> bool {
+        &self.source == source
+            && &self.requested == requested
+            && Arc::ptr_eq(&self.context, context)
+            && self.failed_close.is_none()
+    }
+}
+
 /// Unit-only HostState fixtures intentionally exercise local transports without
 /// a daemon lease. The retained-actor integration fixture opts into the genuine
 /// exec/socket/lease boundary. Production uses the matched public protocol.
