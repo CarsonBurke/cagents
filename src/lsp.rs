@@ -33,18 +33,20 @@
 //! [`LspStatus::Unavailable`] while editing, saving and syntax highlighting
 //! keep working.
 
-use std::collections::{HashMap, VecDeque};
+use crate::repository_widget::text_editor::{Position as NativePosition, TextSnapshot};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
-use std::io;
 use std::ops::{ControlFlow, Range};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
+use std::{fmt, io};
 
 use async_lsp::router::Router;
 use async_lsp::{MainLoop, ServerSocket};
@@ -59,6 +61,7 @@ use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_grou
 use crate::settings::LanguageServerSettings;
 
 mod commands;
+mod discovery;
 
 /// Capacity of the application event channel. Diagnostics are coalesced by
 /// document once it is full; results and status changes apply backpressure to
@@ -222,14 +225,190 @@ pub enum LspSeverity {
     Hint,
 }
 
-/// One diagnostic, already converted to editor-native coordinates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Routine diagnostic previews are bounded independently of the wire frame.
+pub const DIAGNOSTIC_PREVIEW_BYTES: usize = 16 * 1024;
+const DIAGNOSTIC_TRUNCATED: &str =
+    "\n… [preview truncated; copy full diagnostic for complete text]";
+
+/// A UTF-8-safe, visibly truncated prefix. No allocation or full-text scan is
+/// needed for a short value; a long value allocates at most the preview budget.
+pub fn diagnostic_preview(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= DIAGNOSTIC_PREVIEW_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = DIAGNOSTIC_PREVIEW_BYTES - DIAGNOSTIC_TRUNCATED.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{DIAGNOSTIC_TRUNCATED}", &text[..end]))
+}
+
+/// One diagnostic with editor-native coordinates and its complete, immutable
+/// protocol payload. Mirrors and shifted ranges share the original strings,
+/// related information and opaque server data rather than copying them.
+#[derive(Clone)]
 pub struct LspDiagnostic {
     pub range: LspRange,
     pub severity: LspSeverity,
-    pub message: String,
-    pub source: Option<String>,
-    pub code: Option<String>,
+    pub protocol: Arc<lsp_types::Diagnostic>,
+}
+
+impl std::ops::Deref for LspDiagnostic {
+    type Target = lsp_types::Diagnostic;
+
+    fn deref(&self) -> &Self::Target {
+        &self.protocol
+    }
+}
+
+impl PartialEq for LspDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.range == other.range
+            && self.severity == other.severity
+            && (Arc::ptr_eq(&self.protocol, &other.protocol) || self.protocol == other.protocol)
+    }
+}
+impl Eq for LspDiagnostic {}
+
+impl std::fmt::Debug for LspDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspDiagnostic")
+            .field("range", &self.range)
+            .field("severity", &self.severity)
+            .field("message", &diagnostic_preview(&self.message))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LspDiagnostic {
+    /// Construct a local diagnostic; server diagnostics retain the actual wire
+    /// object instead, including its original UTF-16 range and opaque data.
+    pub fn new(
+        range: LspRange,
+        severity: LspSeverity,
+        message: String,
+        source: Option<String>,
+        code: Option<String>,
+    ) -> Self {
+        Self {
+            range,
+            severity,
+            protocol: Arc::new(lsp_types::Diagnostic {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(range.start.line, range.start.character),
+                    lsp_types::Position::new(range.end.line, range.end.character),
+                ),
+                severity: Some(match severity {
+                    LspSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
+                    LspSeverity::Warning => lsp_types::DiagnosticSeverity::WARNING,
+                    LspSeverity::Information => lsp_types::DiagnosticSeverity::INFORMATION,
+                    LspSeverity::Hint => lsp_types::DiagnosticSeverity::HINT,
+                }),
+                message,
+                source,
+                code: code.map(lsp_types::NumberOrString::String),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn message_preview(&self) -> std::borrow::Cow<'_, str> {
+        diagnostic_preview(&self.message)
+    }
+
+    /// Bounded origin text; combine only bounded pieces before formatting so a
+    /// pathological source/code cannot allocate its complete value in a view.
+    pub fn origin_preview(&self) -> String {
+        let source = self.source.as_deref().unwrap_or("");
+        let code = match &self.code {
+            Some(lsp_types::NumberOrString::String(code)) => {
+                std::borrow::Cow::Borrowed(code.as_str())
+            }
+            Some(lsp_types::NumberOrString::Number(code)) => {
+                std::borrow::Cow::Owned(code.to_string())
+            }
+            None => std::borrow::Cow::Borrowed(""),
+        };
+        if source.is_empty() {
+            return diagnostic_preview(&code).into_owned();
+        }
+        if code.is_empty() {
+            return diagnostic_preview(source).into_owned();
+        }
+        diagnostic_preview(&format!(
+            "{} {}",
+            diagnostic_preview(source),
+            diagnostic_preview(&code)
+        ))
+        .into_owned()
+    }
+
+    /// Full protocol JSON is materialized only after an explicit copy action.
+    /// It preserves message, source, numeric/string code, related info and data.
+    pub fn copy_text(&self) -> String {
+        // Compact JSON avoids multiplying deeply nested opaque data with
+        // indentation when a user requests the complete payload.
+        serde_json::to_string(self.protocol.as_ref()).expect("diagnostic JSON is serializable")
+    }
+}
+
+/// Retains standing diagnostics through a sequence of exact editor changes.
+/// Insertions at a diagnostic's beginning move it with the original text;
+/// insertions at its end stay outside the underline. Replaced portions clamp
+/// to the replacement rather than leaving ranges aimed at unrelated lines.
+pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
+    for edit in edits {
+        let mut ending = edit.range.start;
+        for character in edit.new_text.chars() {
+            if character == '\n' {
+                ending.line = ending.line.saturating_add(1);
+                ending.character = 0;
+            } else {
+                ending.character = ending.character.saturating_add(1);
+            }
+        }
+        // CRLF's carriage return is not counted on its completed line. The
+        // final line contains no LF, so only its scalar count is used above.
+        for item in items.iter_mut() {
+            let point = item.range.start == item.range.end;
+            item.range.start =
+                shift_diagnostic_position(item.range.start, edit.range, ending, true);
+            item.range.end = shift_diagnostic_position(item.range.end, edit.range, ending, point);
+            item.range.end = item.range.end.max(item.range.start);
+        }
+    }
+}
+
+fn shift_diagnostic_position(
+    at: LspPosition,
+    old: LspRange,
+    new_end: LspPosition,
+    right: bool,
+) -> LspPosition {
+    if at < old.start {
+        return at;
+    }
+    if old.start == old.end && at == old.start {
+        return if right { new_end } else { old.start };
+    }
+    if at < old.end {
+        return if right { old.start } else { new_end };
+    }
+    if at.line == old.end.line {
+        LspPosition::new(
+            new_end.line,
+            new_end
+                .character
+                .saturating_add(at.character.saturating_sub(old.end.character)),
+        )
+    } else {
+        LspPosition::new(
+            new_end
+                .line
+                .saturating_add(at.line.saturating_sub(old.end.line)),
+            at.character,
+        )
+    }
 }
 
 /// Completion item kind, used only to pick an icon.
@@ -361,9 +540,51 @@ pub struct LspProgress {
     pub done: bool,
 }
 
+/// Authority to deliver one document's current server status or progress.
+/// Only the manager and its bound producer can mint this capability.
+#[derive(Clone)]
+pub struct LspDelivery(Arc<DeliveryState>);
+
+struct DeliveryState {
+    active: AtomicBool,
+    session: Option<Arc<AtomicBool>>,
+}
+
+impl fmt::Debug for LspDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspDelivery").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LspDelivery {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl LspDelivery {
+    fn active(&self) -> bool {
+        self.0.active.load(Ordering::Acquire)
+            && self
+                .0
+                .session
+                .as_ref()
+                .is_none_or(|retired| !retired.load(Ordering::Acquire))
+    }
+}
+
 /// Everything the runtime pushes to the application.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspEvent {
+    /// Discovery completed off the UI thread. The application acknowledges it
+    /// with `LspManager::finish_discovery`; closed/replaced documents are ignored.
+    RootDiscovered {
+        doc: LspDocumentId,
+        ticket: u64,
+        root: PathBuf,
+    },
+    /// Cached process metrics were refreshed by a background worker.
+    Resources { doc: LspDocumentId },
     /// Current diagnostics for `doc` as of `version`. Always a full
     /// replacement, never a delta.
     Diagnostics {
@@ -391,10 +612,12 @@ pub enum LspEvent {
     Status {
         doc: LspDocumentId,
         status: LspStatus,
+        delivery: LspDelivery,
     },
     Progress {
         doc: LspDocumentId,
         progress: LspProgress,
+        delivery: LspDelivery,
     },
     /// A request produced no usable answer. Superseded requests report
     /// [`LspError::Cancelled`].
@@ -454,44 +677,112 @@ pub enum LspError {
 #[derive(Debug)]
 struct Snapshot {
     version: i32,
-    text: Arc<str>,
-    /// Byte offset of the first byte of each line. Never empty.
-    line_starts: Vec<u32>,
+    text: OnceLock<Arc<str>>,
+    native: Option<TextSnapshot>,
+    /// Populated on demand for non-native or incompatible line topology.
+    line_starts: OnceLock<Arc<[u32]>>,
 }
 
 impl Snapshot {
     fn new(version: i32, text: Arc<str>) -> Self {
-        let mut line_starts = Vec::with_capacity(1 + text.len() / 32);
-        line_starts.push(0);
-        for (index, byte) in text.as_bytes().iter().enumerate() {
-            if *byte == b'\n' {
-                // Editable files are capped far below `u32::MAX` bytes by the
-                // repository widget, so this conversion never saturates in
-                // practice.
-                line_starts.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
-            }
-        }
+        let result = Self {
+            version,
+            text: OnceLock::from(text),
+            native: None,
+            line_starts: OnceLock::new(),
+        };
+        result.protocol_lines();
+        result
+    }
+
+    fn with_version(&self, version: i32) -> Self {
         Self {
             version,
-            text,
-            line_starts,
+            native: self.native.clone(),
+            text: self
+                .text
+                .get()
+                .cloned()
+                .map(OnceLock::from)
+                .unwrap_or_default(),
+            line_starts: self
+                .line_starts
+                .get()
+                .cloned()
+                .map(OnceLock::from)
+                .unwrap_or_default(),
         }
+    }
+
+    fn from_native(version: i32, native: TextSnapshot) -> Self {
+        Self {
+            version,
+            text: OnceLock::new(),
+            native: Some(native.without_cached_text()),
+            line_starts: OnceLock::new(),
+        }
+    }
+
+    fn full_text(&self) -> &Arc<str> {
+        self.text.get_or_init(|| {
+            self.native
+                .as_ref()
+                .expect("lazy snapshot has native source")
+                .text()
+        })
+    }
+
+    fn wire_text(&self) -> String {
+        self.native.as_ref().map_or_else(
+            || self.full_text().to_string(),
+            TextSnapshot::to_string_uncached,
+        )
+    }
+
+    fn byte_len(&self) -> usize {
+        self.native
+            .as_ref()
+            .map_or_else(|| self.full_text().len(), TextSnapshot::len)
+    }
+
+    fn compatible_native(&self) -> Option<&TextSnapshot> {
+        self.native
+            .as_ref()
+            .filter(|source| source.protocol_compatible_lines())
+    }
+
+    fn protocol_lines(&self) -> &[u32] {
+        self.line_starts.get_or_init(|| {
+            let mut lines = vec![0];
+            for (index, byte) in self.full_text().bytes().enumerate() {
+                if byte == b'\n' {
+                    lines.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
+                }
+            }
+            lines.into()
+        })
     }
 
     fn line_count(&self) -> u32 {
-        u32::try_from(self.line_starts.len()).unwrap_or(u32::MAX)
+        u32::try_from(
+            self.compatible_native()
+                .map_or_else(|| self.protocol_lines().len(), TextSnapshot::line_count),
+        )
+        .unwrap_or(u32::MAX)
     }
 
-    /// Byte range of the line's content, excluding its terminator. `\r\n` is
-    /// one terminator, so the `\r` is not part of the content.
     fn line_span(&self, line: u32) -> Option<Range<usize>> {
-        let start = *self.line_starts.get(line as usize)? as usize;
-        let end = match self.line_starts.get(line as usize + 1) {
-            // Exclude the '\n' that begins the next line.
-            Some(next) => *next as usize - 1,
-            None => self.text.len(),
-        };
-        let end = if end > start && self.text.as_bytes().get(end - 1) == Some(&b'\r') {
+        if let Some(source) = self.compatible_native() {
+            let line = usize::try_from(line).ok()?;
+            let start = source.byte_offset(NativePosition { line, column: 0 })?;
+            return Some(start..start + source.line(line)?.text.len());
+        }
+        let lines = self.protocol_lines();
+        let start = *lines.get(line as usize)? as usize;
+        let end = lines
+            .get(line as usize + 1)
+            .map_or(self.byte_len(), |next| *next as usize - 1);
+        let end = if end > start && self.full_text().as_bytes().get(end - 1) == Some(&b'\r') {
             end - 1
         } else {
             end
@@ -499,9 +790,12 @@ impl Snapshot {
         Some(start..end)
     }
 
-    fn line_content(&self, line: u32) -> Option<&str> {
+    fn line_content(&self, line: u32) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(source) = self.compatible_native() {
+            return Some(source.line(usize::try_from(line).ok()?)?.text);
+        }
         let span = self.line_span(line)?;
-        Some(&self.text[span])
+        Some(std::borrow::Cow::Borrowed(&self.full_text()[span]))
     }
 
     fn out_of_range(&self, line: u32, character: u32) -> LspError {
@@ -589,7 +883,9 @@ impl Snapshot {
         let span = self
             .line_span(position.line)
             .ok_or_else(|| self.out_of_range(position.line, position.character))?;
-        let content = &self.text[span.clone()];
+        let content = self
+            .line_content(position.line)
+            .ok_or_else(|| self.out_of_range(position.line, position.character))?;
         let mut scalars = 0u32;
         for (offset, _) in content.char_indices() {
             if scalars == position.character {
@@ -658,7 +954,7 @@ fn build_incremental(
 ) -> Result<Vec<lsp_types::TextDocumentContentChangeEvent>, LspError> {
     let Some((last, leading)) = edits.split_last() else {
         // No edits describe no transition, so the buffer must not have moved.
-        return if *base.text == *expected {
+        return if **base.full_text() == *expected {
             Ok(Vec::new())
         } else {
             Err(LspError::InconsistentEdits)
@@ -669,18 +965,58 @@ fn build_incremental(
     for edit in leading {
         let working = intermediate.as_ref().unwrap_or(base);
         let (start, end) = measure_edit(working, edit, &mut changes)?;
-        let mut next = String::with_capacity(working.text.len() + edit.new_text.len());
-        next.push_str(&working.text[..start]);
+        let mut next = String::with_capacity(working.full_text().len() + edit.new_text.len());
+        next.push_str(&working.full_text()[..start]);
         next.push_str(&edit.new_text);
-        next.push_str(&working.text[end..]);
+        next.push_str(&working.full_text()[end..]);
         intermediate = Some(Snapshot::new(base.version, Arc::from(next)));
     }
     let working = intermediate.as_ref().unwrap_or(base);
     let (start, end) = measure_edit(working, last, &mut changes)?;
-    if !splices_into(&working.text, start..end, &last.new_text, expected) {
+    if !splices_into(working.full_text(), start..end, &last.new_text, expected) {
         return Err(LspError::InconsistentEdits);
     }
     Ok(changes)
+}
+
+/// Convert only affected source lines. Unusual native line topology or a
+/// legacy source without persistent intermediate lines uses the lazy full
+/// fallback, leaving serialization at the existing debounce boundary.
+fn native_incremental(
+    base: &Snapshot,
+    edits: &[LspTextEdit],
+    expected: &TextSnapshot,
+) -> Option<Vec<lsp_types::TextDocumentContentChangeEvent>> {
+    if edits.is_empty() {
+        return None;
+    }
+    let mut changes = Vec::with_capacity(edits.len());
+    let mut working = base.compatible_native()?.clone();
+    for edit in edits {
+        let snapshot = Snapshot::from_native(base.version, working.clone());
+        changes.push(lsp_types::TextDocumentContentChangeEvent {
+            range: Some(snapshot.range_to_utf16(edit.range).ok()?),
+            range_length: None,
+            text: edit.new_text.clone(),
+        });
+        let native_position = |at: LspPosition| -> Option<NativePosition> {
+            let line = usize::try_from(at.line).ok()?;
+            let content = working.line(line)?;
+            let scalar = usize::try_from(at.character).ok()?;
+            let column = if scalar == content.text.chars().count() {
+                content.text.len()
+            } else {
+                content.text.char_indices().nth(scalar)?.0
+            };
+            Some(NativePosition { line, column })
+        };
+        working = working.replaced(
+            native_position(edit.range.start)?,
+            native_position(edit.range.end)?,
+            &edit.new_text,
+        )?;
+    }
+    working.same_text(expected).then_some(changes)
 }
 
 /// Records `edit` as a protocol content change measured against `working`,
@@ -790,6 +1126,23 @@ impl SnapshotStore {
         requested_version: i32,
         text: Arc<str>,
     ) -> Option<Arc<Snapshot>> {
+        self.register_source(
+            doc,
+            uri,
+            session,
+            requested_version,
+            Arc::new(Snapshot::new(requested_version, text)),
+        )
+    }
+
+    fn register_source(
+        &self,
+        doc: LspDocumentId,
+        uri: &Arc<Url>,
+        session: &SessionKey,
+        requested_version: i32,
+        source: Arc<Snapshot>,
+    ) -> Option<Arc<Snapshot>> {
         let mut inner = self.lock();
         match inner.uris.get_mut(uri) {
             Some(state) => {
@@ -797,13 +1150,13 @@ impl SnapshotStore {
                 if !state.docs.contains(&doc) {
                     state.docs.push(doc);
                 }
-                let snapshot = Arc::new(Snapshot::new(version, text));
+                let snapshot = Arc::new(source.with_version(version));
                 state.push(Arc::clone(&snapshot));
                 inner.docs.insert(doc, Arc::clone(uri));
                 Some(snapshot)
             }
             None => {
-                let snapshot = Arc::new(Snapshot::new(requested_version, text));
+                let snapshot = Arc::new(source.with_version(requested_version));
                 let mut snapshots = VecDeque::with_capacity(MAX_RETAINED_SNAPSHOTS);
                 snapshots.push_back(Arc::clone(&snapshot));
                 inner.uris.insert(
@@ -835,8 +1188,34 @@ impl SnapshotStore {
         RecordOutcome::Recorded { previous, snapshot }
     }
 
+    fn record_native(
+        &self,
+        uri: &Arc<Url>,
+        requested_version: i32,
+        source: TextSnapshot,
+    ) -> RecordOutcome {
+        let mut inner = self.lock();
+        let Some(state) = inner.uris.get_mut(uri) else {
+            return RecordOutcome::UnknownUri;
+        };
+        let previous = state.latest();
+        let Some(version) = next_version(previous.version, requested_version) else {
+            return RecordOutcome::VersionExhausted;
+        };
+        let snapshot = Arc::new(Snapshot::from_native(version, source));
+        state.push(Arc::clone(&snapshot));
+        RecordOutcome::Recorded { previous, snapshot }
+    }
+
     fn latest(&self, uri: &Url) -> Option<Arc<Snapshot>> {
         Some(self.lock().uris.get(uri)?.latest())
+    }
+
+    fn bound_to_other_session(&self, uri: &Url, session: &SessionKey) -> bool {
+        self.lock()
+            .uris
+            .get(uri)
+            .is_some_and(|state| &state.session != session)
     }
 
     fn snapshot_at(&self, uri: &Url, version: i32) -> Option<Arc<Snapshot>> {
@@ -849,12 +1228,17 @@ impl SnapshotStore {
             .map(Arc::clone)
     }
 
-    fn docs_for_uri(&self, uri: &Url) -> Vec<LspDocumentId> {
-        self.lock()
-            .uris
-            .get(uri)
-            .map(|state| state.docs.clone())
-            .unwrap_or_default()
+    /// Admit a diagnostic batch only from the session that owns this URI.
+    /// Recipients and text must come from the same publication, rather than
+    /// independently looking up a URI that another live server can also name.
+    fn diagnostic_snapshot(
+        &self,
+        uri: &Url,
+        session: &SessionKey,
+    ) -> Option<(Vec<LspDocumentId>, Arc<Snapshot>)> {
+        let inner = self.lock();
+        let state = inner.uris.get(uri)?;
+        (&state.session == session).then(|| (state.docs.clone(), state.latest()))
     }
 
     fn docs_for_session(&self, session: &SessionKey) -> Vec<LspDocumentId> {
@@ -921,10 +1305,13 @@ enum StagedClass {
     Diagnostics(LspDocumentId),
     Status(LspDocumentId),
     Progress(LspDocumentId),
+    Resources(LspDocumentId),
 }
 
 #[derive(Debug, Default)]
 struct PendingInner {
+    /// One producer per current document binding, including unbacked refusals.
+    deliveries: HashMap<LspDocumentId, LspDelivery>,
     /// Newest replaceable event per class. Bounded by the number of open
     /// documents, and a document's entries are dropped when it closes.
     replaceable: HashMap<StagedClass, LspEvent>,
@@ -939,7 +1326,32 @@ struct PendingInner {
 }
 
 impl PendingInner {
+    fn bind(&mut self, doc: LspDocumentId, session: Option<Arc<AtomicBool>>) -> LspDelivery {
+        let delivery = LspDelivery(Arc::new(DeliveryState {
+            active: AtomicBool::new(true),
+            session,
+        }));
+        if let Some(previous) = self.deliveries.insert(doc, delivery.clone()) {
+            previous.0.active.store(false, Ordering::Release);
+        }
+        delivery
+    }
+
+    fn accepts(&self, event: &LspEvent) -> bool {
+        match event {
+            LspEvent::Status { doc, delivery, .. } | LspEvent::Progress { doc, delivery, .. } => {
+                delivery.active() && self.deliveries.get(doc) == Some(delivery)
+            }
+            _ => true,
+        }
+    }
+
     fn stage(&mut self, event: LspEvent) {
+        // Check under the same lock as rebinding, before replacing a current
+        // class. Dropping stale traffic only at delivery would lose that class.
+        if !self.accepts(&event) {
+            return;
+        }
         let class = match &event {
             LspEvent::Diagnostics { doc, version, .. } => {
                 let staged = self.diagnostic_versions.entry(*doc).or_insert(i32::MIN);
@@ -951,6 +1363,7 @@ impl PendingInner {
             }
             LspEvent::Status { doc, .. } => StagedClass::Status(*doc),
             LspEvent::Progress { doc, .. } => StagedClass::Progress(*doc),
+            LspEvent::Resources { doc } => StagedClass::Resources(*doc),
             _ => {
                 // Terminal: dropping one would leave the application waiting
                 // for an answer that never comes, so the oldest is only
@@ -975,7 +1388,9 @@ impl PendingInner {
                 if let StagedClass::Diagnostics(doc) = class {
                     inner.diagnostic_versions.remove(&doc);
                 }
-                return Some(event);
+                if inner.accepts(&event) {
+                    return Some(event);
+                }
             }
         };
         if prefer_terminal {
@@ -986,17 +1401,22 @@ impl PendingInner {
     }
 
     fn forget(&mut self, doc: LspDocumentId) {
+        if let Some(delivery) = self.deliveries.remove(&doc) {
+            delivery.0.active.store(false, Ordering::Release);
+        }
         for class in [
             StagedClass::Diagnostics(doc),
             StagedClass::Status(doc),
             StagedClass::Progress(doc),
+            StagedClass::Resources(doc),
         ] {
             self.replaceable.remove(&class);
         }
         self.order.retain(|class| match class {
-            StagedClass::Diagnostics(at) | StagedClass::Status(at) | StagedClass::Progress(at) => {
-                *at != doc
-            }
+            StagedClass::Diagnostics(at)
+            | StagedClass::Status(at)
+            | StagedClass::Progress(at)
+            | StagedClass::Resources(at) => *at != doc,
         });
         self.diagnostic_versions.remove(&doc);
         self.terminal.retain(|event| event_doc(event) != Some(doc));
@@ -1006,7 +1426,9 @@ impl PendingInner {
 /// The document an event concerns, when it concerns exactly one.
 fn event_doc(event: &LspEvent) -> Option<LspDocumentId> {
     match event {
-        LspEvent::Diagnostics { doc, .. }
+        LspEvent::RootDiscovered { doc, .. }
+        | LspEvent::Resources { doc }
+        | LspEvent::Diagnostics { doc, .. }
         | LspEvent::Completion { doc, .. }
         | LspEvent::Hover { doc, .. }
         | LspEvent::Locations { doc, .. }
@@ -1032,15 +1454,53 @@ struct EventSink {
 }
 
 impl EventSink {
+    fn bind(&self, doc: LspDocumentId, session: Option<Arc<AtomicBool>>) -> LspDelivery {
+        self.pending
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bind(doc, session)
+    }
+
+    fn session_delivery(
+        &self,
+        doc: LspDocumentId,
+        retired: &Arc<AtomicBool>,
+    ) -> Option<LspDelivery> {
+        let inner = self.pending.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let delivery = inner.deliveries.get(&doc)?;
+        (delivery.active()
+            && delivery
+                .0
+                .session
+                .as_ref()
+                .is_some_and(|session| Arc::ptr_eq(session, retired)))
+        .then(|| delivery.clone())
+    }
+
+    fn accepts(&self, event: &LspEvent) -> bool {
+        self.pending
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepts(event)
+    }
+
     /// Awaits channel capacity. Only session and request tasks call this, so
     /// backpressure slows protocol traffic rather than losing results.
     async fn emit(&self, event: LspEvent) {
+        if !self.accepts(&event) {
+            return;
+        }
         let _ = self.tx.send(event).await;
     }
 
     /// Never blocks. When the channel is full the event is staged by class,
     /// and [`drain_pending`] moves it on as capacity appears.
     fn emit_now(&self, event: LspEvent) {
+        if !self.accepts(&event) {
+            return;
+        }
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(async_channel::TrySendError::Closed(_)) => {}
@@ -1559,11 +2019,46 @@ struct Transport {
 /// What to launch, resolved before the session task starts.
 #[derive(Debug, Clone)]
 struct LaunchSpec {
+    initialization_options: Option<serde_json::Value>,
     command: Vec<String>,
     root: PathBuf,
 }
 
 type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + Send + Sync>;
+
+/// Keep the original directory inode allocated while a server owns its root.
+/// A path can be renamed and replaced between watchdog polls; existence alone
+/// would then keep a server for the previous checkout alive indefinitely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl RootIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+async fn pin_session_root(root: &Path) -> io::Result<(tokio::fs::File, RootIdentity)> {
+    // Linux can pin identity without directory read permissions. Other Unix
+    // systems retain a read-only directory descriptor. Both paths run off the
+    // application update thread and keep the inode alive through teardown.
+    let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let flags = flags | libc::O_PATH;
+    let directory = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(root)
+        .await?;
+    let identity = RootIdentity::from_metadata(&directory.metadata().await?);
+    Ok((directory, identity))
+}
 
 /// Anchors `path` to `working_directory` without consulting the filesystem.
 fn absolute_in(working_directory: &Path, path: &Path) -> PathBuf {
@@ -1796,7 +2291,7 @@ enum SessionCommand {
         uri: Arc<Url>,
         language_id: String,
         version: i32,
-        text: Arc<str>,
+        text: Arc<Snapshot>,
     },
     Change {
         uri: Arc<Url>,
@@ -1804,7 +2299,7 @@ enum SessionCommand {
         /// `None` when the manager could not build incremental changes, in
         /// which case the whole document is resent.
         incremental: Option<Vec<lsp_types::TextDocumentContentChangeEvent>>,
-        full: Arc<str>,
+        full: Arc<Snapshot>,
     },
     Save {
         uri: Arc<Url>,
@@ -1824,7 +2319,7 @@ enum SessionCommand {
 struct PendingChange {
     version: i32,
     incremental: Option<Vec<lsp_types::TextDocumentContentChangeEvent>>,
-    full: Arc<str>,
+    full: Arc<Snapshot>,
     /// When this URI's coalesced edits are due. Per URI, so a file being
     /// typed into cannot postpone another file's pending notification.
     due: tokio::time::Instant,
@@ -1923,10 +2418,14 @@ impl SessionContext {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
         for doc in self.snapshots.docs_for_session(&self.key) {
+            let Some(delivery) = self.events.session_delivery(doc, &self.retired) else {
+                continue;
+            };
             self.events
                 .emit(LspEvent::Status {
                     doc,
                     status: status.clone(),
+                    delivery,
                 })
                 .await;
         }
@@ -1982,11 +2481,8 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     if state.retired.load(Ordering::Acquire) {
         return;
     }
-    let docs = state.snapshots.docs_for_uri(&params.uri);
-    if docs.is_empty() {
-        return;
-    }
-    let Some(snapshot) = state.snapshots.latest(&params.uri) else {
+    let Some((docs, snapshot)) = state.snapshots.diagnostic_snapshot(&params.uri, &state.key)
+    else {
         return;
     };
     // A versioned batch is only valid for the text it was computed from.
@@ -2001,7 +2497,7 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     }
     let items: Vec<LspDiagnostic> = params
         .diagnostics
-        .iter()
+        .into_iter()
         .filter_map(|diagnostic| convert_diagnostic(&snapshot, diagnostic))
         .collect();
     for doc in docs {
@@ -2015,7 +2511,7 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
 
 fn convert_diagnostic(
     snapshot: &Snapshot,
-    diagnostic: &lsp_types::Diagnostic,
+    diagnostic: lsp_types::Diagnostic,
 ) -> Option<LspDiagnostic> {
     // One unconvertible range must not discard the whole batch.
     let range = snapshot.range_from_utf16(diagnostic.range).ok()?;
@@ -2027,12 +2523,7 @@ fn convert_diagnostic(
             Some(lsp_types::DiagnosticSeverity::HINT) => LspSeverity::Hint,
             _ => LspSeverity::Error,
         },
-        message: diagnostic.message.clone(),
-        source: diagnostic.source.clone(),
-        code: diagnostic.code.as_ref().map(|code| match code {
-            lsp_types::NumberOrString::Number(value) => value.to_string(),
-            lsp_types::NumberOrString::String(value) => value.clone(),
-        }),
+        protocol: Arc::new(diagnostic),
     })
 }
 
@@ -2077,9 +2568,13 @@ fn publish_progress(state: &mut RouterState, params: &lsp_types::ProgressParams)
     // *this* session sees it and the surface can show one indexing indicator.
     // Documents belonging to another server or root are none of its business.
     for doc in state.snapshots.docs_for_session(&state.key) {
+        let Some(delivery) = state.events.session_delivery(doc, &state.retired) else {
+            continue;
+        };
         state.events.emit_now(LspEvent::Progress {
             doc,
             progress: progress.clone(),
+            delivery,
         });
     }
 }
@@ -2217,7 +2712,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
     // `a_superseded_request_is_cancelled_on_the_wire` locks the coupling.
     let mut next_wire_id: i32 = 0;
 
-    let params = match initialize_params(&context.launch.root) {
+    let mut params = match initialize_params(&context.launch.root) {
         Ok(params) => params,
         Err(reason) => {
             teardown(protocol, child, stderr_drain, &context.process_group).await;
@@ -2225,6 +2720,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             return;
         }
     };
+    params.initialization_options = context.launch.initialization_options.clone();
     let initialize = server.request::<request::Initialize>(params);
     next_wire_id += 1;
     let initialized = tokio::select! {
@@ -2488,7 +2984,7 @@ impl SessionState {
                                 uri: (*uri).clone(),
                                 language_id,
                                 version,
-                                text: text.to_string(),
+                                text: text.wire_text(),
                             },
                         },
                     );
@@ -2799,7 +3295,7 @@ impl SessionState {
         let full_content = || lsp_types::TextDocumentContentChangeEvent {
             range: None,
             range_length: None,
-            text: change.full.to_string(),
+            text: change.full.wire_text(),
         };
         let content_changes = match self.sync.change {
             SyncKind::None => return,
@@ -3278,20 +3774,7 @@ fn expand_placeholder(body: &str, text: &mut String, stops: &mut Vec<LspSnippetS
 // Root discovery
 // ---------------------------------------------------------------------------
 
-/// Whether `candidate` is inside `worktree` after resolving symlinks.
-///
-/// Marker probing and file reads follow symlinks, so a lexical prefix test is
-/// not containment: `<worktree>/link/src` can resolve anywhere. Canonical
-/// paths are compared when both sides resolve; when either does not, the
-/// lexical test decides and the caller treats an unproven path as outside.
-fn contains_path(worktree: &Path, candidate: &Path) -> bool {
-    match (worktree.canonicalize(), candidate.canonicalize()) {
-        (Ok(root), Ok(inside)) => inside.starts_with(&root),
-        _ => candidate.starts_with(worktree),
-    }
-}
-
-/// As [`contains_path`], but an unresolvable path is never treated as inside.
+/// Canonical containment; an unresolvable path is never treated as inside.
 /// Used where being wrong means offering a writable editor for a file outside
 /// the worktree.
 fn contains_path_provably(worktree: &Path, candidate: &Path) -> bool {
@@ -3301,29 +3784,8 @@ fn contains_path_provably(worktree: &Path, candidate: &Path) -> bool {
     }
 }
 
-/// Nearest ancestor of `path` holding one of `markers`, never above
-/// `worktree`; the worktree root otherwise.
-fn discover_root(path: &Path, worktree: &Path, markers: &[String]) -> PathBuf {
-    if !markers.is_empty() {
-        let mut current = path.parent();
-        while let Some(directory) = current {
-            // Containment is checked against resolved paths, so a symlinked
-            // subdirectory cannot smuggle a root marker in from outside the
-            // worktree.
-            if !contains_path(worktree, directory) {
-                break;
-            }
-            if markers.iter().any(|marker| directory.join(marker).exists()) {
-                return directory.to_path_buf();
-            }
-            if directory == worktree {
-                break;
-            }
-            current = directory.parent();
-        }
-    }
-    worktree.to_path_buf()
-}
+#[cfg(test)]
+use discovery::{discover_root, workspace_manifest};
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -3335,8 +3797,27 @@ struct RetiringSession {
     process_group: Arc<PublishedGroup>,
 }
 
+#[derive(Default)]
+struct SessionActivity {
+    documents: HashSet<LspDocumentId>,
+    // Resource refreshes also need a routing identity after the final tab closes.
+    // The application refreshes global metrics before resolving that tab.
+    last_document: Option<LspDocumentId>,
+    // Monotonic ticks relative to the manager's epoch, convenient for fake-clock tests.
+    last_used: Duration,
+}
+
+impl SessionActivity {
+    fn idle_expired(&self, now: Duration, timeout: Duration) -> bool {
+        self.documents.is_empty() && now.saturating_sub(self.last_used) >= timeout
+    }
+}
+
 #[derive(Clone)]
 struct SessionHandle {
+    worktree: Arc<Path>,
+    activity: Arc<Mutex<SessionActivity>>,
+    resident_bytes: Arc<AtomicU64>,
     commands: commands::Sender,
     status: Arc<Mutex<LspStatus>>,
     completion_triggers: Arc<Mutex<Option<Vec<String>>>>,
@@ -3352,6 +3833,9 @@ struct SessionHandle {
 
 impl SessionHandle {
     fn status(&self) -> LspStatus {
+        if self.retired.load(Ordering::Acquire) {
+            return LspStatus::Disabled;
+        }
         self.status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3360,10 +3844,14 @@ impl SessionHandle {
 
     /// Stops using this session. The task keeps running until it has stopped
     /// its process; [`LspManager::wait_for_shutdown`] awaits that.
-    fn retire(&self) -> Option<RetiringSession> {
+    fn request_retirement(&self) {
         self.retired.store(true, Ordering::Release);
         self.retirement.notify_one();
         let _ = self.commands.send(SessionCommand::Shutdown);
+    }
+
+    fn retire(&self) -> Option<RetiringSession> {
+        self.request_retirement();
         self.task
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3372,6 +3860,33 @@ impl SessionHandle {
                 task,
                 process_group: Arc::clone(&self.process_group),
             })
+    }
+}
+
+/// Requests idle/deleted-root shutdown while leaving the join handle in its
+/// manager-owned slot. A concurrent application exit can still await it.
+async fn retire_from_watchdog(handle: SessionHandle) {
+    handle.request_retirement();
+    let deadline = tokio::time::Instant::now() + SESSION_REAP_TIMEOUT;
+    loop {
+        {
+            let task = handle
+                .task
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(task) = task.as_ref() else {
+                return;
+            }; // manager now owns the reap
+            if task.is_finished() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                handle.process_group.kill();
+                task.abort();
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -3401,6 +3916,55 @@ async fn reap_sessions(sessions: Vec<RetiringSession>) {
     }
 }
 
+/// Pre-effect authority for one worktree removal. Reusing the same path or
+/// document ID does not transfer this authority to a later registration.
+#[derive(Clone, Debug)]
+pub struct LspWorktreeRemoval {
+    manager: u64,
+    registrations: Vec<(LspDocumentId, Arc<RegistrationOwner>)>,
+    sessions: Vec<CapturedSession>,
+}
+
+#[derive(Debug, Default)]
+struct RegistrationOwner {
+    // Discovery can create its first session after removal was captured. Only
+    // a session actually created by this registration belongs to that capture;
+    // joining an already existing successor does not grant authority over it.
+    created_session: Mutex<Option<CapturedSession>>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedSession {
+    key: SessionKey,
+    retired: Arc<AtomicBool>,
+}
+
+struct PendingOpen {
+    path: PathBuf,
+    worktree: PathBuf,
+    language: LspLanguage,
+    version: i32,
+    text: Arc<Snapshot>,
+    saved_text: Option<String>,
+    unavailable_reason: Option<String>,
+    ticket: u64,
+    owner: Arc<RegistrationOwner>,
+    _discovery: Option<DiscoveryTask>,
+}
+
+/// Cancels both admission waiters and cooperative work when a registration ends.
+struct DiscoveryTask {
+    cancelled: Arc<AtomicBool>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for DiscoveryTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.task.abort();
+    }
+}
+
 #[derive(Clone)]
 struct DocumentRef {
     session: SessionKey,
@@ -3408,6 +3972,7 @@ struct DocumentRef {
     path: PathBuf,
     worktree: Arc<Path>,
     language: LspLanguage,
+    owner: Arc<RegistrationOwner>,
 }
 
 /// Hands every manager its own event-channel identity.
@@ -3419,8 +3984,42 @@ struct DocumentRef {
 /// distinguish it from the one it retired.
 static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Shares an outgoing manager's bounded reap without letting cancellation of
+/// any one new session cancel that reap or release other sessions early.
+struct LaunchBarrier {
+    predecessor: Mutex<Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    ready: AtomicBool,
+    changed: Notify,
+}
+impl LaunchBarrier {
+    async fn wait(self: Arc<Self>) {
+        let predecessor = {
+            self.predecessor
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        };
+        if let Some(predecessor) = predecessor {
+            let barrier = Arc::clone(&self);
+            tokio::spawn(async move {
+                predecessor.await;
+                barrier.ready.store(true, Ordering::Release);
+                barrier.changed.notify_waiters();
+            });
+        }
+        loop {
+            let changed = self.changed.notified();
+            if self.ready.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 /// The application's single LSP client.
 pub struct LspManager {
+    launch_barrier: Option<Arc<LaunchBarrier>>,
     servers: Vec<LanguageServerSettings>,
     /// Lowercase extension to the first server and language that claims it.
     extensions: HashMap<String, LspLanguage>,
@@ -3428,6 +4027,16 @@ pub struct LspManager {
     receiver: async_channel::Receiver<LspEvent>,
     sessions: HashMap<SessionKey, SessionHandle>,
     documents: HashMap<LspDocumentId, DocumentRef>,
+    pending_opens: HashMap<LspDocumentId, PendingOpen>,
+    next_discovery: u64,
+    discovery_slots: Arc<tokio::sync::Semaphore>,
+    discovery_admissions: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    discovery_enter: Option<Arc<dyn Fn() + Send + Sync>>,
+    idle_timeout: Duration,
+    session_cap: usize,
+    process_slots: Arc<tokio::sync::Semaphore>,
+    epoch: std::time::Instant,
     snapshots: Arc<SnapshotStore>,
     transport: TransportFactory,
     /// Sessions told to stop, awaited by [`LspManager::wait_for_shutdown`] or
@@ -3480,10 +4089,21 @@ impl LspManager {
             receiver: rx,
             sessions: HashMap::new(),
             documents: HashMap::new(),
+            pending_opens: HashMap::new(),
+            next_discovery: 1,
+            discovery_slots: discovery::worker_slots(),
+            discovery_admissions: discovery::admission_slots(),
+            #[cfg(test)]
+            discovery_enter: None,
+            idle_timeout: Duration::from_secs(600),
+            session_cap: 8,
+            process_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            epoch: std::time::Instant::now(),
             snapshots: Arc::new(SnapshotStore::default()),
             transport: Arc::new(spawn_process_transport),
             retiring: Vec::new(),
             flusher: None,
+            launch_barrier: None,
             next_request: 1,
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
             stopping: false,
@@ -3495,6 +4115,13 @@ impl LspManager {
     #[must_use]
     pub fn events(&self) -> async_channel::Receiver<LspEvent> {
         self.receiver.clone()
+    }
+
+    /// Validate status/progress immediately before applying it to a surface.
+    /// A queued value can outlive its server or the document binding it named.
+    #[must_use]
+    pub fn event_is_current(&self, event: &LspEvent) -> bool {
+        self.events.accepts(event)
     }
 
     /// Identity of the channel [`Self::events`] returns.
@@ -3535,6 +4162,215 @@ impl LspManager {
         version: i32,
         text: &str,
     ) -> LspStatus {
+        self.open_source(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::new(version, Arc::from(text))),
+        )
+    }
+
+    /// Registers an immutable editor source without serializing it on the UI
+    /// thread. The worker materializes it only when didOpen is sent.
+    pub fn open_snapshot(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: TextSnapshot,
+    ) -> LspStatus {
+        self.open_source(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::from_native(version, source)),
+        )
+    }
+
+    fn open_source(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: Arc<Snapshot>,
+    ) -> LspStatus {
+        if self.servers.is_empty() {
+            return LspStatus::Disabled;
+        }
+        if self.stopping {
+            return self.unavailable(
+                doc,
+                "the editor is shutting its language servers down".into(),
+            );
+        }
+        let Some(server) = self
+            .servers
+            .iter()
+            .find(|server| server.id == language.server_id)
+            .cloned()
+        else {
+            return self.unavailable(doc, "no configured server claims this language".into());
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return self.unavailable(
+                doc,
+                "no async runtime is available for language servers".into(),
+            );
+        };
+        self.close(doc);
+        let ticket = self.next_discovery;
+        self.next_discovery += 1;
+        // Bound queued work before creating a task; process slots separately
+        // bound blocking workers across manager replacement and cancellation.
+        let Ok(admission) = Arc::clone(&self.discovery_admissions).try_acquire_owned() else {
+            self.pending_opens.insert(
+                doc,
+                PendingOpen {
+                    path: path.to_owned(),
+                    worktree: worktree.to_owned(),
+                    language,
+                    version,
+                    text: source,
+                    saved_text: None,
+                    unavailable_reason: Some(discovery::BUSY_REASON.into()),
+                    ticket,
+                    owner: Arc::default(),
+                    _discovery: None,
+                },
+            );
+            return self.unavailable(doc, discovery::BUSY_REASON.into());
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_path = path.to_owned();
+        let worker_worktree = worktree.to_owned();
+        let markers = server.root_markers.clone();
+        let events = self.events.clone();
+        let slots = Arc::clone(&self.discovery_slots);
+        #[cfg(test)]
+        let discovery_enter = self.discovery_enter.clone();
+        let task = runtime.spawn(async move {
+            let _admission = admission;
+            let Ok(permit) = slots.acquire_owned().await else {
+                return;
+            };
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let active_cancelled = Arc::clone(&worker_cancelled);
+            let root = tokio::task::spawn_blocking(move || {
+                // A cancelled async waiter must not release an active worker's
+                // permit while its filesystem operation is still returning.
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(enter) = discovery_enter {
+                    enter();
+                }
+                discovery::discover(&worker_path, &worker_worktree, &markers, &active_cancelled)
+            })
+            .await;
+            if !worker_cancelled.load(Ordering::Acquire) {
+                if let Ok(Some(root)) = root {
+                    events
+                        .emit(LspEvent::RootDiscovered { doc, ticket, root })
+                        .await;
+                }
+            }
+        });
+        self.pending_opens.insert(
+            doc,
+            PendingOpen {
+                path: path.to_owned(),
+                worktree: worktree.to_owned(),
+                language,
+                version,
+                text: source,
+                saved_text: None,
+                unavailable_reason: None,
+                ticket,
+                owner: Arc::default(),
+                _discovery: Some(DiscoveryTask {
+                    cancelled,
+                    task: task.abort_handle(),
+                }),
+            },
+        );
+        LspStatus::Starting
+    }
+
+    /// Return the initial status to the caller synchronously. Publishing it
+    /// into the event queue could reorder it after a newer worker status.
+    pub fn finish_discovery(
+        &mut self,
+        doc: LspDocumentId,
+        ticket: u64,
+        root: PathBuf,
+    ) -> Option<LspStatus> {
+        if self
+            .pending_opens
+            .get(&doc)
+            .is_none_or(|pending| pending.ticket != ticket)
+        {
+            return None;
+        }
+        let pending = self.pending_opens.remove(&doc).expect("matched discovery");
+        let status = self.open_source_at_root(
+            doc,
+            &pending.path,
+            &pending.worktree,
+            pending.language,
+            pending.version,
+            pending.text,
+            root,
+            pending.owner,
+        );
+        if let Some(saved_text) = pending.saved_text {
+            self.save(doc, &saved_text);
+        }
+        Some(status)
+    }
+
+    fn open_at_root(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        text: &str,
+        root: PathBuf,
+    ) -> LspStatus {
+        self.open_source_at_root(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::new(version, Arc::from(text))),
+            root,
+            Arc::default(),
+        )
+    }
+
+    fn open_source_at_root(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: Arc<Snapshot>,
+        root: PathBuf,
+        owner: Arc<RegistrationOwner>,
+    ) -> LspStatus {
         if self.servers.is_empty() {
             return LspStatus::Disabled;
         }
@@ -3568,24 +4404,87 @@ impl LspManager {
             );
         };
 
-        let root = discover_root(path, worktree, &server.root_markers);
+        // Discovery establishes project membership. An ancestor's live server
+        // is not authority to absorb an independent nested project.
         let key = SessionKey {
             server_id: Arc::from(server.id.as_str()),
             root: Arc::from(root.clone()),
         };
-        let handle = match self.ensure_session(&key, &server, &root) {
-            Ok(handle) => handle,
-            Err(reason) => return self.unavailable(doc, reason),
-        };
+        // URI ownership is singular even when discovery legitimately selects
+        // a different bounded workspace for a second editor of the same file.
+        // Refuse before starting a backend or changing the original stream.
+        if self.snapshots.bound_to_other_session(&uri, &key) {
+            let reason = "This file is already open under another language-server workspace. Close its original editor before retrying.".to_owned();
+            // Keep this registration independently retryable without joining
+            // the original URI stream. A new ticket also rejects any queued
+            // duplicate of the discovery that just refused admission.
+            let ticket = self.next_discovery;
+            self.next_discovery += 1;
+            self.pending_opens.insert(
+                doc,
+                PendingOpen {
+                    path: path.to_owned(),
+                    worktree: worktree.to_owned(),
+                    language,
+                    version,
+                    text: source,
+                    saved_text: None,
+                    unavailable_reason: Some(reason.clone()),
+                    ticket,
+                    owner,
+                    _discovery: None,
+                },
+            );
+            return self.unavailable(doc, reason);
+        }
+        // Keep a refused document registered so Restart can retry admission
+        // after another workspace becomes idle, with its latest buffer text.
+        // Ensure first: reopening previously blocked documents must not also
+        // reopen this new registration.
+        let prior_session = self
+            .sessions
+            .get(&key)
+            .map(|handle| Arc::clone(&handle.retired));
+        let handle = self.ensure_session(&key, &server, &root, worktree);
+        if let Ok(handle) = &handle {
+            if prior_session
+                .as_ref()
+                .is_none_or(|prior| !Arc::ptr_eq(prior, &handle.retired))
+            {
+                *owner
+                    .created_session
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(CapturedSession {
+                    key: key.clone(),
+                    retired: Arc::clone(&handle.retired),
+                });
+            }
+        }
 
         let uri = Arc::new(uri);
         let worktree: Arc<Path> = Arc::from(worktree.to_path_buf());
         let Some(snapshot) = self
             .snapshots
-            .register(doc, &uri, &key, version, Arc::from(text))
+            .register_source(doc, &uri, &key, version, source)
         else {
             return self.unavailable(doc, LspError::VersionExhausted.to_string());
         };
+        self.documents.insert(
+            doc,
+            DocumentRef {
+                session: key,
+                uri: Arc::clone(&uri),
+                path: path.to_path_buf(),
+                worktree,
+                language: language.clone(),
+                owner,
+            },
+        );
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(reason) => return self.unavailable(doc, reason),
+        };
+        self.events.bind(doc, Some(Arc::clone(&handle.retired)));
         // Sent unconditionally: the session decides whether this is the URI's
         // first `didOpen` or a full resynchronisation of an already open file.
         let _ = handle.commands.send(SessionCommand::Open {
@@ -3593,18 +4492,17 @@ impl LspManager {
             uri: Arc::clone(&uri),
             language_id: language.language_id.clone(),
             version: snapshot.version,
-            text: Arc::clone(&snapshot.text),
+            text: Arc::clone(&snapshot),
         });
-        self.documents.insert(
-            doc,
-            DocumentRef {
-                session: key,
-                uri,
-                path: path.to_path_buf(),
-                worktree,
-                language,
-            },
-        );
+        {
+            let mut activity = handle
+                .activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            activity.documents.insert(doc);
+            activity.last_document = Some(doc);
+            activity.last_used = self.epoch.elapsed();
+        }
         handle.status()
     }
 
@@ -3618,6 +4516,11 @@ impl LspManager {
         edits: &[LspTextEdit],
         full_text: &str,
     ) {
+        if let Some(pending) = self.pending_opens.get_mut(&doc) {
+            pending.version = version;
+            pending.text = Arc::new(Snapshot::new(version, Arc::from(full_text)));
+            return;
+        }
         let Some(reference) = self.documents.get(&doc).cloned() else {
             self.events.emit_now(LspEvent::RequestFailed {
                 request: LspRequestId(0),
@@ -3644,7 +4547,7 @@ impl LspManager {
             };
         let mut incremental = None;
         if !edits.is_empty() {
-            match build_incremental(&previous, edits, &snapshot.text) {
+            match build_incremental(&previous, edits, snapshot.full_text()) {
                 Ok(changes) => incremental = Some(changes),
                 Err(error) => {
                     // The buffer is authoritative and already recorded; the
@@ -3662,13 +4565,75 @@ impl LspManager {
                 uri: Arc::clone(&reference.uri),
                 version: snapshot.version,
                 incremental,
-                full: Arc::clone(&snapshot.text),
+                full: Arc::clone(&snapshot),
+            });
+        }
+    }
+
+    /// Records a transition produced by the native recorded-edit layer.
+    /// Its immutable source remains lazy for incremental synchronization.
+    pub fn change_snapshot(
+        &mut self,
+        doc: LspDocumentId,
+        version: i32,
+        edits: &[LspTextEdit],
+        source: TextSnapshot,
+    ) {
+        if let Some(pending) = self.pending_opens.get_mut(&doc) {
+            pending.version = version;
+            pending.text = Arc::new(Snapshot::from_native(version, source));
+            return;
+        }
+        let Some(reference) = self.documents.get(&doc).cloned() else {
+            return;
+        };
+        let (previous, snapshot) =
+            match self
+                .snapshots
+                .record_native(&reference.uri, version, source)
+            {
+                RecordOutcome::Recorded { previous, snapshot } => (previous, snapshot),
+                RecordOutcome::UnknownUri => return,
+                RecordOutcome::VersionExhausted => {
+                    self.events.emit_now(LspEvent::DocumentDesynced {
+                        doc,
+                        version: i32::MAX,
+                        error: LspError::VersionExhausted,
+                    });
+                    return;
+                }
+            };
+        let incremental = if previous.compatible_native().is_some() && !edits.is_empty() {
+            snapshot.compatible_native().and_then(|expected| {
+                let changes = native_incremental(&previous, edits, expected);
+                if changes.is_none() {
+                    self.events.emit_now(LspEvent::DocumentDesynced {
+                        doc,
+                        version: snapshot.version,
+                        error: LspError::InconsistentEdits,
+                    });
+                }
+                changes
+            })
+        } else {
+            None
+        };
+        if let Some(session) = self.sessions.get(&reference.session) {
+            let _ = session.commands.send(SessionCommand::Change {
+                uri: Arc::clone(&reference.uri),
+                version: snapshot.version,
+                incremental,
+                full: snapshot,
             });
         }
     }
 
     /// Reports that the document was written to disk.
     pub fn save(&mut self, doc: LspDocumentId, text: &str) {
+        if let Some(pending) = self.pending_opens.get_mut(&doc) {
+            pending.saved_text = Some(text.to_owned());
+            return;
+        }
         let Some(reference) = self.documents.get(&doc) else {
             return;
         };
@@ -3680,22 +4645,173 @@ impl LspManager {
         }
     }
 
-    /// Unregisters the document. The session stays warm for other tabs,
-    /// because restarting a language server is expensive.
+    /// Unregisters the document and arms a bounded warm-cache period after
+    /// its final tab closes.
     pub fn close(&mut self, doc: LspDocumentId) {
+        self.pending_opens.remove(&doc);
+        // Queued discoveries can also have staged events.
+        self.events.forget(doc);
         let Some(reference) = self.documents.remove(&doc) else {
             return;
         };
         self.snapshots.unregister(doc);
-        // Nothing staged for a closed document can still be useful, and
-        // keeping it would let a churn of documents grow the backlog.
-        self.events.forget(doc);
         if let Some(session) = self.sessions.get(&reference.session) {
             let _ = session.commands.send(SessionCommand::Close {
                 doc,
                 uri: reference.uri,
             });
+            let last_used = self.epoch.elapsed();
+            let mut activity = session
+                .activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            activity.documents.remove(&doc);
+            activity.last_used = last_used;
         }
+    }
+
+    /// Limits apply to future admissions; busy sessions are never evicted.
+    #[must_use]
+    pub fn with_lifecycle(mut self, idle_seconds: u64, session_cap: usize) -> Self {
+        self.idle_timeout = Duration::from_secs(idle_seconds.clamp(1, 604800));
+        self.session_cap = session_cap.clamp(1, 64);
+        self.process_slots = Arc::new(tokio::sync::Semaphore::new(self.session_cap));
+        self
+    }
+
+    /// Delays new processes until a replaced manager has reaped its servers.
+    /// Configuration changes remain asynchronous while preserving the cap
+    /// across the old and new managers' independent admission semaphores.
+    #[must_use]
+    pub fn after_shutdown(
+        mut self,
+        predecessor: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        self.launch_barrier = Some(Arc::new(LaunchBarrier {
+            predecessor: Mutex::new(Some(Box::pin(predecessor))),
+            ready: AtomicBool::new(false),
+            changed: Notify::new(),
+        }));
+        self
+    }
+
+    /// Cached server RSS; reading this performs no filesystem I/O.
+    pub fn live_servers(&self) -> Vec<String> {
+        let mut servers: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, handle)| {
+                !handle.retired.load(Ordering::Acquire) && !handle.commands.is_closed()
+            })
+            .map(|(key, handle)| {
+                let rss = handle.resident_bytes.load(Ordering::Relaxed);
+                let memory = if rss == 0 {
+                    "RSS pending".to_owned()
+                } else {
+                    format!("{:.1} MiB RSS", rss as f64 / (1024.0 * 1024.0))
+                };
+                format!("{} · {} · {}", key.server_id, key.root.display(), memory)
+            })
+            .collect();
+        servers.sort();
+        servers
+    }
+
+    pub fn lifecycle(&self) -> (u64, usize) {
+        (self.idle_timeout.as_secs(), self.session_cap)
+    }
+
+    /// Capture before starting removal, while the original registrations and
+    /// sessions still own the target. Retain this token until that operation's
+    /// known successful completion; dropping it has no effect.
+    pub fn capture_worktree_removal(&self, worktree: &Path) -> LspWorktreeRemoval {
+        let registrations = self
+            .documents
+            .iter()
+            .filter(|(_, reference)| reference.worktree.as_ref() == worktree)
+            .map(|(doc, reference)| (*doc, Arc::clone(&reference.owner)))
+            .chain(
+                self.pending_opens
+                    .iter()
+                    .filter(|(_, pending)| pending.worktree == worktree)
+                    .map(|(doc, pending)| (*doc, Arc::clone(&pending.owner))),
+            )
+            .collect();
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, handle)| handle.worktree.as_ref() == worktree)
+            .map(|(key, handle)| CapturedSession {
+                key: key.clone(),
+                retired: Arc::clone(&handle.retired),
+            })
+            .collect();
+        LspWorktreeRemoval {
+            manager: self.generation,
+            registrations,
+            sessions,
+        }
+    }
+
+    /// Retire only owners captured for the successful removal. An old result
+    /// cannot close a replacement manager, registration, or same-key session.
+    /// Surviving registrations that joined an original session are reopened
+    /// with their latest immutable buffer after that old session retires.
+    /// Returns the exact IDs closed, including still-pending registrations, so
+    /// retained editor buffers can clear only their matching LSP attachment.
+    pub fn remove_captured_worktree(&mut self, removal: LspWorktreeRemoval) -> Vec<LspDocumentId> {
+        if removal.manager != self.generation {
+            return Vec::new();
+        }
+        let mut closed = Vec::new();
+        let mut sessions = removal.sessions;
+        for (doc, owner) in removal.registrations {
+            if let Some(created) = owner
+                .created_session
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+            {
+                sessions.push(created);
+            }
+            let matches = self
+                .documents
+                .get(&doc)
+                .is_some_and(|reference| Arc::ptr_eq(&reference.owner, &owner))
+                || self
+                    .pending_opens
+                    .get(&doc)
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &owner));
+            if matches {
+                self.close(doc);
+                closed.push(doc);
+            }
+        }
+        let mut reopen = Vec::new();
+        for captured in sessions {
+            if self
+                .sessions
+                .get(&captured.key)
+                .is_some_and(|current| Arc::ptr_eq(&current.retired, &captured.retired))
+            {
+                if let Some(handle) = self.sessions.remove(&captured.key) {
+                    self.retire_handle(handle);
+                    reopen.push(captured.key);
+                }
+            }
+        }
+        for key in reopen {
+            self.reopen_documents(&key);
+        }
+        closed
+    }
+
+    /// Immediate removal for callers that already hold current ownership.
+    /// Asynchronous operations must capture before their effect and complete
+    /// with `remove_captured_worktree`, rather than recapturing by path later.
+    pub fn remove_worktree(&mut self, worktree: &Path) {
+        let removal = self.capture_worktree_removal(worktree);
+        let _ = self.remove_captured_worktree(removal);
     }
 
     pub fn request_completion(&mut self, doc: LspDocumentId, at: LspPosition) -> LspRequestId {
@@ -3747,6 +4863,14 @@ impl LspManager {
     /// Current status of the session backing `doc`.
     #[must_use]
     pub fn status(&self, doc: LspDocumentId) -> LspStatus {
+        if let Some(pending) = self.pending_opens.get(&doc) {
+            return pending
+                .unavailable_reason
+                .as_ref()
+                .map_or(LspStatus::Starting, |reason| LspStatus::Unavailable {
+                    reason: reason.clone(),
+                });
+        }
         let Some(reference) = self.documents.get(&doc) else {
             return LspStatus::Disabled;
         };
@@ -3765,6 +4889,9 @@ impl LspManager {
     /// falls silently behind and starts rejecting live results as stale.
     #[must_use]
     pub fn document_version(&self, doc: LspDocumentId) -> Option<i32> {
+        if let Some(pending) = self.pending_opens.get(&doc) {
+            return Some(pending.version);
+        }
         let reference = self.documents.get(&doc)?;
         Some(self.snapshots.latest(&reference.uri)?.version)
     }
@@ -3783,6 +4910,11 @@ impl LspManager {
         doc: LspDocumentId,
         at: LspPosition,
     ) -> Result<LspPosition, LspError> {
+        if let Some(pending) = self.pending_opens.get(&doc) {
+            return pending
+                .text
+                .from_utf16(lsp_types::Position::new(at.line, at.character));
+        }
         let reference = self
             .documents
             .get(&doc)
@@ -3801,14 +4933,29 @@ impl LspManager {
     /// schedule; it is marked retired first, so nothing it still publishes
     /// can reach the documents its replacement now owns.
     pub fn restart(&mut self, doc: LspDocumentId) {
+        if let Some(pending) = self.pending_opens.remove(&doc) {
+            // Admission refusal still owns a document and its newest immutable
+            // source. Retry through the same asynchronous path as an open.
+            drop(pending._discovery);
+            self.open_source(
+                doc,
+                &pending.path,
+                &pending.worktree,
+                pending.language,
+                pending.version,
+                pending.text,
+            );
+            if let Some(text) = pending.saved_text {
+                self.save(doc, &text);
+            }
+            return;
+        }
         let Some(reference) = self.documents.get(&doc).cloned() else {
             return;
         };
         let key = reference.session;
         if let Some(previous) = self.sessions.remove(&key) {
-            if let Some(retiring) = previous.retire() {
-                self.retiring.push(retiring);
-            }
+            self.retire_handle(previous);
         }
         self.reopen_documents(&key);
     }
@@ -3833,6 +4980,7 @@ impl LspManager {
         }
         self.sessions.clear();
         self.documents.clear();
+        self.pending_opens.clear();
         self.snapshots.clear();
         self.events.pending.closed.store(true, Ordering::Release);
         self.events.pending.notify.notify_one();
@@ -3856,6 +5004,7 @@ impl LspManager {
     /// its child cannot be signalled twice and a reused pid cannot be
     /// signalled at all.
     pub fn kill_retired_now(&mut self) {
+        self.collect_retired_sessions();
         for session in std::mem::take(&mut self.retiring) {
             session.process_group.kill();
             session.task.abort();
@@ -3875,6 +5024,10 @@ impl LspManager {
     ///
     /// Bounded by [`SESSION_REAP_TIMEOUT`]; see [`reap_sessions`].
     pub async fn wait_for_shutdown(&mut self) {
+        if let Some(barrier) = self.launch_barrier.clone() {
+            barrier.wait().await;
+        }
+        self.collect_retired_sessions();
         reap_sessions(std::mem::take(&mut self.retiring)).await;
         if let Some(flusher) = self.flusher.take() {
             flusher.abort();
@@ -3894,6 +5047,7 @@ impl LspManager {
     pub fn begin_shutdown(&mut self) -> impl Future<Output = ()> + Send + 'static {
         self.shutdown();
         let sessions = std::mem::take(&mut self.retiring);
+        let launch_barrier = self.launch_barrier.clone();
         if let Some(flusher) = self.flusher.take() {
             flusher.abort();
         }
@@ -3905,6 +5059,9 @@ impl LspManager {
             Err(_) => Err(sessions),
         };
         async move {
+            if let Some(barrier) = launch_barrier {
+                barrier.wait().await;
+            }
             match reaper {
                 Ok(reaper) => {
                     let _ = reaper.await;
@@ -3957,11 +5114,43 @@ impl LspManager {
 
     fn unavailable(&self, doc: LspDocumentId, reason: String) -> LspStatus {
         let status = LspStatus::Unavailable { reason };
+        let delivery = self.events.bind(doc, None);
         self.events.emit_now(LspEvent::Status {
             doc,
             status: status.clone(),
+            delivery,
         });
         status
+    }
+
+    fn collect_retired_sessions(&mut self) {
+        let keys: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, handle)| handle.retired.load(Ordering::Acquire))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            if let Some(handle) = self.sessions.remove(&key) {
+                if let Some(retiring) = handle.retire() {
+                    self.retiring.push(retiring);
+                }
+            }
+        }
+    }
+
+    fn retire_handle(&mut self, handle: SessionHandle) {
+        if let Some(retiring) = handle.retire() {
+            let process_group = Arc::clone(&retiring.process_group);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                self.retiring.push(RetiringSession {
+                    task: runtime.spawn(reap_sessions(vec![retiring])),
+                    process_group,
+                });
+            } else {
+                retiring.process_group.kill();
+            }
+        }
     }
 
     /// Returns the session for `key`, starting one if necessary.
@@ -3982,22 +5171,64 @@ impl LspManager {
         &mut self,
         key: &SessionKey,
         server: &LanguageServerSettings,
-        root: &Path,
+        _root: &Path,
+        worktree: &Path,
     ) -> Result<SessionHandle, String> {
         if self.stopping {
             return Err("the editor is shutting its language servers down".to_owned());
         }
-        let mut orphaned = false;
+        let mut orphaned = !self.snapshots.docs_for_session(key).is_empty();
         if let Some(existing) = self.sessions.get(key) {
-            if !existing.commands.is_closed() {
+            let mut activity = existing
+                .activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !existing.commands.is_closed() && !existing.retired.load(Ordering::Acquire) {
+                // Fence the idle worker before joining this server. It holds
+                // the same lock while publishing retirement.
+                activity.last_used = self.epoch.elapsed();
                 return Ok(existing.clone());
             }
+            drop(activity);
             if let Some(dead) = self.sessions.remove(key) {
-                if let Some(retiring) = dead.retire() {
-                    self.retiring.push(retiring);
-                }
+                self.retire_handle(dead);
             }
             orphaned = true;
+        }
+        // Idle LRU entries are the only legal victims. If every slot is busy,
+        // refuse admission visibly instead of killing an actively edited server.
+        while self
+            .sessions
+            .values()
+            .filter(|handle| !handle.retired.load(Ordering::Acquire))
+            .count()
+            >= self.session_cap
+        {
+            let victim = self
+                .sessions
+                .iter()
+                .filter(|(_, handle)| !handle.retired.load(Ordering::Acquire))
+                .filter_map(|(key, handle)| {
+                    let activity = handle
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    activity
+                        .documents
+                        .is_empty()
+                        .then(|| (key.clone(), activity.last_used))
+                })
+                .min_by_key(|(_, last_used)| *last_used)
+                .map(|(key, _)| key);
+            let Some(victim) = victim else {
+                return Err(format!(
+                    "language server limit ({}) reached; close a document or raise lsp_max_sessions",
+                    self.session_cap
+                ));
+            };
+            if let Some(handle) = self.sessions.remove(&victim) {
+                self.retire_handle(handle);
+            }
         }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "no async runtime is available for language servers".to_owned())?;
@@ -4009,6 +5240,9 @@ impl LspManager {
         }
         let (tx, rx) = commands::channel();
         let handle = SessionHandle {
+            worktree: Arc::from(worktree.to_path_buf()),
+            activity: Arc::new(Mutex::new(SessionActivity::default())),
+            resident_bytes: Arc::new(AtomicU64::new(0)),
             commands: tx,
             status: Arc::new(Mutex::new(LspStatus::Starting)),
             completion_triggers: Arc::new(Mutex::new(None)),
@@ -4020,8 +5254,9 @@ impl LspManager {
         let context = SessionContext {
             key: key.clone(),
             launch: LaunchSpec {
+                initialization_options: server.initialization_options.clone(),
                 command: server.command.clone(),
-                root: root.to_path_buf(),
+                root: key.root.to_path_buf(),
             },
             transport: Arc::clone(&self.transport),
             snapshots: Arc::clone(&self.snapshots),
@@ -4033,11 +5268,139 @@ impl LspManager {
             process_group: Arc::clone(&handle.process_group),
             stderr: Arc::new(StderrTail::default()),
         };
+        let process_slots = Arc::clone(&self.process_slots);
+        let launch_barrier = self.launch_barrier.clone();
+        let root_identity = Arc::new(Mutex::new(None));
+        let launched_root_identity = Arc::clone(&root_identity);
         *handle
             .task
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(runtime.spawn(run_session(context, rx)));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.spawn(async move {
+            if let Some(barrier) = launch_barrier {
+                barrier.wait().await;
+            }
+            // A replacement waits until an evicted process is fully reaped,
+            // so graceful shutdown cannot temporarily exceed the cap.
+            let Ok(_slot) = process_slots.acquire_owned().await else {
+                return;
+            };
+            if !context.retired.load(Ordering::Acquire) {
+                let (directory_pin, identity) = match pin_session_root(&context.launch.root).await {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        context
+                            .set_status(LspStatus::Unavailable {
+                                reason: format!("cannot retain language server root: {error}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                *launched_root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(identity);
+                run_session(context, rx).await;
+                // Prevent inode reuse until protocol teardown has reaped the
+                // process; the watchdog's identity comparison stays exact.
+                drop(directory_pin);
+            }
+        }));
+        let watched = handle.clone();
+        let watched_root = key.root.to_path_buf();
+        let events = self.events.clone();
+        let epoch = self.epoch;
+        let idle_timeout = self.idle_timeout;
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(idle_timeout.min(Duration::from_secs(5))).await;
+                let expired = {
+                    let activity = watched
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let expired = activity.idle_expired(epoch.elapsed(), idle_timeout);
+                    if expired {
+                        watched.request_retirement();
+                    }
+                    expired
+                };
+                if expired {
+                    let doc = watched
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .last_document;
+                    retire_from_watchdog(watched).await;
+                    if let Some(doc) = doc {
+                        events.emit_now(LspEvent::Resources { doc });
+                    }
+                    break;
+                }
+                if watched.retired.load(Ordering::Acquire) || watched.commands.is_closed() {
+                    break;
+                }
+                // Also catches external rename/remove followed by recreation
+                // at the same spelling before this poll. The original inode
+                // remains pinned until the server finishes teardown.
+                let root_metadata = tokio::fs::metadata(&watched_root).await;
+                let original = *root_identity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let root_changed = match root_metadata {
+                    Ok(metadata) => original
+                        .is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                };
+                if root_changed {
+                    let doc = watched
+                        .activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .last_document;
+                    retire_from_watchdog(watched).await;
+                    // Refresh cached inspector metrics even when this was the
+                    // final server, so no other watchdog remains to refresh it.
+                    if let Some(doc) = doc {
+                        events.emit_now(LspEvent::Resources { doc });
+                    }
+                    break;
+                }
+                let pid = {
+                    let group = watched
+                        .process_group
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match *group {
+                        GroupPublication::Live(pid) => Some(pid),
+                        _ => None,
+                    }
+                };
+                if let Some(pid) = pid {
+                    if let Ok(status) =
+                        tokio::fs::read_to_string(format!("/proc/{pid}/status")).await
+                    {
+                        let rss = status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("VmRSS:"))
+                            .and_then(|value| value.split_whitespace().next())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0)
+                            * 1024;
+                        watched.resident_bytes.store(rss, Ordering::Relaxed);
+                    }
+                }
+                let doc = watched
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .last_document;
+                // One wake per server refresh, independent of its tab count.
+                if let Some(doc) = doc {
+                    events.emit_now(LspEvent::Resources { doc });
+                }
+            }
+        });
         self.sessions.insert(key.clone(), handle.clone());
         if orphaned {
             self.reopen_documents(key);
@@ -4048,7 +5411,7 @@ impl LspManager {
     /// Re-sends `didOpen` for every document bound to `key`, carrying the
     /// current buffer text under a fresh version.
     fn reopen_documents(&mut self, key: &SessionKey) {
-        let mut targets: Vec<(LspDocumentId, DocumentRef, i32, Arc<str>)> = Vec::new();
+        let mut targets: Vec<(LspDocumentId, DocumentRef, i32, Arc<Snapshot>)> = Vec::new();
         for candidate in self.snapshots.docs_for_session(key) {
             let Some(document) = self.documents.get(&candidate).cloned() else {
                 continue;
@@ -4060,7 +5423,7 @@ impl LspManager {
                 candidate,
                 document,
                 snapshot.version.saturating_add(1),
-                Arc::clone(&snapshot.text),
+                Arc::clone(&snapshot),
             ));
         }
         for (candidate, ..) in &targets {
@@ -4068,15 +5431,44 @@ impl LspManager {
             self.documents.remove(candidate);
         }
         for (candidate, document, version, text) in targets {
-            let _ = self.open(
+            let _ = self.open_source_at_root(
                 candidate,
                 &document.path,
                 &document.worktree,
                 document.language,
                 version,
-                &text,
+                text,
+                key.root.to_path_buf(),
+                Arc::default(),
             );
         }
+    }
+
+    #[cfg(test)]
+    fn open_for_test(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        text: &str,
+    ) -> LspStatus {
+        let markers = self
+            .servers
+            .iter()
+            .find(|server| server.id == language.server_id)
+            .map(|server| server.root_markers.clone())
+            .unwrap_or_default();
+        self.open_at_root(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            text,
+            discover_root(path, worktree, &markers),
+        )
     }
 
     /// Replaces the process launcher. Tests inject in-process duplex
@@ -4113,7 +5505,7 @@ impl std::fmt::Debug for LspManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::sync::atomic::AtomicUsize;
@@ -4168,6 +5560,7 @@ mod tests {
 
     fn server(id: &str, extensions: &[&str], markers: &[&str]) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: vec![crate::settings::LanguageServerLanguage {
                 language_id: id.to_owned(),
@@ -4442,10 +5835,73 @@ mod tests {
 
     async fn await_ready(events: &async_channel::Receiver<LspEvent>, doc: LspDocumentId) {
         next_matching(events, |event| match event {
-            LspEvent::Status { doc: at, status } if *at == doc && status.is_ready() => Some(()),
+            LspEvent::Status {
+                doc: at, status, ..
+            } if *at == doc && status.is_ready() => Some(()),
             _ => None,
         })
         .await;
+    }
+
+    /// Multiple opens may initialise in either order. Waiting for one document
+    /// at a time would consume and discard another document's Ready event.
+    async fn await_ready_documents(
+        events: &async_channel::Receiver<LspEvent>,
+        documents: &[LspDocumentId],
+    ) {
+        let mut pending: HashSet<_> = documents.iter().copied().collect();
+        assert!(!pending.is_empty(), "expected documents to become ready");
+        next_matching(events, |event| {
+            if let LspEvent::Status { doc, status, .. } = event
+                && status.is_ready()
+            {
+                pending.remove(doc);
+                if pending.is_empty() {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
+    }
+
+    #[test]
+    fn concurrent_readiness_wait_retains_reverse_order_and_ignores_unrelated_events() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let source = manager.events();
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            let three = LspDocumentId(3);
+            for doc in [one, two, three] {
+                manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "text");
+            }
+            let _handle = handle_of(&slot).await;
+            let mut ready = HashMap::new();
+            while ready.len() < 3 {
+                let event = next_matching(&source, |event| match event {
+                    LspEvent::Status {
+                        status: LspStatus::Ready,
+                        ..
+                    } => Some(event.clone()),
+                    _ => None,
+                })
+                .await;
+                ready.insert(event_doc(&event).unwrap(), event);
+            }
+            let (sender, events) = async_channel::bounded(8);
+            for doc in [two, three, two, one] {
+                sender.try_send(ready[&doc].clone()).unwrap();
+            }
+            // The actual producer's values are reordered, not reminted with
+            // an unfenced default. The old sequential waiter still fails.
+            drop(sender);
+            await_ready_documents(&events, &[one, two]).await;
+            assert!(events.is_empty());
+            manager.begin_shutdown().await;
+        });
     }
 
     fn full_sync_capabilities() -> Value {
@@ -4462,9 +5918,15 @@ mod tests {
         json!({ "textDocumentSync": { "openClose": true, "change": 2, "save": true } })
     }
 
+    /// Positive fixture roots must match discovery's canonical session keys.
+    pub(super) fn canonical_tempdir() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().expect("temp parent");
+        tempfile::tempdir_in(parent).expect("tempdir")
+    }
+
     /// A worktree with a root marker and one Rust file.
     fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path().to_path_buf();
         std::fs::write(worktree.join("Cargo.toml"), "[package]\n").expect("marker");
         let file = worktree.join("main.rs");
@@ -4481,6 +5943,1950 @@ mod tests {
             server_id: "rust-analyzer".to_owned(),
             language_id: "rust-analyzer".to_owned(),
         }
+    }
+
+    /// A real manager binding and in-process LSP wire for UI progress tests.
+    pub(crate) struct ProgressFixture {
+        pub(crate) doc: LspDocumentId,
+        pub(crate) ready: LspEvent,
+        handle: FakeHandle,
+        events: async_channel::Receiver<LspEvent>,
+        _root: tempfile::TempDir,
+    }
+
+    pub(crate) async fn progress_fixture() -> (LspManager, ProgressFixture) {
+        let (root, worktree, file) = workspace();
+        let mut manager = rust_manager();
+        let doc = LspDocumentId(1);
+        let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+        let events = manager.events();
+        manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc");
+        let handle = handle_of(&slot).await;
+        let ready = next_matching(&events, |event| match event {
+            LspEvent::Status {
+                status: LspStatus::Ready,
+                ..
+            } => Some(event.clone()),
+            _ => None,
+        })
+        .await;
+        (
+            manager,
+            ProgressFixture {
+                doc,
+                ready,
+                handle,
+                events,
+                _root: root,
+            },
+        )
+    }
+
+    impl ProgressFixture {
+        pub(crate) async fn publish(&self, progress: LspProgress) -> LspEvent {
+            let value = if progress.done {
+                json!({"kind":"end", "message":progress.message})
+            } else {
+                json!({"kind":"begin", "title":progress.title.unwrap_or_default(),
+                    "message":progress.message, "percentage":progress.percentage})
+            };
+            self.handle
+                .notify("$/progress", json!({"token":progress.token, "value":value}));
+            next_matching(&self.events, |event| match event {
+                LspEvent::Progress { .. } => Some(event.clone()),
+                _ => None,
+            })
+            .await
+        }
+    }
+
+    #[test]
+    fn queued_status_and_progress_cannot_cross_a_session_restart() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let doc = LspDocumentId(1);
+            let events = manager.events();
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc");
+            let old_handle = handle_of(&slot).await;
+            let old_ready = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Ready,
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            old_handle.notify(
+                "$/progress",
+                json!({"token":"old", "value":{
+                "kind":"begin", "title":"Old indexing"}}),
+            );
+            let old_progress = next_matching(&events, |event| match event {
+                LspEvent::Progress { .. } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            old_handle.write_raw(b"Content-Length: invalid\r\n\r\n".to_vec());
+            let old_failed = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Failed { .. },
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+
+            // Withhold replacement initialization: a stale Ready must not
+            // masquerade as readiness while the genuine new server starts.
+            let replacement = Arc::new(Mutex::new(None));
+            let output = Arc::clone(&replacement);
+            manager.set_transport(Arc::new(move |_| {
+                let (transport, handle) = fake_transport(|incoming| {
+                    if incoming.method == "shutdown" {
+                        vec![json!({"jsonrpc":"2.0", "id":incoming.id, "result":null})]
+                    } else {
+                        Vec::new()
+                    }
+                });
+                *output.lock().unwrap() = Some(handle);
+                Ok(transport)
+            }));
+            manager.restart(doc);
+            let new_handle = handle_of(&replacement).await;
+            let initialize = new_handle.wait_for("initialize").await;
+            let mut displayed = manager.status(doc);
+            assert_eq!(displayed, LspStatus::Starting);
+            for event in [old_ready, old_failed, old_progress] {
+                assert!(!manager.event_is_current(&event));
+                if manager.event_is_current(&event) {
+                    if let LspEvent::Status { status, .. } = event {
+                        displayed = status;
+                    }
+                }
+                assert_eq!(displayed, LspStatus::Starting);
+            }
+            new_handle
+                .push
+                .send(Outgoing::Message(json!({"jsonrpc":"2.0",
+                "id":initialize.id, "result":{"capabilities":incremental_capabilities()}})))
+                .unwrap();
+            let ready = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Ready,
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            assert!(manager.event_is_current(&ready));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn unbacked_refusal_survives_delivery_but_not_close_or_rebinding() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut manager = rust_manager();
+        let doc = LspDocumentId(1);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff.rs".to_vec()));
+        let status =
+            manager.open_for_test(doc, &path, Path::new("/fixture"), rust_language(), 1, "");
+        assert!(matches!(status, LspStatus::Unavailable { .. }));
+        assert_eq!(manager.status(doc), LspStatus::Disabled);
+        let event = manager.events().try_recv().unwrap();
+        assert!(
+            matches!(&event, LspEvent::Status { status: delivered, .. } if *delivered == status)
+        );
+        assert!(manager.event_is_current(&event));
+        manager.close(doc);
+        assert!(!manager.event_is_current(&event));
+        manager.open_for_test(doc, &path, Path::new("/fixture"), rust_language(), 1, "");
+        let rebound = manager.events().try_recv().unwrap();
+        assert!(manager.event_is_current(&rebound));
+        assert!(!manager.event_is_current(&event));
+    }
+
+    #[test]
+    fn stale_producers_cannot_displace_current_staged_status_or_progress() {
+        use std::os::unix::ffi::OsStringExt;
+        block_on(async {
+            let (manager, fixture) = progress_fixture().await;
+            let mut manager = manager;
+            let old_progress = fixture
+                .publish(LspProgress {
+                    token: "old".into(),
+                    title: Some("Old".into()),
+                    message: None,
+                    percentage: None,
+                    done: false,
+                })
+                .await;
+            let doc = fixture.doc;
+            let old_ready = fixture.ready.clone();
+            // A genuine URI refusal supersedes this doc without retiring the
+            // shared backend. Fill the channel to exercise actual staging.
+            let peer = LspDocumentId(2);
+            let reference = manager.documents[&doc].clone();
+            manager.open_for_test(
+                peer,
+                &reference.path,
+                &reference.worktree,
+                reference.language.clone(),
+                1,
+                "abc",
+            );
+            let backend = manager.sessions[&reference.session].clone();
+            while !manager.events.tx.is_full() {
+                manager.events.emit_now(LspEvent::Resources { doc });
+            }
+            let refused = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff.rs".to_vec()));
+            let current_status =
+                manager.open_for_test(doc, &refused, Path::new("/fixture"), rust_language(), 1, "");
+            let current = manager.events.pending.inner.lock().unwrap().replaceable
+                [&StagedClass::Status(doc)]
+                .clone();
+            {
+                let mut inner = manager.events.pending.inner.lock().unwrap();
+                // Model the delayed producer already past its initial check.
+                inner.stage(old_ready);
+                inner.stage(old_progress.clone());
+                assert_eq!(inner.replaceable[&StagedClass::Status(doc)], current);
+                assert!(!inner.replaceable.contains_key(&StagedClass::Progress(doc)));
+            }
+            assert!(!backend.retired.load(Ordering::Acquire));
+            assert!(
+                manager
+                    .events
+                    .session_delivery(peer, &backend.retired)
+                    .is_some()
+            );
+            // A live new producer's progress also survives delayed old traffic.
+            manager.open_for_test(
+                doc,
+                &reference.path,
+                &reference.worktree,
+                reference.language,
+                1,
+                "abc",
+            );
+            let delivery = manager
+                .events
+                .session_delivery(doc, &backend.retired)
+                .unwrap();
+            let progress = LspEvent::Progress {
+                doc,
+                delivery,
+                progress: LspProgress {
+                    token: "new".into(),
+                    title: Some("New".into()),
+                    message: None,
+                    percentage: None,
+                    done: false,
+                },
+            };
+            manager.events.emit_now(progress.clone());
+            let drained = {
+                let mut inner = manager.events.pending.inner.lock().unwrap();
+                inner.stage(current);
+                inner.stage(old_progress);
+                let mut values = Vec::new();
+                while let Some(event) = inner.take(false) {
+                    values.push(event);
+                }
+                values
+            };
+            assert!(drained.contains(&progress));
+            assert!(matches!(current_status, LspStatus::Unavailable { .. }));
+            while fixture.events.try_recv().is_ok() {}
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_uri_with_another_workspace_owner_is_refused_before_backend_admission() {
+        block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let outer = directory.path().canonicalize().unwrap();
+            let package = outer.join("pkg");
+            std::fs::create_dir(&package).unwrap();
+            std::fs::write(outer.join("Cargo.toml"), "[workspace]\nmembers=[\"pkg\"]\n").unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\nname=\"pkg\"\n").unwrap();
+            let file = package.join("lib.rs");
+            std::fs::write(&file, "fixture").unwrap();
+            let mut manager = rust_manager();
+            let registry =
+                install_fake_registry(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            assert_eq!(
+                open_discovered(&mut manager, one, &file, &outer).await,
+                outer
+            );
+            let uri = Url::from_file_path(&file).unwrap();
+            let original = manager.snapshots.latest(&uri).unwrap();
+            let events = manager.events();
+            let language = rust_language();
+            assert_eq!(
+                manager.open(two, &file, &package, language, 1, "different"),
+                LspStatus::Starting
+            );
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == two => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(root, package);
+            let owner = Arc::clone(&manager.pending_opens[&two].owner);
+            manager.save(two, "saved during discovery");
+            let refusal = manager.finish_discovery(two, ticket, root).unwrap();
+            assert!(
+                matches!(&refusal, LspStatus::Unavailable { reason } if reason.contains("another language-server workspace"))
+            );
+            assert_eq!(manager.status(two), refusal);
+            assert!(Arc::ptr_eq(&manager.pending_opens[&two].owner, &owner));
+            assert_eq!(
+                manager.pending_opens[&two].saved_text.as_deref(),
+                Some("saved during discovery")
+            );
+            assert_eq!(manager.document_version(two), Some(1));
+            assert_ne!(manager.pending_opens[&two].ticket, ticket);
+            assert_eq!(
+                manager.finish_discovery(two, ticket, package.clone()),
+                None,
+                "a duplicate old discovery cannot readmit the refused registration"
+            );
+            assert_eq!(manager.sessions.len(), 1, "no second backend was admitted");
+            assert_eq!(
+                registry.lock().unwrap().len(),
+                1,
+                "no second transport was spawned"
+            );
+            assert!(!manager.documents.contains_key(&two));
+            let (recipients, _) = manager
+                .snapshots
+                .diagnostic_snapshot(&uri, &manager.documents[&one].session)
+                .unwrap();
+            assert_eq!(recipients, vec![one]);
+            assert!(Arc::ptr_eq(
+                &manager.snapshots.latest(&uri).unwrap(),
+                &original
+            ));
+            assert_eq!(manager.document_version(one), Some(original.version));
+            let event = next_matching(&events, |event| match event {
+                LspEvent::Status { doc, .. } if *doc == two => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            assert!(manager.event_is_current(&event));
+            assert!(matches!(event, LspEvent::Status { status, .. } if status == refusal));
+            manager.close(one);
+            manager.change(two, 2, &[], "saved blocked edit");
+            manager.save(two, "saved blocked edit");
+            manager.change(two, 3, &[], "newest unsaved blocked edit");
+            manager.restart(two);
+            assert_eq!(manager.status(two), LspStatus::Starting);
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == two => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(root, package);
+            let status = manager.finish_discovery(two, ticket, root).unwrap();
+            if !status.is_ready() {
+                await_ready(&events, two).await;
+            }
+            assert_eq!(registry.lock().unwrap().len(), 2);
+            assert_eq!(
+                manager.documents[&two].session.root.as_ref(),
+                package.as_path()
+            );
+            let backend = handle_for(&registry, &package).await;
+            let saved = backend.wait_for("textDocument/didSave").await;
+            let opened = &backend.entries("textDocument/didOpen")[0];
+            assert_eq!(
+                opened.params["textDocument"]["text"],
+                "newest unsaved blocked edit"
+            );
+            assert_eq!(opened.params["textDocument"]["version"], 3);
+            assert_eq!(saved.params["text"], "saved blocked edit");
+            manager.begin_shutdown().await;
+        });
+    }
+
+    async fn open_discovered(
+        manager: &mut LspManager,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+    ) -> PathBuf {
+        let language = manager.language_for(path).expect("configured language");
+        assert_eq!(
+            manager.open(doc, path, worktree, language, 1, "fixture"),
+            LspStatus::Starting
+        );
+        let events = manager.events();
+        let (ticket, root) = next_matching(&events, |event| match event {
+            LspEvent::RootDiscovered {
+                doc: at,
+                ticket,
+                root,
+            } if *at == doc => Some((*ticket, root.clone())),
+            _ => None,
+        })
+        .await;
+        let status = manager.finish_discovery(doc, ticket, root.clone());
+        if !status.is_some_and(|status| status.is_ready()) {
+            await_ready(&events, doc).await;
+        }
+        root
+    }
+
+    #[test]
+    fn asynchronous_workspace_members_and_independent_islands_keep_correct_sessions_in_both_orders()
+    {
+        block_on(async {
+            for island_first in [false, true] {
+                for island_manifest in [
+                    "[package]\nname=\"island\"\n[workspace]\n",
+                    "[package]\nname=\"island\"\n",
+                ] {
+                    let root = canonical_tempdir();
+                    let worktree = root.path();
+                    std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\nexclude=[\"tools/island\"]\n[package]\nname=\"outer\"\n").unwrap();
+                    for name in ["crates/a", "crates/b", "tools/island"] {
+                        std::fs::create_dir_all(worktree.join(name).join("src")).unwrap();
+                        std::fs::write(
+                            worktree.join(name).join("Cargo.toml"),
+                            if name == "tools/island" {
+                                island_manifest
+                            } else {
+                                "[package]\nname=\"member\"\n"
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let outer = worktree.join("src/lib.rs");
+                    std::fs::create_dir_all(outer.parent().unwrap()).unwrap();
+                    let island = worktree.join("tools/island/src/lib.rs");
+                    let mut manager = rust_manager();
+                    install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                    let factory = Arc::clone(&manager.transport);
+                    let roots = Arc::new(Mutex::new(Vec::new()));
+                    let launches = Arc::clone(&roots);
+                    manager.set_transport(Arc::new(move |spec| {
+                        launches.lock().unwrap().push(spec.root.clone());
+                        factory(spec)
+                    }));
+                    let order = if island_first {
+                        [
+                            (&island, worktree.join("tools/island")),
+                            (&outer, worktree.to_owned()),
+                        ]
+                    } else {
+                        [
+                            (&outer, worktree.to_owned()),
+                            (&island, worktree.join("tools/island")),
+                        ]
+                    };
+                    for (index, (path, expected)) in order.iter().enumerate() {
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64 + 1),
+                                path,
+                                worktree
+                            )
+                            .await,
+                            *expected
+                        );
+                        assert_eq!(
+                            manager.documents[&LspDocumentId(index as u64 + 1)]
+                                .session
+                                .root
+                                .as_ref(),
+                            expected
+                        );
+                    }
+                    for (index, name) in ["crates/a", "crates/b"].iter().enumerate() {
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64 + 3),
+                                &worktree.join(name).join("src/lib.rs"),
+                                worktree
+                            )
+                            .await,
+                            worktree
+                        );
+                    }
+                    assert_eq!(manager.sessions.len(), 2);
+                    let mut actual = roots.lock().unwrap().clone();
+                    actual.sort();
+                    let mut expected = vec![worktree.to_owned(), worktree.join("tools/island")];
+                    expected.sort();
+                    assert_eq!(
+                        actual, expected,
+                        "initialize must receive each discovered root exactly once"
+                    );
+                    manager.shutdown();
+                    manager.wait_for_shutdown().await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_bounds_pending_work_and_cancels_closed_and_replaced_waiters() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_slots = Arc::new(tokio::sync::Semaphore::new(0));
+            manager.discovery_admissions = Arc::new(tokio::sync::Semaphore::new(4));
+            let events = manager.events();
+            let mut jobs = Vec::new();
+            for index in 0..4 {
+                assert_eq!(
+                    manager.open(
+                        LspDocumentId(index),
+                        &file,
+                        &worktree,
+                        rust_language(),
+                        1,
+                        "queued"
+                    ),
+                    LspStatus::Starting
+                );
+                jobs.push(
+                    manager.pending_opens[&LspDocumentId(index)]
+                        ._discovery
+                        .as_ref()
+                        .unwrap()
+                        .task
+                        .clone(),
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "no blocking work may start before admission"
+            );
+            assert!(matches!(
+                manager.open(
+                    LspDocumentId(99),
+                    &file,
+                    &worktree,
+                    rust_language(),
+                    1,
+                    "over limit"
+                ),
+                LspStatus::Unavailable { .. }
+            ));
+            assert_eq!(manager.pending_opens.len(), 5);
+            assert_eq!(
+                manager
+                    .pending_opens
+                    .values()
+                    .filter(|pending| pending._discovery.is_some())
+                    .count(),
+                4
+            );
+            for index in 0..4 {
+                manager.close(LspDocumentId(index));
+            }
+            tokio::time::timeout(WAIT, async {
+                while jobs.iter().any(|job| !job.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(manager.discovery_admissions.available_permits(), 4);
+            // Reopening the same identity must acquire a fresh ticket and only
+            // that registration may consume the subsequently released worker.
+            manager.open(
+                LspDocumentId(0),
+                &file,
+                &worktree,
+                rust_language(),
+                2,
+                "old queued",
+            );
+            let old_ticket = manager.pending_opens[&LspDocumentId(0)].ticket;
+            let old_job = manager.pending_opens[&LspDocumentId(0)]
+                ._discovery
+                .as_ref()
+                .unwrap()
+                .task
+                .clone();
+            manager.open(
+                LspDocumentId(0),
+                &file,
+                &worktree,
+                rust_language(),
+                3,
+                "replacement",
+            );
+            let new_ticket = manager.pending_opens[&LspDocumentId(0)].ticket;
+            assert_ne!(old_ticket, new_ticket);
+            manager.discovery_slots.add_permits(1);
+            let ticket = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { ticket, .. } => Some(*ticket),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ticket, new_ticket);
+            tokio::time::timeout(WAIT, async {
+                while !old_job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            manager.shutdown();
+            tokio::time::timeout(WAIT, async {
+                while manager.discovery_admissions.available_permits() != 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(event, LspEvent::RootDiscovered { .. }));
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_rejects_fifo_and_oversized_workspace_manifests() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        struct ReleaseFifo {
+            path: PathBuf,
+            writer: Option<std::fs::File>,
+        }
+        impl Drop for ReleaseFifo {
+            fn drop(&mut self) {
+                // Remove the name before releasing a legacy blocking reader:
+                // a late worker must see ENOENT instead of opening a new FIFO.
+                let _ = std::fs::remove_file(&self.path);
+                if let Some(mut writer) = self.writer.take() {
+                    let _ = writer.write_all(b"\n");
+                }
+            }
+        }
+        block_on(async {
+            for inner in [false, true] {
+                for fifo in [false, true] {
+                    for (name, extension, content) in [
+                        ("Cargo.toml", "rs", "[workspace]\nmembers=[\"project\"]\n"),
+                        ("package.json", "ts", "{\"workspaces\":[\"project\"]}"),
+                        (
+                            "tsconfig.json",
+                            "ts",
+                            "{\"references\":[{\"path\":\"project\"}]}",
+                        ),
+                        ("pnpm-workspace.yaml", "ts", "packages:\n - project\n"),
+                    ] {
+                        let root = canonical_tempdir();
+                        let project = root.path().join("project");
+                        std::fs::create_dir_all(project.join("src")).unwrap();
+                        std::fs::write(
+                            project.join(if extension == "rs" {
+                                "Cargo.toml"
+                            } else {
+                                "package.json"
+                            }),
+                            if extension == "rs" {
+                                "[package]\nname=\"project\"\n"
+                            } else {
+                                "{}"
+                            },
+                        )
+                        .unwrap();
+                        if inner {
+                            std::fs::write(root.path().join(name), content).unwrap();
+                        }
+                        let manifest = if inner {
+                            project.join(name)
+                        } else {
+                            root.path().join(name)
+                        };
+                        if fifo {
+                            let _ = std::fs::remove_file(&manifest);
+                        }
+                        let _release = if fifo {
+                            let path =
+                                std::ffi::CString::new(manifest.as_os_str().as_encoded_bytes())
+                                    .unwrap();
+                            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                            Some(ReleaseFifo {
+                                path: manifest.clone(),
+                                writer: Some(
+                                    std::fs::OpenOptions::new()
+                                        .read(true)
+                                        .write(true)
+                                        .custom_flags(libc::O_NONBLOCK)
+                                        .open(&manifest)
+                                        .unwrap(),
+                                ),
+                            })
+                        } else {
+                            let mut bytes = content.as_bytes().to_vec();
+                            bytes.resize(discovery::MAX_MANIFEST_BYTES + 1, b' ');
+                            std::fs::write(&manifest, bytes).unwrap();
+                            None
+                        };
+                        let mut manager = if extension == "rs" {
+                            rust_manager()
+                        } else {
+                            LspManager::new(vec![server("typescript", &["ts"], &["package.json"])])
+                        };
+                        install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(1),
+                                &project.join(format!("src/lib.{extension}")),
+                                root.path()
+                            )
+                            .await,
+                            project,
+                            "{name} descriptor (inner={inner}, fifo={fifo}) must not confer outer membership"
+                        );
+                        manager.shutdown();
+                        manager.wait_for_shutdown().await;
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_cargo_discovery_includes_transitive_workspace_path_dependencies() {
+        block_on(async {
+            let root = canonical_tempdir();
+            std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[\"app\"]\n[workspace.dependencies]\nhelper={path=\"libs/helper\"}\n").unwrap();
+            for (path, manifest) in [
+                (
+                    "app",
+                    "[package]\nname=\"app\"\n[dependencies]\nhelper={workspace=true}\n",
+                ),
+                (
+                    "libs/helper",
+                    "[package]\nname=\"helper\"\n[target.'cfg(unix)'.dependencies]\nleaf={path=\"../leaf\"}\n",
+                ),
+                ("libs/leaf", "[package]\nname=\"leaf\"\n"),
+            ] {
+                std::fs::create_dir_all(root.path().join(path).join("src")).unwrap();
+                std::fs::write(root.path().join(path).join("Cargo.toml"), manifest).unwrap();
+            }
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            for (index, path) in ["libs/leaf", "app", "libs/helper"].iter().enumerate() {
+                assert_eq!(
+                    open_discovered(
+                        &mut manager,
+                        LspDocumentId(index as u64),
+                        &root.path().join(path).join("src/lib.rs"),
+                        root.path()
+                    )
+                    .await,
+                    root.path()
+                );
+            }
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_uses_one_canonical_root_for_in_worktree_aliases() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            std::os::unix::fs::symlink(&worktree, worktree.join("alias")).unwrap();
+            let alias = worktree.join("alias/main.rs");
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(&mut manager, LspDocumentId(1), &alias, &worktree).await,
+                worktree.canonicalize().unwrap()
+            );
+            assert_eq!(
+                open_discovered(&mut manager, LspDocumentId(2), &file, &worktree).await,
+                worktree.canonicalize().unwrap()
+            );
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_package_workspace_link_resolves_a_member_beside_its_workspace_root() {
+        block_on(async {
+            let root = canonical_tempdir();
+            let workspace = root.path().join("workspace");
+            let member = root.path().join("member");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(member.join("src")).unwrap();
+            std::fs::write(
+                workspace.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"../member\"]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname=\"member\"\nworkspace=\"../workspace\"\n",
+            )
+            .unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(
+                    &mut manager,
+                    LspDocumentId(1),
+                    &member.join("src/lib.rs"),
+                    root.path()
+                )
+                .await,
+                workspace
+            );
+            assert_eq!(
+                manager.documents[&LspDocumentId(1)].session.root.as_ref(),
+                workspace
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_active_discovery_holds_worker_admission_until_real_worker_returns() {
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let release = Release(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+            let gate = Arc::clone(&release.0);
+            let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
+            manager.discovery_enter = Some(Arc::new(move || {
+                entered.send(()).unwrap();
+                let (lock, changed) = &*gate;
+                let _guard = changed
+                    .wait_while(lock.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            manager.open(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "active",
+            );
+            tokio::time::timeout(WAIT, entering.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let task = manager.pending_opens[&LspDocumentId(1)]
+                ._discovery
+                .as_ref()
+                .unwrap()
+                .task
+                .clone();
+            manager.close(LspDocumentId(1));
+            tokio::time::timeout(WAIT, async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                manager.discovery_slots.available_permits(),
+                0,
+                "cancelling an async waiter must not free its still-blocking worker slot"
+            );
+            drop(release);
+            tokio::time::timeout(WAIT, async {
+                while manager.discovery_slots.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !manager
+                    .events()
+                    .try_recv()
+                    .is_ok_and(|event| matches!(event, LspEvent::RootDiscovered { .. }))
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_javascript_workspace_boundaries_hold_in_both_open_orders() {
+        block_on(async {
+            for (descriptor, contents) in [
+                (
+                    "package.json",
+                    r#"{"workspaces":["packages/*","!packages/island"]}"#,
+                ),
+                (
+                    "package.json",
+                    r#"{"workspaces":{"packages":["packages/a","packages/b"]}}"#,
+                ),
+                (
+                    "pnpm-workspace.yaml",
+                    "packages:\n - packages/*\n - '!packages/island'\n",
+                ),
+                (
+                    "pnpm-workspace.yaml",
+                    "packages:\n - '!packages/island'\n - packages/*\n",
+                ),
+                (
+                    "tsconfig.json",
+                    r#"{"references":[{"path":"packages/a/tsconfig.json"},{"path":"packages/b/tsconfig.json"}]}"#,
+                ),
+            ] {
+                for island_first in [false, true] {
+                    let root = canonical_tempdir();
+                    for package in ["a", "b", "island"] {
+                        let directory = root.path().join("packages").join(package);
+                        std::fs::create_dir_all(directory.join("src")).unwrap();
+                        std::fs::write(directory.join("package.json"), "{}").unwrap();
+                        std::fs::write(directory.join("tsconfig.json"), r#"{"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#).unwrap();
+                        for config in ["tsconfig.app.json", "tsconfig.node.json"] {
+                            std::fs::write(directory.join(config), "{}").unwrap();
+                        }
+                    }
+                    std::fs::write(root.path().join(descriptor), contents).unwrap();
+                    let mut manager =
+                        LspManager::new(vec![server("typescript", &["ts"], &["package.json"])]);
+                    install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                    let order = if island_first {
+                        ["island", "a"]
+                    } else {
+                        ["a", "island"]
+                    };
+                    for (index, package) in order.iter().enumerate() {
+                        let expected = if *package == "a" {
+                            root.path().to_owned()
+                        } else {
+                            root.path().join("packages/island")
+                        };
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64),
+                                &root
+                                    .path()
+                                    .join("packages")
+                                    .join(package)
+                                    .join("src/index.ts"),
+                                root.path()
+                            )
+                            .await,
+                            expected
+                        );
+                        assert_eq!(
+                            manager.documents[&LspDocumentId(index as u64)]
+                                .session
+                                .root
+                                .as_ref(),
+                            expected
+                        );
+                    }
+                    assert_eq!(
+                        open_discovered(
+                            &mut manager,
+                            LspDocumentId(3),
+                            &root.path().join("packages/b/src/index.ts"),
+                            root.path()
+                        )
+                        .await,
+                        root.path()
+                    );
+                    assert_eq!(manager.sessions.len(), 2);
+                    manager.shutdown();
+                    manager.wait_for_shutdown().await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_membership_budget_exhaustion_keeps_nearest_project() {
+        block_on(async {
+            let root = canonical_tempdir();
+            let project = root.path().join("project");
+            std::fs::create_dir_all(project.join("src")).unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\nname=\"project\"\n").unwrap();
+            let mut manifest =
+                String::from("[workspace]\nmembers=[]\n[package]\nname=\"root\"\n[dependencies]\n");
+            for index in 0..600 {
+                manifest.push_str(&format!("dep{index}={{path=\"missing{index}\"}}\n"));
+            }
+            std::fs::write(root.path().join("Cargo.toml"), manifest).unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(
+                    &mut manager,
+                    LspDocumentId(1),
+                    &project.join("src/lib.rs"),
+                    root.path()
+                )
+                .await,
+                project
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_admission_refusal_restarts_with_the_latest_buffer_and_saved_text() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_admissions = Arc::new(tokio::sync::Semaphore::new(1));
+            let reservation = Arc::clone(&manager.discovery_admissions)
+                .try_acquire_owned()
+                .unwrap();
+            let mut capabilities = incremental_capabilities();
+            capabilities["textDocumentSync"]["save"] = json!({ "includeText": true });
+            let fake = install_fake(&mut manager, capabilities, |_| Vec::new());
+            let doc = LspDocumentId(17);
+            assert!(matches!(
+                manager.open(doc, &file, &worktree, rust_language(), 1, "original"),
+                LspStatus::Unavailable { .. }
+            ));
+            assert!(matches!(manager.status(doc), LspStatus::Unavailable { .. }));
+            assert!(manager.pending_opens[&doc]._discovery.is_none());
+            let refused_ticket = manager.pending_opens[&doc].ticket;
+            manager.change(doc, 2, &[], "saved edit");
+            manager.save(doc, "saved edit");
+            manager.change(doc, 3, &[], "newest unsaved edit");
+            drop(reservation);
+            manager.restart(doc);
+            assert_eq!(manager.status(doc), LspStatus::Starting);
+            let events = manager.events();
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            assert_ne!(ticket, refused_ticket);
+            manager.finish_discovery(doc, ticket, root);
+            await_ready(&events, doc).await;
+            let fake = handle_of(&fake).await;
+            fake.wait_for("textDocument/didSave").await;
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["text"],
+                "newest unsaved edit"
+            );
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["version"],
+                3
+            );
+            assert_eq!(
+                fake.entries("textDocument/didSave")[0].params["text"],
+                "saved edit"
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_pnpm_complexity_boundaries_keep_nearest_project() {
+        block_on(async {
+            let cases = [
+                (
+                    "alias",
+                    String::from("shared: &members [project]\npackages: *members\n"),
+                ),
+                (
+                    "depth",
+                    format!(
+                        "unrelated: {}0{}\npackages:\n - project\n",
+                        "[".repeat(40),
+                        "]".repeat(40)
+                    ),
+                ),
+                (
+                    "tokens",
+                    format!(
+                        "unrelated:\n{}packages:\n - project\n",
+                        " - value\n".repeat(4200)
+                    ),
+                ),
+            ];
+            for (label, contents) in cases {
+                let root = canonical_tempdir();
+                let project = root.path().join("project");
+                std::fs::create_dir_all(project.join("src")).unwrap();
+                std::fs::write(project.join("package.json"), "{}").unwrap();
+                std::fs::write(root.path().join("pnpm-workspace.yaml"), contents).unwrap();
+                let mut manager =
+                    LspManager::new(vec![server("typescript", &["ts"], &["package.json"])]);
+                install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                assert_eq!(
+                    open_discovered(
+                        &mut manager,
+                        LspDocumentId(1),
+                        &project.join("src/index.ts"),
+                        root.path()
+                    )
+                    .await,
+                    project,
+                    "{label} complexity must not confer workspace membership"
+                );
+                manager.shutdown();
+                manager.wait_for_shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn discovery_workers_and_pending_admission_are_shared_across_managers() {
+        let first = rust_manager();
+        let second = rust_manager();
+        assert!(Arc::ptr_eq(&first.discovery_slots, &second.discovery_slots));
+        assert!(Arc::ptr_eq(
+            &first.discovery_admissions,
+            &second.discovery_admissions
+        ));
+        assert_eq!(discovery::MAX_PENDING, 256);
+    }
+
+    #[test]
+    fn workspace_discovery_prefers_topmost_cargo_workspace() {
+        let root = canonical_tempdir();
+        let nested = root.path().join("crates/nested");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/nested\"]\n",
+        )
+        .unwrap();
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"nested\"\n").unwrap();
+        let markers = vec!["Cargo.toml".into()];
+        assert_eq!(
+            discover_root(&nested.join("src/lib.rs"), root.path(), &markers),
+            root.path()
+        );
+        std::fs::remove_file(root.path().join("Cargo.toml")).unwrap();
+        assert_eq!(
+            discover_root(&nested.join("src/lib.rs"), root.path(), &markers),
+            nested
+        );
+        std::fs::remove_file(nested.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            discover_root(&nested.join("src/lib.rs"), root.path(), &markers),
+            root.path()
+        );
+    }
+
+    #[test]
+    fn workspace_discovery_recognizes_typescript_workspace_conventions() {
+        for (manifest, content) in [
+            ("package.json", r#"{"workspaces":["packages/*"]}"#),
+            ("pnpm-workspace.yaml", "packages:\n - packages/*\n"),
+            ("tsconfig.json", r#"{"references":[{"path":"packages/a"}]}"#),
+        ] {
+            let root = canonical_tempdir();
+            let package = root.path().join("packages/a/src");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(root.path().join(manifest), content).unwrap();
+            std::fs::write(package.parent().unwrap().join("package.json"), "{}").unwrap();
+            std::fs::write(package.parent().unwrap().join("tsconfig.json"), "{}").unwrap();
+            assert_eq!(
+                discover_root(
+                    &package.join("index.ts"),
+                    root.path(),
+                    &["package.json".into()]
+                ),
+                root.path()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_jsonc_preserves_strings_and_accepts_comments_and_trailing_commas() {
+        let value = workspace_manifest(
+            br#"{
+            // a normal TypeScript solution configuration
+            "references": [{"path": "packages/a",},],
+            "compilerOptions": {"baseUrl": "https://example.test/a//b",}, /* final comment */
+        }"#
+            .to_vec(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(value["references"][0]["path"], "packages/a");
+        assert_eq!(
+            value["compilerOptions"]["baseUrl"],
+            "https://example.test/a//b"
+        );
+    }
+
+    #[test]
+    fn idle_state_uses_monotonic_fake_clock_and_never_evicts_open_documents() {
+        let mut activity = SessionActivity {
+            documents: HashSet::new(),
+            last_document: None,
+            last_used: Duration::from_secs(20),
+        };
+        let timeout = Duration::from_secs(600);
+        assert!(!activity.idle_expired(Duration::from_secs(619), timeout));
+        assert!(activity.idle_expired(Duration::from_secs(620), timeout));
+        activity.documents.insert(LspDocumentId(1));
+        assert!(!activity.idle_expired(Duration::from_secs(9999), timeout));
+        activity.documents.clear();
+        activity.last_used = Duration::from_secs(9999);
+        assert!(!activity.idle_expired(Duration::from_secs(10000), timeout));
+    }
+
+    #[test]
+    fn session_cap_evicts_idle_lru_and_refuses_busy_eviction() {
+        block_on(async {
+            let (_root, worktree, _) = workspace();
+            let mut manager = rust_manager().with_lifecycle(600, 2);
+            manager.set_transport(Arc::new(|_| {
+                Err("unused transport in admission test".into())
+            }));
+            let settings = manager.servers[0].clone();
+            let key = |name: &str| SessionKey {
+                server_id: Arc::from(settings.id.as_str()),
+                root: Arc::from(worktree.join(name)),
+            };
+            let first = key("first");
+            let second = key("second");
+            let third = key("third");
+            let a = manager
+                .ensure_session(&first, &settings, &first.root, &worktree)
+                .unwrap();
+            let b = manager
+                .ensure_session(&second, &settings, &second.root, &worktree)
+                .unwrap();
+            a.activity
+                .lock()
+                .unwrap()
+                .documents
+                .insert(LspDocumentId(1));
+            b.activity
+                .lock()
+                .unwrap()
+                .documents
+                .insert(LspDocumentId(2));
+            assert!(
+                manager
+                    .ensure_session(&third, &settings, &third.root, &worktree)
+                    .is_err()
+            );
+            assert!(!a.retired.load(Ordering::Acquire));
+            assert!(!b.retired.load(Ordering::Acquire));
+            a.activity.lock().unwrap().documents.clear();
+            manager
+                .ensure_session(&third, &settings, &third.root, &worktree)
+                .unwrap();
+            assert!(a.retired.load(Ordering::Acquire));
+            assert!(!b.retired.load(Ordering::Acquire));
+            assert_eq!(manager.sessions.len(), 2);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn cap_refused_document_keeps_latest_text_for_restart_and_later_join() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let second = worktree.join("other-worktree");
+            std::fs::create_dir_all(&second).unwrap();
+            let mut manager = rust_manager().with_lifecycle(600, 1);
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            manager.open_for_test(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "first",
+            );
+            await_ready(&events, LspDocumentId(1)).await;
+            let status = manager.open_for_test(
+                LspDocumentId(2),
+                &second.join("lib.rs"),
+                &second,
+                rust_language(),
+                1,
+                "blocked",
+            );
+            assert!(matches!(status, LspStatus::Unavailable { .. }));
+            assert!(manager.documents.contains_key(&LspDocumentId(2)));
+            manager.change(LspDocumentId(2), 2, &[], "edited while blocked");
+            manager.close(LspDocumentId(1));
+            manager.restart(LspDocumentId(2));
+            await_ready(&events, LspDocumentId(2)).await;
+            let reference = &manager.documents[&LspDocumentId(2)];
+            assert_eq!(
+                manager
+                    .snapshots
+                    .latest(&reference.uri)
+                    .unwrap()
+                    .full_text()
+                    .as_ref(),
+                "edited while blocked"
+            );
+            assert_eq!(manager.sessions.len(), 1);
+            assert!(
+                manager.sessions[&reference.session]
+                    .activity
+                    .lock()
+                    .unwrap()
+                    .documents
+                    .contains(&LspDocumentId(2))
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn later_admission_reopens_previously_refused_documents_for_that_root() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let second = worktree.join("other-worktree");
+            std::fs::create_dir_all(&second).unwrap();
+            let mut manager = rust_manager().with_lifecycle(600, 1);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            manager.open_for_test(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "first",
+            );
+            await_ready(&events, LspDocumentId(1)).await;
+            assert!(matches!(
+                manager.open_for_test(
+                    LspDocumentId(2),
+                    &second.join("lib.rs"),
+                    &second,
+                    rust_language(),
+                    1,
+                    "blocked"
+                ),
+                LspStatus::Unavailable { .. }
+            ));
+            manager.close(LspDocumentId(1));
+            manager.open_for_test(
+                LspDocumentId(3),
+                &second.join("other.rs"),
+                &second,
+                rust_language(),
+                1,
+                "new file",
+            );
+            await_ready(&events, LspDocumentId(3)).await;
+            let session = manager.sessions.values().next().unwrap();
+            assert_eq!(session.activity.lock().unwrap().documents.len(), 2);
+            let fake = handle_of(&slot).await;
+            fake.wait_for_count("textDocument/didOpen", 2).await;
+            let opened = fake.entries("textDocument/didOpen");
+            assert!(
+                opened
+                    .iter()
+                    .any(|entry| entry.params["textDocument"]["text"] == "blocked")
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn cap_selects_least_recently_used_idle_session_with_fake_clock() {
+        block_on(async {
+            let (_root, worktree, _) = workspace();
+            let mut manager = rust_manager().with_lifecycle(600, 2);
+            manager.set_transport(Arc::new(|_| {
+                Err("unused transport in admission test".into())
+            }));
+            let settings = manager.servers[0].clone();
+            let key = |name: &str| SessionKey {
+                server_id: Arc::from(settings.id.as_str()),
+                root: Arc::from(worktree.join(name)),
+            };
+            let first = key("first");
+            let second = key("second");
+            let third = key("third");
+            let a = manager
+                .ensure_session(&first, &settings, &first.root, &worktree)
+                .unwrap();
+            let b = manager
+                .ensure_session(&second, &settings, &second.root, &worktree)
+                .unwrap();
+            a.activity.lock().unwrap().last_used = Duration::from_secs(20);
+            b.activity.lock().unwrap().last_used = Duration::from_secs(10);
+            manager
+                .ensure_session(&third, &settings, &third.root, &worktree)
+                .unwrap();
+            assert!(!a.retired.load(Ordering::Acquire));
+            assert!(b.retired.load(Ordering::Acquire));
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_workspace_open_shares_server_and_idle_close_restarts_it() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            std::fs::write(
+                worktree.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"crates/member\"]\n",
+            )
+            .unwrap();
+            let member = worktree.join("crates/member");
+            std::fs::create_dir_all(member.join("src")).unwrap();
+            std::fs::write(member.join("Cargo.toml"), "[package]\nname=\"member\"\n").unwrap();
+            let nested = member.join("src/lib.rs");
+            let mut manager = rust_manager().with_lifecycle(1, 2);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            for (doc, path) in [(LspDocumentId(1), &file), (LspDocumentId(2), &nested)] {
+                assert_eq!(
+                    manager.open(doc, path, &worktree, rust_language(), 1, "fn test() {}"),
+                    LspStatus::Starting
+                );
+                let (ticket, root) = next_matching(&events, |event| match event {
+                    LspEvent::RootDiscovered {
+                        doc: at,
+                        ticket,
+                        root,
+                    } if *at == doc => Some((*ticket, root.clone())),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(root, worktree);
+                let status = manager.finish_discovery(doc, ticket, root);
+                if !status.is_some_and(|status| status.is_ready()) {
+                    await_ready(&events, doc).await;
+                }
+            }
+            assert_eq!(manager.sessions.len(), 1);
+            let handle = handle_of(&slot).await;
+            assert_eq!(handle.entries("initialize").len(), 1);
+            manager.close(LspDocumentId(1));
+            manager.close(LspDocumentId(2));
+            handle.wait_for("shutdown").await;
+            handle.wait_for("exit").await;
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc } if *doc == LspDocumentId(2) => Some(()),
+                _ => None,
+            })
+            .await;
+            assert!(
+                manager.live_servers().is_empty(),
+                "idle retirement must refresh cached metrics even after every document closed"
+            );
+            assert!(
+                manager
+                    .sessions
+                    .values()
+                    .all(|session| session.retired.load(Ordering::Acquire))
+            );
+            let doc = LspDocumentId(3);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "fn test() {}");
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            let status = manager.finish_discovery(doc, ticket, root);
+            if !status.is_some_and(|status| status.is_ready()) {
+                await_ready(&events, doc).await;
+            }
+            assert!(
+                manager
+                    .sessions
+                    .values()
+                    .all(|session| !session.retired.load(Ordering::Acquire))
+            );
+            manager.remove_worktree(&worktree);
+            assert!(manager.sessions.is_empty());
+            assert!(manager.documents.is_empty());
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn nested_worktrees_keep_separate_servers_and_removal_retires_idle_owner() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            let linked = worktree.join(".worktrees/feature");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::fs::write(linked.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            manager.open_for_test(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "fn outer() {}",
+            );
+            await_ready(&events, LspDocumentId(1)).await;
+            manager.open_for_test(
+                LspDocumentId(2),
+                &linked.join("lib.rs"),
+                &linked,
+                rust_language(),
+                1,
+                "fn linked() {}",
+            );
+            await_ready(&events, LspDocumentId(2)).await;
+            assert_eq!(
+                manager.sessions.len(),
+                2,
+                "a repository-local worktree is a separate workspace"
+            );
+            let outer = manager
+                .sessions
+                .values()
+                .find(|handle| handle.worktree.as_ref() == worktree)
+                .unwrap()
+                .clone();
+            let inner = manager
+                .sessions
+                .values()
+                .find(|handle| handle.worktree.as_ref() == linked)
+                .unwrap()
+                .clone();
+            manager.close(LspDocumentId(2));
+            assert!(inner.activity.lock().unwrap().documents.is_empty());
+            manager.remove_worktree(&linked);
+            assert!(
+                inner.retired.load(Ordering::Acquire),
+                "idle server must retire immediately, before filesystem polling"
+            );
+            assert!(!outer.retired.load(Ordering::Acquire));
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_removal_does_not_retire_restarted_same_path_session_or_reused_document() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "original");
+            await_ready(&events, doc).await;
+            let old = manager.sessions.values().next().unwrap().clone();
+            let removal = manager.capture_worktree_removal(&worktree);
+            manager.restart(doc);
+            await_ready(&events, doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            assert!(!Arc::ptr_eq(&old.retired, &successor.retired));
+            assert!(manager.remove_captured_worktree(removal.clone()).is_empty());
+            assert!(manager.documents.contains_key(&doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            assert_eq!(manager.sessions.len(), 1);
+            manager.close(doc);
+            manager.open_for_test(
+                doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "new registration",
+            );
+            assert!(manager.remove_captured_worktree(removal).is_empty());
+            let uri = &manager.documents[&doc].uri;
+            assert_eq!(
+                manager.snapshots.latest(uri).unwrap().full_text().as_ref(),
+                "new registration"
+            );
+            assert!(!successor.retired.load(Ordering::Acquire));
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_pending_removal_tracks_created_session_and_preserves_newer_joined_buffer() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let old_doc = LspDocumentId(1);
+            manager.open(
+                old_doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "original pending",
+            );
+            let removal = manager.capture_worktree_removal(&worktree);
+            assert!(removal.sessions.is_empty());
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == old_doc => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            manager.finish_discovery(old_doc, ticket, root);
+            await_ready(&events, old_doc).await;
+            let original = manager.sessions.values().next().unwrap().clone();
+            let new_doc = LspDocumentId(2);
+            manager.open_for_test(
+                new_doc,
+                &worktree.join("new.rs"),
+                &worktree,
+                rust_language(),
+                1,
+                "new buffer",
+            );
+            manager.change(new_doc, 2, &[], "newer unsaved buffer");
+            assert_eq!(
+                manager.remove_captured_worktree(removal.clone()),
+                vec![old_doc]
+            );
+            assert!(!manager.documents.contains_key(&old_doc));
+            assert!(original.retired.load(Ordering::Acquire));
+            await_ready(&events, new_doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            assert!(!Arc::ptr_eq(&original.retired, &successor.retired));
+            assert_eq!(
+                manager
+                    .snapshots
+                    .latest(&manager.documents[&new_doc].uri)
+                    .unwrap()
+                    .full_text()
+                    .as_ref(),
+                "newer unsaved buffer"
+            );
+            assert!(manager.remove_captured_worktree(removal).is_empty());
+            assert!(manager.documents.contains_key(&new_doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_pending_removal_cannot_retire_a_session_created_by_a_newer_registration() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let old_doc = LspDocumentId(1);
+            manager.open(old_doc, &file, &worktree, rust_language(), 1, "pending A");
+            let removal = manager.capture_worktree_removal(&worktree);
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == old_doc => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            let new_doc = LspDocumentId(2);
+            manager.open_for_test(
+                new_doc,
+                &worktree.join("new.rs"),
+                &worktree,
+                rust_language(),
+                1,
+                "B",
+            );
+            await_ready(&events, new_doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            manager.finish_discovery(old_doc, ticket, root);
+            assert_eq!(manager.remove_captured_worktree(removal), vec![old_doc]);
+            assert!(!manager.documents.contains_key(&old_doc));
+            assert!(manager.documents.contains_key(&new_doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            assert_eq!(handle_of(&slot).await.entries("initialize").len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_removal_refuses_another_manager_and_drops_only_original_pending_discovery() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let doc = LspDocumentId(1);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "pending A");
+            let old_ticket = manager.pending_opens[&doc].ticket;
+            let removal = manager.capture_worktree_removal(&worktree);
+            manager.close(doc);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "pending B");
+            let new_ticket = manager.pending_opens[&doc].ticket;
+            assert!(manager.remove_captured_worktree(removal.clone()).is_empty());
+            assert_eq!(manager.pending_opens[&doc].ticket, new_ticket);
+            assert!(
+                manager
+                    .finish_discovery(doc, old_ticket, worktree.clone())
+                    .is_none()
+            );
+            let mut replacement = rust_manager();
+            replacement.open(doc, &file, &worktree, rust_language(), 1, "other manager");
+            assert!(replacement.remove_captured_worktree(removal).is_empty());
+            assert_eq!(
+                replacement.pending_opens[&doc].text.full_text().as_ref(),
+                "other manager"
+            );
+            let current = manager.capture_worktree_removal(&worktree);
+            assert_eq!(manager.remove_captured_worktree(current), vec![doc]);
+            assert!(manager.pending_opens.is_empty());
+            assert!(
+                manager
+                    .finish_discovery(doc, new_ticket, worktree)
+                    .is_none()
+            );
+            manager.shutdown();
+            replacement.shutdown();
+            manager.wait_for_shutdown().await;
+            replacement.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn closed_workspace_session_launches_its_canonical_key_root() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            std::fs::write(
+                worktree.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"package\"]\n[package]\nname=\"root\"\n",
+            )
+            .unwrap();
+            let nested = worktree.join("package");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("Cargo.toml"), "[package]\n").unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let factory = Arc::clone(&manager.transport);
+            let roots = Arc::new(Mutex::new(Vec::new()));
+            let launches = Arc::clone(&roots);
+            manager.set_transport(Arc::new(move |spec| {
+                launches.lock().unwrap().push(spec.root.clone());
+                factory(spec)
+            }));
+            let events = manager.events();
+            manager.open_for_test(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "first",
+            );
+            await_ready(&events, LspDocumentId(1)).await;
+            let previous = manager.sessions.values().next().unwrap().clone();
+            let task = previous.task.lock().unwrap().take().unwrap();
+            task.abort();
+            let _ = task.await;
+            assert!(previous.commands.is_closed());
+            assert!(!previous.retired.load(Ordering::Acquire));
+            manager.open_for_test(
+                LspDocumentId(2),
+                &nested.join("lib.rs"),
+                &worktree,
+                rust_language(),
+                1,
+                "nested",
+            );
+            await_ready(&events, LspDocumentId(2)).await;
+            assert_eq!(
+                *roots.lock().unwrap(),
+                vec![worktree.clone(), worktree.clone()]
+            );
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn save_during_root_discovery_is_replayed_after_open_without_losing_newer_edits() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "original");
+            manager.save(doc, "saved while discovering");
+            manager.change(doc, 2, &[], "newer unsaved edit");
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            manager.finish_discovery(doc, ticket, root);
+            await_ready(&events, doc).await;
+            let fake = handle_of(&slot).await;
+            let saved = fake.wait_for("textDocument/didSave").await;
+            assert_eq!(saved.params["text"], "saved while discovering");
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["text"],
+                "newer unsaved edit"
+            );
+            let methods = fake.methods();
+            assert!(
+                methods
+                    .iter()
+                    .position(|method| method == "textDocument/didOpen")
+                    < methods
+                        .iter()
+                        .position(|method| method == "textDocument/didSave")
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn public_lifecycle_builder_bounds_unvalidated_limits() {
+        let manager = rust_manager().with_lifecycle(u64::MAX, usize::MAX);
+        assert_eq!(manager.lifecycle(), (604800, 64));
+        let manager = rust_manager().with_lifecycle(0, 0);
+        assert_eq!(manager.lifecycle(), (1, 1));
+    }
+
+    #[test]
+    fn shutdown_awaits_idle_retirement_already_started_by_watcher() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&slot);
+            manager.set_transport(Arc::new(move |_| {
+                let (transport, handle) = fake_transport(|message| {
+                    if message.method == "initialize" {
+                        vec![json!({"jsonrpc":"2.0", "id":message.id,
+                            "result":{"capabilities":{"textDocumentSync":2}}})]
+                    } else {
+                        Vec::new()
+                    } // deliberately leave shutdown unanswered
+                });
+                *sink.lock().unwrap() = Some(handle);
+                Ok(transport)
+            }));
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn main() {}");
+            await_ready(&events, doc).await;
+            let handle = handle_of(&slot).await;
+            manager.close(doc);
+            handle.wait_for("shutdown").await;
+            assert!(
+                manager
+                    .sessions
+                    .values()
+                    .all(|session| session.task.lock().unwrap().is_some()),
+                "watcher retirement must leave the join handle reachable by the manager"
+            );
+            let started = tokio::time::Instant::now();
+            manager.begin_shutdown().await;
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "shutdown must await the already-retiring server's handshake"
+            );
+            assert!(handle.entries("exit").len() == 1);
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_ignores_closed_and_replaced_documents() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let events = manager.events();
+            let doc = LspDocumentId(11);
+            assert_eq!(
+                manager.open(doc, &file, &worktree, rust_language(), 1, "old"),
+                LspStatus::Starting
+            );
+            let old_ticket = manager.pending_opens[&doc].ticket;
+            manager.change(doc, 2, &[], "edited during discovery");
+            assert_eq!(
+                manager.pending_opens[&doc].text.full_text().as_ref(),
+                "edited during discovery"
+            );
+            // Exercise a completion already queued before close. Closing
+            // earlier cancels discovery and correctly produces no event.
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { ticket, root, .. } => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ticket, old_ticket);
+            manager.close(doc);
+            assert!(
+                manager
+                    .finish_discovery(doc, ticket, root.clone())
+                    .is_none()
+            );
+            assert!(manager.sessions.is_empty());
+            manager.open(doc, &file, &worktree, rust_language(), 3, "new");
+            assert!(manager.finish_discovery(doc, old_ticket, root).is_none());
+            assert!(
+                manager.sessions.is_empty(),
+                "stale discovery must not reopen a replacement"
+            );
+            assert_eq!(manager.pending_opens[&doc].version, 3);
+            manager.close(doc);
+        });
     }
 
     #[test]
@@ -4503,7 +7909,7 @@ mod tests {
                 Ok(transport)
             }));
             let initial = "a".repeat(64 * 1024);
-            manager.open(
+            manager.open_for_test(
                 LspDocumentId(1),
                 &first,
                 &worktree,
@@ -4511,7 +7917,7 @@ mod tests {
                 1,
                 &initial,
             );
-            manager.open(
+            manager.open_for_test(
                 LspDocumentId(2),
                 &second,
                 &worktree,
@@ -4529,7 +7935,11 @@ mod tests {
                     manager.change(doc, version, &[], &latest);
                 }
                 old_versions.push(Arc::downgrade(
-                    &manager.snapshots.latest(&reference.uri).unwrap().text,
+                    manager
+                        .snapshots
+                        .latest(&reference.uri)
+                        .unwrap()
+                        .full_text(),
                 ));
             }
             assert!(
@@ -4568,7 +7978,7 @@ mod tests {
             let mut manager = rust_manager();
             manager.set_transport(Arc::new(|_| Ok(fake_transport(|_| Vec::new()).0)));
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "text");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "text");
             let mut expected = std::collections::HashSet::new();
             // The Open is already queued. Enough request barriers must stop
             // admission instead of retaining an arbitrary command history.
@@ -4625,7 +8035,7 @@ mod tests {
     fn an_empty_server_list_disables_lsp_without_spawning_anything() {
         let mut manager = LspManager::new(Vec::new());
         assert_eq!(
-            manager.open(
+            manager.open_for_test(
                 LspDocumentId(1),
                 Path::new("/tmp/a.rs"),
                 Path::new("/tmp"),
@@ -4648,7 +8058,7 @@ mod tests {
             let (_root, worktree, file) = workspace();
             let mut manager = rust_manager();
             manager.shutdown();
-            let status = manager.open(
+            let status = manager.open_for_test(
                 LspDocumentId(1),
                 &file,
                 &worktree,
@@ -4676,7 +8086,7 @@ mod tests {
 
     #[test]
     fn root_discovery_stops_at_the_nearest_marker_and_never_leaves_the_worktree() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path();
         let inner = worktree.join("crates/inner");
         std::fs::create_dir_all(inner.join("src")).expect("dirs");
@@ -4703,6 +8113,228 @@ mod tests {
             worktree,
             "a server with no markers uses the worktree"
         );
+    }
+
+    #[test]
+    fn diagnostic_previews_bound_unicode_bytes_and_copy_preserves_complete_protocol() {
+        let budget = DIAGNOSTIC_PREVIEW_BYTES;
+        for text in ["x".repeat(budget), "λ".repeat(budget), "😀".repeat(budget)] {
+            let preview = diagnostic_preview(&text);
+            assert!(preview.len() <= budget);
+            if text.len() <= budget {
+                assert!(matches!(preview, std::borrow::Cow::Borrowed(_)));
+                assert_eq!(preview, text);
+            } else {
+                assert!(preview.ends_with(DIAGNOSTIC_TRUNCATED));
+                assert!(text.starts_with(preview.strip_suffix(DIAGNOSTIC_TRUNCATED).unwrap()));
+            }
+        }
+        let protocol: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": {"start":{"line":0,"character":1},"end":{"line":0,"character":3}},
+            "severity": 2, "message": "λ".repeat(budget) + " ORIGINAL MESSAGE END",
+            "source": "s".repeat(budget + 1), "code": "κ".repeat(budget),
+            "codeDescription": {"href":"https://example.invalid/code"}, "tags":[1],
+            "relatedInformation":[{"location":{"uri":"file:///tmp/other.rs", "range":{
+                "start":{"line":1,"character":0},"end":{"line":1,"character":1}}},"message":"related"}],
+            "data": {"opaque": [7, "unchanged"]}
+        })).unwrap();
+        let expected = serde_json::to_value(&protocol).unwrap();
+        let diagnostic =
+            convert_diagnostic(&Snapshot::new(1, Arc::from("a😀b")), protocol).unwrap();
+        assert_eq!(diagnostic.range.end.character, 2);
+        assert!(diagnostic.message_preview().len() <= budget);
+        assert!(diagnostic.origin_preview().len() <= budget);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic.copy_text()).unwrap(),
+            expected
+        );
+        assert!(!format!("{diagnostic:?}").contains("ORIGINAL MESSAGE END"));
+        // Both optional code representations survive explicit inspection.
+        let mut numeric = diagnostic.protocol.as_ref().clone();
+        numeric.code = Some(lsp_types::NumberOrString::Number(2304));
+        let numeric = convert_diagnostic(&Snapshot::new(1, Arc::from("a😀b")), numeric).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&numeric.copy_text()).unwrap()["code"],
+            2304
+        );
+    }
+
+    #[test]
+    fn diagnostic_publication_and_shift_share_one_original_payload_across_mirrors() {
+        let snapshots = Arc::new(SnapshotStore::default());
+        let uri = Arc::new(Url::parse("file:///tmp/mirrored.rs").unwrap());
+        let key = SessionKey {
+            server_id: Arc::from("test"),
+            root: Arc::from(Path::new("/tmp")),
+        };
+        for doc in 1..=3 {
+            snapshots
+                .register(LspDocumentId(doc), &uri, &key, 1, Arc::from("a😀b"))
+                .unwrap();
+        }
+        let version = snapshots.latest(&uri).unwrap().version;
+        let (tx, rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
+        let mut state = RouterState {
+            key,
+            snapshots,
+            events: EventSink {
+                tx,
+                pending: Arc::new(PendingEvents::default()),
+            },
+            retired: Arc::new(AtomicBool::new(false)),
+        };
+        let message = "λ".repeat(DIAGNOSTIC_PREVIEW_BYTES + 1);
+        let message_ptr = message.as_ptr();
+        let original = lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 1),
+                lsp_types::Position::new(0, 3),
+            ),
+            message,
+            source: Some("test".into()),
+            data: Some(json!({"fix":7})),
+            ..Default::default()
+        };
+        publish_diagnostics(
+            &mut state,
+            lsp_types::PublishDiagnosticsParams {
+                uri: uri.as_ref().clone(),
+                version: Some(version),
+                diagnostics: vec![original],
+            },
+        );
+        let mut batches = Vec::new();
+        for doc in 1..=3 {
+            let LspEvent::Diagnostics {
+                doc: actual, items, ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("diagnostics event")
+            };
+            assert_eq!(actual, LspDocumentId(doc));
+            assert_eq!(
+                items[0].message.as_ptr(),
+                message_ptr,
+                "conversion moves the original strings"
+            );
+            batches.push(items);
+        }
+        for batch in &batches[1..] {
+            assert!(Arc::ptr_eq(&batches[0][0].protocol, &batch[0].protocol));
+        }
+        let old_range = batches[0][0].range;
+        shift_diagnostics(
+            &mut batches[1],
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                new_text: "x".into(),
+            }],
+        );
+        assert_eq!(batches[0][0].range, old_range);
+        assert_eq!(
+            batches[1][0].range.start.character,
+            old_range.start.character + 1
+        );
+        assert!(Arc::ptr_eq(
+            &batches[0][0].protocol,
+            &batches[1][0].protocol
+        ));
+        assert_eq!(
+            batches[1][0].protocol.range.start.character, 1,
+            "protocol coordinates remain original"
+        );
+    }
+
+    #[test]
+    fn diagnostic_ranges_follow_insert_delete_and_multiline_replacements() {
+        fn diagnostic(start: (u32, u32), end: (u32, u32)) -> LspDiagnostic {
+            LspDiagnostic::new(
+                LspRange::new(
+                    LspPosition::new(start.0, start.1),
+                    LspPosition::new(end.0, end.1),
+                ),
+                LspSeverity::Error,
+                "error".into(),
+                None,
+                None,
+            )
+        }
+        let mut items = vec![diagnostic((2, 3), (2, 8)), diagnostic((0, 0), (0, 2))];
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                new_text: "α\r\nβ\n".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(4, 3), LspPosition::new(4, 8))
+        );
+        assert_eq!(
+            items[1].range,
+            LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 2))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(3, 0)),
+                new_text: String::new(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(2, 8))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(2, 5), LspPosition::new(2, 7)),
+                new_text: "x\ny".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(3, 2))
+        );
+    }
+
+    #[test]
+    fn diagnostic_insert_affinity_and_complete_deletion_remain_valid() {
+        let mut item = LspDiagnostic::new(
+            LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 5)),
+            LspSeverity::Error,
+            "error".into(),
+            None,
+            None,
+        );
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 2)),
+                new_text: "α".into(),
+            }],
+        );
+        assert_eq!(
+            item.range,
+            LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6))
+        );
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 6), LspPosition::new(0, 6)),
+                new_text: "z".into(),
+            }],
+        );
+        assert_eq!(item.range.end, LspPosition::new(0, 6));
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(1, 0)),
+                new_text: String::new(),
+            }],
+        );
+        assert_eq!(item.range, LspRange::default());
     }
 
     #[test]
@@ -4781,9 +8413,18 @@ mod tests {
     #[test]
     fn a_crlf_terminator_is_not_part_of_its_line() {
         let snapshot = Snapshot::new(1, Arc::from("ab\r\ncd\r\n"));
-        assert_eq!(snapshot.line_content(0), Some("ab"));
-        assert_eq!(snapshot.line_content(1), Some("cd"));
-        assert_eq!(snapshot.line_content(2), Some(""));
+        assert_eq!(
+            snapshot.line_content(0),
+            Some(std::borrow::Cow::Borrowed("ab"))
+        );
+        assert_eq!(
+            snapshot.line_content(1),
+            Some(std::borrow::Cow::Borrowed("cd"))
+        );
+        assert_eq!(
+            snapshot.line_content(2),
+            Some(std::borrow::Cow::Borrowed(""))
+        );
         assert_eq!(
             snapshot.to_utf16(LspPosition::new(0, 2)).expect("line end"),
             lsp_types::Position::new(0, 2)
@@ -5013,7 +8654,7 @@ mod tests {
             let events = manager.events();
             let doc = LspDocumentId(1);
             assert_eq!(
-                manager.open(doc, &file, &worktree, rust_language(), 1, "fn main() {}\n"),
+                manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn main() {}\n"),
                 LspStatus::Starting
             );
 
@@ -5053,7 +8694,7 @@ mod tests {
                 *sink.lock().unwrap() = Some(handle);
                 Ok(transport)
             }));
-            manager.open(
+            manager.open_for_test(
                 LspDocumentId(1),
                 &file,
                 &worktree,
@@ -5087,7 +8728,7 @@ mod tests {
             let slot = install_fake(&mut manager, json!({}), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "a\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "a\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             manager.change(
@@ -5126,7 +8767,7 @@ mod tests {
             let slot = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "a\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "a\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             let open = handle.wait_for("textDocument/didOpen").await;
@@ -5174,7 +8815,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "a𝄞b\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "a𝄞b\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             let open = handle.wait_for("textDocument/didOpen").await;
@@ -5252,6 +8893,200 @@ mod tests {
         });
     }
 
+    fn native_source(text: &str) -> TextSnapshot {
+        crate::repository_widget::text_editor::Content::<cosmic::Renderer>::with_text(text)
+            .text_snapshot()
+    }
+
+    #[test]
+    fn native_changes_during_root_discovery_remain_lazy_until_worker_open() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let mut manager = rust_manager().after_shutdown(async move {
+                let _ = waiting.await;
+            });
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            let initial = native_source("before");
+            let changed = native_source("after");
+            manager.open_snapshot(doc, &file, &worktree, rust_language(), 1, initial.clone());
+            manager.change_snapshot(doc, 2, &[], changed.clone());
+            assert!(!initial.is_materialized());
+            assert!(!changed.is_materialized());
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            manager.finish_discovery(doc, ticket, root);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "replacement must wait for the old manager to reap"
+            );
+            assert_eq!(initial.serialization_count(), 0);
+            assert_eq!(changed.serialization_count(), 0);
+            release.send(()).unwrap();
+            await_ready(&events, doc).await;
+            let fake = handle_of(&slot).await;
+            let opened = fake.wait_for("textDocument/didOpen").await;
+            assert_eq!(opened.params["textDocument"]["text"], "after");
+            assert!(!initial.is_materialized());
+            assert!(!changed.is_materialized());
+            assert_eq!(initial.serialization_count(), 0);
+            assert_eq!(changed.serialization_count(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn native_incremental_typing_never_materializes_full_text() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_source_at_root(
+                doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                Arc::new(Snapshot::from_native(1, native_source("a😀\nnext\n"))),
+                worktree.clone(),
+                Arc::default(),
+            );
+            await_ready(&events, doc).await;
+            let source = native_source("a😀x\nnext\n");
+            let edit = LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 2)),
+                new_text: "x".into(),
+            };
+            manager.change_snapshot(doc, 2, &[edit], source.clone());
+            assert!(!source.is_materialized());
+            let fake = handle_of(&slot).await;
+            let change = fake.wait_for("textDocument/didChange").await;
+            assert_eq!(
+                change.params["contentChanges"][0]["range"]["start"]["character"],
+                3
+            );
+            assert_eq!(change.params["contentChanges"][0]["text"], "x");
+            assert!(!source.is_materialized());
+            let next = native_source("a😀x\nzero\nnext\n");
+            manager.change_snapshot(
+                doc,
+                3,
+                &[LspTextEdit {
+                    range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                    new_text: "zero\n".into(),
+                }],
+                next.clone(),
+            );
+            let changes = fake.wait_for_count("textDocument/didChange", 2).await;
+            assert_eq!(changes[1].params["contentChanges"][0]["text"], "zero\n");
+            assert!(!source.is_materialized());
+            assert!(!next.is_materialized());
+            assert_eq!(source.serialization_count(), 0);
+            assert_eq!(next.serialization_count(), 0);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn native_full_sync_materializes_only_the_latest_debounced_source() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_source_at_root(
+                doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                Arc::new(Snapshot::from_native(1, native_source("a"))),
+                worktree.clone(),
+                Arc::default(),
+            );
+            await_ready(&events, doc).await;
+            let mut sources = Vec::new();
+            for version in 2..8 {
+                let source = native_source(&"a".repeat(version as usize));
+                manager.change_snapshot(doc, version, &[], source.clone());
+                assert!(!source.is_materialized());
+                sources.push(source);
+            }
+            let fake = handle_of(&slot).await;
+            let change = fake.wait_for("textDocument/didChange").await;
+            assert_eq!(change.params["contentChanges"][0]["text"], "aaaaaaa");
+            assert_eq!(fake.entries("textDocument/didChange").len(), 1);
+            assert_eq!(sources.last().unwrap().serialization_count(), 1);
+            assert!(sources.iter().all(|source| !source.is_materialized()));
+            assert!(
+                sources[..sources.len() - 1]
+                    .iter()
+                    .all(|source| source.serialization_count() == 0)
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn native_incremental_ranges_are_verified_against_the_immutable_result() {
+        let base = Snapshot::from_native(1, native_source("before"));
+        let expected = native_source("incorrect");
+        assert!(
+            native_incremental(
+                &base,
+                &[LspTextEdit {
+                    range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 6)),
+                    new_text: "after".into()
+                }],
+                &expected
+            )
+            .is_none()
+        );
+        assert!(!expected.is_materialized());
+        assert!(!base.native.unwrap().is_materialized());
+    }
+
+    #[test]
+    fn native_group_ranges_use_persistent_intermediate_lines() {
+        let base = Snapshot::from_native(1, native_source("a😀\nlast"));
+        let changes = native_incremental(
+            &base,
+            &[
+                LspTextEdit {
+                    range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                    new_text: "first\n".into(),
+                },
+                LspTextEdit {
+                    range: LspRange::new(LspPosition::new(1, 2), LspPosition::new(1, 2)),
+                    new_text: "x".into(),
+                },
+            ],
+            &native_source("first\na😀x\nlast"),
+        )
+        .unwrap();
+        assert_eq!(
+            changes[1].range.unwrap().start,
+            lsp_types::Position::new(1, 3)
+        );
+        assert!(!base.native.unwrap().is_materialized());
+    }
+
     #[test]
     fn debounced_edits_coalesce_into_one_notification() {
         block_on(async {
@@ -5260,7 +9095,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             handle.wait_for("textDocument/didOpen").await;
@@ -5305,7 +9140,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "a𝄞b\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "a𝄞b\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             let uri = Url::from_file_path(&file).expect("uri").to_string();
@@ -5356,7 +9191,10 @@ mod tests {
                 "UTF-16 offsets convert back to scalar offsets"
             );
             assert_eq!(items[0].severity, LspSeverity::Warning);
-            assert_eq!(items[0].code.as_deref(), Some("E0001"));
+            assert_eq!(
+                items[0].code,
+                Some(lsp_types::NumberOrString::String("E0001".into()))
+            );
             assert_eq!(items[0].source.as_deref(), Some("fake"));
             manager.shutdown();
         });
@@ -5446,7 +9284,7 @@ mod tests {
             });
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abcdef\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abcdef\n");
             let _handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
 
@@ -5605,7 +9443,7 @@ mod tests {
             });
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
 
@@ -5649,7 +9487,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
 
@@ -5696,7 +9534,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             let uri = Url::from_file_path(&file).expect("uri").to_string();
@@ -5810,10 +9648,12 @@ mod tests {
             });
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let _handle = handle_of(&slot).await;
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc: at, status } if *at == doc => match status {
+                LspEvent::Status {
+                    doc: at, status, ..
+                } if *at == doc => match status {
                     LspStatus::Failed { .. } => Some(status.clone()),
                     _ => None,
                 },
@@ -5840,7 +9680,8 @@ mod tests {
                     .snapshots
                     .latest(&uri)
                     .expect("the snapshot survives the crash")
-                    .text,
+                    .full_text()
+                    .as_ref(),
                 "abcd\n"
             );
 
@@ -5868,7 +9709,7 @@ mod tests {
     ) -> (FakeHandle, async_channel::Receiver<LspEvent>) {
         let slot = install_fake(manager, incremental_capabilities(), |_| Vec::new());
         let events = manager.events();
-        manager.open(doc, file, worktree, rust_language(), 1, "abc\n");
+        manager.open_for_test(doc, file, worktree, rust_language(), 1, "abc\n");
         let handle = handle_of(&slot).await;
         await_ready(&events, doc).await;
         (handle, events)
@@ -5882,6 +9723,7 @@ mod tests {
             LspEvent::Status {
                 doc: at,
                 status: LspStatus::Failed { reason, .. },
+                ..
             } if *at == doc => Some(reason.clone()),
             _ => None,
         })
@@ -6024,7 +9866,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             manager.shutdown();
@@ -6046,11 +9888,45 @@ mod tests {
     }
 
     #[test]
+    fn initialization_options_reach_the_server_before_document_open() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let options = json!({
+                "checkOnSave": false,
+                "cargo": {"buildScripts": {"enable": false}, "extraArgs": ["--locked", "--offline"]},
+                "procMacro": {"enable": false}
+            });
+            manager.servers[0].initialization_options = Some(options.clone());
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            await_ready(&events, doc).await;
+            let fake = handle_of(&slot).await;
+            fake.wait_for("textDocument/didOpen").await;
+            assert_eq!(
+                fake.entries("initialize")[0].params["initializationOptions"],
+                options
+            );
+            let methods = fake.methods();
+            assert!(
+                methods.iter().position(|method| method == "initialize")
+                    < methods
+                        .iter()
+                        .position(|method| method == "textDocument/didOpen")
+            );
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
     fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
         block_on(async {
             let (_guard, worktree, file) = workspace();
             // The real launcher runs here: nothing with this name can exist.
             let mut manager = LspManager::new(vec![LanguageServerSettings {
+                initialization_options: None,
                 id: "rust-analyzer".to_owned(),
                 languages: vec![crate::settings::LanguageServerLanguage {
                     language_id: "rust".to_owned(),
@@ -6063,11 +9939,13 @@ mod tests {
             let doc = LspDocumentId(1);
             // Construction never probes PATH, so opening is what discovers it.
             assert_eq!(
-                manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n"),
+                manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n"),
                 LspStatus::Starting
             );
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc: at, status } if *at == doc => match status {
+                LspEvent::Status {
+                    doc: at, status, ..
+                } if *at == doc => match status {
                     LspStatus::Unavailable { .. } => Some(status.clone()),
                     _ => None,
                 },
@@ -6088,7 +9966,8 @@ mod tests {
                     .snapshots
                     .latest(&Url::from_file_path(&file).expect("uri"))
                     .expect("snapshot")
-                    .text,
+                    .full_text()
+                    .as_ref(),
                 "abcd\n",
                 "editing continues without a server"
             );
@@ -6175,7 +10054,7 @@ mod tests {
         let path = PathBuf::from(OsString::from_vec(vec![
             b'/', b't', b'm', b'p', b'/', 0xff, b'.', b'r', b's',
         ]));
-        let status = manager.open(
+        let status = manager.open_for_test(
             LspDocumentId(1),
             &path,
             Path::new("/tmp"),
@@ -6195,7 +10074,7 @@ mod tests {
     #[test]
     fn an_unknown_server_id_is_refused_without_starting_a_session() {
         let mut manager = rust_manager();
-        let status = manager.open(
+        let status = manager.open_for_test(
             LspDocumentId(1),
             Path::new("/tmp/a.rs"),
             Path::new("/tmp"),
@@ -6776,7 +10655,7 @@ mod tests {
             );
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             assert!(
@@ -6854,7 +10733,7 @@ mod tests {
     #[test]
     fn two_files_in_one_root_share_one_session_and_debounce_independently() {
         block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = canonical_tempdir();
             let worktree = root.path().to_path_buf();
             std::fs::write(worktree.join("Cargo.toml"), "").expect("marker");
             let first = worktree.join("first.rs");
@@ -6868,11 +10747,10 @@ mod tests {
             let events = manager.events();
             let one = LspDocumentId(1);
             let two = LspDocumentId(2);
-            manager.open(one, &first, &worktree, rust_language(), 1, "a\n");
-            manager.open(two, &second, &worktree, rust_language(), 1, "b\n");
+            manager.open_for_test(one, &first, &worktree, rust_language(), 1, "a\n");
+            manager.open_for_test(two, &second, &worktree, rust_language(), 1, "b\n");
             let handle = handle_for(&registry, &worktree).await;
-            await_ready(&events, one).await;
-            await_ready(&events, two).await;
+            await_ready_documents(&events, &[one, two]).await;
 
             assert_eq!(
                 registry.lock().expect("registry").len(),
@@ -6921,10 +10799,10 @@ mod tests {
     }
 
     #[test]
-    fn progress_reaches_only_the_documents_of_the_emitting_session() {
+    fn diagnostics_reach_only_the_documents_of_the_emitting_session() {
         block_on(async {
-            let first_root = tempfile::tempdir().expect("tempdir");
-            let second_root = tempfile::tempdir().expect("tempdir");
+            let first_root = canonical_tempdir();
+            let second_root = canonical_tempdir();
             let first = first_root.path().join("one.rs");
             let second = second_root.path().join("two.rs");
             std::fs::write(&first, "a\n").expect("write");
@@ -6936,12 +10814,97 @@ mod tests {
             let events = manager.events();
             let one = LspDocumentId(1);
             let two = LspDocumentId(2);
-            manager.open(one, &first, first_root.path(), rust_language(), 1, "a\n");
-            manager.open(two, &second, second_root.path(), rust_language(), 1, "b\n");
+            manager.open_for_test(one, &first, first_root.path(), rust_language(), 1, "a\n");
+            manager.open_for_test(two, &second, second_root.path(), rust_language(), 1, "b\n");
+            let first_handle = handle_for(&registry, first_root.path()).await;
+            let second_handle = handle_for(&registry, second_root.path()).await;
+            await_ready_documents(&events, &[one, two]).await;
+            assert_eq!(manager.sessions.len(), 2);
+
+            let first_uri = Url::from_file_path(&first).expect("uri").to_string();
+            let second_uri = Url::from_file_path(&second).expect("uri").to_string();
+            for version in [Some(1), None] {
+                first_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": second_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "another live server does not own this file"
+                        }]
+                    }),
+                );
+                // This follows the foreign publication on the SAME server's
+                // ordered wire. Its real event is the barrier: a leaked batch
+                // must fail before it, without a sleep or an absent-event guess.
+                first_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": first_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "first server's own diagnostic"
+                        }]
+                    }),
+                );
+                let (doc, message) = next_matching(&events, |event| match event {
+                    LspEvent::Diagnostics { doc, items, .. } => {
+                        Some((*doc, items.first().map(|item| item.message.to_owned())))
+                    }
+                    _ => None,
+                })
+                .await;
+                assert_eq!(doc, one, "a live server cannot publish into another root");
+                assert_eq!(message.as_deref(), Some("first server's own diagnostic"));
+
+                second_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": second_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "second server's own diagnostic"
+                        }]
+                    }),
+                );
+                let (doc, message) = next_matching(&events, |event| match event {
+                    LspEvent::Diagnostics { doc, items, .. } => {
+                        Some((*doc, items.first().map(|item| item.message.to_owned())))
+                    }
+                    _ => None,
+                })
+                .await;
+                assert_eq!(doc, two);
+                assert_eq!(message.as_deref(), Some("second server's own diagnostic"));
+            }
+            manager.shutdown();
+        });
+    }
+
+    #[test]
+    fn progress_reaches_only_the_documents_of_the_emitting_session() {
+        block_on(async {
+            let first_root = canonical_tempdir();
+            let second_root = canonical_tempdir();
+            let first = first_root.path().join("one.rs");
+            let second = second_root.path().join("two.rs");
+            std::fs::write(&first, "a\n").expect("write");
+            std::fs::write(&second, "b\n").expect("write");
+
+            let mut manager = rust_manager();
+            let registry =
+                install_fake_registry(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            manager.open_for_test(one, &first, first_root.path(), rust_language(), 1, "a\n");
+            manager.open_for_test(two, &second, second_root.path(), rust_language(), 1, "b\n");
             let first_handle = handle_for(&registry, first_root.path()).await;
             let _second_handle = handle_for(&registry, second_root.path()).await;
-            await_ready(&events, one).await;
-            await_ready(&events, two).await;
+            await_ready_documents(&events, &[one, two]).await;
             assert_eq!(
                 manager.sessions.len(),
                 2,
@@ -6956,7 +10919,9 @@ mod tests {
                 }),
             );
             let doc = next_matching(&events, |event| match event {
-                LspEvent::Progress { doc, progress } if progress.token == "indexing" => Some(*doc),
+                LspEvent::Progress { doc, progress, .. } if progress.token == "indexing" => {
+                    Some(*doc)
+                }
                 _ => None,
             })
             .await;
@@ -6981,14 +10946,14 @@ mod tests {
             let events = manager.events();
             let one = LspDocumentId(1);
             let two = LspDocumentId(2);
-            manager.open(one, &file, &worktree, rust_language(), 1, "first\n");
+            manager.open_for_test(one, &file, &worktree, rust_language(), 1, "first\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, one).await;
             handle.wait_for("textDocument/didOpen").await;
 
             // A second buffer on the same file with different text: the server
             // holds the first text, so it must be resynchronised.
-            manager.open(two, &file, &worktree, rust_language(), 1, "second\n");
+            manager.open_for_test(two, &file, &worktree, rust_language(), 1, "second\n");
             let resync = handle.wait_for("textDocument/didChange").await;
             assert_eq!(
                 resync.params["contentChanges"][0]["text"],
@@ -7037,7 +11002,7 @@ mod tests {
             let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
             manager.change(doc, 2, &[], "abcd\n");
@@ -7080,7 +11045,7 @@ mod tests {
     #[test]
     fn a_dead_session_is_replaced_and_every_open_document_is_reopened() {
         block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = canonical_tempdir();
             let worktree = root.path().to_path_buf();
             std::fs::write(worktree.join("Cargo.toml"), "").expect("marker");
             let first = worktree.join("first.rs");
@@ -7104,10 +11069,10 @@ mod tests {
                 });
             let events = manager.events();
             let one = LspDocumentId(1);
-            manager.open(one, &first, &worktree, rust_language(), 1, "a\n");
+            manager.open_for_test(one, &first, &worktree, rust_language(), 1, "a\n");
             let _ = handle_for(&registry, &worktree).await;
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc, status } if *doc == one => match status {
+                LspEvent::Status { doc, status, .. } if *doc == one => match status {
                     LspStatus::Failed { .. } => Some(status.clone()),
                     _ => None,
                 },
@@ -7120,7 +11085,7 @@ mod tests {
             // session; the already-open document must be reopened on it, or
             // the new server would know nothing about it.
             let two = LspDocumentId(2);
-            manager.open(two, &second, &worktree, rust_language(), 1, "b\n");
+            manager.open_for_test(two, &second, &worktree, rust_language(), 1, "b\n");
             let replacement = {
                 let deadline = tokio::time::Instant::now() + WAIT;
                 loop {
@@ -7175,7 +11140,7 @@ mod tests {
             );
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let _handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
 
@@ -7211,7 +11176,7 @@ mod tests {
             Arc::new(Mutex::new(Some(child))),
         );
         let events = manager.events();
-        manager.open(doc, file, worktree, rust_language(), 1, "abc\n");
+        manager.open_for_test(doc, file, worktree, rust_language(), 1, "abc\n");
         let _handle = handle_of(&slot).await;
         await_ready(&events, doc).await;
         assert!(
@@ -7349,7 +11314,7 @@ mod tests {
             );
             let events = manager.events();
             let doc = LspDocumentId(1);
-            manager.open(doc, &file, &worktree, rust_language(), 1, "abc\n");
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let _handle = handle_of(&slot).await;
             await_ready(&events, doc).await;
 
@@ -7387,7 +11352,7 @@ mod tests {
     /// A worktree, a sibling directory outside it that also carries a root
     /// marker, and a symlink inside the worktree pointing at that sibling.
     fn escaping_symlink() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path().join("worktree");
         let outside = root.path().join("outside");
         std::fs::create_dir_all(worktree.join("src")).expect("worktree");
@@ -7619,5 +11584,171 @@ mod tests {
             vec!["fine"],
             "the refused item is omitted and the rest are still offered"
         );
+    }
+
+    #[test]
+    fn reconfiguration_waits_for_prior_reap_even_across_an_empty_intermediate_manager() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let mut intermediate = rust_manager().after_shutdown(async move {
+                let _ = waiting.await;
+            });
+            // A second settings change before root discovery has opened any
+            // document must preserve the first manager's outstanding reap.
+            let predecessor = intermediate.begin_shutdown();
+            let mut manager = rust_manager()
+                .with_lifecycle(1, 1)
+                .after_shutdown(predecessor);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "replacement process started before old reap completed"
+            );
+            release.send(()).unwrap();
+            let _handle = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn cancelling_one_launch_waiter_does_not_release_or_cancel_other_waiters() {
+        block_on(async {
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let barrier = Arc::new(LaunchBarrier {
+                predecessor: Mutex::new(Some(Box::pin(async move {
+                    let _ = waiting.await;
+                }))),
+                ready: AtomicBool::new(false),
+                changed: Notify::new(),
+            });
+            let first = tokio::spawn(Arc::clone(&barrier).wait());
+            tokio::task::yield_now().await;
+            first.abort();
+            let second = tokio::spawn(Arc::clone(&barrier).wait());
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            release.send(()).unwrap();
+            tokio::time::timeout(WAIT, second).await.unwrap().unwrap();
+            assert!(barrier.ready.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn externally_removed_root_retires_and_refreshes_last_server_metrics() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            let handle = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            assert_eq!(manager.live_servers().len(), 1);
+            std::fs::remove_dir_all(&worktree).unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            handle.wait_for("shutdown").await;
+            handle.wait_for("exit").await;
+            assert!(manager.live_servers().is_empty());
+            assert!(handle.methods().iter().any(|method| method == "shutdown"));
+            assert!(handle.methods().iter().any(|method| method == "exit"));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn replaced_root_reaps_original_server_before_reopening_the_same_path() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let worktree = parent.path().join("workspace");
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            let file = worktree.join("main.rs");
+            std::fs::write(&file, "fn old() {}\n").unwrap();
+            let child = spawn_test_child(
+                &["--exact", CHILD_HELPER_TEST, "--test-threads=1"],
+                Helper::Sleeps,
+                true,
+            );
+            let pid = child.process_group;
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake_with_child(
+                &mut manager,
+                incremental_capabilities(),
+                |_| Vec::new(),
+                Arc::new(Mutex::new(Some(child))),
+            );
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn old() {}\n");
+            let old = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+
+            // There is never a watchdog observation where this spelling is
+            // missing. The old open document also prevents idle expiration.
+            std::fs::rename(&worktree, parent.path().join("previous-workspace")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(&file, "fn replacement() {}\n").unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at }
+                    if *at == doc && manager.live_servers().is_empty() =>
+                {
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            assert!(
+                wait_until_gone(pid).await,
+                "the old server must be reaped before replacement admission"
+            );
+            assert!(manager.live_servers().is_empty());
+            assert!(old.methods().iter().any(|method| method == "shutdown"));
+            assert!(old.methods().iter().any(|method| method == "exit"));
+            assert!(matches!(manager.status(doc), LspStatus::Disabled));
+
+            manager.open_for_test(
+                LspDocumentId(2),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "fn replacement() {}\n",
+            );
+            await_ready(&events, LspDocumentId(2)).await;
+            let replacement = handle_of(&slot).await;
+            assert_eq!(replacement.entries("initialize").len(), 1);
+            assert!(replacement.entries("shutdown").is_empty());
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn root_pin_retains_original_directory_identity_after_path_replacement() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("workspace");
+            std::fs::create_dir(&root).unwrap();
+            let (pin, identity) = pin_session_root(&root).await.unwrap();
+            std::fs::rename(&root, parent.path().join("original")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            assert!(identity == RootIdentity::from_metadata(&pin.metadata().await.unwrap()));
+            assert!(identity != RootIdentity::from_metadata(&std::fs::metadata(&root).unwrap()));
+        });
     }
 }

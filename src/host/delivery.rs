@@ -14,10 +14,10 @@ use crate::{
 use super::state::ClientId;
 
 pub(crate) const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 512;
-/// Native transcript pages can be several MiB. Two queued pages are sufficient
-/// for the single-read-credit client; do not allow the ordinary small-message
-/// count limit to retain gigabytes for a stalled peer.
-const MAX_QUEUED_CHAT_PAGES: usize = 2;
+/// Native transcript, channel-work and Work board pages can be several MiB. They share
+/// two queued page credits, preserving the existing single-read-credit bound
+/// rather than letting the ordinary small-message count retain gigabytes.
+const MAX_QUEUED_BULK_PAGES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeliveryError {
@@ -72,31 +72,33 @@ impl From<ServerEnvelope> for Outbound {
     }
 }
 
-/// Message kinds that share one pending slot for a session.
+/// Replaceable state sharing one pending slot, by session or for the whole board.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum SlotKind {
-    Redraw,
-    ChatChanged,
-    ChatActivity,
-    Bell,
+enum SlotKey {
+    Redraw(TerminalId),
+    ChatChanged(TerminalId),
+    ChatActivity(TerminalId),
+    Bell(TerminalId),
+    WorkBoard,
 }
 
-fn coalescible(message: &ServerMessage) -> Option<(SlotKind, TerminalId)> {
+fn coalescible(message: &ServerMessage) -> Option<SlotKey> {
     match message {
-        ServerMessage::Redraw { terminal_id, .. } => Some((SlotKind::Redraw, *terminal_id)),
-        ServerMessage::ChatChanged { chat_id } => Some((SlotKind::ChatChanged, *chat_id)),
-        ServerMessage::ChatActivity { chat_id, .. } => Some((SlotKind::ChatActivity, *chat_id)),
+        ServerMessage::Redraw { terminal_id, .. } => Some(SlotKey::Redraw(*terminal_id)),
+        ServerMessage::ChatChanged { chat_id } => Some(SlotKey::ChatChanged(*chat_id)),
+        ServerMessage::ChatActivity { chat_id, .. } => Some(SlotKey::ChatActivity(*chat_id)),
         ServerMessage::Event {
             terminal_id,
             event: crate::terminal_ipc::WireTerminalEvent::Bell,
             ..
-        } => Some((SlotKind::Bell, *terminal_id)),
+        } => Some(SlotKey::Bell(*terminal_id)),
+        ServerMessage::WorkBoard { .. } => Some(SlotKey::WorkBoard),
         _ => None,
     }
 }
 
-/// Whether this message carries a whole native transcript page.
-fn chat_page(message: &ServerMessage) -> bool {
+/// Whether this response consumes the existing shared bulk-page credit.
+fn bulk_page(message: &ServerMessage) -> bool {
     matches!(
         message,
         ServerMessage::Response {
@@ -108,6 +110,15 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatTextCopy { .. }
+                | ServerResponse::ChannelWork(
+                    crate::channel_work_api::Response::Snapshot(_)
+                        | crate::channel_work_api::Response::Applied(_)
+                        | crate::channel_work_api::Response::Target(_)
+                )
+                | ServerResponse::Work(
+                    crate::work::Response::Board(_) | crate::work::Response::Watching { .. }
+                )
         }
     )
 }
@@ -119,9 +130,9 @@ struct QueueState {
     /// so `push` never scans the queue. A position is `popped` plus the index
     /// in `messages`; both are monotonic, so an entry can only be stale, never
     /// wrong, and a stale entry is discarded on lookup.
-    slots: BTreeMap<(SlotKind, TerminalId), u64>,
+    slots: BTreeMap<SlotKey, u64>,
     popped: u64,
-    queued_chat_pages: usize,
+    queued_bulk_pages: usize,
     close_after_drain: bool,
     aborted: bool,
 }
@@ -129,7 +140,7 @@ struct QueueState {
 impl QueueState {
     /// The queue index of the newest coalescible message for `key`, if it is
     /// still queued.
-    fn slot(&mut self, key: (SlotKind, TerminalId)) -> Option<usize> {
+    fn slot(&mut self, key: SlotKey) -> Option<usize> {
         let position = *self.slots.get(&key)?;
         let index = position
             .checked_sub(self.popped)
@@ -146,8 +157,8 @@ impl QueueState {
             let position = self.popped + self.messages.len() as u64;
             self.slots.insert(key, position);
         }
-        if chat_page(&message.message) {
-            self.queued_chat_pages += 1;
+        if bulk_page(&message.message) {
+            self.queued_bulk_pages += 1;
         }
         self.messages.push_back(message);
     }
@@ -159,8 +170,8 @@ impl QueueState {
         {
             self.slots.remove(&key);
         }
-        if chat_page(&message.message) {
-            self.queued_chat_pages -= 1;
+        if bulk_page(&message.message) {
+            self.queued_bulk_pages -= 1;
         }
         self.popped += 1;
         Some(message)
@@ -170,7 +181,7 @@ impl QueueState {
         self.popped += self.messages.len() as u64;
         self.messages.clear();
         self.slots.clear();
-        self.queued_chat_pages = 0;
+        self.queued_bulk_pages = 0;
     }
 }
 
@@ -191,7 +202,7 @@ impl DeliveryQueue {
                 messages: VecDeque::new(),
                 slots: BTreeMap::new(),
                 popped: 0,
-                queued_chat_pages: 0,
+                queued_bulk_pages: 0,
                 close_after_drain: false,
                 aborted: false,
             }),
@@ -201,7 +212,8 @@ impl DeliveryQueue {
 
     /// Enqueues a message without allowing a slow client to apply backpressure
     /// to a terminal worker. Redraw edges and chat activity for the same
-    /// session are collapsed to the newest state through `slots`. Bells keep
+    /// session and full Work board publications are collapsed to the newest
+    /// state through `slots`. Bells keep
     /// their earliest queued attention edge; other semantic events and
     /// responses remain ordered and lossless until the bounded queue
     /// disconnects the client.
@@ -271,19 +283,35 @@ impl DeliveryQueue {
                         return Ok(());
                     }
                 }
+                ServerMessage::WorkBoard { revision, .. } => {
+                    let existing = &state.messages[index];
+                    if existing.proof == message.proof
+                        && let ServerMessage::WorkBoard {
+                            revision: queued, ..
+                        } = &existing.message
+                    {
+                        // These are complete snapshots. A later board may
+                        // replace an earlier publication in place, but never
+                        // a correlated reply or another daemon's proof.
+                        if revision >= queued {
+                            state.messages[index] = message;
+                        }
+                        return Ok(());
+                    }
+                }
                 _ => {}
             }
         }
 
-        let chat_backlog =
-            chat_page(&message.message) && state.queued_chat_pages >= MAX_QUEUED_CHAT_PAGES;
-        if state.messages.len() >= self.capacity || chat_backlog {
+        let bulk_backlog =
+            bulk_page(&message.message) && state.queued_bulk_pages >= MAX_QUEUED_BULK_PAGES;
+        if state.messages.len() >= self.capacity || bulk_backlog {
             let queued = state.messages.len();
             tracing::warn!(
                 client = self.client_id,
                 queued,
                 capacity = self.capacity,
-                chat_pages = state.queued_chat_pages,
+                bulk_pages = state.queued_bulk_pages,
                 "disconnecting a cagents daemon client that fell behind its delivery queue"
             );
             state.discard();
@@ -383,6 +411,135 @@ mod tests {
                 terminal_id,
                 generation,
             },
+        }
+    }
+
+    fn board(marker: u64) -> crate::work::Board {
+        crate::work::Board {
+            generated_at_unix_ms: marker,
+            stale_after_days: 7,
+            projects: Vec::new(),
+            items: Vec::new(),
+            linear_unavailable: Some("x".repeat(64 * 1024)),
+        }
+    }
+
+    fn work_board(revision: u64) -> ServerEnvelope {
+        let mut envelope = redraw(TerminalId::new(), 0);
+        envelope.message = ServerMessage::WorkBoard {
+            revision,
+            board: Box::new(board(revision)),
+        };
+        envelope
+    }
+
+    #[test]
+    fn work_board_bursts_keep_one_latest_payload_and_preserve_semantic_replies() {
+        let queue = DeliveryQueue::new(1, 3);
+        let accepted = |request_id| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(request_id);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            };
+            envelope
+        };
+        queue.push(accepted(1)).unwrap();
+        queue.push(work_board(1)).unwrap();
+        queue.push(accepted(2)).unwrap();
+        // A queue at its count limit must still accept replacement snapshots.
+        for revision in 2..=128 {
+            queue.push(work_board(revision)).unwrap();
+        }
+        queue.push(work_board(4)).unwrap();
+        {
+            let state = queue.state.lock().unwrap();
+            assert_eq!(state.messages.len(), 3);
+            assert_eq!(state.slots.len(), 1);
+            assert_eq!(state.queued_bulk_pages, 0);
+        }
+        assert_eq!(queue.pop().unwrap().request_id, Some(1));
+        let published = queue.pop().unwrap();
+        assert_eq!(published.request_id, None);
+        assert!(matches!(published.message,
+            ServerMessage::WorkBoard { revision: 128, board }
+                if board.generated_at_unix_ms == 128
+                    && board.linear_unavailable.as_ref().unwrap().len() == 64 * 1024
+        ));
+        assert_eq!(queue.pop().unwrap().request_id, Some(2));
+        // A drained slot cannot swallow the next publication.
+        queue.push(work_board(129)).unwrap();
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::WorkBoard { revision: 129, .. }
+        ));
+    }
+
+    #[test]
+    fn work_board_publications_do_not_replace_another_daemon_proof() {
+        let queue = DeliveryQueue::new(1, 2);
+        queue.push(work_board(5)).unwrap();
+        let mut replacement = work_board(1);
+        replacement.proof.host_incarnation = HostIncarnation::new("replacement");
+        queue.push(replacement.clone()).unwrap();
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::WorkBoard { revision: 5, .. }
+        ));
+        assert_eq!(queue.pop().unwrap().wire().proof, &replacement.proof);
+    }
+
+    #[test]
+    fn work_board_replies_share_bulk_credit_without_coalescing_correlated_responses() {
+        let reply = |request_id, response| {
+            let mut envelope = work_board(99);
+            envelope.request_id = Some(request_id);
+            envelope.message = ServerMessage::Response { response };
+            envelope
+        };
+        let pages = [
+            ServerResponse::Work(crate::work::Response::Board(board(1))),
+            ServerResponse::Work(crate::work::Response::Watching {
+                revision: 2,
+                board: Box::new(board(2)),
+            }),
+        ];
+        for page in pages {
+            let queue = DeliveryQueue::new(1, DEFAULT_CLIENT_QUEUE_CAPACITY);
+            queue.push(reply(1, page.clone())).unwrap();
+            queue.push(reply(2, page.clone())).unwrap();
+            queue.push(work_board(3)).unwrap();
+            queue.push(work_board(4)).unwrap();
+            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
+            let first = queue.pop().unwrap();
+            assert_eq!(first.request_id, Some(1));
+            assert!(matches!(first.message,
+                ServerMessage::Response { response } if response == page
+            ));
+            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
+            queue
+                .push(reply(3, ServerResponse::ChatListed { sessions: vec![] }))
+                .unwrap();
+            assert_eq!(queue.pop().unwrap().request_id, Some(2));
+            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
+            assert!(matches!(
+                queue.pop().unwrap().message,
+                ServerMessage::WorkBoard { revision: 4, .. }
+            ));
+            queue.push(reply(4, page.clone())).unwrap();
+            assert_eq!(queue.push(reply(5, page.clone())), Err(DeliveryError::Full));
+            {
+                let state = queue.state.lock().unwrap();
+                assert_eq!(state.queued_bulk_pages, 0);
+                assert!(state.slots.is_empty());
+            }
+            let ServerMessage::Error(error) = queue.pop().unwrap().message else {
+                panic!("bulk overflow must explain why the connection closed")
+            };
+            assert_eq!(error.code, ProtocolErrorCode::QueueFull);
+            assert!(error.retryable);
+            assert_eq!(queue.push(reply(6, page)), Err(DeliveryError::Closed));
+            assert!(queue.pop().is_none());
         }
     }
 
@@ -527,6 +684,54 @@ mod tests {
     /// A client severed for backpressure must be able to report why, so the
     /// last frame it receives names the cause instead of being an EOF.
     #[test]
+    fn text_copy_pages_share_bulk_backpressure_and_release_credit_when_drained() {
+        let queue = DeliveryQueue::new(7, DEFAULT_CLIENT_QUEUE_CAPACITY);
+        let chat_id = TerminalId::new();
+        let source = crate::chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: crate::chat::TextCopyScope::Conversation,
+            token: 1,
+            revision: 1,
+            bytes: (4 * crate::chat::TEXT_COPY_PAGE_BYTES) as u64,
+        };
+        let page = |request| {
+            let mut envelope = redraw(chat_id, 0);
+            envelope.request_id = Some(request);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::ChatTextCopy {
+                    chat_id,
+                    page: crate::chat::TextCopyPage {
+                        source: source.clone(),
+                        offset: (request - 1) * crate::chat::TEXT_COPY_PAGE_BYTES as u64,
+                        text: "x".repeat(crate::chat::TEXT_COPY_PAGE_BYTES),
+                        done: request == 4,
+                    },
+                },
+            };
+            envelope
+        };
+        queue.push(page(1)).unwrap();
+        queue.push(page(2)).unwrap();
+        let first = queue.pop().unwrap();
+        assert_eq!(first.request_id, Some(1));
+        assert!(matches!(first.message, ServerMessage::Response {
+            response: ServerResponse::ChatTextCopy { page, .. }
+        } if page.offset == 0 && page.text.len() == crate::chat::TEXT_COPY_PAGE_BYTES));
+        // Draining one page admits the next; a third retained page must still
+        // fail at the bulk limit, well before the ordinary 512-frame capacity.
+        queue.push(page(3)).unwrap();
+        assert_eq!(queue.push(page(4)), Err(DeliveryError::Full));
+        assert_eq!(queue.push(page(4)), Err(DeliveryError::Closed));
+        let delivered = queue.pop().unwrap();
+        let ServerMessage::Error(error) = delivered.message else {
+            panic!("a stalled text-copy peer was not told why");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::QueueFull);
+        assert!(error.retryable);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
     fn overflow_reports_backpressure_on_the_wire_then_closes() {
         let queue = DeliveryQueue::new(7, 1);
         let mut envelope = redraw(TerminalId::new(), 1);
@@ -545,5 +750,103 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
         assert!(error.retryable);
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn channel_work_pages_share_chat_credit_preserve_order_and_close_on_mixed_overflow() {
+        use crate::channel_work::{
+            Home, HomeLifecycle, Receipt, Reply, Snapshot, Target, TargetSnapshot,
+        };
+        use crate::channel_work_api::Response;
+        use crate::github_identity::{GitHubRepoKey, PullRequestKey};
+        let home = Home {
+            registry: uuid::Uuid::new_v4(),
+            channel: crate::model::ChannelId::new(),
+            creation_ordinal: 1,
+        };
+        let snapshot = Snapshot {
+            home,
+            lifecycle: HomeLifecycle::Active,
+            revision: 0,
+            entries: vec![],
+            history: vec![],
+            next_current: None,
+            next_history: None,
+        };
+        let target = Target::PullRequest(
+            PullRequestKey::new(
+                GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+                1,
+            )
+            .unwrap(),
+        );
+        let pages = [
+            Response::Snapshot(snapshot.clone()),
+            Response::Applied(Reply {
+                receipt: Receipt {
+                    operation: uuid::Uuid::new_v4(),
+                    home,
+                    revision: 0,
+                    sequence: 0,
+                    changed: false,
+                },
+                snapshot,
+            }),
+            Response::Target(TargetSnapshot {
+                home,
+                lifecycle: HomeLifecycle::Active,
+                revision: 0,
+                target,
+                entry: None,
+            }),
+        ];
+        let envelope = |id, response| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(id);
+            envelope.message = ServerMessage::Response { response };
+            envelope
+        };
+        for page in pages {
+            let queue = DeliveryQueue::new(7, DEFAULT_CLIENT_QUEUE_CAPACITY);
+            queue
+                .push(envelope(1, ServerResponse::ChatListed { sessions: vec![] }))
+                .unwrap();
+            queue
+                .push(envelope(2, ServerResponse::ChannelWork(page.clone())))
+                .unwrap();
+            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
+            assert_eq!(queue.pop().unwrap().request_id, Some(1));
+            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
+            queue
+                .push(envelope(3, ServerResponse::ChannelWork(page.clone())))
+                .unwrap();
+            let first_work = queue.pop().unwrap();
+            assert_eq!(first_work.request_id, Some(2));
+            assert!(
+                matches!(first_work.message, ServerMessage::Response { response: ServerResponse::ChannelWork(returned) } if returned == page)
+            );
+            queue
+                .push(envelope(4, ServerResponse::ChatListed { sessions: vec![] }))
+                .unwrap();
+            assert_eq!(
+                queue.push(envelope(5, ServerResponse::ChannelWork(page.clone()))),
+                Err(DeliveryError::Full)
+            );
+            assert_eq!(
+                queue.state.lock().unwrap().queued_bulk_pages,
+                0,
+                "overflow discards every bulk credit"
+            );
+            assert_eq!(
+                queue.push(envelope(6, ServerResponse::ChannelWork(page))),
+                Err(DeliveryError::Closed)
+            );
+            let ServerMessage::Error(error) = queue.pop().unwrap().message else {
+                panic!("bounded queue must report its overflow")
+            };
+            assert_eq!(error.code, ProtocolErrorCode::QueueFull);
+            assert!(error.retryable);
+            assert!(queue.pop().is_none());
+        }
     }
 }

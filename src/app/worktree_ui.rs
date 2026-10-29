@@ -100,9 +100,11 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
         CardKind::PullRequests(view) => Some(&view.repository),
-        CardKind::Browser(_) | CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
-            None
-        }
+        CardKind::Browser(_)
+        | CardKind::Settings
+        | CardKind::Accounts
+        | CardKind::Automations
+        | CardKind::Work => None,
     }
 }
 
@@ -190,12 +192,15 @@ fn scope_descriptor(
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
+        chat_draft_attachments: HashMap::new(),
+        agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
+        pending_chat_admissions: Default::default(),
         pending_terminal_creations: HashSet::new(),
     }
 }
@@ -334,31 +339,41 @@ impl Cagents {
         }
     }
 
+    /// The exact directory a channel enters, also used by navigation admission.
+    pub(super) fn channel_directory(&self, id: ChannelId) -> Option<PathBuf> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .map(|worktree| worktree.path.clone())
+                .unwrap_or_else(|| {
+                    project
+                        .repository
+                        .parent()
+                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                        .unwrap_or(&project.repository)
+                        .to_path_buf()
+                }),
+        )
+    }
+
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(channel) = self
+        let Some(path) = self.channel_directory(id) else {
+            return Task::none();
+        };
+        let channel = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-        else {
-            return Task::none();
-        };
-        let Some(project) = self.sidebar_model.project(channel.project_id) else {
-            return Task::none();
-        };
-        let path = project
-            .worktrees
-            .iter()
-            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-            .map(|worktree| worktree.path.clone())
-            .unwrap_or_else(|| {
-                project
-                    .repository
-                    .parent()
-                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                    .unwrap_or(&project.repository)
-                    .to_path_buf()
-            });
+            .expect("the channel directory resolved this same channel");
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
@@ -482,9 +497,24 @@ impl Cagents {
     /// nobody's worktree, so neither counts. A path listed under two projects
     /// marks both rows.
     ///
-    /// This runs after every update, terminal output included, so channel
-    /// membership is collected once rather than rescanned per card.
+    /// Structural updates also rebind existing activity and unread ownership.
+    /// Root discovery is shared for this pass, and unchanged grid output skips
+    /// it entirely.
     pub(super) fn refresh_sidebar_worktree_panes(&mut self) {
+        // A passive Folder load has no worktree row and need not select its
+        // scope. Admit its root before deriving ownership, including cached
+        // attention, without requiring a navigation/read acknowledgement.
+        // Resolve aliases and rebuild owners only when a new boundary appears;
+        // unchanged output and ordinary structural passes retain the cache.
+        if self.sidebar_model.projects.iter().any(|project| {
+            project.kind == ProjectKind::Folder
+                && !self.known_worktree_roots.contains(&project.repository)
+        }) {
+            #[cfg(test)]
+            terminal_output_tests::record_folder_root_refresh();
+            self.refresh_worktree_owners(None);
+        }
+        let roots = self.indexed_worktree_roots();
         let channeled = self
             .durable
             .channels
@@ -496,7 +526,7 @@ impl Cagents {
             .cards
             .iter()
             .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
-            .filter_map(|card| self.unchanneled_card_worktree(card))
+            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &roots))
             .collect::<HashSet<_>>();
         let worktrees = self
             .sidebar_model
@@ -510,7 +540,47 @@ impl Cagents {
                     .map(move |worktree| (project.id, worktree.id))
             })
             .collect();
+        // Attention chooses the first matching loaded row, unlike occupancy:
+        // the latter deliberately marks every project sharing an exact path.
+        // Folder boundaries were admitted above; their keys identify the
+        // exact loaded row once the longest-root lookup resolves a directory.
+        let mut loaded = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            if let Some(key) = project.folder_key() {
+                loaded
+                    .entry(project.repository.as_path())
+                    .or_insert((key.project_id, key.worktree_id));
+            }
+            for worktree in &project.worktrees {
+                loaded
+                    .entry(worktree.path.as_path())
+                    .or_insert((project.id, worktree.id));
+            }
+        }
+        let attention = self
+            .sidebar_state
+            .attention_cards()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|id| {
+                let owner = self
+                    .card_state(id)
+                    .filter(|card| {
+                        card.existence.is_open()
+                            && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                            && !channeled.contains(&id)
+                    })
+                    .and_then(|card| self.unchanneled_card_worktree_indexed(card, &roots))
+                    .and_then(|directory| loaded.get(directory).copied());
+                (id, owner)
+            })
+            .collect::<Vec<_>>();
         self.sidebar_state.set_worktrees_with_panes(worktrees);
+        for (id, owner) in attention {
+            self.sidebar_state.reattribute_card_attention(id, owner);
+        }
+        self.sidebar_state
+            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
@@ -612,6 +682,17 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.select_worktree_checked(path, create_if_empty).1
+    }
+
+    /// A synchronous success witness for callers that expose a new draft only
+    /// after worktree protection and scope selection succeeded. A no-op selection
+    /// is successful; a refused protection is not.
+    pub(super) fn select_worktree_checked(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -619,7 +700,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(format!(
                 "Cannot open this worktree yet: {error}"
             )));
-            return Task::none();
+            return (false, Task::none());
         }
         let roots = self
             .known_worktree_roots
@@ -657,13 +738,16 @@ impl Cagents {
                 .map(|card| card.id))
         {
             if !create_if_empty {
-                return Task::none();
+                return (true, Task::none());
             }
-            return if !has_terminal {
-                self.add_default_pane(path, self.settings.default_worktree_pane)
-            } else {
-                Task::none()
-            };
+            return (
+                true,
+                if !has_terminal {
+                    self.add_default_pane(path, self.settings.default_worktree_pane)
+                } else {
+                    Task::none()
+                },
+            );
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {
@@ -723,7 +807,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        Task::batch([scope, terminal])
+        (true, Task::batch([scope, terminal]))
     }
 
     fn install_workspace_scope(
@@ -2342,8 +2426,10 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),
+            managed_ignore_root: None,
             destination: destination.clone(),
             branch: crate::repository::ValidatedBranchName::parse("zulu-new").unwrap(),
             base: crate::repository::BaseRevision::LocalBranch(

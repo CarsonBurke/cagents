@@ -263,7 +263,7 @@ fn index(
         let mut conversations = Vec::new();
         let mut titles = Vec::new();
         for mut found in catalog::find_all(cache, &seeds, batch, workers, cancel) {
-            if let Some(name) = names.get(&found.id) {
+            if let Some(name) = names.get(found.seed).and_then(|names| names.get(&found.id)) {
                 found.title = name.clone();
                 found.titled = true;
                 found.named = true;
@@ -613,11 +613,15 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 match result {
                     Ok(session) => {
+                        if !prepared_resume_matches(&entry.session, &session) {
+                            self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
+                            return Task::none();
+                        }
                         entry.session = session;
                         if self.existing_conversation_card(&entry.session).is_some() {
                             return self.resume_saved_conversation(entry);
                         }
-                        self.insert_resumed_conversation(entry)
+                        self.insert_resumed_conversation(entry, true)
                     }
                     Err(error) => {
                         self.resume_error(&error);
@@ -728,6 +732,7 @@ impl Cagents {
             .iter()
             .find(|card| {
                 card.existence.is_open()
+                    && !self.chat_awaiting_admission(card.id)
                     && match &card.kind {
                         CardKind::Chat(current) => same_conversation(current, session),
                         CardKind::Terminal(current) => chat_ui::conversion(current)
@@ -764,15 +769,15 @@ impl Cagents {
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
-        if entry.open {
+        let local_pending = self.chat_awaiting_admission(entry.card)
+            && matches!(self.card_state(entry.card).map(|card| &card.kind),
+                Some(CardKind::Chat(session)) if session == &entry.session);
+        if entry.open && !local_pending {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
         let session = &entry.session;
-        if matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
             return cosmic::task::future(async move {
@@ -790,10 +795,14 @@ impl Cagents {
                 Message::ResumeConversation(Action::Prepared(generation, entry, result))
             });
         }
-        self.insert_resumed_conversation(entry)
+        self.insert_resumed_conversation(entry, false)
     }
 
-    fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
+    fn insert_resumed_conversation(
+        &mut self,
+        entry: SavedConversation,
+        prepared: bool,
+    ) -> Task<Message> {
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -801,10 +810,10 @@ impl Cagents {
             self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
             return Task::none();
         }
-        if !matches!(
-            session.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        // Preparation may either retain a live actor or allocate its exact
+        // successor after proved retirement. Both answers must survive intact;
+        // a second locally allocated ID loses the daemon's issued lineage.
+        if !prepared {
             session.reset_owned_codex_listener();
             session.id = TerminalId::new();
             session.proof = None;
@@ -1011,6 +1020,26 @@ impl Cagents {
     }
 }
 
+/// Shape validation of the authenticated preparation reply. It grants no
+/// provider ownership; Start/Attach still runs normal HOST admission.
+fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
+    if source == prepared {
+        return true;
+    }
+    if !source.has_valid_native_continuity()
+        || source.launch.session_id.is_none()
+        || prepared.id == source.id
+    {
+        return false;
+    }
+    let mut expected = source.clone();
+    expected.reset_owned_codex_listener();
+    expected.id = prepared.id;
+    expected.proof = None;
+    expected.terminal = None;
+    &expected == prepared
+}
+
 /// Indices of the rows matching `query` within `scope`.
 fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize> {
     let query = query.trim().to_lowercase();
@@ -1058,6 +1087,63 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    #[test]
+    fn retained_claude_resume_waits_for_preparation_and_keeps_its_exact_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut entry = saved(directory.path());
+        entry.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
+        entry.session.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(entry.session.has_valid_native_continuity());
+        let source = entry.session.clone();
+        // Do not execute this UI task: HOST preparation/retirement is covered
+        // by the real-helper tests. This tests dispatch and reply admission.
+        drop(app.resume_saved_conversation(entry.clone()));
+        assert!(app.resume_ui.loading);
+        assert!(app.durable.cards.is_empty());
+        let mut prepared = source.clone();
+        prepared.reset_owned_codex_listener();
+        prepared.id = TerminalId::new();
+        prepared.proof = None;
+        prepared.terminal = None;
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        assert_eq!(card.kind, CardKind::Chat(prepared));
+        assert_eq!(card.title, "Review peripheral Rust modules");
+        assert!(!app.resume_ui.loading);
+    }
+
+    #[test]
+    fn preparation_cannot_change_the_saved_thread_account_or_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = saved(directory.path()).session;
+        let mut prepared = source.clone();
+        prepared.id = TerminalId::new();
+        assert!(prepared_resume_matches(&source, &prepared));
+        for mutation in 0..4 {
+            let mut altered = prepared.clone();
+            match mutation {
+                0 => altered.launch.session_id = Some("another-thread".into()),
+                1 => {
+                    altered
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                2 => altered.launch.recipe.arguments.push("--different".into()),
+                _ => altered.launch.provider = Provider::Codex,
+            }
+            assert!(!prepared_resume_matches(&source, &altered));
+        }
     }
 
     #[test]
@@ -1382,7 +1468,7 @@ mod tests {
                 &path,
                 format!(
                     "{}\n",
-                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Prompt {age}")}})
+                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Review prompt {age}")}})
                 ),
             )
             .unwrap();
@@ -1431,7 +1517,7 @@ mod tests {
         assert_eq!(conversations.len(), FIRST_BATCH - 2);
         assert_eq!(conversations[0].id, ids[0]);
         assert_eq!(conversations[1].id, ids[2]);
-        assert_eq!(titles, &[(entry.card, "Prompt 1".to_owned())]);
+        assert_eq!(titles, &[(entry.card, "Review prompt 1".to_owned())]);
         let Progress::Found { read, .. } = &progress[3] else {
             panic!("the rest follow")
         };

@@ -36,6 +36,11 @@
 //!
 //! # Removal
 //!
+//! The current host admission foundation retains managed files until the
+//! complete ownership/deletion permit is composed. Existing local UI cleanup
+//! APIs below are outside this daemon admission cut; discovery grants no new
+//! cleanup authority.
+//!
 //! A home is removed by renaming it aside within its provider directory and
 //! then deleting the renamed tree. Nothing is followed on the way:
 //! the path is rebuilt from the account's key rather than taken from
@@ -55,6 +60,9 @@ use std::{
 use uuid::Uuid;
 
 use crate::agent::Provider;
+
+mod creation;
+pub(crate) use creation::NewHomeCreationReceipt;
 
 /// Where a removal parks a home while it is deleted, so a removal that is
 /// interrupted leaves a name nothing else uses, and the next start finishes
@@ -115,6 +123,15 @@ impl Homes {
         crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX)
     }
 
+    /// Host short admission must never wait behind another process's flock.
+    pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+        crate::secure_file::prepare_private_directory(&self.root)?;
+        crate::instance::owned_lock(
+            &self.root.join(".lifecycle.lock"),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    }
+
     fn provider_directory(&self, provider: Provider) -> PathBuf {
         self.root.join(provider.executable())
     }
@@ -147,18 +164,56 @@ impl Homes {
         system_home: Option<&Path>,
         codex_config: CodexConfig,
     ) -> io::Result<(Uuid, PathBuf)> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        self.create_with_config_initialized(provider, system_home, codex_config, |_| Ok(()))
+    }
+
+    /// Genuine fresh mkdir provenance, before seeded configuration, shared
+    /// links or publication. Existing directories are never adopted here.
+    /// Store callers hold registry/lifecycle leases: initialize must not
+    /// reenter Store::load/update or acquire export federation locks. The host
+    /// callback only enrolls its actual directory in the existing reservation;
+    /// no production export bootstrap or read grant is enabled here.
+    pub(crate) fn create_with_config_initialized(
+        &self,
+        provider: Provider,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
+        initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_planned_with_config_initialized(
+            provider,
+            Uuid::new_v4(),
+            system_home,
+            codex_config,
+            initialize,
+        )
+    }
+
+    /// Host admission chooses the fresh UUID before mkdir so its exact future
+    /// home can be reserved. This argument grants no creation/read authority;
+    /// the nonrecursive mkdir must still succeed and mint the actual receipt.
+    pub(crate) fn create_planned_with_config_initialized(
+        &self,
+        provider: Provider,
+        key: Uuid,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
+        initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
         let parent = self.provider_directory(provider);
         crate::secure_file::prepare_private_directory(&self.root)?;
         crate::secure_file::prepare_private_directory(&parent)?;
-        let key = Uuid::new_v4();
         let path = self.path(provider, key);
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        crate::secure_file::reject_symlink_components(&path)?;
-        crate::secure_file::validate_owned_directory(&path)?;
-        // The mode given at creation is narrowed by the umask, never widened;
-        // setting it again states it exactly.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        let created = creation::create(&parent, provider, key)?;
+        if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Account initialization failed; files were retained at {} for explicit recovery: {error}",
+                    path.display(),
+                ),
+            ));
+        }
         if let Some(system_home) = system_home {
             let seeded = match provider {
                 Provider::Claude => seed_claude(system_home, &path),
@@ -168,11 +223,14 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                let _ = self.remove(provider, key);
-                return Err(error);
+                return Err(io::Error::other(format!(
+                    "{error}; the new home was retained at {} for recovery",
+                    path.display()
+                )));
             }
-            link_shared(provider, system_home, &path);
+            link_shared(provider, system_home, &path, codex_config);
         }
+        created.revalidate()?;
         Ok((key, path))
     }
 
@@ -209,6 +267,7 @@ impl Homes {
     /// Called only with a supported, existing registry and both locks held.
     /// A grace period also protects homes being created by an older window
     /// that predates atomic creation/registration.
+    #[cfg(test)]
     pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -400,11 +459,19 @@ fn remove_parked(parked: &Path) -> io::Result<()> {
 /// `home` does not. Best effort: an entry that cannot be linked leaves the
 /// account without it, which is how every managed home started before, and
 /// is not worth refusing the account over.
-fn link_shared(provider: Provider, system_home: &Path, home: &Path) {
+fn link_shared(provider: Provider, system_home: &Path, home: &Path, codex_config: CodexConfig) {
     if system_home == home {
         return;
     }
     for name in shared_entries(provider) {
+        // Copy is a policy choice, including when the source was absent or
+        // changed after seeding. Never fall back to a shared configuration.
+        if provider == Provider::Codex
+            && codex_config == CodexConfig::Copy
+            && *name == "config.toml"
+        {
+            continue;
+        }
         let source = system_home.join(name);
         if fs::symlink_metadata(&source).is_err() {
             continue;
@@ -557,6 +624,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_copy_never_links_a_dangling_configuration_or_its_later_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir_all(system.join("skills")).unwrap();
+        fs::write(system.join("AGENTS.md"), "fixture instructions").unwrap();
+        let target = directory.path().join("later-config.toml");
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let (_, shared) = homes.create(Provider::Codex, Some(&system)).unwrap();
+        let config = copied.join("config.toml");
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_link(copied.join("AGENTS.md")).unwrap(),
+            system.join("AGENTS.md")
+        );
+        assert_eq!(
+            fs::read_link(copied.join("skills")).unwrap(),
+            system.join("skills")
+        );
+        assert_eq!(
+            fs::read_link(shared.join("config.toml")).unwrap(),
+            system.join("config.toml")
+        );
+
+        let original = b"approval_policy = \"on-request\"\n";
+        fs::write(&target, original).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(shared.join("config.toml")).unwrap(), original);
+        write_configuration(&config, b"model = \"managed-fixture\"\n").unwrap();
+        assert!(fs::symlink_metadata(&config).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::read_link(system.join("config.toml")).unwrap(), target);
+    }
+
+    #[test]
+    fn codex_copy_policy_survives_changes_between_seeding_and_linking() {
+        for remove_copy in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let system = directory.path().join("system");
+            let copied = directory.path().join("copied");
+            let shared = directory.path().join("shared");
+            for path in [&system, &copied, &shared] {
+                fs::create_dir(path).unwrap();
+            }
+            let source = system.join("config.toml");
+            let destination = copied.join("config.toml");
+            if remove_copy {
+                fs::write(&source, b"fixture original").unwrap();
+            }
+            copy_configuration(&source, &destination).unwrap();
+            if remove_copy {
+                fs::remove_file(&destination).unwrap();
+            } else {
+                fs::write(&source, b"fixture arrived after copy").unwrap();
+            }
+            // Exercise the actual phase boundary without sleeps or a race hook.
+            link_shared(Provider::Codex, &system, &copied, CodexConfig::Copy);
+            assert_eq!(
+                fs::symlink_metadata(&destination).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            link_shared(Provider::Codex, &system, &shared, CodexConfig::Shared);
+            assert_eq!(fs::read_link(shared.join("config.toml")).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn codex_copy_of_a_source_symlink_preserves_private_opaque_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir(&system).unwrap();
+        let target = directory.path().join("source-config.toml");
+        let original = b"# opaque fixture\n\xff\x00\r\n";
+        fs::write(&target, original).unwrap();
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let config = copied.join("config.toml");
+        let metadata = fs::symlink_metadata(&config).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_ne!(metadata.ino(), fs::metadata(&target).unwrap().ino());
+        assert_eq!(fs::read(&config).unwrap(), original);
+        fs::write(&config, b"independent fixture edit").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
     fn invalid_mcp_source_does_not_write_partial_or_leak_its_contents() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.json");
@@ -567,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_seed_removes_the_unregistered_home() {
+    fn a_failed_seed_retains_the_unregistered_home_for_proved_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let system = directory.path().join("system");
         fs::create_dir_all(system.join("settings.json")).unwrap();
@@ -577,7 +743,7 @@ mod tests {
             fs::read_dir(directory.path().join("accounts/claude"))
                 .unwrap()
                 .count(),
-            0
+            1
         );
     }
 

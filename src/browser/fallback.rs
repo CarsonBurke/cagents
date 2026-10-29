@@ -5,6 +5,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use raw_window_handle::{
@@ -94,6 +95,7 @@ pub struct RawWaylandSubsurfaceFactory {
     parent_surface: usize,
     lifetime_guard: Arc<dyn Any + Send + Sync>,
     host: Mutex<FactoryHost>,
+    probe_span: tracing::Span,
 }
 
 impl std::fmt::Debug for RawWaylandSubsurfaceFactory {
@@ -163,6 +165,7 @@ impl RawWaylandSubsurfaceFactory {
             parent_surface: window.surface.as_ptr() as usize,
             lifetime_guard,
             host: Mutex::new(FactoryHost::Uninitialized),
+            probe_span: tracing::Span::current(),
         })
     }
 
@@ -180,7 +183,11 @@ impl RawWaylandSubsurfaceFactory {
             return CapabilityProbe::Unavailable(BrowserUnavailable::InitializationFailed);
         };
         if matches!(*slot, FactoryHost::Uninitialized) {
-            match WaylandPreparation::new(self.display, self.parent_surface) {
+            match WaylandPreparation::new(
+                self.display,
+                self.parent_surface,
+                self.probe_span.clone(),
+            ) {
                 Ok(preparation) => *slot = FactoryHost::Checking(preparation),
                 Err(reason) => *slot = FactoryHost::Unavailable(reason),
             }
@@ -225,6 +232,9 @@ impl RawWaylandSubsurfaceFactory {
     /// Browser leases must have been joined/dropped first.
     pub fn release_parent(&self) {
         if let Ok(mut slot) = self.host.lock() {
+            if let FactoryHost::Checking(preparation) = &*slot {
+                preparation.trace_progress("retired");
+            }
             *slot = FactoryHost::Retired;
         }
     }
@@ -330,9 +340,18 @@ struct WaylandPreparation {
     _sync: wl_callback::WlCallback,
     parent: wl_surface::WlSurface,
     bound: Option<BoundGlobals>,
+    probe_span: tracing::Span,
+    started: Instant,
+    polls: u32,
+    dispatched: u64,
+    flush_would_block: u32,
 }
 impl WaylandPreparation {
-    fn new(display: usize, parent_surface: usize) -> Result<Self, BrowserUnavailable> {
+    fn new(
+        display: usize,
+        parent_surface: usize,
+        probe_span: tracing::Span,
+    ) -> Result<Self, BrowserUnavailable> {
         // SAFETY: the caller runs inside a live parent's UI callback; the app
         // retains and explicitly releases this foreign queue before the owner.
         let backend = unsafe { Backend::from_foreign_display((display as *mut c_void).cast()) };
@@ -358,20 +377,66 @@ impl WaylandPreparation {
             _sync: sync,
             parent,
             bound: None,
+            probe_span,
+            started: Instant::now(),
+            polls: 0,
+            dispatched: 0,
+            flush_would_block: 0,
         })
     }
+
+    // Only first poll, stage transitions, errors and retirement emit a record.
+    fn trace_progress(&self, event: &'static str) {
+        tracing::info!(
+            target: "cagents::browser_capability",
+            parent: &self.probe_span,
+            phase = event,
+            sync_stage = if self.bound.is_some() { "bound_sync" } else { "registry_sync" },
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            globals = self.state.globals.len(),
+            bound = self.bound.is_some(),
+            sync_complete = self.state.complete,
+            polls = self.polls,
+            dispatched = self.dispatched,
+            flush_would_block = self.flush_would_block,
+            "browser protocol capability progress"
+        );
+    }
+
     fn poll(&mut self) -> Result<bool, BrowserUnavailable> {
-        self.queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|_| BrowserUnavailable::InitializationFailed)?;
+        self.polls = self.polls.saturating_add(1);
+        let dispatched = match self.queue.dispatch_pending(&mut self.state) {
+            Ok(count) => count,
+            Err(_) => {
+                self.trace_progress("dispatch_error");
+                return Err(BrowserUnavailable::InitializationFailed);
+            }
+        };
+        self.dispatched = self.dispatched.saturating_add(dispatched as u64);
         if self.state.complete && self.bound.is_none() {
-            self.bind_required()?;
+            self.trace_progress("registry_sync_complete");
+            if let Err(reason) = self.bind_required() {
+                self.trace_progress("binding_error");
+                return Err(reason);
+            }
+            self.trace_progress("bound_sync_queued");
+        } else if self.state.complete {
+            self.trace_progress("bound_sync_complete");
         }
         match self.connection.flush() {
             Ok(()) => {}
             Err(wayland_client::backend::WaylandError::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err(BrowserUnavailable::InitializationFailed),
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                self.flush_would_block = self.flush_would_block.saturating_add(1);
+            }
+            Err(_) => {
+                self.trace_progress("flush_error");
+                return Err(BrowserUnavailable::InitializationFailed);
+            }
+        }
+        if self.polls == 1 {
+            self.trace_progress("first_poll");
         }
         Ok(self.state.complete)
     }
@@ -768,6 +833,49 @@ pub(crate) struct FallbackSurface {
     pub lease: Box<dyn WaylandSubsurfaceLease>,
 }
 
+#[link(name = "EGL")]
+unsafe extern "C" {
+    fn eglGetCurrentDisplay() -> *mut c_void;
+    fn eglGetCurrentSurface(which: i32) -> *mut c_void;
+    fn eglQuerySurface(
+        display: *mut c_void,
+        surface: *mut c_void,
+        attribute: i32,
+        value: *mut i32,
+    ) -> u32;
+    fn eglChooseConfig(
+        display: *mut c_void,
+        attributes: *const i32,
+        configs: *mut *mut c_void,
+        config_size: i32,
+        count: *mut i32,
+    ) -> u32;
+    fn eglGetConfigAttrib(
+        display: *mut c_void,
+        config: *mut c_void,
+        attribute: i32,
+        value: *mut i32,
+    ) -> u32;
+    fn eglSwapInterval(display: *mut c_void, interval: i32) -> u32;
+    fn eglGetError() -> u32;
+}
+
+const EGL_CONFIG_ID: i32 = 0x3028;
+const EGL_MIN_SWAP_INTERVAL: i32 = 0x303b;
+const EGL_MAX_SWAP_INTERVAL: i32 = 0x303c;
+const EGL_NONE: i32 = 0x3038;
+const EGL_DRAW: i32 = 0x3059;
+
+fn require_zero_swap_interval(minimum: i32, maximum: i32) -> Result<(), BrowserError> {
+    if minimum <= 0 && maximum >= 0 {
+        Ok(())
+    } else {
+        Err(BrowserError::Wayland(format!(
+            "Servo EGL draw surface requires swap interval {minimum}..={maximum}; interval zero is required to keep hidden browser cards responsive"
+        )))
+    }
+}
+
 impl FallbackSurface {
     pub(crate) fn create(
         factory: &Arc<dyn WaylandSubsurfaceFactory>,
@@ -787,16 +895,109 @@ impl FallbackSurface {
             dpi::PhysicalSize::new(viewport.width, viewport.height),
         )
         .map_err(|error| BrowserError::Wayland(format!("hardware Servo context: {error:?}")))?;
-        Ok(Self {
+        let rendering = Self {
             context: Rc::new(context),
             lease,
-        })
+        };
+        rendering.prepare_for_paint()?;
+        rendering.validate_swap_interval()?;
+        Ok(rendering)
+    }
+
+    /// EGL silently clamps a requested swap interval to the selected config's
+    /// range. A successful eglSwapInterval(0) is therefore insufficient: reject
+    /// a surface that requires frame pacing before any page can paint into it.
+    fn validate_swap_interval(&self) -> Result<(), BrowserError> {
+        // SAFETY: prepare_for_paint selected our live EGL draw surface on this
+        // thread. Every output pointer below refers to a live initialized
+        // local, and each attribute array is terminated with EGL_NONE.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            let surface = eglGetCurrentSurface(EGL_DRAW);
+            let mut config_id = 0;
+            if display.is_null()
+                || surface.is_null()
+                || eglQuerySurface(display, surface, EGL_CONFIG_ID, &mut config_id) == 0
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "query Servo EGL draw-surface config: {:#x}",
+                    eglGetError()
+                )));
+            }
+            let attributes = [EGL_CONFIG_ID, config_id, EGL_NONE];
+            let mut config = std::ptr::null_mut();
+            let mut count = 0;
+            if eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count) == 0
+                || count != 1
+                || config.is_null()
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "resolve Servo EGL draw-surface config: {:#x}",
+                    eglGetError()
+                )));
+            }
+            let mut minimum = 0;
+            let mut maximum = 0;
+            if eglGetConfigAttrib(display, config, EGL_MIN_SWAP_INTERVAL, &mut minimum) == 0
+                || eglGetConfigAttrib(display, config, EGL_MAX_SWAP_INTERVAL, &mut maximum) == 0
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "query Servo EGL swap-interval range: {:#x}",
+                    eglGetError()
+                )));
+            }
+            require_zero_swap_interval(minimum, maximum)
+        }
+    }
+
+    /// Keep presentation independent of a compositor frame callback. A hidden
+    /// Wayland child is allowed to retain such a callback indefinitely. Waiting
+    /// for it in EGL would block the shared Servo thread, including the command
+    /// that makes the child visible again and every other browser card.
+    ///
+    /// Servo's new-frame notifications and the engine animation cadence already
+    /// pace paints. Interval zero makes Mesa use a display sync callback instead
+    /// of a visibility-dependent surface callback. Apply it before the first
+    /// paint and each later paint because resizing can recreate the EGL surface
+    /// with its default swap interval.
+    pub(crate) fn prepare_for_paint(&self) -> Result<(), BrowserError> {
+        use servo::RenderingContext;
+
+        self.context.make_current().map_err(|error| {
+            BrowserError::Wayland(format!("make Servo context current: {error:?}"))
+        })?;
+        // SAFETY: WindowRenderingContext is an EGL Wayland context, owned by
+        // this browser thread, and make_current above selected its live draw
+        // surface. EGL handles are opaque; no pointer is dereferenced here.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            if display.is_null() || eglSwapInterval(display, 0) == 0 {
+                return Err(BrowserError::Wayland(format!(
+                    "disable visibility-dependent EGL swap throttling: {:#x}",
+                    eglGetError()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_surface_must_support_zero_before_any_paint() {
+        assert!(require_zero_swap_interval(0, 1).is_ok());
+        assert!(require_zero_swap_interval(0, 0).is_ok());
+
+        // EGL reports success when zero is clamped to this config's minimum.
+        // Accepting it would keep the shared engine's hidden-surface deadlock.
+        let error = require_zero_swap_interval(1, 1).unwrap_err();
+        assert!(error.to_string().contains("requires swap interval 1..=1"));
+        assert!(require_zero_swap_interval(2, 4).is_err());
+        assert!(require_zero_swap_interval(-1, -1).is_err());
+    }
 
     fn clipped(
         source_x: u32,

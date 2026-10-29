@@ -36,6 +36,7 @@ pub mod info;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
+pub mod preferences;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -43,6 +44,8 @@ pub mod registry;
 pub mod remote;
 pub mod routing;
 pub mod schedule;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod scope;
 
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its
@@ -1356,6 +1359,7 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_DETACH_SELECTIONS";
         if std::env::var_os(CHILD).is_none() {
             let key = uuid::Uuid::new_v4();
+            // Preserve the caller's scope; override only these fixture inputs.
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1363,7 +1367,6 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env_clear()
                 .env(CHILD, "1")
                 .env("HOME", "/home/a")
                 .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))
