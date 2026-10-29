@@ -78,6 +78,95 @@ fn uninstall_preserves_installation_when_daemon_status_is_untrusted() {
     }
 }
 
+#[test]
+fn installer_entrypoints_refuse_inherited_callers_before_tools_or_purge() {
+    use cagents::process::{
+        CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+    };
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    for role in [
+        OsString::from("inert-fixture-role"),
+        OsString::new(),
+        OsString::from_vec(vec![0xff]),
+    ] {
+        for script in ["install.sh", "packaging/cagents-uninstall"] {
+            let root = tempfile::tempdir().unwrap();
+            for leaf in [
+                "bin",
+                "home",
+                "data/cagents",
+                "config/cagents",
+                "cache/cagents",
+            ] {
+                fs::create_dir_all(root.path().join(leaf)).unwrap();
+            }
+            for leaf in ["data", "config", "cache"] {
+                fs::write(
+                    root.path().join(leaf).join("cagents/saved"),
+                    b"private fixture",
+                )
+                .unwrap();
+            }
+            for name in ["id", "uname", "getconf", "mktemp", "curl", "wget", "rm"] {
+                executable(
+                    &root.path().join("bin").join(name),
+                    "#!/bin/sh\nprintf invoked > \"$HOME/../tool-invoked\"\nexit 91\n",
+                );
+            }
+            let command = || {
+                CommandSpec::new("/bin/sh")
+                    .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+                    .env("CAGENTS_AGENT_AUTHORITY", &role)
+                    .env("HOME", root.path().join("home"))
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_CACHE_HOME", root.path().join("cache"))
+                    .env("PATH", root.path().join("bin"))
+                    .cwd(root.path())
+                    .timeout(std::time::Duration::from_secs(10))
+                    .output_limits(64 * 1024, 64 * 1024)
+            };
+            let options = if script == "install.sh" {
+                vec![
+                    vec![],
+                    vec!["--stage-only"],
+                    vec!["--uninstall"],
+                    vec!["--purge"],
+                ]
+            } else {
+                vec![vec![], vec!["--purge"]]
+            };
+            for args in options {
+                let output = SystemProcessExecutor
+                    .execute(&command().args(args), &CancellationToken::new())
+                    .unwrap();
+                assert_eq!(output.exit_code, Some(1), "{script}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("require your own terminal"),
+                    "{script}: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+                assert!(!root.path().join("tool-invoked").exists());
+                for leaf in ["data", "config", "cache"] {
+                    assert_eq!(
+                        fs::read(root.path().join(leaf).join("cagents/saved")).unwrap(),
+                        b"private fixture"
+                    );
+                }
+            }
+            let output = SystemProcessExecutor
+                .execute(
+                    &command().arg("--help").env("PATH", "/usr/bin:/bin"),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(output.success, "{script}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).starts_with("Usage:"));
+            assert!(!root.path().join("tool-invoked").exists());
+        }
+    }
+}
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
