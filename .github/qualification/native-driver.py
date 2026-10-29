@@ -703,7 +703,7 @@ try:
                         if not tabs or not peer_inside_viewport(tabs[0]):
                             return None
                         name = tabs[0].name
-                        assert ', ' + str(root / 'project') + ', ' in name, 'Unexpected Chat source directory'
+                        assert ', ' + str(root.parent / 'project') + ', ' in name, 'Unexpected Chat source directory'
                         return name
                     return accessibility_snapshot(read)
                 event({'event': 'peer-chat-tab-identified', 'label': wait(peer_chat_tab)})
