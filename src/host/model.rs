@@ -68,6 +68,37 @@ pub(crate) struct Applied {
     pub(crate) changed: bool,
 }
 
+/// Policy refusal is recoverable during an existing-owner maintenance census.
+/// Storage and ownership failures retain their ordinary fatal behavior.
+#[derive(Debug)]
+pub(crate) enum AutomationPrecheckError {
+    PolicyUnavailable(String),
+    Other(String),
+}
+
+impl From<String> for AutomationPrecheckError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<AutomationPrecheckError> for String {
+    fn from(error: AutomationPrecheckError) -> Self {
+        match error {
+            AutomationPrecheckError::PolicyUnavailable(message)
+            | AutomationPrecheckError::Other(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for AutomationPrecheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PolicyUnavailable(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub(crate) struct Registry {
     db: Connection,
     path: PathBuf,
