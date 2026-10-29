@@ -1,0 +1,336 @@
+{
+  "schema": 2,
+  "never_merge": true,
+  "prepared_only": true,
+  "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+  "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "contract_sources": [
+    {
+      "head": "c91ff7b23deca8f9ac786805cfd8d1b93d0630b9",
+      "path": ".github/workflows/qualify-close-save-corrections.yml",
+      "sha256": "9b1259bef227b95ecd4e5baad43912f85270de9a011809f815a9d0a624de60f8"
+    },
+    {
+      "head": "f0288282fbf25229cbb33009f19f765c39f9fdd5",
+      "path": ".github/workflows/qualify-precheck-retirement.yml",
+      "sha256": "0f8ef86a184f95d10bc635803366d8827f6dc3e26706a157143958048cd25cc4"
+    }
+  ],
+  "products": [
+    {
+      "pr": 1231,
+      "head": "c273cc717c60283af6739e0289e37e7f06f5d8f7",
+      "tree": "277caa5ec107080824ae87fa4a5966ae62fbdd41",
+      "selectors": [
+        "settings::agents::tests::unreadable_containers_preserve_scope_and_require_observed_reset",
+        "settings::agents::tests::unreadable_execution_leaves_survive_merges_until_each_explicit_repair",
+        "settings::agents::tests::unreadable_execution_keeps_nonexecution_fallback_and_nan_equality",
+        "settings::agents::tests::policy_repair_acknowledgments_match_raw_intent_and_persisted_scope",
+        "settings::agents::tests::canonical_policy_repair_retries_after_confirmation_failure_without_overwriting_new_policy",
+        "settings::agents::tests::unchanged_nan_policy_cannot_undo_another_windows_repair",
+        "settings::agents::tests::concurrent_first_provider_edits_merge_fields_without_losing_launch_policy",
+        "settings::agents::tests::multiple_unavailable_paths_can_be_repaired_and_saved_one_at_a_time",
+        "settings::tests::a_value_this_build_cannot_read_falls_back_and_is_kept_until_changed",
+        "settings::agents::tests::unreadable_saved_policy_refuses_launch_and_every_discovery_entrypoint",
+        "host::chat::configured_start::tests::configured_ingress_refuses_account_mutation_before_factory_reads_or_start_reservation",
+        "host::chat::configured_start::tests::owning_factory_uses_saved_execution_policy_and_preserves_explicit_clear",
+        "host::chat::configured_start::tests::explicit_choices_and_automatic_routing_survive_host_resolution",
+        "host::chat::configured_start::tests::missing_executable_account_and_invalid_intent_refuse_without_fallback",
+        "host::chat::configured_start::tests::registered_account_home_is_resolved_by_the_daemon_registry",
+        "host::chat::configured_start::tests::fresh_ingress_refuses_an_original_terminal_or_chat_reservation_before_settings_io",
+        "host::chat::configured_start::tests::captured_execution_policy_is_immutable_and_later_starts_read_actual_saved_changes",
+        "host::chat::configured_start::tests::original_preparation_serializes_all_start_routes_and_preserves_newer_pending_rows",
+        "host::chat::configured_start::tests::configured_path_and_pin_override_initialized_shell_search_and_launch_uses_same_path",
+        "app::tests::unreadable_agent_repair_stays_refused_through_failed_save_until_exact_acknowledgment",
+        "app::tests::out_of_order_settings_saves_and_acknowledgments_preserve_latest_edits",
+        "app::tests::settings_detect_rejects_reset_edit_clear_and_superseded_request_callbacks",
+        "app::tests::settings_agent_rows_reject_removed_rows_and_replaced_drafts_before_mutation",
+        "app::settings_ui::agents::tests::settings_agent_named_rows_preserve_native_state_across_actual_reducer_batches",
+        "app::settings_ui::agents::tests::stale_provider_binary_does_not_hide_the_edited_environment_refusal"
+      ],
+      "source_paths": [
+        ".cargo/config.toml",
+        "src/app.rs",
+        "src/app/chat_ui.rs",
+        "src/app/settings_ui/agents.rs",
+        "src/host/agent_execution/tests.rs",
+        "src/host/chat/configured_start.rs",
+        "src/settings.rs",
+        "src/settings/agents.rs",
+        "src/account.rs",
+        "src/account/probe.rs",
+        "src/chat.rs",
+        "src/host/mod.rs",
+        "src/host/chat.rs",
+        "src/host/agent_execution.rs",
+        "src/persistence.rs",
+        "src/app/settings_ui.rs"
+      ],
+      "fixture_contract": "Six new shared real-file/merge/repair parents, one UI-or-HOST malformed-discovery parent and one UI failed-save/ACK parent, plus seventeen preserved adjacent causal guards. The gated parent self-execs the same exact Rust test ELF under private XDG; child stdout/stderr are captured, inert executable fixtures are never invoked, and it counts one outer parent. No daemon helper, commercial provider or native UI is used. Synchronous SettingsSave.run and direct ACK injection do not validate the async native save flow.",
+      "selector_sources": {
+        "settings::agents::tests::unreadable_containers_preserve_scope_and_require_observed_reset": "src/settings/agents.rs",
+        "settings::agents::tests::unreadable_execution_leaves_survive_merges_until_each_explicit_repair": "src/settings/agents.rs",
+        "settings::agents::tests::unreadable_execution_keeps_nonexecution_fallback_and_nan_equality": "src/settings/agents.rs",
+        "settings::agents::tests::policy_repair_acknowledgments_match_raw_intent_and_persisted_scope": "src/settings/agents.rs",
+        "settings::agents::tests::canonical_policy_repair_retries_after_confirmation_failure_without_overwriting_new_policy": "src/settings/agents.rs",
+        "settings::agents::tests::unchanged_nan_policy_cannot_undo_another_windows_repair": "src/settings/agents.rs",
+        "settings::agents::tests::concurrent_first_provider_edits_merge_fields_without_losing_launch_policy": "src/settings/agents.rs",
+        "settings::agents::tests::multiple_unavailable_paths_can_be_repaired_and_saved_one_at_a_time": "src/settings/agents.rs",
+        "settings::tests::a_value_this_build_cannot_read_falls_back_and_is_kept_until_changed": "src/settings.rs",
+        "settings::agents::tests::unreadable_saved_policy_refuses_launch_and_every_discovery_entrypoint": "src/settings/agents.rs",
+        "host::chat::configured_start::tests::configured_ingress_refuses_account_mutation_before_factory_reads_or_start_reservation": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::owning_factory_uses_saved_execution_policy_and_preserves_explicit_clear": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::explicit_choices_and_automatic_routing_survive_host_resolution": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::missing_executable_account_and_invalid_intent_refuse_without_fallback": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::registered_account_home_is_resolved_by_the_daemon_registry": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::fresh_ingress_refuses_an_original_terminal_or_chat_reservation_before_settings_io": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::captured_execution_policy_is_immutable_and_later_starts_read_actual_saved_changes": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::original_preparation_serializes_all_start_routes_and_preserves_newer_pending_rows": "src/host/chat/configured_start.rs",
+        "host::chat::configured_start::tests::configured_path_and_pin_override_initialized_shell_search_and_launch_uses_same_path": "src/host/chat/configured_start.rs",
+        "app::tests::unreadable_agent_repair_stays_refused_through_failed_save_until_exact_acknowledgment": "src/app.rs",
+        "app::tests::out_of_order_settings_saves_and_acknowledgments_preserve_latest_edits": "src/app.rs",
+        "app::tests::settings_detect_rejects_reset_edit_clear_and_superseded_request_callbacks": "src/app.rs",
+        "app::tests::settings_agent_rows_reject_removed_rows_and_replaced_drafts_before_mutation": "src/app.rs",
+        "app::settings_ui::agents::tests::settings_agent_named_rows_preserve_native_state_across_actual_reducer_batches": "src/app/settings_ui/agents.rs",
+        "app::settings_ui::agents::tests::stale_provider_binary_does_not_hide_the_edited_environment_refusal": "src/app/settings_ui/agents.rs"
+      },
+      "source_sha256": {
+        "Cargo.toml": "e970f066314a0a3b9e82558a76f3254853bfbbdde520a60e7e6510ab3844fd23",
+        "Cargo.lock": "e855cb409d864a7aaa04850d546ece6a22db2ed63203604cdaebec804a1abc0d",
+        "src/lib.rs": "70a090241583be5bf862d99ab0e7939ab6a807fa49cc3fca1ac6975d3bdb2053",
+        "src/modules.rs": "235ef743a92cd53f81e3bd948b2fe168d3d056125acdecfa155247029b1c3618",
+        ".cargo/config.toml": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96",
+        "src/app.rs": "0514be6000ca576d272a77464293dfc58437b69d9a093fdad84be3b5d7b0092c",
+        "src/app/chat_ui.rs": "ddd71e01dfd46611847a8f0119807ee703f73a13c668ca7cc5762eadb8c2103f",
+        "src/app/settings_ui/agents.rs": "e23126b69ba1051ce41cf75d43b8a77370654cd26f300d9e86d7247fcddcc7ef",
+        "src/host/agent_execution/tests.rs": "edd4a6d654e4814b616f955cc1546537c665e4399f4746ccbe607b4a43baa36d",
+        "src/host/chat/configured_start.rs": "91a1abc4ab8dedfda5cc9df5355011e6294a5ff1de7793d520ec8f4c7b15b611",
+        "src/settings.rs": "4e1c66590a36c78b353a465927003b7b113041e0bbe1564b4037980f7cd711e0",
+        "src/settings/agents.rs": "6af815dcf6b54f340dc412de24acc1538fe31f24d5faffaf3d7b94f0e136e972",
+        "src/account.rs": "a56d3d55ae8714f4f06deee18e2665f906284070856d3041900e7a4974fb1afe",
+        "src/account/probe.rs": "d155a2a5d8d39d2e0c7ef729d1c8d6ed851df2c33c2d0fa3acd754d2717a1258",
+        "src/chat.rs": "872277b7442d06861a3c8cfdb26d7b98d4e7dcac3e655d24f2eb29aaef77873f",
+        "src/host/mod.rs": "7a2eebea982cba1dc009c267ace2f426ae10e7af27abba5ab64785812d8a7c72",
+        "src/host/chat.rs": "983e7277414cbc218aac0a5cd4a9d7b524065746be766c58478b8d587a4864e7",
+        "src/host/agent_execution.rs": "68b160dab6e4391d46884e4eda29578b82a5925869cb46da90eecada6d457d29",
+        "src/persistence.rs": "049d96287b6111ab83d50093847e92e97cf95d11dfd11c42cc167330906fb34e",
+        "src/app/settings_ui.rs": "c387019086fe88af4c59686adcc9b6c1e008d553aff42788bf303b15e8dd6634"
+      },
+      "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1231#issuecomment-6489175574"
+    },
+    {
+      "pr": 1726,
+      "head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+      "tree": "eab6239b6533db73e6d67b543d2abf07e155aa67",
+      "selectors": [
+        "app::tests::older_settings_success_preserves_final_close_error_and_same_value_retry",
+        "app::tests::cancelled_window_close_settles_only_original_settings_owner",
+        "app::tests::window_close_updater_commit_waits_for_current_final_save",
+        "app::shared_views::tests::a_reported_title_awaiting_its_save_survives_shared_view_edits",
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+      ],
+      "source_paths": [
+        "src/app.rs",
+        "src/app/shared_views.rs",
+        "src/settings.rs",
+        "src/persistence.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "Direct headless app reducers and temporary Settings/SQLite stores; synthetic pane descriptors and dropped engine futures do not launch a native window, terminal, provider or executable helper. The source is an independently reviewed deliberate composition with one resolved shared_views.rs conflict, preserving reported titles and no-op durable allocation identity; it is not an ordinary conflict-free merge. The successor changes only failed test fixture custody and diagnostic assertions; all five parents are freshly requested, with no qualified-source transfer.",
+      "selector_sources": {
+        "app::tests::older_settings_success_preserves_final_close_error_and_same_value_retry": "src/app.rs",
+        "app::tests::cancelled_window_close_settles_only_original_settings_owner": "src/app.rs",
+        "app::tests::window_close_updater_commit_waits_for_current_final_save": "src/app.rs",
+        "app::shared_views::tests::a_reported_title_awaiting_its_save_survives_shared_view_edits": "src/app/shared_views.rs",
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs"
+      },
+      "source_sha256": {
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
+        "src/app/shared_views.rs": "f909efa51ad086a87b5e5ac9c6f9034d693ceb095f795b6c7a8a29315f7bfd72",
+        "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de",
+        "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+      },
+      "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6489176249"
+    },
+    {
+      "pr": 1606,
+      "head": "f2e7d95b1c17b900fb2bb61591c3c26eb200a879",
+      "tree": "484f18ac2e253394acaa55a5aeba633e8c229d21",
+      "selectors": [
+        "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits",
+        "host::automations::precheck::worker::tests::unlocked_worker_without_receipt_is_never_inferred_successful",
+        "host::automations::precheck::worker::tests::durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence",
+        "host::automations::precheck::worker::tests::retirement_refuses_missing_legacy_and_replaced_directories",
+        "host::automations::precheck::worker::tests::retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records",
+        "host::model::automations::tests::precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners"
+      ],
+      "source_paths": [
+        ".cargo/config.toml",
+        "scripts/build-ceditor-product",
+        "src/host/mod.rs",
+        "src/host/automations.rs",
+        "src/host/automations/broker.rs",
+        "src/host/automations/broker/history_tests.rs",
+        "src/host/automations/precheck.rs",
+        "src/host/automations/precheck/worker.rs",
+        "src/host/model.rs",
+        "src/host/model/automations.rs",
+        "src/host/model/automations/history.rs",
+        "src/host/model/automations/history_tests.rs"
+      ],
+      "source_sha256": {
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "scripts/build-ceditor-product": "5f3aab4052ba9ddf2ea21ab8cc4af494b5afbd22781dcfeeb68b2d74afaf67f4",
+        "src/host/mod.rs": "5c72a121c8914f495684dca0a9da0062816a4425731add8822dd8ed078c879c8",
+        "src/host/automations.rs": "994fe6a5641eeedfa738c4a3cf1eb6d1916684f971c0752c675a5a4cf357ca85",
+        "src/host/automations/broker.rs": "49050a2665eb48dacd392d427aaff1200f3057bc18138f4ae7a2926c3e03e42f",
+        "src/host/automations/broker/history_tests.rs": "309f37704a3609f4786a2d96e3d691b7449cfb896fcf240cd3cc649c9cdfecf9",
+        "src/host/automations/precheck.rs": "a1b1fe6ebfb23e1d4f8eb7e795f1e0a33e3b560f6de14f63d4d6854369a3dc77",
+        "src/host/automations/precheck/worker.rs": "97374249b56b1df959d941f7ca768ef43ac5365f5a3da1c1886a47c4b0b134d1",
+        "src/host/model.rs": "4d94e70102b13b9c4f2825ed6a460fb5c6fbbd72f440234568582e0520a0e3c9",
+        "src/host/model/automations.rs": "7690097f684b3354c17b6f22bdb49d3c45556916f0aea6cc6d8501dd85de1500",
+        "src/host/model/automations/history.rs": "076d24f8bbd7edc744c436dccff8f041db6b404dedeecccecb6726da1f74ecd6",
+        "src/host/model/automations/history_tests.rs": "9b03a4e9cb2a22ddab5ddb78b32932c9edec49a82dbf7fc42c3d0d45e38033cf"
+      },
+      "selector_sources": {
+        "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits": "src/host/automations/broker/history_tests.rs",
+        "host::automations::precheck::worker::tests::unlocked_worker_without_receipt_is_never_inferred_successful": "src/host/automations/precheck/worker.rs",
+        "host::automations::precheck::worker::tests::durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence": "src/host/automations/precheck/worker.rs",
+        "host::automations::precheck::worker::tests::retirement_refuses_missing_legacy_and_replaced_directories": "src/host/automations/precheck/worker.rs",
+        "host::automations::precheck::worker::tests::retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records": "src/host/automations/precheck/worker.rs",
+        "host::model::automations::tests::precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners": "src/host/model/automations/history_tests.rs"
+      },
+      "internal_broker_cases": {
+        "outer_parent": "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits",
+        "count": 6,
+        "counts_as_parents": 1,
+        "kind": "Owned offline exit-7 shell through matched precheck supervisor; not self-executed Rust test harnesses."
+      },
+      "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1606#issuecomment-6488416083"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "1231-cli",
+      "pr": 1231,
+      "feature": "cli",
+      "binary": "cagents",
+      "selectors": [
+        "settings::agents::tests::unreadable_containers_preserve_scope_and_require_observed_reset",
+        "settings::agents::tests::unreadable_execution_leaves_survive_merges_until_each_explicit_repair",
+        "settings::agents::tests::unreadable_execution_keeps_nonexecution_fallback_and_nan_equality",
+        "settings::agents::tests::policy_repair_acknowledgments_match_raw_intent_and_persisted_scope",
+        "settings::agents::tests::canonical_policy_repair_retries_after_confirmation_failure_without_overwriting_new_policy",
+        "settings::agents::tests::unchanged_nan_policy_cannot_undo_another_windows_repair",
+        "settings::agents::tests::concurrent_first_provider_edits_merge_fields_without_losing_launch_policy",
+        "settings::agents::tests::multiple_unavailable_paths_can_be_repaired_and_saved_one_at_a_time",
+        "settings::tests::a_value_this_build_cannot_read_falls_back_and_is_kept_until_changed"
+      ],
+      "matched_helper": false
+    },
+    {
+      "id": "1726-ui",
+      "pr": 1726,
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::tests::older_settings_success_preserves_final_close_error_and_same_value_retry",
+        "app::tests::cancelled_window_close_settles_only_original_settings_owner",
+        "app::tests::window_close_updater_commit_waits_for_current_final_save",
+        "app::shared_views::tests::a_reported_title_awaiting_its_save_survives_shared_view_edits",
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+      ],
+      "matched_helper": false
+    },
+    {
+      "id": "1231-ui",
+      "pr": 1231,
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::tests::unreadable_agent_repair_stays_refused_through_failed_save_until_exact_acknowledgment",
+        "app::tests::out_of_order_settings_saves_and_acknowledgments_preserve_latest_edits",
+        "app::tests::settings_detect_rejects_reset_edit_clear_and_superseded_request_callbacks",
+        "app::tests::settings_agent_rows_reject_removed_rows_and_replaced_drafts_before_mutation",
+        "app::settings_ui::agents::tests::settings_agent_named_rows_preserve_native_state_across_actual_reducer_batches",
+        "app::settings_ui::agents::tests::stale_provider_binary_does_not_hide_the_edited_environment_refusal"
+      ],
+      "matched_helper": false
+    },
+    {
+      "id": "1606-host",
+      "pr": 1606,
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits",
+        "host::automations::precheck::worker::tests::unlocked_worker_without_receipt_is_never_inferred_successful",
+        "host::automations::precheck::worker::tests::durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence",
+        "host::automations::precheck::worker::tests::retirement_refuses_missing_legacy_and_replaced_directories",
+        "host::automations::precheck::worker::tests::retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records",
+        "host::model::automations::tests::precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners"
+      ],
+      "matched_helper": true
+    },
+    {
+      "id": "1231-host",
+      "pr": 1231,
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "settings::agents::tests::unreadable_saved_policy_refuses_launch_and_every_discovery_entrypoint",
+        "host::chat::configured_start::tests::configured_ingress_refuses_account_mutation_before_factory_reads_or_start_reservation",
+        "host::chat::configured_start::tests::owning_factory_uses_saved_execution_policy_and_preserves_explicit_clear",
+        "host::chat::configured_start::tests::explicit_choices_and_automatic_routing_survive_host_resolution",
+        "host::chat::configured_start::tests::missing_executable_account_and_invalid_intent_refuse_without_fallback",
+        "host::chat::configured_start::tests::registered_account_home_is_resolved_by_the_daemon_registry",
+        "host::chat::configured_start::tests::fresh_ingress_refuses_an_original_terminal_or_chat_reservation_before_settings_io",
+        "host::chat::configured_start::tests::captured_execution_policy_is_immutable_and_later_starts_read_actual_saved_changes",
+        "host::chat::configured_start::tests::original_preparation_serializes_all_start_routes_and_preserves_newer_pending_rows",
+        "host::chat::configured_start::tests::configured_path_and_pin_override_initialized_shell_search_and_launch_uses_same_path"
+      ],
+      "matched_helper": false
+    }
+  ],
+  "original_negative": {
+    "pr": 1948,
+    "control_head": "c91ff7b23deca8f9ac786805cfd8d1b93d0630b9",
+    "run_id": 40822439576,
+    "artifact_id": 12876530180,
+    "zip_sha256": "8ef3248751053f2b29ad3dcf1c73fd1f0b394ddc6bad4d3f00bc9df7605bf6ca",
+    "product_pr": 1726,
+    "product_head": "59f6a9c84f02891a8cc6e6642701074cad92763a",
+    "failed_parent": "app::tests::cancelled_window_close_settles_only_original_settings_owner",
+    "outer_result": {
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    "receipt": "https://github.com/CarsonBurke/cagents/pull/1948#issuecomment-6489056052",
+    "scope": "Original negative retained at old source. Parent1 passed there; parent2 failed and remaining3 were unrun. No old pass qualifies this new successor."
+  },
+  "limits": [
+    "Temporary unpublished research control only; never merge. No current publication, queue admission or dispatch is authorized by these files.",
+    "One serial hosted job, CARGO_BUILD_JOBS=2, five isolated executable checks and thirty-six distinct exact parent invocations: 1231 CLI 9, 1726 UI 5, 1231 UI 6, 1606 HOST 6, 1231 HOST 10. Planned counts are not execution results.",
+    "Each lane has an independent target directory and feature graph. Never combine UI and HOST in one Cargo invocation or run independent cold builds concurrently.",
+    "Ordinary settled compile/inventory/test-oracle failure stops that lane dependent tests and fails aggregate qualification. Later isolated lanes continue, including another feature graph on the same source, to obtain independent boundary evidence; no failed lane is hidden or retried.",
+    "Context/source/configuration integrity faults, any matched-helper build/path/digest/provenance fault and uncertain timeout/signal/wrapper outcomes stop globally. GNU timeout 2700s + 30s grace and 240min job ceiling retained; no detached-family closure claim.",
+    "Natural hosted User context refuses inherited CAGENTS_ names without reading values or removing authority. Only 1606 HOST receives its freshly built source-matched Cargo-reported absolute cagentsd helper; no copied/preinstalled fallback. Source Cargo checkout-root configuration remains intact.",
+    "Source, configuration/build-input and helper digests bind observation points before/after commands; no execution-held helper-image proof is claimed. Original commands/stdout/stderr/exits/digests and final source state are retained.",
+    "One exact compiled inventory entry and one named outer 1P0F0I summary are required per selected root. The 1606 broker six internal exit-7 cases count as one parent; the 1231 self-ELF child output is captured and counts as one parent. Never salvage inner lines after failure.",
+    "1231 adds eight new parents (six shared, one gated self-ELF, one UI) plus seventeen adjacent causal guards. All 563 baseline source-declaration names remain preserved (source enumeration, not execution). Original cited historical results remain separately scoped.",
+    "Historical 1606 markerless lost custody remains protected; inert staging-file accumulation remains deferred to bounded-scope follow-up #1943. Neither is claimed repaired by qualification.",
+    "No whole feature suite, integrated-browser/current 1231 fourth boundary, native interaction/screenshots/focus/responsiveness, commercial-provider or merge acceptance is established. Native Settings/repair async-save/restore/startup and final-close flows remain unqualified. Formatting is separately scoped and not run here.",
+    "All current Cargo/build/helper/Rust-test/provider/native/workflow execution is UNRUN; local execution/push/PR/dispatch is outside this prepared control."
+  ]
+}
