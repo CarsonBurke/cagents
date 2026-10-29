@@ -163,6 +163,8 @@ enum Report {
     Started {
         protocol: u32,
         record: Record,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_error: Option<String>,
     },
     Confirmed,
     SourceUpdated,
@@ -493,11 +495,25 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             START_TIMEOUT,
         )?;
         match receive(&control, START_TIMEOUT)? {
-            Some(Report::Started { protocol, record })
-                if protocol == PROTOCOL
-                    && record.holder.pid == pid
-                    && record.holder.is_current() =>
+            Some(Report::Started {
+                protocol,
+                record,
+                scope_error,
+            }) if protocol == PROTOCOL
+                && record.holder.pid == pid
+                && record.holder.is_current() =>
             {
+                if let Some(error) = scope_error {
+                    tracing::warn!(
+                        %error,
+                        holder = record.holder.pid,
+                        "holder scope enrollment failed; provider uses existing launch fallback"
+                    );
+                    // Execed holders have null stderr and no subscriber. Keep
+                    // the refusal visible in staged owning-test failure output.
+                    #[cfg(test)]
+                    eprintln!("native holder scope enrollment failed: {error}");
+                }
                 crate::daemon::process_scope::warn_if_shared(
                     record.holder.pid as u32,
                     record.root.pid as u32,
@@ -1302,13 +1318,16 @@ extern "C" fn serve_if_requested() {
         };
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
-        let _ = crate::daemon::process_scope::enroll_holder();
+        let scope_error = crate::daemon::process_scope::enroll_holder()
+            .err()
+            .map(|error| error.to_string());
         let mut residence = Residence::start(spawn)?;
         send(
             &control,
             &Report::Started {
                 protocol: PROTOCOL,
                 record: residence.record.clone(),
+                scope_error,
             },
             START_TIMEOUT,
         )?;
@@ -1326,6 +1345,51 @@ extern "C" fn serve_if_requested() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_report_preserves_optional_scope_failure() {
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: crate::model::BootId::new("fixture-boot"),
+            terminal: crate::model::TerminalId::new(),
+            holder: Process { pid: 42, start: 17 },
+            root: Process { pid: 43, start: 18 },
+        };
+        let mut wire = serde_json::to_value(Report::Started {
+            protocol: PROTOCOL,
+            record: record.clone(),
+            scope_error: None,
+        })
+        .unwrap();
+        assert!(wire["Started"].get("scope_error").is_none());
+        let Report::Started {
+            protocol,
+            record: decoded,
+            scope_error,
+        } = serde_json::from_value(wire.clone()).unwrap()
+        else {
+            panic!("legacy startup report changed type");
+        };
+        assert_eq!(protocol, PROTOCOL);
+        assert_eq!(decoded, record);
+        assert_eq!(scope_error, None);
+
+        wire["Started"]["scope_error"] = serde_json::json!("fixture enrollment refusal");
+        let Report::Started {
+            protocol,
+            record: decoded,
+            scope_error,
+        } = serde_json::from_value(wire).unwrap()
+        else {
+            panic!("diagnostic startup report changed type");
+        };
+        assert_eq!(protocol, PROTOCOL);
+        assert_eq!(decoded, record);
+        assert_eq!(scope_error.as_deref(), Some("fixture enrollment refusal"));
+    }
 
     #[test]
     fn legacy_exit_diagnostics_identify_only_the_launcher() {
