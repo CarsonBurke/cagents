@@ -6719,6 +6719,15 @@ mod tests {
             .find(|frame| frame["method"] == "thread/resume")
             .unwrap();
         let attached = parent.receive(json!({"id":attach["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":"older"}}})).unwrap();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = parent
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
         if list {
             attached
                 .writes
