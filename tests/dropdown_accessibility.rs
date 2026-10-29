@@ -234,10 +234,22 @@ impl Fixture {
     #[cfg(target_os = "linux")]
     fn popup_provider(
         &self,
+        owner: NodeId,
         options: Vec<String>,
         selected: Option<usize>,
     ) -> Box<dyn Fn() -> Element<'static, Message>> {
-        let state = self.tree.children[1]
+        // Column drops the zero-height spacer. Resolve the actual exported
+        // owner instead of borrowing a positional sibling's closed state.
+        let state = self
+            .tree
+            .children
+            .iter()
+            .find(|child| {
+                child.id.as_ref().is_some_and(|id| {
+                    NodeId::from(iced_accessibility::A11yId::from(id.clone())) == owner
+                })
+            })
+            .expect("the popup provider's exported owner must still exist")
             .state
             .downcast_ref::<widget::dropdown::State>()
             .clone();
@@ -542,45 +554,73 @@ fn dropdown_accessibility_real_scrolled_upward_bounds_pointer_and_keyboard_share
 #[cfg(target_os = "linux")]
 #[test]
 fn dropdown_accessibility_materialized_popup_rejects_second_action_and_removed_control_owner() {
-    let labels = choices(3);
-    let mut owner = Fixture::new(labels.clone(), Some(0));
-    let root = target(&named(&owner.export(), "Settings category"));
-    owner.action(root, Action::Expand);
-    let provider = owner.popup_provider(labels.clone(), Some(0));
-    let mut popup = Fixture::from_element(provider());
-    let old = options(&popup.export());
-    assert_eq!(old.len(), 3);
-    assert_eq!(
-        popup.action(target(&old[2]), Action::Click),
-        [Message::Selected(2), Message::SurfaceClosed]
-    );
-    assert!(
-        !popup
-            .action(target(&old[2]), Action::Click)
-            .iter()
-            .any(|message| matches!(message, Message::Selected(_))),
-        "materialized overlay has already spent its selection authorization"
-    );
-    owner.action(root, Action::Expand);
-    let provider = owner.popup_provider(labels.clone(), Some(0));
-    let mut popup = Fixture::from_element(provider());
-    let old = options(&popup.export());
-    owner.replace("owner-b", "source-a", labels, Some(0), 0.0);
-    assert!(
-        !popup
-            .action(target(&old[1]), Action::Click)
-            .iter()
-            .any(|message| matches!(message, Message::Selected(_))),
-        "a removed owning Tree retires an already materialized popup"
-    );
-    let mut rebuilt_old_popup = Fixture::from_element(provider());
-    assert!(options(&rebuilt_old_popup.export()).is_empty());
-    assert!(
-        !rebuilt_old_popup
-            .action(target(&old[1]), Action::Click)
-            .iter()
-            .any(|message| matches!(message, Message::Selected(_)))
-    );
+    // Both omitted and retained spacers must borrow this exact owner.
+    for top in [0.0, 24.0] {
+        let labels = choices(3);
+        let mut owner =
+            Fixture::from_element(view("owner-a", "source-a", labels.clone(), Some(0), top));
+        let root = target(&named(&owner.export(), "Settings category"));
+        owner.action(root, Action::Expand);
+        assert_eq!(
+            named(&owner.export(), "Terminal color theme")
+                .node()
+                .is_expanded(),
+            Some(false),
+            "the sibling whose index moves with the spacer remains closed"
+        );
+        let provider = owner.popup_provider(root, labels.clone(), Some(0));
+        let mut popup = Fixture::from_element(provider());
+        let tree = popup.export();
+        let menu = named(&tree, "Settings category options");
+        assert_eq!(menu.node().role(), Role::ListBox);
+        let old = options(&tree);
+        assert_eq!(old.len(), 3);
+        assert_eq!(
+            old.iter()
+                .map(|node| node.node().label().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            labels,
+            "the materialized provider must carry the open category's choices"
+        );
+        assert_eq!(
+            old.iter()
+                .map(|node| node.node().is_selected())
+                .collect::<Vec<_>>(),
+            [Some(true), Some(false), Some(false)],
+            "the provider must retain the category's committed choice"
+        );
+        assert_eq!(
+            popup.action(target(&old[2]), Action::Click),
+            [Message::Selected(2), Message::SurfaceClosed]
+        );
+        assert!(
+            !popup
+                .action(target(&old[2]), Action::Click)
+                .iter()
+                .any(|message| matches!(message, Message::Selected(_))),
+            "materialized overlay has already spent its selection authorization"
+        );
+        owner.action(root, Action::Expand);
+        let provider = owner.popup_provider(root, labels.clone(), Some(0));
+        let mut popup = Fixture::from_element(provider());
+        let old = options(&popup.export());
+        owner.replace("owner-b", "source-a", labels, Some(0), 0.0);
+        assert!(
+            !popup
+                .action(target(&old[1]), Action::Click)
+                .iter()
+                .any(|message| matches!(message, Message::Selected(_))),
+            "a removed owning Tree retires an already materialized popup"
+        );
+        let mut rebuilt_old_popup = Fixture::from_element(provider());
+        assert!(options(&rebuilt_old_popup.export()).is_empty());
+        assert!(
+            !rebuilt_old_popup
+                .action(target(&old[1]), Action::Click)
+                .iter()
+                .any(|message| matches!(message, Message::Selected(_)))
+        );
+    }
 }
 
 fn assert_active_targets_exist(tree: &A11yTree) {
@@ -658,7 +698,7 @@ fn dropdown_accessibility_separate_popup_active_descendants_stay_in_their_own_ex
     let mut owner = Fixture::new(choices(3), Some(0));
     let root = target(&named(&owner.export(), "Settings category"));
     owner.action(root, Action::Expand);
-    let mut popup = Fixture::from_element(owner.popup_provider(choices(3), Some(0))());
+    let mut popup = Fixture::from_element(owner.popup_provider(root, choices(3), Some(0))());
     assert_active_targets_exist(&owner.export());
     assert_active_targets_exist(&popup.export());
     let element = widget::dropdown(choices(3), Some(0), Message::Selected)
