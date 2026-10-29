@@ -576,21 +576,17 @@ fn command(
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
     }
-    match account.probe_environment() {
-        Some((variable, home)) => {
-            command.env(variable, home);
+    if account.is_system() {
+        // Forget inherited account selections before pinning the system home.
+        for variable in super::inherited_selections(&|name| std::env::var(name).ok()) {
+            command.env_remove(variable);
         }
-        // The system account is the home the CLI resolves on its own, which
-        // an account cagents selected for this process is not.
-        None if account.is_system() => {
-            for variable in super::inherited_selections(&|name| std::env::var(name).ok()) {
-                command.env_remove(variable);
-            }
-        }
-        None => {}
     }
     for variable in account.credential_overrides() {
         command.env_remove(variable);
+    }
+    if let Some((variable, home)) = account.probe_environment() {
+        command.env(variable, home);
     }
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
@@ -1201,6 +1197,162 @@ mod tests {
     }
 
     use super::*;
+
+    /// A configured HOME remains available to the CLI's tools, while the
+    /// account selector agrees with the cache and sign-in even if it is missing.
+    #[tokio::test]
+    async fn system_probe_home_stays_pinned_with_a_configured_home() {
+        const TEST: &str =
+            "account::probe::tests::system_probe_home_stays_pinned_with_a_configured_home";
+        const ROOT: &str = "CAGENTS_TEST_SYSTEM_PROBE_HOME_ROOT";
+        const MODE: &str = "CAGENTS_TEST_SYSTEM_PROBE_HOME_MODE";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let directory = tempfile::tempdir().unwrap();
+            for mode in ["default", "explicit", "inherited"] {
+                let root = directory.path().join(mode);
+                std::fs::create_dir_all(root.join("daemon-home")).unwrap();
+                std::fs::write(root.join("owner"), TEST).unwrap();
+                // Inherit the harness environment naturally, including its
+                // authority. Override only fixture inputs; never mutate the
+                // shared harness environment or enumerate its other values.
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(ROOT, &root)
+                    .env(MODE, mode)
+                    .env("HOME", root.join("daemon-home"))
+                    .env_remove(super::super::SELECTION_MARKER);
+                let mut selections = Vec::new();
+                for provider in Account::PROVIDERS {
+                    let variable = super::super::home_variable(provider).unwrap();
+                    if mode == "default" {
+                        child.env_remove(variable);
+                    } else {
+                        let home = root.join(format!("{mode}-{}", provider.executable()));
+                        child.env(variable, &home);
+                        if mode == "inherited" {
+                            selections.push(format!("{variable}={}", home.display()));
+                        }
+                    }
+                }
+                if !selections.is_empty() {
+                    child.env(super::super::SELECTION_MARKER, selections.join("\n"));
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{mode} child: {}", output.status);
+                // Success alone could mean --exact selected no test. Only the
+                // owning child writes this receipt, after all assertions pass.
+                assert_eq!(
+                    std::fs::read_to_string(root.join("complete")).unwrap(),
+                    format!("{TEST}:{mode}")
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        assert!(root.is_absolute());
+        assert_eq!(std::fs::read_to_string(root.join("owner")).unwrap(), TEST);
+        let mode = std::env::var(MODE).unwrap();
+        assert!(matches!(
+            mode.as_str(),
+            "default" | "explicit" | "inherited"
+        ));
+        let configured_home = root.join("configured-home");
+        let configuration = crate::settings::AgentLaunchSettings {
+            environment: std::collections::BTreeMap::from([(
+                "HOME".into(),
+                configured_home.to_str().unwrap().into(),
+            )]),
+            ..Default::default()
+        };
+        for provider in Account::PROVIDERS {
+            configuration.validate_execution(provider).unwrap();
+            let variable = super::super::home_variable(provider).unwrap();
+            let system_home = if mode == "explicit" {
+                root.join(format!("explicit-{}", provider.executable()))
+            } else {
+                root.join("daemon-home")
+                    .join(format!(".{}", provider.executable()))
+            };
+            // The configured HOME has a usable alternative. A missing selected
+            // home must still remain selected rather than falling back here.
+            std::fs::create_dir_all(configured_home.join(format!(".{}", provider.executable())))
+                .unwrap();
+            let pinned_home = root.join(format!("pinned-{}", provider.executable()));
+            for (account, selected_home) in [
+                (Account::system(provider), system_home),
+                (
+                    Account {
+                        provider,
+                        home: super::super::AccountHome::SystemAt {
+                            path: pinned_home.clone(),
+                        },
+                    },
+                    pinned_home,
+                ),
+            ] {
+                std::fs::create_dir_all(&selected_home).unwrap();
+                for present in [true, false] {
+                    if !present {
+                        std::fs::remove_dir(&selected_home).unwrap();
+                    }
+                    assert_eq!(account.resolved_home(), Some(selected_home.clone()));
+                    assert_eq!(
+                        account.probe_environment(),
+                        Some((variable, selected_home.clone()))
+                    );
+                    let cache_home = selected_home
+                        .canonicalize()
+                        .unwrap_or(selected_home.clone());
+                    assert_eq!(
+                        account.cache_key(),
+                        Some(format!(
+                            "{}:{}",
+                            provider.executable(),
+                            cache_home.display()
+                        ))
+                    );
+                    #[cfg(feature = "host")]
+                    {
+                        let cli = Cli {
+                            program: "/bin/sh".into(),
+                            configuration: configuration.clone(),
+                        };
+                        let login = super::super::remote::login_recipe(&account, &cli).unwrap();
+                        assert_eq!(login.environment[variable], selected_home.to_str().unwrap());
+                        assert_eq!(login.environment["HOME"], configured_home.to_str().unwrap());
+                    }
+                    let script = match provider {
+                        Provider::Claude => {
+                            r#"selected="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; printf '%s\n%s\n' "$HOME" "$selected"; if [ -d "$selected" ]; then printf present; else printf missing; fi"#
+                        }
+                        Provider::Codex => {
+                            r#"selected="${CODEX_HOME:-$HOME/.codex}"; printf '%s\n%s\n' "$HOME" "$selected"; if [ -d "$selected" ]; then printf present; else printf missing; fi"#
+                        }
+                        Provider::Omp => unreachable!(),
+                    };
+                    let output = command(&account, Path::new("/bin/sh"), &configuration)
+                        .args(["-c", script])
+                        .output()
+                        .await
+                        .unwrap();
+                    assert!(output.status.success());
+                    assert_eq!(
+                        String::from_utf8(output.stdout).unwrap(),
+                        format!(
+                            "{}\n{}\n{}",
+                            configured_home.display(),
+                            selected_home.display(),
+                            if present { "present" } else { "missing" }
+                        ),
+                        "{provider:?} mode={mode}, account={:?}, present={present}",
+                        account.home
+                    );
+                }
+            }
+        }
+        std::fs::write(root.join("complete"), format!("{TEST}:{mode}")).unwrap();
+    }
 
     #[tokio::test]
     async fn selected_home_probes_remove_inherited_credentials_but_system_keeps_them() {

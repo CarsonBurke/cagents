@@ -510,17 +510,10 @@ impl Account {
 
     /// The environment a probe of this account sets on the CLI.
     ///
-    /// The system account sets nothing, so the CLI resolves its default
-    /// exactly as it would in the user's own shell.
+    /// Pin the same resolved home used by the cache, launches and sign-in.
+    /// A configured `HOME` must not select a different system login.
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
-        match &self.home {
-            AccountHome::System | AccountHome::SystemAt { .. } | AccountHome::Brokered { .. } => {
-                None
-            }
-            AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
-                Some((home_variable(self.provider)?, path.clone()))
-            }
-        }
+        Some((home_variable(self.provider)?, self.resolved_home()?))
     }
 
     /// The key the cross-window cache files this account under: the provider
@@ -1248,7 +1241,12 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
-        assert_eq!(claude.probe_environment(), None);
+        assert_eq!(
+            claude.probe_environment(),
+            claude
+                .resolved_home()
+                .map(|home| ("CLAUDE_CONFIG_DIR", home))
+        );
         let key = uuid::Uuid::from_u128(1);
         let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());
         assert_eq!(
@@ -1269,6 +1267,31 @@ mod tests {
         );
         assert_ne!(managed.lock_name(), codex.lock_name());
         assert!(!managed.is_system() && codex.is_system());
+    }
+
+    #[test]
+    fn probe_environment_preserves_explicit_homes_and_has_none_for_brokered_accounts() {
+        for provider in Account::PROVIDERS {
+            let path = PathBuf::from("/fixture/selected-home");
+            let key = uuid::Uuid::from_u128(1);
+            for account in [
+                Account {
+                    provider,
+                    home: AccountHome::SystemAt { path: path.clone() },
+                },
+                Account::managed(provider, key, path.clone()),
+                Account::linked(provider, key, path.clone()),
+            ] {
+                assert_eq!(
+                    account.probe_environment(),
+                    Some((home_variable(provider).unwrap(), path.clone()))
+                );
+            }
+            assert_eq!(
+                Account::brokered(provider, "fixture".into(), "account".into()).probe_environment(),
+                None
+            );
+        }
     }
 
     /// Regression for #520: a cagents process started from inside a
