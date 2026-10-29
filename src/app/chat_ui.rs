@@ -4475,6 +4475,7 @@ impl Runtime {
             }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        self.admit_report_output();
         images::sync(self);
         let result = self.present();
         if visible {

@@ -32,6 +32,9 @@ pub(super) struct State {
     error: Option<String>,
     page: usize,
     selection: Rc<RefCell<PageSelection>>,
+    // Owned by this inspector, never by a callback. Revoked tickets cannot
+    // become live again when the same runtime is shown later.
+    visibility: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -247,6 +250,12 @@ fn page_menu(
 }
 
 impl State {
+    fn admit(&mut self) {
+        if !self.visibility.load(Ordering::Relaxed) {
+            self.visibility = Arc::new(AtomicBool::new(true));
+        }
+    }
+
     fn cancel(&mut self) {
         if let Some(request) = self.request.take() {
             request.cancelled.store(true, Ordering::Release);
@@ -254,6 +263,7 @@ impl State {
     }
 
     pub(super) fn hide(&mut self, reloadable: bool) {
+        self.visibility.store(false, Ordering::Relaxed);
         self.cancel();
         if reloadable {
             self.ready = None;
@@ -275,6 +285,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.visibility.store(false, Ordering::Relaxed);
         self.cancel();
     }
 }
@@ -328,6 +339,22 @@ fn page_bounds(text: &str, page: usize) -> (std::ops::Range<usize>, usize, usize
 }
 
 impl Runtime {
+    // Keep presentation ownership local to the inspector. The Runtime's own
+    // visibility is still the authority; callbacks only retain a revocable
+    // admission granted after both current source publications agree.
+    pub(super) fn admit_report_output(&mut self) {
+        if self.visible.load(Ordering::Relaxed)
+            && self.provider_exit.expanded
+            && self
+                .provider_exit
+                .key
+                .as_ref()
+                .is_some_and(|key| self.keeps_report_output(key))
+        {
+            self.provider_exit.admit();
+        }
+    }
+
     fn report_output_key(&self, id: &str, source: &chat::TextCopySource) -> Option<Key> {
         let item = self.active_item(id)?;
         if !matches!(
@@ -460,7 +487,7 @@ impl Runtime {
                 selection: selection.clone(),
                 key: key.clone(),
                 handle: self.handle()?.clone(),
-                visible: self.visible.clone(),
+                visible: state.visibility.clone(),
             };
             rows.push(
                 widget::scrollable(crate::ui_controls::owned(
@@ -508,6 +535,7 @@ impl Cagents {
         state.key = Some(key);
         state.expanded = true;
         runtime.provider_exit = state;
+        runtime.admit_report_output();
         self.load_report_output(target, id, source)
     }
 
@@ -689,7 +717,7 @@ impl Cagents {
                 return Task::none();
             }
             let handle = runtime.handle().unwrap().clone();
-            let visible = runtime.visible.clone();
+            let visible = runtime.provider_exit.visibility.clone();
             let mut write = Some(text_copy::write_shared_literal(text));
             return iced::Task::done(()).then(move |_| {
                 let effect = write.take();
@@ -718,9 +746,21 @@ mod tests {
             Some(PathBuf::from("/workspace/report-fixture")),
         ));
         let card = app.workspace.focused().unwrap();
+        // Admit the pane through the same viewport/update path as the native
+        // workspace, before installing any report body. A zero-width fixture
+        // is genuinely hidden and must not load output.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("chat");
         };
+        assert!(runtime.visible.load(Ordering::Relaxed));
         let target = runtime.target;
         runtime.session.launch.session_id = Some("saved-report-conversation".into());
         let source = chat::TextCopySource {
@@ -1202,6 +1242,149 @@ mod tests {
     }
 
     #[test]
+    fn report_page_visibility_ticket_survives_live_updates_but_not_hide_show_or_runtime_drop() {
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, source) = fixture();
+        let original = (*handle.snapshot()).clone();
+        let request = begin(&mut app, target, &source);
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            request,
+            Ok(Arc::new(SAVED.into())),
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let key = runtime.provider_exit.key.as_ref().unwrap().clone();
+        let first = runtime.provider_exit.visibility.clone();
+        assert!(first.load(Ordering::Relaxed));
+        for _ in 0..3 {
+            runtime.set_visible(true).unwrap();
+            assert!(Arc::ptr_eq(&first, &runtime.provider_exit.visibility));
+        }
+        let selected: Arc<str> = Arc::from("Saved first");
+        runtime.provider_exit.selection.borrow_mut().selected = Some(selected.clone());
+        let pending = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            0,
+            selected.clone(),
+        ));
+        // Hide through the actual Runtime transition. Showing again must not
+        // revive an Arc already retained by a queued clipboard effect/widget.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(false)
+            .unwrap();
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .request
+                .is_none()
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(true)
+            .unwrap();
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(clipboard_writes(pending).is_empty());
+
+        handle.publish_snapshot_for_test(original);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        let request = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .provider_exit
+            .request
+            .as_ref()
+            .unwrap()
+            .clone();
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            request,
+            Ok(Arc::new(SAVED.into())),
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let fresh = runtime.provider_exit.visibility.clone();
+        assert!(fresh.load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(&first, &fresh));
+        runtime.provider_exit.selection.borrow_mut().selected = Some(selected.clone());
+        let admitted = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            0,
+            selected.clone(),
+        ));
+        assert_eq!(clipboard_writes(admitted), [selected.to_string()]);
+        let pending = app.handle_chat_ui(Action::CopyReportSelection(
+            target,
+            key.clone(),
+            0,
+            selected,
+        ));
+        drop(
+            app.remove_chat_card(target.card, None)
+                .expect("commit removal of the owning chat surface"),
+        );
+        assert!(!app.cards.contains_key(&target.card));
+        assert!(!fresh.load(Ordering::Relaxed));
+        assert!(handle.is_connected());
+        assert!(snapshot_keeps(&handle.snapshot(), &key));
+        assert!(
+            clipboard_writes(pending).is_empty(),
+            "a retained live handle is insufficient after its inspector owner drops"
+        );
+    }
+
+    #[test]
+    fn report_page_visibility_ticket_revokes_on_collapse_and_source_replacement() {
+        let _context = text_copy::isolated_context();
+        for withdraw in [false, true] {
+            let (mut app, target, handle, source) = fixture();
+            let request = begin(&mut app, target, &source);
+            drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+                target,
+                request,
+                Ok(Arc::new(SAVED.into())),
+            )));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let key = runtime.provider_exit.key.as_ref().unwrap().clone();
+            let ticket = runtime.provider_exit.visibility.clone();
+            let selected: Arc<str> = Arc::from("Saved first");
+            runtime.provider_exit.selection.borrow_mut().selected = Some(selected.clone());
+            let pending = app.handle_chat_ui(Action::CopyReportSelection(
+                target,
+                key.clone(),
+                0,
+                selected,
+            ));
+            if withdraw {
+                let mut withdrawn = (*handle.snapshot()).clone();
+                withdrawn.text_copy_sources.conversation = vec![None];
+                handle.publish_snapshot_for_test(withdrawn);
+                drop(app.reload_report_output(target));
+            } else {
+                drop(app.handle_chat_ui(Action::ToggleReportOutput(
+                    target,
+                    "owned-report".into(),
+                    source,
+                )));
+                assert!(snapshot_keeps(&handle.snapshot(), &key));
+            }
+            assert!(!ticket.load(Ordering::Relaxed));
+            assert!(clipboard_writes(pending).is_empty());
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            assert!(
+                !ticket.load(Ordering::Relaxed),
+                "an old ticket is never reused"
+            );
+        }
+    }
+
+    #[test]
     fn page_selection_copy_supersedes_delayed_full_copy_and_refuses_stale_actions() {
         let _context = text_copy::isolated_context();
         let (mut app, target, handle, source) = fixture();
@@ -1310,7 +1493,7 @@ mod tests {
         )));
         let runtime = app.chat_runtime_mut(target).unwrap();
         let key = runtime.provider_exit.key.as_ref().unwrap().clone();
-        let visible = runtime.visible.clone();
+        let visible = runtime.provider_exit.visibility.clone();
         let delayed = text_copy::Request::for_test(handle.clone(), source);
         #[derive(Default)]
         struct MemoryClipboard(Vec<String>);
