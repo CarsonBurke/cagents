@@ -20,12 +20,6 @@ env:
   # Exact reviewed diagnostic manifest, embedded to keep this control to one file.
   FINAL_SAVE_DIAGNOSTIC_MANIFEST: |
     {
-      "schema": 2,
-      "never_merge": true,
-      "prepared_only": true,
-      "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
-      "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21",
-      "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
       "contract_sources": [
         {
           "head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
@@ -33,13 +27,123 @@ env:
           "sha256": "5ed902501f1bba82391b2ae1d407dbcf7c0011604a3fd54b204b037f655973cb"
         }
       ],
+      "fixture_source_review": {
+        "head": "bc80ba61f9d1a5de02cb570902d3b55fb024a230",
+        "scope": "Independent source clear for bounded cfg(test) fixture-only correction and real StateStore regression; current-head execution UNRUN.",
+        "sha256": "fda81c8029a1ce4af1f4154914cfb11064664e6941538df78a7c74e1b4181813",
+        "tree": "dee67e666efcd48b7dbcba20d5980aa577a775c2"
+      },
+      "lanes": [
+        {
+          "binary": "cagents-ui",
+          "feature": "ui",
+          "id": "1726-ui",
+          "matched_helper": false,
+          "pr": 1726,
+          "selectors": [
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity"
+          ]
+        }
+      ],
+      "limits": [
+        "Temporary isolated research control only; never merge. Preparation is not queue admission, publication or dispatch authorization. Parent must grant a shared lane before execution.",
+        "One serial hosted job, CARGO_BUILD_JOBS=2, one browserless UI target and one isolated UI binary check followed by two exact compiled inventories and two distinct exact parent invocations, each once. Exactly five planned phases; planned counts are not executed results. No CLI/HOST builds, graph unification, helper build, provider or native launcher.",
+        "Natural hosted User context is mandatory: refuse every inherited CAGENTS_ name by presence without reading values or clearing authority. Source Cargo checkout-root configuration stays intact.",
+        "Pin exact source head/tree/clean status, source hashes, build configuration/input hashes, control head/tree/workflow and proven setup action. Recheck source/config/context around every command; retain original stdout/stderr/command/exits/digests and final source state.",
+        "Each command retains GNU timeout2700s plus30s TERM-to-KILL grace and direct-wrapper wait accounting. Uncertain timeout/signal/wrapper, context, source or config faults stop globally; ordinary settled check/inventory/parent failure stops dependent phases and fails qualification. No retry, ignored-test waiver or evidence replacement.",
+        "Each selector requires its own exact inventory entry and matching named outer parent plus a single1P0F0I summary. Both parents are required for qualification. A real runtime failure remains a failure with raw diagnostics retained; stop the first negative and do not salvage inner lines or start dependent invocations.",
+        "All three equal-read scenarios in their original order, original ten assertions, real final-save/settings-writer ownership and all production native-continuity/storage guards are preserved. The retained Claude synthetic test descriptor alone is corrected under cfg(test), with a new real StateStore regression. Runtime success and any production repair are unclaimed.",
+        "Both previous final-save negatives remain at original source/run scopes:1959 exit101 at7e280 and40a exit101 in the third/final retained-chat scenario before ACK. Earlier cancelled-close negative remains. No prior check/test/native pass transfers tobc80.",
+        "No native close/recovery interaction, matched screenshots, UX acceptance, responsiveness, whole feature suite, integrated-browser, commercial provider or merge readiness is established. All current Cargo/test/helper/native/provider/workflow execution is UNRUN."
+      ],
+      "never_merge": true,
+      "original_negative": {
+        "artifact_id": 12878074392,
+        "command_exit": 101,
+        "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+        "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+        "outer_result": {
+          "failed": 1,
+          "ignored": 0,
+          "passed": 0
+        },
+        "phase": "1726-ui-parent-5",
+        "pr": 1959,
+        "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+        "product_pr": 1726,
+        "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+        "run_id": 40828554073,
+        "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair.",
+        "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+        "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+        "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a"
+      },
+      "original_negatives": [
+        {
+          "artifact_id": 12878074392,
+          "command_exit": 101,
+          "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+          "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+          "outer_result": {
+            "failed": 1,
+            "ignored": 0,
+            "passed": 0
+          },
+          "phase": "1726-ui-parent-5",
+          "pr": 1959,
+          "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+          "product_pr": 1726,
+          "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+          "run_id": 40828554073,
+          "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair.",
+          "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+          "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+          "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a"
+        },
+        {
+          "artifact_id": 12925179838,
+          "command_exit": 101,
+          "control_head": "fd44a82e61726afe33b691ced245e410c189264f",
+          "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+          "flush_error_category": "InvalidState at the window pane before ACK",
+          "outer_result": {
+            "failed": 1,
+            "ignored": 0,
+            "passed": 0
+          },
+          "phase": "1726-ui-parent-1",
+          "product_head": "40a574dcb5fdb8a96986412399324fda07598032",
+          "raw_audit_sha256": "7a37f09b88b59e7c901d38fc20ecece36d43adb7094378a2d8a6d625b8b2ad72",
+          "run_id": 40938441627,
+          "saved_error": null,
+          "scenario": {
+            "ordinal": 3,
+            "retained_chat": true,
+            "scoped": false,
+            "total": 3
+          },
+          "scope": "The third/final retained-chat scenario failed before ACK on40a. This is not the first scenario. The log gives the invalid-state category and pane; the violated native-continuity invariant and fixture-only correction are source-established. No40a pass qualifiesbc80.",
+          "stderr_sha256": "65179de862b85829d5821813d3b54d9b67b21f004977b469ddd9fc0b3a33e6cc",
+          "stdout_sha256": "c64587bd901b1397c3cf835c8de785c036ff6749bedbbc76ec48c38c62b38b83",
+          "zip_sha256": "11aac71ae51658014701c0d7616b48354df396f1cf88763b840e955a42a460f4"
+        }
+      ],
+      "prepared_only": true,
       "products": [
         {
+          "fixture_contract": "Fixture-only correction of the synthetic retained Claude native-continuity descriptor plus a real StateStore save/load/refusal/rollback regression. The original equal-read parent, all ten assertion predicates and all three scenarios in their original order are unchanged. All production guards and production source prefix are unchanged. No production repair, native holder/provider authority, authenticated adoption, window or helper is proved by this fixture.",
+          "fixture_source_review_sha256": "fda81c8029a1ce4af1f4154914cfb11064664e6941538df78a7c74e1b4181813",
+          "head": "bc80ba61f9d1a5de02cb570902d3b55fb024a230",
           "pr": 1726,
-          "head": "40a574dcb5fdb8a96986412399324fda07598032",
-          "tree": "ae66e2f08cc0dce6388db46efe27f80ed77aedd8",
+          "predecessor_source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490739169",
+          "selector_sources": {
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity": "src/app/shared_views.rs"
+          },
           "selectors": [
-            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity"
           ],
           "source_paths": [
             "src/app.rs",
@@ -48,68 +152,24 @@ env:
             "src/persistence.rs",
             ".cargo/config.toml"
           ],
-          "fixture_contract": "Actual headless production app reducers, real SettingsSave/final-save worker and temporary Settings/SQLite stores. The three original equal-read scenarios and all original assertion predicates remain unchanged. This source adds only scenario and saved/result Err diagnostics before the original success assertion and before ACK application; it is not a causal repair. No native window, provider, terminal or executable helper is launched by the controller.",
-          "selector_sources": {
-            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs"
-          },
           "source_sha256": {
-            "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
             "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+            "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
+            "src/app/shared_views.rs": "ed3a003b782272bc39e00233078e83759c3f9e508a6303b2f427006cbf8106ea",
             "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
             "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
-            "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
-            "src/app/shared_views.rs": "6eede63fa8f4d19ccfe14d088483483b7a7ba94e1a592050750e0d01b15d61fa",
-            "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de",
             "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
-            ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+            "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de"
           },
-          "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490739169"
+          "tree": "dee67e666efcd48b7dbcba20d5980aa577a775c2"
         }
       ],
-      "lanes": [
-        {
-          "id": "1726-ui",
-          "pr": 1726,
-          "feature": "ui",
-          "binary": "cagents-ui",
-          "selectors": [
-            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
-          ],
-          "matched_helper": false
-        }
-      ],
-      "original_negative": {
-        "pr": 1959,
-        "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
-        "run_id": 40828554073,
-        "artifact_id": 12878074392,
-        "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a",
-        "product_pr": 1726,
-        "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
-        "phase": "1726-ui-parent-5",
-        "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
-        "outer_result": {
-          "passed": 0,
-          "failed": 1,
-          "ignored": 0
-        },
-        "command_exit": 101,
-        "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
-        "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
-        "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
-        "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair."
-      },
-      "limits": [
-        "Temporary isolated research control only; never merge. Preparation is not queue admission, publication or dispatch authorization. Parent must grant a shared lane before execution.",
-        "One serial hosted job, CARGO_BUILD_JOBS=2, one browserless UI target and one isolated UI binary check followed by one exact compiled inventory and one exact parent invocation. Exactly three planned phases; planned counts are not executed results. No CLI/HOST builds, graph unification, helper build, provider or native launcher.",
-        "Natural hosted User context is mandatory: refuse every inherited CAGENTS_ name by presence without reading values or clearing authority. Source Cargo checkout-root configuration stays intact.",
-        "Pin exact source head/tree/clean status, source hashes, build configuration/input hashes, control head/tree/workflow and proven setup action. Recheck source/config/context around every command; retain original stdout/stderr/command/exits/digests and final source state.",
-        "Each command retains GNU timeout2700s plus30s TERM-to-KILL grace and direct-wrapper wait accounting. Uncertain timeout/signal/wrapper, context, source or config faults stop globally; ordinary settled check/inventory/parent failure stops dependent phases and fails qualification. No retry, ignored-test waiver or evidence replacement.",
-        "One exact inventory entry and one matching named outer parent plus a single1P0F0I summary are required for success. A real runtime failure remains a failure while its raw diagnostic payload is retained; inner lines are never salvaged.",
-        "All three scenarios, original production Arc/no-op/title guards, real final-save/settings-writer ownership and original ten assertion predicates are preserved in the pinned source. Obtain actual saved/result Err before proposing a causal correction; no speculative repair is included.",
-        "The previous final-save negative and earlier cancelled-close negative remain at original source/run scopes. No prior pass transfers to this source.",
-        "No native close/recovery interaction, matched screenshots, UX acceptance, responsiveness, whole feature suite, integrated-browser, commercial provider or merge readiness is established. All current Cargo/test/helper/native/provider/workflow execution is UNRUN."
-      ]
+      "schema": 2,
+      "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+      "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21"
     }
 
 jobs:
@@ -161,7 +221,7 @@ jobs:
       - name: Check out exact PR 1726
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 40a574dcb5fdb8a96986412399324fda07598032
+          ref: bc80ba61f9d1a5de02cb570902d3b55fb024a230
           path: product-1726
           persist-credentials: false
 
@@ -198,9 +258,9 @@ jobs:
           assert manifest["never_merge"] is True
           assert [p["pr"] for p in manifest["products"]] == [1726]
           assert [lane["id"] for lane in manifest["lanes"]] == ["1726-ui"]
-          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [1]
+          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [2]
           selected = [name for lane in manifest["lanes"] for name in lane["selectors"]]
-          assert len(selected) == len(set(selected)) == 1
+          assert len(selected) == len(set(selected)) == 2
           for lane in manifest["lanes"]:
               assert lane["feature"] == "ui" and lane["binary"] == "cagents-ui"
               assert lane["matched_helper"] is False
