@@ -408,11 +408,57 @@ async fn root_scope_owned_file_round_trip(path: &Path) {
     assert!(runtime.is_dirty());
     let save = runtime.request_save(card, false);
     assert!(runtime.is_saving());
-    finish(&mut runtime, save).await;
+    let mut completions = Vec::new();
+    if let Some(mut stream) = iced::runtime::task::into_stream(save) {
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                if let RepositoryAction::RetainedSaveFinished {
+                    ticket,
+                    revision,
+                    result,
+                    ..
+                } = &action
+                {
+                    // Observe the typed worker result before update flattens its
+                    // error or consumes its outcome. Keep no recovery owner.
+                    let result = match result {
+                        Ok(saved) => format!(
+                            "Ok({:?}); recovery_present={}",
+                            saved.outcome(),
+                            saved.recovery_authority().is_some()
+                        ),
+                        Err(crate::editor::retained_save::RetainedSaveError::Io(error)) => {
+                            format!("Err(Io({error:?})); recovery_present=false")
+                        }
+                        Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                            message,
+                            ..
+                        }) => format!("Err(Recovery({message:?})); recovery_present=true"),
+                    };
+                    completions.push(format!(
+                        "RetainedSaveFinished ticket={ticket} revision={revision} result={result}"
+                    ));
+                }
+                drop(runtime.update(action));
+            }
+        }
+    }
     assert_eq!(
         std::fs::read_to_string(path).unwrap(),
         submitted,
-        "Save must use the actual qualified edited-file parent despite Root scope"
+        "Save must use the actual qualified edited-file parent despite Root scope; \
+         path={path:?}; completion_count={}; completions={completions:?}; \
+         editor_text={:?}; dirty={}; saving={}; save_error={:?}; \
+         editor_recovery={}; durability_warning={}; conflict={}; custody_pending={}",
+        completions.len(),
+        runtime.editor_text(),
+        runtime.is_dirty(),
+        runtime.is_saving(),
+        runtime.save_error(),
+        runtime.has_editor_recovery(),
+        runtime.has_durability_warning(),
+        runtime.has_save_conflict(),
+        custody.lock().unwrap().is_pending()
     );
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());
