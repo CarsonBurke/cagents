@@ -1307,11 +1307,23 @@ pub(crate) mod tests {
                 organization: None,
                 added_at: 1,
             };
+            let before = store.load().unwrap();
+            let bytes = std::fs::read(root.path().join("registry/accounts.toml")).unwrap();
+            let failure = store
+                .try_register_pending_reserved(&reservation, &homes, registered, &[])
+                .unwrap_err();
             assert!(
-                store
-                    .try_register_pending_reserved(&reservation, &homes, registered, &[])
-                    .is_err()
+                failure
+                    .to_string()
+                    .contains("affected account registration changed"),
+                "{failure}"
             );
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(
+                std::fs::read(root.path().join("registry/accounts.toml")).unwrap(),
+                bytes
+            );
+            assert!(store.load().unwrap().find(key).is_none());
         }
     }
 
