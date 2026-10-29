@@ -8,6 +8,16 @@ use super::{
 use crate::{agent::Provider, chat::runtime::Handle};
 use std::{path::Path, time::Instant};
 
+struct Lease<'a> {
+    handle: &'a Handle,
+    token: uuid::Uuid,
+}
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.handle.release_reset_credit(self.token);
+    }
+}
+
 pub(crate) fn execute(
     handle: &Handle,
     request: Request,
@@ -63,6 +73,25 @@ pub(crate) fn execute(
             return Err("An earlier reset attempt remains uncertain although current usage is below the monitor condition. No consuming request was sent; explicitly reconcile the original account and credit before retrying".into());
         }
         if meets_condition {
+            // Reserve this exact actor before writing an intent. Different
+            // account/origin ledgers cannot race through a check-only gate.
+            // Current terminal records can resolve an old actor-local tuple
+            // completed by another pane, including verified no-effect ACKs.
+            let reservation = transport::Reservation::prepared(
+                expires,
+                expected,
+                credit_id.clone(),
+                ledger.original_key(&credit_id)?,
+                ledger.verified_attempts(&allowance)?,
+            );
+            let _lease = Lease {
+                handle,
+                token: reservation.token,
+            };
+            current()?;
+            handle.reserve_reset_credit(reservation.clone())?;
+            current()?;
+            reservation.check()?;
             match ledger.begin_available(&credit_id, now, &allowance)? {
                 Admission::Complete(prior) => {
                     outcome = Some(prior);
@@ -72,15 +101,15 @@ pub(crate) fn execute(
                     idempotency_key,
                     reconcile_first,
                 } => {
+                    if idempotency_key != reservation.attempt.key {
+                        return Err("Reset intent no longer matches its actor reservation".into());
+                    }
                     // That durable record is intentionally retained after EVERY
                     // error below, including missing RPC support and timeout.
                     current()?;
                     let (reply, response) = crossbeam_channel::bounded(1);
                     handle.consume_reset_credit(transport::Consume::prepared(
-                        expires,
-                        expected,
-                        credit_id.clone(),
-                        idempotency_key,
+                        &reservation,
                         reconcile_first,
                         condition,
                         reply,

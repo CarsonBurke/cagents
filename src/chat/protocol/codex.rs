@@ -358,6 +358,7 @@ fn create_inner(
             expected_home,
             next_id: 0,
             pending: BTreeMap::new(),
+            reset_state: reset_credit::State::default(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
@@ -496,6 +497,7 @@ struct Codex {
     expected_home: PathBuf,
     next_id: u64,
     pending: BTreeMap<String, Pending>,
+    reset_state: reset_credit::State,
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
     /// What is held of each running command's output between deltas: the
@@ -1556,6 +1558,22 @@ impl Adapter for Codex {
     ) -> Result<Step, String> {
         reset_credit::start(self, request)
     }
+    fn reserve_reset_credit(
+        &mut self,
+        request: crate::account::reset::transport::Reservation,
+    ) -> Result<(), String> {
+        reset_credit::reserve(self, request)
+    }
+    fn release_reset_credit(&mut self, token: uuid::Uuid) {
+        reset_credit::release(self, token);
+    }
+    fn write_guard(&self, frame: &Value) -> Option<std::sync::Arc<dyn super::WriteGuard>> {
+        let id = rpc_id(frame.get("id")?).ok()?;
+        match self.pending.get(&id)? {
+            Pending::ResetCredit(redemption) => redemption.write_guard(),
+            _ => None,
+        }
+    }
     fn read_allowance(
         &mut self,
         request: crate::account::reset::transport::Read,
@@ -1710,6 +1728,9 @@ impl Adapter for Codex {
         }
         if frame.get("id").is_some() {
             let id = rpc_id(&frame["id"])?;
+            if self.reset_state.tombstones.remove(&id) {
+                return Ok(step);
+            }
             let pending = self
                 .pending
                 .remove(&id)
@@ -2907,12 +2928,13 @@ impl Adapter for Codex {
                 }
             }
             "account/updated" => {
+                reset_credit::invalidate(self);
                 // A login transition invalidates in-flight reads on this
                 // connection. Keep RPC IDs so their late replies are drained.
                 for pending in self.pending.values_mut() {
                     match pending {
                         Pending::Allowance(request) => request.invalidated = true,
-                        Pending::ResetCredit(request) => request.invalidated = true,
+                        Pending::ResetCredit(request) => request.invalidate(),
                         _ => {}
                     }
                 }
@@ -4295,6 +4317,17 @@ mod tests {
         );
     }
 
+    impl Codex {
+        fn fixture_consume(
+            &mut self,
+            request: crate::account::reset::transport::Consume,
+        ) -> Result<Step, String> {
+            self.reserve_reset_credit(crate::account::reset::transport::Reservation::fixture(
+                &request,
+            ))?;
+            self.consume_reset_credit(request)
+        }
+    }
     fn reset_request() -> (
         crate::account::reset::transport::Consume,
         crossbeam_channel::Receiver<Result<crate::account::reset::transport::Consumed, String>>,
@@ -4322,7 +4355,7 @@ mod tests {
         adapter.turn = Some("preserved-running-turn".into());
         let (request, receiver) = reset_request();
         let key = request.key.clone();
-        let mut step = adapter.consume_reset_credit(request).unwrap();
+        let mut step = adapter.fixture_consume(request).unwrap();
         for (method, result) in [
             ("account/read", allowance_account()),
             ("account/rateLimits/read", reset_limits(96, 1)),
@@ -4361,7 +4394,7 @@ mod tests {
         for changed_event in [false, true] {
             let mut adapter = adapter();
             let (request, receiver) = reset_request();
-            let first = adapter.consume_reset_credit(request).unwrap();
+            let first = adapter.fixture_consume(request).unwrap();
             let mut account = allowance_account();
             if changed_event {
                 adapter
@@ -4392,7 +4425,7 @@ mod tests {
             used_percent: 90,
             max_age_ms: 30_000,
         });
-        let first = adapter.consume_reset_credit(request).unwrap();
+        let first = adapter.fixture_consume(request).unwrap();
         let second = adapter
             .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
             .unwrap();
@@ -4414,7 +4447,7 @@ mod tests {
     fn uncertain_reset_reply_cannot_be_replaced_by_a_second_reset_or_inspection_request() {
         let mut adapter = adapter();
         let (request, receiver) = reset_request();
-        let first = adapter.consume_reset_credit(request).unwrap();
+        let first = adapter.fixture_consume(request).unwrap();
         let second = adapter
             .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
             .unwrap();
@@ -4429,7 +4462,7 @@ mod tests {
         let (retry, _) = reset_request();
         assert!(
             adapter
-                .consume_reset_credit(retry)
+                .fixture_consume(retry)
                 .unwrap_err()
                 .contains("still pending")
         );
@@ -4493,7 +4526,7 @@ mod tests {
         assert_eq!(adapter.turn.as_deref(), Some("still-running"));
     }
     #[test]
-    fn expired_unanswered_allowance_read_keeps_one_rpc_and_never_spends_shared_request_budget() {
+    fn expired_allowance_read_releases_only_its_barrier_and_drains_its_exact_late_id() {
         let mut adapter = adapter();
         let (request, _) = allowance_request();
         let first = adapter.read_allowance(request).unwrap();
@@ -4502,22 +4535,22 @@ mod tests {
                 read.expire_for_test();
             }
         }
-        for _ in 0..256 {
-            let (request, _) = allowance_request();
-            assert!(
-                adapter
-                    .read_allowance(request)
-                    .unwrap_err()
-                    .contains("already in flight")
-            );
-        }
+        let (request, receiver) = allowance_request();
+        let fresh = adapter.read_allowance(request).unwrap();
         assert_eq!(adapter.pending.len(), 1);
-        // Late original reply is drained under its exact ID and cannot
-        // advance to another request after the original deadline.
+        assert_eq!(adapter.reset_state.tombstones.len(), 1);
         let late = adapter
             .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
             .unwrap();
         assert!(late.writes.is_empty() && late.events.is_empty());
+        assert_eq!(adapter.pending.len(), 1);
+        let limits = adapter
+            .receive(json!({"id":fresh.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        adapter
+            .receive(json!({"id":limits.writes[0]["id"],"result":reset_limits(96,1)}))
+            .unwrap();
+        assert!(receiver.try_recv().unwrap().is_ok());
         assert!(adapter.pending.is_empty());
     }
     #[test]
@@ -4589,6 +4622,7 @@ mod tests {
             expected_home: std::fs::canonicalize("/tmp").unwrap(),
             next_id: 0,
             pending: BTreeMap::new(),
+            reset_state: reset_credit::State::default(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),

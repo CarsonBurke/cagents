@@ -152,6 +152,51 @@ impl Ledger {
             .map(|attempt| attempt.credit_id.as_str()))
     }
 
+    pub(crate) fn original_key(&self, credit_id: &str) -> Result<String, String> {
+        self.ensure_usable()?;
+        identifier_str(credit_id)?;
+        Ok(self
+            .state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.credit_id == credit_id)
+            .map(|attempt| attempt.idempotency_key.clone())
+            .unwrap_or_else(|| attempt_key(&self.state.account_id, credit_id)))
+    }
+
+    /// The owning lease stays held through actor reservation and journal
+    /// admission. Only current terminal records qualify: a revived credit's
+    /// outcome is None and cannot resolve an actor's uncertainty.
+    pub(crate) fn verified_attempts(
+        &self,
+        fresh: &Allowance,
+    ) -> Result<Vec<super::transport::Verified>, String> {
+        self.ensure_usable()?;
+        let expected = ProviderAccount {
+            account_id: self.state.account_id.clone(),
+            backend_origin: self.state.backend_origin.clone(),
+        };
+        if fresh.account.as_ref() != Some(&expected) || fresh.reset_credits.is_none() {
+            return Err(
+                "Fresh matching account and reset inventory are required for actor reservation"
+                    .into(),
+            );
+        }
+        Ok(self
+            .state
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.outcome.is_some())
+            .map(|attempt| {
+                super::transport::Verified::recorded(super::transport::Attempt {
+                    expected: expected.clone(),
+                    credit_id: attempt.credit_id.clone(),
+                    key: attempt.idempotency_key.clone(),
+                })
+            })
+            .collect())
+    }
+
     pub(crate) fn begin_available(
         &mut self,
         credit_id: &str,

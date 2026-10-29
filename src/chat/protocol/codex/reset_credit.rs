@@ -2,6 +2,182 @@
 //! on this same connection. ACK is followed by fresh identity/inventory reads.
 use super::{Codex, Pending, Step, Value, json};
 use crate::account::reset::{Outcome, parse_codex, transport};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+#[derive(Default)]
+pub(super) struct State {
+    uncertain: Option<transport::Attempt>,
+    reservation: Option<Reserved>,
+    pub(super) tombstones: BTreeSet<String>,
+}
+struct Reserved {
+    request: transport::Reservation,
+    valid: Arc<AtomicBool>,
+}
+
+struct Permit {
+    request: transport::Consume,
+    valid: AtomicBool,
+    reservation: Arc<AtomicBool>,
+}
+impl Permit {
+    fn revoke(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
+}
+impl crate::chat::protocol::WriteGuard for Permit {
+    fn before_first_byte(&self) -> bool {
+        if self.valid.load(Ordering::Acquire)
+            && self.reservation.load(Ordering::Acquire)
+            && self.request.check().is_ok()
+        {
+            return true;
+        }
+        self.revoke();
+        let _ = self.request.reply.try_send(Err("The wholly unsent reset request was cancelled because its account, reservation or deadline changed; preserve and reconcile the original durable attempt".into()));
+        false
+    }
+}
+
+fn stale_ids(adapter: &Codex) -> Vec<String> {
+    adapter
+        .pending
+        .iter()
+        .filter_map(|(id, pending)| {
+            match pending {
+                Pending::Allowance(read) => read.stale(),
+                Pending::ResetCredit(redemption) => redemption.stale(),
+                _ => false,
+            }
+            .then(|| id.clone())
+        })
+        .collect()
+}
+fn check_capacity(adapter: &Codex, stale: &[String]) -> Result<(), String> {
+    if adapter.reset_state.tombstones.len() + stale.len() > super::MAX_PENDING {
+        return Err("Too many unanswered account requests to retain their late-response IDs safely; the live turn and original reset attempt were preserved".into());
+    }
+    Ok(())
+}
+fn retire(adapter: &mut Codex, stale: Vec<String>) {
+    for id in stale {
+        match adapter
+            .pending
+            .remove(&id)
+            .expect("retained stale account request")
+        {
+            Pending::Allowance(read) => read.retire(),
+            Pending::ResetCredit(redemption) => {
+                // The queue may still own this permit after Pending is gone.
+                redemption.permit.revoke();
+                let _ = redemption.request.reply.try_send(Err("The previous reset request expired or its account changed; reconcile the original durable tuple and key".into()));
+            }
+            _ => unreachable!(),
+        }
+        adapter.reset_state.tombstones.insert(id);
+    }
+}
+pub(super) fn retire_stale(adapter: &mut Codex) -> Result<(), String> {
+    let stale = stale_ids(adapter);
+    check_capacity(adapter, &stale)?;
+    retire(adapter, stale);
+    Ok(())
+}
+
+pub(super) fn reserve(adapter: &mut Codex, request: transport::Reservation) -> Result<(), String> {
+    request.check()?;
+    if !adapter.ready {
+        return Err("Codex connection is not ready for reset reservation".into());
+    }
+    let stale = stale_ids(adapter);
+    check_capacity(adapter, &stale)?;
+    if adapter.pending.iter().any(|(id, pending)| {
+        !stale.contains(id) && matches!(pending, Pending::Allowance(_) | Pending::ResetCredit(_))
+    }) {
+        return Err("Another account allowance/reset request is still pending".into());
+    }
+    if adapter
+        .reset_state
+        .reservation
+        .as_ref()
+        .is_some_and(|reserved| {
+            reserved.request.token != request.token
+                && reserved.request.check().is_ok()
+                && reserved.valid.load(Ordering::Acquire)
+        })
+    {
+        return Err("Another controller has reserved this exact actor for a reset attempt".into());
+    }
+    let resolved = adapter
+        .reset_state
+        .uncertain
+        .as_ref()
+        .is_some_and(|uncertain| {
+            request
+                .verified
+                .iter()
+                .any(|proof| &proof.attempt == uncertain)
+        });
+    if adapter
+        .reset_state
+        .uncertain
+        .as_ref()
+        .is_some_and(|uncertain| uncertain != &request.attempt && !resolved)
+    {
+        return Err("The original account, origin, credit and key remain uncertain on this actor; reconcile that exact durable attempt before selecting another".into());
+    }
+    // Every refusal above leaves the retained state intact. Revoke old
+    // permits and reserve atomically before the controller writes an intent.
+    retire(adapter, stale);
+    if let Some(prior) = adapter.reset_state.reservation.take() {
+        prior.valid.store(false, Ordering::Release);
+    }
+    if resolved {
+        adapter.reset_state.uncertain = None;
+    }
+    adapter.reset_state.reservation = Some(Reserved {
+        request,
+        valid: Arc::new(AtomicBool::new(true)),
+    });
+    Ok(())
+}
+pub(super) fn release(adapter: &mut Codex, token: uuid::Uuid) {
+    if adapter
+        .reset_state
+        .reservation
+        .as_ref()
+        .is_some_and(|reserved| reserved.request.token == token)
+        && let Some(reserved) = adapter.reset_state.reservation.take()
+    {
+        reserved.valid.store(false, Ordering::Release);
+    }
+}
+pub(super) fn invalidate(adapter: &mut Codex) {
+    if let Some(reserved) = &adapter.reset_state.reservation {
+        reserved.valid.store(false, Ordering::Release);
+    }
+}
+
+fn reservation(adapter: &Codex, request: &transport::Consume) -> Result<Arc<AtomicBool>, String> {
+    let reserved = adapter
+        .reset_state
+        .reservation
+        .as_ref()
+        .filter(|reserved| {
+            reserved.request.token == request.reservation
+                && reserved.request.attempt == request.attempt()
+                && reserved.valid.load(Ordering::Acquire)
+        })
+        .ok_or("The reset controller's exact actor reservation is no longer current")?;
+    reserved.request.check()?;
+    Ok(reserved.valid.clone())
+}
 
 #[derive(Clone)]
 enum Stage {
@@ -16,12 +192,36 @@ pub(super) struct Redemption {
     request: transport::Consume,
     stage: Stage,
     pub(super) invalidated: bool,
+    permit: Arc<Permit>,
+}
+impl Redemption {
+    fn stale(&self) -> bool {
+        self.invalidated
+            || self.request.check().is_err()
+            || !self.permit.valid.load(Ordering::Acquire)
+            || !self.permit.reservation.load(Ordering::Acquire)
+    }
+    pub(super) fn invalidate(&mut self) {
+        self.invalidated = true;
+        self.permit.revoke();
+    }
+    pub(super) fn write_guard(&self) -> Option<Arc<dyn crate::chat::protocol::WriteGuard>> {
+        matches!(self.stage, Stage::Consume)
+            .then(|| self.permit.clone() as Arc<dyn crate::chat::protocol::WriteGuard>)
+    }
 }
 
 pub(super) fn start(adapter: &mut Codex, request: transport::Consume) -> Result<Step, String> {
     request.check()?;
     if !adapter.ready {
         return Err("Codex connection is not ready for reset-credit redemption".into());
+    }
+    retire_stale(adapter)?;
+    let reserved = reservation(adapter, &request)?;
+    if let Some(uncertain) = &adapter.reset_state.uncertain {
+        if uncertain != &request.attempt() || !request.reconcile {
+            return Err("An uncertain reset requires explicit reconciliation of the original account, origin, credit and key".into());
+        }
     }
     if adapter
         .pending
@@ -30,6 +230,11 @@ pub(super) fn start(adapter: &mut Codex, request: transport::Consume) -> Result<
     {
         return Err("Another account allowance/reset request is still pending; reconcile it before retrying".into());
     }
+    let permit = Arc::new(Permit {
+        request: request.clone(),
+        valid: AtomicBool::new(true),
+        reservation: reserved,
+    });
     let mut step = Step::default();
     adapter.call(
         &mut step,
@@ -39,6 +244,7 @@ pub(super) fn start(adapter: &mut Codex, request: transport::Consume) -> Result<
             request,
             stage: Stage::Identity,
             invalidated: false,
+            permit,
         }),
     )?;
     Ok(step)
@@ -52,6 +258,11 @@ pub(super) fn receive(
     let mut step = Step::default();
     let result = (|| {
         redemption.request.check()?;
+        if !redemption.permit.reservation.load(Ordering::Acquire) {
+            return Err(
+                "The original reset reservation was released; reconcile its durable attempt".into(),
+            );
+        }
         if redemption.invalidated {
             return Err("Provider login changed during reset redemption; reconcile the original durable attempt".into());
         }
@@ -153,6 +364,7 @@ pub(super) fn receive(
                     }
                 }
                 redemption.request.check()?;
+                reservation(adapter, &redemption.request)?;
                 let params = json!({"idempotencyKey":redemption.request.key,"creditId":redemption.request.credit_id});
                 redemption.stage = Stage::Consume;
                 adapter.call(
@@ -161,6 +373,7 @@ pub(super) fn receive(
                     params,
                     Pending::ResetCredit(redemption.clone()),
                 )?;
+                adapter.reset_state.uncertain = Some(redemption.request.attempt());
                 Ok(None)
             }
             Stage::Consume => {
@@ -179,10 +392,16 @@ pub(super) fn receive(
     match result {
         Ok(None) => {}
         result => {
+            redemption.permit.revoke();
+            if result.is_ok()
+                && adapter.reset_state.uncertain.as_ref() == Some(&redemption.request.attempt())
+            {
+                adapter.reset_state.uncertain = None;
+            }
             let _ = redemption
                 .request
                 .reply
-                .send(result.map(|value| value.expect("verified reset result")));
+                .try_send(result.map(|value| value.expect("verified reset result")));
         }
     }
     Ok(step)

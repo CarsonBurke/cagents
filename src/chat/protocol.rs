@@ -196,6 +196,11 @@ pub struct Step {
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
 }
+/// Checked by the JSON-lines writer immediately before the first byte. Once
+/// a frame has started it must finish intact, even if this permit is revoked.
+pub trait WriteGuard: Send + Sync {
+    fn before_first_byte(&self) -> bool;
+}
 /// Account identity verified during initialize on the actual server connection.
 /// A holder can retain it when the account directory is subsequently removed.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -209,6 +214,16 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    fn write_guard(&self, _frame: &Value) -> Option<std::sync::Arc<dyn WriteGuard>> {
+        None
+    }
+    fn reserve_reset_credit(
+        &mut self,
+        _request: crate::account::reset::transport::Reservation,
+    ) -> Result<(), String> {
+        Err("This provider transport has no supported reset-credit reservation path".into())
+    }
+    fn release_reset_credit(&mut self, _token: uuid::Uuid) {}
     fn read_allowance(
         &mut self,
         _request: crate::account::reset::transport::Read,

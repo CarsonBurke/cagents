@@ -9,6 +9,14 @@ pub(super) struct Read {
     account: Option<Value>,
     pub(super) invalidated: bool,
 }
+impl Read {
+    pub(super) fn stale(&self) -> bool {
+        self.invalidated || self.request.check().is_err()
+    }
+    pub(super) fn retire(&self) {
+        let _ = self.request.reply.try_send(Err("The previous allowance read expired or its account changed; inspect the same live actor again".into()));
+    }
+}
 
 #[cfg(test)]
 impl Read {
@@ -22,6 +30,7 @@ pub(super) fn start(adapter: &mut Codex, request: transport::Read) -> Result<Ste
     if !adapter.ready {
         return Err("Codex connection is not ready for allowance inspection".into());
     }
+    super::reset_credit::retire_stale(adapter)?;
     if adapter
         .pending
         .values()

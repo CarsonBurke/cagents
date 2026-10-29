@@ -36,6 +36,8 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    ReserveResetCredit(crate::account::reset::transport::Reservation),
+    ReleaseResetCredit(uuid::Uuid),
     ReadAllowance(crate::account::reset::transport::Read),
     ConsumeResetCredit(crate::account::reset::transport::Consume),
     UpdateSource(
@@ -359,7 +361,7 @@ impl Handle {
                     notify,
                     output: Vec::new(),
                     scanned: 0,
-                    pending: VecDeque::new(),
+                    pending: PendingWrites::default(),
                     offset: 0,
                     queued: 0,
                     stderr: VecDeque::new(),
@@ -593,6 +595,40 @@ impl Handle {
             "Reset admission is uncertain; reconcile the durable attempt before retrying"
                 .to_string()
         })?
+    }
+
+    pub(crate) fn reserve_reset_credit(
+        &self,
+        request: crate::account::reset::transport::Reservation,
+    ) -> Result<(), String> {
+        request.check()?;
+        if self.is_completed()
+            || self.0.draining.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+        {
+            return Err("The exact provider actor is unavailable for reset reservation".into());
+        }
+        let expires = request.expires;
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0
+            .commands
+            .try_send((ActorCommand::ReserveResetCredit(request), reply))
+            .map_err(|e| format!("Reset reservation queue unavailable: {e}"))?;
+        self.wake();
+        response.recv_deadline(expires).map_err(|_| {
+            "Reset reservation timed out; no replacement actor was started".to_string()
+        })?
+    }
+
+    /// Best effort and bounded: an unprocessed release also expires on the
+    /// actor. Its exact UUID can never release a newer controller's lease.
+    pub(crate) fn release_reset_credit(&self, token: uuid::Uuid) {
+        let (reply, _) = crossbeam_channel::bounded(1);
+        let _ = self
+            .0
+            .commands
+            .try_send((ActorCommand::ReleaseResetCredit(token), reply));
+        self.wake();
     }
 
     pub fn command(&self, command: Command) -> Result<(), String> {
@@ -1588,6 +1624,39 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     }
     Ok(())
 }
+/// Preserve the byte-frame API used by the WebSocket writer. Its pop hands
+/// ownership to tungstenite; only JSON-lines can cancel a zero-byte frame.
+#[derive(Default)]
+struct PendingWrites(VecDeque<(Vec<u8>, Option<Arc<dyn super::protocol::WriteGuard>>)>);
+impl PendingWrites {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn front(&self) -> Option<&Vec<u8>> {
+        self.0.front().map(|(bytes, _)| bytes)
+    }
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        self.0.pop_front().map(|(bytes, _)| bytes)
+    }
+    fn push_back(&mut self, bytes: Vec<u8>, guard: Option<Arc<dyn super::protocol::WriteGuard>>) {
+        self.0.push_back((bytes, guard));
+    }
+    fn discard_rejected(&mut self, offset: usize) -> usize {
+        if offset != 0 {
+            return 0;
+        }
+        let mut removed = 0;
+        while self.0.front().is_some_and(|(_, guard)| {
+            guard
+                .as_ref()
+                .is_some_and(|guard| !guard.before_first_byte())
+        }) {
+            removed += self.pop_front().expect("guarded front exists").len();
+        }
+        removed
+    }
+}
+
 struct Actor {
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -1612,7 +1681,7 @@ struct Actor {
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
-    pending: VecDeque<Vec<u8>>,
+    pending: PendingWrites,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
@@ -1824,6 +1893,7 @@ impl Actor {
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
             }
+            self.discard_rejected_writes();
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
             }
@@ -1931,6 +2001,7 @@ impl Actor {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
             if fds[3].revents != 0 {
+                self.discard_rejected_writes();
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
                         Ok(0) => return Err("Provider closed stdin".into()),
@@ -1998,6 +2069,18 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::ReserveResetCredit(request) => {
+                    let result = request
+                        .check()
+                        .and_then(|()| self.adapter.reserve_reset_credit(request));
+                    let _ = reply.try_send(result);
+                    continue;
+                }
+                ActorCommand::ReleaseResetCredit(token) => {
+                    self.adapter.release_reset_credit(token);
+                    let _ = reply.try_send(Ok(()));
+                    continue;
+                }
                 ActorCommand::ConsumeResetCredit(request) => {
                     let result = request
                         .check()
@@ -2314,6 +2397,17 @@ impl Actor {
     fn step(&mut self, step: Step) -> Result<(), String> {
         self.apply_step(step, None)
     }
+    fn discard_rejected_writes(&mut self) {
+        let removed = self.pending.discard_rejected(self.offset);
+        if removed != 0 {
+            self.queued -= removed;
+            self.write_started = if self.pending.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
+        }
+    }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
@@ -2329,6 +2423,7 @@ impl Actor {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
+            let guard = self.adapter.write_guard(&value);
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
                 .map_err(|error| format!("Provider JSON request: {error}"))?;
@@ -2341,7 +2436,7 @@ impl Actor {
                 return Err("Provider stdin queue exceeds 64 MiB; no frames discarded".into());
             }
             self.queued += bytes.len();
-            self.pending.push_back(bytes);
+            self.pending.push_back(bytes, guard);
             if self.write_started.is_none() {
                 self.write_started = Some(Instant::now());
             }

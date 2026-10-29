@@ -2,6 +2,81 @@
 use super::Allowance;
 use std::time::Instant;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Attempt {
+    pub(crate) expected: super::ProviderAccount,
+    pub(crate) credit_id: String,
+    pub(crate) key: String,
+}
+
+/// Produced only from the current, locked durable ledger. An inventory
+/// observation or a caller's requested outcome cannot construct this proof.
+#[derive(Clone)]
+pub(crate) struct Verified {
+    pub(crate) attempt: Attempt,
+    _private: (),
+}
+
+impl Verified {
+    pub(super) fn recorded(attempt: Attempt) -> Self {
+        Self {
+            attempt,
+            _private: (),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Reservation {
+    pub(crate) expires: Instant,
+    pub(crate) token: uuid::Uuid,
+    pub(crate) attempt: Attempt,
+    pub(crate) verified: Vec<Verified>,
+    _private: (),
+}
+
+impl Reservation {
+    pub(super) fn prepared(
+        expires: Instant,
+        expected: super::ProviderAccount,
+        credit_id: String,
+        key: String,
+        verified: Vec<Verified>,
+    ) -> Self {
+        Self {
+            expires,
+            token: uuid::Uuid::new_v4(),
+            attempt: Attempt {
+                expected,
+                credit_id,
+                key,
+            },
+            verified,
+            _private: (),
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if Instant::now() >= self.expires {
+            return Err(
+                "Reset reservation deadline elapsed; no new consuming request was admitted".into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(request: &Consume) -> Self {
+        Self {
+            expires: request.expires,
+            token: request.reservation,
+            attempt: request.attempt(),
+            verified: Vec::new(),
+            _private: (),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Read {
     pub expires: Instant,
@@ -25,6 +100,7 @@ pub(crate) struct Consume {
     pub(crate) key: String,
     pub(crate) reconcile: bool,
     pub(crate) condition: Option<super::request::Threshold>,
+    pub(crate) reservation: uuid::Uuid,
     pub(crate) reply: crossbeam_channel::Sender<Result<Consumed, String>>,
     _private: (),
 }
@@ -38,23 +114,28 @@ impl Consume {
     /// Called only inside the reset controller after durable Ledger::begin
     /// and explicit authenticated user intent. No deserializable effect token.
     pub(super) fn prepared(
-        expires: Instant,
-        expected: super::ProviderAccount,
-        credit_id: String,
-        key: String,
+        reservation: &Reservation,
         reconcile: bool,
         condition: Option<super::request::Threshold>,
         reply: crossbeam_channel::Sender<Result<Consumed, String>>,
     ) -> Self {
         Self {
-            expires,
-            expected,
-            credit_id,
-            key,
+            expires: reservation.expires,
+            expected: reservation.attempt.expected.clone(),
+            credit_id: reservation.attempt.credit_id.clone(),
+            key: reservation.attempt.key.clone(),
             reconcile,
             condition,
+            reservation: reservation.token,
             reply,
             _private: (),
+        }
+    }
+    pub(crate) fn attempt(&self) -> Attempt {
+        Attempt {
+            expected: self.expected.clone(),
+            credit_id: self.credit_id.clone(),
+            key: self.key.clone(),
         }
     }
     pub(crate) fn check(&self) -> Result<(), String> {
@@ -76,14 +157,13 @@ impl Consume {
         expected: super::ProviderAccount,
         reply: crossbeam_channel::Sender<Result<Consumed, String>>,
     ) -> Self {
-        Self::prepared(
+        let reservation = Reservation::prepared(
             expires,
             expected,
             "actual-credit".into(),
             "d4883d22-89ad-8c5f-a577-53ada6ed3afb".into(),
-            false,
-            None,
-            reply,
-        )
+            Vec::new(),
+        );
+        Self::prepared(&reservation, false, None, reply)
     }
 }
