@@ -121,16 +121,27 @@ impl Cagents {
                 .is_some_and(|session| self.terminal_close_attempts.contains(&session.id))
     }
 
-    /// Refuses to close a fenced pane, whatever its kind. Its removal could
-    /// not be shared, so the pane would come back.
-    pub(super) fn refuse_fenced_close(&mut self, card: CardId) -> bool {
-        let fenced = self.shared_views.quarantined.contains(&card);
-        if fenced {
-            self.status = Some(TransientNotice::warning(
-                "This pane can't be closed while its saved session doesn't match its agent. It would reopen in this and your other windows.",
-            ));
+    /// Closes a fenced pane, whatever its kind, in this window only. Its saved
+    /// session is unconfirmed, so its agent is asked to close nothing and
+    /// nothing is shared: other windows keep the pane, and its canonical pane
+    /// reopens here once the session is confirmed.
+    pub(super) fn close_fenced_card_here(&mut self, card: CardId) -> Option<Task<Message>> {
+        if !self.shared_views.quarantined.contains(&card) {
+            return None;
         }
-        fenced
+        Arc::make_mut(&mut self.durable)
+            .pending_chat_admissions
+            .remove(&card);
+        self.chat_discard(card);
+        self.detach_shared_pane_as(
+            card,
+            "closed in this window while its session was unconfirmed",
+        );
+        self.status = Some(TransientNotice::success(
+            "Closed in this window. Other windows keep this pane, and it reopens here once its session is confirmed.",
+        ));
+        self.persist();
+        Some(self.sync_chrome())
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
@@ -178,8 +189,8 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
-        if self.refuse_fenced_close(card) {
-            return Task::none();
+        if let Some(closed) = self.close_fenced_card_here(card) {
+            return closed;
         }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(

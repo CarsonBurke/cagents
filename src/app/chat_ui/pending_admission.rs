@@ -10,35 +10,51 @@ impl Runtime {
     /// stays as saved rather than waiting to reconnect.
     pub(super) fn pending_admission_view(&self, fenced: bool) -> Element<'_, Message> {
         let text = self.unsent_text();
-        let copy = widget::button::custom(design::body("Copy saved draft"))
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([space::S as u16, space::M as u16])
-            .on_press_maybe(
-                (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
+        let mut children = Vec::new();
+        if fenced {
+            children.push(design::body(super::super::shared_views::FENCED_PANE_EXPLANATION).into());
+            children.push(
+                widget::button::standard("Close here")
+                    .on_press(Message::CloseCard(self.target.card))
+                    .into(),
             );
-        let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
-            .align_items(Alignment::Center)
-            .spacing(space::M as u16);
-        let draft = widget::container(view::body(text))
-            .width(Length::Fill)
-            .padding(space::M)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_M; 4],
-                false,
-            ));
-        let content = widget::column::with_children(vec![
-            header.into(),
-            design::body(if fenced {
-                "This pane's saved session doesn't match what its agent now reports, so it stays as saved instead of reopening. Your unsent text is kept here; you can copy it, or open the conversation from history."
-            } else {
-                "This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history."
-            })
-            .into(),
-            widget::scrollable(draft).height(Length::Fill).into(),
-        ])
-        .spacing(space::M)
-        .width(Length::Fill);
+        }
+        // A fenced pane may have nothing unsent; an empty saved draft would
+        // only look like something to copy.
+        if !fenced || !text.is_empty() {
+            let copy = widget::button::custom(design::body("Copy saved draft"))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([space::S as u16, space::M as u16])
+                .on_press_maybe(
+                    (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
+                );
+            children.push(
+                widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
+                    .align_items(Alignment::Center)
+                    .spacing(space::M as u16)
+                    .into(),
+            );
+            if !fenced {
+                children.push(
+                    design::body(
+                        "This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.",
+                    )
+                    .into(),
+                );
+            }
+            let draft = widget::container(view::body(text))
+                .width(Length::Fill)
+                .padding(space::M)
+                .class(design::surface(
+                    Some(design::sunken),
+                    [design::RADIUS_M; 4],
+                    false,
+                ));
+            children.push(widget::scrollable(draft).height(Length::Fill).into());
+        }
+        let content = widget::column::with_children(children)
+            .spacing(space::M)
+            .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
             .padding(space::L)
             .width(Length::Fill)
