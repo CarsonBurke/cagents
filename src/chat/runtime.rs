@@ -3835,7 +3835,10 @@ pub(crate) fn notification_frames_with_probe_for_test<R>(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
-    let snapshot = handle.0.state.lock().unwrap().clone();
+    // Parent items belong to the transcript Store, so the resident metadata
+    // alone is not a client snapshot. Hydrate through the normal read boundary
+    // before probing original-copy sources and capturing pre-teardown state.
+    let snapshot = handle.snapshot(None).unwrap();
     // Collect observations before teardown; callers assert them only after
     // the existing process cleanup/completion guards below have succeeded.
     let probed = probe(&snapshot, &|source, offset| {
