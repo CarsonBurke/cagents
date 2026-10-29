@@ -102,12 +102,14 @@ fn create_inner(
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.arguments = arguments(launch)?;
-    let history = launch
-        .session_id
-        .as_deref()
-        .map(|id| History::open(launch, id))
-        .transpose()?;
     let history_only = forced_history || launch.needs_read_only_history();
+    let (history, history_titles) = match launch.session_id.as_deref() {
+        Some(id) => {
+            let (history, titles) = History::open(launch, id, history_only)?;
+            (Some(history), titles)
+        }
+        None => (None, None),
+    };
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
@@ -131,7 +133,11 @@ fn create_inner(
             forced_history,
             cwd: launch.recipe.working_directory.clone(),
             history,
-            titles: super::claude_titles::ClaudeTitles::new(launch),
+            titles: if history_only {
+                history_titles
+            } else {
+                super::claude_titles::ClaudeTitles::new(launch)
+            },
             ..Claude::default()
         }),
     ))
@@ -4637,6 +4643,76 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
     serde_json::from_reader(file).ok()
 }
 
+/// Validate a recorded namespace without replacing it with today's target.
+/// This proves path spelling only, not the identity of a former directory.
+fn validate_history_anchor(path: &Path, label: &str, missing: bool) -> Result<(), String> {
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(format!(
+            "Saved Claude history requires an absolute recorded {label} without traversal"
+        ));
+    }
+    crate::secure_file::reject_symlink_components(path).map_err(|error| {
+        format!(
+            "Saved Claude history {label} changed or is unavailable; its original history source could not be verified: {error}"
+        )
+    })?;
+    match path.canonicalize() {
+        Ok(current) if current == path => Ok(()),
+        Ok(_) => Err(format!(
+            "Saved Claude history {label} now resolves to another location; its original history source could not be verified"
+        )),
+        Err(error) if missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Cannot verify saved Claude history {label}: {error}"
+        )),
+    }
+}
+
+/// Observe real transcript-open attempts under one fixture root, across the
+/// real client/Host threads. This never supplies data or changes the route.
+#[cfg(test)]
+pub(crate) struct HistoryOpenProbe {
+    paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+#[cfg(test)]
+impl HistoryOpenProbe {
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.paths.lock().unwrap().clone()
+    }
+}
+#[cfg(test)]
+type HistoryOpenProbes = Vec<(PathBuf, std::sync::Weak<std::sync::Mutex<Vec<PathBuf>>>)>;
+#[cfg(test)]
+static HISTORY_OPEN_PROBES: std::sync::Mutex<HistoryOpenProbes> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn history_open_probe(root: &Path) -> HistoryOpenProbe {
+    let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    HISTORY_OPEN_PROBES
+        .lock()
+        .unwrap()
+        .push((root.to_path_buf(), std::sync::Arc::downgrade(&paths)));
+    HistoryOpenProbe { paths }
+}
+#[cfg(test)]
+fn observe_history_open(path: &Path) {
+    HISTORY_OPEN_PROBES.lock().unwrap().retain(|(root, probe)| {
+        let Some(paths) = probe.upgrade() else {
+            return false;
+        };
+        if path.starts_with(root.as_path()) {
+            paths.lock().unwrap().push(path.to_path_buf());
+        }
+        true
+    });
+}
+
 // Port of the official SDK's _build_conversation_chain, with a bounded offset
 // index rather than retaining the full transcript. Never scan other sessions.
 struct History {
@@ -4677,34 +4753,54 @@ struct HistoryNode {
     tool_refs: Vec<(String, usize, bool)>,
 }
 impl History {
-    fn open(launch: &Launch, id: &str) -> Result<Self, String> {
+    fn open(
+        launch: &Launch,
+        id: &str,
+        read_only: bool,
+    ) -> Result<(Self, Option<super::claude_titles::ClaudeTitles>), String> {
         validate_id(id)?;
         let saved_cwd = &launch.recipe.working_directory;
-        let cwd = match saved_cwd.canonicalize() {
-            Ok(cwd) => cwd,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && saved_cwd.is_absolute()
-                    && saved_cwd.components().all(|part| {
-                        matches!(
-                            part,
-                            std::path::Component::RootDir | std::path::Component::Normal(_)
-                        )
-                    }) =>
-            {
-                saved_cwd.clone()
+        let cwd = if read_only {
+            // A saved History scope is a namespace, not permission to resolve
+            // a replacement directory and select its transcript namespace.
+            validate_history_anchor(saved_cwd, "working directory", true)?;
+            saved_cwd.clone()
+        } else {
+            match saved_cwd.canonicalize() {
+                Ok(cwd) => cwd,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && saved_cwd.is_absolute()
+                        && saved_cwd.components().all(|part| {
+                            matches!(
+                                part,
+                                std::path::Component::RootDir | std::path::Component::Normal(_)
+                            )
+                        }) =>
+                {
+                    saved_cwd.clone()
+                }
+                Err(error) => {
+                    return Err(format!("Cannot resolve Claude session directory: {error}"));
+                }
             }
-            Err(error) => return Err(format!("Cannot resolve Claude session directory: {error}")),
         };
-        let config = launch
-            .recipe
-            .environment
-            .get("CLAUDE_CONFIG_DIR")
-            .cloned()
-            .filter(|s| !s.is_empty());
+        let value = |key: &str| {
+            (!launch.recipe.unset_environment.contains(key))
+                .then(|| launch.recipe.environment.get(key))
+                .flatten()
+                .filter(|value| !value.is_empty())
+        };
+        let config = value("CLAUDE_CONFIG_DIR");
         let config = match config {
             Some(config) => {
                 let path = PathBuf::from(config);
+                if read_only && !path.is_absolute() {
+                    return Err(
+                        "Saved Claude history requires an absolute recorded account directory"
+                            .into(),
+                    );
+                }
                 if path.is_absolute() {
                     path
                 } else {
@@ -4712,27 +4808,43 @@ impl History {
                 }
             }
             None => {
-                let home = launch
-                    .recipe
-                    .environment
-                    .get("HOME")
-                    .cloned()
-                    .ok_or("Cannot locate Claude config without HOME")?;
-                PathBuf::from(home).join(".claude")
+                let home = value("HOME").ok_or(if read_only {
+                    "Saved Claude history has no recorded effective account directory or HOME"
+                } else {
+                    "Cannot locate Claude config without HOME"
+                })?;
+                let home = PathBuf::from(home);
+                if read_only && !home.is_absolute() {
+                    return Err("Saved Claude history requires an absolute recorded HOME".into());
+                }
+                home.join(".claude")
             }
         };
+        if read_only {
+            validate_history_anchor(&config, "account directory", false)?;
+        }
         let path = crate::agent::claude_transcript(&config, &cwd, id)?;
         let mut options = std::fs::OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt as _;
         options
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(test)]
+        observe_history_open(&path);
         let file = options
             .open(&path)
             .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
+        let titles = if read_only {
+            Some(super::claude_titles::ClaudeTitles::from_history(
+                file.try_clone().map_err(|error| error.to_string())?,
+                cwd,
+            ))
+        } else {
+            None
+        };
         let mut history = Self::index(file, id)?;
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
-        Ok(history)
+        Ok((history, titles))
     }
     fn index(file: File, id: &str) -> Result<Self, String> {
         Self::index_with_tool_budget(file, id, 32 * 1024 * 1024, 200_000)
@@ -5593,7 +5705,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 }
 
 #[cfg(test)]
-mod history_tests;
+pub(crate) mod history_tests;
 
 #[cfg(test)]
 mod tests {

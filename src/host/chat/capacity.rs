@@ -1336,6 +1336,111 @@ mod tests {
     }
 
     #[test]
+    fn cold_client_history_refuses_rebound_namespace_without_opening_same_uuid_decoy() {
+        for decoy in [false, true] {
+            let host = host();
+            let fixture = chat::protocol::claude::history_tests::Namespaces::new(false, decoy);
+            let registry = super::super::super::model::Registry::at(
+                &fixture.root.path().join("history-source-model.sqlite"),
+            )
+            .unwrap();
+            host.lock().unwrap().execution_registry =
+                Some(Arc::new(std::sync::Mutex::new(registry)));
+            let mut source = fixture.session.clone();
+            source.proof = Some(host.lock().unwrap().proof().clone());
+            let issued = source.clone();
+            // No resident handle is installed by the fixture. The real client
+            // handshake and Host Attach must construct the forced A reader.
+            let (first, server) = restore_client(&host, source.clone(), 71);
+            let first = first.unwrap();
+            first.set_visible(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = first.snapshot();
+                if snapshot.read_only_reason.is_some()
+                    && snapshot.title.as_deref() == Some("Source A title")
+                    && snapshot.items.iter().any(|item| {
+                        matches!(&item.content,
+                        chat::ItemContent::Text { text, .. } if text == "Source A row 219")
+                    })
+                {
+                    assert!(!snapshot.ready);
+                    assert!(snapshot.has_earlier);
+                    assert!(!host.lock().unwrap().chats[&source.id].handle.owns_work());
+                    assert!(
+                        host.lock().unwrap().chats[&source.id]
+                            .handle
+                            .is_read_only_history()
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real client did not receive source A"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(first.session(), issued);
+            drop(first);
+            server.join().unwrap();
+
+            // Release through the real authenticated control connection before
+            // changing A. Keeping the first reader would only test FD retention.
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let server =
+                thread::spawn(move || super::super::super::client::serve(server, 72, server_host));
+            let mut control = crate::control::ControlClient::from_stream(client).unwrap();
+            control.authenticate(Default::default()).unwrap();
+            let ServerResponse::ChatReleaseInspected { inspection } = control
+                .fixture_request(ClientRequest::ChatReleaseInspect { chat_id: source.id })
+                .unwrap()
+            else {
+                panic!("release inspection response");
+            };
+            assert_eq!(inspection.release_blocked, None);
+            assert!(matches!(
+                control
+                    .fixture_request(ClientRequest::ChatRelease {
+                        proof: inspection.proof,
+                        dry_run: false,
+                    })
+                    .unwrap(),
+                ServerResponse::ChatReleased { dry_run: false, .. }
+            ));
+            drop(control);
+            server.join().unwrap();
+            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+
+            fixture.replace_cwd();
+            let probe = chat::protocol::claude::history_open_probe(fixture.root.path());
+            let (result, server) = restore_client(&host, source.clone(), 73);
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(_) => panic!("cold History must refuse a rebound namespace"),
+            };
+            server.join().unwrap();
+            assert!(
+                failure.message.contains("working directory")
+                    && failure
+                        .message
+                        .contains("original history source could not be verified"),
+                "{}",
+                failure.message
+            );
+            assert!(
+                probe.paths().is_empty(),
+                "the production transcript open path must not try B"
+            );
+            assert_eq!(source, issued);
+            let state = host.lock().unwrap();
+            assert!(state.chats.is_empty());
+            assert!(state.chat_spawning.is_empty());
+            assert!(state.native_actor_startups.is_empty());
+        }
+    }
+
+    #[test]
     fn missing_saved_history_refuses_unknown_ownership_and_native_writer_descriptors() {
         let host = host();
         let (_directory, source, _) = closed_history(&host);
