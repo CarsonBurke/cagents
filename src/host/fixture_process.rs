@@ -1935,6 +1935,7 @@ mod tests {
     }
 
     const HOLDER_TEST_LIFETIME_READER: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_LIFETIME_READER";
+    const HOLDER_TEST_CANCEL_READER: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_CANCEL_READER";
 
     fn coordinator_lifetime_pipe() -> (OwnedFd, OwnedFd) {
         let mut descriptors = [-1; 2];
@@ -1950,15 +1951,15 @@ mod tests {
         }
     }
 
-    fn inherit_lifetime_reader(command: &mut Command, reader: &OwnedFd) {
+    fn inherit_lifetime_reader(command: &mut Command, reader: &OwnedFd, environment: &'static str) {
         use std::os::unix::process::CommandExt;
-        assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
+        assert!(std::env::var_os(environment).is_none());
         let descriptor = reader.as_raw_fd();
         let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
         assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
-        command.env(HOLDER_TEST_LIFETIME_READER, descriptor.to_string());
-        // Only the read end survives this exec. The sole coordinator writer
-        // retains pipe2's CLOEXEC, so no stage0/holder copy can suppress EOF.
+        command.env(environment, descriptor.to_string());
+        // Only the read end survives this exec. The sole owning parent writer
+        // retains pipe2's CLOEXEC, so this child cannot keep that writer alive.
         // The owning reader remains alive until Command::spawn has returned.
         unsafe {
             command.pre_exec(move || {
@@ -1972,8 +1973,8 @@ mod tests {
 
     struct CoordinatorLifetime(OwnedFd);
     impl CoordinatorLifetime {
-        fn inherited() -> io::Result<Self> {
-            let descriptor = std::env::var(HOLDER_TEST_LIFETIME_READER)
+        fn inherited(environment: &'static str) -> io::Result<Self> {
+            let descriptor = std::env::var(environment)
                 .map_err(io::Error::other)?
                 .parse::<RawFd>()
                 .map_err(io::Error::other)?;
@@ -1996,8 +1997,8 @@ mod tests {
             {
                 return Err(refused("invalid inherited coordinator lifetime reader"));
             }
-            // Restore close-on-exec BEFORE creating the original holder. It
-            // inherits neither the coordinator's writer nor this read copy.
+            // Restore close-on-exec BEFORE creating any fixture child. Later
+            // execs inherit neither the issuing parent's writer nor this reader.
             if unsafe {
                 libc::fcntl(
                     descriptor.as_raw_fd(),
@@ -2066,9 +2067,69 @@ mod tests {
         }
     }
 
+    // This owner must NEVER force-kill the coordinator: that process owns an
+    // admitted holder pin and its exclusive adopted wait after stage0 dies.
+    // Timeout/panic closes cancellation, then keeps this actual Child until
+    // its original wait completes. No second hard-kill deadline or fake wait
+    // handle may discard that custody to make the outer test return sooner.
+    struct CooperativeCoordinator {
+        child: Child,
+        cancellation_writer: Option<OwnedFd>,
+        status_path: PathBuf,
+    }
+    impl CooperativeCoordinator {
+        fn spawn(root: &Path, mode: &str) -> Self {
+            let (reader, writer) = coordinator_lifetime_pipe();
+            let mut command = holder_child_command(root, mode);
+            inherit_lifetime_reader(&mut command, &reader, HOLDER_TEST_CANCEL_READER);
+            let status_path = root.join("coordinator-original-child-status.json");
+            require_waitable_children().unwrap();
+            let child = command.spawn().unwrap();
+            // Install the real Child owner before any further fallible work.
+            let owner = Self {
+                child,
+                cancellation_writer: Some(writer),
+                status_path,
+            };
+            drop(reader);
+            owner
+        }
+    }
+    impl Drop for CooperativeCoordinator {
+        fn drop(&mut self) {
+            use std::os::unix::process::ExitStatusExt;
+            drop(self.cancellation_writer.take());
+            // Deliberately retains Child.wait's existing blocking limitation.
+            // On an OS wait error, report unknown; never signal or invent a
+            // replacement owner/status to turn the test into a cleanup pass.
+            let mut retain = || -> io::Result<()> {
+                let status = self.child.wait()?;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&self.status_path)?;
+                serde_json::to_writer(
+                    &mut file,
+                    &serde_json::json!({
+                        "raw_status": status.into_raw(), "code": status.code(),
+                        "signal": status.signal(), "core_dumped": status.core_dumped(),
+                        "basis": "cooperative EOF cancellation then sole original coordinator Child.wait; no forced signal"
+                    }),
+                )
+                .map_err(io::Error::other)?;
+                file.flush()
+            };
+            if let Err(error) = retain() {
+                eprintln!("original cooperative coordinator wait/status unconfirmed: {error}");
+            }
+        }
+    }
+
     fn acknowledged_stage0_body() {
         let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
-        let lifetime = CoordinatorLifetime::inherited().unwrap();
+        let lifetime = CoordinatorLifetime::inherited(HOLDER_TEST_LIFETIME_READER).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         if !lifetime.alive().unwrap() {
             return;
@@ -2085,8 +2146,9 @@ mod tests {
         .unwrap();
         fs::write(root.join("stage0-observed-ack"), b"acknowledged").unwrap();
         // Keep the actual startup guard on this stack until the deliberate
-        // crash. If the coordinator instead dies (including outer timeout),
-        // its sole writer closes and we return through the original kill/wait.
+        // crash. If the coordinator dies, its sole writer closes and we return
+        // through the original kill/wait. An ordinary outer timeout instead
+        // cancels and retains that coordinator through its actual cleanup.
         // The finite local deadline also prevents indefinite orphan waiting.
         let reason = lifetime.wait_until(deadline).unwrap();
         drop(original);
@@ -2094,15 +2156,23 @@ mod tests {
         fs::write(root.join("stage0-lifetime-ended"), reason).unwrap();
     }
 
-    fn holder_crash_coordinator(root: &Path) {
+    fn holder_crash_coordinator(root: &Path, cancel_after_stage0_death: bool) {
         use std::os::unix::{fs::DirBuilderExt, process::ExitStatusExt};
         require_waitable_children().unwrap();
         // This body is reached only after reexec of this one exact test. Never
         // change process-wide subreaping beside unrelated libtest parents.
         assert_eq!(
             std::env::var(HOLDER_TEST_CHILD).as_deref(),
-            Ok("crash-coordinator")
+            Ok(if cancel_after_stage0_death {
+                "cancel-coordinator"
+            } else {
+                "crash-coordinator"
+            })
         );
+        let cancellation = CoordinatorLifetime::inherited(HOLDER_TEST_CANCEL_READER).unwrap();
+        if !cancellation.alive().unwrap() {
+            return;
+        }
         assert_eq!(
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
             0
@@ -2111,8 +2181,15 @@ mod tests {
         let stage0 = root.join("stage0");
         fs::DirBuilder::new().mode(0o700).create(&stage0).unwrap();
         let (reader, lifetime_writer) = coordinator_lifetime_pipe();
-        let mut command = holder_child_command(&stage0, "crash-stage0");
-        inherit_lifetime_reader(&mut command, &reader);
+        let mut command = holder_child_command(
+            &stage0,
+            if cancel_after_stage0_death {
+                "cancel-stage0"
+            } else {
+                "crash-stage0"
+            },
+        );
+        inherit_lifetime_reader(&mut command, &reader, HOLDER_TEST_LIFETIME_READER);
         let parent =
             TerminalHolderParent::spawn_stage0(&stage0, TerminalId::new(), &mut command).unwrap();
         drop(reader);
@@ -2170,6 +2247,20 @@ mod tests {
         assert_eq!(stored.descriptor.as_raw_fd(), descriptor);
         assert!(stored.armed && !exited(&stored.descriptor).unwrap());
         assert!(sentinel.child.try_wait().unwrap().is_none());
+        if cancel_after_stage0_death {
+            fs::write(
+                root.join("post-stage0-death-cut-reached"),
+                b"original-waited-live-pin",
+            )
+            .unwrap();
+            assert_eq!(
+                cancellation.wait_until(deadline).unwrap(),
+                "coordinator-eof",
+                "the exact post-stage0-death fault must observe outer cancellation"
+            );
+            assert!(parent.holder.as_ref().unwrap().armed);
+            assert!(!exited(&parent.holder.as_ref().unwrap().descriptor).unwrap());
+        }
         // Exercise the actual failure Drop, keeping only the independently
         // owned wait descriptor. No test-side holder signal precedes this.
         drop(custody.parent.take());
@@ -2185,6 +2276,13 @@ mod tests {
             b"original-only",
         )
         .unwrap();
+        if cancel_after_stage0_death {
+            fs::write(
+                root.join("post-stage0-death-cancellation-settled"),
+                b"cancel-eof-original-holder-waited-sentinel-survived",
+            )
+            .unwrap();
+        }
         drop(lifetime_writer);
     }
 
@@ -2194,13 +2292,13 @@ mod tests {
             Ok("crash-stage0") => acknowledged_stage0_body(),
             Ok("crash-coordinator") => {
                 let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
-                holder_crash_coordinator(&root);
+                holder_crash_coordinator(&root, false);
             }
             Err(std::env::VarError::NotPresent) => {
                 assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
                 let root = tempfile::tempdir().unwrap();
-                let mut command = holder_child_command(root.path(), "crash-coordinator");
-                let mut coordinator = OriginalChild::spawn(&mut command).unwrap();
+                let mut coordinator =
+                    CooperativeCoordinator::spawn(root.path(), "crash-coordinator");
                 let deadline = Instant::now() + Duration::from_secs(15);
                 let status = loop {
                     if let Some(status) = coordinator.child.try_wait().unwrap() {
@@ -2241,7 +2339,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (reader, lifetime_writer) = coordinator_lifetime_pipe();
         let mut command = holder_child_command(root.path(), "eof-stage0");
-        inherit_lifetime_reader(&mut command, &reader);
+        inherit_lifetime_reader(&mut command, &reader, HOLDER_TEST_LIFETIME_READER);
         let mut parent =
             TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
                 .unwrap();
@@ -2277,5 +2375,59 @@ mod tests {
         assert!(status["code"].is_null());
         parent.confirm_holder_exit_until(deadline).unwrap();
         assert!(!parent.holder.as_ref().unwrap().armed);
+    }
+
+    #[test]
+    fn single_holder_post_stage0_death_outer_cancellation_retains_exact_cleanup_owner() {
+        match std::env::var(HOLDER_TEST_CHILD).as_deref() {
+            Ok("cancel-stage0") => {
+                acknowledged_stage0_body();
+                return;
+            }
+            Ok("cancel-coordinator") => {
+                let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+                holder_crash_coordinator(&root, true);
+                return;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            _ => panic!("unknown post-stage0-death cancellation role"),
+        }
+        assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
+        let root = tempfile::tempdir().unwrap();
+        struct PostStage0OuterTimeout;
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> () {
+            let mut coordinator = CooperativeCoordinator::spawn(root.path(), "cancel-coordinator");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !root.path().join("post-stage0-death-cut-reached").exists() {
+                assert!(coordinator.child.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Actual outer unwinding at the admitted-pin cut must close
+            // cancellation and retain the SAME original Child through its
+            // cleanup/wait. A pre-cut failure cannot satisfy this typed fault.
+            std::panic::panic_any(PostStage0OuterTimeout);
+        }));
+        let payload = fault.expect_err("injected post-stage0-death outer timeout must unwind");
+        assert!(payload.is::<PostStage0OuterTimeout>());
+        assert_eq!(
+            fs::read(root.path().join("post-stage0-death-cancellation-settled")).unwrap(),
+            b"cancel-eof-original-holder-waited-sentinel-survived"
+        );
+        assert_eq!(
+            fs::read(root.path().join("post-ack-crash-oracles-completed")).unwrap(),
+            b"original-only"
+        );
+        let status: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("coordinator-original-child-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["code"], 0);
+        assert!(status["signal"].is_null());
+        assert!(
+            fs::read_to_string(root.path().join("holder-child.stdout"))
+                .unwrap()
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        );
     }
 }
