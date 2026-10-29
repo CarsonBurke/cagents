@@ -1,9 +1,11 @@
-//! Read-only source qualification after source windows flush, before close.
-//! The helper does not take a daemon admission lease, migrate SQLite, attach,
-//! restart providers, or publish a replacement descriptor.
+//! Bounded source qualification after source windows flush, before close.
+//! Stores remain read-only. Exact retained providers missing from startup
+//! discovery may be authenticated through Resolve; no launch recipe is run.
 mod current;
 mod v68;
 mod v77;
+#[cfg(test)]
+pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
 use crate::{
@@ -77,11 +79,23 @@ impl Reader {
             Self::Legacy68(client) => client.terminals(),
         }
     }
+    fn reconcile_retained(&mut self, source: &Session) -> Result<(), String> {
+        match self {
+            Self::Current(client) => client.reconcile_retained(source),
+            _ => Ok(()),
+        }
+    }
     fn resolve(&mut self, source: &Session) -> Result<Session, String> {
         match self {
             Self::Current(client) => client.resolve(source),
             Self::Legacy(client) => client.resolve(source),
             Self::Legacy68(client) => client.resolve(source),
+        }
+    }
+    fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
+        match self {
+            Self::Current(client) => client.inspect_saved_history(source),
+            _ => Err("Source has no qualified read-only history API".into()),
         }
     }
 }
@@ -112,47 +126,128 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
     }
 }
 
-fn inspect(request: Request) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let paths = crate::instance::window_database_paths()
-        .map_err(|_| "Cannot enumerate saved source windows")?;
-    let mut budget = crate::persistence::MigrationInspectionBudget::new(deadline);
-    let mut saved = Vec::new();
-    for path in paths {
-        check_deadline(deadline)?;
-        if !path
-            .try_exists()
-            .map_err(|_| "Cannot verify a saved source database")?
-        {
-            continue;
-        }
-        saved.extend(
-            crate::persistence::read_open_migration_sessions_with_budget(&path, &mut budget)
-                .map_err(|_| "A saved source pane is unreadable; source windows remain usable")?
-                .into_iter()
-                .map(|(card, kind)| (path.clone(), card, kind)),
-        );
-        if saved.len() > handoff::MAX_SESSIONS {
-            return Err("Saved pane inventory exceeds the migration inspection limit".into());
+/// Keep the complete classification in one bounded pass. Details are redacted
+/// and capped independently of the inventory: a large workspace must not turn
+/// one refusal into a sequence of install/close/retry cycles.
+#[derive(Default)]
+struct InspectionFailures {
+    count: usize,
+    details: Vec<String>,
+}
+
+impl InspectionFailures {
+    fn push(&mut self, reason: String) {
+        self.count += 1;
+        if self.details.len() < 40 {
+            self.details.push(reason);
         }
     }
-    let saved = saved
-        .into_iter()
-        .map(|(_, card, kind)| (card, kind))
-        .collect::<Vec<_>>();
+
+    fn finish(self) -> Result<(), String> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        let omitted = self.count - self.details.len();
+        let mut message = format!(
+            "Update needs recovery for {} saved-state problem(s). Source windows remain usable.\n{}",
+            self.count,
+            self.details.join("\n")
+        );
+        if omitted > 0 {
+            message.push_str(&format!(
+                "\n{omitted} additional problems were classified; showing the first 40."
+            ));
+        }
+        Err(message)
+    }
+}
+
+fn inspect(request: Request) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let current_boot =
+        crate::daemon::read_boot_id().map_err(|_| "Cannot verify the current kernel boot")?;
+    let paths = crate::instance::window_database_paths()
+        .map_err(|_| "Cannot enumerate saved source windows")?;
+    let mut failures = InspectionFailures::default();
+    let mut budget = crate::persistence::MigrationInspectionBudget::new(deadline);
+    let mut saved = Vec::new();
+    for (window, path) in paths.into_iter().enumerate() {
+        check_deadline(deadline)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                failures.push(format!("Saved window {} cannot be read.", window + 1));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        match crate::persistence::read_open_migration_sessions_with_budget(&path, &mut budget) {
+            Ok(panes) => saved.extend(panes),
+            Err(_) => failures.push(format!("Saved window {} has an unreadable or unsupported pane store; its contents were preserved.", window + 1)),
+        }
+    }
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => session.is_unstarted(),
-        CardKind::Terminal(session) => terminal_ended(session),
+        CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
         _ => true,
     });
     if no_live_panes && request.proof.is_none() {
-        return Ok(());
+        return failures.finish();
     }
-    let mut reader = connect(&request, deadline)?;
+    let mut reader = match connect(&request, deadline) {
+        Ok(reader) => reader,
+        Err(reason) => {
+            failures.push(reason);
+            return failures.finish();
+        }
+    };
+    // Resolve stale and missing sources first, then sample the roster once.
+    // Every cache entry retains the complete issued descriptor; two aliases
+    // with the same actor ID cannot borrow each other's authentication.
+    let initial_inventory = reader.list()?;
+    let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
+    let mut cold_history = Vec::new();
+    for (_, kind) in &saved {
+        check_deadline(deadline)?;
+        if let CardKind::Chat(source) = kind {
+            if !source.is_unstarted()
+                && (source.proof.as_ref() != request.proof.as_ref()
+                    || !initial_inventory.iter().any(|live| live.id == source.id))
+                && !resolutions.iter().any(|(issued, _)| issued == source)
+            {
+                let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                let result = if missing && request.reconcile_retained {
+                    reader
+                        .reconcile_retained(source)
+                        .and_then(|()| reader.resolve(source))
+                } else if missing {
+                    Err(
+                        "Saved owner changed after preview; review the recovered inventory again"
+                            .into(),
+                    )
+                } else {
+                    reader.resolve(source)
+                };
+                if missing
+                    && source.is_saved_claude_history()
+                    && !result
+                        .as_ref()
+                        .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
+                    && reader.inspect_saved_history(source).is_ok()
+                {
+                    cold_history.push(source.clone());
+                }
+                resolutions.push((source.clone(), result));
+            }
+        }
+    }
     let inventory = reader.list()?;
     let terminals = reader.terminals()?;
     if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
-        return Err("Source inventory exceeds the qualified migration limit; reduce the inventory before updating. Source windows remain usable".into());
+        return Err(
+            "Source inventory exceeds the qualified migration limit; source windows remain usable"
+                .into(),
+        );
     }
     let proof = request
         .proof
@@ -163,52 +258,92 @@ fn inspect(request: Request) -> Result<(), String> {
         .map_err(|_| "Cannot qualify the destination console companion")?;
     let mut ids = HashSet::new();
     for session in &inventory {
+        check_deadline(deadline)?;
         if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
-            return Err(format!(
-                "Source conversation {} has ambiguous ownership; reconnect or close it before updating. Source windows remain usable",
+            failures.push(format!(
+                "Source conversation {} has ambiguous ownership.",
+                session.id
+            ));
+            continue;
+        }
+        if let Some(terminal) = &session.terminal {
+            if let Err(reason) = qualify_console_migration(terminal, &matched_cli) {
+                failures.push(format!("Source conversation {}: {reason}.", session.id));
+            }
+        }
+        if validate_live_chat(session, request.require_resumable).is_err() {
+            failures.push(format!(
+                "Source conversation {} has no qualified immutable migration.",
                 session.id
             ));
         }
-        if let Some(terminal) = &session.terminal {
-            qualify_console_migration(terminal, &matched_cli).map_err(|reason| {
-                format!(
-                    "Source conversation {}: {reason}. Source windows remain usable",
-                    session.id
-                )
-            })?;
-        }
-        validate_live_chat(session, request.require_resumable)
-            .map_err(|_| format!("Source conversation {} has no qualified immutable migration; reconnect or close it before updating. Source windows remain usable", session.id))?;
     }
     for terminal in &terminals {
-        if !terminal_ended(&terminal.session) {
-            qualify_console_migration(&terminal.session, &matched_cli).map_err(|reason| {
-                format!(
-                    "Source terminal {}: {reason}. Source windows remain usable",
+        check_deadline(deadline)?;
+        if terminal_requires_migration(&terminal.session, &current_boot) {
+            if let Err(reason) = qualify_console_migration(&terminal.session, &matched_cli) {
+                failures.push(format!(
+                    "Source terminal {}: {reason}.",
                     terminal.session.id
-                )
-            })?;
+                ));
+            }
         }
     }
     for (card, kind) in saved {
         check_deadline(deadline)?;
-        if let CardKind::Terminal(source) = &kind {
-            if !terminal_ended(source) {
-                qualify_terminal(source, &terminals, proof)
-                    .map_err(|_| format!("Saved terminal pane {card} has no qualified exact source owner. Recover or close it before updating; source windows remain usable"))?;
+        match kind {
+            CardKind::Terminal(source) if terminal_requires_migration(&source, &current_boot) => {
+                if qualify_terminal(&source, &terminals, proof).is_err() {
+                    failures.push(format!(
+                        "Saved terminal pane {card} needs exact-owner recovery."
+                    ));
+                }
             }
-            continue;
+            CardKind::Chat(source) if !source.is_unstarted() => {
+                if cold_history.iter().any(|issued| issued == &source) {
+                    continue;
+                }
+                if qualify_with_mode(
+                    &source,
+                    &inventory,
+                    proof,
+                    request.require_resumable,
+                    |source| {
+                        resolutions
+                            .iter()
+                            .find(|(issued, _)| issued == source)
+                            .map(|(_, result)| result.clone())
+                            .unwrap_or_else(|| Err("No authenticated source resolution".into()))
+                    },
+                )
+                .is_err()
+                {
+                    failures.push(format!(
+                        "Saved conversation pane {card} needs exact conversation recovery."
+                    ));
+                }
+            }
+            _ => {}
         }
-        let CardKind::Chat(source) = kind else {
-            continue;
-        };
-        if source.is_unstarted() {
-            continue;
-        }
-        qualify_with_mode(&source, &inventory, proof, request.require_resumable, |source| reader.resolve(source))
-            .map_err(|_| format!("Saved conversation pane {card} has no qualified exact migration. Reconnect, recover, or close that pane before updating; source windows remain usable"))?;
     }
-    Ok(())
+    failures.finish()
+}
+
+// Cold terminal presentation is retained unchanged. An actual previous boot
+// proves its old process cannot survive; a missing cwd or absent inventory in
+// the same boot does not. Never replay a provider hint or synthesize an exit.
+fn terminal_requires_migration(
+    session: &crate::model::TerminalSession,
+    current_boot: &crate::model::BootId,
+) -> bool {
+    match &session.continuity {
+        crate::model::TerminalContinuity::Exited { .. }
+        | crate::model::TerminalContinuity::RelaunchAvailable { .. } => false,
+        _ => !session
+            .continuity
+            .live_proof()
+            .is_some_and(|proof| proof.is_complete() && &proof.boot_id != current_boot),
+    }
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -219,17 +354,6 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-fn terminal_ended(session: &crate::model::TerminalSession) -> bool {
-    matches!(
-        session.continuity,
-        crate::model::TerminalContinuity::Exited { .. }
-            | crate::model::TerminalContinuity::RelaunchAvailable {
-                last_exit: Some(_),
-                ..
-            }
-    )
 }
 
 /// A console's issued recipe is not permission to replay a different installed
@@ -317,6 +441,61 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[test]
+    fn cold_terminal_history_never_requires_replaying_a_launch_or_inventing_an_exit() {
+        let mut source = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            session().launch.recipe,
+            None,
+        )
+        .session;
+        source.launch.working_directory = "/deleted-worktree".into();
+        source.resume_hint = Some("historical-provider-observation".into());
+        let original = source.clone();
+        assert!(!terminal_requires_migration(
+            &source,
+            &BootId::new("current")
+        ));
+        assert_eq!(source, original);
+        source.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("original"),
+            boot_id: BootId::new("previous"),
+            host_incarnation: HostIncarnation::new("original"),
+        };
+        assert!(!terminal_requires_migration(
+            &source,
+            &BootId::new("current")
+        ));
+        assert!(
+            terminal_requires_migration(&source, &BootId::new("previous")),
+            "missing cwd and inventory are not evidence that a same-boot owner died"
+        );
+        source.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: HostSessionId::new(""),
+            boot_id: BootId::new("previous"),
+            host_incarnation: HostIncarnation::new("original"),
+        };
+        assert!(
+            terminal_requires_migration(&source, &BootId::new("current")),
+            "incomplete proof cannot classify obsolete execution"
+        );
+    }
+
+    #[test]
+    fn large_workspace_refusals_are_reported_together_with_bounded_details() {
+        let mut failures = InspectionFailures::default();
+        for _ in 0..65 {
+            failures.push(format!(
+                "Saved conversation pane {} needs exact conversation recovery.",
+                crate::model::CardId::new()
+            ));
+        }
+        let message = failures.finish().unwrap_err();
+        assert!(message.contains("65 saved-state problem(s)"));
+        assert!(message.contains("25 additional problems"));
+        assert!(message.len() < 16 * 1024);
+    }
 
     #[test]
     fn accepted_console_migration_defers_even_when_the_cli_path_is_unchanged() {
@@ -638,7 +817,9 @@ fn qualify_with_mode(
     mut resolve: impl FnMut(&Session) -> Result<Session, String>,
 ) -> Result<(), String> {
     let resolved;
-    let source = if saved.proof.as_ref() == Some(proof) {
+    let source = if saved.proof.as_ref() == Some(proof)
+        && inventory.iter().any(|live| live.id == saved.id)
+    {
         saved
     } else {
         resolved = resolve(saved)?;

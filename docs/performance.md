@@ -1,10 +1,12 @@
 # Performance measurements
 
 - [Redraw scheduling](#redraw-scheduling)
+- [Activity spinner cost](#activity-spinner-cost)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
 - [Native chat viewport](#native-chat-viewport)
 - [Reference results](#reference-results)
 
@@ -49,6 +51,48 @@ non-gating until a named reference baseline is accepted.
 in-process terminal scroll workload (no compositor, daemon, or release build).
 It reports what one viewport scroll command costs, and so what applying one
 coalesced move per frame saves over applying every wheel notch.
+
+## Activity spinner cost
+
+Each visible activity spinner asks for a whole-window redraw every
+`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+focused. An unfocused window may still be in view, so its spinners keep turning,
+but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
+advance one focused step per frame. Measure the UI process with one busy agent
+on screen:
+
+1. Run `scripts/run-development --browserless` without `--debug` in a nested
+   session, using the isolated environment from
+   [chat-composer-fixture.md](chat-composer-fixture.md). The fixture's first
+   turn stays busy, so its channel shows sidebar, tab and footer spinners
+   without a real model.
+2. Open the busy channel, leave the pointer still, and read `utime + stime`
+   from `/proc/<ui-pid>/stat` across a 20 s interval. Also read the main
+   thread's `voluntary_ctxt_switches` from `/proc/<ui-pid>/task/<ui-pid>/status`.
+3. Repeat with another window focused, then with the agent interrupted for the
+   idle floor.
+
+Local reference: Ryzen 7 7840HS, Radeon RX 7600S, `dev-runtime` build, nested
+niri 26.04 inside a headless KWin 6.4 virtual output, 1596x929, scale 1.0.
+Each row reports 20 s samples, as a percentage of one core:
+
+| State | Before (`c07b6f78e`) | After |
+| --- | --- | --- |
+| One busy agent, window focused | 11.1-12.6% (73-86 wakeups/s) | 4.1-4.2% (30-34 wakeups/s) |
+| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | 1.15-1.25% (5-6 wakeups/s) |
+| Agent interrupted, window focused | not measured | 1.6% (7 wakeups/s) |
+
+Two changes produced the focused result. At the 100 ms cadence alone, the UI
+still used 11.8% of a core because Iced's event loop kept a deadline that had
+already elapsed. After a redraw scheduled a later deadline, the event loop
+polled with a zero timeout until that deadline arrived (about 630
+`epoll_pwait` calls per second). The vendored `iced-winit` now replaces an
+elapsed deadline with the requested one; see `vendor/iced-winit/README.cagents.md`.
+Each remaining step still repaints the whole window, which is why a busy
+agent still costs about 3% of a core above idle in this build. Slowing
+unfocused spinners instead of stopping them costs little: an earlier revision
+that stopped them entirely measured 1.0-1.6% with another window focused
+(3 wakeups/s).
 
 ## Native chat stage attribution
 
@@ -273,6 +317,48 @@ ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
 helper delegates to the original character-by-character implementation.
 The two additional Unicode-miss guard workloads have optimized samples only
 in this reference; no before/after claim is made for those cases.
+
+## Busy terminals and the update tail
+
+After most messages, `Cagents::update` runs a tail of whole-workspace
+projection: sidebar channels and worktree panes, worktree protections,
+selection, source control, transcript probes and chrome. Terminal wakes that
+change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
+integrated build, browser progress ticks), now skip it. A wake whose only
+change is a reported terminal title (OSC 0/2) runs only chrome, which includes
+the window title. Reported titles on their own cause at most one save, and
+one publication to shared views, every three seconds. The unit tests in `src/app/terminal_output_tests.rs`
+count the tail passes, chrome syncs and saves each message causes.
+
+The native workload has no script. In the browserless development runner,
+inside a nested niri session with fresh private HOME and XDG directories, open
+20 terminals with Ctrl+Shift+T. Then use `cagents terminal write` to start one
+of these in every terminal:
+
+- Title churn: `bash -c 'i=0; while :; do printf "\033]0;build step %d\007" $((i++)); sleep 0.1; done'`
+  (20 terminals, 10 titles per second each).
+- Streaming: `bash -c 'while :; do yes cagents-N | head -c 200M; done'`.
+
+After five seconds, sample `utime+stime` from `/proc/<ui>/task/<ui>/stat`
+(UI main thread), `/proc/<ui>/stat` (UI process) and the matched `cagentsd`
+over 20-second windows.
+
+Local reference on a Ryzen 7 7840HS, `dev-runtime`, `c07b6f78e` (before)
+against the #1103 branch (after). Each build had one fresh run with two
+windows per workload. The host was shared with other builds, with a load
+average of 35 to 45, so treat the differences as indicative only.
+
+| Workload | Main thread before | Main thread after | Daemon before | Daemon after |
+| --- | --- | --- | --- | --- |
+| Idle, 20 terminals | 0.4% | 0.2% | 0.1% | 0.2% |
+| Title churn | 83.7%, 80.9% | 53.7%, 53.2% | 43.7%, 42.8% | 34.6%, 33.4% |
+| Streaming | 15.5%, 14.8% | 17.4%, 14.8% | 423%, 420% | 443%, 418% |
+
+Streaming output already took the metadata-unchanged fast path before this
+change, so it is unchanged. Its main-thread profile is terminal widget
+resolution, layout, accessibility projection and allocation. After the change,
+the remaining title-churn time is mostly the same view, layout and render work
+that each title causes; `sync_chrome` is about 0.2% of samples.
 
 ## Native chat viewport
 
