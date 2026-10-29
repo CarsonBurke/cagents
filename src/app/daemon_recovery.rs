@@ -66,6 +66,15 @@ pub(super) fn reconcile(
     })
 }
 
+/// Resolve saved-pane ownership at its captured endpoint without starting a daemon.
+/// The caller may attach the result, but must not execute a returned replay plan.
+pub(super) fn inspect_saved_at(
+    session: TerminalSession,
+    socket: &Path,
+) -> Result<RecoveredTerminal, String> {
+    reconcile_at(session, false, socket, Path::new("/proc"))
+}
+
 fn reconcile_at(
     session: TerminalSession,
     explicit_retry: bool,

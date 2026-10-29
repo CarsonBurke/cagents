@@ -24,7 +24,9 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod archived_history;
 mod automation_audit;
+pub(super) use archived_history::ArchivedHistory;
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
