@@ -1,4 +1,4 @@
-name: Research PR 1951 native CLI and Linux preservation
+name: Research native portability and bounded backend followups
 'on':
   pull_request:
     types:
@@ -18,6 +18,10 @@ env:
   RUSTUP_TOOLCHAIN: 1.93.0
   EXPECTED_PRODUCT_SHA: 883726734a8194ec8b18161e3dbcb50367a7db4d
   EXPECTED_PRODUCT_TREE: ff0c743dcf4d878bbae048bf8346c37e1a2a2d05
+  EXPECTED_RECEIPT_SHA: 5ad7985a56aaac5760cb71a6ea3d1ed2ba2c956a
+  EXPECTED_RECEIPT_TREE: 67cbc81261e9c0f2a6f1bdf8718b7fd12fd2e787
+  EXPECTED_FIXTURE_SHA: 32bc36da066bcf0cb614cff704a94c442279d3b1
+  EXPECTED_FIXTURE_TREE: 68620a875769fcd9a0505165460689bbded9fc80
 jobs:
   macos:
     if: github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' && github.event.pull_request.head.repo.full_name ==
@@ -186,7 +190,7 @@ jobs:
         retention-days: 14
   linux:
     needs: macos
-    name: Linux full CLI then isolated HOST and UI
+    name: Linux isolated CLI HOST UI and bounded backend followups
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     defaults:
@@ -227,6 +231,18 @@ jobs:
         ref: 883726734a8194ec8b18161e3dbcb50367a7db4d
         path: product
         persist-credentials: false
+    - name: Check out receipt-product
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: 5ad7985a56aaac5760cb71a6ea3d1ed2ba2c956a
+        path: receipt-product
+        persist-credentials: false
+    - name: Check out fixture-product
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: 32bc36da066bcf0cb614cff704a94c442279d3b1
+        path: fixture-product
+        persist-credentials: false
     - name: Bind exact product and research sources
       env:
         EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
@@ -248,6 +264,20 @@ jobs:
         hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
         hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
         (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
+
+        companions={
+            'receipt-product': ('EXPECTED_RECEIPT_SHA','EXPECTED_RECEIPT_TREE',['Cargo.toml','Cargo.lock','src/control/agents.rs','tests/cli_list_contracts.rs']),
+            'fixture-product': ('EXPECTED_FIXTURE_SHA','EXPECTED_FIXTURE_TREE',['Cargo.toml','Cargo.lock','src/git_watch.rs','src/chat/native_holder/transport.rs']),
+        }
+        companion_state={}
+        for folder,(head_name,tree_name,paths) in companions.items():
+            checkout=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/folder
+            state={'head':git('rev-parse','HEAD',where=checkout),'tree':git('rev-parse','HEAD^{tree}',where=checkout),'status':git('status','--porcelain','--untracked-files=all',where=checkout),'sha256':{name:hashlib.sha256((checkout/name).read_bytes()).hexdigest() for name in paths}}
+            companion_state[folder]=state
+        (logs/'companions-before.json').write_text(json.dumps(companion_state,indent=2)+'\n')
+        for folder,(head_name,tree_name,_) in companions.items():
+            state=companion_state[folder]
+            assert state['head']==os.environ[head_name] and state['tree']==os.environ[tree_name] and not state['status'], state
         PY
     - name: Set up the literal product Linux build environment
       uses: ./product/.github/actions/setup-linux-build
@@ -265,14 +295,14 @@ jobs:
         logs = pathlib.Path(os.environ['EVIDENCE_DIR'])
         records = []
 
-        def phase(label, command):
-            record = dict(label=label, command=command, started=time.time())
+        def phase(label, command, cwd=None):
+            record = dict(label=label, command=command, cwd=str(cwd or pathlib.Path.cwd()), started=time.time())
             records.append(record)
             (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
             print('Starting ' + label, flush=True)
             path = logs / (label + '.txt')
             with path.open('wb') as output:
-                result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
+                result = subprocess.run(command, cwd=cwd, stdout=output, stderr=subprocess.STDOUT)
             record.update(exit=result.returncode, finished=time.time(), log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
             (logs / (label + '.exit')).write_text(str(result.returncode) + '\n')
             (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
@@ -281,12 +311,12 @@ jobs:
                 raise SystemExit(result.returncode)
             return path.read_text(errors='replace')
 
-        def exact(label, selector, feature=None):
+        def exact(label, selector, feature=None, cwd=None):
             command = ['cargo', 'test', '--locked', '--no-default-features']
             if feature:
                 command += ['--features', feature]
             command += ['--lib', selector, '--', '--exact', '--show-output', '--test-threads=1', '--color=never']
-            output = phase(label, command)
+            output = phase(label, command, cwd=cwd)
             assert len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. ok$', output, re.M)) == 1, selector
             assert re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output, re.M) == [('1', '0', '0')], selector
             return output
@@ -303,12 +333,34 @@ jobs:
         assert 'test update::tests::streaming_child_refuses_a_kernel_reused_original_pid ... ignored' in output
         print('All '+str(len(expected))+' strict Linux filesystem/supervision roots passed; nested self-exec output is nonadditive and ignored PID-reuse remains ignored.',flush=True)
 
+
+        receipt=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'receipt-product'
+        phase('receipt-cli-check',['cargo','check','--locked','--no-default-features','--bin','cagents'],cwd=receipt)
+        receipt_output=phase('receipt-cli-all-targets',['cargo','test','--locked','--no-default-features','--all-targets','--','--test-threads=2','--color=never'],cwd=receipt)
+        for selector in [
+            'control::agents::tests::accepted_wait_recovery_keeps_device_routing_and_original_error_details',
+            'accepted_wait_errors_retain_original_receipts_without_resubmission',
+            'accepted_final_status_errors_retain_original_receipts_without_resubmission',
+            'accepted_wait_recovery_is_readable_and_normal_timeout_stays_distinct',
+        ]:
+            assert len(re.findall(r'^test '+re.escape(selector)+r' \.\.\. ok$',receipt_output,re.M))==1, selector
+
         phase('linux-host-check',['cargo','check','--locked','--no-default-features','--features','host','--bin','cagentsd'])
         for index, selector in enumerate(['worktree_setup::tests::anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names', 'worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask', 'worktree_setup::tests::changed_source_cannot_publish_new_private_bytes_with_old_permissions', 'worktree_setup::tests::source_changes_after_permission_application_refuse_publication', 'worktree_setup::tests::copy_preserves_restrictive_access_acl_and_removes_inherited_acl'], 1):
             output = exact("linux-host-parent-%02d" % index,selector,"host")
             if selector.endswith("::copy_preserves_restrictive_access_acl_and_removes_inherited_acl"):
                 assert "SETUP_ACL_COPY_VERIFIED" in output
                 assert "SETUP_ACL_FIXTURE_UNSUPPORTED" not in output
+
+
+        fixtures=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'fixture-product'
+        phase('fixture-host-check',['cargo','check','--locked','--no-default-features','--features','host','--bin','cagentsd'],cwd=fixtures)
+        for index,selector in enumerate([
+            'chat::native_holder::transport::tests::post_child_census_failure_preserves_live_ownership_and_services_control',
+            'chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool',
+            'git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory',
+        ],1):
+            exact('fixture-host-parent-%02d'%index,selector,'host',cwd=fixtures)
 
         phase('linux-ui-check',['cargo','check','--locked','--no-default-features','--features','ui','--bin','cagents-ui'])
         PY
@@ -336,6 +388,21 @@ jobs:
         before=json.loads((logs/'source-before.json').read_text())
         assert state['sha256']==before['sha256']
         assert state['research_tree']==before['research_tree']
+
+        companions={
+            'receipt-product': ('EXPECTED_RECEIPT_SHA','EXPECTED_RECEIPT_TREE',['Cargo.toml','Cargo.lock','src/control/agents.rs','tests/cli_list_contracts.rs']),
+            'fixture-product': ('EXPECTED_FIXTURE_SHA','EXPECTED_FIXTURE_TREE',['Cargo.toml','Cargo.lock','src/git_watch.rs','src/chat/native_holder/transport.rs']),
+        }
+        companion_state={}
+        for folder,(head_name,tree_name,paths) in companions.items():
+            checkout=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/folder
+            state={'head':git('rev-parse','HEAD',where=checkout),'tree':git('rev-parse','HEAD^{tree}',where=checkout),'status':git('status','--porcelain','--untracked-files=all',where=checkout),'sha256':{name:hashlib.sha256((checkout/name).read_bytes()).hexdigest() for name in paths}}
+            companion_state[folder]=state
+        (logs/'companions-after-always.json').write_text(json.dumps(companion_state,indent=2)+'\n')
+        for folder,(head_name,tree_name,_) in companions.items():
+            state=companion_state[folder]
+            assert state['head']==os.environ[head_name] and state['tree']==os.environ[tree_name] and not state['status'], state
+        assert companion_state==json.loads((logs/'companions-before.json').read_text())
         PY
     - name: Retain original linux qualification evidence
       if: always()
