@@ -213,10 +213,6 @@ try:
             'app::chat_ui::view::provider_context_tests::provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure',
             'app::chat_ui::view::provider_context_tests::provider_context_closed_widget_and_catalog_preserve_literal_body',
             'app::chat_ui::view::provider_context_tests::provider_context_find_reveals_selected_scope_and_restores_disclosure',
-            'chat::runtime::store::text_copy::tests::provider_context_copy_reads_unloaded_body_and_revokes_stale_authority',
-            'chat::runtime::child_text_copy::tests::provider_context_copy_keeps_child_identity_and_rejects_rewrite_trim_and_user_notice',
-            'chat::protocol::claude::tests::synthetic_context_live_preserves_skill_calls_results_and_user_quotes',
-            'chat::protocol::claude::tests::synthetic_context_history_preserves_opaque_context_without_rewriting_source',
             'app::shared_views::tests::startup_admission::verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence',
             'app::shared_views::tests::startup_admission::verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources',
             'app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope',
@@ -251,7 +247,16 @@ try:
     os.environ['CAGENTS_TEST_RETAINED_ACTOR_HELPER'] = str(helper)
     assert observe_helper(helper) == helper_before, 'HOST helper changed before suite execution'
     try:
-        run('host-all-targets-suite', ['cargo', 'test', *host, '--all-targets', '--', '--test-threads=1'], required=False)
+        host_output = run('host-all-targets-suite', ['cargo', 'test', *host, '--all-targets', '--', '--test-threads=1'], required=False)
+        host_lines = host_output.read_text(errors='replace').splitlines()
+        for test in [
+            'chat::runtime::store::text_copy::tests::provider_context_copy_reads_unloaded_body_and_revokes_stale_authority',
+            'chat::runtime::child_text_copy::tests::provider_context_copy_keeps_child_identity_and_rejects_rewrite_trim_and_user_notice',
+            'chat::protocol::claude::tests::synthetic_context_live_preserves_skill_calls_results_and_user_quotes',
+            'chat::protocol::claude::tests::synthetic_context_history_preserves_opaque_context_without_rewriting_source',
+        ]:
+            if host_lines.count('test ' + test + ' ... ok') != 1:
+                failures.append('host-owning-parent:' + test)
     finally:
         preceding_error = repr(sys.exc_info()[1]) if sys.exc_info()[1] else None
         try:
