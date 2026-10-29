@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_receipt_protocol_is_discovered_without_widening_native_versions() {
+    fn terminal_and_native_v4_are_discovered_without_accepting_native_v5() {
         let directory = tempfile::tempdir().unwrap();
         let mut terminal = record();
         terminal.version = 4;
@@ -582,13 +582,32 @@ mod tests {
         let mut native = record();
         native.kind = Kind::Native;
         native.version = 4;
+        native.build = Some(BuildIdentity::current(Kind::Native));
         native.create(directory.path()).unwrap();
-        assert!(evidence(&socket(directory.path(), native.terminal), Kind::Native).is_err());
-        assert!(
-            discover(directory.path(), &native.boot, Kind::Native)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
+            Some(native.clone())
         );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native.clone()]
+        );
+        let mut unsupported_native = native.clone();
+        unsupported_native.terminal = TerminalId::new();
+        unsupported_native.version = 5;
+        unsupported_native.create(directory.path()).unwrap();
+        assert!(
+            evidence(
+                &socket(directory.path(), unsupported_native.terminal),
+                Kind::Native
+            )
+            .is_err()
+        );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native]
+        );
+        assert!(unsupported_native.path(directory.path()).exists());
     }
 
     #[test]
