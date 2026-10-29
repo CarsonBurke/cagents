@@ -928,6 +928,91 @@ mod tests {
         let message = messages.pop().expect("actual button emits its owner action"); assert!(messages.is_empty()); message
     }
 
+    #[cfg(target_os = "linux")]
+    fn check_pre_admission_cancellation_releases_creation_capacity() {
+        let repository = git_fixture();
+        let data = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        app.settings_path = data.path().join("settings.toml");
+        let task = app.load_checkout_journal();
+        run_tasks(&mut app, task);
+        let card = open_real_git(&mut app, repository.path(), None);
+        let authority = app.tab(card).unwrap().worktree_authority.clone().unwrap();
+        let head = cagents::repository::Oid::parse(&git(repository.path(), &["rev-parse", "HEAD"]))
+            .unwrap();
+        for index in 0..33 {
+            app.begin_commit_checkout(authority.clone(), head.clone());
+            let branch = format!("cancelled-{index}");
+            drop(app.update(Message::Checkout(Action::Branch(branch))));
+            let destination = data.path().join(format!("cancelled-{index}"));
+            drop(app.update(Message::Checkout(Action::Destination(
+                destination.to_string_lossy().into_owned(),
+            ))));
+            let task = app.update(Message::Checkout(Action::Resolve));
+            run_tasks(&mut app, task);
+            let dialog = app.checkout_dialog.as_ref().unwrap();
+            assert!(dialog.request.is_some(), "{:?}", dialog.error);
+            let id = dialog.id;
+            let task = app.update(Message::Checkout(Action::Create));
+            assert!(app.checkout_dialog.as_ref().unwrap().accepted);
+            assert!(app.checkout_owners.get(&id).is_some_and(Option::is_none));
+            drop(app.update(Message::CloseWindow));
+            assert!(!app.exiting, "pending creation still owns close custody");
+            // The returned future is cold: cancel before the worker starts,
+            // then exercise the real captured producer and Finished reducer.
+            drop(app.update(Message::Checkout(Action::Cancel)));
+            run_tasks(&mut app, task);
+            let report = app
+                .checkout_history
+                .iter()
+                .find(|report| report.operation_id == id)
+                .unwrap();
+            assert_eq!(report.state, WorktreeOperationState::NotCreated);
+            assert!(matches!(
+                report.outcome.as_ref(),
+                Some(cagents::repository::WorktreeCreationOutcome::NotCreated { .. })
+            ));
+            assert!(
+                app.checkout_owners.is_empty(),
+                "clean cancellation must retire its admitted placeholder"
+            );
+            assert!(!app.checkout_dialog.as_ref().unwrap().busy());
+            assert!(!destination.exists());
+            assert!(
+                app.checkout_journal
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .journaled_worktree_operations()
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(app.update(Message::Checkout(Action::Cancel)));
+        }
+        assert_eq!(app.checkout_history.len(), 20);
+        assert_eq!(
+            git(repository.path(), &["branch", "--list", "cancelled-*"]),
+            ""
+        );
+        drop(app.update(Message::CloseWindow));
+        assert!(
+            app.exiting,
+            "more than 32 clean cancellations must not exhaust close or creation capacity"
+        );
+
+        // An uncertain worker completion retains its pending placeholder.
+        let mut uncertain = editor();
+        let id = OperationId::new();
+        uncertain.checkout_owners.insert(id, None);
+        drop(uncertain.update(Message::Checkout(Action::Finished(
+            id,
+            Err("worker result unavailable".into()),
+        ))));
+        assert!(uncertain.checkout_owners.get(&id).is_some_and(Option::is_none));
+        drop(uncertain.update(Message::CloseWindow));
+        assert!(!uncertain.exiting);
+    }
+
     #[test]
     fn actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open() {
         use cosmic::iced::futures::StreamExt;
@@ -987,6 +1072,8 @@ mod tests {
             );
             return;
         }
+        #[cfg(target_os = "linux")]
+        check_pre_admission_cancellation_releases_creation_capacity();
         let repository = git_fixture(); let data = tempfile::tempdir().unwrap();
         let destination = data.path().join("created");
         let mut app = editor(); app.settings_path = data.path().join("settings.toml");

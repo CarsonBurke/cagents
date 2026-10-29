@@ -27,6 +27,17 @@ pub use creation_retention::{
     CreationPrivateRecoverySummary, CreationPrivateRetry, CreationRetention, RetainedWorktreeCreation,
     SettledCreatedWorktree,
 };
+
+/// Worker control-flow proof, never reconstructed from a public outcome or a
+/// clear private-recovery summary. Every unproven outcome retains its owner.
+#[cfg(feature = "ui")]
+#[derive(Default)]
+enum CreationRetirement {
+    #[default]
+    Retain,
+    CancelledBeforeAdmission,
+}
+
 mod branch_transaction;
 // The same source owns the landed deletion and journal branch fences.
 mod browse_reveal;
@@ -13899,12 +13910,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
             progress,
             None,
+            None,
         )
     }
 
     /// Retain the original source, created scope and all private publication
-    /// receipts across every worker outcome. This is synchronous worker work;
-    /// neither the return carrier nor its serialized report mints new authority.
+    /// receipts unless this worker proves cancellation before journal admission.
+    /// This is synchronous worker work; neither the return carrier nor its
+    /// serialized report mints new authority or proves safe retirement.
     #[cfg(feature = "ui")]
     pub fn create_worktree_journaled_retained(
         &self,
@@ -13926,6 +13939,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         );
         match captured {
             Ok((service, scope, evidence)) => {
+                let mut retirement = CreationRetirement::Retain;
                 let report = service.create_worktree_journaled_inner(
                     store,
                     request,
@@ -13933,7 +13947,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     cancellation,
                     progress,
                     Some((scope.clone(), evidence)),
+                    Some(&mut retirement),
                 );
+                if matches!(retirement, CreationRetirement::CancelledBeforeAdmission)
+                    && report.state == WorktreeOperationState::NotCreated
+                    && matches!(
+                        report.outcome.as_ref(),
+                        Some(WorktreeCreationOutcome::NotCreated { .. })
+                    )
+                    && scope.recovery_summary().is_clear()
+                    && !scope.has_destination()
+                {
+                    return RetainedWorktreeCreation::refused(report);
+                }
                 RetainedWorktreeCreation::from_original(report, scope, authority.clone())
             }
             Err(error) => RetainedWorktreeCreation::refused(creation_refusal(
@@ -13959,6 +13985,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Arc<creation_authority::CreationSession>,
             creation_authority::CreationEvidence,
         )>,
+        retirement: Option<&mut CreationRetirement>,
     ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
@@ -13993,6 +14020,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     report.outcome = Some(WorktreeCreationOutcome::NotCreated {
                         failure: repository_warning(&self.git, error),
                     });
+                    if let Some(retirement) = retirement {
+                        *retirement = CreationRetirement::CancelledBeforeAdmission;
+                    }
                     return report;
                 }
                 emit(WorktreeProgressStage::Finished);
@@ -15388,6 +15418,92 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn retained_cancellation_retires_only_before_journal_admission() {
+        if isolated_creation_fixture(concat!(
+            module_path!(),
+            "::retained_cancellation_retires_only_before_journal_admission"
+        )) {
+            return;
+        }
+        let fixture = Fixture::new();
+        let scoped = fixture
+            .service
+            .with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+            )
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (progress, _) = async_channel::bounded(8);
+        let retained = scoped.create_worktree_journaled_retained(
+            &fixture.store,
+            &fixture.request,
+            7,
+            &cancellation,
+            &progress,
+        );
+        assert_eq!(retained.report.state, WorktreeOperationState::NotCreated);
+        assert!(matches!(
+            retained.report.outcome.as_ref(),
+            Some(WorktreeCreationOutcome::NotCreated { .. })
+        ));
+        assert!(retained.retention().is_none());
+        assert!(retained.created.is_none());
+        assert!(!fixture.holds(fixture.request.operation_id));
+        assert!(!fixture.request.managed_root.exists());
+        assert_eq!(fixture.git(&["branch", "--list", "feature"]), "");
+
+        // The same terminal state and clear private counts are insufficient
+        // after admission: the already checked-out branch refuses before Git
+        // mutates it, but its durable operation still owns reconciliation.
+        let mut fixture = Fixture::new();
+        fixture.request.branch = ValidatedBranchName::parse("main").unwrap();
+        let scoped = fixture
+            .service
+            .with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+            )
+            .unwrap();
+        let retained = scoped.create_worktree_journaled_retained(
+            &fixture.store,
+            &fixture.request,
+            7,
+            &CancellationToken::new(),
+            &progress,
+        );
+        assert_eq!(retained.report.state, WorktreeOperationState::NotCreated);
+        assert!(fixture.holds(fixture.request.operation_id));
+        assert!(retained.retention().unwrap().recovery_summary().is_clear());
+        assert!(retained.created.is_none());
+        assert!(!fixture.request.destination.exists());
+
+        // A failed begin is not a cancellation proof, even with no private
+        // publication. Preserve the original owner on journal uncertainty.
+        let fixture = Fixture::new();
+        let scoped = fixture
+            .service
+            .with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+            )
+            .unwrap();
+        fixture.store.shutdown().unwrap();
+        let retained = scoped.create_worktree_journaled_retained(
+            &fixture.store,
+            &fixture.request,
+            7,
+            &CancellationToken::new(),
+            &progress,
+        );
+        assert_eq!(
+            retained.report.state,
+            WorktreeOperationState::JournalWriteFailed
+        );
+        assert!(retained.retention().unwrap().recovery_summary().is_clear());
+        assert!(!fixture.request.managed_root.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn scoped_publication_failure_preserves_known_identity_for_restart() {
         if isolated_creation_fixture(concat!(
             module_path!(),
@@ -15777,6 +15893,7 @@ mod worktree_journal_tests {
                 .is_empty()
         );
         assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
+        assert!(retained.retention().unwrap().recovery_summary().is_clear());
     }
 
     #[cfg(target_os = "linux")]
