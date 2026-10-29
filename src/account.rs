@@ -1364,6 +1364,7 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_DETACH_SELECTIONS";
         if std::env::var_os(CHILD).is_none() {
             let key = uuid::Uuid::new_v4();
+            // Preserve the caller's scope; override only these fixture inputs.
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1371,7 +1372,6 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env_clear()
                 .env(CHILD, "1")
                 .env("HOME", "/home/a")
                 .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))
