@@ -1756,7 +1756,8 @@ impl State {
     }
 
     /// Optimistic marks settle one bounded aliased mutation chunk at a time.
-    /// Authority is checked once; each chunk yields progress back to the UI.
+    /// Each chunk checks the captured authority and yields progress to the UI.
+    /// GitHub cannot make that read and the following mutation atomic.
     fn set_viewed(&mut self, indices: Vec<usize>, viewed: bool) -> ActionTask {
         if indices
             .iter()
@@ -1807,8 +1808,8 @@ impl State {
             .map(<[RepoPath]>::to_vec)
             .collect();
         let stream = iced::futures::stream::unfold(
-            (chunks.into_iter(), false, None::<String>, 0usize, false),
-            move |(mut chunks, verified, refused, failed, finished)| {
+            (chunks.into_iter(), None::<String>, 0usize, false),
+            move |(mut chunks, refused, failed, finished)| {
                 let api = api.clone();
                 let git = git.clone();
                 let authority = authority.clone();
@@ -1826,7 +1827,7 @@ impl State {
                                     failed,
                                     total,
                                 },
-                                (chunks, verified, refused, failed, true),
+                                (chunks, refused, failed, true),
                             ));
                         }
                         None => return None,
@@ -1835,7 +1836,7 @@ impl State {
                     let result = tokio::task::spawn_blocking(move || {
                         let mut refused = refused;
                         if cancellation.is_cancelled() { refused = Some("The review revision changed before this chunk was sent.".into()); }
-                        if !verified && refused.is_none() {
+                        if refused.is_none() {
                             if let Err(failure) = discussion::verify_authority(api.as_ref(), &git, &authority, &cancellation) {
                                 refused = Some(match failure {
                                     discussion::Outcome::Refused(message) | discussion::Outcome::Unknown(message) => message,
@@ -1879,7 +1880,7 @@ impl State {
                             authority_revision,
                             results,
                         },
-                        (chunks, true, refused, failed, false),
+                        (chunks, refused, failed, false),
                     ))
                 }
             },
@@ -3695,9 +3696,7 @@ pub(crate) mod tests {
         assert!(crate::github::polling::rate_limit(host).is_none());
     }
 
-    #[tokio::test]
-    async fn two_hundred_folder_marks_use_one_authority_and_four_chunks() {
-        use cosmic::iced::futures::StreamExt;
+    fn viewed_folder_fixture(viewed: bool) -> (tempfile::TempDir, State, Arc<ScriptedApi>) {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             std::process::Command::new("git")
@@ -3716,48 +3715,162 @@ pub(crate) mod tests {
                 .unwrap()
                 .success()
         );
+        let (mut state, api) = state();
+        let mut target = target(1);
+        target.worktree = dir.path().into();
+        state.target = Some(target);
+        let files: Vec<_> = (0..200).map(|i| format!("folder/file-{i:03}.rs")).collect();
+        let previous = loaded(
+            files
+                .iter()
+                .map(|name| entry(name, ChangeKind::Modified))
+                .collect(),
+            files
+                .iter()
+                .map(|name| remote_file(name, !viewed))
+                .collect(),
+        );
+        *api.context.lock().unwrap() = Some(previous.context.clone());
+        state.adopt(&previous);
+        (dir, state, api)
+    }
+
+    #[tokio::test]
+    async fn two_hundred_folder_marks_recheck_authority_for_each_of_four_chunks() {
+        use cosmic::iced::futures::StreamExt;
         for viewed in [true, false] {
-            let (mut state, api) = state();
-            let mut target = target(1);
-            target.worktree = dir.path().into();
-            state.target = Some(target);
-            let files: Vec<_> = (0..200).map(|i| format!("folder/file-{i}.rs")).collect();
-            let previous = loaded(
-                files
-                    .iter()
-                    .map(|name| entry(name, ChangeKind::Modified))
-                    .collect(),
-                files
-                    .iter()
-                    .map(|name| remote_file(name, !viewed))
-                    .collect(),
-            );
-            *api.context.lock().unwrap() = Some(previous.context.clone());
-            state.adopt(&previous);
-            let task = state.set_viewed((0..200).collect(), viewed);
+            let (_dir, mut state, api) = viewed_folder_fixture(viewed);
+            let task = state.update(Action::SetDirectoryViewed {
+                directory: path("folder"),
+                viewed,
+            });
             let mut stream = iced::runtime::task::into_stream(task).unwrap();
             let mut completions = 0;
             while let Some(action) = stream.next().await {
                 if let iced::runtime::Action::Output(action) = action {
-                    drop(state.update_inner(action));
+                    let Action::ViewedApplied { results, .. } = &action else {
+                        panic!("expected one progress receipt per chunk: {action:?}");
+                    };
+                    assert_eq!(results.len(), 50);
+                    assert!(results.iter().all(|(_, value, outcome)| {
+                        *value == viewed && matches!(outcome, ViewedOutcome::Applied)
+                    }));
+                    drop(state.update(action));
                     completions += 1;
+                    assert_eq!(
+                        state
+                            .files
+                            .iter()
+                            .filter(|file| file.sync == ViewedSync::Settled)
+                            .count(),
+                        completions * 50
+                    );
                 }
             }
             assert_eq!(completions, 4);
             assert_eq!(
                 api.context_calls.load(std::sync::atomic::Ordering::Relaxed),
-                1
+                4
             );
             assert_eq!(
                 api.batch_calls.load(std::sync::atomic::Ordering::Relaxed),
                 4
             );
+            assert_eq!(api.viewed.lock().unwrap().len(), 200);
             assert!(
                 state
                     .files
                     .iter()
                     .all(|file| file.viewed == viewed && file.sync == ViewedSync::Settled)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_head_change_between_viewed_chunks_keeps_progress_and_refuses_the_rest() {
+        use cosmic::iced::futures::StreamExt;
+        for viewed in [true, false] {
+            let (_dir, mut state, api) = viewed_folder_fixture(viewed);
+            let original_context = state.context.clone().unwrap();
+            let task = state.update(Action::SetDirectoryViewed {
+                directory: path("folder"),
+                viewed,
+            });
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            let mut completions = 0;
+            let mut summaries = 0;
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    match &action {
+                        Action::ViewedApplied { results, .. } => {
+                            completions += 1;
+                            assert_eq!(results.len(), 50);
+                            assert!(results.iter().all(|(_, value, outcome)| {
+                                *value == viewed
+                                    && if completions == 1 {
+                                        matches!(outcome, ViewedOutcome::Applied)
+                                    } else {
+                                        matches!(outcome, ViewedOutcome::NotApplied(message)
+                                            if message.contains("diff revision changed"))
+                                    }
+                            }));
+                            drop(state.update(action));
+                            if completions == 1 {
+                                assert!(state.files[..50].iter().all(|file| {
+                                    file.viewed == viewed && file.sync == ViewedSync::Settled
+                                }));
+                                assert!(state.files[50..].iter().all(|file| {
+                                    file.viewed == viewed && file.sync == ViewedSync::Pending
+                                }));
+                                // Only GitHub moves to H2; no local refresh cancels H1.
+                                api.context.lock().unwrap().as_mut().unwrap().head_oid =
+                                    "d".repeat(40);
+                            } else if completions == 2 {
+                                // A refused operation must not resume if H1 returns.
+                                *api.context.lock().unwrap() = Some(original_context.clone());
+                            }
+                        }
+                        Action::ViewedBatchSummary { failed, total, .. } => {
+                            assert_eq!((*failed, *total), (150, 200));
+                            summaries += 1;
+                            drop(state.update(action));
+                        }
+                        _ => panic!("unexpected viewed operation receipt: {action:?}"),
+                    }
+                    assert_eq!(state.context.as_ref(), Some(&original_context));
+                    assert!(!state.viewed_cancellation.is_cancelled());
+                }
+            }
+            assert_eq!((completions, summaries), (4, 1));
+            assert_eq!(
+                api.context_calls.load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                api.batch_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            let recorded = api.viewed.lock().unwrap();
+            assert_eq!(recorded.len(), 50);
+            assert!(
+                state.files[..50]
+                    .iter()
+                    .zip(recorded.iter())
+                    .all(|(file, (path, value))| {
+                        file.entry.path.display().as_ref() == path.as_str() && *value == viewed
+                    })
+            );
+            assert!(
+                state.files[..50]
+                    .iter()
+                    .all(|file| { file.viewed == viewed && file.sync == ViewedSync::Settled })
+            );
+            assert!(
+                state.files[50..]
+                    .iter()
+                    .all(|file| { file.viewed != viewed && file.sync == ViewedSync::Settled })
+            );
+            assert!(state.notice.as_ref().unwrap().contains("150 of 200"));
         }
     }
 
