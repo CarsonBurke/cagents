@@ -134,6 +134,38 @@ pub struct WorktreeRecord {
     pub prunable_reason: Option<String>,
 }
 
+/// The worktrees among `worktrees` that lie strictly inside `path`, compared
+/// component by component.
+///
+/// `git worktree remove` deletes the directory recursively: a linked worktree
+/// nested inside it goes too, uncommitted and ignored files included, and is
+/// left registered as prunable. No removal may proceed while any exist.
+pub fn nested_worktree_paths<'a>(
+    path: &'a Path,
+    worktrees: impl IntoIterator<Item = &'a Path> + 'a,
+) -> impl Iterator<Item = &'a Path> + 'a {
+    worktrees
+        .into_iter()
+        .filter(move |candidate| *candidate != path && candidate.starts_with(path))
+}
+
+/// Why a worktree containing `nested` other worktrees cannot be removed, or
+/// `None` when it contains none.
+pub fn nested_worktrees_refusal(nested: usize) -> Option<String> {
+    match nested {
+        0 => None,
+        1 => Some(
+            "This worktree contains another worktree, which Git would delete with it. \
+             Delete that worktree first."
+                .into(),
+        ),
+        n => Some(format!(
+            "This worktree contains {n} other worktrees, which Git would delete with it. \
+             Delete those worktrees first."
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DirtyState {
     pub staged: u32,

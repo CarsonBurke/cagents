@@ -6188,6 +6188,7 @@ fn project_view<'a>(
             .state
             .rows
             .group_size(SelectionRow::Project(project_id)),
+        true,
     );
     let header = RowInteraction::selectable(
         header,
@@ -6477,6 +6478,7 @@ fn compact_project<'a>(
             .state
             .rows
             .group_size(SelectionRow::Project(entity.id)),
+        true,
     );
     let header = RowInteraction::selectable(
         header,
@@ -7344,6 +7346,7 @@ fn worktree_view<'a>(
             github_ready,
             editors,
             selection_count,
+            !primary,
         ),
         deletion,
         compact,
@@ -7441,6 +7444,97 @@ fn project_channel_command_label(worktree: Option<WorktreeId>) -> &'static str {
     }
 }
 
+/// The commands a row's context menu offers, in order. `selection_count` is
+/// the size of the group the menu acts on; several rows offer only their
+/// group deletion. A row that is not `deletable` offers no deletion at all.
+fn context_commands(
+    project_id: ProjectId,
+    worktree_id: Option<WorktreeId>,
+    git: bool,
+    github_ready: bool,
+    editors: &[SidebarEditor],
+    selection_count: usize,
+    deletable: bool,
+) -> Vec<(String, Option<icon::Handle>, ProjectCommand)> {
+    let mut commands = vec![
+        ("Open folder".to_owned(), None, ProjectCommand::Reveal),
+        ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
+        (
+            project_channel_command_label(worktree_id).to_owned(),
+            None,
+            ProjectCommand::NewChannel,
+        ),
+    ];
+    if git {
+        commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
+    }
+    if worktree_id.is_some() {
+        commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
+        if git {
+            commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
+            commands.push((
+                "New worktree from this branch…".into(),
+                None,
+                ProjectCommand::NewWorktreeFromBranch,
+            ));
+            if github_ready {
+                commands.push((
+                    "Open or create pull request…".into(),
+                    None,
+                    ProjectCommand::PullRequest,
+                ));
+            }
+        }
+    } else {
+        commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
+        commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
+        commands.push((
+            "Reset sidebar order".into(),
+            None,
+            ProjectCommand::ResetSidebarOrder,
+        ));
+    }
+    commands.extend(editors.iter().map(|editor| {
+        (
+            editor.name.clone(),
+            Some(editor_icon(editor)),
+            ProjectCommand::OpenEditor(editor.id.clone()),
+        )
+    }));
+    if github_ready {
+        commands.push((
+            "Open repository on GitHub".to_owned(),
+            None,
+            ProjectCommand::RepositoryUrl,
+        ));
+    }
+    if selection_count != 1 {
+        commands.clear();
+    }
+    if deletable {
+        // Every row names its own kind, so one label covers both counts.
+        let (row, command) = match worktree_id {
+            Some(worktree_id) => (
+                SelectionRow::Worktree(project_id, worktree_id),
+                ProjectCommand::Delete,
+            ),
+            None => (SelectionRow::Project(project_id), ProjectCommand::Remove),
+        };
+        let label = if selection_count > 1 {
+            row.deletion_label(selection_count)
+        } else {
+            format!("{} {}", row.deletion_verb(), row.noun(1))
+        };
+        commands.push((format!("{label}…"), None, command));
+    }
+    commands
+}
+
+/// `deletable` is false for a row whose menu offers no deletion at all: the
+/// primary checkout, which only removing its project takes away. Such a row's
+/// menu acts on that row alone even while it is part of a selection, so its
+/// commands never stand in for a group deletion it cannot join.
+#[allow(clippy::too_many_arguments)]
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -7451,84 +7545,25 @@ fn context_controls<'a>(
     github_ready: bool,
     editors: &[SidebarEditor],
     selection_count: Option<usize>,
+    deletable: bool,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let editors = editors.to_vec();
-    if modal_open || selection_count.is_none() {
+    let Some(selection_count) = selection_count.filter(|_| !modal_open) else {
         return content.into();
-    }
+    };
+    // A row that cannot be deleted never speaks for the selection it is in.
+    let selection_count = if deletable { selection_count } else { 1 };
     crate::interaction::context_menu_lazy(content, move || {
-        let mut commands = vec![
-            ("Open folder".to_owned(), None, ProjectCommand::Reveal),
-            ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            (
-                project_channel_command_label(worktree_id).to_owned(),
-                None,
-                ProjectCommand::NewChannel,
-            ),
-        ];
-        if git {
-            commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
-        }
-        if worktree_id.is_some() {
-            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
-            if git {
-                commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
-                commands.push((
-                    "New worktree from this branch…".into(),
-                    None,
-                    ProjectCommand::NewWorktreeFromBranch,
-                ));
-                if github_ready {
-                    commands.push((
-                        "Open or create pull request…".into(),
-                        None,
-                        ProjectCommand::PullRequest,
-                    ));
-                }
-            }
-        } else {
-            commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
-            commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
-            commands.push((
-                "Reset sidebar order".into(),
-                None,
-                ProjectCommand::ResetSidebarOrder,
-            ));
-        }
-        commands.extend(editors.iter().map(|editor| {
-            (
-                editor.name.clone(),
-                Some(editor_icon(editor)),
-                ProjectCommand::OpenEditor(editor.id.clone()),
-            )
-        }));
-        if github_ready {
-            commands.push((
-                "Open repository on GitHub".to_owned(),
-                None,
-                ProjectCommand::RepositoryUrl,
-            ));
-        }
-        if selection_count != Some(1) {
-            commands.clear();
-        }
-        if let Some(count) = selection_count {
-            // Every row names its own kind, so one label covers both counts.
-            let (row, command) = match worktree_id {
-                Some(worktree_id) => (
-                    SelectionRow::Worktree(project_id, worktree_id),
-                    ProjectCommand::Delete,
-                ),
-                None => (SelectionRow::Project(project_id), ProjectCommand::Remove),
-            };
-            let label = if count > 1 {
-                row.deletion_label(count)
-            } else {
-                format!("{} {}", row.deletion_verb(), row.noun(1))
-            };
-            commands.push((format!("{label}…"), None, command));
-        }
+        let commands = context_commands(
+            project_id,
+            worktree_id,
+            git,
+            github_ready,
+            &editors,
+            selection_count,
+            deletable,
+        );
         let entries = commands
             .iter()
             .map(|(label, icon, command)| {
@@ -7561,7 +7596,7 @@ fn context_controls<'a>(
                         project_id,
                         worktree_id,
                         command,
-                        selection_count.is_some_and(|count| count > 1)
+                        selection_count > 1
                             && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
                     ),
                 )
@@ -15182,6 +15217,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// The primary checkout's menu offers no deletion: only removing the
+    /// project takes it away, and a confirmation that could only refuse is
+    /// not a command (#1982). A linked worktree keeps its own deletion, and
+    /// its group's.
+    #[test]
+    fn only_deletable_rows_offer_a_deletion_in_their_menu() {
+        let project = project_id(1);
+        let worktree = Some(WorktreeId::from_uuid(Uuid::from_u128(2)));
+        let commands_for = |worktree, count, deletable| {
+            context_commands(project, worktree, true, true, &[], count, deletable)
+                .into_iter()
+                .map(|(label, _, command)| (label, command))
+                .collect::<Vec<_>>()
+        };
+        let commands = |count, deletable| commands_for(worktree, count, deletable);
+        let deletes = |commands: &[(String, ProjectCommand)]| {
+            commands
+                .iter()
+                .filter(|(_, command)| {
+                    matches!(command, ProjectCommand::Delete | ProjectCommand::Remove)
+                })
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let linked = commands(1, true);
+        assert_eq!(deletes(&linked), ["Delete worktree…"]);
+        assert_eq!(
+            commands(3, true),
+            [("Delete 3 worktrees…".to_owned(), ProjectCommand::Delete)]
+        );
+
+        let primary = commands(1, false);
+        assert!(deletes(&primary).is_empty(), "{primary:?}");
+        assert_eq!(
+            primary.len(),
+            linked.len() - 1,
+            "the primary keeps every other command: {primary:?}"
+        );
+        // The project row still removes the project.
+        assert_eq!(deletes(&commands_for(None, 1, true)), ["Remove project…"]);
+    }
+
     #[test]
     fn context_menu_preserves_child_cursors_and_primary_clicks() {
         use cosmic::iced::{
@@ -15215,6 +15293,7 @@ pub(crate) mod tests {
             false,
             &[],
             Some(1),
+            true,
         );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
@@ -16433,6 +16512,7 @@ pub(crate) mod tests {
                 true,
                 &[],
                 Some(1),
+                true,
             )
         };
         let renderer = headless_renderer();
