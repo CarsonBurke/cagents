@@ -1,0 +1,410 @@
+{
+  "schema": 1,
+  "never_merge": true,
+  "pr": 1984,
+  "status": "DESIGN_FROZEN_NATIVE_ENTRY_CLOSED",
+  "current_main": {
+    "head": "c4e75601ae2e8c6f11f810d36af94726477efbb4",
+    "tree": "69dacc7a72689e6d24f0a3d4122f9ddfe6ed23c8"
+  },
+  "original_pr_head": "f736193a64c54ee399fe6cd2387462f707617dad",
+  "published_correction_head": "cb625a889574ef4486137cf7ccfbf9362f1febe9",
+  "before": {
+    "head": "94c3cef719f5cb27637899dfd13e67baca3cbc34",
+    "tree": "63e08c61e41e20192fc7d869cad8e3ddf8043200"
+  },
+  "after": {
+    "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
+    "tree": "7d84da268933045b1add2ad310ce45c84be751db"
+  },
+  "composition": "Before normal two-parent merge f736+c4e; After supplied normal composition24d. No old0677/4dc/f736 WebP or donor execution result transfers.",
+  "feature_paths": [
+    "src/app/project_ui.rs",
+    "src/app/sidebar_selection_ui.rs",
+    "src/repository.rs",
+    "src/repository/nested_repositories.rs",
+    "src/sidebar.rs",
+    "src/worktree_cleanup.rs"
+  ],
+  "changed_paths_from_main": {
+    "before": [
+      "src/app/project_ui.rs",
+      "src/app/sidebar_selection_ui.rs",
+      "src/repository.rs",
+      "src/sidebar.rs",
+      "src/worktree_cleanup.rs"
+    ],
+    "after": [
+      "src/app/project_ui.rs",
+      "src/app/sidebar_selection_ui.rs",
+      "src/repository.rs",
+      "src/repository/nested_repositories.rs",
+      "src/sidebar.rs",
+      "src/worktree_cleanup.rs"
+    ]
+  },
+  "correction_paths": [
+    "src/app/project_ui.rs",
+    "src/repository.rs",
+    "src/repository/nested_repositories.rs",
+    "src/worktree_cleanup.rs"
+  ],
+  "source_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "build.rs",
+    "mise.toml",
+    "scripts/run-development",
+    "scripts/check-format",
+    ".github/actions/setup-linux-build/action.yml",
+    "src/modules.rs",
+    "src/main.rs",
+    "src/bin/cagents-ui.rs",
+    "src/bin/cagentsd.rs",
+    "src/instance.rs",
+    "src/control.rs",
+    "src/control/terminal_list.rs",
+    "src/control/work.rs",
+    "src/settings.rs",
+    "src/session.rs",
+    "src/persistence.rs",
+    "src/host/client.rs",
+    "src/terminal/hosted.rs",
+    "src/app.rs",
+    "src/sidebar.rs",
+    "src/app/project_ui.rs",
+    "src/app/sidebar_selection_ui.rs",
+    "src/app/terminal_adoption.rs",
+    "src/app/terminal_end_ui.rs",
+    "src/app/session_recovery.rs",
+    "src/app/startup_gate.rs",
+    "src/app/workspace_model_sync.rs",
+    "src/repository.rs",
+    "src/worktree_cleanup.rs"
+  ],
+  "source_sha256": {
+    "before": {
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "mise.toml": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+      "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+      "scripts/check-format": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7",
+      ".github/actions/setup-linux-build/action.yml": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+      "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+      "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+      "src/control.rs": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673",
+      "src/control/terminal_list.rs": "61c46d6ef3e131c402b281590e9e294c3835ba531570b8942d3db4a9d316e082",
+      "src/control/work.rs": "530d849fda8b1e9acf12604ff1fde10b325ed90b30db2a8a1a83b986b0c4010e",
+      "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+      "src/session.rs": "72e34f0c595243ebdc899d29fc232cc64fda5000c7036505773667ffd180223e",
+      "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+      "src/host/client.rs": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9",
+      "src/terminal/hosted.rs": "d6c65d889586ba176e7266d94057c06ec0d6f67fc5a02d69b8b81c5f226d56e3",
+      "src/app.rs": "1ba68f9549829e73a3eaa77a73d7e54e027eaedae01f6060c02c68e700796ec7",
+      "src/sidebar.rs": "8453d1263998ccfacffe46adbd2e9c3a1c88badbd8804917efb547688fbc3c18",
+      "src/app/project_ui.rs": "542f49746f5a44f15056cc25f063cc6ee1b8905b127b217016847b2797817e77",
+      "src/app/sidebar_selection_ui.rs": "c9c3ebb07c6c7b9bcd4ce2e4cbde90666b97d81d9da0a4d80ec8514c2e207085",
+      "src/app/terminal_adoption.rs": "1e83cb5f3fec49250d1f3457c8ce2aa9d09f255ecd159fdfb4a67b9baf241bf3",
+      "src/app/terminal_end_ui.rs": "577324afa74865b16ac466b92e55aa25ecf3d56d6ec633a92c8659eea3975103",
+      "src/app/session_recovery.rs": "0cfee2c192d0dfef3e3fb7dbfafe0953bab015e8b3d10b01e39d50c3be6096f9",
+      "src/app/startup_gate.rs": "205d415af76c9e222cdacc1c1d1f516fefdf913adb57ddf4d11121330c45e730",
+      "src/app/workspace_model_sync.rs": "cef30b3124fe0313fcdc35f8241660857672609424b9ac31b61c57c469c5693d",
+      "src/repository.rs": "8cd27a4a5b93da08d92c1e0a6eed1490958e809cf3d7f0800e999234b791fe4f",
+      "src/worktree_cleanup.rs": "7060bce422ad19dd69f7f4590ba395e963cd7d43ce528e530cb1c11c9d6af0db"
+    },
+    "after": {
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "mise.toml": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+      "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+      "scripts/check-format": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7",
+      ".github/actions/setup-linux-build/action.yml": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+      "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+      "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+      "src/control.rs": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673",
+      "src/control/terminal_list.rs": "61c46d6ef3e131c402b281590e9e294c3835ba531570b8942d3db4a9d316e082",
+      "src/control/work.rs": "530d849fda8b1e9acf12604ff1fde10b325ed90b30db2a8a1a83b986b0c4010e",
+      "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+      "src/session.rs": "72e34f0c595243ebdc899d29fc232cc64fda5000c7036505773667ffd180223e",
+      "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+      "src/host/client.rs": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9",
+      "src/terminal/hosted.rs": "d6c65d889586ba176e7266d94057c06ec0d6f67fc5a02d69b8b81c5f226d56e3",
+      "src/app.rs": "1ba68f9549829e73a3eaa77a73d7e54e027eaedae01f6060c02c68e700796ec7",
+      "src/sidebar.rs": "8453d1263998ccfacffe46adbd2e9c3a1c88badbd8804917efb547688fbc3c18",
+      "src/app/project_ui.rs": "be6e6ed19a47343c924f833afaa82254b811dbfa4d0b7d6cb7614f82cf1f0ab8",
+      "src/app/sidebar_selection_ui.rs": "c9c3ebb07c6c7b9bcd4ce2e4cbde90666b97d81d9da0a4d80ec8514c2e207085",
+      "src/app/terminal_adoption.rs": "1e83cb5f3fec49250d1f3457c8ce2aa9d09f255ecd159fdfb4a67b9baf241bf3",
+      "src/app/terminal_end_ui.rs": "577324afa74865b16ac466b92e55aa25ecf3d56d6ec633a92c8659eea3975103",
+      "src/app/session_recovery.rs": "0cfee2c192d0dfef3e3fb7dbfafe0953bab015e8b3d10b01e39d50c3be6096f9",
+      "src/app/startup_gate.rs": "205d415af76c9e222cdacc1c1d1f516fefdf913adb57ddf4d11121330c45e730",
+      "src/app/workspace_model_sync.rs": "cef30b3124fe0313fcdc35f8241660857672609424b9ac31b61c57c469c5693d",
+      "src/repository.rs": "869bc77966139dfceb79c5f1963849b266d7f4c59015330b5e78e04e194537cc",
+      "src/worktree_cleanup.rs": "45062881b5725eb9ae39d9ed7604b815ad8e0ff81d6b18cc529c58395c117ea0"
+    }
+  },
+  "current_main_guard_paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "build.rs",
+    "mise.toml",
+    "scripts/run-development",
+    "scripts/check-format",
+    ".github/actions/setup-linux-build/action.yml",
+    "src/modules.rs",
+    "src/main.rs",
+    "src/bin/cagents-ui.rs",
+    "src/bin/cagentsd.rs",
+    "src/instance.rs",
+    "src/control.rs",
+    "src/control/terminal_list.rs",
+    "src/control/work.rs",
+    "src/settings.rs",
+    "src/session.rs",
+    "src/persistence.rs",
+    "src/host/client.rs",
+    "src/terminal/hosted.rs",
+    "src/app.rs",
+    "src/app/terminal_adoption.rs",
+    "src/app/terminal_end_ui.rs",
+    "src/app/session_recovery.rs",
+    "src/app/startup_gate.rs",
+    "src/app/workspace_model_sync.rs"
+  ],
+  "native_gaps": [
+    {
+      "id": "G1",
+      "status": "UNQUALIFIED_NATIVE_REACHABILITY",
+      "source": "src/app/project_ui.rs::worktree_deletion_blocker requires current exact row; delete_worktree_with_sessions can retire exact prunable absent registration. src/app.rs startup retires missing worktrees.",
+      "decision": "Root/EC may admit a bounded actual After UI probe: open Delete confirmation for a fresh disposable absent fixture, park its directory, observe refresh then confirm. If row/dialog no longer permits exact deletion, record native gap and stop. No catalog mutation, direct event injection, stale-target hook or alternative CLI flow can count as native completion. Do not assume source oracle proves UI reachability."
+    },
+    {
+      "id": "G2",
+      "status": "UNQUALIFIED_NATIVE_CONTROL_MAPPING",
+      "source": "src/sidebar.rs worktree_accessible_name/context_commands; src/app/project_ui.rs dialog controls.",
+      "decision": "Use only actual owned-PID AX visible row/menu/button or confidence-qualified same-frame OCR. Resolve exact labels/roles from per-head native snapshots. Missing/ambiguous menu/popup/row target refuses input. Preserve primary menu commands and Delete-key refusal; no guessed coordinates or fabricated accessibility tree."
+    },
+    {
+      "id": "G3",
+      "status": "CONTROLLER_SEQUENCE_INCOMPLETE_HELD",
+      "source": "This packet implements source freeze, fresh disposable Git fixture, forensic bytes/Git capture and actual native observation primitives. Full action sequence, same-path restore and terminal/card semantic assertions are design contracts below, not implemented or executed.",
+      "decision": "Continue control-only implementation after root chooses bounded reachability probe versus complete paired run; freeze and independently review exact successor before any queue. No product hook is proposed/authorized."
+    },
+    {
+      "id": "G4",
+      "status": "NO_EXECUTION_OR_CAPACITY_GRANT",
+      "source": "Parent states no actual runtime; current-main composition independent review pending; EC owns future queue.",
+      "decision": "Need exact composed-source review, exact controller independent review and fresh existing-lane/native grant. This manifest or historical hosted15d/8dec/1294/1900/1962 evidence grants no runtime/build/dispatch authority."
+    }
+  ],
+  "cases": [
+    {
+      "case": "primary-menu",
+      "data": "A primary fixture-primary-a",
+      "actions": "Actual row right-click; keep other commands visible; dismiss.",
+      "both": "No Delete worktree entry; New terminal/Copy path/Copy branch and other applicable controls remain. Same native viewport/theme/data."
+    },
+    {
+      "case": "primary-delete-key",
+      "data": "A primary focused by real search then Down",
+      "actions": "One real Delete key; open actual Application notices if needed.",
+      "both": "No deletion dialog; actual primary refusal; no Git/session/unsaved-state effects. Existing notice discoverability is reviewed, not waived."
+    },
+    {
+      "case": "same-common-nested",
+      "data": "A/same-parent/.worktrees/same-child; child dirty+ignored+untracked",
+      "actions": "Actual parent Delete; capture disabled/refusal and Cancel.",
+      "both": "Same-common nested guard preserves every child byte, registrations, refs and exact session IDs; dialog counts only parent sessions."
+    },
+    {
+      "case": "foreign-known-unsaved",
+      "data": "B foreign worktree under ignored A/outer; B project loaded; real B editor changed but not saved",
+      "actions": "One actual outer Delete; Cancel; return to B editor and copy retained buffer through native Ctrl+A/C; continue typing/save known exact bytes.",
+      "before": "Original common-only exclusion can include B in outer scope; retain actual result, no presupposed after UI. Destructive confirmation only fresh disposable fixture.",
+      "after": "Known nested root excluded from count/capture/saving/unsaved checks; parent deletion disabled/refused; B buffer, disk bytes, session proofs and registrations retained."
+    },
+    {
+      "case": "foreign-unknown-causal",
+      "data": "B project unopened; actual B terminal adopted under current known A scope; ignored nested gitdir and uncommitted/ignored/untracked B files remain real",
+      "actions": "Capture outer dialog/count; actual Cancel preserves state; reopen and confirm once.",
+      "before": "Known causal destructive behavior may remove outer+B bytes, close A/B prefix sessions and leave B registration prunable. Capture actual evidence only in new disposable A/B fixture; no forced Git command substitutes UI deletion.",
+      "after": "Actual filesystem scanner refusal reaches failed row/dialog before any session-close; A+B exact running IDs/proofs/bytes/registrations/refs remain. Unknown-root count may still include B; report actual wording as UX limitation."
+    },
+    {
+      "case": "own-worktree-cancel-confirm",
+      "data": "Independent A/own with own terminal; A primary/sibling/foreign controls remain",
+      "actions": "Actual Cancel then reopen and confirm once.",
+      "both": "Cancel conserves everything; confirm removes only own directory/registration, retains its branch, closes only its own terminal; other scope/cards/unsaved buffers remain accessible."
+    },
+    {
+      "case": "absent-registration-recovery",
+      "data": "A/absent registered worktree, no unsaved contents/sessions; private parked copy retained",
+      "actions": "Open actual confirmation; park only this disposable directory. Observe UI; confirm only if current exact dialog remains enabled.",
+      "after": "Exact prunable registration can retire while branch/primary remain. A vanished row/blocked confirmation is explicit native reachability failure and stops; no direct source invocation or synthetic state mutation."
+    },
+    {
+      "case": "prunable-replacement-kept",
+      "data": "Same exact prunable registration, path now contains fresh unrelated replacement bytes",
+      "actions": "Create replacement only inside authorized disposable fixture; actual current UI delete/retry if supported.",
+      "after": "Refusal before close/removal; replacement exact bytes/identity preserved. Fix ownership using explicit real Git repair or move contents safely, never force a stale deletion."
+    }
+  ],
+  "viewports": [
+    {
+      "name": "wide",
+      "size": [
+        1400,
+        875
+      ]
+    },
+    {
+      "name": "narrow",
+      "size": [
+        900,
+        600
+      ]
+    }
+  ],
+  "settings": "schema_version = 3\napp_theme = \"dark\"\nui_scale = 1.0\ncheck_for_updates = false\neditor_auto_save = false\n",
+  "configured_scale": 1.0,
+  "actual_native_scale": "UNMEASURED; retain observed geometry/native scale evidence, never infer from configuration",
+  "capture": {
+    "accepted_route": "Actual visible root pixels, unscaled crop at Xlib XTranslateCoordinates absolute client bounds; root and drawable diagnostics retained",
+    "geometry": "XGetWindowAttributes plus XTranslateCoordinates to root; SCREEN0, actual1280x800/900x600 client must fit wholly inside the identical1600x1000 root. xdotool parent-relative geometry is diagnostic only. Native bounds remain absolute; OCR bounds remain original crop-local data and are translated for input only using that same frame actual client origin. No offset guesses, crop padding or repair during capture.",
+    "occlusion": "XQueryTree bottom-to-top siblings above every ancestor to root, including frame and override-redirect siblings; any mapped InputOutput overlap or changing/ambiguous state refuses OCR/acceptance",
+    "nonblank": {
+      "minimum_luminance_span": 8,
+      "minimum_luminance_stddev": 2.0,
+      "minimum_nonblack_fraction": 0.05,
+      "minimum_distinct_rgb_colors": 16
+    },
+    "retained": [
+      "Original full root PNG",
+      "Original direct-drawable diagnostic PNG and actual command exit",
+      "Unscaled client PNG and lossless WebP",
+      "Root/client absolute geometry, stacking, pointer/focus before and after",
+      "Original image digests and numeric nonblank metrics"
+    ],
+    "scope": "Nonblank thresholds are a refusal gate, not visual correctness proof. Actual unchanged images still need independent review; no capture repair or retry.",
+    "root_size": [
+      1600,
+      1000
+    ],
+    "xlib_api_references": [
+      "https://www.x.org/archive/X11R7.5/doc/man/man3/XQueryTree.3.html",
+      "https://www.x.org/archive/X11R7.5/doc/man/man3/XTranslateCoordinates.3.html"
+    ]
+  },
+  "backend": {
+    "requested_environment": {
+      "ICED_BACKEND": "wgpu",
+      "WGPU_BACKEND": "gl",
+      "LIBGL_ALWAYS_SOFTWARE": "1"
+    },
+    "observation": "Only Selected: AdapterInfo from the exact owned UI log can establish an observed renderer. Requested/child env, startup, pixels and donor evidence cannot. Missing/unparseable/ambiguous receipt stays UNMEASURED."
+  },
+  "ocr": {
+    "minimum_word_confidence": 80.0
+  },
+  "fixture": {
+    "provider": "NONE; actual terminal-only /bin/sleep or fixed shell argv after grant; no Send/input/provider agent",
+    "creation": "Exactly one new tempfile root under /tmp,0700 plus uid/dev/inode/nonce marker. Actual A/B private Git repositories and registered worktrees, deterministic branches/files. No existing caller-specified root.",
+    "same_pair": "Before/After must use same absolute fixture/app paths and exact frozen raw initial bytes; preserve mutated arm roots and sourceDB raw bytes before reset. Same-path archive/restore action controller remains G3, not claimed implemented.",
+    "destructive_baseline": "ONLY new private disposable A/B fixture authorized by task. No real/shared repository, project, editor data or inherited sessions may be deletion targets. Native confirmation is the causal operation; no replacement git --force invocation.",
+    "unsaved": "Uncommitted disk bytes and UI unsaved editor buffers are separate oracles. Native pixels/clipboard after real input prove editor state; file hash alone does not. Reuse1294 actual clipboard contract only after exact code/control review.",
+    "persistence": "Do not delete fixture roots, forensic sourceDB bytes, Git registrations or original output artifacts on failure. Raw live database copies are observational and explicitly not a consistent transaction snapshot. No writes/SQL seeding to app databases."
+  },
+  "supported_commands": {
+    "runner": [
+      "scripts/run-development",
+      "--browserless",
+      "--debug",
+      "--fresh-daemon",
+      "--log-file",
+      "ABSOLUTE_LOG"
+    ],
+    "project": [
+      "MATCHED_CAGENTS",
+      "--json",
+      "--no-start",
+      "project",
+      "open",
+      "DISPOSABLE_A_OR_B"
+    ],
+    "terminal": [
+      "MATCHED_CAGENTS",
+      "--json",
+      "--no-start",
+      "terminal",
+      "spawn",
+      "--cwd",
+      "DISPOSABLE_SCOPE",
+      "--",
+      "/bin/sleep",
+      "86400"
+    ],
+    "observations": [
+      [
+        "terminal",
+        "list",
+        "--all"
+      ],
+      [
+        "terminal",
+        "show",
+        "ACTUAL_ID"
+      ],
+      [
+        "terminal",
+        "snapshot",
+        "ACTUAL_ID"
+      ],
+      [
+        "project",
+        "list"
+      ],
+      [
+        "channel",
+        "list"
+      ],
+      [
+        "daemon",
+        "status"
+      ]
+    ],
+    "not_selected": "No new flags/protocol or broad User API; actual matched CLI at both pins. Verify actual daemon User connection and PID before seeding; fresh-daemon operates only private fixture runtime. Preserve HOME/CODEX_HOME and inherited opaque authority."
+  },
+  "qualification_gates": {
+    "composed_source_review": "PENDING_PARENT",
+    "control_source_review": "PENDING",
+    "native_reachability_and_sequence": "HELD_G1_G2_G3",
+    "root_existing_lane_grant": "NONE",
+    "EC_native_queue_grant": "NONE",
+    "screenshots": "NONE",
+    "independent_native_UX": "UNRUN"
+  },
+  "limits": [
+    "Source-only preparation; no native/backend/OCR/renderer/hosted/resource/whole-PR qualification.",
+    "Requested GL env is separate from OBSERVED exact owned-process Selected AdapterInfo log. Missing/ambiguous log remains UNMEASURED per head.",
+    "No provider behavior, saved Claude1757/1749,1922 recovery, Wayland, integrated-browser or concurrent-agent/frame-stall claim.",
+    "Any real execution capacity/error stops once with original command output/exit; no authority stripping, alternate account/model/provider/cache/pool, retries or resource-limit workaround.",
+    "Unknown historical foreign ownership with all markers removed and unrelated writers after final observation retain source limitations.",
+    "Keep product Draft/unmerged. Actual WebPs only separate retained screenshots branch, immutable links and exactly two Before/After columns after privacy/image review."
+  ],
+  "historical_controls": {
+    "1294": "def443cf729c246704c3fde259292043ee69e9e7 clipboard/input contract only; no old source/result transfer",
+    "1900": "664cb4dcc1ff9617a4c599e4fd809e16518a8c56 exact unchanged primitive AST bodies retained with provenance",
+    "1962": "12d4c1565df5ba772074d0052d9be070ab6451d2 current-source/closed-gate/geometry/visible-node review contract only; no old scale/selection/native results transfer"
+  }
+}
