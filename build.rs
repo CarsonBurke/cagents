@@ -38,10 +38,12 @@ fn main() {
         let map = output.join("linux-ui-font-symbols.map");
         std::fs::write(&map, "{ local: hb_*; FT_*; };\n")
             .expect("write Linux browser UI font symbol map");
-        println!(
-            "cargo:rustc-link-arg-bin=cagents-ui=-Wl,--version-script={}",
-            map.display()
-        );
+        // Forward the complete path as one linker argument, including commas.
+        // The compiler driver splits -Wl arguments at commas in filesystem paths.
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=--version-script");
+        println!("cargo:rustc-link-arg-bin=cagents-ui=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=cagents-ui={}", map.display());
     }
     println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");

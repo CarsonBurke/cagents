@@ -56,7 +56,7 @@ class LinuxUiFontExports(unittest.TestCase):
         return result
 
     def build_script(self, label, target, features):
-        output = self.directory / (label + ' output with spaces "quote"')
+        output = self.directory / (label + ' output with spaces "quote",comma')
         output.mkdir()
         environment = os.environ.copy()
         # These are Cargo's synthetic per-build-script inputs, never an agent
@@ -88,17 +88,18 @@ class LinuxUiFontExports(unittest.TestCase):
             "linux-integrated", "linux", ["UI", "FULL", "INTEGRATED_BROWSER"])
         path = output / "linux-ui-font-symbols.map"
         self.assertEqual(path.read_text(), "{ local: hb_*; FT_*; };\n")
-        self.assertEqual(instructions, [
-            "cargo:rustc-link-arg-bin=cagents-ui=-Wl,--version-script=" + str(path),
-        ])
+        prefix = "cargo:rustc-link-arg-bin=cagents-ui="
+        self.assertEqual(instructions, [prefix + argument for argument in (
+            "-Xlinker", "--version-script", "-Xlinker", str(path),
+        )])
 
     def test_real_interposition_is_removed_without_losing_runtime_export_or_import(self):
         output, instructions = self.build_script(
             "real-link", "linux", ["UI", "FULL", "INTEGRATED_BROWSER"])
-        self.assertEqual(len(instructions), 1)
+        self.assertEqual(len(instructions), 4)
         prefix = "cargo:rustc-link-arg-bin=cagents-ui="
-        self.assertTrue(instructions[0].startswith(prefix))
-        flag = instructions[0][len(prefix):]
+        self.assertTrue(all(instruction.startswith(prefix) for instruction in instructions))
+        flags = [instruction[len(prefix):] for instruction in instructions]
         system = output / "system.c"
         system.write_text("""
 int hb_fixture_value(void) { return 73; }
@@ -146,7 +147,7 @@ int main(void) {
                     self.command(command, timeout=20)
                 for variant, extra, expected in (
                     ("before", [], "direct=17,19 shared=17,19 runtime=97 import=89\n"),
-                    ("after", [flag], "direct=17,19 shared=73,79 runtime=97 import=89\n"),
+                    ("after", flags, "direct=17,19 shared=73,79 runtime=97 import=89\n"),
                 ):
                     program = output / (linker + "-" + variant)
                     # Later --export-dynamic exercises the actual restriction;
