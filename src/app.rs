@@ -21806,6 +21806,13 @@ mod tests {
                 app.settings_feedback,
                 Some(SettingsFeedback::Pending)
             ));
+            // Keep the captured save's runtime alive until its stale receipt
+            // is applied; dropping it would shut down the original store.
+            let original_writer = (outcome == "replaced writer").then(|| {
+                app.session
+                    .take()
+                    .expect("replacement fixture must retain the original session writer")
+            });
             if outcome == "replaced writer" {
                 install_window_close_storage(&mut app, directory.path());
             } else if outcome == "replaced window" {
@@ -21828,6 +21835,9 @@ mod tests {
             })
             .await
             .expect("cancelled save must settle");
+            let Message::WindowCloseFlushed { saved, result, .. } = &completed else {
+                unreachable!("cancelled save returned a different message for {outcome}");
+            };
             assert_eq!(
                 matches!(
                     &completed,
@@ -21837,17 +21847,25 @@ mod tests {
                         ..
                     }
                 ),
-                outcome == "refused"
+                outcome == "refused",
+                "{outcome}: saved error={:?}; flush error={:?}",
+                saved.as_ref().err(),
+                result.as_ref().err()
             );
             if outcome != "refused" {
-                assert!(matches!(
-                    &completed,
-                    Message::WindowCloseFlushed {
-                        saved: Ok(_),
-                        result: Ok(()),
-                        ..
-                    }
-                ));
+                assert!(
+                    matches!(
+                        &completed,
+                        Message::WindowCloseFlushed {
+                            saved: Ok(_),
+                            result: Ok(()),
+                            ..
+                        }
+                    ),
+                    "{outcome}: saved error={:?}; flush error={:?}",
+                    saved.as_ref().err(),
+                    result.as_ref().err()
+                );
             }
             drop(app.update(completed));
             if outcome == "saved" {
@@ -21896,6 +21914,7 @@ mod tests {
             assert!(!app.update_prepared);
             assert!(!app.update_committed);
             assert_eq!(app.persistent_workspace().chat_drafts[&card], retained);
+            drop(original_writer);
         }
     }
 
