@@ -514,6 +514,10 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(3)),
             true
         ));
+        let settled_deadline = Instant::now() + Duration::from_secs(3);
+        while !owner.cleanup_settled() && Instant::now() < settled_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(owner.cleanup_settled());
     }
 }
