@@ -2187,6 +2187,7 @@ mod tests {
             (true, None),
         ] {
             let directory = tempfile::tempdir().unwrap();
+            let scoped = scope.is_some();
             let (mut app, _, _, pane) = if retained_chat {
                 retained_chat_move_fixture()
             } else {
@@ -2230,10 +2231,20 @@ mod tests {
                 assert_eq!(app.core.main_window_id(), Some(window));
             }
             let completed = super::super::tests::window_close_test_message(&mut app, task);
-            assert!(matches!(
-                &completed,
-                Message::WindowCloseFlushed { result: Ok(()), .. }
-            ));
+            let Message::WindowCloseFlushed { saved, result, .. } = &completed else {
+                unreachable!(
+                    "final save returned a different message for retained_chat={retained_chat}, scoped={scoped}"
+                );
+            };
+            assert!(
+                matches!(
+                    &completed,
+                    Message::WindowCloseFlushed { result: Ok(()), .. }
+                ),
+                "retained_chat={retained_chat}, scoped={scoped}: saved error={:?}; flush error={:?}",
+                saved.as_ref().err(),
+                result.as_ref().err()
+            );
             let saved = app
                 .session
                 .as_ref()
