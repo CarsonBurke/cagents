@@ -65,6 +65,9 @@ jobs:
           key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
           restore-keys: |
             held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
+      - name: Verify completed same-head isolated suite receipts
+        shell: bash
+        run: python3 control/.github/qualification/reuse-suites.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control"
       - name: Check exact UI source and execute focused User regressions
         id: focus
         shell: bash
@@ -82,13 +85,12 @@ jobs:
           path: ${{ runner.temp }}/held-scope-evidence
           if-no-files-found: error
           retention-days: 14
-      - name: Run every affected isolated suite after native cleanup
+      - name: Confirm successor native cleanup
         if: ${{ !cancelled() && steps.focus.outcome == 'success' && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         shell: bash
         run: |
           test -f "$QUALIFICATION_EVIDENCE/native/cleanup-complete"
           python3 -c 'import json, os; from pathlib import Path; p = Path(os.environ["QUALIFICATION_EVIDENCE"]) / "native/cleanup.json"; assert json.loads(p.read_text())["errors"] == []'
-          python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --suites-only
       - name: Recompute all artifact checksums
         if: always()
         shell: bash
