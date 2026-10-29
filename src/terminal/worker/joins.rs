@@ -41,6 +41,9 @@ struct Progress {
     requested: bool,
     body_finished: bool,
     installed: bool,
+    start_claimed: bool,
+    // A positively refused OS-thread creation is distinct from an actual join.
+    no_thread: bool,
     native_settled: bool,
     queued: bool,
     joined: bool,
@@ -76,6 +79,8 @@ impl JoinOwner {
                 requested: false,
                 body_finished: empty,
                 installed: empty,
+                start_claimed: empty,
+                no_thread: false,
                 native_settled: empty,
                 queued: false,
                 joined: empty,
@@ -97,6 +102,26 @@ impl JoinOwner {
         // Body completion can precede parent-side handle installation.
         dispatch(self);
     }
+
+    /// The sole token allowed to create this owner's original OS thread.
+    /// Callers must settle it on pre-thread refusal, or consume it in spawn.
+    pub(super) fn thread_start(self: &Arc<Self>) -> ThreadStart {
+        let mut p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!p.start_claimed && !p.installed && !p.no_thread);
+        p.start_claimed = true;
+        ThreadStart(self.clone())
+    }
+    pub(super) fn no_thread(&self) -> bool {
+        self.progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .no_thread
+    }
+    pub(super) fn cleanup_settled(&self) -> bool {
+        let p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        (p.no_thread || (p.joined && !p.panicked && p.native_settled && p.released))
+            && p.reservation.is_none()
+    }
     #[cfg(test)]
     pub(super) fn joined(&self) -> bool {
         let p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
@@ -106,6 +131,71 @@ impl JoinOwner {
     pub(super) fn native_settled_for_test(&self) -> bool {
         let p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
         p.joined && !p.panicked && p.native_settled && p.reservation.is_none()
+    }
+}
+
+/// This token has no generic Drop settlement: losing it cannot prove whether
+/// a thread exists. Only the concrete before-spawn and Builder::spawn Err
+/// branches below establish NoThread. It never authorizes native cleanup.
+pub(super) struct ThreadStart(Arc<JoinOwner>);
+
+impl ThreadStart {
+    pub(super) fn refuse(self) {
+        self.settle_no_thread();
+    }
+
+    pub(super) fn spawn(
+        self,
+        builder: thread::Builder,
+        body: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        self.spawn_with(|| builder.spawn(body))
+    }
+
+    fn spawn_with(
+        self,
+        spawn: impl FnOnce() -> std::io::Result<JoinHandle<()>>,
+    ) -> std::io::Result<()> {
+        match spawn() {
+            Ok(worker) => {
+                // The actual original JoinHandle is installed before returning.
+                self.0.install(worker);
+                Ok(())
+            }
+            Err(error) => {
+                self.settle_no_thread();
+                Err(error)
+            }
+        }
+    }
+
+    fn settle_no_thread(self) {
+        let mut p = self.0.progress.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!p.installed && !p.body_finished && !p.queued && !p.joined);
+        assert!(
+            self.0
+                .worker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+        assert!(!self.0.published.has_retained_holder());
+        p.no_thread = true;
+        p.native_settled = true;
+        p.released = true;
+        // No OS join occurred. Retire only this never-used admission credit.
+        if p.registered {
+            if let Some(service) = self.0.service {
+                service
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|pending| !Arc::ptr_eq(pending, &self.0));
+            }
+            p.registered = false;
+        }
+        p.reservation.take();
+        self.0.changed.notify_all();
     }
 }
 
@@ -160,6 +250,14 @@ fn service() -> Result<&'static Service, String> {
 /// `release` uses the existing completed-holder policy. Only final HandleInner
 /// destruction also performs the existing last-owner drop for a failed body.
 pub(super) fn request(owner: &Arc<JoinOwner>, release: bool, final_drop: bool) {
+    if owner
+        .progress
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .no_thread
+    {
+        return;
+    }
     if release {
         owner.published.request_shutdown();
     }
@@ -317,7 +415,7 @@ pub(super) fn wait_until(owner: &JoinOwner, deadline: Option<Instant>, release: 
         if p.panicked {
             return false;
         }
-        if p.joined && (!release || p.released) {
+        if p.no_thread || (p.joined && (!release || p.released)) {
             return true;
         }
         p = match deadline {
@@ -338,4 +436,84 @@ pub(super) fn wait_until(owner: &JoinOwner, deadline: Option<Instant>, release: 
 #[cfg(test)]
 pub(super) fn reserved() -> usize {
     RESERVED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn owner() -> Arc<JoinOwner> {
+        JoinOwner::new(
+            Arc::new(PublishedState::new(true, Arc::new(|_| {}))),
+            reserve().unwrap(),
+        )
+    }
+
+    #[test]
+    fn install_refusal_retires_only_unused_ticket_without_inventing_join() {
+        let owner = owner();
+        let start = owner.thread_start();
+        // Even an observer's early request cannot orphan the pending ticket.
+        request(&owner, false, false);
+        assert!(owner.progress.lock().unwrap().registered);
+        start.refuse();
+        let p = owner.progress.lock().unwrap();
+        assert!(p.no_thread && p.native_settled && p.released);
+        assert!(!p.installed && !p.body_finished && !p.joined && !p.registered);
+        assert!(p.reservation.is_none());
+        drop(p);
+        assert!(!owner.published.completed.load(Ordering::Acquire));
+        request(&owner, true, true);
+        assert!(!owner.published.shutdown_requested.load(Ordering::Acquire));
+        assert!(wait_until(&owner, Some(Instant::now()), true));
+    }
+
+    #[test]
+    fn builder_error_establishes_no_thread_at_the_actual_result_boundary() {
+        let owner = owner();
+        let error = owner
+            .thread_start()
+            .spawn_with(|| {
+                // Fault at Builder::spawn's Err boundary, before a body/JoinHandle.
+                Err(std::io::Error::other("injected OS thread creation refusal"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected OS thread"));
+        assert!(owner.no_thread() && owner.cleanup_settled());
+        assert!(!owner.joined());
+        assert!(owner.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn created_body_needs_real_join_and_requested_native_release() {
+        let owner = owner();
+        let body_owner = owner.clone();
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        owner
+            .thread_start()
+            .spawn(thread::Builder::new(), move || {
+                let _body = BodyCompletion(body_owner);
+                blocked.recv().unwrap();
+            })
+            .unwrap();
+        request(&owner, false, false);
+        assert!(!owner.no_thread() && !owner.cleanup_settled());
+        assert!(!wait_until(&owner, Some(Instant::now()), false));
+        release.send(()).unwrap();
+        assert!(wait_until(
+            &owner,
+            Some(Instant::now() + Duration::from_secs(3)),
+            false
+        ));
+        assert!(owner.joined() && !owner.no_thread());
+        assert!(!owner.cleanup_settled());
+        request(&owner, true, false);
+        assert!(wait_until(
+            &owner,
+            Some(Instant::now() + Duration::from_secs(3)),
+            true
+        ));
+        assert!(owner.cleanup_settled());
+    }
 }
