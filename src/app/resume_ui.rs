@@ -907,7 +907,13 @@ impl Cagents {
                 "{} · {}{}",
                 row.provider.label(),
                 row.account,
-                if row.open { " · Open" } else { "" }
+                if matches!(&row.source, Source::Saved(entry) if entry.quarantined) {
+                    " · Unavailable"
+                } else if row.open {
+                    " · Open"
+                } else {
+                    ""
+                }
             );
             let date = chat::local_time(row.updated_at_unix_ms / 1000)
                 .map(|time| {
