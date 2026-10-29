@@ -116,6 +116,8 @@ pub enum AcceptanceError {
     LimitReached(LimitReached),
     #[error("{0}")]
     MailboxFull(String),
+    #[error("{message}")]
+    PolicyUnavailable { message: String, retryable: bool },
 }
 impl From<String> for AcceptanceError {
     fn from(value: String) -> Self {

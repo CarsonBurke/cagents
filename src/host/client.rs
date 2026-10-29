@@ -756,6 +756,10 @@ pub(super) fn process_request(
                     crate::agent_execution::AcceptanceError::LimitReached(details) => {
                         ProtocolError::agent_limit_reached(details)
                     }
+                    crate::agent_execution::AcceptanceError::PolicyUnavailable {
+                        message,
+                        retryable,
+                    } => ProtocolError::new(ProtocolErrorCode::Internal, message, retryable),
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }

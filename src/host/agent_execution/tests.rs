@@ -4720,6 +4720,160 @@ fn daemon_capacity_refusals_keep_retryable_wire_details_for_both_scopes() {
 }
 
 #[test]
+fn busy_or_semantically_unreadable_policy_preserves_retry_and_cleanup_without_new_acceptance() {
+    if isolated(
+        "busy_or_semantically_unreadable_policy_preserves_retry_and_cleanup_without_new_acceptance",
+    )
+    .is_some()
+    {
+        return;
+    }
+    use crate::{
+        agent_execution::{AcceptanceError, ConcurrencyLimits},
+        terminal_ipc::ProtocolErrorCode,
+    };
+    use std::os::fd::AsRawFd;
+    let (host, mut request, fixture_path) = fixture();
+    let store = registry(&host).unwrap();
+    let settings_path = crate::settings::default_path().unwrap();
+    assert!(!settings_path.exists());
+    assert_eq!(admission_limits().unwrap(), ConcurrencyLimits::default());
+    crate::settings::save(&settings_path, &crate::settings::AppSettings::default()).unwrap();
+    let valid = toml::to_string(&crate::settings::AppSettings::default()).unwrap();
+
+    for busy in [true, false] {
+        // Seed one exact undispatched acceptance through the actual Registry.
+        // No provider is constructed; Close proves this original empty custody.
+        std::fs::write(&settings_path, &valid).unwrap();
+        request.idempotency_key = format!("policy-original-{busy}");
+        let accepted = store
+            .lock()
+            .unwrap()
+            .submit_agent(&Origin::User, &request, now())
+            .unwrap();
+        let lock = busy.then(|| {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(settings_path.with_extension("toml.lock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            lock
+        });
+        if !busy {
+            std::fs::write(
+                &settings_path,
+                "schema_version = 3\n[agent_concurrency]\ncaller = 0\nglobal = 1\n",
+            )
+            .unwrap();
+        }
+        let original_file = std::fs::read(&settings_path).unwrap();
+        let before = store.lock().unwrap().model().unwrap();
+        assert!(
+            concurrency_limits().is_err(),
+            "broker policy adapter must also refuse fallback"
+        );
+        let mut new = request.clone();
+        new.idempotency_key = format!("policy-new-{busy}");
+        let error = process_request(&host, Authority::default(), Operation::Submit(new.clone()))
+            .unwrap_err();
+        assert!(
+            matches!(error, AcceptanceError::PolicyUnavailable { retryable, .. } if retryable == busy)
+        );
+        for operation in [Operation::Submit(new), Operation::Capacity] {
+            let error = super::super::client::process_request(
+                &host,
+                1,
+                ClientRequest::Agent {
+                    authority: Authority::default(),
+                    operation,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::Internal);
+            assert_eq!(error.retryable, busy);
+            assert!(error.details.is_none());
+            assert!(
+                error
+                    .message
+                    .contains("Cannot read agent concurrency settings")
+            );
+        }
+        let Reply::Accepted(retry) = process_request(
+            &host,
+            Authority::default(),
+            Operation::Submit(request.clone()),
+        )
+        .unwrap() else {
+            panic!("exact committed retry must precede policy consumption");
+        };
+        assert!(!retry.created);
+        assert_eq!(
+            (retry.agent.id, retry.run.id),
+            (accepted.agent.id, accepted.run.id)
+        );
+        let mut changed = request.clone();
+        changed.prompt = "different prompt for the original key".into();
+        let error = super::super::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority: Authority::default(),
+                operation: Operation::Submit(changed),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        assert_eq!(store.lock().unwrap().model().unwrap(), before);
+        assert!(host.lock().unwrap().chats.is_empty());
+        for name in ["spawns", "prompts"] {
+            assert!(!fixture_path.parent().unwrap().join(name).exists());
+        }
+        let Reply::Closed(closed) = process_request(
+            &host,
+            Authority::default(),
+            Operation::Close(accepted.agent.id),
+        )
+        .unwrap() else {
+            panic!("proved undispatched cleanup must not consume policy");
+        };
+        assert!(closed.closed);
+        assert_eq!(closed.id, accepted.agent.id);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .agent_capacity(&Origin::User, ConcurrencyLimits::default())
+                .unwrap()
+                .global
+                .running,
+            0
+        );
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original_file);
+        drop(lock);
+    }
+    std::fs::write(
+        &settings_path,
+        "schema_version = 3\napp_theme = 'future-theme'\n[agent_concurrency]\ncaller = 2\nglobal = 1\nfuture_limit = 99\n",
+    )
+    .unwrap();
+    assert_eq!(
+        admission_limits().unwrap(),
+        ConcurrencyLimits {
+            caller: 2,
+            global: 1
+        },
+        "unrelated fallback and unknown policy keys must not replace valid limits"
+    );
+    std::fs::remove_file(&settings_path).unwrap();
+    assert_eq!(admission_limits().unwrap(), ConcurrencyLimits::default());
+}
+
+#[test]
 fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
     if isolated("saved_concurrency_settings_change_admission_without_a_daemon_restart").is_some() {
         return;
@@ -5208,6 +5362,72 @@ fn console_submit_reloads_limits_without_claiming_refused_interaction() {
         std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),
         "spawn\n"
     );
+    // Both new policy refusals also cross the actual console wire route,
+    // without claiming another interaction or submitting another prompt.
+    for busy in [true, false] {
+        std::fs::write(
+            &settings_path,
+            toml::to_string(&crate::settings::AppSettings::default()).unwrap(),
+        )
+        .unwrap();
+        let lock = busy.then(|| {
+            use std::os::fd::AsRawFd;
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(settings_path.with_extension("toml.lock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            lock
+        });
+        if !busy {
+            std::fs::write(
+                &settings_path,
+                "schema_version = 3\n[agent_concurrency]\ncaller = 0\nglobal = 1\n",
+            )
+            .unwrap();
+        }
+        let before = store.lock().unwrap().model().unwrap();
+        let original_file = std::fs::read(&settings_path).unwrap();
+        let error = super::super::client::process_request(
+            &host,
+            37,
+            ClientRequest::Agent {
+                authority: authority.clone(),
+                operation: Operation::Console {
+                    agent: agent.id,
+                    command: ConsoleCommand::Submit {
+                        prompt: "POLICY_REFUSED_CONSOLE_PROMPT".into(),
+                        idempotency_key: format!("policy-refused-console-{busy}"),
+                    },
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::Internal);
+        assert_eq!(error.retryable, busy);
+        assert!(error.details.is_none());
+        let ServerResponse::Agent(Reply::Accepted(retry)) = invoke(authority.clone()).unwrap()
+        else {
+            panic!("console's exact accepted retry must precede policy consumption");
+        };
+        assert!(!retry.created);
+        assert_eq!((retry.agent.id, retry.run.id), (agent.id, followup.run.id));
+        assert_eq!(store.lock().unwrap().model().unwrap(), before);
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original_file);
+        assert_eq!(
+            std::fs::read(path.parent().unwrap().join("prompts")).unwrap(),
+            after_prompts
+        );
+        assert_eq!(
+            std::fs::read(path.parent().unwrap().join("spawns")).unwrap(),
+            b"spawn\n"
+        );
+        drop(lock);
+    }
     // Remove only fixture-added descriptor metadata before the original
     // owning close; there was no console PTY to stop or retire.
     {

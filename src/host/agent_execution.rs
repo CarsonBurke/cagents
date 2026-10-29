@@ -144,17 +144,30 @@ pub(super) fn submit(
 }
 
 pub(super) fn concurrency_limits() -> Result<crate::agent_execution::ConcurrencyLimits, String> {
+    admission_limits().map_err(|error| error.to_string())
+}
+
+fn admission_limits()
+-> Result<crate::agent_execution::ConcurrencyLimits, crate::agent_execution::AcceptanceError> {
+    use crate::{agent_execution::AcceptanceError, settings::SettingsError};
     let Some(path) = crate::instance::settings_path() else {
         return Ok(Default::default());
     };
-    match crate::settings::try_load(path) {
-        Ok(settings) => Ok(settings.agent_concurrency),
-        Err(crate::settings::SettingsError::Io(error))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
+    match crate::settings::try_load_detailed(path) {
+        Ok(loaded) if loaded.has_unreadable_setting("agent_concurrency") => {
+            Err(AcceptanceError::PolicyUnavailable {
+                message: "Cannot read agent concurrency settings: saved limits contain a value this version cannot use. Correct the saved limits before starting new work.".into(),
+                retryable: false,
+            })
+        }
+        Ok(loaded) => Ok(loaded.settings.agent_concurrency),
+        Err(SettingsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(Default::default())
         }
-        Err(error) => Err(format!("Cannot read agent concurrency settings: {error}")),
+        Err(error) => Err(AcceptanceError::PolicyUnavailable {
+            retryable: matches!(&error, SettingsError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            message: format!("Cannot read agent concurrency settings: {error}"),
+        }),
     }
 }
 
@@ -173,7 +186,7 @@ fn submit_with_limits(
     {
         return Ok(previous);
     }
-    let limits = concurrency_limits()?;
+    let limits = admission_limits()?;
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -879,7 +892,7 @@ fn close_as_origin(
     Ok(result)
 }
 
-/// Preserve typed capacity and mailbox backpressure at the service boundary. Existing
+/// Preserve typed capacity, policy and mailbox refusals at the service boundary. Existing
 /// operations retain their original validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
@@ -897,6 +910,7 @@ pub(super) fn process_request(
         crate::agent_execution::Operation::Console { agent, command } => {
             console_with_limits(host, &authority, agent, command)
         }
+        crate::agent_execution::Operation::Capacity => capacity_with_limits(host, &authority),
         other => process(host, authority, other).map_err(Into::into),
     }
 }
@@ -979,14 +993,7 @@ pub(super) fn process(
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
         Operation::Capacity => {
-            let origin = origin(host, &authority)?;
-            let limits = concurrency_limits()?;
-            let store = registry(host)?;
-            let result = store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .agent_capacity(&origin, limits)?;
-            Ok(Reply::Capacity(result))
+            capacity_with_limits(host, &authority).map_err(|error| error.to_string())
         }
         Operation::CloseInterrupted { all, after } => {
             close_interrupted(host, &authority, all, after).map(Reply::InterruptedClosed)
@@ -1394,6 +1401,20 @@ fn console(
     console_with_limits(host, authority, id, command).map_err(|error| error.to_string())
 }
 
+fn capacity_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    let origin = origin(host, authority)?;
+    let limits = admission_limits()?;
+    let store = registry(host)?;
+    let result = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_capacity(&origin, limits)?;
+    Ok(crate::agent_execution::Reply::Capacity(result))
+}
+
 /// Keep policy refusals typed at the wire boundary without changing the
 /// console's existing ownership, per-agent gate or interaction sequencing.
 fn console_with_limits(
@@ -1458,7 +1479,7 @@ fn console_with_limits(
             {
                 return Ok(Reply::Accepted(previous));
             }
-            let limits = concurrency_limits()?;
+            let limits = admission_limits()?;
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
