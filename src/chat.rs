@@ -299,6 +299,9 @@ pub enum Intent {
     /// Begin this launch. A conversation the launch names by id is resumed by
     /// the provider's own argv rather than by attaching to a daemon writer.
     Start,
+    /// Retry an exact, explicitly requested named launch. Resolve any existing
+    /// owner first so a lost start reply cannot create a second provider.
+    RetryStart,
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
@@ -536,6 +539,29 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
+
+/// Whether `path` names an inline image the host's transcript store decoded
+/// into a conversation's private cache (`chat-<uuid>/image-<sha256>.<ext>`).
+/// Such a file lives only as long as that cache, so it is no path to hand to
+/// anyone else.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
+    let name = |part: Option<&std::ffi::OsStr>, prefix: &str| {
+        part.and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix(prefix))
+            .map(str::to_owned)
+    };
+    let image = name(path.file_name(), "image-").is_some_and(|name| {
+        name.split_once('.').is_some_and(|(digest, extension)| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && matches!(extension, "png" | "jpg" | "webp" | "gif")
+        })
+    });
+    image
+        && name(path.parent().and_then(|parent| parent.file_name()), "chat-")
+            .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -825,7 +851,53 @@ impl Session {
     }
 
     pub fn has_valid_native_continuity(&self) -> bool {
-        match &self.native_continuity {
+        self.valid_native_continuity(&self.native_continuity)
+    }
+
+    /// A saved transcript is eligible for the forced, read-only history API.
+    /// This shape is never authority to launch, close or resume a provider.
+    pub(crate) fn is_saved_claude_history(&self) -> bool {
+        self.launch.provider == Provider::Claude
+            && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
+            && self.terminal.is_none()
+            && self.owned_codex_listener.is_none()
+            && self
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+            && self
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
+    /// Import an installed capability observed on this exact authenticated
+    /// attachment. A missing capability never revokes one already recorded.
+    /// Validation applies to the resulting descriptor, including pre-ID
+    /// Claude actors; a valid ReconnectOnly source alone grants nothing.
+    pub(crate) fn learn_native_continuity(&mut self, observed: &NativeContinuity) {
+        if observed.retains_provider() && self.valid_native_continuity(observed) {
+            self.native_continuity = observed.clone();
+        }
+    }
+
+    /// Runtime projections may learn provider identity/capability, but may
+    /// never borrow it from another allocation, account or daemon epoch.
+    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+        if self.id == observed.id
+            && self.proof == observed.proof
+            && self.launch.provider == observed.launch.provider
+            && self.launch.recipe == observed.launch.recipe
+            && self.terminal == observed.terminal
+            && self.owned_codex_listener == observed.owned_codex_listener
+        {
+            self.learn_native_continuity(&observed.native_continuity);
+        }
+    }
+
+    fn valid_native_continuity(&self, continuity: &NativeContinuity) -> bool {
+        match continuity {
             NativeContinuity::ReconnectOnly => true,
             NativeContinuity::RetainedClaudeActor { protocol } => {
                 *protocol == 2
@@ -2335,6 +2407,48 @@ mod retained_native_pair_tests {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    #[test]
+    fn observed_retained_capability_requires_the_exact_valid_owner_and_never_downgrades() {
+        for confirmed in [false, true] {
+            let (observed, _) = pair(confirmed);
+            let mut source = observed.clone();
+            source.native_continuity = NativeContinuity::ReconnectOnly;
+            for mutation in 0..5 {
+                let mut foreign = observed.clone();
+                match mutation {
+                    0 => foreign.id = TerminalId::new(),
+                    1 => foreign.proof.as_mut().unwrap().host_incarnation = "another-owner".into(),
+                    2 => foreign.launch.provider = Provider::Codex,
+                    3 => {
+                        foreign
+                            .launch
+                            .recipe
+                            .environment
+                            .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+                    }
+                    _ => foreign.launch.recipe.arguments.push("--different".into()),
+                }
+                let mut retained = source.clone();
+                retained.learn_native_continuity_from(&foreign);
+                assert_eq!(retained, source);
+            }
+            let mut missing_proof = source.clone();
+            missing_proof.proof = None;
+            missing_proof.learn_native_continuity(&observed.native_continuity);
+            assert_eq!(
+                missing_proof.native_continuity,
+                NativeContinuity::ReconnectOnly
+            );
+            source.learn_native_continuity_from(&observed);
+            assert_eq!(source, observed);
+            assert!(source.has_valid_native_continuity());
+            source.learn_native_continuity(&NativeContinuity::ReconnectOnly);
+            assert_eq!(source, observed);
+            source.learn_native_continuity(&NativeContinuity::RetainedClaudeActor { protocol: 3 });
+            assert_eq!(source, observed);
         }
     }
 

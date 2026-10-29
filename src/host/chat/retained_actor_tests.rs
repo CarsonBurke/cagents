@@ -378,7 +378,7 @@ fn retained_upgrade_tail(fail_final_save: bool) {
         "successor failed to hydrate retained transcript",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact slow turn");
     let transcript = snapshot
         .items
         .iter()
@@ -935,7 +935,7 @@ fn retained_turn_final_action(action: &str) {
         "retained transcript failed to hydrate",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact slow turn");
     let transcript = snapshot
         .items
         .iter()
@@ -1343,7 +1343,21 @@ fn running_commit_diagnostic(
     )
 }
 
-fn assert_retained_copy_sources(handle: &Handle, snapshot: &chat::Snapshot) {
+fn assert_retained_copy_sources(handle: &Handle, snapshot: &chat::Snapshot, prompt: &str) {
+    let users = snapshot
+        .items
+        .iter()
+        .filter(|item| item.role == chat::Role::User)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users.len(),
+        1,
+        "one prompt and its echo must remain one row"
+    );
+    assert!(
+        matches!(&users[0].content, chat::ItemContent::Text { text, .. } if text == prompt),
+        "retained attachment must preserve the original prompt exactly"
+    );
     assert_eq!(
         snapshot.items.len(),
         snapshot.text_copy_sources.conversation.len()
@@ -1443,7 +1457,7 @@ for line in sys.stdin:
     elif frame.get('type')=='user':
         with (root/'prompts').open('a') as log: log.write('prompt\n')
         received=frame['uuid']
-        send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':{'id':'native-'+received,'role':'user','content':[{'type':'text','text':'One exact slow turn'}]}})
+        send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':frame['message']})
         send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
         for index in range(40):
             send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
@@ -2369,7 +2383,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
         "transcript did not hydrate after host SIGKILL",
     );
     let snapshot = handle.snapshot(None).unwrap();
-    assert_retained_copy_sources(&handle, &snapshot);
+    assert_retained_copy_sources(&handle, &snapshot, "One exact killed-host turn");
     let text = snapshot
         .items
         .iter()
@@ -3115,13 +3129,18 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     struct Cleanup {
         proved: AtomicBool,
+        fail: AtomicBool,
+        proof: chat::protocol::LaunchOutcome,
         observations: AtomicUsize,
     }
     impl chat::protocol::LaunchCleanup for Cleanup {
         fn cleanup(&self) -> Result<chat::protocol::LaunchOutcome, String> {
             self.observations.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("fixture cleanup remains unconfirmed".into());
+            }
             Ok(if self.proved.load(Ordering::SeqCst) {
-                chat::protocol::LaunchOutcome::TeardownProved
+                self.proof
             } else {
                 chat::protocol::LaunchOutcome::Uncertain
             })
@@ -3159,15 +3178,19 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     let original = Arc::new(chat::protocol::ExecutionContext::capture(root.path()).unwrap());
     let cleanup = Arc::new(Cleanup {
         proved: AtomicBool::new(false),
+        fail: AtomicBool::new(false),
+        proof: chat::protocol::LaunchOutcome::TeardownProved,
         observations: AtomicUsize::new(0),
     });
     original.claim_owner(cleanup.clone());
+    host.lock().unwrap().native_chat_capacity = 1;
     host.lock().unwrap().native_actor_startups.insert(
         source.id,
         retained_actor::Startup {
             source: source.clone(),
             requested: source.clone(),
             context: original.clone(),
+            failed_close: None,
         },
     );
     for _ in 0..2 {
@@ -3194,21 +3217,80 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
         assert_eq!(pending.source, source);
         assert!(state.chat_spawning.is_empty());
         assert!(state.chats.is_empty());
+        assert_eq!(capacity::usage(&state), 1);
+        assert_eq!(capacity::status_from_state(&state).spawning, 1);
         assert!(
             !spawned.exists(),
             "retry may not start a provider before original cleanup proof"
         );
     }
     assert_eq!(cleanup.observations.load(Ordering::SeqCst), 2);
+    let generation = host.lock().unwrap().inventory_generation;
+    let mut other = source.clone();
+    other.id = TerminalId::new();
+    other.launch.recipe.program = "/missing-provider-never-constructed".into();
+    let rejected = start(&host, 0, other, None, false, None, Default::default()).unwrap_err();
+    assert_eq!(rejected.code, ProtocolErrorCode::ChatCapacity);
+    assert!(rejected.retryable);
+    assert!(rejected.message.contains("0 resident, 1 starting, limit 1"));
+    cleanup.fail.store(true, Ordering::SeqCst);
+    assert!(
+        retained_actor::reconcile_startup(&host, &source)
+            .unwrap_err()
+            .contains("fixture cleanup remains unconfirmed")
+    );
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation);
+    cleanup.fail.store(false, Ordering::SeqCst);
     cleanup.proved.store(true, Ordering::SeqCst);
     assert!(retained_actor::reconcile_startup(&host, &source).unwrap());
     assert!(host.lock().unwrap().native_actor_startups.is_empty());
-    assert_eq!(cleanup.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 0);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
+    assert_eq!(cleanup.observations.load(Ordering::SeqCst), 4);
     assert_eq!(
         original.outcome(),
         chat::protocol::LaunchOutcome::TeardownProved
     );
     assert!(!spawned.exists());
+
+    // A later context under the same exact source cannot be retired by an
+    // earlier context's delayed callback. Count it even before claim_owner.
+    let successor = Arc::new(chat::protocol::ExecutionContext::capture(root.path()).unwrap());
+    let no_provider = Arc::new(Cleanup {
+        proved: AtomicBool::new(true),
+        fail: AtomicBool::new(false),
+        proof: chat::protocol::LaunchOutcome::NoProvider,
+        observations: AtomicUsize::new(0),
+    });
+    host.lock().unwrap().native_actor_startups.insert(
+        source.id,
+        retained_actor::Startup {
+            source: source.clone(),
+            requested: source.clone(),
+            context: successor.clone(),
+            failed_close: None,
+        },
+    );
+    let generation = host.lock().unwrap().inventory_generation;
+    assert_eq!(
+        successor.outcome(),
+        chat::protocol::LaunchOutcome::NoProvider
+    );
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
+    retained_actor::forget_startup(&host, &source, &original);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation);
+    assert!(Arc::ptr_eq(
+        &host.lock().unwrap().native_actor_startups[&source.id].context,
+        &successor
+    ));
+    successor.claim_owner(no_provider.clone());
+    assert!(retained_actor::reconcile_startup(&host, &source).unwrap());
+    assert_eq!(no_provider.observations.load(Ordering::SeqCst), 1);
+    assert_eq!(capacity::usage(&host.lock().unwrap()), 0);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
+    retained_actor::forget_startup(&host, &source, &successor);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
 }
 
 #[test]

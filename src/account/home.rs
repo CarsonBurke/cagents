@@ -228,7 +228,7 @@ impl Homes {
                     path.display()
                 )));
             }
-            link_shared(provider, system_home, &path);
+            link_shared(provider, system_home, &path, codex_config);
         }
         created.revalidate()?;
         Ok((key, path))
@@ -459,11 +459,19 @@ fn remove_parked(parked: &Path) -> io::Result<()> {
 /// `home` does not. Best effort: an entry that cannot be linked leaves the
 /// account without it, which is how every managed home started before, and
 /// is not worth refusing the account over.
-fn link_shared(provider: Provider, system_home: &Path, home: &Path) {
+fn link_shared(provider: Provider, system_home: &Path, home: &Path, codex_config: CodexConfig) {
     if system_home == home {
         return;
     }
     for name in shared_entries(provider) {
+        // Copy is a policy choice, including when the source was absent or
+        // changed after seeding. Never fall back to a shared configuration.
+        if provider == Provider::Codex
+            && codex_config == CodexConfig::Copy
+            && *name == "config.toml"
+        {
+            continue;
+        }
         let source = system_home.join(name);
         if fs::symlink_metadata(&source).is_err() {
             continue;
@@ -613,6 +621,105 @@ mod tests {
             fs::canonicalize(shared).unwrap(),
             "Codex derives its keyring key from each canonical home"
         );
+    }
+
+    #[test]
+    fn codex_copy_never_links_a_dangling_configuration_or_its_later_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir_all(system.join("skills")).unwrap();
+        fs::write(system.join("AGENTS.md"), "fixture instructions").unwrap();
+        let target = directory.path().join("later-config.toml");
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let (_, shared) = homes.create(Provider::Codex, Some(&system)).unwrap();
+        let config = copied.join("config.toml");
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_link(copied.join("AGENTS.md")).unwrap(),
+            system.join("AGENTS.md")
+        );
+        assert_eq!(
+            fs::read_link(copied.join("skills")).unwrap(),
+            system.join("skills")
+        );
+        assert_eq!(
+            fs::read_link(shared.join("config.toml")).unwrap(),
+            system.join("config.toml")
+        );
+
+        let original = b"approval_policy = \"on-request\"\n";
+        fs::write(&target, original).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&config).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(shared.join("config.toml")).unwrap(), original);
+        write_configuration(&config, b"model = \"managed-fixture\"\n").unwrap();
+        assert!(fs::symlink_metadata(&config).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::read_link(system.join("config.toml")).unwrap(), target);
+    }
+
+    #[test]
+    fn codex_copy_policy_survives_changes_between_seeding_and_linking() {
+        for remove_copy in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let system = directory.path().join("system");
+            let copied = directory.path().join("copied");
+            let shared = directory.path().join("shared");
+            for path in [&system, &copied, &shared] {
+                fs::create_dir(path).unwrap();
+            }
+            let source = system.join("config.toml");
+            let destination = copied.join("config.toml");
+            if remove_copy {
+                fs::write(&source, b"fixture original").unwrap();
+            }
+            copy_configuration(&source, &destination).unwrap();
+            if remove_copy {
+                fs::remove_file(&destination).unwrap();
+            } else {
+                fs::write(&source, b"fixture arrived after copy").unwrap();
+            }
+            // Exercise the actual phase boundary without sleeps or a race hook.
+            link_shared(Provider::Codex, &system, &copied, CodexConfig::Copy);
+            assert_eq!(
+                fs::symlink_metadata(&destination).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            link_shared(Provider::Codex, &system, &shared, CodexConfig::Shared);
+            assert_eq!(fs::read_link(shared.join("config.toml")).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn codex_copy_of_a_source_symlink_preserves_private_opaque_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir(&system).unwrap();
+        let target = directory.path().join("source-config.toml");
+        let original = b"# opaque fixture\n\xff\x00\r\n";
+        fs::write(&target, original).unwrap();
+        symlink(&target, system.join("config.toml")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let config = copied.join("config.toml");
+        let metadata = fs::symlink_metadata(&config).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_ne!(metadata.ino(), fs::metadata(&target).unwrap().ino());
+        assert_eq!(fs::read(&config).unwrap(), original);
+        fs::write(&config, b"independent fixture edit").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), original);
     }
 
     #[test]

@@ -23,6 +23,8 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(test)]
+mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 
@@ -293,6 +295,10 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Close(_),
+                    ..
+                }
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -522,13 +528,17 @@ pub(super) fn process_request(
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
-        operation: crate::device_service::Operation::RemoveMergedWorktree { request },
+        operation:
+            crate::device_service::Operation::RemoveMergedWorktree {
+                request: removal_request,
+            },
     } = &request
     {
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
-            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            crate::worktree_cleanup::PreparedRemoval::prepare(removal_request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
@@ -739,9 +749,14 @@ pub(super) fn process_request(
             authority,
             operation,
         } => {
-            let reply =
-                super::agent_execution::process(host, authority, operation).map_err(|message| {
-                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            let reply = super::agent_execution::process_request(host, authority, operation)
+                .map_err(|error| match error {
+                    crate::agent_execution::AcceptanceError::Invalid(message) => {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    }
+                    crate::agent_execution::AcceptanceError::MailboxFull(message) => {
+                        ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
+                    }
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
@@ -2627,6 +2642,217 @@ mod tests {
             super::super::state::HostState::new(proof.clone()),
         ));
         (proof, host)
+    }
+
+    #[test]
+    fn agent_close_reply_drains_before_ordinary_exit_seals_delivery() {
+        use crate::agent_execution::{
+            Destination, Operation, Origin, Reply, Spec, Submit, Surface, Target,
+        };
+        use std::sync::mpsc;
+        let name = thread::current().name().unwrap().to_owned();
+        let Some(_root) = super::super::exit_drain_tests::private_runtime_case(&name, None) else {
+            return;
+        };
+        thread_local! {
+            static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        fn close_then_pause(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            let result = process_request(host, client, request);
+            if matches!(&result, Ok((ServerResponse::Agent(crate::agent_execution::Reply::Closed(agent)), _, _)) if agent.closed)
+            {
+                PAUSE.with(|pause| {
+                    let (closed, resume) = pause.borrow_mut().take().unwrap();
+                    closed.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            }
+            result
+        }
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+        fn reply(stream: &mut UnixStream, request_id: u64) -> ServerMessage {
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let envelope = codec
+                    .read::<ServerEnvelope>(stream)
+                    .unwrap()
+                    .expect("Agent Close reply was lost before delivery drained");
+                if envelope.request_id == Some(request_id) {
+                    return envelope.message;
+                }
+            }
+        }
+        let (proof, host) = panic_test_host("agent-close-reply-custody");
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap();
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Close fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        // Accept a fixture-owned pending run without dispatching any actor.
+        // Close still crosses the real origin/ownership checks and durable
+        // terminal-state transition, and may release the last run owner.
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: repository.clone(),
+                            directory: repository,
+                            placement: None,
+                        },
+                        surface: Surface::Chat,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Never dispatched".into(),
+                    idempotency_key: "close-reply-fixture".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let agent = accepted.agent.id;
+        host.lock().unwrap().install_model(registry);
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let serving_host = Arc::clone(&host);
+        let serving = thread::spawn(move || {
+            PAUSE.with(|pause| *pause.borrow_mut() = Some((closed_tx, resume_rx)));
+            serve_with(server_stream, 1, serving_host, close_then_pause);
+        });
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            reply(&mut stream, 1),
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        send(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::Agent {
+                authority: crate::agent_execution::Authority::default(),
+                operation: Operation::Close(crate::model::AgentId::new()),
+            },
+        );
+        assert!(matches!(reply(&mut stream, 2), ServerMessage::Error(_)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+            assert!(
+                Instant::now() < deadline,
+                "refused Agent Close leaked reply custody"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        send(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::Agent {
+                authority: crate::agent_execution::Authority::default(),
+                operation: Operation::Close(agent),
+            },
+        );
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        assert!(registry.lock().unwrap().agent(agent).unwrap().closed);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_run(accepted.run.id)
+                .unwrap()
+                .state,
+            crate::agent_execution::State::Cancelled
+        );
+        let drain = super::super::begin_ordinary_exit(&host).unwrap();
+        assert!(drain.try_seal_absence());
+        let mut cleanup_error = None;
+        assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        assert!(!super::super::finish_shutdown_owners(
+            &host,
+            &mut cleanup_error,
+            false
+        ));
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+            assert!(
+                Instant::now() < deadline,
+                "Agent Close reply guard did not release"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(super::super::finish_shutdown_owners(
+            &host,
+            &mut cleanup_error,
+            false
+        ));
+        assert!(cleanup_error.is_none());
+        let deliveries = {
+            let mut state = host.lock().unwrap();
+            assert!(drain.try_seal_absence());
+            state.close_ordinary_exit_registration()
+        };
+        super::super::close_shutdown_deliveries(&host, &deliveries);
+        assert!(matches!(reply(&mut stream, 3), ServerMessage::Response {
+            response: ServerResponse::Agent(Reply::Closed(closed)),
+        } if closed.id == agent && closed.closed));
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+            assert_eq!(envelope.request_id, None);
+            assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+        }
+        serving.join().unwrap();
+        assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
     }
 
     /// Hold the real close handler before serve_with can enqueue its response.

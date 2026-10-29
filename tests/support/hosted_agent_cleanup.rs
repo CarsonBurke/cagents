@@ -15,6 +15,40 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Private seams exercise the real cleanup loop without creating a daemon or
+// depending on an OS-wide thread limit. The public API still uses cli and the
+// same scoped worker creation below.
+type CleanupCommand<'a> = dyn Fn(&Path, &[&str], Instant) -> Result<Value, String>
+    + Sync
+    + std::panic::RefUnwindSafe
+    + 'a;
+type CleanupJob<'scope> = Box<dyn FnOnce() -> Result<Value, String> + Send + 'scope>;
+
+trait CleanupSpawner {
+    fn spawn<'scope, 'env>(
+        &self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        job: CleanupJob<'scope>,
+    ) -> std::io::Result<thread::ScopedJoinHandle<'scope, Result<Value, String>>>
+    where
+        'env: 'scope;
+}
+
+struct ScopedCleanupSpawner;
+
+impl CleanupSpawner for ScopedCleanupSpawner {
+    fn spawn<'scope, 'env>(
+        &self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        job: CleanupJob<'scope>,
+    ) -> std::io::Result<thread::ScopedJoinHandle<'scope, Result<Value, String>>>
+    where
+        'env: 'scope,
+    {
+        thread::Builder::new().spawn_scoped(scope, job)
+    }
+}
+
 #[derive(Default)]
 pub struct Agents(Mutex<BTreeSet<String>>);
 
@@ -40,6 +74,16 @@ impl Agents {
 
     pub fn close(&self, root: &Path) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(60);
+        self.close_with(root, deadline, &cli, &ScopedCleanupSpawner)
+    }
+
+    fn close_with(
+        &self,
+        root: &Path,
+        deadline: Instant,
+        command: &CleanupCommand<'_>,
+        spawner: &impl CleanupSpawner,
+    ) -> Result<(), String> {
         let ids: Vec<_> = self
             .0
             .lock()
@@ -47,7 +91,7 @@ impl Agents {
             .iter()
             .cloned()
             .collect();
-        let status = cli(root, &["daemon", "status"], deadline)?;
+        let status = command(root, &["daemon", "status"], deadline)?;
         if status["running"] != true {
             return if ids.is_empty() {
                 Ok(())
@@ -55,7 +99,7 @@ impl Agents {
                 Err("Private daemon disappeared before exact accepted-agent cleanup".into())
             };
         }
-        quiesce_automations(root, deadline)?;
+        quiesce_automations(root, deadline, command)?;
         let mut failures = Vec::new();
         for batch in ids.chunks(4) {
             if Instant::now() >= deadline {
@@ -65,13 +109,27 @@ impl Agents {
             thread::scope(|scope| {
                 let workers: Vec<_> = batch
                     .iter()
-                    .map(|id| scope.spawn(move || cli(root, &["agent", "close", id], deadline)))
+                    .map(|id| {
+                        spawner.spawn(
+                            scope,
+                            Box::new(move || command(root, &["agent", "close", id], deadline)),
+                        )
+                    })
                     .collect();
                 for (id, worker) in batch.iter().zip(workers) {
-                    match worker.join() {
+                    // Cleanup also runs while unwinding a failed assertion.
+                    // A full task budget must not turn a failed worker spawn
+                    // into a second panic that skips the daemon's teardown.
+                    let result = match worker {
+                        Ok(worker) => worker.join(),
+                        Err(_) => std::panic::catch_unwind(|| {
+                            command(root, &["agent", "close", id], deadline)
+                        }),
+                    };
+                    match result {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => failures.push(format!("agent {id}: {error}")),
-                        Err(_) => failures.push(format!("agent {id}: cleanup worker panicked")),
+                        Err(_) => failures.push(format!("agent {id}: cleanup panicked")),
                     }
                 }
             });
@@ -79,7 +137,7 @@ impl Agents {
         if !failures.is_empty() {
             return Err(failures.join("; "));
         }
-        let remaining = cli(root, &["agent", "list"], deadline)?;
+        let remaining = command(root, &["agent", "list"], deadline)?;
         if !remaining["agents"].as_array().is_some_and(Vec::is_empty) {
             return Err(
                 "Private fixture still owns open agents after exact accepted-ID cleanup".into(),
@@ -92,7 +150,11 @@ impl Agents {
 // Current private automation fixtures use fresh sessions. Stop future firings
 // and ask the public scheduler to cancel/retire active executions before stop;
 // killing the daemon alone deliberately preserves those retained owners.
-fn quiesce_automations(root: &Path, deadline: Instant) -> Result<(), String> {
+fn quiesce_automations(
+    root: &Path,
+    deadline: Instant,
+    cli: &CleanupCommand<'_>,
+) -> Result<(), String> {
     let listed = cli(root, &["automation", "list", "--limit", "100"], deadline)?;
     let automations = listed["automations"]
         .as_array()
@@ -271,5 +333,172 @@ pub fn diagnostics(root: &Path) {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus};
+
+    struct RefuseWorkers(AtomicUsize);
+
+    impl CleanupSpawner for RefuseWorkers {
+        fn spawn<'scope, 'env>(
+            &self,
+            _scope: &'scope thread::Scope<'scope, 'env>,
+            _job: CleanupJob<'scope>,
+        ) -> std::io::Result<thread::ScopedJoinHandle<'scope, Result<Value, String>>>
+        where
+            'env: 'scope,
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Call {
+        root: PathBuf,
+        arguments: Vec<String>,
+        deadline: Instant,
+    }
+
+    fn five_accepted_agents() -> (Agents, Vec<String>) {
+        let agents = Agents::default();
+        let ids: Vec<_> = (1..=5)
+            .map(|id| uuid::Uuid::from_u128(id).to_string())
+            .collect();
+        for id in &ids {
+            agents.observe(&Output {
+                status: ExitStatus::from_raw(0),
+                stdout: serde_json::to_vec(&serde_json::json!({
+                    "ok": true, "data": {"agent": {"origin": "User", "id": id}}
+                }))
+                .unwrap(),
+                stderr: Vec::new(),
+            });
+        }
+        (agents, ids)
+    }
+
+    fn fake_cli<'a>(
+        calls: &'a Mutex<Vec<Call>>,
+        error_id: Option<&'a str>,
+        panic_id: Option<&'a str>,
+    ) -> impl Fn(&Path, &[&str], Instant) -> Result<Value, String> + Sync + std::panic::RefUnwindSafe + 'a
+    {
+        move |root: &Path, arguments: &[&str], deadline: Instant| {
+            // Release the trace lock before the deliberately caught panic.
+            calls.lock().unwrap().push(Call {
+                root: root.to_owned(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+                deadline,
+            });
+            match arguments {
+                ["daemon", "status"] => Ok(serde_json::json!({"running": true})),
+                ["automation", "list", "--limit", "100"] => {
+                    Ok(serde_json::json!({"automations": []}))
+                }
+                ["agent", "close", id] => {
+                    if Some(*id) == panic_id {
+                        panic!("injected inline cleanup panic");
+                    }
+                    if Some(*id) == error_id {
+                        return Err("injected cleanup error".to_owned());
+                    }
+                    Ok(serde_json::json!({}))
+                }
+                ["agent", "list"] => Ok(serde_json::json!({"agents": []})),
+                _ => panic!("unexpected cleanup command: {arguments:?}"),
+            }
+        }
+    }
+
+    fn assert_calls(calls: &[Call], ids: &[String], root: &Path, deadline: Instant) {
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.root == root && call.deadline == deadline)
+        );
+        assert_eq!(calls[0].arguments, ["daemon", "status"]);
+        assert_eq!(calls[1].arguments, ["automation", "list", "--limit", "100"]);
+        let closed: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.arguments.first().is_some_and(|value| value == "agent")
+                    && call.arguments.get(1).is_some_and(|value| value == "close")
+            })
+            .map(|call| call.arguments[2].clone())
+            .collect();
+        assert_eq!(closed, ids);
+    }
+
+    #[test]
+    fn spawn_refusal_closes_exact_ids_inline_with_original_deadline() {
+        let (agents, ids) = five_accepted_agents();
+        let root = Path::new("/not-created/private-cleanup-fixture");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let calls = Mutex::new(Vec::new());
+        let spawner = RefuseWorkers(AtomicUsize::new(0));
+        let command = fake_cli(&calls, None, None);
+        assert_eq!(
+            agents.close_with(root, deadline, &command, &spawner),
+            Ok(())
+        );
+        assert_eq!(spawner.0.load(Ordering::Relaxed), 5);
+        let calls = calls.lock().unwrap();
+        assert_calls(&calls, &ids, root, deadline);
+        assert_eq!(calls.len(), 8);
+        assert_eq!(calls.last().unwrap().arguments, ["agent", "list"]);
+    }
+
+    #[test]
+    fn spawn_refusal_accumulates_inline_error_and_panic() {
+        let (agents, ids) = five_accepted_agents();
+        let root = Path::new("/not-created/private-cleanup-fixture");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let calls = Mutex::new(Vec::new());
+        let spawner = RefuseWorkers(AtomicUsize::new(0));
+        let command = fake_cli(&calls, Some(&ids[0]), Some(&ids[1]));
+        struct DuringUnwind<F: FnOnce()>(Option<F>);
+        impl<F: FnOnce()> Drop for DuringUnwind<F> {
+            fn drop(&mut self) {
+                if let Some(cleanup) = self.0.take() {
+                    cleanup();
+                }
+            }
+        }
+        let was_unwinding = Mutex::new(false);
+        let result = Mutex::new(None);
+        let original = std::panic::catch_unwind(|| {
+            let _cleanup = DuringUnwind(Some(|| {
+                *was_unwinding.lock().unwrap() = thread::panicking();
+                let closed = agents.close_with(root, deadline, &command, &spawner);
+                *result.lock().unwrap() = Some(closed);
+            }));
+            panic!("original fixture assertion");
+        });
+        assert_eq!(
+            original.unwrap_err().downcast_ref::<&str>(),
+            Some(&"original fixture assertion")
+        );
+        assert!(*was_unwinding.lock().unwrap());
+        let error = result.into_inner().unwrap().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "agent {}: injected cleanup error; agent {}: cleanup panicked",
+                ids[0], ids[1]
+            )
+        );
+        assert_eq!(spawner.0.load(Ordering::Relaxed), 5);
+        let calls = calls.lock().unwrap();
+        assert_calls(&calls, &ids, root, deadline);
+        assert_eq!(calls.len(), 7);
+        assert!(!calls.iter().any(|call| call.arguments == ["agent", "list"]));
     }
 }
