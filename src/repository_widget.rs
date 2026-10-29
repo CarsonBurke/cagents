@@ -6486,6 +6486,9 @@ impl RepositoryRuntime {
                             markdown,
                         );
                         if let Some(retained) = retained {
+                            // This admitted history was retained at the saved bytes.
+                            // Keep its checkpoint in the original graph's identity space.
+                            document.saved_history_revision = retained.history.revision();
                             document.history = retained.history;
                             document.content.set_cursor(retained.cursor);
                         }
@@ -14822,17 +14825,73 @@ mod tests {
         }));
         let task = runtime.request_save(card, false);
         finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.rs")).unwrap(),
+            "xone"
+        );
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        let saved_revision = document.history.revision();
+        assert_ne!(saved_revision, 0);
+        assert_eq!(document.saved_history_revision, saved_revision);
         let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
         finish_navigation_task(&mut runtime, task).await;
         let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
         finish_navigation_task(&mut runtime, task).await;
-        drop(runtime.update(RepositoryAction::Undo { card }));
         let DocumentState::Editable(document) = &runtime.document else {
             panic!("editor");
         };
-        assert_eq!(document.content.text(), "one");
+        assert_eq!(document.content.text(), "xone");
+        assert_eq!(document.history.revision(), saved_revision);
+        assert_eq!(document.saved_history_revision, saved_revision);
+        assert!(!runtime.is_dirty());
+        assert!(!runtime.can_save());
+        assert!(!runtime.blocks_navigation());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("one"));
+        assert!(runtime.is_dirty());
+        assert!(runtime.can_save());
+        assert!(runtime.blocks_navigation());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.rs")).unwrap(),
+            "xone"
+        );
+
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("xone"));
+        assert!(!runtime.is_dirty());
+        assert!(!runtime.can_save());
+        assert!(!runtime.blocks_navigation());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
         let task = runtime.request_save(card, false);
         finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.rs")).unwrap(),
+            "one"
+        );
+        assert!(!runtime.is_dirty());
+        assert!(!runtime.can_save());
+        assert!(!runtime.blocks_navigation());
+
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('y')),
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), "yone");
+        assert!(document.history.revision() > saved_revision);
+        assert!(!document.history.can_redo());
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("one"));
+        assert!(!runtime.is_dirty());
+        assert!(!runtime.blocks_navigation());
+
         let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
         finish_navigation_task(&mut runtime, task).await;
         std::fs::write(root.path().join("a.rs"), "outside").unwrap();
@@ -14843,6 +14902,7 @@ mod tests {
         };
         assert_eq!(document.content.text(), "outside");
         assert!(!document.history.can_undo());
+        assert!(!document.history.can_redo());
     }
 
     #[tokio::test]
