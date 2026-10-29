@@ -797,7 +797,7 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
-    #[serde(default)]
+    #[serde(default, serialize_with = "agents::serialize_provider_settings")]
     pub agents: std::collections::BTreeMap<String, AgentLaunchSettings>,
     #[serde(default)]
     pub default_shell: Option<String>,
@@ -1969,16 +1969,32 @@ pub fn save_merged(
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
     let previous = load_unlocked(path)?.settings;
+    // Loading may retain unreadable saved execution policy, but a newly
+    // invalid edited value must still refuse the save rather than fall back.
+    desired.clone().validate_transition(base)?;
+    agents::validate_container_repairs(&base.agents, &desired.agents, &previous.agents)
+        .map_err(SettingsError::AgentLaunch)?;
     let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
         &merge_base_value(base, desired)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    let settings = current
-        .try_into::<AppSettings>()?
-        .validate_transition(&previous)?;
-    save_validated_unlocked(path, &settings)
+    let mut table = current.try_into::<toml::Table>()?;
+    let retained = agents::retain_unreadable_containers(&mut table)?;
+    let mut settings = toml::Value::Table(table).try_into::<AppSettings>()?;
+    retained.restore(&mut settings.agents);
+    let settings = settings.validate_transition(&previous)?;
+    save_validated_unlocked(path, &settings)?;
+    if agents::has_policy_repairs(&desired.agents) {
+        // The same writer lock still owns this file, including on final-close
+        // saves. A failed read or changed canonical scope cannot acknowledge
+        // the repair or clear its live refusal.
+        let persisted = load_unlocked(path)?.settings;
+        agents::confirm_policy_repairs(&desired.agents, &persisted.agents)
+            .map_err(SettingsError::AgentLaunch)?;
+    }
+    Ok(())
 }
 
 /// A newly configured provider still has default-valued fields before its
@@ -2290,7 +2306,8 @@ struct Decoded {
 /// that decodes but fails validation, such as a range a newer build widened
 /// or a chord naming a key it added, falls back the same way; each shortcut
 /// action is a setting of its own. Anything else still fails the document.
-fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
+fn decode_current(mut table: toml::Table) -> Result<Decoded, SettingsError> {
+    let retained = agents::retain_unreadable_containers(&mut table)?;
     let defaults = written(&AppSettings::default())?;
     let mut read = toml::Value::Table(table);
     let mut foreign: Vec<Foreign> = Vec::new();
@@ -2333,7 +2350,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
     for path in &absent {
         tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; this build fills it in and writes it only if that is not the plain default");
     }
-    let settings = loop {
+    let mut settings = loop {
         let mut unknown = Vec::new();
         let decoded: Result<AppSettings, _> = serde_path_to_error::deserialize(
             serde_ignored::Deserializer::new(read.clone(), &mut |path: serde_ignored::Path<'_>| {
@@ -2412,6 +2429,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
                 }),
         );
     }
+    retained.restore(&mut settings.agents);
     Ok(Decoded {
         settings,
         foreign,

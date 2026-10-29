@@ -300,6 +300,7 @@ mod tests {
                     model: Some("daemon-model".into()),
                     effort: Some("low".into()),
                     permission_mode: Some("workspaceWrite".into()),
+                    ..Default::default()
                 },
             );
             crate::settings::save(&settings, &preferences).unwrap();

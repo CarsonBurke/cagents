@@ -14231,6 +14231,7 @@ mod tests {
             executable: Some("relative-local-only".into()),
             arguments: vec!["invalid\0argument".into()],
             environment: [("INVALID NAME".into(), "local-secret".into())].into(),
+            ..Default::default()
         };
         let remote = draft_launch_configuration(&configuration, true);
         assert_eq!(remote.model, configuration.model);
@@ -14633,6 +14634,7 @@ mod tests {
                     "PROVIDER_FIXTURE_VALUE".into(),
                     "UI fixture environment".into(),
                 )]),
+                ..Default::default()
             },
         );
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));

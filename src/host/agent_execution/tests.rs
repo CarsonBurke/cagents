@@ -149,6 +149,7 @@ fn provider_settings_reach_cli_and_automation_processes_and_recorded_recipes() {
             "PROVIDER_FIXTURE_VALUE".into(),
             "settings environment".into(),
         )]),
+        ..Default::default()
     };
     let settings = crate::settings::AppSettings {
         agents: std::collections::BTreeMap::from([("claude".into(), configuration)]),

@@ -2511,6 +2511,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SelectSettingsCategory(_)
         | Message::SettingsSearchChanged(_)
         | Message::DetectAgentExecutable(_)
+        | Message::RepairUnreadableAgentPolicy { .. }
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
         | Message::AgentListEdited { .. }
@@ -2577,6 +2578,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SelectSettingsCategory(_)
                 | Message::SettingsSearchChanged(_)
                 | Message::DetectAgentExecutable(_)
+                | Message::RepairUnreadableAgentPolicy { .. }
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
                 | Message::AgentListEdited { .. }
@@ -3239,14 +3241,15 @@ impl AgentDraft {
             self.argument_owner = uuid::Uuid::new_v4();
             self.argument_rows = arguments.iter().map(|_| uuid::Uuid::new_v4()).collect();
         }
-        self.configuration.arguments = arguments;
+        self.configuration.set_arguments(arguments);
     }
     fn set_environment(&mut self, environment: Vec<(String, String)>) {
         if self.environment_rows.len() != environment.len() {
             self.environment_owner = uuid::Uuid::new_v4();
             self.environment_rows = environment.iter().map(|_| uuid::Uuid::new_v4()).collect();
         }
-        self.configuration.environment = environment.iter().cloned().collect();
+        self.configuration
+            .set_environment(environment.iter().cloned().collect());
         self.environment = environment;
     }
     /// Apply one emitted row operation against the latest draft. Views capture
@@ -3485,6 +3488,9 @@ impl SettingsDraft {
             }
             SettingsField::Agent(provider, field) => {
                 let draft = self.agents.entry(provider).or_default();
+                if unreadable_agent_edit(&draft.configuration, provider, field).is_some() {
+                    return;
+                }
                 let optional = |value: String| (!value.is_empty()).then_some(value);
                 match field {
                     AgentSetting::Model => draft.configuration.model = optional(value),
@@ -3493,7 +3499,7 @@ impl SettingsDraft {
                         draft.configuration.permission_mode = optional(value)
                     }
                     AgentSetting::Executable => {
-                        draft.configuration.executable = optional(value);
+                        draft.configuration.set_executable(optional(value));
                         draft.executable_unavailable = false;
                     }
                     AgentSetting::Arguments => {
@@ -3691,6 +3697,17 @@ fn settings_update(
     settings_update_with_availability(current, field, raw_value, true)
 }
 
+fn unreadable_agent_edit(
+    configuration: &settings::AgentLaunchSettings,
+    provider: crate::agent::Provider,
+    field: AgentSetting,
+) -> Option<String> {
+    (configuration.unreadable_container().is_some()
+        || configuration.unreadable_field(field.key()).is_some())
+    .then(|| configuration.validate_readable_execution(provider).err())
+    .flatten()
+}
+
 fn settings_update_syntax(
     current: &AppSettings,
     field: SettingsField,
@@ -3705,6 +3722,12 @@ fn settings_update_with_availability(
     raw_value: &str,
     availability: bool,
 ) -> SettingsDecision {
+    if let SettingsField::Agent(provider, field) = field
+        && let Some(configuration) = current.agents.get(settings::agents::provider_key(provider))
+        && let Some(reason) = unreadable_agent_edit(configuration, provider, field)
+    {
+        return SettingsDecision::Invalid(reason);
+    }
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
@@ -3732,11 +3755,11 @@ fn settings_update_with_availability(
                     Ok(())
                 }
                 AgentSetting::Executable => {
-                    configuration.executable = optional();
+                    configuration.set_executable(optional());
                     Ok(())
                 }
                 AgentSetting::Arguments => serde_json::from_str(value)
-                    .map(|arguments| configuration.arguments = arguments)
+                    .map(|arguments| configuration.set_arguments(arguments))
                     .map_err(|_| "Enter each argument in its own row.".to_owned()),
                 AgentSetting::Environment => serde_json::from_str::<Vec<(String, String)>>(value)
                     .map_err(|_| "Enter each environment variable in its own row.".to_owned())
@@ -3745,7 +3768,7 @@ fn settings_update_with_availability(
                         if entries.iter().any(|(name, _)| !names.insert(name)) {
                             return Err("Environment variable names must be unique.".into());
                         }
-                        configuration.environment = entries.into_iter().collect();
+                        configuration.set_environment(entries.into_iter().collect());
                         Ok(())
                     }),
             }
@@ -4660,6 +4683,10 @@ pub enum Message {
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
     DetectAgentExecutable(crate::agent::Provider),
+    RepairUnreadableAgentPolicy {
+        provider: crate::agent::Provider,
+        observed: settings::agents::UnreadablePolicyReset,
+    },
     AgentExecutableDetected {
         provider: crate::agent::Provider,
         revision: uuid::Uuid,
@@ -12631,8 +12658,33 @@ impl Cagents {
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> bool {
+    fn acknowledge_settings_save(&mut self, mut saved: SettingsSaved) -> bool {
         if saved.generation >= self.settings_ack_generation {
+            if settings::agents::has_policy_repairs(&saved.settings.agents) {
+                settings::agents::acknowledge_policy_repairs(
+                    &mut self.settings.agents,
+                    &saved.settings.agents,
+                );
+                let mut drafts = self
+                    .settings_draft
+                    .agents
+                    .iter()
+                    .map(|(&provider, draft)| {
+                        (
+                            settings::agents::provider_key(provider).into(),
+                            draft.configuration.clone(),
+                        )
+                    })
+                    .collect();
+                settings::agents::acknowledge_policy_repairs(&mut drafts, &saved.settings.agents);
+                for (&provider, draft) in &mut self.settings_draft.agents {
+                    draft.configuration = drafts
+                        .remove(settings::agents::provider_key(provider))
+                        .unwrap_or_default();
+                    draft.launch_error = draft.configuration.validate_syntax(provider).err();
+                }
+                settings::agents::complete_policy_repairs(&mut saved.settings.agents);
+            }
             self.settings_ack_generation = saved.generation;
             let previous = std::mem::replace(&mut self.settings_base, saved.settings);
             self.settings_path = Some(saved.path);
@@ -16614,6 +16666,14 @@ impl Application for Cagents {
             }
             Message::DetectAgentExecutable(provider) => {
                 let draft = self.settings_draft.agents.entry(provider).or_default();
+                if let Err(reason) = draft.configuration.validate_readable_execution(provider) {
+                    self.settings_invalid.insert(
+                        SettingsField::Agent(provider, AgentSetting::Executable),
+                        reason,
+                    );
+                    self.refresh_settings_feedback();
+                    return Task::none();
+                }
                 // A new request, edited execution input, or replaced draft
                 // invalidates old discovery even when its text later matches.
                 draft.executable_revision = uuid::Uuid::new_v4();
@@ -16642,6 +16702,47 @@ impl Application for Cagents {
                         result,
                     }
                 })
+            }
+            Message::RepairUnreadableAgentPolicy { provider, observed } => {
+                let previous = self.settings.clone();
+                if !settings::agents::repair_unreadable_policy(
+                    &mut self.settings.agents,
+                    provider,
+                    &observed,
+                ) {
+                    return Task::none();
+                }
+                for (&candidate, draft) in &mut self.settings_draft.agents {
+                    if observed.all_providers() || candidate == provider {
+                        let mut configuration = std::collections::BTreeMap::from([(
+                            settings::agents::provider_key(candidate).into(),
+                            draft.configuration.clone(),
+                        )]);
+                        settings::agents::repair_unreadable_policy(
+                            &mut configuration,
+                            candidate,
+                            &observed,
+                        );
+                        draft.configuration = configuration
+                            .remove(settings::agents::provider_key(candidate))
+                            .unwrap_or_default();
+                        draft.launch_error = draft.configuration.validate_syntax(candidate).err();
+                    }
+                }
+                self.settings_pending.retain(|field, _| {
+                    !matches!(field, SettingsField::Agent(candidate, field)
+                    if (observed.all_providers() || *candidate == provider)
+                        && observed.field().is_none_or(|key| field.key() == key))
+                });
+                self.settings_invalid.retain(|field, _| {
+                    !matches!(field, SettingsField::Agent(candidate, field)
+                    if (observed.all_providers() || *candidate == provider)
+                        && observed.field().is_none_or(|key| field.key() == key))
+                });
+                let save = self.save_settings_task(false);
+                self.refresh_settings_feedback();
+                let effect = self.synchronize_settings(&previous);
+                Task::batch([save, effect])
             }
             Message::AgentExecutableDetected {
                 provider,
@@ -16698,6 +16799,22 @@ impl Application for Cagents {
                 owner,
                 edit,
             } => {
+                let field = match &edit {
+                    AgentListEdit::Argument { .. }
+                    | AgentListEdit::RemoveArgument(_)
+                    | AgentListEdit::AddArgument => AgentSetting::Arguments,
+                    _ => AgentSetting::Environment,
+                };
+                if self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .is_some_and(|draft| {
+                        unreadable_agent_edit(&draft.configuration, provider, field).is_some()
+                    })
+                {
+                    return Task::none();
+                }
                 let change = self
                     .settings_draft
                     .agents
@@ -20402,6 +20519,160 @@ mod tests {
             assert_eq!(app.settings_save_generation, generation);
             assert!(app.settings_invalid.is_empty());
         }
+    }
+
+    #[test]
+    fn unreadable_agent_repair_stays_refused_through_failed_save_until_exact_acknowledgment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let original = "schema_version = 3\n[agents.claude]\nexecutable = \"/bin/sh\"\narguments = [\"--prefix\", 7, \"--suffix\"]\nenvironment = { KEEP = \"kept-value\" }\n[agents.codex]\narguments = [\"--sibling\"]\n";
+        std::fs::write(&path, original).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let mut app = context_inspector_test_app(false);
+        app.settings = settings::load(&path).unwrap();
+        app.settings_base = app.settings.clone();
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        let observed = app.settings.agents["claude"]
+            .unreadable_field("arguments")
+            .unwrap();
+        assert!(matches!(
+            settings_update_syntax(
+                &app.settings,
+                SettingsField::Agent(provider, AgentSetting::Arguments),
+                "[]"
+            ),
+            SettingsDecision::Invalid(_)
+        ));
+        let draft = app.settings_draft.agents[&provider].clone();
+        drop(app.update(Message::AgentListEdited {
+            provider,
+            owner: draft.argument_owner,
+            edit: AgentListEdit::AddArgument,
+        }));
+        assert_eq!(app.settings_draft.agents[&provider], draft);
+        let detect = settings::agents::without_executable_checks(|| {
+            app.update(Message::DetectAgentExecutable(provider))
+        });
+        assert!(
+            iced::runtime::task::into_stream(detect).is_none(),
+            "refuse before any discovery task is created"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        // Drop the task without polling it: the live reducer has requested a
+        // repair, but no save worker or provider process has run yet.
+        drop(app.update(Message::RepairUnreadableAgentPolicy {
+            provider,
+            observed: observed.clone(),
+        }));
+        assert!(
+            app.settings.agents["claude"]
+                .validate_execution(provider)
+                .is_err()
+        );
+        assert!(
+            app.settings_draft.agents[&provider]
+                .configuration
+                .resolve_executable(provider, None)
+                .is_err()
+        );
+        let mut failed = app.capture_settings_save().unwrap();
+        let failed_generation = failed.generation;
+        failed.path = directory.path().to_owned();
+        assert!(failed.run().is_err());
+        drop(app.update(Message::SettingsSaved {
+            generation: failed_generation,
+            result: Err("fixture write refused".into()),
+        }));
+        assert!(
+            app.settings.agents["claude"]
+                .validate_execution(provider)
+                .is_err()
+        );
+        assert!(
+            app.settings_base.agents["claude"]
+                .validate_execution(provider)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        // The same request can retry, preserving both valid argument entries.
+        drop(app.update(Message::RepairUnreadableAgentPolicy { provider, observed }));
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        let persisted = settings::load(&path).unwrap();
+        persisted.agents["claude"]
+            .validate_execution(provider)
+            .unwrap();
+        assert_eq!(
+            persisted.agents["claude"].arguments,
+            ["--prefix", "--suffix"]
+        );
+        assert_eq!(persisted.agents["claude"].environment["KEEP"], "kept-value");
+        assert_eq!(persisted.agents["codex"].arguments, ["--sibling"]);
+        assert!(
+            app.settings.agents["claude"]
+                .validate_execution(provider)
+                .is_err(),
+            "writing alone is not a live acknowledgement"
+        );
+        // An acknowledgement must leave unrelated later edits in place.
+        app.settings.terminal_font_size = 23.0;
+        app.settings.agents.get_mut("claude").unwrap().model = Some("later-model".into());
+        app.settings_draft
+            .agents
+            .get_mut(&provider)
+            .unwrap()
+            .configuration
+            .model = Some("later-draft".into());
+        app.acknowledge_settings_save(saved.clone());
+        app.settings.agents["claude"]
+            .validate_execution(provider)
+            .unwrap();
+        app.settings_base.agents["claude"]
+            .validate_execution(provider)
+            .unwrap();
+        assert!(
+            app.settings_draft.agents[&provider]
+                .configuration
+                .resolve_executable(provider, None)
+                .is_ok()
+        );
+        assert_eq!(app.settings.terminal_font_size, 23.0);
+        assert_eq!(
+            app.settings.agents["claude"].model.as_deref(),
+            Some("later-model")
+        );
+        assert_eq!(
+            app.settings_draft.agents[&provider]
+                .configuration
+                .model
+                .as_deref(),
+            Some("later-draft")
+        );
+        // The lane keeps an acknowledged intent as its merge baseline. Its
+        // next ordinary save must not revive raw evidence or demand a reset.
+        app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(
+            settings::load(&path).unwrap().agents["claude"]
+                .model
+                .as_deref(),
+            Some("later-model")
+        );
+        let newer_raw = "schema_version = 3\n[agents.claude]\narguments = [false, \"--new\"]\n";
+        std::fs::write(&path, newer_raw).unwrap();
+        app.settings = settings::load(&path).unwrap();
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        app.settings_ack_generation = saved.generation + 1;
+        let before = app.settings.clone();
+        let draft_before = app.settings_draft.clone();
+        assert!(!app.acknowledge_settings_save(saved));
+        assert_eq!(app.settings, before);
+        assert_eq!(app.settings_draft, draft_before);
+        assert!(
+            app.settings.agents["claude"]
+                .validate_execution(provider)
+                .is_err()
+        );
     }
 
     #[test]

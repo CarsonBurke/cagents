@@ -178,6 +178,45 @@ fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a
         .into()
 }
 
+fn repair_control<'a>(
+    provider: Provider,
+    configuration: &settings::AgentLaunchSettings,
+    observed: settings::agents::UnreadablePolicyReset,
+    title: &'static str,
+    action: String,
+    detail: &'static str,
+    feedback: Option<&SettingsFeedback>,
+) -> Setting<'a, Message> {
+    let pending = configuration.repair_requested(&observed);
+    let failed = matches!(feedback, Some(SettingsFeedback::Error(_)));
+    let label = if pending && !failed {
+        "Saving repair…".into()
+    } else if pending {
+        format!("Retry: {action}")
+    } else {
+        action
+    };
+    let id = widget::Id::new(format!(
+        "settings.agent-repair.{}.{}",
+        settings::agents::provider_key(provider),
+        observed.field().unwrap_or("container")
+    ));
+    let control = widget::button::custom(
+        design::heading(label.clone())
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill),
+    )
+    .name(label)
+    .id(id)
+    .class(cosmic::theme::Button::Destructive)
+    .padding([space::S, space::M])
+    .width(Length::Fill)
+    .on_press_maybe(
+        (!pending || failed).then_some(Message::RepairUnreadableAgentPolicy { provider, observed }),
+    );
+    setting_field(title, detail, control.into())
+}
+
 pub(super) fn controls<'a>(
     draft: &'a SettingsDraft,
     context: &SettingsContext<'a>,
@@ -203,12 +242,36 @@ pub(super) fn controls<'a>(
             })),
         ],
     )];
+    if let Some((provider, entry, observed)) = draft.agents.iter().find_map(|(&provider, entry)| {
+        entry
+            .configuration
+            .unreadable_container()
+            .filter(settings::agents::UnreadablePolicyReset::all_providers)
+            .map(|observed| (provider, entry, observed))
+    }) {
+        groups.push(settings_group("Provider preferences", "Provider discovery and new conversations are unavailable until this section is repaired.", vec![repair_control(
+            provider, &entry.configuration, observed, "Unreadable provider preferences",
+            "Reset unreadable provider preferences".into(),
+            "Reset only provider preferences to defaults: detected executables, no extra arguments or environment overrides, and automatic conversation defaults. Other app settings, accounts and existing conversations stay saved. Provider operations remain unavailable until the repair is saved.",
+            context.feedback,
+        )]));
+        return groups;
+    }
     for provider in Provider::ALL {
         let entry = draft
             .agents
             .get(&provider)
             .expect("all provider drafts exist");
         let configuration = &entry.configuration;
+        if let Some(observed) = configuration.unreadable_container() {
+            groups.push(settings_group(provider.label(), "Provider discovery and new conversations are unavailable until these preferences are repaired.", vec![repair_control(
+                provider, configuration, observed, "Unreadable provider preferences",
+                format!("Reset unreadable {} preferences", provider.label()),
+                "Reset only this provider to a detected executable, no extra arguments or environment overrides, and automatic conversation defaults. Other providers, app settings, accounts and existing conversations stay saved. Provider operations remain unavailable until the repair is saved.",
+                context.feedback,
+            )]));
+            continue;
+        }
 
         let models = context
             .agent_models
@@ -235,6 +298,8 @@ pub(super) fn controls<'a>(
                 "Repair these preferences before starting a new conversation.",
                 design::caption(reason)
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
                     .into(),
             ));
         }
@@ -258,28 +323,45 @@ pub(super) fn controls<'a>(
                 modes.iter().map(|mode| (*mode).into()),
             ));
         }
-        let executable = widget::row::with_children(vec![
-            crate::ui_controls::field::text(
-                "Use detected provider CLI",
-                configuration.executable.as_deref().unwrap_or(""),
-            )
-            .on_input(move |value| Message::SettingsDraftChanged {
-                field: SettingsField::Agent(provider, AgentSetting::Executable),
-                value,
-            })
-            .width(Length::Fill)
-            .into(),
-            crate::ui_controls::button::secondary("Detect")
-                .on_press(Message::DetectAgentExecutable(provider))
+        if let Some(observed) = configuration.unreadable_field("executable") {
+            options.push(repair_control(provider, configuration, observed, "Unreadable executable pin", "Use detected executable".into(), "Reset this unreadable saved executable pin. After the repair is saved, discovery and future launches may use the provider executable on PATH. Other launch preferences stay saved.", context.feedback));
+        } else {
+            let executable = widget::row::with_children(vec![
+                crate::ui_controls::field::text(
+                    "Use detected provider CLI",
+                    configuration.executable.as_deref().unwrap_or(""),
+                )
+                .on_input(move |value| Message::SettingsDraftChanged {
+                    field: SettingsField::Agent(provider, AgentSetting::Executable),
+                    value,
+                })
+                .width(Length::Fill)
                 .into(),
-        ])
-        .spacing(space::S)
-        .align_y(Alignment::Center);
-        options.push(setting_field("Executable", "Use an absolute path to a provider binary or wrapper. Detect searches the provider's configured PATH, or the shell PATH when absent, without starting the provider.", executable.into()).error(context.invalid.get(&field(AgentSetting::Executable)).map(String::as_str)).keywords(format!("agents.{}.executable", settings::agents::provider_key(provider))).keywords(configuration.executable.as_deref().unwrap_or("")));
+                crate::ui_controls::button::secondary("Detect")
+                    .on_press_maybe(
+                        configuration
+                            .validate_readable_execution(provider)
+                            .is_ok()
+                            .then_some(Message::DetectAgentExecutable(provider)),
+                    )
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            options.push(setting_field("Executable", "Use an absolute path to a provider binary or wrapper. Detect searches the provider's configured PATH, or the shell PATH when absent, without starting the provider.", executable.into()).error(context.invalid.get(&field(AgentSetting::Executable)).map(String::as_str)).keywords(format!("agents.{}.executable", settings::agents::provider_key(provider))).keywords(configuration.executable.as_deref().unwrap_or("")));
+        }
 
-        options.push(setting_field("Extra arguments", "One argument per row, in launch order. Spaces stay inside the argument; no shell parsing is performed.", argument_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Arguments)).map(String::as_str)).keywords(format!("agents.{}.arguments", settings::agents::provider_key(provider))).keywords(configuration.arguments.join(" ")));
+        if let Some(observed) = configuration.unreadable_field("arguments") {
+            options.push(repair_control(provider, configuration, observed, "Unreadable extra arguments", "Remove unreadable arguments".into(), "Remove only arguments that cannot be read. Valid saved arguments stay in their original order and can be edited after repair. Other launch preferences stay saved. Provider operations remain unavailable until the repair is saved.", context.feedback));
+        } else {
+            options.push(setting_field("Extra arguments", "One argument per row, in launch order. Spaces stay inside the argument; no shell parsing is performed.", argument_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Arguments)).map(String::as_str)).keywords(format!("agents.{}.arguments", settings::agents::provider_key(provider))).keywords(configuration.arguments.join(" ")));
+        }
 
-        options.push(setting_field("Environment", "Values are masked. Account home and credential isolation variables cannot be overridden. Changes apply to future launches.", environment_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Environment)).map(String::as_str)).keywords(format!("agents.{}.environment variables", settings::agents::provider_key(provider))).keywords(entry.environment.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ")));
+        if let Some(observed) = configuration.unreadable_field("environment") {
+            options.push(repair_control(provider, configuration, observed, "Unreadable environment entries", "Remove unreadable environment entries".into(), "Remove only environment entries that cannot be read. Valid saved names and values stay saved and can be edited after repair. Other launch preferences stay saved. Provider operations remain unavailable until the repair is saved.", context.feedback));
+        } else {
+            options.push(setting_field("Environment", "Values are masked. Account home and credential isolation variables cannot be overridden. Changes apply to future launches.", environment_rows(provider, entry)).error(context.invalid.get(&field(AgentSetting::Environment)).map(String::as_str)).keywords(format!("agents.{}.environment variables", settings::agents::provider_key(provider))).keywords(entry.environment.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ")));
+        }
         groups.push(settings_group(provider.label(), "Provider defaults and launch options. Existing conversations keep their recorded recipe.", options));
     }
     groups

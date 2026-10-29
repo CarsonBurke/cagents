@@ -1,10 +1,14 @@
 //! Provider launch preferences shared by the CLI, daemon and native composer.
 use crate::{agent::Provider, model::LaunchRecipe};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::CString,
+    os::unix::ffi::OsStrExt,
+    path::Path,
+};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AgentLaunchSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -12,6 +16,515 @@ pub struct AgentLaunchSettings {
     pub executable: Option<String>,
     pub arguments: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    pub(crate) unreadable_execution: UnreadableExecution,
+}
+
+impl std::fmt::Debug for AgentLaunchSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentLaunchSettings")
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("permission_mode", &self.permission_mode)
+            .field("executable", &self.executable)
+            .field("arguments", &"<redacted>")
+            .field("environment", &"<redacted>")
+            .field("unreadable_execution", &self.unreadable_execution)
+            .finish()
+    }
+}
+
+/// Retain unreadable execution leaves under their original saved keys. A
+/// string envelope also gives NaN and other TOML values stable equality.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct UnreadableExecution(
+    BTreeMap<String, String>,
+    Option<UnreadablePolicyReset>,
+    BTreeSet<String>,
+);
+
+impl std::fmt::Debug for UnreadableExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnreadableExecution")
+            .field("fields", &self.0.keys().collect::<Vec<_>>())
+            .field("container", &self.1)
+            .field("repairs", &self.2)
+            .finish()
+    }
+}
+
+/// An exact observed container, carried only by a local Settings action.
+/// Its original value is private and never appears in messages or feedback.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnreadablePolicyReset {
+    all_providers: bool,
+    field: Option<String>,
+    document: String,
+}
+
+impl std::fmt::Debug for UnreadablePolicyReset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnreadablePolicyReset")
+            .field("all_providers", &self.all_providers)
+            .field("field", &self.field)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UnreadablePolicyReset {
+    pub(crate) fn all_providers(&self) -> bool {
+        self.all_providers
+    }
+
+    pub(crate) fn field(&self) -> Option<&str> {
+        self.field.as_deref()
+    }
+
+    fn value(&self) -> Result<toml::Value, toml::de::Error> {
+        Ok(toml::from_str::<toml::Table>(&self.document)?
+            .remove("value")
+            .expect("internally retained value"))
+    }
+}
+
+pub(super) struct UnreadableAgentContainers(Vec<(String, UnreadablePolicyReset)>);
+
+impl UnreadableAgentContainers {
+    pub(super) fn restore(self, settings: &mut BTreeMap<String, AgentLaunchSettings>) {
+        for (provider, container) in self.0 {
+            settings.entry(provider).or_default().unreadable_execution.1 = Some(container);
+        }
+    }
+}
+
+/// Decode unreadable containers without inferring any launch policy from them.
+/// Nonexecution fields inside valid tables still use ordinary granular fallback.
+pub(super) fn retain_unreadable_containers(
+    table: &mut toml::Table,
+) -> Result<UnreadableAgentContainers, toml::ser::Error> {
+    let mut retained = Vec::new();
+    if let Some(agents) = table.get_mut("agents") {
+        if let Some(agents) = agents.as_table_mut() {
+            for provider in Provider::ALL {
+                let key = provider_key(provider);
+                if let Some(value) = agents.get_mut(key)
+                    && !value.is_table()
+                {
+                    retained.push((
+                        key.into(),
+                        UnreadablePolicyReset {
+                            all_providers: false,
+                            field: None,
+                            document: toml::to_string(&BTreeMap::from([("value", value.clone())]))?,
+                        },
+                    ));
+                    *value = toml::Value::Table(toml::Table::new());
+                }
+            }
+        } else {
+            let container = UnreadablePolicyReset {
+                all_providers: true,
+                field: None,
+                document: toml::to_string(&BTreeMap::from([("value", agents.clone())]))?,
+            };
+            *agents = toml::Value::Table(toml::Table::new());
+            for provider in Provider::ALL {
+                retained.push((provider_key(provider).into(), container.clone()));
+            }
+        }
+    }
+    Ok(UnreadableAgentContainers(retained))
+}
+
+pub(super) fn serialize_provider_settings<S: serde::Serializer>(
+    settings: &BTreeMap<String, AgentLaunchSettings>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if let Some(container) = settings
+        .values()
+        .filter_map(AgentLaunchSettings::unreadable_container)
+        .find(UnreadablePolicyReset::all_providers)
+    {
+        if !settings
+            .values()
+            .all(|configuration| configuration.unreadable_execution.1.as_ref() == Some(&container))
+        {
+            return Err(serde::ser::Error::custom(
+                "Reset the unreadable provider preferences before editing this section.",
+            ));
+        }
+        if settings
+            .values()
+            .all(AgentLaunchSettings::container_repair_requested)
+        {
+            return BTreeMap::<String, AgentLaunchSettings>::new().serialize(serializer);
+        }
+        if settings
+            .values()
+            .any(AgentLaunchSettings::container_repair_requested)
+        {
+            return Err(serde::ser::Error::custom(
+                "The provider preference repair is incomplete.",
+            ));
+        }
+        return container
+            .value()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer);
+    }
+    settings.serialize(serializer)
+}
+
+pub(crate) fn repair_unreadable_policy(
+    settings: &mut BTreeMap<String, AgentLaunchSettings>,
+    provider: Provider,
+    observed: &UnreadablePolicyReset,
+) -> bool {
+    if let Some(field) = observed.field() {
+        let Some(configuration) = settings.get_mut(provider_key(provider)) else {
+            return false;
+        };
+        if configuration.unreadable_container().is_some()
+            || configuration.unreadable_field(field).as_ref() != Some(observed)
+        {
+            return false;
+        }
+        match field {
+            "executable" => configuration.set_executable(None),
+            "arguments" => configuration.set_arguments(configuration.arguments.clone()),
+            "environment" => configuration.set_environment(configuration.environment.clone()),
+            _ => return false,
+        }
+        return true;
+    }
+    if settings
+        .get(provider_key(provider))
+        .and_then(AgentLaunchSettings::unreadable_container)
+        .as_ref()
+        != Some(observed)
+    {
+        return false;
+    }
+    if observed.all_providers {
+        if !settings
+            .values()
+            .all(|configuration| configuration.unreadable_execution.1.as_ref() == Some(observed))
+        {
+            return false;
+        }
+        for configuration in settings.values_mut() {
+            configuration
+                .unreadable_execution
+                .2
+                .insert("container".into());
+        }
+    } else {
+        settings
+            .get_mut(provider_key(provider))
+            .expect("observed provider")
+            .unreadable_execution
+            .2
+            .insert("container".into());
+    }
+    true
+}
+
+pub(crate) fn has_policy_repairs(settings: &BTreeMap<String, AgentLaunchSettings>) -> bool {
+    settings
+        .values()
+        .any(|configuration| !configuration.unreadable_execution.2.is_empty())
+}
+
+fn same_field(left: &AgentLaunchSettings, right: &AgentLaunchSettings, field: &str) -> bool {
+    match field {
+        "executable" => left.executable == right.executable,
+        "arguments" => left.arguments == right.arguments,
+        "environment" => left.environment == right.environment,
+        _ => false,
+    }
+}
+
+/// Confirm only the repaired scope; unrelated concurrent preferences may
+/// legitimately differ from this window's captured desired settings.
+pub(crate) fn confirm_policy_repairs(
+    requested: &BTreeMap<String, AgentLaunchSettings>,
+    persisted: &BTreeMap<String, AgentLaunchSettings>,
+) -> Result<(), String> {
+    for (provider, configuration) in requested {
+        if configuration.container_repair_requested() {
+            let observed = configuration
+                .unreadable_execution
+                .1
+                .as_ref()
+                .expect("requested container");
+            if observed.all_providers {
+                if !persisted.is_empty() {
+                    return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+                }
+            } else if persisted.get(provider) != Some(&AgentLaunchSettings::default()) {
+                return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+            }
+        }
+        for field in &configuration.unreadable_execution.2 {
+            if field == "container" {
+                continue;
+            }
+            if persisted.get(provider).is_none_or(|current| {
+                current.unreadable_container().is_some()
+                    || current.unreadable_field(field).is_some()
+                    || !same_field(configuration, current, field)
+            }) {
+                return Err("Provider preference repair changed before it could be acknowledged. Reopen Agents settings.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Complete only an acknowledged repair of the same raw evidence and value.
+/// A newer edit or newly observed unreadable policy keeps its own refusal.
+pub(crate) fn acknowledge_policy_repairs(
+    current: &mut BTreeMap<String, AgentLaunchSettings>,
+    accepted: &BTreeMap<String, AgentLaunchSettings>,
+) {
+    if accepted.values().any(|configuration| {
+        configuration.container_repair_requested()
+            && configuration
+                .unreadable_execution
+                .1
+                .as_ref()
+                .is_some_and(UnreadablePolicyReset::all_providers)
+    }) {
+        if current == accepted {
+            current.clear();
+        }
+        return;
+    }
+    for (provider, accepted) in accepted {
+        let Some(configuration) = current.get_mut(provider) else {
+            continue;
+        };
+        if accepted.container_repair_requested() && configuration == accepted {
+            configuration.unreadable_execution.1 = None;
+            configuration.unreadable_execution.2.remove("container");
+        }
+        for field in &accepted.unreadable_execution.2 {
+            if field != "container"
+                && configuration.unreadable_execution.2.contains(field)
+                && configuration.unreadable_execution.0.get(field)
+                    == accepted.unreadable_execution.0.get(field)
+                && same_field(configuration, accepted, field)
+            {
+                configuration.unreadable_execution.0.remove(field);
+                configuration.unreadable_execution.2.remove(field);
+            }
+        }
+    }
+}
+
+pub(crate) fn complete_policy_repairs(settings: &mut BTreeMap<String, AgentLaunchSettings>) {
+    let accepted = settings.clone();
+    acknowledge_policy_repairs(settings, &accepted);
+}
+
+/// An old window may edit other preferences, but cannot replace a newly
+/// unreadable container or apply a reset after that exact container changed.
+pub(super) fn validate_container_repairs(
+    base: &BTreeMap<String, AgentLaunchSettings>,
+    desired: &BTreeMap<String, AgentLaunchSettings>,
+    current: &BTreeMap<String, AgentLaunchSettings>,
+) -> Result<(), String> {
+    let global = |settings: &BTreeMap<String, AgentLaunchSettings>| {
+        settings
+            .values()
+            .filter_map(AgentLaunchSettings::stored_unreadable_container)
+            .find(UnreadablePolicyReset::all_providers)
+    };
+    let (base_global, current_global) = (global(base), global(current));
+    if (base_global.is_some() || current_global.is_some()) && base != desired {
+        let requested = base_global.as_ref().is_some_and(|observed| {
+            desired.values().all(|configuration| {
+                configuration.unreadable_execution.1.as_ref() == Some(observed)
+                    && configuration.container_repair_requested()
+            })
+        });
+        if base_global.is_none()
+            || base_global != current_global
+            || (!desired.is_empty() && !requested)
+        {
+            return Err("Provider preferences changed or are unreadable. Reopen Agents settings before resetting this section.".into());
+        }
+        return Ok(());
+    }
+    for provider in Provider::ALL {
+        let key = provider_key(provider);
+        if base.get(key) == desired.get(key) {
+            continue;
+        }
+        let base_container = base
+            .get(key)
+            .and_then(AgentLaunchSettings::stored_unreadable_container);
+        let current_container = current
+            .get(key)
+            .and_then(AgentLaunchSettings::stored_unreadable_container);
+        let requested = desired.get(key).is_some_and(|configuration| {
+            configuration.container_repair_requested()
+                && configuration.unreadable_execution.1 == base_container
+        });
+        if (base_container.is_some() || current_container.is_some())
+            && (base_container.is_none()
+                || base_container != current_container
+                || (desired.contains_key(key) && !requested))
+        {
+            return Err(format!(
+                "{} preferences changed or are unreadable. Reopen Agents settings before resetting this provider.",
+                provider.label()
+            ));
+        }
+        let empty = AgentLaunchSettings::default();
+        let base = base.get(key).unwrap_or(&empty);
+        let desired = desired.get(key).unwrap_or(&empty);
+        let current = current.get(key).unwrap_or(&empty);
+        let base_value = toml::Value::try_from(base).map_err(|error| error.to_string())?;
+        let desired_value = toml::Value::try_from(desired).map_err(|error| error.to_string())?;
+        for field in ["executable", "arguments", "environment"] {
+            let observed = base.stored_unreadable_field(field);
+            let actual = current.stored_unreadable_field(field);
+            if (observed.is_some() || actual.is_some())
+                && base_value.get(field) != desired_value.get(field)
+                && (observed.is_none() || observed != actual)
+            {
+                return Err(format!(
+                    "{} saved {field} changed or is unreadable. Reopen Agents settings before repairing it.",
+                    provider.label()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedAgentLaunchSettings {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+    executable: Option<toml::Value>,
+    arguments: Option<toml::Value>,
+    environment: Option<toml::Value>,
+}
+
+impl UnreadableExecution {
+    fn decode<T: serde::de::DeserializeOwned + Default>(
+        &mut self,
+        field: &str,
+        value: Option<toml::Value>,
+        retained_entries: T,
+    ) -> Result<T, toml::ser::Error> {
+        let Some(value) = value else {
+            return Ok(T::default());
+        };
+        if let Ok(decoded) = value.clone().try_into::<T>() {
+            return Ok(decoded);
+        }
+        self.0.insert(
+            field.into(),
+            toml::to_string(&BTreeMap::from([("value", value)]))?,
+        );
+        Ok(retained_entries)
+    }
+
+    fn saved(
+        &self,
+        field: &str,
+        fallback: Option<toml::Value>,
+    ) -> Result<Option<toml::Value>, toml::de::Error> {
+        match self.0.get(field).filter(|_| !self.2.contains(field)) {
+            Some(document) => Ok(toml::from_str::<toml::Table>(document)?.remove("value")),
+            None => Ok(fallback),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentLaunchSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let saved = SavedAgentLaunchSettings::deserialize(deserializer)?;
+        let arguments = saved
+            .arguments
+            .as_ref()
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let environment = saved
+            .environment
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.into())))
+            .collect::<BTreeMap<_, _>>();
+        let mut unreadable_execution = UnreadableExecution::default();
+        Ok(Self {
+            model: saved.model,
+            effort: saved.effort,
+            permission_mode: saved.permission_mode,
+            executable: unreadable_execution
+                .decode("executable", saved.executable, None)
+                .map_err(serde::de::Error::custom)?,
+            arguments: unreadable_execution
+                .decode("arguments", saved.arguments, arguments)
+                .map_err(serde::de::Error::custom)?,
+            environment: unreadable_execution
+                .decode("environment", saved.environment, environment)
+                .map_err(serde::de::Error::custom)?,
+            unreadable_execution,
+        })
+    }
+}
+
+impl Serialize for AgentLaunchSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(container) = &self.unreadable_execution.1
+            && !self.container_repair_requested()
+        {
+            return container
+                .value()
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer);
+        }
+        let executable = self
+            .unreadable_execution
+            .saved(
+                "executable",
+                self.executable.clone().map(toml::Value::String),
+            )
+            .map_err(serde::ser::Error::custom)?;
+        let arguments =
+            toml::Value::try_from(&self.arguments).map_err(serde::ser::Error::custom)?;
+        let environment =
+            toml::Value::try_from(&self.environment).map_err(serde::ser::Error::custom)?;
+        SavedAgentLaunchSettings {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            permission_mode: self.permission_mode.clone(),
+            executable,
+            arguments: self
+                .unreadable_execution
+                .saved("arguments", Some(arguments))
+                .map_err(serde::ser::Error::custom)?,
+            environment: self
+                .unreadable_execution
+                .saved("environment", Some(environment))
+                .map_err(serde::ser::Error::custom)?,
+        }
+        .serialize(serializer)
+    }
 }
 
 pub fn provider_key(provider: Provider) -> &'static str {
@@ -136,11 +649,105 @@ pub fn environment_reserved(provider: Provider, name: &str) -> bool {
 }
 
 impl AgentLaunchSettings {
+    pub(crate) fn unreadable_container(&self) -> Option<UnreadablePolicyReset> {
+        self.unreadable_execution.1.clone()
+    }
+
+    pub(crate) fn unreadable_field(&self, field: &str) -> Option<UnreadablePolicyReset> {
+        self.unreadable_execution
+            .0
+            .get(field)
+            .map(|document| UnreadablePolicyReset {
+                all_providers: false,
+                field: Some(field.into()),
+                document: document.clone(),
+            })
+    }
+
+    pub(crate) fn repair_requested(&self, observed: &UnreadablePolicyReset) -> bool {
+        self.unreadable_execution
+            .2
+            .contains(observed.field().unwrap_or("container"))
+    }
+
+    fn container_repair_requested(&self) -> bool {
+        self.unreadable_execution.2.contains("container")
+    }
+
+    fn stored_unreadable_container(&self) -> Option<UnreadablePolicyReset> {
+        (!self.container_repair_requested())
+            .then(|| self.unreadable_container())
+            .flatten()
+    }
+
+    fn stored_unreadable_field(&self, field: &str) -> Option<&String> {
+        self.unreadable_execution
+            .0
+            .get(field)
+            .filter(|_| !self.unreadable_execution.2.contains(field))
+    }
     /// Conversation presets do not change the CLI used for account metadata.
     pub(crate) fn same_execution_policy(&self, other: &Self) -> bool {
         self.executable == other.executable
             && self.arguments == other.arguments
             && self.environment == other.environment
+            && self.unreadable_execution == other.unreadable_execution
+    }
+
+    /// Replacing a control explicitly repairs only that execution leaf.
+    /// Leaving its value blank is an explicit choice of the default too.
+    pub fn set_executable(&mut self, executable: Option<String>) {
+        if self.unreadable_execution.0.contains_key("executable") {
+            self.unreadable_execution.2.insert("executable".into());
+        }
+        self.executable = executable;
+    }
+
+    pub fn set_arguments(&mut self, arguments: Vec<String>) {
+        if self.unreadable_execution.0.contains_key("arguments") {
+            self.unreadable_execution.2.insert("arguments".into());
+        }
+        self.arguments = arguments;
+    }
+
+    pub fn set_environment(&mut self, environment: BTreeMap<String, String>) {
+        if self.unreadable_execution.0.contains_key("environment") {
+            self.unreadable_execution.2.insert("environment".into());
+        }
+        self.environment = environment;
+    }
+
+    pub(crate) fn validate_readable_execution(&self, provider: Provider) -> Result<(), String> {
+        if !self.unreadable_execution.2.is_empty() {
+            return Err(format!(
+                "{} preference repair is not acknowledged yet. Save the repair before launching or discovering this provider.",
+                provider.label()
+            ));
+        }
+        if let Some(container) = &self.unreadable_execution.1 {
+            return Err(if container.all_providers {
+                "Saved provider preferences could not be read. Reset the unreadable provider preferences in Agents settings before launching or discovering providers.".into()
+            } else {
+                format!(
+                    "{} saved preferences could not be read. Reset this provider's unreadable preferences in Agents settings before launching or discovering it.",
+                    provider.label()
+                )
+            });
+        }
+        if self.unreadable_execution.0.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} saved {} could not be read. Repair these fields in Agents settings before launching or discovering this provider.",
+                provider.label(),
+                self.unreadable_execution
+                    .0
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
     }
 
     /// Resolve from this immutable policy capture so probes cannot pair an
@@ -152,6 +759,7 @@ impl AgentLaunchSettings {
         provider: Provider,
         search_path: Option<&std::ffi::OsStr>,
     ) -> Result<std::path::PathBuf, String> {
+        self.validate_readable_execution(provider)?;
         if let Some(executable) = &self.executable {
             if !executable_available(executable) {
                 return Err(format!(
@@ -201,6 +809,7 @@ impl AgentLaunchSettings {
         provider: Provider,
         availability: bool,
     ) -> Result<(), String> {
+        self.validate_readable_execution(provider)?;
         if self.executable.as_deref().is_some_and(|path| {
             if availability {
                 !executable_available(path)
@@ -308,6 +917,13 @@ impl AgentLaunchSettings {
         provider: Provider,
         availability: bool,
     ) -> Result<(), String> {
+        if self.unreadable_execution.1.is_some() && self != previous {
+            let mut requested = previous.clone();
+            requested.unreadable_execution.2.insert("container".into());
+            if self != &requested {
+                return self.validate_readable_execution(provider);
+            }
+        }
         Self {
             model: (self.model != previous.model)
                 .then(|| self.model.clone())
@@ -331,6 +947,7 @@ impl AgentLaunchSettings {
             } else {
                 Default::default()
             },
+            ..Default::default()
         }
         .validate_fields_with_availability(provider, availability)?;
         if self.executable != previous.executable
@@ -502,6 +1119,545 @@ fn remove_config_key(arguments: &mut Vec<String>, key: &str) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn malformed_policy_document(policy: &str) -> String {
+        format!("schema_version = 3\n[agents.claude]\n{policy}\n")
+    }
+
+    #[test]
+    fn unreadable_containers_preserve_scope_and_require_observed_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for all in [false, true] {
+            for raw in [
+                "\"private-raw-policy\"",
+                "[]",
+                "7",
+                "true",
+                "nan",
+                "1979-05-27T07:32:00Z",
+            ] {
+                let original = if all {
+                    format!("schema_version = 3\nagents = {raw}\n")
+                } else {
+                    format!(
+                        "schema_version = 3\n[agents]\nclaude = {raw}\n[agents.codex]\nexecutable = \"/bin/sh\"\narguments = [\"--sibling\"]\nenvironment = {{ KEEP = \"sibling-value\" }}\n"
+                    )
+                };
+                std::fs::write(&path, &original).unwrap();
+                let loaded = super::super::load(&path).unwrap();
+                let observed = loaded.agents["claude"].unreadable_container().unwrap();
+                assert_eq!(observed.all_providers(), all);
+                assert!(!format!("{observed:?}").contains("private-raw-policy"));
+                for provider in Provider::ALL {
+                    let configuration = loaded
+                        .agents
+                        .get(provider_key(provider))
+                        .cloned()
+                        .unwrap_or_default();
+                    assert_eq!(
+                        configuration.validate_execution(provider).is_err(),
+                        all || provider == Provider::Claude
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+                let mut unrelated = loaded.clone();
+                unrelated.terminal_font_size = 21.0;
+                super::super::save_merged(&path, &loaded, &unrelated).unwrap();
+                let retained = super::super::load(&path).unwrap();
+                assert_eq!(retained.agents, loaded.agents);
+                let mut requested = retained.clone();
+                assert!(repair_unreadable_policy(
+                    &mut requested.agents,
+                    Provider::Claude,
+                    &observed
+                ));
+                assert!(
+                    requested.agents["claude"]
+                        .validate_execution(Provider::Claude)
+                        .is_err()
+                );
+                super::super::save_merged(&path, &retained, &requested).unwrap();
+                let repaired = super::super::load(&path).unwrap();
+                assert_eq!(repaired.terminal_font_size, 21.0);
+                if all {
+                    assert!(repaired.agents.is_empty());
+                } else {
+                    assert_eq!(repaired.agents["codex"], loaded.agents["codex"]);
+                    repaired.agents["claude"]
+                        .validate_execution(Provider::Claude)
+                        .unwrap();
+                }
+                // The request remains a refusal until the durable receipt is
+                // acknowledged, even though its canonical bytes now exist.
+                assert!(
+                    requested.agents["claude"]
+                        .validate_execution(Provider::Claude)
+                        .is_err()
+                );
+                confirm_policy_repairs(&requested.agents, &repaired.agents).unwrap();
+                complete_policy_repairs(&mut requested.agents);
+                assert_eq!(requested.agents, repaired.agents);
+                assert!(!repair_unreadable_policy(
+                    &mut requested.agents,
+                    Provider::Claude,
+                    &observed
+                ));
+                // The same captured reset cannot erase a newer valid policy.
+                let replacement = "schema_version = 3\n[agents.claude]\nexecutable = \"/bin/sh\"\narguments = [\"--new-owner\"]\n";
+                std::fs::write(&path, replacement).unwrap();
+                let mut stale_reset = loaded.clone();
+                assert!(repair_unreadable_policy(
+                    &mut stale_reset.agents,
+                    Provider::Claude,
+                    &observed
+                ));
+                assert!(super::super::save_merged(&path, &loaded, &stale_reset).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), replacement.as_bytes());
+                let mut newer = super::super::load(&path).unwrap();
+                assert!(!repair_unreadable_policy(
+                    &mut newer.agents,
+                    Provider::Claude,
+                    &observed
+                ));
+                // Nor can an ordinary old field edit erase a container it
+                // never observed while it was still a valid table.
+                let valid_base = newer.clone();
+                newer
+                    .agents
+                    .get_mut("claude")
+                    .unwrap()
+                    .arguments
+                    .push("--ordinary-edit".into());
+                std::fs::write(&path, &original).unwrap();
+                assert!(super::super::save_merged(&path, &valid_base, &newer).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_execution_leaves_survive_merges_until_each_explicit_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let original = malformed_policy_document(
+            r#"model = "kept-model"
+permission_mode = "plan"
+executable = ["/pinned/wrapper"]
+arguments = ["--prefix", 7, "--suffix"]
+environment = { KEEP = "kept-value", BROKEN = 7 }"#,
+        );
+        std::fs::write(&path, &original).unwrap();
+        let loaded = super::super::load(&path).unwrap();
+        let bad = &loaded.agents["claude"];
+        assert!(bad.validate_execution(Provider::Claude).is_err());
+        assert!(bad.validate_syntax(Provider::Claude).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(bad.model.as_deref(), Some("kept-model"));
+        assert_eq!(bad.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(bad, &bad.clone());
+        assert!(!format!("{bad:?}").contains("kept-value"));
+        assert!(!format!("{bad:?}").contains("/pinned/wrapper"));
+        assert_eq!(
+            serde_json::from_str::<AgentLaunchSettings>(&serde_json::to_string(bad).unwrap())
+                .unwrap(),
+            *bad
+        );
+        let raw = toml::from_str::<toml::Value>(&original).unwrap();
+        let mut unrelated = loaded.clone();
+        unrelated.terminal_font_size = 21.0;
+        super::super::save_merged(&path, &loaded, &unrelated).unwrap();
+        let saved =
+            toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["agents"], raw["agents"]);
+        let mut current = super::super::load(&path).unwrap();
+        let stale = current.clone();
+        let mut repaired = current.clone();
+        repaired
+            .agents
+            .get_mut("claude")
+            .unwrap()
+            .set_executable(None);
+        assert!(!repaired.agents["claude"].same_execution_policy(&current.agents["claude"]));
+        assert!(
+            repaired.agents["claude"]
+                .validate_execution(Provider::Claude)
+                .is_err()
+        );
+        super::super::save_merged(&path, &current, &repaired).unwrap();
+        current = super::super::load(&path).unwrap();
+        assert!(
+            !current.agents["claude"]
+                .unreadable_execution
+                .0
+                .contains_key("executable")
+        );
+        assert_eq!(current.agents["claude"].unreadable_execution.0.len(), 2);
+        // An older window's unrelated edit must not restore the repaired pin.
+        let mut stale_edit = stale.clone();
+        stale_edit.terminal_font_size = 22.0;
+        super::super::save_merged(&path, &stale, &stale_edit).unwrap();
+        assert_eq!(super::super::load(&path).unwrap().agents, current.agents);
+        repaired = current.clone();
+        let observed = repaired.agents["claude"]
+            .unreadable_field("arguments")
+            .unwrap();
+        assert!(repair_unreadable_policy(
+            &mut repaired.agents,
+            Provider::Claude,
+            &observed
+        ));
+        super::super::save_merged(&path, &current, &repaired).unwrap();
+        current = super::super::load(&path).unwrap();
+        assert_eq!(current.agents["claude"].unreadable_execution.0.len(), 1);
+        assert!(
+            current.agents["claude"]
+                .validate_execution(Provider::Claude)
+                .is_err()
+        );
+        repaired = current.clone();
+        let observed = repaired.agents["claude"]
+            .unreadable_field("environment")
+            .unwrap();
+        assert!(repair_unreadable_policy(
+            &mut repaired.agents,
+            Provider::Claude,
+            &observed
+        ));
+        super::super::save_merged(&path, &current, &repaired).unwrap();
+        current = super::super::load(&path).unwrap();
+        current.agents["claude"]
+            .validate_execution(Provider::Claude)
+            .unwrap();
+        assert_eq!(
+            current.agents["claude"].model.as_deref(),
+            Some("kept-model")
+        );
+        assert_eq!(
+            current.agents["claude"].permission_mode.as_deref(),
+            Some("plan")
+        );
+        assert!(current.agents["claude"].executable.is_none());
+        assert_eq!(current.agents["claude"].arguments, ["--prefix", "--suffix"]);
+        assert_eq!(
+            current.agents["claude"].environment,
+            BTreeMap::from([("KEEP".into(), "kept-value".into())])
+        );
+        assert_eq!(current.terminal_font_size, 22.0);
+        let mut invalid = current.clone();
+        invalid.ui_scale = 999.0;
+        let before = std::fs::read(&path).unwrap();
+        assert!(super::super::save_merged(&path, &current, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn unreadable_execution_keeps_nonexecution_fallback_and_nan_equality() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for policy in [
+            "model = [\"unreadable-model\"]\neffort = 7\narguments = [\"--kept\"]\nenvironment = { KEPT = \"value\" }",
+            "model = [\"unreadable-model\"]\neffort = 7\narguments = nan\nenvironment = { KEPT = \"value\" }",
+        ] {
+            let original = malformed_policy_document(policy);
+            std::fs::write(&path, &original).unwrap();
+            let detailed = super::super::load_detailed(&path).unwrap();
+            let configuration = &detailed.settings.agents["claude"];
+            assert!(configuration.model.is_none());
+            assert!(configuration.effort.is_none());
+            assert_eq!(configuration.environment["KEPT"], "value");
+            assert_eq!(configuration, &configuration.clone());
+            assert_eq!(detailed.set_aside().count(), 2);
+            if policy.contains("arguments = nan") {
+                assert!(configuration.validate_execution(Provider::Claude).is_err());
+                let serialized = toml::to_string(configuration).unwrap();
+                assert_eq!(
+                    toml::from_str::<AgentLaunchSettings>(&serialized).unwrap(),
+                    *configuration
+                );
+            } else {
+                assert_eq!(configuration.arguments, ["--kept"]);
+                configuration.validate_execution(Provider::Claude).unwrap();
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn policy_repair_acknowledgments_match_raw_intent_and_persisted_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            malformed_policy_document(
+                "arguments = [\"--before\", 7, \"--after\"]\nenvironment = { KEEP = \"value\" }",
+            ),
+        )
+        .unwrap();
+        let original = super::super::load(&path).unwrap();
+        let observed = original.agents["claude"]
+            .unreadable_field("arguments")
+            .unwrap();
+        let mut requested = original.clone();
+        assert!(repair_unreadable_policy(
+            &mut requested.agents,
+            Provider::Claude,
+            &observed
+        ));
+        assert!(confirm_policy_repairs(&requested.agents, &original.agents).is_err());
+        super::super::save_merged(&path, &original, &requested).unwrap();
+        let persisted = super::super::load(&path).unwrap();
+        confirm_policy_repairs(&requested.agents, &persisted.agents).unwrap();
+        assert!(
+            requested.agents["claude"]
+                .validate_execution(Provider::Claude)
+                .is_err()
+        );
+        let mut wrong_persisted = persisted.clone();
+        wrong_persisted.agents.get_mut("claude").unwrap().arguments = vec!["--different".into()];
+        assert!(confirm_policy_repairs(&requested.agents, &wrong_persisted.agents).is_err());
+        let mut newer_intent = requested.clone();
+        newer_intent
+            .agents
+            .get_mut("claude")
+            .unwrap()
+            .set_arguments(vec!["--new-intent".into()]);
+        let before = newer_intent.clone();
+        acknowledge_policy_repairs(&mut newer_intent.agents, &requested.agents);
+        assert_eq!(newer_intent, before);
+        std::fs::write(
+            &path,
+            malformed_policy_document("arguments = [false, \"--new-raw\"]"),
+        )
+        .unwrap();
+        let mut newer_raw = super::super::load(&path).unwrap();
+        let next_observed = newer_raw.agents["claude"]
+            .unreadable_field("arguments")
+            .unwrap();
+        assert!(!repair_unreadable_policy(
+            &mut newer_raw.agents,
+            Provider::Claude,
+            &observed
+        ));
+        assert!(repair_unreadable_policy(
+            &mut newer_raw.agents,
+            Provider::Claude,
+            &next_observed
+        ));
+        let before = newer_raw.clone();
+        acknowledge_policy_repairs(&mut newer_raw.agents, &requested.agents);
+        assert_eq!(newer_raw, before);
+        let mut current = requested.clone();
+        current.agents.get_mut("claude").unwrap().model = Some("later-model".into());
+        acknowledge_policy_repairs(&mut current.agents, &requested.agents);
+        current.agents["claude"]
+            .validate_execution(Provider::Claude)
+            .unwrap();
+        assert_eq!(
+            current.agents["claude"].model.as_deref(),
+            Some("later-model")
+        );
+        assert_eq!(current.agents["claude"].arguments, ["--before", "--after"]);
+        assert_eq!(current.agents["claude"].environment["KEEP"], "value");
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn unreadable_saved_policy_refuses_launch_and_every_discovery_entrypoint() {
+        const MARKER: &str = "CAGENTS_TEST_UNREADABLE_PROVIDER_POLICY_ROOT";
+        let root = if let Some(root) = std::env::var_os(MARKER) {
+            std::path::PathBuf::from(root)
+        } else {
+            let directory = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "settings::agents::tests::unreadable_saved_policy_refuses_launch_and_every_discovery_entrypoint", "--nocapture", "--test-threads=1"])
+                .env(MARKER, directory.path())
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_STATE_HOME", directory.path().join("state"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let binaries = root.join("bin");
+        std::fs::create_dir(&binaries).unwrap();
+        for provider in Provider::ALL {
+            let binary = binaries.join(provider.executable());
+            std::fs::write(&binary, "#!/bin/sh\nexit 91\n").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = super::super::default_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for provider in Provider::ALL {
+            let binary = binaries.join(provider.executable());
+            for pin in [None, Some(binary.to_str().unwrap())] {
+                let valid = AgentLaunchSettings {
+                    executable: pin.map(str::to_owned),
+                    arguments: vec!["--kept".into()],
+                    environment: BTreeMap::from([("KEPT".into(), "value".into())]),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    valid
+                        .resolve_executable(provider, Some(binaries.as_os_str()))
+                        .unwrap(),
+                    binary
+                );
+                assert!(
+                    crate::account::probe::Cli::configured(
+                        provider,
+                        Some(binaries.as_os_str()),
+                        valid.clone()
+                    )
+                    .is_ok()
+                );
+                let valid_value = toml::Value::try_from(&valid).unwrap();
+                for (field, bad_value) in [
+                    (
+                        "executable",
+                        toml::Value::Array(vec![toml::Value::String("/pinned/wrapper".into())]),
+                    ),
+                    ("arguments", toml::Value::String("--unreadable".into())),
+                    (
+                        "arguments",
+                        toml::Value::Array(vec![
+                            toml::Value::String("--kept".into()),
+                            toml::Value::Integer(7),
+                        ]),
+                    ),
+                    ("environment", toml::Value::Array(vec![])),
+                    (
+                        "environment",
+                        toml::Value::Table(toml::Table::from_iter([(
+                            "KEPT".into(),
+                            toml::Value::Integer(7),
+                        )])),
+                    ),
+                ] {
+                    let mut bad_value_table = valid_value.as_table().unwrap().clone();
+                    bad_value_table.insert(field.into(), bad_value);
+                    let document = toml::to_string(&toml::Table::from_iter([
+                        ("schema_version".into(), toml::Value::Integer(3)),
+                        (
+                            "agents".into(),
+                            toml::Value::Table(toml::Table::from_iter([(
+                                provider_key(provider).into(),
+                                toml::Value::Table(bad_value_table),
+                            )])),
+                        ),
+                    ]))
+                    .unwrap();
+                    std::fs::write(&path, &document).unwrap();
+                    let loaded = super::super::load(&path).unwrap();
+                    let configuration = &loaded.agents[provider_key(provider)];
+                    assert!(
+                        configuration.validate_execution(provider).is_err(),
+                        "{provider:?}/{field}"
+                    );
+                    assert!(
+                        configuration
+                            .resolve_executable(provider, Some(binaries.as_os_str()))
+                            .is_err()
+                    );
+                    assert!(provider_executable(provider, Some(binaries.as_os_str())).is_err());
+                    assert!(
+                        crate::account::probe::Cli::discover(provider, Some(binaries.as_os_str()))
+                            .is_err()
+                    );
+                    assert!(
+                        crate::account::probe::Cli::configured(
+                            provider,
+                            Some(binaries.as_os_str()),
+                            configuration.clone()
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        crate::chat::fresh_session_configured(
+                            provider,
+                            crate::model::TerminalId::new(),
+                            root.clone(),
+                            &crate::account::Account::system(provider),
+                            configuration,
+                            Default::default()
+                        )
+                        .is_err()
+                    );
+                    for sibling in Provider::ALL
+                        .into_iter()
+                        .filter(|candidate| *candidate != provider)
+                    {
+                        assert_eq!(
+                            provider_executable(sibling, Some(binaries.as_os_str())).unwrap(),
+                            binaries.join(sibling.executable())
+                        );
+                    }
+                    assert_eq!(std::fs::read(&path).unwrap(), document.as_bytes());
+                }
+            }
+        }
+        for all in [false, true] {
+            let document = if all {
+                "schema_version = 3\nagents = [\"private-policy\"]\n"
+            } else {
+                "schema_version = 3\n[agents]\nclaude = [\"private-policy\"]\n"
+            };
+            std::fs::write(&path, document).unwrap();
+            let loaded = super::super::load(&path).unwrap();
+            for provider in Provider::ALL {
+                let blocked = all || provider == Provider::Claude;
+                let configuration = loaded
+                    .agents
+                    .get(provider_key(provider))
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(
+                    configuration
+                        .resolve_executable(provider, Some(binaries.as_os_str()))
+                        .is_err(),
+                    blocked
+                );
+                assert_eq!(
+                    provider_executable(provider, Some(binaries.as_os_str())).is_err(),
+                    blocked
+                );
+                assert_eq!(
+                    crate::account::probe::Cli::discover(provider, Some(binaries.as_os_str()))
+                        .is_err(),
+                    blocked
+                );
+                if blocked {
+                    assert!(
+                        crate::chat::fresh_session_configured(
+                            provider,
+                            crate::model::TerminalId::new(),
+                            root.clone(),
+                            &crate::account::Account::system(provider),
+                            &configuration,
+                            Default::default()
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), document.as_bytes());
+        }
+        let missing = AgentLaunchSettings {
+            executable: Some(root.join("missing-pin").to_str().unwrap().into()),
+            ..Default::default()
+        };
+        assert!(
+            missing
+                .resolve_executable(Provider::Claude, Some(binaries.as_os_str()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn ambiguous_provider_path_requires_a_pin_without_blocking_independent_repairs() {
@@ -727,6 +1883,7 @@ mod tests {
             permission_mode: Some("plan".into()),
             arguments: vec!["--fixture".into(), "two words".into()],
             environment: BTreeMap::from([("PROXY_URL".into(), "http://localhost:8080".into())]),
+            ..Default::default()
         };
         let settings = super::super::AppSettings {
             agents: BTreeMap::from([("claude".into(), configuration.clone())]),
@@ -1292,6 +2449,7 @@ mod tests {
             permission_mode: Some("plan".into()),
             arguments: vec!["--fixture-launch".into()],
             environment: BTreeMap::from([("PROXY_URL".into(), "http://localhost:8080".into())]),
+            ..Default::default()
         };
         let session = crate::chat::fresh_session_configured(
             Provider::Claude,
