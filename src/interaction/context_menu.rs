@@ -464,7 +464,7 @@ mod tests {
         let named = |keys: Vec<Named>| {
             keys.into_iter()
                 .map(keyboard::Key::Named)
-                .collect::<Vec<_>>()
+                .collect::<Vec<keyboard::Key>>()
         };
         for (rows, keys, expected, visible) in [
             (
