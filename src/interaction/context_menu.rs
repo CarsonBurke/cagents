@@ -777,6 +777,8 @@ mod tests {
 
     #[test]
     fn tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge() {
+        use cosmic::iced::keyboard::{self, key::Named};
+
         let renderer = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -793,120 +795,162 @@ mod tests {
         let chords = vec!["Ctrl+Alt+F5".to_owned()];
         let bindings = menu_shortcuts([(chords.as_slice(), RowAction(39))]);
         let hint = bindings.keys().next().unwrap().to_string();
-        let mut element = surface(widget::menu::items(
-            &bindings,
-            (0..40)
-                .map(|index| {
-                    widget::menu::Item::Button(
-                        if index == 0 {
-                            "New worktree from this branch…".into()
-                        } else {
-                            format!("Action {index}")
-                        },
-                        None,
-                        RowAction(index),
-                    )
-                })
-                .collect(),
-        ));
-        let widget = element.as_widget_mut();
-        let mut tree = Tree::new(&*widget);
-        widget.diff(&mut tree);
-        let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
-        let mut messages = Vec::new();
-        widget.update(
-            &mut tree,
-            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-            Layout::new(&row),
-            mouse::Cursor::Available(anchor),
-            &renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-        let mut popup = widget
-            .overlay(
-                &mut tree,
-                Layout::new(&row),
-                &renderer,
-                &viewport,
-                Vector::ZERO,
-            )
-            .unwrap();
-        let node = popup.as_overlay_mut().layout(&renderer, window);
-        popup.as_overlay_mut().update(
-            &Event::Window(window::Event::RedrawRequested(Instant::now())),
-            Layout::new(&node),
-            mouse::Cursor::Available(anchor),
-            &renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-        );
-        let node = popup.as_overlay_mut().layout(&renderer, window);
-        let menu = node.children().first().unwrap().bounds();
-        assert!(menu.x >= 0.0 && menu.x + menu.width <= window.width);
-        assert!(
-            menu.width > 240.0,
-            "long labels grow the shared menu beyond its old fixed width"
-        );
-        let pointer = mouse::Cursor::Available(Point::new(menu.x + 30.0, window.height - 18.0));
-        // No pointer motion is required before the first wheel event.
-        popup.as_overlay_mut().update(
-            &Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 },
-            }),
-            Layout::new(&node),
-            pointer,
-            &renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-        );
-        let node = popup.as_overlay_mut().layout(&renderer, window);
-        #[derive(Default)]
-        struct Texts(Vec<String>);
-        impl Operation for Texts {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) {
-                self.0.push(text.to_owned());
-            }
-        }
-        let mut texts = Texts::default();
-        popup
-            .as_overlay_mut()
-            .operate(Layout::new(&node), &renderer, &mut texts);
-        assert!(
-            texts.0.iter().any(|text| text == &hint),
-            "the rendered trailing action must expose its configured chord: {:?}",
-            texts.0
-        );
-        assert!(texts.0.iter().any(|text| text == "Action 39"));
-        assert!(
-            !texts
-                .0
-                .iter()
-                .any(|text| text == "New worktree from this branch…"),
-            "operations must follow the visible scroll slice, not the hidden first row"
-        );
-        for event in [
-            mouse::Event::ButtonPressed(mouse::Button::Left),
-            mouse::Event::ButtonReleased(mouse::Button::Left),
+        for delta in [
+            mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 },
+            mouse::ScrollDelta::Pixels { x: 0.0, y: -6000.0 },
         ] {
-            popup.as_overlay_mut().update(
-                &Event::Mouse(event),
-                Layout::new(&node),
-                pointer,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-            );
+            for activation in [
+                None,
+                Some(keyboard::Key::Named(Named::Enter)),
+                Some(keyboard::Key::Character(" ".into())),
+            ] {
+                let mut element = surface(widget::menu::items(
+                    &bindings,
+                    (0..40)
+                        .map(|index| {
+                            widget::menu::Item::Button(
+                                if index == 0 {
+                                    "New worktree from this branch…".into()
+                                } else {
+                                    format!("Action {index}")
+                                },
+                                None,
+                                RowAction(index),
+                            )
+                        })
+                        .collect(),
+                ));
+                let widget = element.as_widget_mut();
+                let mut tree = Tree::new(&*widget);
+                widget.diff(&mut tree);
+                let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                let mut messages = Vec::new();
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    mouse::Cursor::Available(anchor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut popup = widget
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&row),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .unwrap();
+                let node = popup.as_overlay_mut().layout(&renderer, window);
+                popup.as_overlay_mut().update(
+                    &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(anchor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let node = popup.as_overlay_mut().layout(&renderer, window);
+                let menu = node.children().first().unwrap().bounds();
+                assert!(menu.x >= 0.0 && menu.x + menu.width <= window.width);
+                assert!(
+                    menu.width > 240.0,
+                    "long labels grow the shared menu beyond its old fixed width"
+                );
+                let pointer =
+                    mouse::Cursor::Available(Point::new(menu.x + 30.0, window.height - 18.0));
+                // No pointer motion is required before the first wheel event.
+                popup.as_overlay_mut().update(
+                    &Event::Mouse(mouse::Event::WheelScrolled { delta }),
+                    Layout::new(&node),
+                    pointer,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let node = popup.as_overlay_mut().layout(&renderer, window);
+                #[derive(Default)]
+                struct Texts(Vec<String>);
+                impl Operation for Texts {
+                    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                        visit(self);
+                    }
+                    fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) {
+                        self.0.push(text.to_owned());
+                    }
+                }
+                let mut texts = Texts::default();
+                popup
+                    .as_overlay_mut()
+                    .operate(Layout::new(&node), &renderer, &mut texts);
+                assert!(
+                    texts.0.iter().any(|text| text == &hint),
+                    "the rendered trailing action must expose its configured chord: {:?}",
+                    texts.0
+                );
+                assert!(texts.0.iter().any(|text| text == "Action 39"));
+                assert!(
+                    !texts
+                        .0
+                        .iter()
+                        .any(|text| text == "New worktree from this branch…"),
+                    "operations must follow the visible scroll slice, not the hidden first row"
+                );
+                assert!(messages.is_empty(), "scrolling must not activate a row");
+                if let Some(key) = activation {
+                    // No motion or click may repair the pre-scroll pointer selection
+                    // before Enter or the Linux Character-space event activates it.
+                    let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: key.clone(),
+                        modified_key: key.clone(),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    });
+                    let mut shell = Shell::new(&mut messages);
+                    popup.as_overlay_mut().update(
+                        &event,
+                        Layout::new(&node),
+                        pointer,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                    );
+                    assert!(shell.is_event_captured());
+                    assert_eq!(
+                        messages,
+                        [39],
+                        "{key:?} after {delta:?} must activate the row now beneath the stationary pointer"
+                    );
+                } else {
+                    for event in [
+                        mouse::Event::ButtonPressed(mouse::Button::Left),
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
+                    ] {
+                        popup.as_overlay_mut().update(
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            pointer,
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                        );
+                    }
+                    assert_eq!(
+                        messages,
+                        [39],
+                        "the destructive trailing item must remain reachable"
+                    );
+                }
+            }
         }
-        assert_eq!(
-            messages,
-            [39],
-            "the destructive trailing item must remain reachable"
-        );
     }
 
     #[test]

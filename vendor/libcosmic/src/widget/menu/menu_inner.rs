@@ -634,14 +634,33 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         );
 
         match event {
-            Mouse(WheelScrolled { delta }) => process_scroll_events(
-                self,
-                shell,
-                *delta,
-                overlay_cursor,
-                viewport_size,
-                overlay_offset,
-            ),
+            Mouse(WheelScrolled { delta }) => {
+                process_scroll_events(
+                    self,
+                    shell,
+                    *delta,
+                    overlay_cursor,
+                    viewport_size,
+                    overlay_offset,
+                );
+                // Scrolling moves a different row beneath a stationary pointer.
+                // Reuse motion's hit test after every scroll path has settled,
+                // including parent scrolling that moves an open submenu.
+                if view_cursor.position().is_some()
+                    && (self.is_overlay || view_cursor.is_over(viewport))
+                {
+                    return process_overlay_events(
+                        self,
+                        renderer,
+                        viewport_size,
+                        overlay_offset,
+                        view_cursor,
+                        overlay_cursor,
+                        self.cross_offset as f32,
+                        shell,
+                    );
+                }
+            }
 
             Mouse(ButtonPressed(Left)) | Touch(FingerPressed { .. }) => {
                 self.tree.inner.with_data_mut(|data| {
