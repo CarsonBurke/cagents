@@ -643,7 +643,7 @@ fn peer_chat_read_context_in(
                 {
                     return Err("The caller pane is not uniquely active".into());
                 }
-                caller_pane = Some(source);
+                caller_pane = Some(source.clone());
             }
             // Count ID matches before checking kind/proof: a terminal alias or
             // a malformed duplicate cannot provide a second peer presentation.
