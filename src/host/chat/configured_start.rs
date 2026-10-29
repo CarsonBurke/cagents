@@ -16,8 +16,10 @@ pub(super) fn start(
     // The outer request still holds the existing shared control admission.
     // Account mutation installs under its writer, so this refusal protects
     // factory account/project default-mode reads as well as the later spawn.
-    super::super::account_lifecycle::ensure_idle(host).map_err(|_| unavailable(
+    super::super::account_lifecycle::ensure_idle(host).map_err(|_| ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
         "An account operation is still using credential directories. Wait for it to finish before starting a new conversation.",
+        true,
     ))?;
     // These paths and settings belong to this daemon. No path to a settings
     // file, executable, account home or environment comes from the request.
@@ -347,11 +349,28 @@ mod tests {
         // Exercise the actual ingress. It must refuse before looking up the
         // installation's settings/registry or touching any provider endpoint.
         let failure = start(&host, 1, fixture.intent.clone()).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
         assert!(failure.message.contains("account operation"), "{failure:?}");
         assert!(failure.retryable);
         let state = host.lock().unwrap();
         assert!(state.chat_spawning.is_empty());
         assert!(state.chats.is_empty());
+        assert!(!state.contains_session_identity(fixture.intent.id));
+    }
+
+    #[test]
+    fn configured_ingress_shutdown_refusal_stays_nonretryable_without_reserving_identity() {
+        let fixture = Fixture::new();
+        let host = crate::host::AccountReservation::test_host();
+        host.lock().unwrap().shutting_down = true;
+        let failure = start(&host, 1, fixture.intent.clone()).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+        assert_eq!(failure.message, "Daemon is shutting down");
+        assert!(!failure.retryable);
+        let state = host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
+        assert!(!state.contains_session_identity(fixture.intent.id));
     }
 
     #[test]
