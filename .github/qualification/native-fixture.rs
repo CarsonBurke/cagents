@@ -54,7 +54,15 @@ fn snapshot(session: &Session) -> Snapshot {
         session_id: session.launch.session_id.clone(),
         title: (std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1"))
             .then(|| "Hidden conversation recovered".into()),
-        items: if std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") {
+        items: if session.launch.recipe.arguments.first().map(String::as_str) == Some("ordinary-retained-source") {
+            vec![Arc::new(cagents::chat::Item {
+                id: "ordinary-history-ready".into(), role: cagents::chat::Role::Assistant,
+                content: cagents::chat::ItemContent::Text {
+                    text: "Ordinary History recovery is ready.".into(), thinking: false,
+                    phase: cagents::chat::Phase::Final,
+                }, at: None, started_at: None,
+            })]
+        } else if std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") {
             (0..200).map(|index| Arc::new(cagents::chat::Item {
                 id: format!("synthetic-history-{index}"),
                 role: if index % 2 == 0 { cagents::chat::Role::User } else { cagents::chat::Role::Assistant },
@@ -70,10 +78,22 @@ fn snapshot(session: &Session) -> Snapshot {
         ..Default::default()
     }
 }
+fn ordinary_source(healthy: &Session) -> Session {
+    let mut source = healthy.clone();
+    source.id = "00000000-0000-4000-8000-000000010922".parse().unwrap();
+    source.launch.session_id = Some(source.id.to_string());
+    source.launch.recipe.arguments = vec!["ordinary-retained-source".into()];
+    source
+}
+fn ordinary_card() -> CardId {
+    "00000000-0000-4000-8000-000000011922".parse().unwrap()
+}
+const ORDINARY_DRAFT: &str = "Keep the ordinary retained draft intact.\nOriginal café 🌿 text.";
 struct FixtureState {
     model: WorkspaceModel,
     repaired: bool,
     performance_started: bool,
+    ordinary_started: bool,
 }
 fn client(
     mut stream: UnixStream,
@@ -84,6 +104,15 @@ fn client(
 ) {
     let writer = Arc::new(Mutex::new(stream.try_clone().expect("private fixture writer")));
     while let Ok(Some(request)) = terminal_ipc::read_frame::<ClientEnvelope>(&mut stream) {
+        match &request.request {
+            ClientRequest::ChatAttach { .. } => record(&root, "effect-request-chat-attach"),
+            ClientRequest::ChatStart { .. } => record(&root, "effect-request-chat-start"),
+            ClientRequest::ChatPrepareResume { .. } => record(&root, "effect-request-chat-prepare"),
+            ClientRequest::ChatRecoverAccount { .. } | ClientRequest::ChatStartSelected { .. }
+            | ClientRequest::ChatReturnTerminal { .. } => record(&root, "effect-request-other-provider-mutation"),
+            ClientRequest::ChatClose { .. } | ClientRequest::ChatCloseRetained { .. } => record(&root, "effect-request-chat-close"),
+            _ => {}
+        }
         let watching = matches!(&request.request, ClientRequest::WatchWorkspaceModel);
         let explicit_read = matches!(&request.request, ClientRequest::ReadWorkspaceModel);
         if explicit_read {
@@ -294,7 +323,36 @@ fn client(
                 record(&root, "UNEXPECTED-terminal-attach");
                 error("This fixture never attaches a terminal")
             }
+            ClientRequest::ChatStart { mut session, source, terminate_source, .. }
+                if std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1")
+                    && session.launch == ordinary_source(&healthy).launch
+                    && session.id != ordinary_source(&healthy).id
+                    && session.id != healthy.id && session.id != held.id
+                    && session.proof.is_none()
+                    && session.terminal.is_none()
+                    && session.owned_codex_listener.is_none()
+                    && session.native_continuity == ordinary_source(&healthy).native_continuity
+                    && source.is_none() && !terminate_source =>
+            {
+                let mut fixture = state.lock().unwrap();
+                if fixture.ordinary_started {
+                    record(&root, "UNEXPECTED-duplicate-ordinary-start");
+                    return;
+                }
+                fixture.ordinary_started = true;
+                // One exact synthetic protocol response, with no process or
+                // provider launch. Every other provider effect remains fatal.
+                session.proof = Some(proof());
+                fs::write(root.join("ordinary-recovered-chat-id"), session.id.to_string()).unwrap();
+                record(&root, "ordinary-exact-history-start-accepted");
+                ServerMessage::Response { response: ServerResponse::ChatAttached {
+                    snapshot: snapshot(&session), session,
+                }}
+            }
             ClientRequest::ChatStart { .. }
+            | ClientRequest::ChatRecoverAccount { .. }
+            | ClientRequest::ChatStartSelected { .. }
+            | ClientRequest::ChatReturnTerminal { .. }
             | ClientRequest::Spawn { .. }
             | ClientRequest::ChatCommand { .. } => {
                 record(&root, "UNEXPECTED-provider-effect");
@@ -495,6 +553,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        if std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1") {
+            let id = ordinary_card();
+            let original = ordinary_source(&healthy);
+            let card = saved.cards.iter().find(|card| card.id == id).ok_or("Ordinary closed copy missing")?;
+            if card.existence.is_open() || card.kind != CardKind::Chat(original.clone())
+                || !saved.local_only_cards.contains(&id)
+                || saved.pending_chat_admissions.contains_key(&id)
+                || saved.chat_drafts.get(&id).map(String::as_str) != Some(ORDINARY_DRAFT)
+                || saved.chat_draft_attachments.get(&id) != Some(&vec![cagents::chat::Attachment::file(attachment.clone())])
+            { return Err("Ordinary closed source or its saved payload changed".into()); }
+            #[cfg(held_product_after)]
+            if saved.quarantined_panes.contains_key(&id) {
+                return Err("Ordinary closed copy acquired false denial evidence".into());
+            }
+            let recovered = fs::read_to_string(root.join("ordinary-recovered-chat-id"))?;
+            let recovered = saved.cards.iter().find(|card| matches!(&card.kind, CardKind::Chat(session) if session.id.to_string() == recovered)).ok_or("Recovered ordinary conversation missing")?;
+            if !recovered.existence.is_open()
+                || saved.chat_drafts.get(&recovered.id).map(String::as_str) != Some("Fresh work after ordinary History recovery.")
+            { return Err("Recovered ordinary conversation did not keep fresh work".into()); }
+        }
         if std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1") {
             let active: ChannelId = "00000000-0000-4000-8000-000000008922".parse()?;
             let settings: CardId = "00000000-0000-4000-8000-000000009922".parse()?;
@@ -529,7 +607,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bad_id,
             draft,
         )]),
-        chat_draft_attachments: if payload == "empty" { HashMap::new() } else { HashMap::from([(bad_id, vec![cagents::chat::Attachment::file(attachment)])]) },
+        chat_draft_attachments: if payload == "empty" { HashMap::new() } else { HashMap::from([(bad_id, vec![cagents::chat::Attachment::file(attachment.clone())])]) },
         ..Default::default()
     };
     fs::write(root.join("workspace-id"), workspace.id.to_string())?;
@@ -549,6 +627,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         focused: Some(healthy_id),
     });
     let active_channel: ChannelId = "00000000-0000-4000-8000-000000008922".parse()?;
+    let ordinary_mode = std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1");
+    if ordinary_mode {
+        let source = ordinary_source(&healthy);
+        let id = ordinary_card();
+        workspace.cards.push(CardState {
+            id, generation: 0, title: "Ordinary retained conversation".into(), width_fraction: 1.0,
+            kind: CardKind::Chat(source.clone()),
+            existence: Existence::Closed { tombstone: Tombstone {
+                operation_id: None, closed_at_unix_ms: 0, reason: Some("ordinary retained copy closed by user".into()),
+            }}, exposure: Exposure::Offscreen, residency: Residency::Cold,
+        });
+        workspace.local_only_cards.insert(id);
+        workspace.chat_drafts.insert(id, ORDINARY_DRAFT.into());
+        workspace.chat_draft_attachments.insert(id, vec![cagents::chat::Attachment::file(attachment.clone())]);
+    }
     if hidden_mode {
         let settings: CardId = "00000000-0000-4000-8000-000000009922".parse()?;
         workspace.cards.push(CardState {
@@ -661,6 +754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(FixtureState {
         repaired: false,
         performance_started: false,
+        ordinary_started: false,
         model: WorkspaceModel {
             identity: workspace.workspace_model_identity.unwrap(),
             sequence: 1,
@@ -698,6 +792,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ordinal: 0,
         });
         fixture.model.views.push(View::empty(Scope::Channel(active_channel)));
+    }
+    if ordinary_mode {
+        let mut fixture = state.lock().unwrap();
+        let repository = fixture.model.projects[0].repository.clone();
+        fixture.model.views.push(View::empty(Scope::Worktree { repository: repository.clone(), path: repository }));
     }
     let socket = terminal_ipc::daemon_socket_path()?;
     fs::create_dir_all(socket.parent().ok_or("Socket parent missing")?)?;

@@ -336,8 +336,8 @@ try:
                 for path in row.get('linked_paths', []):
                     command += ['-L', path]
         run(command, timeout=180)
-        for surface, mode, payload, hidden in [('chat', 'stale', 'short', False), ('chat', 'stale', 'long', False), ('chat', 'closed', 'short', False), ('chat', 'closed', 'empty', False), ('terminal', 'closed', 'empty', False), ('chat', 'stale', 'short', True)]:
-            label = f'{variant}-' + ('hidden-' if hidden else '') + f'{surface}-{mode}-{payload}'
+        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'stale', 'short', False, True)]:
+            label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             root = base / label
             root.mkdir(mode=0o700)
             env = os.environ.copy()
@@ -352,6 +352,7 @@ try:
             env['HELD_FIXTURE_PAYLOAD'] = payload
             env['HELD_FIXTURE_SURFACE'] = surface
             env['HELD_FIXTURE_HIDDEN'] = '1' if hidden else '0'
+            env['HELD_FIXTURE_ORDINARY'] = '1' if ordinary else '0'
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
@@ -438,7 +439,43 @@ try:
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', healthy_text])
                 wait(lambda: field.queryText().getText(0, -1) == healthy_text)
                 (root / 'healthy-draft-expected').write_text(healthy_text)
-            if variant == 'after' and not hidden and payload == 'short' and mode == 'stale':
+            if ordinary:
+                if variant == 'after':
+                    focus_failed_pane(pid)
+                    click(pid, 'Remove saved pane')
+                    wait(lambda: not any(node.name == 'Saved pane unavailable' for node in live_tree(pid)))
+                plus = wait(lambda: next((node for node in live_tree(pid)
+                                         if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                         and node.name.startswith('New tab · Thread ')
+                                         and visible(node)), None))
+                click(pid, plus.name)
+                click(pid, 'New Resume conversation tab')
+                wait(lambda: any(node.name == 'Resume Ordinary retained conversation' and visible(node)
+                                 for node in live_tree(pid)))
+                capture(window, label + '-ordinary-history', (1280, 800))
+                if variant == 'after':
+                    before_denied = receipt.read_text().count('effect-request-')
+                    click(pid, 'Resume Unavailable saved pane')
+                    wait(lambda: any('This saved pane could not be verified and cannot be reopened here.' in node.name
+                                     and visible(node) for node in live_tree(pid)))
+                    assert receipt.read_text().count('effect-request-') == before_denied
+                    capture(window, label + '-denied-history', (1280, 800))
+                click(pid, 'Resume Ordinary retained conversation')
+                wait(lambda: receipt.read_text().count('ordinary-exact-history-start-accepted') == 1)
+                wait(lambda: not any(node.name == 'Resume conversation' and visible(node) for node in live_tree(pid)))
+                wait(lambda: any('Ordinary History recovery is ready.' in node.name and visible(node)
+                                 for node in live_tree(pid)))
+                def recovered_field():
+                    fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
+                              and node.getState().contains(pyatspi.STATE_EDITABLE)]
+                    return fields[0] if len(fields) == 1 else None
+                field = wait(recovered_field)
+                assert field.queryText().getText(0, -1) == '', 'History unexpectedly transferred the old closed draft'
+                assert field.queryComponent().grabFocus()
+                run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'Fresh work after ordinary History recovery.'])
+                wait(lambda: field.queryText().getText(0, -1) == 'Fresh work after ordinary History recovery.')
+                capture(window, label + '-ordinary-recovered', (1280, 800))
+            elif variant == 'after' and not hidden and payload == 'short' and mode == 'stale':
                 capture(window, label + '-controls', (1280, 800))
                 copy_exact(pid, 'Copy saved draft', (root / 'expected-draft.txt').read_bytes(), keyboard=True)
                 copy_exact(pid, 'Copy saved attachment locations', (root / 'expected-attachment.txt').read_bytes())
@@ -521,16 +558,30 @@ try:
                                 return False
                             marker = json.loads(marker_row[0])
                             is_closed = 'closed' in str(json.loads(card_row[0])).lower()
-                            should_close = mode == 'closed'
-                            should_mark = hidden or mode != 'stale' or payload != 'short'
+                            should_close = mode == 'closed' or ordinary
+                            should_mark = hidden or ordinary or mode != 'stale' or payload != 'short'
                             healthy_saved = hidden or json.loads(drafts_row[0]).get('00000000-0000-4000-8000-000000003922') == healthy_text
                             return healthy_saved and is_closed == should_close and ('00000000-0000-4000-8000-000000004922' in marker) == should_mark
                     except sqlite3.Error:
                         return False
                 wait(durable_settled)
+            if ordinary:
+                def recovered_durable_settled():
+                    try:
+                        actor = (root / 'ordinary-recovered-chat-id').read_text()
+                        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                            row = next((row for row in db.execute('SELECT card_id, content_json, existence_json FROM cards WHERE kind_tag=?', ('chat',))
+                                        if json.loads(row[1]).get('id') == actor), None)
+                            draft_key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:chat_drafts'
+                            drafts = db.execute('SELECT value FROM metadata WHERE key=?', (draft_key,)).fetchone()
+                            return (row is not None and 'open' in str(json.loads(row[2])).lower() and drafts is not None
+                                    and json.loads(drafts[0]).get(row[0]) == 'Fresh work after ordinary History recovery.')
+                    except (sqlite3.Error, FileNotFoundError):
+                        return False
+                wait(recovered_durable_settled)
             stop(ui)
             stop(fixture)
-            expected_existence = 'closed' if variant == 'after' and mode == 'closed' else 'open'
+            expected_existence = 'closed' if variant == 'after' and (mode == 'closed' or ordinary) else 'open'
             with (out / (label + '-typed-persistence.log')).open('w') as log:
                 run([str(helper), str(root), mode, '--inspect', expected_existence], env=env, stdout=log)
             database = Path((root / 'database-path').read_text())
@@ -540,7 +591,7 @@ try:
                     key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:quarantined_panes'
                     marker = json.loads(db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()[0])
                     bad_id = '00000000-0000-4000-8000-000000004922'
-                    assert (bad_id in marker) == (hidden or mode != 'stale' or payload != 'short')
+                    assert (bad_id in marker) == (hidden or ordinary or mode != 'stale' or payload != 'short')
                     before_rows = list(db.iterdump())
                 old_reader = subprocess.run([str(base / 'before-fixture'), str(root), mode, '--inspect', expected_existence],
                                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)

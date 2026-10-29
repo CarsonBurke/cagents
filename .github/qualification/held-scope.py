@@ -135,7 +135,8 @@ try:
         }, indent=2) + '\n')
         for name in ['active_mixed_managed_saved_scope_recovers_healthy_panes_only',
                      'hidden_mixed_managed_saved_scope_recovers_healthy_panes_only',
-                     'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner']:
+                     'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner',
+                     'ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume']:
             test = 'app::shared_views::tests::startup_admission::' + name
             output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
