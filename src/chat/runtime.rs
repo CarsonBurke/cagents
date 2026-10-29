@@ -3899,7 +3899,15 @@ mod tests {
             }
             fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
                 Ok(Step {
-                    events: vec![Event::Waiting(true)],
+                    // TurnStarted establishes identity, not busy state. This
+                    // fixture must report work as well as its input wait.
+                    events: vec![
+                        Event::Status {
+                            busy: true,
+                            detail: "Fixture work waiting for input".into(),
+                        },
+                        Event::Waiting(true),
+                    ],
                     ..Step::default()
                 })
             }
@@ -3909,7 +3917,14 @@ mod tests {
             vec![serde_json::Value::Null],
             false,
         );
-        assert!(snapshot.busy && snapshot.waiting && !snapshot.exited);
+        assert!(
+            snapshot.busy && snapshot.waiting && !snapshot.exited,
+            "captured busy={}, waiting={}, exited={}, error_present={}",
+            snapshot.busy,
+            snapshot.waiting,
+            snapshot.exited,
+            snapshot.error.is_some(),
+        );
         assert!(snapshot.error.is_none());
         assert_eq!(
             receipts.len(),
