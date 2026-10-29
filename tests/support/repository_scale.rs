@@ -7,6 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+// These fixtures run several sequential commands with their ordinary 120s
+// deadlines, plus filesystem verification and process-family settlement. The
+// 40k contract reached its final restore after 208s on a hosted runner, leaving
+// only 32s of the old aggregate budget for that command and final verification.
+const LARGE_PATHSPEC_CONTRACT_TIMEOUT: Duration = Duration::from_secs(600);
+
 // The scale contract's 26 fixed phase pairs total at most 4,114 bytes with
 // maximal u128 elapsed digits and "panicking" results. Its executor documents
 // the combined diagnostic bound against the 64 KiB failure capture limit.
@@ -159,7 +165,7 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
             "--test-threads=1",
             "--color=never",
         ])
-        .timeout(Duration::from_secs(240))
+        .timeout(LARGE_PATHSPEC_CONTRACT_TIMEOUT)
         .output_limits(1024 * 1024, 1024 * 1024);
     for (key, _) in std::env::vars_os() {
         if key.as_encoded_bytes().starts_with(b"GIT_") {
