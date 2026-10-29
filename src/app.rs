@@ -2313,6 +2313,21 @@ pub struct SettingsSaved {
     settings: AppSettings,
 }
 
+#[derive(Clone)]
+pub struct WindowCloseSettingsOwner {
+    generation: u64,
+    writer: Option<Arc<crate::persistence::StateStore>>,
+}
+
+impl std::fmt::Debug for WindowCloseSettingsOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowCloseSettingsOwner")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 // Closing freezes user input, so contention must return control to the same
 // window. This bounds lock acquisition, not filesystem IO after taking a lock.
 const WINDOW_CLOSE_SETTINGS_LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -4386,6 +4401,7 @@ pub enum Message {
     WindowCloseFlushed {
         generation: u64,
         window: window::Id,
+        settings_owner: WindowCloseSettingsOwner,
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     },
@@ -5389,6 +5405,7 @@ pub struct Cagents {
     settings_generation: u64,
     settings_invalid: HashMap<SettingsField, String>,
     settings_save_error: Option<String>,
+    settings_save_error_generation: Option<u64>,
     status: Option<TransientNotice>,
 }
 
@@ -12795,6 +12812,10 @@ impl Cagents {
         let writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let save = self.capture_workspace_save();
         self.refresh_settings_feedback();
+        let settings_owner = WindowCloseSettingsOwner {
+            generation: self.settings_save_generation,
+            writer: writer.clone(),
+        };
         self.window_close_generation = self.window_close_generation.wrapping_add(1);
         let generation = self.window_close_generation;
         self.status = Some(
@@ -12822,6 +12843,7 @@ impl Cagents {
                 Message::WindowCloseFlushed {
                     generation,
                     window,
+                    settings_owner,
                     saved,
                     result,
                 }
@@ -12833,9 +12855,18 @@ impl Cagents {
         &mut self,
         generation: u64,
         window: window::Id,
+        settings_owner: WindowCloseSettingsOwner,
         saved: Result<SettingsSaved, String>,
         result: Result<(), String>,
     ) -> Task<Message> {
+        let current_writer = self.session.as_ref().map(SessionRuntime::operation_store);
+        let same_settings_writer = matches!((&settings_owner.writer, &current_writer),
+            (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+        // Cancelling a close retires its permission to exit, not the Settings
+        // worker. Settle its receipt only for the original window and writer.
+        if self.core.main_window_id() == Some(window) && same_settings_writer {
+            self.receive_settings_save(settings_owner.generation, saved);
+        }
         if !self
             .pending_window_close
             .as_ref()
@@ -12850,14 +12881,8 @@ impl Cagents {
         if pending.updater.is_some() {
             self.update_flush_pending = false;
         }
-        let current_writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let same_writer = matches!((&pending.writer, &current_writer),
             (Some(original), Some(current)) if Arc::ptr_eq(original, current));
-        // Settings retain their normal acknowledgement/error and same-value
-        // retry behavior while this window still owns the original writer.
-        if self.core.main_window_id() == Some(window) && same_writer {
-            self.receive_settings_save(pending.settings_generation, saved);
-        }
         let current = self.persistent_workspace();
         let result = result.and_then(|()| {
             if self.core.main_window_id() != Some(window) || !same_writer {
@@ -13481,16 +13506,27 @@ impl Cagents {
     fn receive_settings_save(&mut self, generation: u64, result: Result<SettingsSaved, String>) {
         match result {
             Ok(saved) => {
-                if saved.generation >= self.settings_ack_generation {
+                if saved.generation >= self.settings_ack_generation
+                    && self
+                        .settings_save_error_generation
+                        .is_none_or(|failed| saved.generation >= failed)
+                {
                     self.settings_save_error = None;
+                    self.settings_save_error_generation = None;
                 }
                 self.acknowledge_settings_save(saved);
             }
-            Err(error) if generation >= self.settings_ack_generation => {
+            Err(error)
+                if generation >= self.settings_ack_generation
+                    && self
+                        .settings_save_error_generation
+                        .is_none_or(|failed| generation >= failed) =>
+            {
                 self.status = Some(TransientNotice::warning(format!(
                     "Could not save settings: {error}"
                 )));
                 self.settings_save_error = Some(error);
+                self.settings_save_error_generation = Some(generation);
             }
             Err(_) => {}
         }
@@ -14341,6 +14377,7 @@ impl Application for Cagents {
             settings_generation: 0,
             settings_invalid: HashMap::new(),
             settings_save_error: None,
+            settings_save_error_generation: None,
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
@@ -16368,8 +16405,8 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::WindowCloseFlushed { generation, window, saved, result } => {
-                self.finish_window_close(generation, window, saved, result)
+            Message::WindowCloseFlushed { generation, window, settings_owner, saved, result } => {
+                self.finish_window_close(generation, window, settings_owner, saved, result)
             }
             Message::WindowCloseRequested(window) => {
                 // libcosmic reports the closed window through this same
@@ -21133,6 +21170,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn older_settings_success_preserves_final_close_error_and_same_value_retry() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, window) = window_close_draft_app(directory.path());
+        let path = app.settings_path.clone().unwrap();
+        settings::save(&path, &app.settings).unwrap();
+        let lane = Arc::clone(&app.settings_save_lane);
+        // Drop the held file before the runtime even if an assertion fails,
+        // so the real ordinary worker can always finish during teardown.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let held_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("toml.lock"))
+            .unwrap();
+        // SAFETY: this separate live descriptor holds only the private fixture lock.
+        assert_eq!(
+            unsafe { libc::flock(held_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let desired = !app.settings.chat_expand_tool_groups;
+        let ordinary = app.update(Message::SettingsChanged {
+            field: SettingsField::ChatExpandToolGroups,
+            value: desired.to_string(),
+        });
+        let older_generation = app.settings_save_generation;
+        let mut older_receipt = Box::pin(async move {
+            let mut effects = iced::runtime::task::into_stream(ordinary).expect("ordinary save");
+            while let Some(effect) = effects.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(
+                    message @ Message::SettingsSaved { .. },
+                )) = effect
+                {
+                    return message;
+                }
+            }
+            panic!("ordinary save must return its receipt");
+        });
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if matches!(lane.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = older_receipt.as_mut() => panic!("ordinary save passed the held lock"),
+                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
+                    }
+                })
+                .await
+            })
+            .expect("ordinary save must hold its lane while awaiting the file lock");
+
+        let close = app.update(Message::WindowCloseRequested(window));
+        let failed_generation = app.settings_save_generation;
+        assert!(failed_generation > older_generation);
+        let failed = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    WINDOW_CLOSE_SETTINGS_LOCK_WAIT + Duration::from_secs(5),
+                    async {
+                        let mut effects = iced::runtime::task::into_stream(close).unwrap();
+                        while let Some(effect) = effects.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(
+                                message @ Message::WindowCloseFlushed { .. },
+                            )) = effect
+                            {
+                                return message;
+                            }
+                        }
+                        panic!("final close must refuse the occupied save lane");
+                    },
+                )
+                .await
+            })
+            .expect("contended final close must return control");
+        assert!(matches!(
+            &failed,
+            Message::WindowCloseFlushed {
+                saved: Err(_),
+                result: Err(_),
+                ..
+            }
+        ));
+        drop(app.update(failed));
+        let final_error = app.settings_save_error.clone();
+        assert!(final_error.is_some());
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Error(_))
+        ));
+        type_window_close_draft(&mut app, card, " edited after refusal");
+        let retained = app.persistent_workspace().chat_drafts[&card].clone();
+        assert!(retained.contains("edited after refusal"));
+
+        drop(held_file);
+        let older = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), older_receipt).await })
+            .expect("older ordinary save must finish after releasing the lock");
+        assert!(
+            matches!(&older, Message::SettingsSaved { result: Ok(saved), .. }
+            if saved.generation == older_generation)
+        );
+        drop(app.update(older));
+        assert_eq!(app.settings_ack_generation, older_generation);
+        assert_eq!(app.settings_base.chat_expand_tool_groups, desired);
+        assert_eq!(app.settings_save_error, final_error);
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Error(_))
+        ));
+        // A late failure from the same older request cannot replace the newer diagnostic either.
+        drop(app.update(Message::SettingsSaved {
+            generation: older_generation,
+            result: Err("obsolete older failure".into()),
+        }));
+        assert_eq!(app.settings_save_error, final_error);
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], retained);
+        let retry = app.update(Message::SettingsChanged {
+            field: SettingsField::ChatExpandToolGroups,
+            value: desired.to_string(),
+        });
+        assert!(app.settings_save_generation > failed_generation);
+        settle_settings_task(&mut app, retry);
+        assert!(app.settings_save_error.is_none());
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Saved)
+        ));
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], retained);
+        assert_eq!(
+            settings::load(&path).unwrap().chat_expand_tool_groups,
+            desired
+        );
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+    }
+
     async fn prepare_window_close_update(app: &mut Cagents) {
         let (response, prepared) = std::sync::mpsc::sync_channel(1);
         let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
@@ -21204,6 +21386,10 @@ mod tests {
                 })));
                 assert_eq!(cancelled.try_recv().unwrap(), "ok");
                 assert!(app.pending_window_close.is_none());
+                assert!(matches!(
+                    app.settings_feedback,
+                    Some(SettingsFeedback::Pending)
+                ));
             }
             drop(app.update(message));
             let result = committed.try_recv().unwrap();
@@ -21214,7 +21400,13 @@ mod tests {
                 assert!(app.exit.is_none());
                 assert_eq!(app.core.main_window_id(), Some(window));
                 if changed == "cancel" {
-                    // The old successful ACK did nothing, and a new public
+                    assert_eq!(app.settings_ack_generation, app.settings_save_generation);
+                    assert!(matches!(
+                        app.settings_feedback,
+                        Some(SettingsFeedback::Saved)
+                    ));
+                    assert!(app.settings_save_error.is_none());
+                    // The old ACK settles Settings but cannot close. A new public
                     // Prepare/Commit owns a new barrier rather than inheriting it.
                     prepare_window_close_update(&mut app).await;
                     let (response, committed) = std::sync::mpsc::sync_channel(1);
@@ -21232,6 +21424,131 @@ mod tests {
                 assert!(app.update_committed);
                 assert!(app.exit.is_some());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_window_close_settles_only_original_settings_owner() {
+        for outcome in ["saved", "refused", "replaced writer", "replaced window"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            prepare_window_close_update(&mut app).await;
+            let path = app.settings_path.clone().unwrap();
+            if outcome == "refused" {
+                let refused = directory.path().join("settings-directory");
+                std::fs::create_dir(&refused).unwrap();
+                app.settings_path = Some(refused);
+            }
+            let (response, committed) = std::sync::mpsc::sync_channel(1);
+            let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Commit,
+                response,
+            }));
+            let settings_generation = app.settings_save_generation;
+            let acknowledged = app.settings_ack_generation;
+            let baseline = app.settings_base.clone();
+            let (response, cancelled) = std::sync::mpsc::sync_channel(1);
+            drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Cancel,
+                response,
+            })));
+            assert_eq!(cancelled.try_recv().unwrap(), "ok");
+            assert!(committed.try_recv().unwrap().starts_with("error:"));
+            assert!(app.pending_window_close.is_none());
+            assert!(matches!(
+                app.settings_feedback,
+                Some(SettingsFeedback::Pending)
+            ));
+            if outcome == "replaced writer" {
+                install_window_close_storage(&mut app, directory.path());
+            } else if outcome == "replaced window" {
+                app.core.set_main_window_id(Some(window::Id::unique()));
+            }
+            type_window_close_draft(&mut app, card, " edited after cancellation");
+            let retained = app.persistent_workspace().chat_drafts[&card].clone();
+            assert!(retained.contains("edited after cancellation"));
+            let completed = tokio::time::timeout(Duration::from_secs(25), async {
+                let mut effects = iced::runtime::task::into_stream(task).expect("cancelled save");
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::WindowCloseFlushed { .. },
+                    )) = effect
+                    {
+                        return message;
+                    }
+                }
+                panic!("cancelled final save must still return its actual result");
+            })
+            .await
+            .expect("cancelled save must settle");
+            assert_eq!(
+                matches!(
+                    &completed,
+                    Message::WindowCloseFlushed {
+                        saved: Err(_),
+                        result: Err(_),
+                        ..
+                    }
+                ),
+                outcome == "refused"
+            );
+            if outcome != "refused" {
+                assert!(matches!(
+                    &completed,
+                    Message::WindowCloseFlushed {
+                        saved: Ok(_),
+                        result: Ok(()),
+                        ..
+                    }
+                ));
+            }
+            drop(app.update(completed));
+            if outcome == "saved" {
+                assert_eq!(app.settings_ack_generation, settings_generation);
+                assert!(matches!(
+                    app.settings_feedback,
+                    Some(SettingsFeedback::Saved)
+                ));
+            } else if outcome == "refused" {
+                assert!(app.settings_save_error.is_some());
+                assert!(matches!(
+                    app.settings_feedback,
+                    Some(SettingsFeedback::Error(_))
+                ));
+                app.settings_path = Some(path);
+                let retry = app.update(Message::SettingsChanged {
+                    field: SettingsField::ChatExpandToolGroups,
+                    value: app.settings.chat_expand_tool_groups.to_string(),
+                });
+                let mut effects =
+                    iced::runtime::task::into_stream(retry).expect("same-value retry");
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::SettingsSaved { .. },
+                    )) = effect
+                    {
+                        assert!(matches!(
+                            &message,
+                            Message::SettingsSaved { result: Ok(_), .. }
+                        ));
+                        drop(app.update(message));
+                    }
+                }
+                assert!(app.settings_save_error.is_none());
+                assert!(matches!(
+                    app.settings_feedback,
+                    Some(SettingsFeedback::Saved)
+                ));
+            } else {
+                assert_eq!(app.settings_ack_generation, acknowledged);
+                assert_eq!(app.settings_base, baseline);
+                assert!(app.settings_save_error.is_none());
+            }
+            assert!(app.pending_window_close.is_none());
+            assert!(app.exit.is_none());
+            assert!(!app.update_prepared);
+            assert!(!app.update_committed);
+            assert_eq!(app.persistent_workspace().chat_drafts[&card], retained);
         }
     }
 
@@ -29834,6 +30151,7 @@ mod tests {
             settings_generation: 0,
             settings_invalid: HashMap::new(),
             settings_save_error: None,
+            settings_save_error_generation: None,
             status: None,
         }
     }
