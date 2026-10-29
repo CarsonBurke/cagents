@@ -268,21 +268,6 @@
       "matched_helper": false
     },
     {
-      "id": "1606-host",
-      "pr": 1606,
-      "feature": "host",
-      "binary": "cagentsd",
-      "selectors": [
-        "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits",
-        "host::automations::precheck::worker::tests::unlocked_worker_without_receipt_is_never_inferred_successful",
-        "host::automations::precheck::worker::tests::durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence",
-        "host::automations::precheck::worker::tests::retirement_refuses_missing_legacy_and_replaced_directories",
-        "host::automations::precheck::worker::tests::retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records",
-        "host::model::automations::tests::precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners"
-      ],
-      "matched_helper": true
-    },
-    {
       "id": "1231-host",
       "pr": 1231,
       "feature": "host",
@@ -300,6 +285,21 @@
         "host::chat::configured_start::tests::configured_path_and_pin_override_initialized_shell_search_and_launch_uses_same_path"
       ],
       "matched_helper": false
+    },
+    {
+      "id": "1606-host",
+      "pr": 1606,
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "host::automations::broker::tests::retired_precheck_worker_keeps_retry_custody_until_history_ack_commits",
+        "host::automations::precheck::worker::tests::unlocked_worker_without_receipt_is_never_inferred_successful",
+        "host::automations::precheck::worker::tests::durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence",
+        "host::automations::precheck::worker::tests::retirement_refuses_missing_legacy_and_replaced_directories",
+        "host::automations::precheck::worker::tests::retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records",
+        "host::model::automations::tests::precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners"
+      ],
+      "matched_helper": true
     }
   ],
   "original_negative": {
@@ -321,8 +321,8 @@
   },
   "limits": [
     "Temporary unpublished research control only; never merge. No current publication, queue admission or dispatch is authorized by these files.",
-    "One serial hosted job, CARGO_BUILD_JOBS=2, five isolated executable checks and thirty-six distinct exact parent invocations: 1231 CLI 9, 1726 UI 5, 1231 UI 6, 1606 HOST 6, 1231 HOST 10. Planned counts are not execution results.",
-    "Each lane has an independent target directory and feature graph. Never combine UI and HOST in one Cargo invocation or run independent cold builds concurrently.",
+    "One serial hosted job, CARGO_BUILD_JOBS=2, five isolated executable checks and thirty-six distinct exact parent invocations: 1231 CLI 9, 1726 UI 5, 1231 UI 6, 1231 HOST 10, 1606 HOST 6. Planned counts are not execution results.",
+    "Three target directories isolate the CLI, UI and HOST feature graphs. Same-feature source roots share dependency artifacts under Cargo fingerprints; exact source checks and tests remain separate. Never combine UI and HOST in one Cargo invocation or run independent cold builds concurrently. The 1606 HOST source and helper build run last, so no later different-source build can replace its helper before its final digest check.",
     "Ordinary settled compile/inventory/test-oracle failure stops that lane dependent tests and fails aggregate qualification. Later isolated lanes continue, including another feature graph on the same source, to obtain independent boundary evidence; no failed lane is hidden or retried.",
     "Context/source/configuration integrity faults, any matched-helper build/path/digest/provenance fault and uncertain timeout/signal/wrapper outcomes stop globally. GNU timeout 2700s + 30s grace and 240min job ceiling retained; no detached-family closure claim.",
     "Natural hosted User context refuses inherited CAGENTS_ names without reading values or removing authority. Only 1606 HOST receives its freshly built source-matched Cargo-reported absolute cagentsd helper; no copied/preinstalled fallback. Source Cargo checkout-root configuration remains intact.",

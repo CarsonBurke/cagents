@@ -118,8 +118,8 @@ jobs:
           assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
           assert manifest["never_merge"] is True
           assert [p["pr"] for p in manifest["products"]] == [1231, 1726, 1606]
-          assert [lane["id"] for lane in manifest["lanes"]] == ["1231-cli", "1726-ui", "1231-ui", "1606-host", "1231-host"]
-          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [9, 5, 6, 6, 10]
+          assert [lane["id"] for lane in manifest["lanes"]] == ["1231-cli", "1726-ui", "1231-ui", "1231-host", "1606-host"]
+          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [9, 5, 6, 10, 6]
           selected = [name for lane in manifest["lanes"] for name in lane["selectors"]]
           assert len(selected) == len(set(selected)) == 36
           for lane in manifest["lanes"]:
@@ -320,7 +320,7 @@ jobs:
                       directory = fixture / leaf
                       directory.mkdir(mode=0o700)
                       env[key] = str(directory)
-                  env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("recovery-products-target-" + lane["id"]))
+                  env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("recovery-products-target-" + lane["feature"]))
                   env["CARGO_BUILD_JOBS"] = "2"
                   root = workspace / ("product-" + str(product["pr"]))
                   baseline_context = configuration(root, env)
