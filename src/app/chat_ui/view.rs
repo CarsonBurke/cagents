@@ -1,6 +1,6 @@
 use super::coordination::Coordinated;
 use super::*;
-use crate::chat::protocol::codex::{ApprovalRole, approval_role as codex_approval_role};
+use crate::chat::approval::{ApprovalRole, approval_role as shared_approval_role};
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -789,7 +789,7 @@ fn approval_role(choice: &chat::Choice) -> Option<ApprovalRole> {
     match choice.id.as_str() {
         "allow" => Some(ApprovalRole::Once),
         "allow_session" | "allowForSession" => Some(ApprovalRole::Session),
-        _ => codex_approval_role(&choice.id),
+        _ => shared_approval_role(&choice.id),
     }
 }
 
@@ -7308,72 +7308,38 @@ mod tests {
     }
 
     #[test]
-    fn codex_approval_shortcuts_dispatch_wire_decisions_without_payload_inference() {
-        use chat::protocol::{Adapter, codex};
+    fn approval_fixture_keyboard_dispatch_preserves_decision_roles_and_scope() {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         use iced_accessibility::accesskit::Role;
         use serde_json::{Value, json};
 
-        fn request(
-            home: &Path,
-            method: &str,
-            decisions: &[Value],
-        ) -> (Box<dyn Adapter>, chat::Request) {
-            let launch = chat::Launch {
-                provider: Provider::Codex,
-                recipe: crate::model::LaunchRecipe {
-                    program: "unused-provider-fixture".into(),
-                    arguments: Vec::new(),
-                    working_directory: home.into(),
-                    environment: [("CODEX_HOME".into(), home.to_string_lossy().into_owned())]
-                        .into(),
-                    unset_environment: Default::default(),
-                },
-                session_id: Some("thread-exact".into()),
-            };
-            // This factory prepares an adapter/spec only. No socket, process,
-            // provider, account configuration or durable permission is opened.
-            let (_, mut adapter) =
-                codex::create_with_listener(&launch, home.join("unused.sock")).unwrap();
-            let initialize = adapter.initialize().unwrap();
-            let setup = adapter
-                .receive(json!({"id":initialize.writes[0]["id"],"result":{
-                    "userAgent":"codex-fixture","codexHome":home
-                }}))
-                .unwrap();
-            let resume = setup
-                .writes
+        fn request(method: &str, decisions: &[Value]) -> (Value, chat::Request) {
+            // The host-side fixture contract test checks these serialized
+            // Requests and exact reply maps against the real Codex adapter.
+            // This isolated UI test only consumes that shared boundary;
+            // it neither imports a host module nor exercises App transport.
+            let fixture: Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/codex-approval-shortcuts.json"
+            )))
+            .unwrap();
+            assert_eq!(fixture["version"], 1);
+            let case = fixture["cases"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .find(|frame| frame["method"] == "thread/resume")
-                .unwrap();
-            adapter.receive(json!({"id":resume["id"],"result":{
-                "thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true},
-                "model":"fixture","initialTurnsPage":{"data":[],"nextCursor":null}
-            }})).unwrap();
-            for frame in setup.writes.iter().filter(|frame| {
-                matches!(frame["method"].as_str(), Some("skills/list" | "model/list"))
-            }) {
-                adapter
-                    .receive(json!({"id":frame["id"],"result":{"data":[]}}))
-                    .unwrap();
-            }
-            let step = adapter
-                .receive(json!({"id":71,"method":method,"params":{
-                    "threadId":"thread-exact","turnId":"turn","itemId":"tool",
-                    "command":"python scripts/cancel_job.py --force","cwd":home,
-                    "availableDecisions":decisions,"permissions":{"network":{"enabled":true}}
-                }}))
-                .unwrap();
-            assert!(step.writes.is_empty(), "request arrival never answers it");
-            let request = step
-                .events
-                .into_iter()
-                .find_map(|event| match event {
-                    chat::Event::Request(request) => Some(request),
-                    _ => None,
+                .find(|case| {
+                    case["frame"]["method"] == method
+                        && case["frame"]["params"]["availableDecisions"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            == Some(decisions)
                 })
-                .unwrap();
-            (adapter, request)
+                .expect("every widget case has a producer-checked serialized Request fixture");
+            (
+                case["replies"].clone(),
+                serde_json::from_value(case["request"].clone()).unwrap(),
+            )
         }
 
         fn dispatch(
@@ -7573,8 +7539,6 @@ mod tests {
             (messages, labels)
         }
 
-        let fixture = tempfile::tempdir().unwrap();
-        let home = std::fs::canonicalize(fixture.path()).unwrap();
         let renderer = crate::app::tests::headless_renderer();
         let policy = json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":[
             "python","scripts/cancel_job.py","deny","decline","always"
@@ -7623,7 +7587,7 @@ mod tests {
         for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
             for (method, decisions, refusal, explicit) in &cases {
                 for focused in ["card", "refusal", "explicit"] {
-                    let (mut adapter, request) = request(&home, method, decisions);
+                    let (replies, request) = request(method, decisions);
                     let refusal_label = if refusal["decision"] == "cancel" {
                         "Deny and cancel"
                     } else {
@@ -7653,16 +7617,13 @@ mod tests {
                     else {
                         panic!("one real keyboard action must answer, got {messages:?}");
                     };
-                    // The widget's exact Answer identity is passed to the real
-                    // adapter, as the unchanged App answer handler does.
-                    let reply = adapter
-                        .command(Command::Answer {
-                            request_id: id.clone(),
-                            action: choice.clone(),
-                            answers: Vec::new(),
-                        })
-                        .unwrap();
-                    assert_eq!(reply.writes, vec![json!({"id":71,"result":expected})]);
+                    assert_eq!(id, &request.id);
+                    assert_eq!(
+                        replies
+                            .get(choice)
+                            .expect("offered action has an exact wire reply"),
+                        &json!({"id":71,"result":expected})
+                    );
                     assert_eq!(
                         labels
                             .iter()
@@ -7700,8 +7661,7 @@ mod tests {
                 ),
             ] {
                 for width in [360.0, 640.0] {
-                    let (mut adapter, request) = request(
-                        &home,
+                    let (replies, request) = request(
                         "item/commandExecution/requestApproval",
                         &[json!("accept"), decision.clone(), json!("cancel")],
                     );
@@ -7730,21 +7690,16 @@ mod tests {
                             "the narrow policy control must remain reachable through native focus and Enter"
                         );
                     };
+                    assert_eq!(id, &request.id);
                     assert_eq!(
-                        adapter
-                            .command(Command::Answer {
-                                request_id: id.clone(),
-                                action: choice.clone(),
-                                answers: Vec::new(),
-                            })
-                            .unwrap()
-                            .writes,
-                        vec![json!({"id":71,"result":{"decision":decision}})]
+                        replies
+                            .get(choice)
+                            .expect("offered policy action has an exact wire reply"),
+                        &json!({"id":71,"result":{"decision":decision}})
                     );
                 }
             }
             let (_, mut legacy) = request(
-                &home,
                 "item/commandExecution/requestApproval",
                 &[json!("accept"), json!("cancel")],
             );
@@ -7798,8 +7753,7 @@ mod tests {
                     json!("cancel"),
                 ],
             ] {
-                let (_, request) =
-                    request(&home, "item/commandExecution/requestApproval", &decisions);
+                let (_, request) = request("item/commandExecution/requestApproval", &decisions);
                 for key in [keyboard::key::Named::Enter, keyboard::key::Named::Escape] {
                     let (messages, labels) =
                         dispatch(&renderer, &request, surface, true, Some("card"), key);
@@ -7814,8 +7768,7 @@ mod tests {
                     );
                 }
             }
-            let (mut adapter, request) = request(
-                &home,
+            let (replies, request) = request(
                 "item/commandExecution/requestApproval",
                 &[json!("accept"), json!("cancel")],
             );
@@ -7865,16 +7818,12 @@ mod tests {
             let [Message::ChatUi(Action::Answer(_, id, choice))] = messages.as_slice() else {
                 panic!("focused card Enter retains the explicit one-time grant");
             };
+            assert_eq!(id, &request.id);
             assert_eq!(
-                adapter
-                    .command(Command::Answer {
-                        request_id: id.clone(),
-                        action: choice.clone(),
-                        answers: Vec::new(),
-                    })
-                    .unwrap()
-                    .writes,
-                vec![json!({"id":71,"result":{"decision":"accept"}})]
+                replies
+                    .get(choice)
+                    .expect("offered one-time action has an exact wire reply"),
+                &json!({"id":71,"result":{"decision":"accept"}})
             );
         }
     }

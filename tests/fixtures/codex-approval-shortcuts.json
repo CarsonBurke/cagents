@@ -1,0 +1,944 @@
+{
+  "cases": [
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "scripts/cancel_job.py",
+                  "deny",
+                  "decline",
+                  "always"
+                ]
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "policy-words",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-allow": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "scripts/cancel_job.py",
+                  "deny",
+                  "decline",
+                  "always"
+                ]
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"python\",\"scripts/cancel_job.py\",\"deny\",\"decline\",\"always\"]}}",
+            "id": "decision-1:policy-allow",
+            "label": "Always allow command prefix [\"python\",\"scripts/cancel_job.py\",\"deny\",\"decline\",\"always\"]"
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "scripts/cancel_job.py",
+                  "deny",
+                  "decline",
+                  "always"
+                ]
+              }
+            },
+            "cancel",
+            "accept"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "reordered-policy-words",
+      "replies": {
+        "decision-0:policy-allow": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "scripts/cancel_job.py",
+                  "deny",
+                  "decline",
+                  "always"
+                ]
+              }
+            }
+          }
+        },
+        "decision-1:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        },
+        "decision-2:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"python\",\"scripts/cancel_job.py\",\"deny\",\"decline\",\"always\"]}}",
+            "id": "decision-0:policy-allow",
+            "label": "Always allow command prefix [\"python\",\"scripts/cancel_job.py\",\"deny\",\"decline\",\"always\"]"
+          },
+          {
+            "description": "",
+            "id": "decision-1:cancel",
+            "label": "Deny and cancel"
+          },
+          {
+            "description": "",
+            "id": "decision-2:once",
+            "label": "Allow once"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "cancel",
+            {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "allow.example"
+                }
+              }
+            },
+            "accept",
+            "decline"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "decline-before-interruption-or-persistent-denial",
+      "replies": {
+        "decision-0:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        },
+        "decision-1:policy-deny": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "allow.example"
+                }
+              }
+            }
+          }
+        },
+        "decision-2:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-3:decline": {
+          "id": 71,
+          "result": {
+            "decision": "decline"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:cancel",
+            "label": "Deny and cancel"
+          },
+          {
+            "description": "{\"applyNetworkPolicyAmendment\":{\"network_policy_amendment\":{\"action\":\"deny\",\"host\":\"allow.example\"}}}",
+            "id": "decision-1:policy-deny",
+            "label": "Always deny host \"allow.example\""
+          },
+          {
+            "description": "",
+            "id": "decision-2:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "",
+            "id": "decision-3:decline",
+            "label": "Deny"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "futureDecision": {
+                "command": "deny cancel always"
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "unknown-structured-decision",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:unknown": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "futureDecision": {
+                "command": "deny cancel always"
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"futureDecision\":{\"command\":\"deny cancel always\"}}",
+            "id": "decision-1:unknown",
+            "label": "{\"futureDecision\":{\"command\":\"deny cancel always\"}}"
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python"
+                ]
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "broader-python-prefix",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-allow": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python"
+                ]
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"python\"]}}",
+            "id": "decision-1:policy-allow",
+            "label": "Always allow command prefix [\"python\"]"
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "allow",
+                  "host": "cancel.example"
+                }
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "persistent-host-allow",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-allow": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "allow",
+                  "host": "cancel.example"
+                }
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"applyNetworkPolicyAmendment\":{\"network_policy_amendment\":{\"action\":\"allow\",\"host\":\"cancel.example\"}}}",
+            "id": "decision-1:policy-allow",
+            "label": "Always allow host \"cancel.example\""
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "allow.example"
+                }
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "persistent-host-deny",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-deny": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "allow.example"
+                }
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"applyNetworkPolicyAmendment\":{\"network_policy_amendment\":{\"action\":\"deny\",\"host\":\"allow.example\"}}}",
+            "id": "decision-1:policy-deny",
+            "label": "Always deny host \"allow.example\""
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py",
+                  "--option with spaces"
+                ]
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "long-exact-argv-prefix",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-allow": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "python",
+                  "/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py",
+                  "--option with spaces"
+                ]
+              }
+            }
+          }
+        },
+        "decision-2:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[\"python\",\"/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py\",\"--option with spaces\"]}}",
+            "id": "decision-1:policy-allow",
+            "label": "Always allow command prefix [\"python\",\"/one/very-long-unbroken-directory-component-that-requires-glyph-wrapping/cancel_job.py\",\"--option with spaces\"]"
+          },
+          {
+            "description": "",
+            "id": "decision-2:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "ordinary-once-or-cancel",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "",
+            "id": "decision-1:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            "accept",
+            {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "cancel.example"
+                }
+              }
+            }
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "persistent-denial-is-not-escape",
+      "replies": {
+        "decision-0:once": {
+          "id": 71,
+          "result": {
+            "decision": "accept"
+          }
+        },
+        "decision-1:policy-deny": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                  "action": "deny",
+                  "host": "cancel.example"
+                }
+              }
+            }
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "",
+            "id": "decision-0:once",
+            "label": "Allow once"
+          },
+          {
+            "description": "{\"applyNetworkPolicyAmendment\":{\"network_policy_amendment\":{\"action\":\"deny\",\"host\":\"cancel.example\"}}}",
+            "id": "decision-1:policy-deny",
+            "label": "Always deny host \"cancel.example\""
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+          "availableDecisions": [
+            {
+              "futureDecision": {
+                "command": "deny cancel"
+              }
+            },
+            "cancel"
+          ],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "unknown-is-not-enter",
+      "replies": {
+        "decision-0:unknown": {
+          "id": 71,
+          "result": {
+            "decision": {
+              "futureDecision": {
+                "command": "deny cancel"
+              }
+            }
+          }
+        },
+        "decision-1:cancel": {
+          "id": 71,
+          "result": {
+            "decision": "cancel"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "{\"futureDecision\":{\"command\":\"deny cancel\"}}",
+            "id": "decision-0:unknown",
+            "label": "{\"futureDecision\":{\"command\":\"deny cancel\"}}"
+          },
+          {
+            "description": "",
+            "id": "decision-1:cancel",
+            "label": "Deny and cancel"
+          }
+        ],
+        "description": "\npython scripts/cancel_job.py --force\nWorking directory: /approval-fixture",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Command approval"
+      }
+    },
+    {
+      "frame": {
+        "id": 71,
+        "method": "item/permissions/requestApproval",
+        "params": {
+          "availableDecisions": [],
+          "command": "python scripts/cancel_job.py --force",
+          "cwd": "/approval-fixture",
+          "itemId": "tool",
+          "permissions": {
+            "network": {
+              "enabled": true
+            }
+          },
+          "threadId": "thread-exact",
+          "turnId": "turn"
+        }
+      },
+      "name": "additional-permission-denial",
+      "replies": {
+        "deny": {
+          "id": 71,
+          "result": {
+            "permissions": {},
+            "scope": "turn"
+          }
+        },
+        "grant-session": {
+          "id": 71,
+          "result": {
+            "permissions": {
+              "network": {
+                "enabled": true
+              }
+            },
+            "scope": "session"
+          }
+        },
+        "grant-turn": {
+          "id": 71,
+          "result": {
+            "permissions": {
+              "network": {
+                "enabled": true
+              }
+            },
+            "scope": "turn"
+          }
+        }
+      },
+      "request": {
+        "actions": [
+          {
+            "description": "{\"permissions\":{},\"scope\":\"turn\"}",
+            "id": "deny",
+            "label": "Deny"
+          },
+          {
+            "description": "{\"permissions\":{\"network\":{\"enabled\":true}},\"scope\":\"session\"}",
+            "id": "grant-session",
+            "label": "Grant for session"
+          },
+          {
+            "description": "{\"permissions\":{\"network\":{\"enabled\":true}},\"scope\":\"turn\"}",
+            "id": "grant-turn",
+            "label": "Grant for this turn"
+          }
+        ],
+        "description": "\nRequested permissions: {\"network\":{\"enabled\":true}}",
+        "fields": [],
+        "id": "71",
+        "kind": "Approval",
+        "title": "Additional permissions"
+      }
+    }
+  ],
+  "version": 1
+}

@@ -3,6 +3,7 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod approval;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;

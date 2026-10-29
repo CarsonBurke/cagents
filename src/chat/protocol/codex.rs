@@ -5,6 +5,7 @@
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
 use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
+use crate::chat::approval::{ApprovalRole, approval_role};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
     Field, FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode,
@@ -62,45 +63,6 @@ const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
 const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
-
-/// The effect of an approval action, independent of its displayed payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalRole {
-    Once,
-    Session,
-    Decline,
-    Cancel,
-    DenyPermissions,
-    PolicyAllow,
-    PolicyDeny,
-}
-
-/// Action IDs are opaque to callers. The adapter stamps known wire semantics
-/// into its own IDs so views never infer permission from labels or arguments.
-/// Old unclassified IDs deliberately provide no keyboard authority.
-pub fn approval_role(id: &str) -> Option<ApprovalRole> {
-    use ApprovalRole::*;
-    Some(match id {
-        "accept" | "grant-turn" => Once,
-        "acceptForSession" | "grant-session" => Session,
-        "decline" => Decline,
-        "cancel" => Cancel,
-        "deny" => DenyPermissions,
-        _ => {
-            let (index, role) = id.strip_prefix("decision-")?.split_once(':')?;
-            index.parse::<usize>().ok()?;
-            match role {
-                "once" => Once,
-                "session" => Session,
-                "decline" => Decline,
-                "cancel" => Cancel,
-                "policy-allow" => PolicyAllow,
-                "policy-deny" => PolicyDeny,
-                _ => return None,
-            }
-        }
-    })
-}
 
 fn decision_id(index: usize, value: &Value) -> String {
     let role = match value.as_str() {
@@ -6036,6 +5998,59 @@ mod tests {
                 .unwrap()
                 .clone()
         );
+    }
+
+    #[test]
+    fn approval_request_fixture_matches_serialized_producer_and_exact_replies() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-approval-shortcuts.json"
+        )))
+        .unwrap();
+        assert_eq!(fixture["version"], 1);
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut producer = adapter();
+            let step = producer.receive(case["frame"].clone()).unwrap();
+            assert!(step.writes.is_empty(), "request arrival never answers it");
+            let request = step
+                .events
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::Request(request) => Some(request),
+                    _ => None,
+                })
+                .expect("the real adapter produces the serialized fixture Request");
+            assert_eq!(
+                serde_json::to_value(&request).unwrap(),
+                case["request"],
+                "producer Request diverged for {}",
+                case["name"]
+            );
+            assert_eq!(
+                request.actions.len(),
+                case["replies"].as_object().unwrap().len()
+            );
+            for choice in &request.actions {
+                // Resolving an approval consumes it, so each offered action is
+                // independently round-tripped through a fresh real adapter.
+                let mut consumer = adapter();
+                consumer.receive(case["frame"].clone()).unwrap();
+                let reply = consumer
+                    .command(Command::Answer {
+                        request_id: request.id.clone(),
+                        action: choice.id.clone(),
+                        answers: Vec::new(),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    reply.writes,
+                    vec![case["replies"][&choice.id].clone()],
+                    "wire reply diverged for {} / {}",
+                    case["name"],
+                    choice.id
+                );
+            }
+        }
     }
 
     #[test]
