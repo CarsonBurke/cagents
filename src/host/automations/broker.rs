@@ -785,9 +785,28 @@ mod tests {
         thread.join().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn completed_precheck_wakes_parked_accept_loop_and_arms_idle_exit() {
+        precheck_release_wakes_parked_accept_loop(
+            "host::automations::broker::tests::completed_precheck_wakes_parked_accept_loop_and_arms_idle_exit",
+            false,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn passed_precheck_with_invalid_target_wakes_parked_accept_loop_and_arms_idle_exit() {
+        precheck_release_wakes_parked_accept_loop(
+            "host::automations::broker::tests::passed_precheck_with_invalid_target_wakes_parked_accept_loop_and_arms_idle_exit",
+            true,
+        );
+    }
+
+    // The /proc syscall oracle below observes x86_64 SYS_poll directly. Other
+    // Linux architectures may implement libc::poll through ppoll instead.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn precheck_release_wakes_parked_accept_loop(test: &str, invalid_target: bool) {
         use std::{
             fs::{self, OpenOptions},
             os::{
@@ -800,7 +819,11 @@ mod tests {
         };
 
         const ROOT: &str = "CAGENTS_TEST_PRECHECK_IDLE_ROOT";
-        const TEST: &str = "host::automations::broker::tests::completed_precheck_wakes_parked_accept_loop_and_arms_idle_exit";
+        let case = if invalid_target {
+            "passed-invalid-target"
+        } else {
+            "nonzero"
+        };
 
         fn publish(path: &Path, value: &impl serde::Serialize) {
             let temporary = path.with_file_name(format!(
@@ -852,7 +875,7 @@ mod tests {
                 "name":"Precheck idle fixture", "prompt":"must never launch a provider",
                 "agent":{"provider":"Omp","account":null,"target":{"repository":project,"directory":project,"channel":null},"surface":"Chat","model":null,"permission_mode":null},
                 "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
-                "session_mode":"fresh","precheck":{"command":"exit 7","timeout_seconds":5}
+                "session_mode":"fresh","precheck":{"command": if invalid_target { "exit 0" } else { "exit 7" },"timeout_seconds":5}
             })).unwrap();
             let automation = registry
                 .create_automation(
@@ -896,7 +919,7 @@ mod tests {
                 .open(worker.join("lease"))
                 .unwrap();
             // SAFETY: lease is a live fixture-owned descriptor. This owner
-            // retains it until publishing the exact nonzero cleanup receipt.
+            // retains it until publishing the exact completion receipt.
             assert_eq!(
                 unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
@@ -909,13 +932,21 @@ mod tests {
                     assert!(Instant::now() < deadline, "precheck owner was not released");
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                // Synthetic nonzero receipt: this exercises the real recovery,
-                // broker and accept loop, not shell execution or supervisor
-                // teardown. No provider or child capability is consumed.
-                let outcome = Outcome::Stopped {
-                    state: FiringState::Skipped,
-                    skip: Some(SkipReason::PrecheckExit),
-                    diagnostic: "Precheck exited with status 7 (fixture)".into(),
+                // Synthetic receipts exercise real recovery, acceptance and
+                // the accept loop, not shell execution or supervisor teardown.
+                // No provider or child capability is consumed.
+                let outcome = if invalid_target {
+                    // Keep the original object alive at a different path, so
+                    // its inode cannot be reused by the replacement directory.
+                    fs::rename(&project, owner_root.join("replaced-project")).unwrap();
+                    crate::secure_file::prepare_private_directory(&project).unwrap();
+                    Outcome::Passed
+                } else {
+                    Outcome::Stopped {
+                        state: FiringState::Skipped,
+                        skip: Some(SkipReason::PrecheckExit),
+                        diagnostic: "Precheck exited with status 7 (fixture)".into(),
+                    }
                 };
                 publish(
                     &worker.join("receipt"),
@@ -931,7 +962,7 @@ mod tests {
             publish(
                 &root.join("ready"),
                 &serde_json::json!({
-                    "thread": thread, "firing": firing.id,
+                    "thread": thread, "firing": firing.id, "case": case,
                     "database": data.data_dir().join("workspace-model.sqlite3"),
                 }),
             );
@@ -941,9 +972,32 @@ mod tests {
             let automation = registry.automation(automation.id).unwrap();
             let detail = registry.automation_run_detail(firing.id).unwrap();
             assert!(!automation.enabled && automation.next.is_none());
-            assert!(automation.active_firing.is_none() && detail.run.is_none());
-            assert_eq!(detail.firing.state, FiringState::Skipped);
-            assert_eq!(detail.firing.skip, Some(SkipReason::PrecheckExit));
+            assert!(automation.active_firing.is_none());
+            if invalid_target {
+                // A real accepted run proves the Passed receipt reached the
+                // continuation, rather than failing inside acceptance itself.
+                let run = detail
+                    .run
+                    .as_ref()
+                    .expect("Passed precheck must accept a run");
+                assert_eq!(run.state, crate::agent_execution::State::Failed);
+                let agent = detail.agent.as_ref().unwrap();
+                assert!(agent.closed && agent.session.is_none());
+                assert_eq!(detail.firing.state, FiringState::Failed);
+                assert!(detail.firing.skip.is_none());
+                assert!(
+                    detail
+                        .firing
+                        .diagnostic
+                        .as_ref()
+                        .unwrap()
+                        .contains("target was replaced")
+                );
+            } else {
+                assert!(detail.run.is_none());
+                assert_eq!(detail.firing.state, FiringState::Skipped);
+                assert_eq!(detail.firing.skip, Some(SkipReason::PrecheckExit));
+            }
             return;
         }
 
@@ -987,7 +1041,7 @@ mod tests {
         // setting differ. Two seconds establishes no production timing claim.
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(ROOT, root.path())
             .env("HOME", root.path().join("home"))
             .env("XDG_RUNTIME_DIR", root.path().join("run"))
@@ -1023,6 +1077,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         };
+        assert_eq!(
+            ready["case"], case,
+            "exact child must run the intended fixture"
+        );
         let syscall = PathBuf::from(format!(
             "/proc/{}/task/{}/syscall",
             child.0.id(),
@@ -1059,11 +1117,13 @@ mod tests {
         publish(&root.path().join("release-precheck"), &true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut armed = false;
+        let expected_state = if invalid_target { "failed" } else { "skipped" };
         loop {
-            let (active, state): (Option<String>, String) = database.query_row(
-                "SELECT a.active_firing,f.state FROM automations a JOIN automation_firings f ON f.automation=a.id WHERE f.id=?1",
-                [ready["firing"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
-            let released = active.is_none() && state == "skipped";
+            let (active, state, run): (Option<String>, String, Option<String>) = database.query_row(
+                "SELECT a.active_firing,f.state,f.run_id FROM automations a JOIN automation_firings f ON f.automation=a.id WHERE f.id=?1",
+                [ready["firing"].as_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            let released =
+                active.is_none() && state == expected_state && run.is_some() == invalid_target;
             armed |= released
                 && poll_timeout(&syscall).is_some_and(|timeout| (1..=2_000).contains(&timeout));
             if let Some(status) = child.0.try_wait().unwrap() {
