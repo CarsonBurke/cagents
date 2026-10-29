@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use std::{
+    io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -143,33 +144,155 @@ impl Drop for StartupFence {
     }
 }
 
-fn blocked_at_gate(helper: &Spawned, gate: &File) -> bool {
-    let metadata = gate.metadata().unwrap();
-    let identity = (
-        libc::major(metadata.dev()),
-        libc::minor(metadata.dev()),
-        metadata.ino(),
-    );
-    fs::read_to_string("/proc/locks")
-        .unwrap()
-        .lines()
-        .any(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() < 9
-                || fields[1] != "->"
-                || fields[2] != "FLOCK"
-                || fields[3] != "ADVISORY"
-                || fields[4] != "READ"
-                || fields[5].parse::<i32>().ok() != Some(helper.process.pid)
-            {
-                return false;
-            }
-            let parts: Vec<_> = fields[6].split(':').collect();
-            parts.len() == 3
-                && u32::from_str_radix(parts[0], 16).ok() == Some(identity.0)
-                && u32::from_str_radix(parts[1], 16).ok() == Some(identity.1)
-                && parts[2].parse::<u64>().ok() == Some(identity.2)
-        })
+#[derive(Debug)]
+struct GateWait {
+    fd: i32,
+    device: u64,
+    inode: u64,
+}
+
+fn flock_arguments(syscall: &str) -> Option<(i32, u64)> {
+    let mut fields = syscall.split_whitespace();
+    if fields.next()?.parse::<libc::c_long>().ok()? != libc::SYS_flock {
+        return None;
+    }
+    let fd = u64::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
+    let operation = u64::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
+    Some((i32::try_from(fd).ok()?, operation))
+}
+
+fn blocked_at_gate(helper: &Spawned, gate: &File) -> Result<Option<GateWait>, String> {
+    if !helper.process.is_current() || helper_exited(helper) {
+        return Ok(None);
+    }
+    let syscall = fs::read_to_string(format!("/proc/{}/syscall", helper.process.pid))
+        .map_err(|error| format!("cannot observe original helper syscall: {error}"))?;
+    let Some((fd, operation)) = flock_arguments(&syscall) else {
+        return Ok(None);
+    };
+    if operation != libc::LOCK_SH as u64 {
+        return Ok(None);
+    }
+    // Compare two stat views of the SAME open inode. /proc/locks instead
+    // prints the inode's superblock device; filesystems such as btrfs may
+    // report a different device from stat for a subvolume.
+    let held = gate.metadata().map_err(|error| error.to_string())?;
+    let observed = fs::metadata(format!("/proc/{}/fd/{fd}", helper.process.pid))
+        .map_err(|error| format!("cannot inspect original flock descriptor: {error}"))?;
+    if !observed.is_file()
+        || (held.dev(), held.ino()) != (observed.dev(), observed.ino())
+        || !helper.process.is_current()
+        || helper_exited(helper)
+    {
+        return Ok(None);
+    }
+    // The exclusive gate remains held. This exact blocking LOCK_SH on that
+    // inode cannot finish, so the observed syscall proves the preflight gate.
+    Ok(Some(GateWait {
+        fd,
+        device: observed.dev(),
+        inode: observed.ino(),
+    }))
+}
+
+fn preserve_gate_diagnostics(
+    root: &Path,
+    helper: Option<&Spawned>,
+    gate: &File,
+    observation: &Result<Option<GateWait>, String>,
+) {
+    let held = gate
+        .metadata()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    let mut records = vec![
+        (
+            "gate-observation.txt",
+            Ok(format!(
+                "helper={:?}\nheld={held:?}\nobservation={observation:?}\n",
+                helper.map(|helper| &helper.process)
+            )),
+        ),
+        (
+            "gate-owner-fdinfo.txt",
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", gate.as_raw_fd())),
+        ),
+    ];
+    let helper_pid = helper.map(|helper| helper.process.pid.to_string());
+    let inode = held.as_ref().ok().map(|(_, inode)| inode.to_string());
+    records.push((
+        "gate-locks.txt",
+        fs::read_to_string("/proc/locks").map(|locks| {
+            locks
+                .lines()
+                .filter(|line| {
+                    line.split_whitespace().any(|field| {
+                        helper_pid.as_deref() == Some(field)
+                            || inode
+                                .as_deref()
+                                .is_some_and(|inode| field.rsplit(':').next() == Some(inode))
+                    })
+                })
+                .map(|line| format!("{line}\n"))
+                .collect()
+        }),
+    ));
+    if let Some(helper) = helper {
+        let syscall = fs::read_to_string(format!("/proc/{}/syscall", helper.process.pid));
+        let descriptor = syscall
+            .as_ref()
+            .ok()
+            .and_then(|syscall| flock_arguments(syscall));
+        records.push(("gate-helper-syscall.txt", syscall));
+        records.push((
+            "gate-helper-wchan.txt",
+            fs::read_to_string(format!("/proc/{}/wchan", helper.process.pid)),
+        ));
+        records.push((
+            "gate-helper-status.txt",
+            fs::read_to_string(format!("/proc/{}/status", helper.process.pid)).map(|status| {
+                status
+                    .lines()
+                    .filter(|line| {
+                        ["State:", "Tgid:", "Pid:", "PPid:", "NSpid:"]
+                            .iter()
+                            .any(|prefix| line.starts_with(prefix))
+                    })
+                    .map(|line| format!("{line}\n"))
+                    .collect()
+            }),
+        ));
+        if let Some((fd, _)) = descriptor {
+            records.push((
+                "gate-helper-fdinfo.txt",
+                fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", helper.process.pid)),
+            ));
+            records.push((
+                "gate-helper-fd-metadata.txt",
+                fs::metadata(format!("/proc/{}/fd/{fd}", helper.process.pid)).map(|metadata| {
+                    format!(
+                        "fd={fd} device={} inode={} regular={}\n",
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.is_file()
+                    )
+                }),
+            ));
+        }
+    }
+    for (name, contents) in records {
+        let contents =
+            contents.unwrap_or_else(|error| format!("observation unavailable: {error}\n"));
+        let saved = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root.join(name))
+            .and_then(|mut file| file.write_all(contents.as_bytes()));
+        if let Err(error) = saved {
+            eprintln!("Could not preserve {name}: {error}");
+        }
+    }
 }
 
 fn helper_exited(helper: &Spawned) -> bool {
@@ -295,22 +418,35 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
     }));
 
     let mut host_result = None;
+    let mut actual_helper = None;
+    let mut gate_observation = Ok(None);
+    let mut shutdown_stimulated = false;
     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let helper = match observation
-            .events
-            .recv_timeout(Duration::from_secs(8))
-            .unwrap()
-        {
-            Event::Spawned(helper) => helper.unwrap(),
-            Event::Reaped(_) => {
-                panic!("sole watcher reported a wait before the actual spawn observation")
-            }
-        };
-        wait_for(|| blocked_at_gate(&helper, startup.gate.as_ref().unwrap()));
-        assert!(helper.process.is_current() && !helper_exited(&helper));
+        actual_helper = Some(
+            match observation
+                .events
+                .recv_timeout(Duration::from_secs(8))
+                .unwrap()
+            {
+                Event::Spawned(helper) => helper.unwrap(),
+                Event::Reaped(_) => {
+                    panic!("sole watcher reported a wait before the actual spawn observation")
+                }
+            },
+        );
+        let helper = actual_helper.as_ref().unwrap();
+        eprintln!("Original helper spawned: process={:?}", helper.process);
+        wait_for(|| {
+            gate_observation = blocked_at_gate(helper, startup.gate.as_ref().unwrap());
+            gate_observation
+                .as_ref()
+                .is_ok_and(|observed| observed.is_some())
+        });
+        assert!(helper.process.is_current() && !helper_exited(helper));
+        let gate_wait = gate_observation.as_ref().unwrap().as_ref().unwrap();
         eprintln!(
-            "Actual helper blocked on exact transcript-cache gate: process={:?}, admitted_reader={admitted_reader}",
-            helper.process,
+            "Actual helper blocked on exact transcript-cache gate: process={:?}, syscall=SYS_flock, operation=LOCK_SH, fd={}, device={}, inode={}, admitted_reader={admitted_reader}",
+            helper.process, gate_wait.fd, gate_wait.device, gate_wait.inode,
         );
         startup.observe_caller();
         assert!(startup.result.is_none(), "startup must still be blocked");
@@ -326,6 +462,7 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
                 ServerResponse::ShutdownAccepted
             ));
         }
+        shutdown_stimulated = true;
         // Much shorter than the transport's own 30-second startup timeout.
         // Observe the production cancellation/early-exit result before any
         // manual cleanup can close the original control socket.
@@ -356,8 +493,9 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
             same_startup_retained,
             cleanup_still_uncertain: context.outcome() == LaunchOutcome::Uncertain,
             helper_alive_and_blocked: helper.process.is_current()
-                && !helper_exited(&helper)
-                && blocked_at_gate(&helper, startup.gate.as_ref().unwrap()),
+                && !helper_exited(helper)
+                && blocked_at_gate(helper, startup.gate.as_ref().unwrap())
+                    .is_ok_and(|observed| observed.is_some()),
             helper_has_no_children: fs::read_to_string(format!(
                 "/proc/{0}/task/{0}/children",
                 helper.process.pid,
@@ -378,14 +516,18 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
             snapshot.fresh_user_can_inspect = matches!(fresh.request(ClientRequest::List).unwrap(),
                 ServerResponse::Listed { terminals } if terminals.is_empty());
         }
-        (helper, snapshot)
+        snapshot
     }));
 
-    let production_qualified = checked
-        .as_ref()
-        .is_ok_and(|(_, snapshot)| snapshot.qualified());
+    preserve_gate_diagnostics(
+        &root,
+        actual_helper.as_ref(),
+        startup.gate.as_ref().unwrap(),
+        &gate_observation,
+    );
+    let production_qualified = checked.as_ref().is_ok_and(WhileGated::qualified);
     if !production_qualified {
-        if let Ok((_, snapshot)) = &checked {
+        if let Ok(snapshot) = &checked {
             eprintln!(
                 "Observed BEFORE failure-only cleanup, while original gate held: {snapshot:?}"
             );
@@ -395,33 +537,63 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
     // Even a failing baseline MUST cancel and observe the ORIGINAL caller's
     // Err while the helper is still blocked, before allowing it past preflight.
     startup.release_after_cancellation().unwrap();
-    let waited = match observation
-        .events
-        .recv_timeout(Duration::from_secs(8))
-        .unwrap()
-    {
-        Event::Reaped(waited) => waited.unwrap(),
-        Event::Spawned(_) => panic!("duplicate actual helper spawn"),
-    };
     startup.finish_failure_cleanup().unwrap();
-    assert_eq!(
-        waited.code(),
-        Some(73),
-        "actual sole Child.wait must prove helper teardown"
-    );
-    let (helper, snapshot) = match checked {
-        Ok(checked) => checked,
-        Err(panic) => std::panic::resume_unwind(panic),
+    let waited = if actual_helper.is_none() && context.outcome() == LaunchOutcome::NoProvider {
+        None
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match observation
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Event::Reaped(waited) => break Some(waited.unwrap()),
+                Event::Spawned(helper) => {
+                    assert!(actual_helper.is_none(), "duplicate actual helper spawn");
+                    actual_helper = Some(helper.unwrap());
+                    eprintln!(
+                        "Original helper observed during failure cleanup: process={:?}",
+                        actual_helper.as_ref().unwrap().process
+                    );
+                }
+            }
+        }
     };
-    assert!(helper_exited(&helper));
-    assert!(
-        match Process::read(helper.process.pid) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Ok(current) => current != helper.process,
-            Err(error) => panic!("could not observe original Child reaping: {error}"),
-        },
-        "kernel exit alone is not the original Child.wait"
-    );
+    if let Some(helper) = &actual_helper {
+        let waited = waited.expect("observed original helper requires its sole Child.wait");
+        eprintln!(
+            "Original sole Child.wait observed: process={:?}, status={waited}",
+            helper.process
+        );
+        assert_eq!(
+            waited.code(),
+            Some(73),
+            "actual sole Child.wait must prove helper teardown"
+        );
+        assert!(helper_exited(helper));
+        assert!(
+            match Process::read(helper.process.pid) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Ok(current) => current != helper.process,
+                Err(error) => panic!("could not observe original Child reaping: {error}"),
+            },
+            "kernel exit alone is not the original Child.wait"
+        );
+    } else {
+        assert_eq!(context.outcome(), LaunchOutcome::NoProvider);
+        eprintln!(
+            "Failure-only startup cleanup settled without spawning a helper; no Child.wait status claimed"
+        );
+    }
+    if !shutdown_stimulated {
+        assert!(!production_qualified);
+        host.lock().unwrap().request_shutdown();
+        crate::daemon::wake();
+        eprintln!(
+            "Failure-only fixture HOST shutdown requested after owned cleanup; production shutdown stimulus was not reached"
+        );
+    }
     if host_result.is_none() {
         host_result = Some(completed.recv_timeout(Duration::from_secs(8)).unwrap());
     }
@@ -429,10 +601,22 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
     assert!(host_result.unwrap().is_ok());
     assert!(!paths.socket.exists());
     assert!(!HostLease::is_held(&paths).unwrap());
-    eprintln!(
-        "Original cleanup settled: process={:?}, failure_only_cleanup={}, sole_Child_wait_exit=73, pidfd_exited=true, original_reaped=true, actual_host_returned=true, lease_released=true",
-        helper.process, !production_qualified,
-    );
+    if let Some(helper) = actual_helper {
+        eprintln!(
+            "Original cleanup settled: process={:?}, failure_only_cleanup={}, sole_Child_wait_exit=73, pidfd_exited=true, original_reaped=true, actual_host_returned=true, lease_released=true",
+            helper.process, !production_qualified,
+        );
+    } else {
+        eprintln!(
+            "Failure-only fixture settled: no helper spawned, actual_host_returned=true, listener_removed=true, lease_released=true"
+        );
+    }
+    // Setup panics retain their original meaning, but only AFTER the original
+    // helper and actual HOST have been proved settled and the receipt emitted.
+    let snapshot = match checked {
+        Ok(snapshot) => snapshot,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     assert!(
         snapshot.qualified(),
         "ordinary shutdown violated the pre-cleanup oracle: {snapshot:?}"
