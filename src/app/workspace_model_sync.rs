@@ -593,9 +593,12 @@ impl Cagents {
                 let transferred = operation
                     .and_then(|operation| self.shared_views.requested_transfer_card(operation));
                 self.install_workspace_model_snapshot(model);
+                // This receipt can reveal a peer transfer before the watcher.
+                // Preserve its pending Update and captured source basis until
+                // retargeting has minted the destination's distinct receipt.
+                self.retarget_transferred_pane_updates(transferred);
                 self.acknowledge_view_edit(scope, operation);
                 self.retire_settled_empty_channels();
-                self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
             ModelUpdate::Connected(model) => {
