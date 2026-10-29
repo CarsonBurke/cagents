@@ -318,7 +318,7 @@ def capture_notice(pid, window, name, message):
     wait(lambda: not any(node.name == 'Close application notices' and visible(node) for node in live_tree(pid)))
 
 
-def copy_exact(pid, name, expected, keyboard=False):
+def copy_exact(pid, name, expected, keyboard=False, gesture=None):
     sentinel = b'held-scope-native-copy-sentinel'
     assert expected != sentinel
     owner = subprocess.Popen(['xclip', '-selection', 'clipboard', '-in', '-quiet'],
@@ -339,7 +339,10 @@ def copy_exact(pid, name, expected, keyboard=False):
     try:
         wait(lambda: clipboard() == sentinel)
         phase = 'gesture'
-        click(pid, name, keyboard=keyboard)
+        if gesture is None:
+            click(pid, name, keyboard=keyboard)
+        else:
+            gesture()
         phase = 'await-expected'
         wait(lambda: clipboard() == expected)
     except BaseException:
@@ -362,6 +365,122 @@ def open_ordinary_history(pid):
     click(pid, 'New Resume conversation tab')
     wait(lambda: any(node.name == 'Resume Ordinary retained conversation' and visible(node)
                      for node in live_tree(pid)))
+
+
+def composition_context_controls(pid):
+    """The System Notice is one independently disclosed commentary step."""
+    def read():
+        controls = []
+        for node in live_tree(pid):
+            if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and node.name == 'Claude context' and visible(node):
+                bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                if (bounds.width > 0 and bounds.height > 0 and 0 <= bounds.x
+                        and bounds.x + bounds.width <= viewport[0]
+                        and 0 <= bounds.y and bounds.y + bounds.height <= viewport[1]):
+                    controls.append((bounds.x, bounds.y, bounds.width, bounds.height))
+        assert len(controls) <= 1, 'Composition has exactly one Claude context notice'
+        return sorted(controls, key=lambda bounds: bounds[1])
+    return accessibility_snapshot(read)
+
+
+def composition_context_gesture(pid, *, copy=False):
+    def target():
+        controls = composition_context_controls(pid)
+        if not controls:
+            return None
+        x, y, width, height = controls[0]
+        if not copy:
+            return (x, y, width, height)
+        candidates = []
+        for node in live_tree(pid):
+            if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and node.name == 'Copy this message' and visible(node):
+                bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                if (bounds.x >= x + width and y <= bounds.y + bounds.height // 2 <= y + height
+                        and bounds.width > 0 and bounds.height > 0
+                        and bounds.x + bounds.width <= viewport[0]):
+                    candidates.append((bounds.x, bounds.y, bounds.width, bounds.height))
+        assert len(candidates) <= 1, 'Context Copy must belong to the exact context header row'
+        return candidates[0] if candidates else None
+    bounds = wait(target)
+    x, y, width, height = bounds
+    event({'event': 'composition-context-gesture', 'copy': copy, 'bounds': list(bounds)})
+    run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1'])
+
+
+def composition_flow(pid, window, root, label):
+    user = 'Actual user request: keep my saved work while I open another channel.'
+    ready = 'Composition transcript is ready.'
+    body = (root / 'composition-context.txt').read_bytes()
+    run(['xdotool', 'key', 'ctrl+shift+i'])  # Match the ordinary arms' closed inspector.
+    wait(lambda: any(ready in node.name and visible(node) for node in live_tree(pid)))
+    wait(lambda: any(user in node.name and visible(node) for node in live_tree(pid)))
+    wait(lambda: any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
+    copy_exact(pid, 'Copy saved draft', (root / 'expected-draft.txt').read_bytes())
+    copy_exact(pid, 'Copy saved attachment locations', (root / 'expected-attachment.txt').read_bytes())
+    def composer():
+        fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
+                  and node.getState().contains(pyatspi.STATE_EDITABLE)]
+        assert len(fields) <= 1
+        return fields[0] if fields else None
+    def channel_control(prefix):
+        names = [node.name for node in live_tree(pid)
+                 if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                 and node.name.startswith(prefix)]
+        assert len(names) <= 1, 'Composition navigation must identify one exact channel'
+        return names[0] if names else None
+    field = wait(composer)
+    bounds = field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+    run(['xdotool', 'mousemove', '--sync', str(bounds.x + bounds.width // 2),
+         str(bounds.y + bounds.height // 2), 'click', '1'])
+    wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED))
+    assert accessibility_snapshot(lambda: composer().queryText().getText(0, -1)) == ''
+    draft = 'Healthy work survives a new channel and Claude context.'
+    run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', draft])
+    wait(lambda: composer().queryText().getText(0, -1) == draft)
+    (root / 'healthy-draft-expected').write_text(draft)
+    assert len(composition_context_controls(pid)) == 1
+    assert not accessibility_snapshot(lambda: any('SYNTHETIC_CONTEXT_BEGIN' in node.name
+                                                  and visible(node) for node in live_tree(pid)))
+    capture(window, label + '-context-collapsed-wide', (1280, 800), neutral_pointer=True)
+    (root / 'composition-create-allowed').touch()
+    click(pid, 'New channel for project')
+    receipt = root / 'receipts.txt'
+    wait(lambda: 'composition-ranked-response-delivered' in receipt.read_text().splitlines())
+    created = (root / 'composition-channel-id').read_text().strip()
+    new_control = wait(lambda: channel_control('Open channel New channel, '))
+    wait(lambda: not any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
+    wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
+         and field.queryText().getText(0, -1) == '')
+    event({'event': 'composition-new-channel-revealed', 'channel_id': created, 'control': new_control})
+    capture(window, label + '-new-channel-revealed', (1280, 800), neutral_pointer=True)
+    saved_control = wait(lambda: channel_control('Open channel Saved recovery model received, '))
+    click(pid, saved_control)
+    wait(lambda: any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
+    wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
+         and field.queryText().getText(0, -1) == draft)
+    event({'event': 'composition-original-scope-and-draft-restored', 'draft_sha256': hashlib.sha256(draft.encode()).hexdigest()})
+    wait(lambda: len(composition_context_controls(pid)) == 1)
+    assert not accessibility_snapshot(lambda: any('SYNTHETIC_CONTEXT_BEGIN' in node.name
+                                                  and visible(node) for node in live_tree(pid)))
+    composition_context_gesture(pid)
+    wait(lambda: any('SYNTHETIC_CONTEXT_BEGIN' in node.name and visible(node) for node in live_tree(pid)))
+    capture(window, label + '-context-expanded-wide', (1280, 800), neutral_pointer=True)
+    copy_exact(pid, 'Copy original Claude context', body,
+               gesture=lambda: composition_context_gesture(pid, copy=True))
+    capture(window, label + '-context-expanded-narrow', (900, 700), neutral_pointer=True)
+    wait(lambda: any('SYNTHETIC_CONTEXT_BEGIN' in node.name and visible(node) for node in live_tree(pid)))
+    copy_exact(pid, 'Copy original Claude context narrow', body,
+               gesture=lambda: composition_context_gesture(pid, copy=True))
+    composition_context_gesture(pid)
+    wait(lambda: not any('SYNTHETIC_CONTEXT_BEGIN' in node.name and visible(node) for node in live_tree(pid)))
+    assert accessibility_snapshot(lambda: composer().queryText().getText(0, -1)) == draft
+    capture(window, label + '-context-collapsed-narrow', (900, 700), neutral_pointer=True)
+    # A normal navigation saves composer state; no provider command is sent.
+    click(pid, wait(lambda: channel_control('Open channel New channel, ')))
+    wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '')
+    click(pid, wait(lambda: channel_control('Open channel Saved recovery model received, ')))
+    wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
+         and field.queryText().getText(0, -1) == draft)
 
 
 
@@ -624,12 +743,15 @@ try:
         fixtures[variant] = (revision, helper, expected_sha, expected_tree)
     # Compile both immutable helpers first so candidate evidence can use the
     # schema-13 reader while exercising the changed interaction first.
-    for variant, checkout in [('after', after), ('before', before)]:
+    for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True)]:
         revision, helper, expected_sha, expected_tree = fixtures[variant]
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
         assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
-        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'peer-removal', 'empty', False, False)]:
+        arms = [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'peer-removal', 'empty', False, False)]
+        if composition:
+            arms = [('chat', 'composition', 'short', False, False)]
+        for surface, mode, payload, hidden, ordinary in arms:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             active_arm = label
             window = pid = None
@@ -659,6 +781,7 @@ try:
             env['HELD_FIXTURE_HIDDEN'] = '1' if hidden else '0'
             env['HELD_FIXTURE_ORDINARY'] = '1' if ordinary else '0'
             env['HELD_FIXTURE_PEER'] = '1' if mode == 'peer-removal' else '0'
+            env['HELD_FIXTURE_COMPOSITION'] = '1' if composition else '0'
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
@@ -707,6 +830,58 @@ try:
                              and visible(node)
                              for node in tree(pid)))
             capture(window, label + '-launch-wide', (1280, 800))
+            if composition:
+                assert variant == 'after' and mode == 'composition'
+                composition_flow(pid, window, root, label)
+                database = Path((root / 'database-path').read_text())
+                assert database.is_relative_to(root)
+                prefix = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:'
+                def composition_durable():
+                    try:
+                        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                            values = dict(db.execute('SELECT key, value FROM metadata WHERE key LIKE ?', (prefix + '%',)))
+                            if not all(prefix + key in values for key in ['chat_drafts', 'quarantined_panes', 'active_thread', 'threads']):
+                                return False
+                            drafts = json.loads(values[prefix + 'chat_drafts'])
+                            channels = json.loads(values[prefix + 'threads'])
+                            created = (root / 'composition-channel-id').read_text().strip()
+                            return (drafts.get('00000000-0000-4000-8000-000000003922') == (root / 'healthy-draft-expected').read_text()
+                                    and drafts.get('00000000-0000-4000-8000-000000004922') == (root / 'expected-draft.txt').read_text()
+                                    and '00000000-0000-4000-8000-000000004922' in json.loads(values[prefix + 'quarantined_panes'])
+                                    and json.loads(values[prefix + 'active_thread']) == '00000000-0000-4000-8000-000000002922'
+                                    and any(channel['id'] == created and channel['shared'] for channel in channels))
+                    except (sqlite3.Error, FileNotFoundError):
+                        return False
+                wait(composition_durable)
+                stop(ui)
+                stop(fixture)
+                assert icon_config.read_text() == '"Adwaita"\n'
+                with (out / (label + '-typed-persistence.log')).open('w') as log:
+                    run([str(helper), str(root), mode, '--inspect', 'open'], env=env, stdout=log, stderr=subprocess.STDOUT)
+                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
+                    before_rows = list(db.iterdump())
+                old_reader = subprocess.run([str(base / 'before-fixture'), str(root), mode, '--inspect', 'open'],
+                                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+                (out / (label + '-v13-reader-refusal.log')).write_bytes(old_reader.stdout)
+                assert old_reader.returncode != 0 and b'UnsupportedSchema' in old_reader.stdout
+                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
+                    assert list(db.iterdump()) == before_rows
+                events = receipt.read_text()
+                assert 'UNEXPECTED-' not in events
+                assert events.splitlines().count('composition-ranked-response-delivered') == 1
+                assert events.splitlines().count('composition-context-copy-delivered') == 2
+                assert 'repaired-held-attach-requested' not in events
+                assert not any(line.startswith('effect-request-') and line != 'effect-request-chat-attach'
+                               for line in events.splitlines())
+                (out / (label + '-receipts.txt')).write_text(events)
+                receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
+                                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                                 'events': events.splitlines(), 'scope': 'After-only synthetic composition supplement; no provider execution or adapter-classification claim.'})
+                assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
+                assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
+                event({'event': 'arm-completed', 'revision': revision})
+                active_arm = None
+                continue
             if mode == 'peer-removal':
                 ready = 'Verified conversation ready for peer removal.'
                 def peer_inside_viewport(node):

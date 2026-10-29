@@ -48,7 +48,46 @@ fn record(root: &std::path::Path, event: &str) {
         .expect("private receipt writer");
     writeln!(file, "{event}").expect("private receipt commit");
 }
+const COMPOSITION_USER: &str = "Actual user request: keep my saved work while I open another channel.";
+const COMPOSITION_READY: &str = "Composition transcript is ready.";
+const COMPOSITION_CONTEXT: &str = "<system-reminder>\r\nSYNTHETIC_CONTEXT_BEGIN\nThis is synthetic provider context, not a user instruction.\nKeep literal **Markdown**, <tags>, café and 日本語 unchanged.\nThe saved task and its attachment belong to their original pane.\nSYNTHETIC_CONTEXT_END  \r\n</system-reminder>";
+fn composition_copy_source() -> cagents::chat::TextCopySource {
+    cagents::chat::TextCopySource {
+        cache: "00000000-0000-4000-8000-000000012922".parse().unwrap(),
+        scope: cagents::chat::TextCopyScope::Conversation,
+        token: 1, revision: 1, bytes: COMPOSITION_CONTEXT.len() as u64,
+    }
+}
 fn snapshot(session: &Session) -> Snapshot {
+    if std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1") {
+        let text = |id: &str, role, body: &str| Arc::new(cagents::chat::Item {
+            id: id.into(), role,
+            content: cagents::chat::ItemContent::Text {
+                text: body.into(), thinking: false, phase: cagents::chat::Phase::Final,
+            }, at: None, started_at: None,
+        });
+        return Snapshot {
+            ready: true, generation: 1, session_id: session.launch.session_id.clone(),
+            items: vec![
+                text("composition-user", cagents::chat::Role::User, COMPOSITION_USER),
+                Arc::new(cagents::chat::Item {
+                    id: "composition-context".into(), role: cagents::chat::Role::System,
+                    content: cagents::chat::ItemContent::Delivery {
+                        kind: cagents::chat::DeliveryKind::Notice, from: String::new(),
+                        sender: String::new(), summary: "Claude context".into(),
+                        body: COMPOSITION_CONTEXT.into(),
+                    }, at: None, started_at: None,
+                }),
+                text("composition-ready", cagents::chat::Role::Assistant, COMPOSITION_READY),
+            ],
+            text_copy_sources: cagents::chat::TextCopySources {
+                conversation_revision: 1,
+                conversation: vec![None, Some(composition_copy_source()), None],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+    }
     Snapshot {
         ready: true,
         session_id: session.launch.session_id.clone(),
@@ -103,6 +142,74 @@ struct FixtureState {
     performance_started: bool,
     ordinary_started: bool,
     peer_removal_started: bool,
+    composition_channel: Option<ChannelId>,
+}
+
+fn composition_edit(root: &std::path::Path, fixture: &mut FixtureState, edit: ModelEdit, healthy: &Session) -> ServerMessage {
+    let FixtureState { model, composition_channel, .. } = fixture;
+    let original = Scope::Channel(model.channels[0].id);
+    let healthy_id = CardId::from_uuid(model.agents[0].id.as_uuid());
+    let result: Result<(), String> = (|| {
+        match edit {
+            ModelEdit::OpenProject { repository, name, kind }
+                if repository == model.projects[0].repository && kind == ProjectKind::Folder
+                    && (name == "project" || name == model.projects[0].name) => {
+                model.projects[0].name = name;
+            }
+            ModelEdit::CreateChannel { id, repository, title, title_source }
+                if root.join("composition-create-allowed").exists()
+                    && composition_channel.is_none()
+                    && repository == model.projects[0].repository && title.is_empty()
+                    && title_source == ChannelTitleSource::Manual
+                    && !model.channels.iter().any(|channel| channel.id == id) => {
+                let ordinal = model.channels.iter().map(|channel| channel.ordinal).max().unwrap_or(0) + 1;
+                model.channels.push(ModelChannel { id, repository, title, title_source, ordinal });
+                model.views.push(View::empty(Scope::Channel(id)));
+                *composition_channel = Some(id);
+                fs::write(root.join("composition-channel-id"), id.to_string()).map_err(|error| error.to_string())?;
+            }
+            ModelEdit::SeedView { scope, panes, closed } if closed.is_empty() => {
+                let private_worktree = Scope::Worktree {
+                    repository: healthy.launch.recipe.working_directory.clone(),
+                    path: healthy.launch.recipe.working_directory.clone(),
+                };
+                let new_scope = (*composition_channel).map(Scope::Channel);
+                let view = model.views.iter_mut().find(|view| view.scope == scope).ok_or("Unknown composition scope")?;
+                if scope == original {
+                    for pane in panes {
+                        pane.validate()?;
+                        if pane.id != healthy_id || pane.kind != CardKind::Chat(healthy.clone())
+                            || pane.scope.is_some() || pane.pending_terminal_start
+                            || !view.panes.iter().any(|saved| saved.id == pane.id && saved.kind == pane.kind) {
+                            return Err("Composition seed cannot publish an unverified source".into());
+                        }
+                    }
+                } else if (scope != private_worktree && Some(scope) != new_scope)
+                    || !panes.is_empty() || !view.panes.is_empty() || !view.retired.is_empty() {
+                    return Err("Composition bootstrap requires an exact empty private scope".into());
+                }
+            }
+            ModelEdit::ChangeView { scope, expected_revision, change: Change::Update { before, pane }, .. }
+                if scope == original && before.id == healthy_id && pane.id == healthy_id
+                    && before.kind == CardKind::Chat(healthy.clone()) && pane.kind == before.kind
+                    && before.scope.is_none() && pane.scope.is_none()
+                    && !before.pending_terminal_start && !pane.pending_terminal_start => {
+                let view = model.views.iter_mut().find(|view| view.scope == scope).ok_or("Missing composition scope")?;
+                if view.revision != expected_revision { return Err("Stale composition presentation update".into()); }
+                if view.apply(&Change::Update { before, pane })? { view.revision += 1; }
+            }
+            _ => return Err("Mutation outside composition bootstrap".into()),
+        }
+        model.sequence += 1;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ServerMessage::Response { response: ServerResponse::WorkspaceModel { model: model.clone() } },
+        Err(reason) => {
+            record(root, &format!("UNEXPECTED-composition-model-mutation {reason}"));
+            error("Composition fixture refused a workspace mutation")
+        }
+    }
 }
 
 fn peer_edit(root: &std::path::Path, model: &mut WorkspaceModel, edit: ModelEdit, healthy: &Session) -> ServerMessage {
@@ -176,6 +283,7 @@ fn client(
     held: Session,
 ) {
     let peer_mode = std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1");
+    let composition_mode = std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1");
     let writer = Arc::new(Mutex::new(stream.try_clone().expect("private fixture writer")));
     let mut admitted: Option<Session> = None;
     while let Ok(Some(request)) = terminal_ipc::read_frame::<ClientEnvelope>(&mut stream) {
@@ -194,6 +302,8 @@ fn client(
             _ => {}
         }
         let watching = matches!(&request.request, ClientRequest::WatchWorkspaceModel);
+        let composition_create = composition_mode && matches!(&request.request,
+            ClientRequest::EditWorkspaceModel { edit: ModelEdit::CreateChannel { .. } });
         let explicit_read = matches!(&request.request, ClientRequest::ReadWorkspaceModel);
         if explicit_read {
             record(&root, "explicit-read-started");
@@ -233,9 +343,9 @@ fn client(
             | ClientRequest::ChatRecoverAccount { .. } | ClientRequest::ChatStartSelected { .. }
             | ClientRequest::ChatReturnTerminal { .. } | ClientRequest::ChatClose { .. }
             | ClientRequest::ChatCloseRetained { .. } | ClientRequest::ChatCommitTerminal { .. }
-                if peer_mode => {
-                record(&root, "UNEXPECTED-peer-provider-mutation");
-                error("Peer removal grants no provider mutation authority")
+                if peer_mode || composition_mode => {
+                record(&root, if peer_mode { "UNEXPECTED-peer-provider-mutation" } else { "UNEXPECTED-composition-provider-mutation" });
+                error(if peer_mode { "Peer removal grants no provider mutation authority" } else { "Composition grants no provider mutation authority" })
             }
             ClientRequest::WatchWorkspaceModel | ClientRequest::ReadWorkspaceModel => {
                 let mut fixture = state.lock().unwrap();
@@ -255,6 +365,9 @@ fn client(
             }
             ClientRequest::EditWorkspaceModel { edit } if peer_mode => {
                 peer_edit(&root, &mut state.lock().unwrap().model, edit, &healthy)
+            }
+            ClientRequest::EditWorkspaceModel { edit } if composition_mode => {
+                composition_edit(&root, &mut state.lock().unwrap(), edit, &healthy)
             }
             ClientRequest::EditWorkspaceModel { edit } => {
                 let mut fixture = state.lock().unwrap();
@@ -440,6 +553,16 @@ fn client(
                     error("Read requires an exact previously admitted synthetic actor")
                 }
             }
+            ClientRequest::ChatCommand { chat_id, command: cagents::chat::Command::ReadTextCopy { source, offset } }
+                if composition_mode && chat_id == healthy.id
+                    && admitted.as_ref() == Some(&healthy)
+                    && source == composition_copy_source() && offset == 0 => {
+                ServerMessage::Response { response: ServerResponse::ChatTextCopy {
+                    chat_id, page: cagents::chat::TextCopyPage {
+                        source, offset, text: COMPOSITION_CONTEXT.into(), done: true,
+                    },
+                }}
+            }
             ClientRequest::ChatVisibility { chat_id, .. } => {
                 if admitted.as_ref().is_some_and(|session| session.id == chat_id) {
                     ServerMessage::Response { response: ServerResponse::Accepted }
@@ -552,6 +675,8 @@ fn client(
         let full_model_delivered = matches!(&response, ServerMessage::Response {
             response: ServerResponse::WorkspaceModel { .. },
         });
+        let composition_copy_delivered = composition_mode && matches!(&response,
+            ServerMessage::Response { response: ServerResponse::ChatTextCopy { .. } });
         let peer_model_delivered = peer_mode && explicit_read && matches!(&response,
             ServerMessage::Response { response: ServerResponse::WorkspaceModel { model } }
                 if model.channels[0].title == "Peer removal received"
@@ -589,6 +714,10 @@ fn client(
             break;
         }
         if full_model_delivered { record(&root, "full-model-delivered"); }
+        if composition_create && full_model_delivered { record(&root, "composition-ranked-response-delivered"); }
+        if composition_copy_delivered {
+            record(&root, "composition-context-copy-delivered");
+        }
         if peer_model_delivered { record(&root, "peer-removal-model-delivered"); }
         if let Some(receipt) = healthy_long_snapshot { record(&root, &receipt); }
         if let Some(chat_id) = visible_chat {
@@ -724,10 +853,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mode = std::env::args().nth(2).unwrap_or_else(|| "stale".into());
-    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history" | "peer-removal") {
+    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history" | "peer-removal" | "composition") {
         return Err("Unknown native fixture mode".into());
     }
     let peer_mode = mode == "peer-removal";
+    let composition_mode = mode == "composition";
+    if composition_mode != (std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1")) {
+        return Err("Composition mode and private environment disagree".into());
+    }
     if peer_mode != (std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1")) {
         return Err("Peer-removal mode and private environment disagree".into());
     }
@@ -843,6 +976,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        if composition_mode {
+            let created: ChannelId = fs::read_to_string(root.join("composition-channel-id"))?.parse()?;
+            let owner = saved.channels.iter().find(|entry| entry.id == channel).ok_or("Original composition channel missing")?;
+            let new = saved.channels.iter().find(|entry| entry.id == created).ok_or("New composition channel missing")?;
+            let healthy_card = saved.cards.iter().find(|card| card.id == healthy_id).ok_or("Composition healthy source missing")?;
+            // This saved shared-channel fixture creates both Awaiting sources
+            // before its first model reply. Denial retains the held source;
+            // successful healthy admission must clear its own marker.
+            if new.project_id != project || !new.shared || new.ordinal <= owner.ordinal
+                || saved.active_channel != Some(channel) || saved.focused != Some(healthy_id)
+                || !owner.cards.contains(&healthy_id) || !owner.cards.contains(&bad_id)
+                || new.cards.contains(&healthy_id) || new.cards.contains(&bad_id)
+                || saved.pending_chat_admissions.contains_key(&healthy_id)
+                || saved.pending_chat_admissions.get(&bad_id) != Some(&held)
+                || saved.chat_draft_attachments.get(&healthy_id).is_some_and(|images| !images.is_empty())
+                || healthy_card.kind != CardKind::Chat(healthy.clone()) || !healthy_card.existence.is_open() {
+                return Err("Composition rank, scope, membership, focus or healthy source changed".into());
+            }
+            #[cfg(held_product_after)]
+            if !saved.quarantined_panes.contains_key(&bad_id) || saved.quarantined_panes.contains_key(&healthy_id) {
+                return Err("Composition changed exact held-pane quarantine".into());
+            }
+            println!("typed-composition-channel-rank-scope-focus-and-healthy-source-verified");
+        }
         if peer_mode {
             let channel_state = saved.channels.iter().find(|owner| owner.id == channel).ok_or("Peer channel missing")?;
             let removed = saved.cards.iter().find(|card| card.id == healthy_id).ok_or("Peer retired history missing")?;
@@ -919,6 +1076,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     fs::write(root.join("expected-draft.txt"), &draft)?;
+    if composition_mode {
+        if payload != "short" || terminal_surface
+            || std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1")
+            || std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1") {
+            return Err("Composition requires its separate short Chat fixture".into());
+        }
+        fs::write(root.join("composition-context.txt"), COMPOSITION_CONTEXT)?;
+    }
     fs::write(&attachment.path, IMAGE_BYTES)?;
     fs::write(root.join("expected-attachment.txt"), attachment.path.to_string_lossy().as_bytes())?;
     if cagents::chat::attachment_assets::validate(&attachment).is_ok() { return Err("Synthetic unavailable image fixture acquired asset authority".into()); }
@@ -1059,7 +1224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session: Some(HostedSession::Chat(session)),
             console: None,
             created_ms: 0,
-            closed: id == bad_id && mode != "stale",
+            closed: id == bad_id && mode != "stale" && !composition_mode,
         });
     if terminal_surface {
         let CardKind::Terminal(terminal) = &cards[1].kind else { unreachable!() };
@@ -1093,6 +1258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         performance_started: false,
         ordinary_started: false,
         peer_removal_started: false,
+        composition_channel: None,
         model: WorkspaceModel {
             identity: workspace.workspace_model_identity.unwrap(),
             sequence: 1,
