@@ -34,8 +34,10 @@ use crate::model::ProjectId;
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
 const VERSION: u32 = 6;
+mod pending_retention;
 mod preparations;
 pub use super::preparation::{
+    ExistingPending, ExistingPendingBinding, ExistingPendingState, ExistingPendingTarget,
     Preparation, PreparationBinding, PreparationPayload, PreparationState,
 };
 /// A registry larger than this is not one cagents wrote.
@@ -133,6 +135,8 @@ pub struct Registry {
     installation: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     preparations: Vec<Preparation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    existing_pending: Vec<ExistingPending>,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -199,6 +203,9 @@ impl Registry {
                 .iter()
                 .any(|pending| pending.provider == provider && pending.key == key)
             || self.preparation_for_key(provider, key).is_some()
+            || self
+                .existing_pending(key)
+                .is_some_and(|entry| entry.binding.provider == provider)
     }
     /// Credential homes affected by an externally proposed preference edit.
     /// Include physical aliases and both ends of changed routing preferences.
@@ -551,6 +558,21 @@ impl Registry {
                 return Err(RegistrationError::RetainedPreparation);
             }
         }
+        if let Some(entry) = self.existing_pending(managed.key) {
+            if entry.binding.provider != managed.provider
+                || managed.linked_home.is_some()
+                || entry.state != ExistingPendingState::Pending
+                || !self.pending_is_eligible(managed.provider, managed.key)
+            {
+                return Err(RegistrationError::RetainedPreparation);
+            }
+        }
+        if self.pending.iter().any(|row| {
+            row.key == managed.key
+                && (row.provider != managed.provider || managed.linked_home.is_some())
+        }) {
+            return Err(RegistrationError::RetainedPreparation);
+        }
         let identity = managed.identity();
         if let Some((provider, _)) = system
             .iter()
@@ -569,6 +591,26 @@ impl Registry {
             return Err(RegistrationError::Duplicate(
                 Account::managed(existing.provider, existing.key, PathBuf::new()).id(),
             ));
+        }
+        if self
+            .preparations
+            .iter()
+            .all(|entry| entry.binding.key != managed.key)
+        {
+            if let Some(pending) = self
+                .pending
+                .iter()
+                .find(|row| row.key == managed.key)
+                .cloned()
+            {
+                self.adopt_existing_pending(pending.provider, pending.key, pending.started_at)
+                    .map_err(|_| RegistrationError::RetainedPreparation)?;
+                self.existing_pending
+                    .iter_mut()
+                    .find(|entry| entry.binding.key == managed.key)
+                    .unwrap()
+                    .state = ExistingPendingState::Registered;
+            }
         }
         if let Some(entry) = self
             .preparations
@@ -634,8 +676,14 @@ impl Registry {
             self.archived.retain(|archived| *archived != key);
             return Ok(key);
         }
-        if self.find(key).is_some() {
-            return Err("That account identity is already listed".into());
+        if self.find(key).is_some()
+            || self
+                .preparations
+                .iter()
+                .any(|entry| entry.binding.key == key)
+            || self.existing_pending(key).is_some()
+        {
+            return Err("That account identity is already listed or retained".into());
         }
         self.accounts.push(Registered {
             key,
@@ -651,6 +699,9 @@ impl Registry {
 
     /// Records a home created for a sign-in that is about to start.
     pub fn begin(&mut self, provider: Provider, key: Uuid, started_at: u64) {
+        if self.existing_pending(key).is_some() {
+            return;
+        }
         if self.preparations.iter().any(|entry| {
             entry.binding.key == key
                 && (entry.binding.payload.provider != provider
@@ -674,6 +725,9 @@ impl Registry {
 
     /// Forgets a sign-in whose home is gone.
     pub fn abandon(&mut self, key: Uuid) {
+        if self.existing_pending(key).is_some() {
+            return;
+        }
         if self
             .preparations
             .iter()
@@ -1160,6 +1214,10 @@ impl Store {
                 registry
                     .preparation_for_key(provider, key)
                     .is_some_and(|entry| entry.state == PreparationState::Registered)
+                    || registry.existing_pending(key).is_some_and(|entry| {
+                        entry.binding.provider == provider
+                            && entry.state == ExistingPendingState::Registered
+                    })
             },
             sync,
         )

@@ -36,6 +36,49 @@ pub struct Preparation {
     pub state: PreparationState,
 }
 
+/// A persisted observation of an older pending home. This never grants path
+/// or deletion authority and is distinct from a newly planned preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExistingPendingTarget {
+    Observed {
+        #[serde(with = "provider_name")]
+        provider: Provider,
+        key: Uuid,
+        started_at: u64,
+        expected_installation: Option<Uuid>,
+    },
+    Bound {
+        binding: ExistingPendingBinding,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingPendingBinding {
+    pub installation_id: Uuid,
+    #[serde(with = "provider_name")]
+    pub provider: Provider,
+    pub key: Uuid,
+    pub started_at: u64,
+    pub generation_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingPendingState {
+    Pending,
+    CancelledRetained,
+    Registered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingPending {
+    pub binding: ExistingPendingBinding,
+    pub state: ExistingPendingState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cancellation_ids: Vec<Uuid>,
+}
+
 mod provider_name {
     use crate::agent::Provider;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};

@@ -10,10 +10,15 @@ impl Registry {
             .find(|entry| entry.binding.request_id == request_id)
     }
 
-    pub fn preparation_for_key(&self, provider: Provider, key: Uuid) -> Option<&Preparation> {
+    pub fn preparation_for_home(&self, key: Uuid) -> Option<&Preparation> {
         self.preparations
             .iter()
-            .find(|entry| entry.binding.key == key && entry.binding.payload.provider == provider)
+            .find(|entry| entry.binding.key == key)
+    }
+
+    pub fn preparation_for_key(&self, provider: Provider, key: Uuid) -> Option<&Preparation> {
+        self.preparation_for_home(key)
+            .filter(|entry| entry.binding.payload.provider == provider)
     }
 
     fn exact_preparation(&self, binding: &PreparationBinding) -> io::Result<&Preparation> {
@@ -36,6 +41,7 @@ impl Registry {
                 "The accounts file has inconsistent setup records",
             )
         };
+        self.validate_existing_pending()?;
         let mut registered_keys = std::collections::HashSet::new();
         if self
             .accounts
@@ -93,12 +99,25 @@ impl Registry {
         self.pending
             .iter()
             .any(|row| row.provider == provider && row.key == key)
+            && self.existing_pending(key).is_none_or(|entry| {
+                entry.binding.provider == provider && entry.state == ExistingPendingState::Pending
+            })
             && self
                 .preparation_for_key(provider, key)
                 .is_none_or(|entry| entry.state == PreparationState::Created)
     }
 
     pub fn managed_home_is_eligible(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+        if let Some(entry) = self.existing_pending(key) {
+            return entry.binding.provider == provider
+                && match entry.state {
+                    ExistingPendingState::Pending => self.pending_is_eligible(provider, key),
+                    ExistingPendingState::Registered => {
+                        self.registered_home_is_eligible(homes, provider, key)
+                    }
+                    ExistingPendingState::CancelledRetained => false,
+                };
+        }
         if let Some(entry) = self.preparation_for_key(provider, key) {
             return match entry.state {
                 PreparationState::Created => self.pending_is_eligible(provider, key),
@@ -342,7 +361,7 @@ impl Store {
         )
     }
 
-    fn preparation_transaction<T>(
+    pub(super) fn preparation_transaction<T>(
         &self,
         nonblocking: bool,
         change: impl FnOnce(&mut Registry) -> io::Result<T>,

@@ -232,6 +232,8 @@ pub(crate) struct Reservation {
         uuid::Uuid,
         Option<crate::account::registry::Registered>,
         Option<crate::account::registry::Pending>,
+        Option<crate::account::registry::Preparation>,
+        Option<crate::account::registry::ExistingPending>,
         bool,
     )>,
 }
@@ -323,6 +325,8 @@ impl Reservation {
                         .iter()
                         .find(|pending| pending.key == key)
                         .cloned(),
+                    registry.preparation_for_home(key).cloned(),
+                    registry.existing_pending(key).cloned(),
                     registry.is_archived(key),
                 )
             })
@@ -697,9 +701,11 @@ impl Reservation {
         for home in &current.homes {
             home.verify()?;
         }
-        for (key, account, pending, archived) in &self.registered {
+        for (key, account, pending, preparation, existing_pending, archived) in &self.registered {
             if registry.find(*key) != account.as_ref()
                 || registry.pending().iter().find(|value| value.key == *key) != pending.as_ref()
+                || registry.preparation_for_home(*key) != preparation.as_ref()
+                || registry.existing_pending(*key) != existing_pending.as_ref()
                 || registry.is_archived(*key) != *archived
             {
                 return Err(
