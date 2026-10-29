@@ -183,6 +183,15 @@ impl Registry {
         })
     }
 
+    fn registered_home_is_eligible(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+        self.has_registered_home(homes, provider, key)
+            || self.accounts.iter().any(|account| {
+                account.linked_home.as_ref().is_some_and(|linked| {
+                    homes.canonical_managed_identity(linked) == Some((provider, key))
+                })
+            })
+    }
+
     pub fn contains_managed_home(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
         self.has_registered_home(homes, provider, key)
             || self
@@ -624,6 +633,9 @@ impl Registry {
             let key = existing.key;
             self.archived.retain(|archived| *archived != key);
             return Ok(key);
+        }
+        if self.find(key).is_some() {
+            return Err("That account identity is already listed".into());
         }
         self.accounts.push(Registered {
             key,

@@ -36,6 +36,14 @@ impl Registry {
                 "The accounts file has inconsistent setup records",
             )
         };
+        let mut registered_keys = std::collections::HashSet::new();
+        if self
+            .accounts
+            .iter()
+            .any(|account| !registered_keys.insert(account.key))
+        {
+            return Err(invalid());
+        }
         if self.preparations.is_empty() && self.installation.is_none() {
             return Ok(());
         }
@@ -94,11 +102,14 @@ impl Registry {
         if let Some(entry) = self.preparation_for_key(provider, key) {
             return match entry.state {
                 PreparationState::Created => self.pending_is_eligible(provider, key),
-                PreparationState::Registered => self.has_registered_home(homes, provider, key),
+                PreparationState::Registered => {
+                    self.registered_home_is_eligible(homes, provider, key)
+                }
                 _ => false,
             };
         }
-        self.contains_managed_home(homes, provider, key)
+        self.pending_is_eligible(provider, key)
+            || self.registered_home_is_eligible(homes, provider, key)
     }
 }
 
@@ -794,6 +805,219 @@ mod tests {
             .unwrap();
         assert_eq!(calls, 2);
         assert_eq!(replay.state, PreparationState::CancelledRetained);
+    }
+
+    #[test]
+    fn canonical_linked_registration_authorizes_a_noncanonical_ordinary_home_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let extra = directory.path().join("extra");
+        fs::create_dir(&extra).unwrap();
+        // Absolute XDG roots can retain ParentDir components. This exercises
+        // canonical identity without accepting a symlink storage ancestor.
+        let homes = Homes::at(extra.join("../homes"));
+        let store = Store::at(directory.path().join("registry"));
+        let (key, path) = homes.create(Provider::Codex, None).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        let external = directory.path().join("home-alias");
+        std::os::unix::fs::symlink(&canonical, &external).unwrap();
+        let linked = Uuid::new_v4();
+        store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    linked,
+                    canonical.clone(),
+                    None,
+                    Some(&homes),
+                    1,
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        for selected in [&path, &canonical, &external] {
+            let environment =
+                BTreeMap::from([("CODEX_HOME".into(), selected.to_str().unwrap().to_owned())]);
+            let lease = store
+                .authorize_environment(&homes, &environment, None)
+                .unwrap();
+            assert!(lease.is_some());
+            drop(lease);
+        }
+        store
+            .update(|registry| registry.unregister(linked))
+            .unwrap();
+        let environment =
+            BTreeMap::from([("CODEX_HOME".into(), canonical.to_str().unwrap().to_owned())]);
+        assert!(
+            matches!(store.authorize_environment(&homes, &environment, None), Err(super::super::LaunchAccountError::Removed { key: actual, .. }) if actual == key)
+        );
+    }
+
+    #[test]
+    fn canonical_registered_aliases_do_not_authorize_retained_preparations() {
+        for state in [
+            PreparationState::CancelledRetained,
+            PreparationState::Uncertain,
+        ] {
+            let fixture = Fixture::new();
+            let planned = fixture.plan();
+            fixture.create(&planned.binding);
+            if state == PreparationState::CancelledRetained {
+                fixture
+                    .store
+                    .cancel_preparation(&fixture.homes, &planned.binding)
+                    .unwrap();
+            } else {
+                fixture
+                    .store
+                    .update(|registry| {
+                        registry
+                            .preparations
+                            .iter_mut()
+                            .find(|entry| entry.binding == planned.binding)
+                            .unwrap()
+                            .state = state;
+                        registry
+                            .pending
+                            .retain(|row| row.key != planned.binding.key);
+                    })
+                    .unwrap();
+            }
+            let path = fixture.homes.path(Provider::Codex, planned.binding.key);
+            let canonical = fs::canonicalize(&path).unwrap();
+            let alias = fixture._directory.path().join("alias");
+            std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+            fixture
+                .store
+                .update(|registry| {
+                    registry.link(
+                        Provider::Codex,
+                        Uuid::new_v4(),
+                        canonical.clone(),
+                        None,
+                        Some(&fixture.homes),
+                        1,
+                    )
+                })
+                .unwrap()
+                .1
+                .unwrap();
+            let registry = fixture.store.load().unwrap();
+            assert!(registry.contains_managed_home(
+                &fixture.homes,
+                Provider::Codex,
+                planned.binding.key
+            ));
+            assert!(!registry.managed_home_is_eligible(
+                &fixture.homes,
+                Provider::Codex,
+                planned.binding.key
+            ));
+            for selected in [&path, &canonical, &alias] {
+                let environment =
+                    BTreeMap::from([("CODEX_HOME".into(), selected.to_str().unwrap().to_owned())]);
+                assert!(
+                    matches!(fixture.store.authorize_environment(&fixture.homes, &environment, None), Err(super::super::LaunchAccountError::Removed { key, .. }) if key == planned.binding.key)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_registered_keys_are_rejected_in_both_orders_without_rewriting() {
+        let fixture = Fixture::new();
+        let planned = fixture.plan();
+        fixture.create(&planned.binding);
+        fixture
+            .store
+            .register_pending(&fixture.homes, fixture.account(&planned.binding), &[])
+            .unwrap()
+            .1
+            .unwrap();
+        let valid = fixture.store.load().unwrap();
+        for ordinary in [false, true] {
+            for reverse in [false, true] {
+                let mut invalid = valid.clone();
+                if ordinary {
+                    invalid.preparations.clear();
+                    invalid.installation = None;
+                }
+                let mut duplicate = fixture.account(&planned.binding);
+                duplicate.provider = Provider::Claude;
+                duplicate.linked_home = Some(fixture._directory.path().join("different"));
+                invalid.accounts.push(duplicate);
+                if reverse {
+                    invalid.accounts.reverse();
+                }
+                assert_eq!(
+                    invalid.validate_preparations().unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                let before = fs::read(fixture.store.path()).unwrap();
+                assert_eq!(
+                    write(&fixture.store.directory, &fixture.store.path(), &invalid)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+                fs::write(
+                    fixture.store.path(),
+                    toml::to_string_pretty(&invalid).unwrap(),
+                )
+                .unwrap();
+                let malformed = fs::read(fixture.store.path()).unwrap();
+                assert_eq!(
+                    fixture.store.load().unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), malformed);
+                fs::write(fixture.store.path(), before).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn linking_an_occupied_key_and_invalid_created_registration_preserve_state() {
+        let fixture = Fixture::new();
+        let planned = fixture.plan();
+        fixture.create(&planned.binding);
+        let mut registry = fixture.store.load().unwrap();
+        let before = registry.clone();
+        for linked in [false, true] {
+            let mut account = fixture.account(&planned.binding);
+            if linked {
+                account.linked_home =
+                    Some(fixture.homes.path(Provider::Codex, planned.binding.key));
+            } else {
+                account.provider = Provider::Claude;
+            }
+            assert_eq!(
+                registry.register(account, &[]),
+                Err(RegistrationError::RetainedPreparation)
+            );
+            assert_eq!(registry, before);
+        }
+        registry
+            .register(fixture.account(&planned.binding), &[])
+            .unwrap();
+        let registered = registry.clone();
+        let other = fixture._directory.path().join("different");
+        fs::create_dir(&other).unwrap();
+        assert!(
+            registry
+                .link(
+                    Provider::Claude,
+                    planned.binding.key,
+                    other,
+                    None,
+                    Some(&fixture.homes),
+                    1
+                )
+                .is_err()
+        );
+        assert_eq!(registry, registered);
     }
 
     #[test]
