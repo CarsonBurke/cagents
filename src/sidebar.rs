@@ -21256,6 +21256,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn optional_operation_draft_keeps_mounted_recovery_and_conflict_navigation() {
+        let renderer = headless_renderer();
+        for kind in [
+            crate::repository::GitOperationKind::Merge,
+            crate::repository::GitOperationKind::Rebase,
+        ] {
+            for draft in ["", "Keep my resolution draft"] {
+                let mut model = panel_model();
+                let mut state = panel_state(&model);
+                state.changes_tab = ChangesTab::Changes;
+                state.apply(&SidebarAction::CommitMessageChanged {
+                    key: main_key(),
+                    message: draft.into(),
+                });
+                let mut snapshot = snapshot();
+                snapshot.operation = Some(crate::repository::GitOperationState {
+                    kind,
+                    incoming_ref: Some("a".repeat(40)),
+                    message: None,
+                });
+                model.source_control = Some(SourceControlModel::ready(main_key(), &snapshot));
+                state.prefill_operation_message(&main_key(), None);
+                let actions =
+                    frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
+                assert!(
+                    actions.iter().any(|action| matches!(action,
+                    SidebarAction::GitOperation { operation: GitOperation::Abort { kind: actual }, .. }
+                        if *actual == kind)),
+                    "Abort remains mounted: {actions:?}"
+                );
+                assert!(
+                    !actions.iter().any(|action| matches!(
+                        action,
+                        SidebarAction::GitOperation {
+                            operation: GitOperation::Continue { .. },
+                            ..
+                        }
+                    )),
+                    "Continue waits for conflict resolution"
+                );
+                assert!(
+                    actions.iter().any(|action| matches!(action,
+                    SidebarAction::OpenChange { area: ChangeArea::Conflict, path, .. }
+                        if path == &repo_path("src/sidebar.rs"))),
+                    "conflict navigation remains mounted: {actions:?}"
+                );
+                assert_eq!(state.commit_message(), draft);
+
+                snapshot
+                    .status
+                    .entries
+                    .retain(|entry| entry.area != ChangeArea::Conflict);
+                snapshot.status.dirty.conflicted = 0;
+                model.source_control = Some(SourceControlModel::ready(main_key(), &snapshot));
+                let actions =
+                    frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
+                assert!(actions.iter().any(|action| matches!(action,
+                    SidebarAction::GitOperation { operation: GitOperation::Abort { kind: actual }, .. }
+                        if *actual == kind)));
+                assert!(actions.iter().any(|action| matches!(action,
+                    SidebarAction::GitOperation { operation: GitOperation::Continue { kind: actual }, .. }
+                        if *actual == kind)), "resolved operation can continue: {actions:?}");
+                assert_eq!(state.commit_message(), draft);
+            }
+        }
+    }
+
+    #[test]
     fn no_panel_command_is_pressable_while_a_dialog_is_open() {
         let renderer = headless_renderer();
         let mut model = panel_model();

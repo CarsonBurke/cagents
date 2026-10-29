@@ -35143,6 +35143,70 @@ mod tests {
     }
 
     #[test]
+    fn source_control_load_without_optional_draft_keeps_conflicts_and_composer() {
+        use crate::repository::{
+            ChangeArea, ChangeKind, ChangedPath, ConflictKind, GitOperationKind, GitOperationState,
+            RepositorySnapshot, StatusSnapshot, WorkingFiles,
+        };
+
+        for draft in ["", "My conflict resolution"] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+            app.sidebar_state
+                .apply(&SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: draft.into(),
+                });
+            let operation = GitOperationState {
+                kind: GitOperationKind::Merge,
+                incoming_ref: Some("a".repeat(40)),
+                message: None,
+            };
+            let path = crate::repository::RepoPath::parse("conflicted.txt").unwrap();
+            let mut status = StatusSnapshot::default();
+            status.dirty.conflicted = 1;
+            status.entries.push(ChangedPath {
+                path: path.clone(),
+                old_path: None,
+                area: ChangeArea::Conflict,
+                kind: ChangeKind::Unmerged,
+                conflict: Some(ConflictKind::BothModified),
+                submodule: false,
+                added_lines: None,
+                removed_lines: None,
+            });
+            let snapshot = RepositorySnapshot {
+                operation: Some(operation.clone()),
+                stashes: Vec::new(),
+                last_fetch_unix_ms: None,
+                status,
+                files: WorkingFiles::default(),
+                remotes: Vec::new(),
+                local_refs: Vec::new(),
+                remote_refs: Vec::new(),
+                remote_heads: Vec::new(),
+            };
+            let model = SourceControlModel::ready(key.clone(), &snapshot);
+            drop(app.update(Message::SourceControlLoaded {
+                key: key.clone(),
+                request: app.refresh_ui.source_generation,
+                result: Ok(Some(Box::new((snapshot, model)))),
+            }));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert_eq!(source.data_state, sidebar::SidebarDataState::Ready);
+            assert_eq!(source.operation.as_ref(), Some(&operation));
+            let conflicts = source.group(ChangeArea::Conflict).unwrap();
+            assert_eq!(conflicts.rows().len(), 1);
+            assert_eq!(conflicts.rows()[0].entry.path, path);
+            assert_eq!(app.sidebar_state.commit_message(), draft);
+            assert!(source.error.is_none());
+        }
+    }
+
+    #[test]
     fn discard_expiry_keeps_newer_receipts_and_other_worktree_notices() {
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();

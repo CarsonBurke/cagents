@@ -5175,6 +5175,179 @@ fn operation_message_prefill_uses_the_repository_comment_policy() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn optional_merge_draft_fault_keeps_conflict_snapshot_and_captured_diff() {
+    use cagents::repository::{GitOperationKind, WorktreeAuthority};
+
+    for fault in ["absent", "oversized", "non_utf8", "not_regular"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("f.txt", b"base\n");
+        fixture.git_in_work(&["add", "."]);
+        fixture.commit("base");
+        fixture.git_in_work(&["switch", "-c", "incoming"]);
+        fixture.write("f.txt", b"theirs\n");
+        fixture.git_in_work(&["add", "."]);
+        let incoming = fixture.commit("incoming");
+        fixture.git_in_work(&["switch", "main"]);
+        fixture.write("f.txt", b"ours\n");
+        fixture.git_in_work(&["add", "."]);
+        fixture.commit("ours");
+        fixture.run_failing(&fixture.work(), &["merge", "incoming"]);
+
+        let authority = WorktreeAuthority::capture(&fixture.work()).unwrap();
+        let service = fixture
+            .service()
+            .with_worktree_authority(authority.clone())
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let message = fixture.work().join(".git/MERGE_MSG");
+        fs::remove_file(&message).unwrap();
+        match fault {
+            "absent" => {}
+            "oversized" => fs::File::create(&message)
+                .unwrap()
+                .set_len(1024 * 1024 + 1)
+                .unwrap(),
+            "non_utf8" => fs::write(&message, [0xff]).unwrap(),
+            "not_regular" => fs::create_dir(&message).unwrap(),
+            _ => unreachable!(),
+        }
+        authority.validate().unwrap();
+        let operation = service
+            .operation_state(&fixture.work(), &cancellation)
+            .expect("optional draft must not hide a required operation")
+            .unwrap();
+        assert_eq!(operation.kind, GitOperationKind::Merge, "{fault}");
+        assert_eq!(
+            operation.incoming_ref.as_deref(),
+            Some(incoming.as_str()),
+            "{fault}"
+        );
+        assert_eq!(operation.message, None, "{fault}");
+
+        // A fresh public snapshot cannot pass by returning an unchanged cache.
+        let snapshot = service
+            .snapshot(&fixture.work(), &cancellation)
+            .expect("optional draft must not discard the selected panel");
+        assert_eq!(snapshot.operation.as_ref(), Some(&operation), "{fault}");
+        assert_eq!(snapshot.status.dirty.conflicted, 1, "{fault}");
+        assert_eq!(
+            entry(&snapshot, ChangeArea::Conflict, "f.txt").conflict,
+            Some(ConflictKind::BothModified),
+            "{fault}"
+        );
+        let request = DiffRequest {
+            worktree: fixture.work(),
+            basis: DiffBasis::IndexToWorktree,
+            path: path("f.txt"),
+            old_path: None,
+        };
+        match service
+            .diff(&request, &cancellation)
+            .expect("captured required diff stays readable")
+        {
+            DiffContent::Unmerged {
+                base,
+                ours,
+                theirs,
+                worktree,
+            } => {
+                assert_eq!(text_side(&base), "base\n");
+                assert_eq!(text_side(&ours), "ours\n");
+                assert_eq!(text_side(&theirs), "theirs\n");
+                assert!(text_side(&worktree).contains("<<<<<<<"));
+            }
+            other => panic!("expected actual unmerged comparison: {other:?}"),
+        }
+        authority.validate().unwrap();
+
+        if fault == "absent" {
+            fs::write(fixture.work().join(".git/MERGE_HEAD"), [0xff]).unwrap();
+            assert!(
+                service
+                    .operation_state(&fixture.work(), &cancellation)
+                    .is_err(),
+                "required marker refusal must not become an absent operation"
+            );
+            assert!(service.snapshot(&fixture.work(), &cancellation).is_err());
+            fs::write(fixture.work().join(".git/MERGE_HEAD"), incoming.as_str()).unwrap();
+            fs::write(fixture.work().join(".git/index"), b"invalid index").unwrap();
+            authority.validate().unwrap();
+            assert!(
+                matches!(service.diff(&request, &cancellation),
+                Err(cagents::repository::RepositoryError::Process(error))
+                    if error.exit_code.is_some_and(|code| code != 0)),
+                "required index failure must not become an empty diff"
+            );
+        }
+    }
+}
+
+#[test]
+fn operation_draft_cleanup_process_failures_still_fail_the_snapshot() {
+    struct FailCleanup(ProcessFailureKind);
+    impl ProcessExecutor for FailCleanup {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "stripspace")
+            {
+                if self.0 == ProcessFailureKind::Exit {
+                    return Ok(ProcessOutput {
+                        stdout_truncated: false,
+                        exit_code: Some(7),
+                        signal: None,
+                        success: false,
+                        stdout: Vec::new(),
+                        stderr: b"injected nonzero draft cleanup".to_vec(),
+                    });
+                }
+                return Err(ProcessFailure {
+                    kind: self.0,
+                    program: command.program.clone(),
+                    exit_code: None,
+                    signal: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    message: "injected draft cleanup failure".into(),
+                    started: self.0 != ProcessFailureKind::Spawn,
+                });
+            }
+            SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)
+        }
+    }
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("f.txt", b"base\n");
+    fixture.git_in_work(&["add", "."]);
+    let head = fixture.commit("base");
+    fs::write(fixture.work().join(".git/MERGE_HEAD"), head.as_str()).unwrap();
+    fs::write(fixture.work().join(".git/MERGE_MSG"), "Generated draft\n").unwrap();
+    for kind in [
+        ProcessFailureKind::Cancelled,
+        ProcessFailureKind::Spawn,
+        ProcessFailureKind::Exit,
+    ] {
+        let service = RepositoryService::new(&fixture.git, Arc::new(FailCleanup(kind)));
+        assert!(
+            matches!(service.snapshot(&fixture.work(), &CancellationToken::new()),
+            Err(cagents::repository::RepositoryError::Process(error))
+                if error.kind == kind && (kind != ProcessFailureKind::Exit || error.exit_code == Some(7))),
+            "a valid optional draft does not downgrade cleanup {kind:?}"
+        );
+    }
+}
+
 #[test]
 fn conflict_side_resolution_handles_modify_delete_on_both_sides() {
     use cagents::repository::GitOperation;
