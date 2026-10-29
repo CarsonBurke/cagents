@@ -1,0 +1,92 @@
+{
+  "schema": 2,
+  "never_merge": true,
+  "prepared_only": true,
+  "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+  "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "contract_sources": [
+    {
+      "head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+      "path": ".github/workflows/qualify-recovery-products.yml",
+      "sha256": "5ed902501f1bba82391b2ae1d407dbcf7c0011604a3fd54b204b037f655973cb"
+    }
+  ],
+  "products": [
+    {
+      "pr": 1726,
+      "head": "40a574dcb5fdb8a96986412399324fda07598032",
+      "tree": "ae66e2f08cc0dce6388db46efe27f80ed77aedd8",
+      "selectors": [
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+      ],
+      "source_paths": [
+        "src/app.rs",
+        "src/app/shared_views.rs",
+        "src/settings.rs",
+        "src/persistence.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "Actual headless production app reducers, real SettingsSave/final-save worker and temporary Settings/SQLite stores. The three original equal-read scenarios and all original assertion predicates remain unchanged. This source adds only scenario and saved/result Err diagnostics before the original success assertion and before ACK application; it is not a causal repair. No native window, provider, terminal or executable helper is launched by the controller.",
+      "selector_sources": {
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs"
+      },
+      "source_sha256": {
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
+        "src/app/shared_views.rs": "6eede63fa8f4d19ccfe14d088483483b7a7ba94e1a592050750e0d01b15d61fa",
+        "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de",
+        "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+      },
+      "source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490739169"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "1726-ui",
+      "pr": 1726,
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+      ],
+      "matched_helper": false
+    }
+  ],
+  "original_negative": {
+    "pr": 1959,
+    "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+    "run_id": 40828554073,
+    "artifact_id": 12878074392,
+    "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a",
+    "product_pr": 1726,
+    "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+    "phase": "1726-ui-parent-5",
+    "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+    "outer_result": {
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    "command_exit": 101,
+    "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+    "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+    "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+    "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair."
+  },
+  "limits": [
+    "Temporary isolated research control only; never merge. Preparation is not queue admission, publication or dispatch authorization. Parent must grant a shared lane before execution.",
+    "One serial hosted job, CARGO_BUILD_JOBS=2, one browserless UI target and one isolated UI binary check followed by one exact compiled inventory and one exact parent invocation. Exactly three planned phases; planned counts are not executed results. No CLI/HOST builds, graph unification, helper build, provider or native launcher.",
+    "Natural hosted User context is mandatory: refuse every inherited CAGENTS_ name by presence without reading values or clearing authority. Source Cargo checkout-root configuration stays intact.",
+    "Pin exact source head/tree/clean status, source hashes, build configuration/input hashes, control head/tree/workflow and proven setup action. Recheck source/config/context around every command; retain original stdout/stderr/command/exits/digests and final source state.",
+    "Each command retains GNU timeout2700s plus30s TERM-to-KILL grace and direct-wrapper wait accounting. Uncertain timeout/signal/wrapper, context, source or config faults stop globally; ordinary settled check/inventory/parent failure stops dependent phases and fails qualification. No retry, ignored-test waiver or evidence replacement.",
+    "One exact inventory entry and one matching named outer parent plus a single1P0F0I summary are required for success. A real runtime failure remains a failure while its raw diagnostic payload is retained; inner lines are never salvaged.",
+    "All three scenarios, original production Arc/no-op/title guards, real final-save/settings-writer ownership and original ten assertion predicates are preserved in the pinned source. Obtain actual saved/result Err before proposing a causal correction; no speculative repair is included.",
+    "The previous final-save negative and earlier cancelled-close negative remain at original source/run scopes. No prior pass transfers to this source.",
+    "No native close/recovery interaction, matched screenshots, UX acceptance, responsiveness, whole feature suite, integrated-browser, commercial provider or merge readiness is established. All current Cargo/test/helper/native/provider/workflow execution is UNRUN."
+  ]
+}
