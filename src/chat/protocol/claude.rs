@@ -2863,6 +2863,12 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
                 thinking,
                 delta,
             },
+            Event::InputDelta { id, offset, delta } => Event::SubagentInputDelta {
+                id: parent.into(),
+                item_id: id,
+                offset,
+                delta,
+            },
             Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
                 id: parent.into(),
                 ids,
@@ -7968,6 +7974,216 @@ mod tests {
         );
         let finished = adapter.receive(json!({"type":"user","uuid":"result-carrier","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Done"}]}})).unwrap();
         assert!(finished.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn child_tool_input_fragments_keep_child_scope_and_offsets() {
+        let mut adapter = Claude::default();
+        let frame = |parent: Option<&str>, event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        for (parent, message, tool) in [
+            (None, "parent-message", "parent-tool"),
+            (Some("child-one"), "child-message", "child-tool"),
+            (Some("child-two"), "sibling-message", "sibling-tool"),
+        ] {
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"message_start","message":{"id":message}}),
+                ))
+                .unwrap();
+            adapter.receive(frame(parent, json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool,"name":"CustomTool"}}))).unwrap();
+        }
+        let mut offset = 0;
+        for delta in ["{\"payload\":\"", "🦀", "tail"] {
+            let child = adapter.receive(frame(Some("child-one"), json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}))).unwrap();
+            assert!(
+                matches!(child.events.as_slice(), [Event::SubagentInputDelta { id, item_id, offset: actual, delta: fragment }] if id == "child-one" && item_id == "child-tool" && *actual == offset && fragment == delta)
+            );
+            offset += delta.len();
+        }
+        for (parent, tool) in [(None, "parent-tool"), (Some("child-two"), "sibling-tool")] {
+            let step = adapter.receive(frame(parent, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"own prefix"}}))).unwrap();
+            if let Some(parent) = parent {
+                assert!(
+                    matches!(step.events.as_slice(), [Event::SubagentInputDelta { id, item_id, offset: 0, delta }] if id == parent && item_id == tool && delta == "own prefix")
+                );
+            } else {
+                assert!(
+                    matches!(step.events.as_slice(), [Event::InputDelta { id, offset: 0, delta }] if id == tool && delta == "own prefix")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_child_tool_input_survives_through_runtime_and_store() {
+        // Only transport is replaced: actual Claude frames feed the real
+        // actor and SQLite Store. No provider initialization or live RPC runs.
+        struct ChildInputFrames {
+            adapter: Claude,
+            batches: std::collections::VecDeque<Vec<Value>>,
+        }
+        impl Adapter for ChildInputFrames {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Capabilities(self.adapter.capabilities()),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if !matches!(command, Command::Compact) {
+                    return Err("Unexpected child-input fixture command".into());
+                }
+                let mut step = Step::default();
+                for frame in self
+                    .batches
+                    .pop_front()
+                    .ok_or("No child-input fixture batch")?
+                {
+                    let received = self.adapter.receive(frame)?;
+                    if !received.writes.is_empty() {
+                        return Err("Child-input fixture attempted a provider RPC".into());
+                    }
+                    step.events.extend(received.events);
+                }
+                Ok(step)
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Err("Unexpected child-input fixture transport frame".into())
+            }
+        }
+        fn input<'a>(snapshot: &'a chat::Snapshot, child: Option<&str>, tool: &str) -> &'a str {
+            let items = if let Some(child) = child {
+                &snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == child)
+                    .unwrap()
+                    .items
+            } else {
+                &snapshot.items
+            };
+            match &items.iter().find(|item| item.id == tool).unwrap().content {
+                ItemContent::Tool { input, .. } => input,
+                other => panic!("expected a streamed tool, got {other:?}"),
+            }
+        }
+        let frame = |parent: Option<&str>, event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        let mut starts = Vec::new();
+        for (parent, message, tool) in [
+            (None, "parent-message", "parent-tool"),
+            (Some("child-one"), "child-message", "child-tool"),
+            (Some("child-two"), "sibling-message", "sibling-tool"),
+        ] {
+            starts.push(frame(
+                parent,
+                json!({"type":"message_start","message":{"id":message}}),
+            ));
+            starts.push(frame(parent, json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool,"name":"CustomTool"}})));
+        }
+        let mut adapter = ChildInputFrames {
+            adapter: Claude::default(),
+            batches: vec![
+                starts,
+                vec![
+                    frame(None, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"parent\":\"local"}})),
+                    frame(Some("child-one"), json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"payload\":\""}})),
+                    frame(Some("child-two"), json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"sibling\":\"other"}})),
+                ],
+                vec![
+                    frame(Some("child-one"), json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"🦀"}})),
+                    frame(Some("child-one"), json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" unfinished"}})),
+                ],
+                // Moving to another message abandons the partial block without
+                // the full-item repair that normally accompanies block stop.
+                vec![frame(Some("child-one"), json!({"type":"message_start","message":{"id":"child-retry"}}))],
+                vec![json!({"type":"assistant","uuid":"child-repair","parent_tool_use_id":"child-one","message":{"id":"child-message","content":[{"type":"tool_use","id":"child-tool","name":"CustomTool","input":{"payload":"🦀 repaired"}}]}})],
+                // The sibling never receives a whole assistant frame or block
+                // stop. Its streamed prefix must survive the failed turn.
+                vec![json!({"type":"result","subtype":"error_during_execution","uuid":"parent-failed","is_error":true,"errors":["fixture failure"]})],
+            ].into(),
+        };
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: super::super::TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: std::collections::BTreeMap::new(),
+        };
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                .unwrap();
+        handle.command(Command::Compact).unwrap();
+        handle.command(Command::Compact).unwrap();
+        let partial = handle.snapshot(None).unwrap();
+        assert!(
+            partial.error.is_none(),
+            "child input must not enter the parent's uncached-item path: {:?}",
+            partial.error
+        );
+        assert_eq!(input(&partial, None, "parent-tool"), "{\"parent\":\"local");
+        assert_eq!(
+            input(&partial, Some("child-one"), "child-tool"),
+            "{\"payload\":\""
+        );
+        assert_eq!(
+            input(&partial, Some("child-two"), "sibling-tool"),
+            "{\"sibling\":\"other"
+        );
+        assert_eq!(
+            partial.items.len(),
+            1,
+            "child tools must remain outside the parent transcript"
+        );
+        handle.command(Command::Compact).unwrap();
+        let streamed = handle.snapshot(None).unwrap();
+        assert_eq!(
+            input(&streamed, Some("child-one"), "child-tool"),
+            "{\"payload\":\"🦀 unfinished"
+        );
+        assert_eq!(
+            input(&streamed, None, "parent-tool"),
+            input(&partial, None, "parent-tool")
+        );
+        handle.command(Command::Compact).unwrap();
+        let interrupted = handle.snapshot(None).unwrap();
+        assert_eq!(
+            input(&interrupted, Some("child-one"), "child-tool"),
+            input(&streamed, Some("child-one"), "child-tool")
+        );
+        assert!(interrupted.error.is_none());
+        handle.command(Command::Compact).unwrap();
+        let repaired = handle.snapshot(None).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(input(&repaired, Some("child-one"), "child-tool"))
+                .unwrap(),
+            json!({"payload":"🦀 repaired"})
+        );
+        assert_eq!(
+            input(&repaired, None, "parent-tool"),
+            input(&partial, None, "parent-tool")
+        );
+        handle.command(Command::Compact).unwrap();
+        let failed = handle.snapshot(None).unwrap();
+        assert!(!failed.busy);
+        assert_eq!(failed.activity(), crate::agent::ActivityState::Idle);
+        assert_eq!(
+            input(&failed, Some("child-two"), "sibling-tool"),
+            "{\"sibling\":\"other"
+        );
+        assert_eq!(
+            input(&failed, None, "parent-tool"),
+            input(&partial, None, "parent-tool")
+        );
+        handle.close().unwrap();
     }
 
     #[test]
