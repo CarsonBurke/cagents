@@ -47,12 +47,16 @@ impl Store {
             Err(error) => return Err(error),
         };
         let lock = crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)?;
+        // SAFETY: geteuid has no preconditions or side effects.
+        let uid = unsafe { libc::geteuid() };
         let verify = || {
             namespace.revalidate()?;
+            let directory = fs::symlink_metadata(&self.directory)?;
+            if directory.uid() != uid || directory.mode() & 0o077 != 0 {
+                return Err(unsafe_entry());
+            }
             let held = lock.metadata()?;
             let named = fs::symlink_metadata(&lock_path)?;
-            // SAFETY: geteuid has no preconditions or side effects.
-            let uid = unsafe { libc::geteuid() };
             if !held.is_file()
                 || !named.is_file()
                 || held.uid() != uid
@@ -95,6 +99,7 @@ impl Store {
                 (Some(file), Ok(named)) => {
                     let held = file.metadata()?;
                     if !named.is_file()
+                        || named.uid() != uid
                         || named.nlink() != 1
                         || named.mode() & 0o077 != 0
                         || (held.dev(), held.ino()) != (named.dev(), named.ino())
@@ -354,5 +359,27 @@ mod tests {
         );
         assert!(!store.path().exists());
         assert!(original.join(FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn initialization_does_not_confirm_or_repair_permissions_changed_during_the_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("registry"));
+        store.try_initialize_installation_id().unwrap();
+        assert!(
+            store
+                .initialize_installation_with_io(
+                    || panic!("no publication"),
+                    |namespace| {
+                        fs::set_permissions(&store.directory, fs::Permissions::from_mode(0o755))?;
+                        namespace.sync()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::metadata(&store.directory).unwrap().mode() & 0o777,
+            0o755
+        );
     }
 }
