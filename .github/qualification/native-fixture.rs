@@ -103,7 +103,13 @@ fn client(
     held: Session,
 ) {
     let writer = Arc::new(Mutex::new(stream.try_clone().expect("private fixture writer")));
+    let mut admitted: Option<Session> = None;
     while let Ok(Some(request)) = terminal_ipc::read_frame::<ClientEnvelope>(&mut stream) {
+        let visible_chat = match &request.request {
+            ClientRequest::ChatVisibility { chat_id, visible: true }
+                if admitted.as_ref().is_some_and(|session| session.id == *chat_id) => Some(*chat_id),
+            _ => None,
+        };
         match &request.request {
             ClientRequest::ChatAttach { .. } => record(&root, "effect-request-chat-attach"),
             ClientRequest::ChatStart { .. } => record(&root, "effect-request-chat-start"),
@@ -171,6 +177,14 @@ fn client(
                 let model = &mut fixture.model;
                 let result: Result<(), String> = (|| {
                     match edit {
+                        ModelEdit::OpenProject { repository, name, kind }
+                            if repository == model.projects[0].repository
+                                && kind == ProjectKind::Folder
+                                && (name == "project" || name == model.projects[0].name) =>
+                        {
+                            model.projects[0].name = name;
+                            record(&root, "private-project-open-accepted");
+                        }
                         ModelEdit::SeedView {
                             scope,
                             panes,
@@ -236,7 +250,10 @@ fn client(
                             model.channels[0].title_source = source;
                             record(&root, "hidden-healthy-ready-title-published");
                         }
-                        _ => return Err("Mutation outside this native fixture".into()),
+                        other => {
+                            record(&root, &format!("UNEXPECTED-unsupported-model-edit-{:?}", std::mem::discriminant(&other)));
+                            return Err("Mutation outside this native fixture".into());
+                        }
                     }
                     model.sequence += 1;
                     Ok(())
@@ -250,7 +267,10 @@ fn client(
                     Err(_) => error("Synthetic fixture refused an inadmissible workspace edit"),
                 }
             }
-            ClientRequest::List | ClientRequest::WatchTerminals => ServerMessage::Response {
+            ClientRequest::WatchTerminals => ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+            ClientRequest::List => ServerMessage::Response {
                 response: ServerResponse::Listed { terminals: vec![] },
             },
             ClientRequest::ChatList => ServerMessage::Response {
@@ -280,6 +300,7 @@ fn client(
                             "repaired-held-attach-requested"
                         },
                     );
+                    admitted = Some(session.clone());
                     ServerMessage::Response {
                         response: ServerResponse::ChatAttached {
                             snapshot: snapshot(&session),
@@ -291,18 +312,36 @@ fn client(
                     error("Synthetic pane is unverified")
                 }
             }
-            ClientRequest::ChatRead { chat_id, .. } => ServerMessage::Response {
-                response: ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: None,
-                },
-            },
-            ClientRequest::ChatVisibility { .. }
-            | ClientRequest::ChatAcknowledge { .. }
+            ClientRequest::ChatRead { chat_id, after_generation } => {
+                if let Some(session) = admitted.as_ref().filter(|session| session.id == chat_id) {
+                    let snapshot = snapshot(session);
+                    ServerMessage::Response { response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: after_generation.is_none_or(|generation| generation < snapshot.generation).then_some(snapshot),
+                    }}
+                } else {
+                    record(&root, "UNEXPECTED-unadmitted-chat-read");
+                    error("Read requires an exact previously admitted synthetic actor")
+                }
+            }
+            ClientRequest::ChatVisibility { chat_id, .. } => {
+                if admitted.as_ref().is_some_and(|session| session.id == chat_id) {
+                    ServerMessage::Response { response: ServerResponse::Accepted }
+                } else {
+                    record(&root, "UNEXPECTED-unadmitted-chat-visibility");
+                    error("Visibility requires an exact previously admitted synthetic actor")
+                }
+            }
+            ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatDetach { .. } => ServerMessage::Response {
                 response: ServerResponse::Accepted,
             },
-            ClientRequest::WatchNotifications { .. } => ServerMessage::Response {
+            ClientRequest::NotificationPresence { .. }
+            | ClientRequest::NotificationPreferencesChanged { .. }
+            | ClientRequest::AcknowledgeNotification { .. } => ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+            ClientRequest::WatchNotifications { .. } | ClientRequest::ReadNotifications => ServerMessage::Response {
                 response: ServerResponse::Notifications {
                     snapshot: Default::default(),
                 },
@@ -343,6 +382,7 @@ fn client(
                 // One exact synthetic protocol response, with no process or
                 // provider launch. Every other provider effect remains fatal.
                 session.proof = Some(proof());
+                admitted = Some(session.clone());
                 fs::write(root.join("ordinary-recovered-chat-id"), session.id.to_string()).unwrap();
                 record(&root, "ordinary-exact-history-start-accepted");
                 ServerMessage::Response { response: ServerResponse::ChatAttached {
@@ -364,7 +404,10 @@ fn client(
                 record(&root, "UNEXPECTED-runtime-close");
                 error("This fixture never closes a provider")
             }
-            _ => error("Request outside this synthetic native fixture"),
+            other => {
+                record(&root, &format!("UNEXPECTED-unsupported-request-{:?}", std::mem::discriminant(&other)));
+                error("Request outside this synthetic native fixture")
+            }
         };
         if terminal_ipc::write_frame(
             &mut *writer.lock().unwrap(),
@@ -378,6 +421,12 @@ fn client(
         .is_err()
         {
             break;
+        }
+        if let Some(chat_id) = visible_chat {
+            if terminal_ipc::write_frame(&mut *writer.lock().unwrap(), &ServerEnvelope {
+                version: terminal_ipc::PROTOCOL_VERSION, request_id: None,
+                proof: proof(), message: ServerMessage::ChatChanged { chat_id },
+            }).is_err() { break; }
         }
         if explicit_read { record(&root, "explicit-read-replied"); }
         let start_performance = if watching && std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") {

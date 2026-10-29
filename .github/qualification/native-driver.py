@@ -13,6 +13,7 @@ import tempfile
 import time
 
 import pyatspi
+from gi.repository import GLib
 from PIL import Image
 
 control, before, after = map(Path, sys.argv[1:4])
@@ -30,6 +31,7 @@ receipts = []
 children = []
 stopped = set()
 viewport = (1280, 800)
+stale_accessibility_retries = 0
 
 
 def cancelled(signum, frame):
@@ -62,13 +64,28 @@ def run(args, **kwargs):
 
 
 def wait(predicate, timeout=30):
+    global stale_accessibility_retries
     end = time.monotonic() + timeout
+    last_stale = None
     while time.monotonic() < end:
-        result = predicate()
+        try:
+            result = predicate()
+        except GLib.Error as error:
+            if 'Unknown object' not in str(error):
+                raise
+            last_stale = error
+            stale_accessibility_retries += 1
+            result = None
         if result:
             return result
         time.sleep(.15)
-    raise RuntimeError('Native condition did not settle within its deadline')
+    raise RuntimeError('Native condition did not settle within its deadline') from last_stale
+
+
+def accessibility_snapshot(query):
+    # An accessible can disappear between traversal and property lookup during
+    # a genuine frame update. Retry the whole read, never an input gesture.
+    return wait(lambda: (query(),))[0]
 
 
 def digest(path):
@@ -113,7 +130,23 @@ def capture(window, name, size):
     viewport = size
     time.sleep(.6)
     png = out / (name + '.png')
-    run(['import', '-window', window, str(png)])
+    def rendered_frame():
+        run(['import', '-screen', '-window', window, str(png)])
+        with Image.open(png) as picture:
+            assert picture.size == size, (picture.size, size)
+            rgb = picture.convert('RGB')
+            histogram = rgb.convert('L').histogram()
+            levels = [level for level, count in enumerate(histogram) if count]
+            lit = sum(histogram[9:]) / (picture.width * picture.height)
+            diverse = rgb.getcolors(maxcolors=15) is None
+            metrics = {'size': list(picture.size), 'pixels_above_intensity_8_fraction': lit,
+                       'luminance_range': max(levels) - min(levels), 'at_least_16_colors': diverse,
+                       'backend_requested': 'tiny-skia', 'capture': 'visible screen pixels for owned window'}
+            (out / (name + '-frame.json')).write_text(json.dumps(metrics, indent=2) + '\n')
+            return diverse and lit > .01 and metrics['luminance_range'] >= 16
+    wait(rendered_frame, timeout=20)
+    if name.endswith('-wide'):
+        run(['import', '-window', window, str(out / (name + '-drawable.png'))])
     with Image.open(png) as picture:
         assert picture.size == size, (picture.size, size)
         picture.save(out / (name + '.webp'), lossless=True)
@@ -367,6 +400,7 @@ try:
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
+            env['ICED_BACKEND'] = 'tiny-skia'
             env['LIBGL_ALWAYS_SOFTWARE'] = '1'
             with (out / (label + '-fixture.log')).open('w') as log:
                 fixture = subprocess.Popen([str(helper), str(root), mode], env=env, stdout=log,
@@ -428,8 +462,8 @@ try:
             capture(window, label + '-wide', (1280, 800))
             capture(window, label + '-narrow', (900, 700))
             run(['xdotool', 'key', 'Tab', 'shift+Tab'])
-            focused = [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)
-                       if node.getState().contains(pyatspi.STATE_FOCUSED)]
+            focused = accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)
+                       if node.getState().contains(pyatspi.STATE_FOCUSED)])
             (out / (label + '-focused.json')).write_text(json.dumps(focused, indent=2))
             capture(window, label + '-keyboard', (900, 700))
             if payload == 'long':
@@ -548,7 +582,7 @@ try:
                 wait(lambda: any(node.name == 'Message' and node.getState().contains(pyatspi.STATE_FOCUSED)
                                  for node in live_tree(pid)))
                 capture(window, label + '-removed', (1280, 800))
-            names = [{'name': node.name, 'role': node.getRoleName()} for node in tree(pid)]
+            names = accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)])
             (out / (label + '-accessibility.json')).write_text(json.dumps(names, indent=2))
             database = Path((root / 'database-path').read_text())
             key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:quarantined_panes'
@@ -641,6 +675,8 @@ finally:
                 if (root / name).is_file():
                     (out / (root.name + '-' + name)).write_bytes((root / name).read_bytes())
     (out / 'cleanup.json').write_text(json.dumps({'errors': cleanup_errors, 'subreaper': True}, indent=2) + '\n')
+    (out / 'accessibility-retries.json').write_text(json.dumps({'unknown_object_retries': stale_accessibility_retries,
+        'scope': 'Bounded whole-query retry for AT-SPI Unknown object only; no input gesture is retried.'}, indent=2) + '\n')
     if not cleanup_errors:
         (out / 'cleanup-complete').write_text('Owned descendant families observed inactive; private native fixture closed.\n')
     (out / 'native-receipts.json').write_text(json.dumps(receipts, indent=2) + '\n')
