@@ -1564,6 +1564,20 @@ fn start_with_execution(
                 .clone()
                 .ok_or_else(|| unavailable("Retained startup lost its pinned execution context"))?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // Preparation above may have crossed ordinary-exit intent. The
+            // final startup publication is the spawn fence: cancellation must
+            // have an exact HOST entry to capture before a helper can exist.
+            if state.shutting_down
+                || session.proof.as_ref() != Some(state.proof())
+                || state.chat_spawning.get(&reservation_id) != Some(&startup_source)
+                || admission
+                    .as_ref()
+                    .is_none_or(|reservation| !reservation.holds(&state, reservation_id))
+            {
+                return Err(unavailable(
+                    "Native startup admission changed before helper creation",
+                ));
+            }
             if state.native_actor_startups.contains_key(&id) {
                 return Err(unavailable(
                     "An exact retained startup still owns cleanup; no second helper was started",
@@ -1669,7 +1683,9 @@ fn start_with_execution(
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);
-            let _ = handle.close();
+            if !remote {
+                let _ = handle.close();
+            }
             return Err(unavailable("Daemon shutdown cancelled chat start"));
         }
         let observation = Observation {
@@ -1727,7 +1743,9 @@ fn start_with_execution(
                 .is_some_and(|current| current.handle.owns_work())
         {
             drop(state);
-            let _ = record.handle.close();
+            if !remote {
+                let _ = record.handle.close();
+            }
             return Err(unavailable(
                 "Native startup ownership changed before attachment publication",
             ));
@@ -1797,6 +1815,11 @@ fn start_with_execution(
                         // authority. A successful attachment must not hide SDK exit.
                         let target = {
                             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                            if state.shutting_down {
+                                return Err(unavailable(format!(
+                                    "{message}. Ordinary shutdown retains the exact semantic cleanup owner"
+                                )));
+                            }
                             let record = state.chats.get(&id).ok_or_else(|| {
                                 unavailable("The unconfirmed conversation lost its cleanup owner")
                             })?;
@@ -3207,8 +3230,17 @@ impl CloseTarget {
     }
 
     fn require_current(&self, host: &SharedHost) -> Result<(), ProtocolError> {
+        self.require_current_with_shutdown(host, None)
+    }
+
+    fn require_current_with_shutdown(
+        &self,
+        host: &SharedHost,
+        shutdown: Option<&retained_actor::startup_shutdown::Capture>,
+    ) -> Result<(), ProtocolError> {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
+        if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+            || (state.shutting_down && shutdown.is_none())
             || state.chat_handoffs.contains_key(&self.source.id)
             || !state
                 .chats

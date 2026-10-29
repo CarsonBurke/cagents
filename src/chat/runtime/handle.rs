@@ -24,6 +24,15 @@ pub(crate) enum RetainedInputOutcome {
 }
 
 impl Handle {
+    pub(in crate::chat) fn from_remote(remote: RemoteActor) -> Self {
+        Self(Owner::Remote(remote))
+    }
+    pub(crate) fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        match &self.0 {
+            Owner::Remote(remote) => remote.original_helper_wait_proof(),
+            Owner::Local(_) => chat::protocol::HelperWaitProof::NoParentChild,
+        }
+    }
     /// A real remote proxy with no external provider or helper. The returned
     /// responder waits for actual production admission before settling it.
     #[cfg(test)]
@@ -720,6 +729,12 @@ impl chat::protocol::LaunchCleanup for Handle {
             Owner::Local(local) => local.cleanup(),
             Owner::Remote(remote) => remote.cleanup(),
         }
+    }
+    fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        self.original_helper_wait_proof()
+    }
+    fn retained_handle(&self) -> Option<Handle> {
+        matches!(&self.0, Owner::Remote(_)).then(|| self.clone())
     }
 }
 #[cfg(test)]

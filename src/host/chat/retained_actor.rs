@@ -9,14 +9,25 @@ use std::{
     sync::{Condvar, Mutex},
 };
 
+pub(in crate::host) mod startup_shutdown;
+
 #[derive(Clone)]
 pub(in crate::host) struct Startup {
-    pub(super) source: Session,
-    pub(super) requested: Session,
-    pub(super) context: Arc<chat::protocol::ExecutionContext>,
+    pub(in crate::host) source: Session,
+    pub(in crate::host) requested: Session,
+    pub(in crate::host) context: Arc<chat::protocol::ExecutionContext>,
     /// An initial named resume failed after installation. Only this exact
     /// attachment may finish its normal semantic close before a retry starts.
-    pub(super) failed_close: Option<super::CloseTarget>,
+    pub(in crate::host) failed_close: Option<super::CloseTarget>,
+}
+
+impl Startup {
+    pub(in crate::host) fn matches(&self, captured: &Self) -> bool {
+        self.source == captured.source
+            && self.requested == captured.requested
+            && Arc::ptr_eq(&self.context, &captured.context)
+            && startup_shutdown::same_target(&self.failed_close, &captured.failed_close)
+    }
 }
 
 #[cfg(test)]
@@ -564,10 +575,13 @@ pub(super) fn forget_startup(
     context: &Arc<chat::protocol::ExecutionContext>,
 ) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state
-        .native_actor_startups
-        .get(&source.id)
-        .is_some_and(|pending| &pending.source == source && Arc::ptr_eq(&pending.context, context))
+    if !state.shutting_down
+        && state
+            .native_actor_startups
+            .get(&source.id)
+            .is_some_and(|pending| {
+                &pending.source == source && Arc::ptr_eq(&pending.context, context)
+            })
     {
         state.native_actor_startups.remove(&source.id);
     }
@@ -588,12 +602,20 @@ pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<b
         {
             return Err("The retained startup belongs to another exact descriptor or is still transitioning".into());
         }
-        (pending.source.clone(), pending.context.clone())
+        pending.clone()
     };
-    match pending.1.reconcile_cleanup()? {
+    if matches!(
+        pending.context.ownership_snapshot().kind,
+        chat::protocol::LaunchOwnerKind::RemoteActor { .. }
+    ) {
+        startup_shutdown::cleanup_normal_startup(host, &pending)?;
+        forget_startup(host, &pending.source, &pending.context);
+        return Ok(true);
+    }
+    match pending.context.reconcile_cleanup()? {
         chat::protocol::LaunchOutcome::NoProvider
         | chat::protocol::LaunchOutcome::TeardownProved => {
-            forget_startup(host, &pending.0, &pending.1);
+            forget_startup(host, &pending.source, &pending.context);
             Ok(true)
         }
         chat::protocol::LaunchOutcome::Uncertain => Err(
@@ -756,7 +778,7 @@ pub(super) fn restore(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
-    restore_actor(host, client, requested, proof, owner, true, None)
+    restore_actor(host, client, requested, proof, owner, true, None, None)
 }
 
 /// A failed cleanup attachment is not a user request to return to a terminal.
@@ -800,6 +822,7 @@ pub(super) fn recover_cleanup_attachment(
         identity.record,
         true,
         Some(&target),
+        None,
     )?;
     Ok(())
 }
@@ -834,7 +857,7 @@ pub(super) fn restore_cleanup_for_test(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
-    restore_actor(host, 0, requested, proof, owner, false, None)
+    restore_actor(host, 0, requested, proof, owner, false, None, None)
 }
 
 fn restore_actor(
@@ -845,7 +868,11 @@ fn restore_actor(
     owner: crate::daemon::holder_registry::Record,
     publish_snapshot: bool,
     replacing: Option<&super::CloseTarget>,
+    shutdown: Option<&startup_shutdown::Capture>,
 ) -> Result<ServerResponse, String> {
+    if let Some(capture) = shutdown {
+        capture.require_host(host)?;
+    }
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
         || inspection.source.id != requested.id
@@ -866,6 +893,24 @@ fn restore_actor(
         {
             return Err("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into());
         }
+    }
+    if let Some(capture) = shutdown {
+        capture.require_inspection(
+            &inspection.identity,
+            &inspection.source,
+            &inspection.previous_sources,
+        )?;
+        capture.enroll_uninstalled(
+            host,
+            &inspection.identity,
+            &inspection.source,
+            &inspection.previous_sources,
+            inspection
+                .launch_account_scope
+                .as_ref()
+                .map_err(String::as_str),
+            inspection.state.installed,
+        )?;
     }
     if !publish_snapshot {
         verify_close_ownership(
@@ -1010,7 +1055,8 @@ fn restore_actor(
         }
         _ => false,
     };
-    if state.shutting_down
+    if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+        || (state.shutting_down && shutdown.is_none())
         || state.proof() != proof
         || !pair_unchanged
         || match replacing {
@@ -1110,7 +1156,7 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None, None)
+    close_with_target(host, requested, discovered, None, None, None)
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -1120,7 +1166,7 @@ pub(super) fn close_captured(
     target: &super::CloseTarget,
     closing: Option<&super::capacity::Reservation>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target), closing)
+    close_with_target(host, requested, None, Some(target), closing, None)
 }
 
 fn close_with_target(
@@ -1129,6 +1175,7 @@ fn close_with_target(
     discovered: Option<crate::daemon::holder_registry::Record>,
     expected: Option<&super::CloseTarget>,
     closing: Option<&super::capacity::Reservation>,
+    shutdown: Option<&startup_shutdown::Capture>,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -1145,7 +1192,8 @@ fn close_with_target(
     }
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
+        if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+            || (state.shutting_down && shutdown.is_none())
             || closing.map_or_else(
                 || state.chat_spawning.contains_key(&requested.id),
                 |closing| !closing.holds(&state, requested.id),
@@ -1180,7 +1228,7 @@ fn close_with_target(
         .contains_key(&requested.id);
     if !present {
         if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
-            return close_verified_unattached(host, requested, &proof, verified);
+            return close_verified_unattached(host, requested, &proof, verified, shutdown);
         }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
@@ -1189,7 +1237,16 @@ fn close_with_target(
                     .into(),
             );
         }
-        restore_actor(host, 0, requested, &proof, owner.clone(), false, None)?;
+        restore_actor(
+            host,
+            0,
+            requested,
+            &proof,
+            owner.clone(),
+            false,
+            None,
+            shutdown,
+        )?;
     }
     let (handle, source, paired, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1197,6 +1254,9 @@ fn close_with_target(
             .chats
             .get(&requested.id)
             .ok_or("The retained actor changed during cleanup admission")?;
+        if let Some(capture) = shutdown {
+            capture.require_state(&state)?;
+        }
         if expected.is_some_and(|expected| !expected.matches(record)) {
             return Err(
                 "The exact hosted attachment changed during retained cleanup admission".into(),
@@ -1302,6 +1362,10 @@ fn close_with_target(
                 return Err("The closed helper lacks its exact semantic-retirement receipt".into());
             }
         };
+    if let Some(capture) = shutdown {
+        capture.require_host(host)?;
+        capture.require_inspection(&identity, &issued, &lineage)?;
+    }
     verify_close_ownership(
         host,
         &identity,
@@ -1325,13 +1389,13 @@ fn close_with_target(
             .preflight_agent_retirement(retained)?;
     }
     target
-        .require_current(host)
+        .require_current_with_shutdown(host, shutdown)
         .map_err(|error| error.message)?;
     if retired.is_none() {
         handle.close()?;
     }
     target
-        .require_current(host)
+        .require_current_with_shutdown(host, shutdown)
         .map_err(|error| error.message)?;
     if let Some((terminal, worker)) = &paired {
         let current = {
@@ -1350,7 +1414,7 @@ fn close_with_target(
         worker.close_with_receipt(terminal, &proof)?;
     }
     target
-        .require_current(host)
+        .require_current_with_shutdown(host, shutdown)
         .map_err(|error| error.message)?;
     if let Some(verified) = retired {
         publish_verified_retirement(host, &handle, &source, verified)?;
@@ -1358,13 +1422,14 @@ fn close_with_target(
         finish_close(host, &handle, &source)?;
     }
     target
-        .require_current(host)
+        .require_current_with_shutdown(host, shutdown)
         .map_err(|error| error.message)?;
     // Keep the closed record retryable until durable process retirement succeeds.
     super::super::agent_execution::retired(host, &source)?;
     let removed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.proof() != &proof
+        if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+            || state.proof() != &proof
             || !state
                 .chats
                 .get(&source.id)
@@ -1388,17 +1453,19 @@ fn close_with_target(
         // Ordinary Close may finish a previously failed initialization too.
         // Clear only the startup captured by this fully retired attachment;
         // a replacement owner or an unproved teardown retains its reservation.
-        if removed.as_ref().is_some_and(|record| {
-            state
-                .native_actor_startups
-                .get(&source.id)
-                .is_some_and(|pending| {
-                    pending
-                        .failed_close
-                        .as_ref()
-                        .is_some_and(|failed| failed.matches(record))
-                })
-        }) {
+        if !state.shutting_down
+            && removed.as_ref().is_some_and(|record| {
+                state
+                    .native_actor_startups
+                    .get(&source.id)
+                    .is_some_and(|pending| {
+                        pending
+                            .failed_close
+                            .as_ref()
+                            .is_some_and(|failed| failed.matches(record))
+                    })
+            })
+        {
             state.native_actor_startups.remove(&source.id);
         }
         state.native_adoption_failures.clear(source.id);
@@ -1476,8 +1543,17 @@ fn close_verified_unattached(
     requested: &Session,
     proof: &HostSessionProof,
     verified: VerifiedRetirement,
+    shutdown: Option<&startup_shutdown::Capture>,
 ) -> Result<(), String> {
     let receipt = verified.receipt();
+    if let Some(capture) = shutdown {
+        capture.require_host(host)?;
+        capture.require_inspection(
+            &receipt.identity,
+            &receipt.source,
+            &receipt.previous_sources,
+        )?;
+    }
     verify_close_ownership(
         host,
         &receipt.identity,
@@ -1513,7 +1589,8 @@ fn close_verified_unattached(
     let pair =
         {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if state.shutting_down
+            if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+                || (state.shutting_down && shutdown.is_none())
                 || state.proof() != proof
                 || state.chats.contains_key(&requested.id)
                 || state.chat_spawning.get(&requested.id) != Some(requested)
@@ -1571,7 +1648,8 @@ fn close_verified_unattached(
     }
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
+        if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+            || (state.shutting_down && shutdown.is_none())
             || state.proof() != proof
             || state.chats.contains_key(&requested.id)
             || state.chat_spawning.get(&requested.id) != Some(requested)

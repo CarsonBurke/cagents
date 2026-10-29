@@ -13,6 +13,7 @@ mod exit_drain_tests;
 mod lock;
 mod model;
 mod notifications;
+mod ordinary_exit;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod service;
@@ -403,7 +404,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let mut clients = Vec::new();
     let mut runtime_error = None;
     let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
-    let mut ordinary_cleanup_started = false;
+    let mut ordinary_coordinator: Option<ordinary_exit::Coordinator> = None;
     let mut sealed_deliveries = None;
     tracing::info!(
         instance = crate::instance::NAME,
@@ -420,49 +421,52 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
         }
-        // Read the epoch BEFORE checking absence. A final ticket release
-        // between this check and a fatal-listener wait must not be lost.
-        let progress_epoch = ordinary_exit_drain
-            .as_ref()
-            .map(|drain| drain.progress_epoch());
-        if let Some(drain) = &ordinary_exit_drain {
-            if !ordinary_cleanup_started {
-                ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+        // Coordination owns every potentially blocking teardown operation;
+        // the listener remains available while original owners are pending.
+        if let Some(coordinator) = ordinary_coordinator.as_mut() {
+            if ordinary_exit_drain.is_none() {
+                ordinary_exit_drain = coordinator.drain();
             }
-            // Restored originals can lack a local reaper credit. Their
-            // independent parent/startup proof must settle before either
-            // ordinary teardown or the terminal-child absence seal authorizes
-            // returning from the daemon.
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if ordinary_cleanup_started
-                && !state.ordinary_exit_cleanup_blocked()
-                && drain.try_seal_absence()
-            {
-                // The startup/reply guard, core seal and registration/reply
-                // acquisition fence share this one HostMutex transaction.
-                sealed_deliveries = Some(state.close_ordinary_exit_registration());
-                break;
+            if coordinator.completed() {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if !state.ordinary_exit_final_blocked()
+                    && ordinary_exit_drain
+                        .as_ref()
+                        .is_some_and(|drain| drain.try_seal_absence())
+                {
+                    sealed_deliveries = Some(state.close_ordinary_exit_registration());
+                    break;
+                }
             }
         } else if host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_shutting_down()
         {
-            let Some(drain) = begin_ordinary_exit(&host) else {
-                break; // saved committed-successor decision, before teardown
-            };
-            ordinary_exit_drain = Some(drain);
-
-            // Stop autonomous producers once, then use the original ordinary
-            // cleanup paths. No producer/reaper waits while holding control.
-            drop(stall_watch.take());
-            drop(automation_broker.take());
-            drop(courier.take());
-            host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
-            drop(work_board.take());
-            ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
-            tracing::info!(pending = %ordinary_exit_drain.as_ref().unwrap().pending_description(),
-                "ordinary daemon exit retains its listener and lease until exact child absence is sealed");
+            // Save the committed-successor decision in the same transaction
+            // that would establish ordinary intent. No control reader/writer
+            // can delay cancellation of an admitted startup.
+            let (stop, broker, courier_stop, board) = (
+                stall_watch.take(),
+                automation_broker.take(),
+                courier.take(),
+                work_board.take(),
+            );
+            let producer_host = host.clone();
+            match ordinary_exit::Coordinator::start(&host, move || {
+                drop(stop);
+                drop(broker);
+                drop(courier_stop);
+                producer_host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+                drop(board);
+            }) {
+                Ok(Some(coordinator)) => ordinary_coordinator = Some(coordinator),
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::error!(%error, "cannot start ordinary cleanup; listener and ownership retained");
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
             continue;
         }
 
@@ -528,7 +532,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 tracing::error!(%error, pending = %drain.pending_description(),
                     "listener unavailable while original child custody remains; retaining daemon and lease");
                 runtime_error = Some(error);
-                drain.wait_for_progress(progress_epoch.expect("active ordinary exit epoch"));
+                thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
             host.lock()
@@ -542,7 +546,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     }
 
     tracing::info!("cagents daemon is shutting down");
-    if ordinary_exit_drain.is_some() {
+    if ordinary_coordinator.is_some() {
         // Already fenced atomically with the final startup/core absence check.
         // Late accepted threads receive an already-closed queue, while the
         // original writer drains every correlated checked-Close reply first.
@@ -573,26 +577,30 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     }
 }
 
-/// The ordinary exit caller owns the permit. Keep reservation closure and
-/// public quiescence under the existing writer, then release both locks before
-/// invoking any producer Drop, provider cleanup, child wait or client work.
+/// Small unit fixtures exercise the terminal drain directly. The serving run
+/// loop always uses the off-listener coordinator above.
+#[cfg(test)]
 fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
-    let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
-    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
-    // Save intentional successor transfer BEFORE finish_upgrade takes its
-    // state. Such a handoff is not a claim of original-child absence.
-    if host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .has_committed_upgrade()
-    {
-        return None;
+    let (gate, contexts) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.has_committed_upgrade() {
+            return None;
+        }
+        state.begin_ordinary_exit_cleanup();
+        (
+            state.control_gate.clone(),
+            state
+                .native_actor_startups
+                .values()
+                .map(|pending| pending.context.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    for context in contexts {
+        context.request_ordinary_cleanup();
     }
-    let drain = crate::daemon::child_reaper::begin_exit_drain();
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .begin_ordinary_exit_cleanup();
-    Some(drain)
+    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    Some(crate::daemon::child_reaper::begin_exit_drain())
 }
 
 fn close_shutdown_deliveries(host: &SharedHost, deliveries: &[Arc<delivery::DeliveryQueue>]) {

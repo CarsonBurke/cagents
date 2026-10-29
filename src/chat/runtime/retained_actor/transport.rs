@@ -41,6 +41,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(test, target_os = "linux"))]
 #[path = "startup_observation.rs"]
 pub(crate) mod startup_observation;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "startup_shutdown_tests.rs"]
+mod startup_shutdown_tests;
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -227,12 +230,86 @@ struct Remote {
     preserved: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
+    origin: SpawnOrigin,
+}
+enum SpawnOrigin {
+    SpawnedHere(Arc<StartupOwner>),
+    NoParentChild,
+}
+struct StartupProgress {
+    outcome: chat::protocol::LaunchOutcome,
+    ordinary_deferred: bool,
 }
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
     cancelled: AtomicBool,
-    outcome: Mutex<chat::protocol::LaunchOutcome>,
+    progress: Mutex<StartupProgress>,
     finished: std::sync::Condvar,
+    #[cfg(test)]
+    cleanup_waiters: std::sync::atomic::AtomicUsize,
+}
+#[cfg(test)]
+struct CleanupWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+#[cfg(test)]
+impl Drop for CleanupWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl StartupOwner {
+    fn cancel_control(&self) {
+        if let Some(control) = self
+            .control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = control.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    fn begin_spawn(&self) -> Result<(), String> {
+        let mut progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err("Retained actor launch was cancelled before process creation".into());
+        }
+        // Release this short mutex before spawn. A concurrent cancellation
+        // must see uncertainty even before the Child has been returned.
+        progress.outcome = chat::protocol::LaunchOutcome::Uncertain;
+        Ok(())
+    }
+    fn publish_outcome(&self, outcome: chat::protocol::LaunchOutcome) {
+        self.progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome = outcome;
+        self.finished.notify_all();
+        crate::daemon::wake();
+    }
+    fn spawn_child(&self, command: &mut ChildCommand) -> Result<std::process::Child, String> {
+        self.begin_spawn()?;
+        match command.spawn() {
+            Ok(child) => Ok(child),
+            Err(error) => {
+                self.publish_outcome(chat::protocol::LaunchOutcome::NoProvider);
+                Err(error.to_string())
+            }
+        }
+    }
+    fn wait_for_child(
+        &self,
+        mut child: std::process::Child,
+    ) -> Result<std::process::ExitStatus, String> {
+        let waited = child.wait().map_err(|error| error.to_string());
+        if waited
+            .as_ref()
+            .is_ok_and(|status| status.code() == Some(73))
+        {
+            self.publish_outcome(chat::protocol::LaunchOutcome::TeardownProved);
+        }
+        self.finished.notify_all();
+        crate::daemon::wake();
+        waited
+    }
 }
 struct StartupAttempt {
     owner: Arc<StartupOwner>,
@@ -242,43 +319,80 @@ impl Drop for StartupAttempt {
     fn drop(&mut self) {
         if !self.handed_off {
             self.owner.cancelled.store(true, Ordering::Release);
-            if let Some(control) = self
-                .owner
-                .control
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
-                let _ = control.shutdown(std::net::Shutdown::Both);
-            }
+            self.owner.cancel_control();
         }
     }
 }
 impl chat::protocol::LaunchCleanup for StartupOwner {
     fn cleanup(&self) -> Result<chat::protocol::LaunchOutcome, String> {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(control) = self
-            .control
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let _ = control.shutdown(std::net::Shutdown::Both);
-        }
+        self.cancel_control();
         let deadline = Instant::now() + Duration::from_secs(40);
-        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
-        while *outcome == chat::protocol::LaunchOutcome::Uncertain {
+        let mut progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        let mut waiter = None;
+        while progress.outcome == chat::protocol::LaunchOutcome::Uncertain {
+            if progress.ordinary_deferred {
+                return Ok(chat::protocol::LaunchOutcome::Uncertain);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("Retained actor startup cleanup remains unconfirmed; its exact owner is retained".into());
             }
-            outcome = self
+            #[cfg(test)]
+            if waiter.is_none() {
+                self.cleanup_waiters.fetch_add(1, Ordering::AcqRel);
+                waiter = Some(CleanupWaiter(&self.cleanup_waiters));
+            }
+            progress = self
                 .finished
-                .wait_timeout(outcome, remaining)
+                .wait_timeout(progress, remaining)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
-        Ok(*outcome)
+        Ok(progress.outcome)
+    }
+    fn request_ordinary_cleanup(&self) {
+        {
+            let mut progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+            self.cancelled.store(true, Ordering::Release);
+            progress.ordinary_deferred = true;
+            self.finished.notify_all();
+        }
+        self.cancel_control();
+        crate::daemon::wake();
+    }
+    fn poll_cleanup(&self) -> chat::protocol::LaunchOutcome {
+        let progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        // NoProvider is a receipt only after cancellation has fenced future
+        // spawn transitions through this same progress mutex.
+        if progress.outcome == chat::protocol::LaunchOutcome::NoProvider
+            && !self.cancelled.load(Ordering::Acquire)
+        {
+            chat::protocol::LaunchOutcome::Uncertain
+        } else {
+            progress.outcome
+        }
+    }
+    fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        match self
+            .progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome
+        {
+            chat::protocol::LaunchOutcome::NoProvider => {
+                chat::protocol::HelperWaitProof::NoParentChild
+            }
+            chat::protocol::LaunchOutcome::Uncertain => chat::protocol::HelperWaitProof::Pending,
+            chat::protocol::LaunchOutcome::TeardownProved => {
+                chat::protocol::HelperWaitProof::TeardownProved
+            }
+        }
+    }
+    #[cfg(test)]
+    fn cleanup_waiters_for_test(&self) -> usize {
+        self.cleanup_waiters.load(Ordering::Acquire)
     }
 }
 #[cfg(test)]
@@ -414,6 +528,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
+            origin: SpawnOrigin::NoParentChild,
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -549,6 +664,14 @@ impl RemoteActor {
     }
     pub fn same_attachment(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        match &self.0.origin {
+            SpawnOrigin::SpawnedHere(owner) => {
+                chat::protocol::LaunchCleanup::original_helper_wait_proof(owner.as_ref())
+            }
+            SpawnOrigin::NoParentChild => chat::protocol::HelperWaitProof::NoParentChild,
+        }
     }
     /// Unlike snapshots, resolution always authenticates this live epoch.
     pub fn resolve_source(&self, source: &chat::Session) -> Result<chat::Session, String> {
@@ -820,16 +943,22 @@ impl RemoteActor {
                 control.try_clone().map_err(|error| error.to_string())?,
             )),
             cancelled: AtomicBool::new(false),
-            outcome: Mutex::new(chat::protocol::LaunchOutcome::NoProvider),
+            progress: Mutex::new(StartupProgress {
+                outcome: chat::protocol::LaunchOutcome::NoProvider,
+                ordinary_deferred: false,
+            }),
             finished: std::sync::Condvar::new(),
+            #[cfg(test)]
+            cleanup_waiters: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut attempt = StartupAttempt {
             owner: owner.clone(),
             handed_off: false,
         };
-        if let Some(context) = &spec.execution {
-            context.claim_owner(owner.clone());
-        }
+        let owner_token = spec
+            .execution
+            .as_ref()
+            .map(|context| context.claim_startup_owner(owner.clone()));
         // Allocate the sole child reaper before creating the helper. A startup
         // failure keeps an exact cleanup owner rather than killing an assumed
         // process group or allowing the provider to appear after cancellation.
@@ -842,60 +971,56 @@ impl RemoteActor {
         thread::Builder::new()
             .name("cagents-actor-owner".into())
             .spawn(move || {
-                if let Ok(mut child) = incoming.recv() {
+                if let Ok(child) = incoming.recv() {
+                    let waited = watcher.wait_for_child(child);
                     #[cfg(not(all(test, target_os = "linux")))]
-                    let proved = child.wait().is_ok_and(|status| status.code() == Some(73));
-                    #[cfg(all(test, target_os = "linux"))]
-                    let waited = child.wait();
-                    #[cfg(all(test, target_os = "linux"))]
-                    let proved = waited
-                        .as_ref()
-                        .is_ok_and(|status| status.code() == Some(73));
-                    if proved {
-                        *watcher.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
-                            chat::protocol::LaunchOutcome::TeardownProved;
-                    }
-                    watcher.finished.notify_all();
+                    let _ = waited;
                     #[cfg(all(test, target_os = "linux"))]
                     if let Some(observation) = reaper_observation {
-                        let _ = observation.try_send(startup_observation::Event::Reaped(
-                            waited.map_err(|error| error.to_string()),
-                        ));
+                        let _ = observation.try_send(startup_observation::Event::Reaped(waited));
                     }
                 }
             })
             .map_err(|error| error.to_string())?;
-        {
-            let mut outcome = owner.outcome.lock().unwrap_or_else(|p| p.into_inner());
-            if owner.cancelled.load(Ordering::Acquire) {
-                return Err("Retained actor launch was cancelled before process creation".into());
-            }
-            let child = command.spawn().map_err(|error| error.to_string())?;
-            #[cfg(all(test, target_os = "linux"))]
-            if let Some(observation) = observation {
-                let _ = observation.try_send(startup_observation::Event::Spawned(
-                    startup_observation::capture(&child),
-                ));
-            }
-            *outcome = chat::protocol::LaunchOutcome::Uncertain;
-            publish
-                .send(child)
-                .map_err(|_| "Retained actor startup lost its exact child reaper")?;
+        let child = owner.spawn_child(&mut command)?;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(observation) = observation {
+            let _ = observation.try_send(startup_observation::Event::Spawned(
+                startup_observation::capture(&child),
+            ));
         }
+        publish
+            .send(child)
+            .map_err(|_| "Retained actor startup lost its exact child reaper")?;
         drop(remote);
         // Keep this channel through installation. EOF before commit asks the
         // helper to clean its still-private actor and every descendant.
         send(&control, &request, Duration::from_secs(30))?;
         let attached: Result<Attached, String> = receive(&control, Duration::from_secs(30))?;
         let attached = attached?;
-        let handle = Self::from_attached(attached, proof, Some(control), notify)?;
+        let handle = Self::from_attached_with_origin(
+            attached,
+            proof,
+            Some(control),
+            SpawnOrigin::SpawnedHere(owner.clone()),
+            notify,
+        )?;
         let record = handle.identity().record;
         crate::daemon::process_scope::warn_if_shared(
             record.holder.pid as u32,
             record.root.pid as u32,
         );
-        if let Some(context) = spec.execution {
-            context.claim_owner(Arc::new(handle.clone()));
+        if let Some(context) = spec.execution
+            && !context.transfer_startup_owner(
+                owner_token.expect("claimed retained startup owner"),
+                Arc::new(handle.clone()),
+                handle.identity(),
+            )
+        {
+            return Err(
+                "Retained actor launch was cancelled before authenticated ownership transfer"
+                    .into(),
+            );
         }
         owner
             .control
@@ -1017,6 +1142,21 @@ impl RemoteActor {
         startup: Option<UnixStream>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        Self::from_attached_with_origin(
+            attached,
+            proof,
+            startup,
+            SpawnOrigin::NoParentChild,
+            notify,
+        )
+    }
+    fn from_attached_with_origin(
+        attached: Attached,
+        proof: HostSessionProof,
+        startup: Option<UnixStream>,
+        origin: SpawnOrigin,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
         if attached.protocol != PROTOCOL {
             return Err(
                 "Retained Claude actor protocol is incompatible; no prompt was replayed".into(),
@@ -1027,13 +1167,31 @@ impl RemoteActor {
             &registry::directory(Kind::Native)?,
             attached.identity.record.terminal,
         );
-        Self::from_attached_at(attached, proof, startup, socket, notify)
+        Self::from_attached_at_with_origin(attached, proof, startup, socket, origin, notify)
     }
+    #[cfg(test)]
     fn from_attached_at(
         attached: Attached,
         proof: HostSessionProof,
         startup: Option<UnixStream>,
         socket: PathBuf,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::from_attached_at_with_origin(
+            attached,
+            proof,
+            startup,
+            socket,
+            SpawnOrigin::NoParentChild,
+            notify,
+        )
+    }
+    fn from_attached_at_with_origin(
+        attached: Attached,
+        proof: HostSessionProof,
+        startup: Option<UnixStream>,
+        socket: PathBuf,
+        origin: SpawnOrigin,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let recovering_inputs = attached.resident.acknowledged_input_count > 0;
@@ -1065,6 +1223,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
+            origin,
         }));
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
@@ -1755,9 +1914,15 @@ impl RemoteActor {
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
     fn cleanup(&self) -> Result<chat::protocol::LaunchOutcome, String> {
-        self.close()?;
-        self.finish_close()?;
-        Ok(chat::protocol::LaunchOutcome::TeardownProved)
+        // Even a pre-commit transfer may have consumed provider outcomes. Only
+        // HOST can settle its managed semantic journal and verified retirement.
+        Ok(chat::protocol::LaunchOutcome::Uncertain)
+    }
+    fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        self.original_helper_wait_proof()
+    }
+    fn retained_handle(&self) -> Option<super::super::Handle> {
+        Some(super::super::Handle::from_remote(self.clone()))
     }
 }
 impl Drop for Remote {
@@ -3208,15 +3373,28 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         // SAFETY: the exact helper-only descriptor has been checked as a
         // connected Unix stream socket and is now owned by this dispatch.
         let control = unsafe { UnixStream::from_raw_fd(fd) };
-        let startup: Startup = receive(&control, Duration::from_secs(30))?;
-        authorize(
-            &control,
-            startup
-                .source
-                .proof
-                .as_ref()
-                .ok_or("Retained startup lacks proof")?,
-        )?;
+        let startup = (|| {
+            let startup: Startup = receive(&control, Duration::from_secs(30))?;
+            authorize(
+                &control,
+                startup
+                    .source
+                    .proof
+                    .as_ref()
+                    .ok_or("Retained startup lacks proof")?,
+            )?;
+            Ok::<_, String>(startup)
+        })();
+        let startup = match startup {
+            Ok(startup) => startup,
+            Err(error) => {
+                let _ = send(&control, &Err::<Attached, _>(error), TIMEOUT);
+                // The validated connected descriptor is owned, but this
+                // boundary has not changed process policy or created a child.
+                // Refusal is genuine no-provider cleanup, not reap evidence.
+                return Ok(());
+            }
+        };
         // No provider, signal policy, subreaper or enrollment work occurs
         // until the connected peer proves current daemon lease ownership.
         unsafe {
@@ -3224,10 +3402,10 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
             libc::prctl(libc::PR_SET_NAME, c"cagents-native".as_ptr());
         }
-        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
         let result = (|| {
+            if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let server = Server::start_after_scope_enrollment(
                 startup,

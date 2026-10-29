@@ -384,6 +384,13 @@ fn dispatch(
         let intent = HostedSession::Chat(session.clone());
         let response = super::chat::start_execution(host, EXECUTION_CLIENT, session, context.clone())
             .map_err(|error| {
+                if host.lock().unwrap_or_else(|p| p.into_inner()).ordinary_exit_cleanup_pending() {
+                    // Release the actual dispatch reader promptly. The same
+                    // context also wakes a cleanup entered before intent.
+                    context.request_ordinary_cleanup();
+                    let retained = retain_startup(host, accepted.agent.id, &intent, &context);
+                    return (State::Interrupted, format!("{}; ordinary shutdown retains the exact startup owner: {retained:?}", error.message));
+                }
                 // The retained owner joins startup or receives an explicit
                 // helper teardown receipt. A timed-out caller is not proof.
                 let cleanup = context.reconcile_cleanup();
@@ -393,14 +400,12 @@ fn dispatch(
                     match cleared {
                         Ok(()) => before(error.message),
                         Err(clear) => {
-                            host.lock().unwrap_or_else(|p| p.into_inner()).execution_startups
-                                .insert(accepted.agent.id, (intent.clone(), context.clone()));
+                            let _ = retain_startup(host, accepted.agent.id, &intent, &context);
                             (State::Interrupted, format!("{}; cannot clear proved-quiescent launch intent: {clear}. Close the agent to retry the durable update.", error.message))
                         },
                     }
                 } else {
-                    host.lock().unwrap_or_else(|p| p.into_inner()).execution_startups
-                        .insert(accepted.agent.id, (intent.clone(), context.clone()));
+                    let _ = retain_startup(host, accepted.agent.id, &intent, &context);
                     (State::Interrupted, format!("Provider startup did not establish confirmed ownership: {}; cleanup: {cleanup:?}. The exact cleanup owner is retained; close the agent to retry teardown. No prompt was resent.", error.message))
                 }
             })?;
@@ -717,6 +722,85 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     let gate = Arc::new(Mutex::new(()));
     state.execution_gates.insert(id, Arc::downgrade(&gate));
     gate
+}
+
+fn retain_startup(
+    host: &SharedHost,
+    id: AgentId,
+    intent: &HostedSession,
+    context: &Arc<chat::protocol::ExecutionContext>,
+) -> Result<(), String> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state
+        .execution_startups
+        .get(&id)
+        .is_some_and(|(current, owner)| current != intent || !Arc::ptr_eq(owner, context))
+    {
+        return Err("A different exact launch still owns this agent's cleanup".into());
+    }
+    state
+        .execution_startups
+        .insert(id, (intent.clone(), context.clone()));
+    drop(state);
+    crate::daemon::wake();
+    Ok(())
+}
+
+/// The coordinator has already obtained genuine cleanup evidence. Serialize
+/// with the real dispatch and persist before removing its in-memory owner.
+pub(super) fn finish_ordinary_startups(host: &SharedHost) -> Result<(), String> {
+    use chat::protocol::LaunchOutcome;
+    let pending = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_startups
+        .clone();
+    for (id, (intent, context)) in pending {
+        let gate = agent_gate(host, id);
+        let _dispatch = match gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        let proof = context.ownership_snapshot();
+        if !proof.ordinary_requested
+            || !matches!(
+                proof.outcome,
+                LaunchOutcome::NoProvider | LaunchOutcome::TeardownProved
+            )
+        {
+            continue;
+        }
+        let matches = |state: &super::state::HostState| {
+            state
+                .execution_startups
+                .get(&id)
+                .is_some_and(|(current, owner)| current == &intent && Arc::ptr_eq(owner, &context))
+        };
+        if !matches(&host.lock().unwrap_or_else(|p| p.into_inner())) {
+            continue;
+        }
+        registry(host)?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_quiescent_agent_launch(id, &intent)?;
+        // No SQLite or helper operation occurs in this final HOST transaction.
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let current = context.ownership_snapshot();
+        if matches(&state)
+            && current.token == proof.token
+            && current.kind == proof.kind
+            && matches!(
+                current.outcome,
+                LaunchOutcome::NoProvider | LaunchOutcome::TeardownProved
+            )
+        {
+            state.execution_startups.remove(&id);
+            state.inventory_generation += 1;
+            crate::daemon::wake();
+        }
+    }
+    Ok(())
 }
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {

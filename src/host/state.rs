@@ -1990,6 +1990,14 @@ impl HostState {
         self.startup_blocks_shutdown() || !self.checked_close_replies.is_empty()
     }
 
+    /// Pending native custody blocks only the final seal. Including it in the
+    /// initiation guard would prevent the coordinator from cleaning it up.
+    pub(super) fn ordinary_exit_final_blocked(&self) -> bool {
+        self.ordinary_exit_cleanup_blocked()
+            || !self.native_actor_startups.is_empty()
+            || !self.execution_startups.is_empty()
+    }
+
     pub(super) fn startup_recovery(&self) -> Option<&str> {
         self.startup_recovery.as_deref().or_else(|| {
             (!self.startup_custody.is_empty())

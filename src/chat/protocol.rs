@@ -85,12 +85,68 @@ pub(crate) enum LaunchOutcome {
 /// unverified process exit is not a teardown receipt.
 pub(crate) trait LaunchCleanup: Send + Sync {
     fn cleanup(&self) -> Result<LaunchOutcome, String>;
+
+    /// Request ordinary cancellation without waiting for a worker or child.
+    fn request_ordinary_cleanup(&self) {}
+
+    /// Only implementations with synchronized real progress may report proof.
+    fn poll_cleanup(&self) -> LaunchOutcome {
+        LaunchOutcome::Uncertain
+    }
+
+    fn original_helper_wait_proof(&self) -> HelperWaitProof {
+        HelperWaitProof::NoParentChild
+    }
+
+    fn retained_handle(&self) -> Option<super::runtime::Handle> {
+        None
+    }
+    #[cfg(test)]
+    fn cleanup_waiters_for_test(&self) -> usize {
+        0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchOwnerToken(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchOwnerKind {
+    None,
+    Generic,
+    Startup,
+    RemoteActor {
+        identity: super::runtime::ActorIdentity,
+    },
+}
+
+/// A parent wait is distinct from authenticated semantic/execution retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelperWaitProof {
+    NoParentChild,
+    Pending,
+    TeardownProved,
+}
+
+#[derive(Clone)]
+pub(crate) struct LaunchOwnershipSnapshot {
+    pub token: Option<LaunchOwnerToken>,
+    pub kind: LaunchOwnerKind,
+    pub outcome: LaunchOutcome,
+    pub ordinary_requested: bool,
+    pub original_helper: HelperWaitProof,
+    pub remote: Option<super::runtime::Handle>,
 }
 
 #[derive(Default)]
 struct LaunchOwnership {
     outcome: LaunchOutcome,
     owner: Option<std::sync::Arc<dyn LaunchCleanup>>,
+    generation: u64,
+    token: Option<LaunchOwnerToken>,
+    kind: Option<LaunchOwnerKind>,
+    ordinary_requested: bool,
+    original_helper: Option<std::sync::Arc<dyn LaunchCleanup>>,
 }
 
 #[derive(Default)]
@@ -194,11 +250,175 @@ impl ExecutionContext {
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
-    pub(crate) fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) {
-        *self.ownership.lock().unwrap_or_else(|p| p.into_inner()) = LaunchOwnership {
-            outcome: LaunchOutcome::Uncertain,
-            owner: Some(owner),
+    pub(crate) fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) -> LaunchOwnerToken {
+        self.claim_owner_kind(owner, LaunchOwnerKind::Generic)
+    }
+    pub(crate) fn claim_startup_owner(
+        &self,
+        owner: std::sync::Arc<dyn LaunchCleanup>,
+    ) -> LaunchOwnerToken {
+        self.claim_owner_kind(owner, LaunchOwnerKind::Startup)
+    }
+    fn claim_owner_kind(
+        &self,
+        owner: std::sync::Arc<dyn LaunchCleanup>,
+        kind: LaunchOwnerKind,
+    ) -> LaunchOwnerToken {
+        let (token, requested) = {
+            let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&state.kind, Some(LaunchOwnerKind::RemoteActor { .. })) {
+                // A transferred context never returns to raw startup cleanup,
+                // even after installed() has dropped its strong attachment.
+                return state.token.expect("transferred launch owner token");
+            }
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("launch owner generation");
+            let token = LaunchOwnerToken(state.generation);
+            state.token = Some(token);
+            state.kind = Some(kind);
+            state.outcome = LaunchOutcome::Uncertain;
+            state.original_helper = None;
+            state.owner = Some(owner.clone());
+            (token, state.ordinary_requested)
         };
+        // A request before the first claim also fences a late spawn. Never
+        // invoke an owner's callback while holding the context mutex.
+        if requested {
+            owner.request_ordinary_cleanup();
+        }
+        crate::daemon::wake();
+        token
+    }
+    /// The latch and transfer share one mutex. A cancelled startup keeps its
+    /// original owner; only the successful branch becomes semantic-required.
+    pub(crate) fn transfer_startup_owner(
+        &self,
+        token: LaunchOwnerToken,
+        owner: std::sync::Arc<dyn LaunchCleanup>,
+        identity: super::runtime::ActorIdentity,
+    ) -> bool {
+        let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        if state.token != Some(token)
+            || state.kind != Some(LaunchOwnerKind::Startup)
+            || state.ordinary_requested
+        {
+            return false;
+        }
+        state.original_helper = state.owner.clone();
+        state.owner = Some(owner);
+        state.kind = Some(LaunchOwnerKind::RemoteActor { identity });
+        state.outcome = LaunchOutcome::Uncertain;
+        drop(state);
+        crate::daemon::wake();
+        true
+    }
+    pub(crate) fn ownership_snapshot(&self) -> LaunchOwnershipSnapshot {
+        let (token, kind, outcome, ordinary_requested, owner, original_helper) = {
+            let state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                state.token,
+                state.kind.clone().unwrap_or(LaunchOwnerKind::None),
+                state.outcome,
+                state.ordinary_requested,
+                state.owner.clone(),
+                state.original_helper.clone(),
+            )
+        };
+        let original_helper = original_helper
+            .as_ref()
+            .or(owner.as_ref())
+            .map_or(HelperWaitProof::NoParentChild, |owner| {
+                owner.original_helper_wait_proof()
+            });
+        LaunchOwnershipSnapshot {
+            token,
+            kind,
+            outcome,
+            ordinary_requested,
+            original_helper,
+            remote: owner.and_then(|owner| owner.retained_handle()),
+        }
+    }
+    pub(crate) fn request_ordinary_cleanup(&self) -> LaunchOwnershipSnapshot {
+        let owner = {
+            let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            state.ordinary_requested = true;
+            state.owner.clone()
+        };
+        if let Some(owner) = owner {
+            owner.request_ordinary_cleanup();
+        }
+        crate::daemon::wake();
+        self.ownership_snapshot()
+    }
+    #[cfg(test)]
+    pub(crate) fn cleanup_waiters_for_test(&self) -> usize {
+        let owner = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner
+            .clone();
+        owner.map_or(0, |owner| owner.cleanup_waiters_for_test())
+    }
+    /// Poll only the captured generation. In particular, an old startup wait
+    /// cannot clear a transferred remote role or a replacement owner.
+    pub(crate) fn poll_cleanup(
+        &self,
+        captured: &LaunchOwnershipSnapshot,
+    ) -> LaunchOwnershipSnapshot {
+        let owner = {
+            let state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            if state.token != captured.token || state.kind.as_ref() != Some(&captured.kind) {
+                drop(state);
+                return self.ownership_snapshot();
+            }
+            match &state.kind {
+                Some(LaunchOwnerKind::Startup | LaunchOwnerKind::Generic) => state.owner.clone(),
+                _ => None,
+            }
+        };
+        if let Some(owner) = owner {
+            let outcome = owner.poll_cleanup();
+            let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            if state.token == captured.token
+                && state.kind.as_ref() == Some(&captured.kind)
+                && state
+                    .owner
+                    .as_ref()
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &owner))
+                && outcome != LaunchOutcome::Uncertain
+            {
+                state.outcome = outcome;
+                state.owner = None;
+                crate::daemon::wake();
+            }
+        }
+        self.ownership_snapshot()
+    }
+    /// Call only after exact HOST semantic settlement/ACK and verified helper
+    /// retirement. A spawned-here owner additionally needs its sole wait73.
+    pub(crate) fn complete_semantic_cleanup(
+        &self,
+        token: LaunchOwnerToken,
+        identity: &super::runtime::ActorIdentity,
+    ) -> bool {
+        let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        if state.token != Some(token)
+            || !matches!(&state.kind, Some(LaunchOwnerKind::RemoteActor { identity: current }) if current == identity)
+            || state.original_helper.as_ref().is_some_and(|origin| {
+                origin.original_helper_wait_proof() != HelperWaitProof::TeardownProved
+            })
+        {
+            return false;
+        }
+        state.outcome = LaunchOutcome::TeardownProved;
+        state.owner = None;
+        drop(state);
+        crate::daemon::wake();
+        true
     }
     pub(crate) fn outcome(&self) -> LaunchOutcome {
         self.ownership
@@ -213,12 +433,16 @@ impl ExecutionContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .owner = None;
+        crate::daemon::wake();
     }
     pub(crate) fn reconcile_cleanup(&self) -> Result<LaunchOutcome, String> {
-        let owner = {
+        let (owner, token, kind) = {
             let state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(state.kind, Some(LaunchOwnerKind::RemoteActor { .. })) {
+                return Ok(state.outcome);
+            }
             match &state.owner {
-                Some(owner) => owner.clone(),
+                Some(owner) => (owner.clone(), state.token, state.kind.clone()),
                 None => return Ok(state.outcome),
             }
         };
@@ -226,10 +450,12 @@ impl ExecutionContext {
         let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
         // A worker may have transferred ownership to a helper while the caller
         // was joining it. Its receipt cannot prove that new owner's teardown.
-        if state
-            .owner
-            .as_ref()
-            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &owner))
+        if state.token == token
+            && state.kind == kind
+            && state
+                .owner
+                .as_ref()
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &owner))
             && outcome != LaunchOutcome::Uncertain
         {
             state.outcome = outcome;
