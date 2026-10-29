@@ -6900,39 +6900,41 @@ for line in sys.stdin:
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
         restored.observe_agent().unwrap();
-        // FIFO control observation is not idle-shell proof. Wait for an
-        // actually inactive frozen observation, releasing our own stops before
-        // retrying or asking the host to prepare its independent snapshot.
-        let idle_started = Instant::now();
-        let mut idle_attempts = 0;
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
         loop {
-            idle_attempts += 1;
-            let snapshot = restored.prepare_upgrade().unwrap_or_else(|error| {
-                panic!("restored shell observation failed after {idle_attempts} attempts: {error}")
-            });
-            let active = snapshot.active;
-            let hint = snapshot.hint.clone();
-            drop(snapshot);
-            if !active {
-                break;
-            }
             assert!(
-                idle_started.elapsed() < Duration::from_secs(5),
-                "restored shell stayed active after {idle_attempts} observations ({:?}); hint: {hint:?}; completed: {}; startup unresolved: {}; startup: {:?}",
-                idle_started.elapsed(),
-                restored.is_completed(),
-                restored.startup_unresolved(),
-                restored.startup_diagnostic()
+                prepare_started.elapsed() < Duration::from_secs(5),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
         }
-        let capability = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown_preflight(Instant::now())
-            .unwrap()
-            .capability;
-        prepare_upgrade_with(&host, capability, || Store::open(directory.path())).unwrap();
         finish_upgrade(&host).unwrap();
         let store = Store::open(directory.path()).unwrap();
         let second = store.load().unwrap().unwrap();
