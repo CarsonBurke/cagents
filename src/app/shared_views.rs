@@ -5442,20 +5442,26 @@ mod tests {
         let CardKind::Terminal(terminal) = moving_terminal_kind() else {
             unreachable!()
         };
+        let proof = terminal.continuity.live_proof();
+        let mut recipe = terminal.launch;
+        recipe.program = crate::agent::Provider::Claude.executable().into();
+        recipe.arguments.clear();
         let session = chat::Session {
             id: TerminalId::new(),
-            proof: terminal.continuity.live_proof(),
+            proof,
             terminal: None,
             owned_codex_listener: None,
-            native_continuity: chat::NativeContinuity::Durable {
-                provider_version: "fixture".into(),
-            },
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             launch: chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                recipe: terminal.launch,
-                session_id: Some("retained-close-fixture".into()),
+                recipe,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
             },
         };
+        assert!(
+            session.has_valid_native_continuity(),
+            "the retained-chat fixture must satisfy the real storage admission guard"
+        );
         let kind = CardKind::Chat(session);
         pane.kind = kind.clone();
         app.card_state_mut(pane.id).unwrap().kind = kind.clone();
@@ -5466,13 +5472,99 @@ mod tests {
             .find(|candidate| candidate.id == pane.id)
             .unwrap()
             .kind = kind;
-        // This is the real recovery path: the saved owner remains while its
-        // unavailable surface waits for an exact native close receipt.
+        // Model the retained-owner recovery path with a schema-valid synthetic
+        // descriptor. No provider or authenticated native holder is exercised;
+        // the unavailable surface waits for its exact native close receipt.
         app.cards.insert(
             pane.id,
             CardRuntime::Failed("fixture detached native surface".into()),
         );
         (app, source, destination, pane)
+    }
+
+    #[test]
+    fn retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity() {
+        use crate::persistence::{SnapshotBase, StateStore, StoreError};
+
+        let (mut app, _, _, pane) = retained_chat_move_fixture();
+        let snapshot = app.persistent_workspace();
+        let CardKind::Chat(session) = &pane.kind else {
+            panic!("retained chat fixture");
+        };
+        assert!(session.has_valid_native_continuity());
+        assert_eq!(session.launch.provider, crate::agent::Provider::Claude);
+        assert_eq!(session.launch.recipe.program, "claude");
+        assert!(uuid::Uuid::parse_str(session.launch.session_id.as_ref().unwrap()).is_ok());
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("retained-fixture.sqlite3"),
+            crate::model::BootId::new("retained-fixture-storage"),
+        )
+        .unwrap();
+        let cards = std::collections::BTreeMap::new();
+        let committed = store
+            .save_workspace(
+                &snapshot,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &cards,
+                },
+            )
+            .unwrap();
+        let saved = store.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .kind,
+            pane.kind
+        );
+
+        // The old fixture's Codex-only continuity claim must remain invalid for
+        // Claude. Repairing the fixture must never weaken production admission.
+        let mut invalid = snapshot.as_ref().clone();
+        let CardKind::Chat(session) = &mut invalid
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane.id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        session.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        assert!(!session.has_valid_native_continuity());
+        let error = store
+            .save_workspace(
+                &invalid,
+                SnapshotBase {
+                    workspace: committed.generation,
+                    cards: &committed.card_generations,
+                },
+            )
+            .unwrap_err();
+        let StoreError::Card { card, error } = error else {
+            panic!("expected an invalid retained pane, got {error:?}");
+        };
+        assert_eq!(card, pane.id);
+        assert!(
+            matches!(*error, StoreError::InvalidState(ref reason) if reason == &format!("chat card {} has invalid native continuity evidence", pane.id))
+        );
+        let after = store.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(after.generation, committed.generation);
+        assert_eq!(
+            after
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .kind,
+            pane.kind
+        );
     }
 
     #[test]
