@@ -141,6 +141,19 @@ impl Registry {
 }
 
 impl Store {
+    /// Reconcile only an exact retained binding. Even unchanged metadata must
+    /// complete the namespace barrier before being returned successfully.
+    /// This does not inspect or initialize a home, run a provider, or establish
+    /// whether a historic registration is still current.
+    pub(crate) fn try_reconcile_preparation(
+        &self,
+        binding: &PreparationBinding,
+    ) -> io::Result<Preparation> {
+        self.preparation_transaction(true, |registry| {
+            registry.exact_preparation(binding).cloned()
+        })
+    }
+
     /// Persist the request-to-key mapping before any managed-home effects.
     /// Equal retries still complete the directory durability barrier.
     pub fn plan_preparation(
@@ -476,6 +489,92 @@ mod tests {
                 added_at: 1,
             }
         }
+    }
+
+    #[test]
+    fn reconciliation_preserves_each_exact_metadata_state_without_home_effects() {
+        for state in [
+            PreparationState::Planned,
+            PreparationState::Uncertain,
+            PreparationState::Created,
+            PreparationState::CancelledRetained,
+            PreparationState::Registered,
+        ] {
+            let fixture = Fixture::new();
+            let mut planned = fixture.plan();
+            fixture
+                .store
+                .preparation_transaction(false, |registry| {
+                    registry.preparations[0].state = state;
+                    if state == PreparationState::Created {
+                        registry.begin(planned.binding.payload.provider, planned.binding.key, 1);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            planned.state = state;
+            let before = fixture.store.load().unwrap();
+            let bytes = fs::read(fixture.store.path()).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .try_reconcile_preparation(&planned.binding)
+                    .unwrap(),
+                planned
+            );
+            assert_eq!(fixture.store.load().unwrap(), before);
+            assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+            assert!(before.find(planned.binding.key).is_none());
+            assert!(!fixture._directory.path().join("homes").exists());
+        }
+    }
+
+    #[test]
+    fn reconciliation_refuses_every_changed_binding_and_busy_storage() {
+        let fixture = Fixture::new();
+        let planned = fixture.plan();
+        let before = fixture.store.load().unwrap();
+        let bytes = fs::read(fixture.store.path()).unwrap();
+        let mut changed_bindings = Vec::new();
+        let mut changed = planned.binding.clone();
+        changed.request_id = Uuid::new_v4();
+        changed_bindings.push(changed);
+        let mut changed = planned.binding.clone();
+        changed.installation_id = Uuid::new_v4();
+        changed_bindings.push(changed);
+        let mut changed = planned.binding.clone();
+        changed.key = Uuid::new_v4();
+        changed_bindings.push(changed);
+        let mut changed = planned.binding.clone();
+        changed.payload.provider = Provider::Claude;
+        changed_bindings.push(changed);
+        let mut changed = planned.binding.clone();
+        changed.payload.copy_codex_config = !changed.payload.copy_codex_config;
+        changed_bindings.push(changed);
+        for binding in changed_bindings {
+            assert_eq!(
+                fixture
+                    .store
+                    .try_reconcile_preparation(&binding)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        {
+            let _lock = fixture.store.lock().unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .try_reconcile_preparation(&planned.binding)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        assert_eq!(fixture.store.load().unwrap(), before);
+        assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+        assert!(!fixture._directory.path().join("homes").exists());
     }
 
     #[test]
@@ -817,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_rename_with_failed_directory_sync_requires_durability_retry() {
+    fn reconciliation_requires_the_barrier_for_an_equal_visible_record() {
         let fixture = Fixture::new();
         let planned = fixture.plan();
         let mut registry = fixture.store.load().unwrap();
@@ -840,12 +939,13 @@ mod tests {
                 .state,
             PreparationState::CancelledRetained
         );
+        let bytes = fs::read(fixture.store.path()).unwrap();
         // The equal replay enters the directory sync path instead of relying
         // on visibility or skipping the write because equality is unchanged.
         let mut calls = 0;
         let failed_replay = fixture.store.preparation_transaction_with_sync(
-            false,
-            |registry| Ok(registry.exact_preparation(&planned.binding)?.clone()),
+            true,
+            |registry| registry.exact_preparation(&planned.binding).cloned(),
             |_| {
                 calls += 1;
                 Err(io::Error::from_raw_os_error(libc::EIO))
@@ -859,8 +959,8 @@ mod tests {
         let replay = fixture
             .store
             .preparation_transaction_with_sync(
-                false,
-                |registry| Ok(registry.exact_preparation(&planned.binding)?.clone()),
+                true,
+                |registry| registry.exact_preparation(&planned.binding).cloned(),
                 |namespace| {
                     calls += 1;
                     namespace.sync()
@@ -869,6 +969,16 @@ mod tests {
             .unwrap();
         assert_eq!(calls, 2);
         assert_eq!(replay.state, PreparationState::CancelledRetained);
+        assert_eq!(
+            fixture
+                .store
+                .try_reconcile_preparation(&planned.binding)
+                .unwrap(),
+            replay
+        );
+        assert_eq!(fixture.store.load().unwrap(), registry);
+        assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+        assert!(!fixture._directory.path().join("homes").exists());
     }
 
     #[test]
