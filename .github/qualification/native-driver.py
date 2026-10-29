@@ -32,6 +32,14 @@ children = []
 stopped = set()
 viewport = (1280, 800)
 stale_accessibility_retries = 0
+active_arm = None
+command_sequence = 0
+
+
+def event(value):
+    value = {'arm': active_arm, 'monotonic': time.monotonic(), 'unix_ns': time.time_ns(), **value}
+    with (out / 'native-events.jsonl').open('a') as stream:
+        stream.write(json.dumps(value) + '\n')
 
 
 def cancelled(signum, frame):
@@ -47,15 +55,23 @@ if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
 
 
 def run(args, **kwargs):
+    global command_sequence
     if 'CAGENTS_AGENT_AUTHORITY' in os.environ:
         raise RuntimeError('Inherited caller authority is present; native command refused')
     timeout = kwargs.pop('timeout', 20)
+    command_sequence += 1
+    command_id = command_sequence
+    event({'event': 'command-started', 'command_id': command_id, 'argv': list(map(str, args)),
+           'cwd': str(kwargs.get('cwd', Path.cwd()))})
     process = subprocess.Popen(args, start_new_session=True, **kwargs)
     try:
         code = process.wait(timeout=timeout)
-    except BaseException:
+    except BaseException as error:
+        event({'event': 'command-failed', 'command_id': command_id,
+               'error_type': type(error).__name__, 'error': str(error)[:2000]})
         stop(process)
         raise
+    event({'event': 'command-finished', 'command_id': command_id, 'exit_code': code})
     if code:
         stop(process)
         raise subprocess.CalledProcessError(code, args)
@@ -160,6 +176,7 @@ def click(pid, name, keyboard=False):
         return nodes[0] if len(nodes) == 1 else None
     node = wait(find)
     if keyboard:
+        event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'keyboard'})
         assert node.queryComponent().grabFocus(), 'Recovery control refused keyboard focus'
         wait(lambda: node.getState().contains(pyatspi.STATE_FOCUSED))
         run(['xdotool', 'key', 'Return'])
@@ -168,6 +185,8 @@ def click(pid, name, keyboard=False):
     assert bounds.width > 0 and bounds.height > 0
     assert 0 <= bounds.x + bounds.width // 2 < viewport[0]
     assert 0 <= bounds.y + bounds.height // 2 < viewport[1]
+    event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'pointer',
+           'bounds': [bounds.x, bounds.y, bounds.width, bounds.height]})
     run(['xdotool', 'mousemove', '--sync', str(bounds.x + bounds.width // 2),
          str(bounds.y + bounds.height // 2), 'click', '1'])
 
@@ -187,6 +206,8 @@ def copy_exact(pid, name, expected, keyboard=False):
     wait(lambda: clipboard() == sentinel)
     click(pid, name, keyboard=keyboard)
     wait(lambda: clipboard() == expected)
+    event({'event': 'clipboard-match', 'pid': pid, 'name': name, 'bytes': len(expected),
+           'sha256': hashlib.sha256(expected).hexdigest()})
 
 
 def open_ordinary_history(pid):
@@ -382,6 +403,8 @@ try:
         run(command, timeout=180)
         for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'stale', 'short', False, True)]:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
+            active_arm = label
+            event({'event': 'arm-started', 'revision': revision})
             root = base / label
             root.mkdir(mode=0o700)
             env = os.environ.copy()
@@ -431,6 +454,10 @@ try:
                 'backend_requested': env['ICED_BACKEND'], 'fixture_source_sha256': digest(source),
                 'helper_sha256': digest(helper), 'scope': 'Owned native window binding before application input',
             }, indent=2) + '\n')
+            with (out / (label + '-window.txt')).open('w') as log:
+                run(['xwininfo', '-id', window, '-tree', '-stats'], stdout=log)
+            with (out / (label + '-root-window.txt')).open('w') as log:
+                run(['xwininfo', '-root', '-stats'], stdout=log)
             run(['xdotool', 'windowactivate', '--sync', window])
             wait(lambda: 'full-model-delivered' in receipt.read_text())
             wait(lambda: any(node.getRole() == pyatspi.ROLE_PUSH_BUTTON
@@ -659,7 +686,10 @@ try:
                              'events': events.splitlines()})
             assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
             assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
+            event({'event': 'arm-completed', 'revision': revision})
+            active_arm = None
 finally:
+    native_failure = sys.exc_info()[1]
     cleanup_errors = []
     for process in reversed(children):
         try:
@@ -687,6 +717,11 @@ finally:
                 if (root / name).is_file():
                     (out / (root.name + '-' + name)).write_bytes((root / name).read_bytes())
     (out / 'cleanup.json').write_text(json.dumps({'errors': cleanup_errors, 'subreaper': True}, indent=2) + '\n')
+    (out / 'native-outcome.json').write_text(json.dumps({
+        'outcome': 'failed' if native_failure is not None or cleanup_errors else 'complete',
+        'incomplete_arm': active_arm, 'error_type': type(native_failure).__name__ if native_failure else None,
+        'error': str(native_failure)[:2000] if native_failure else None, 'cleanup_errors': cleanup_errors,
+    }, indent=2) + '\n')
     (out / 'accessibility-retries.json').write_text(json.dumps({'unknown_object_retries': stale_accessibility_retries,
         'scope': 'Bounded whole-query retry for AT-SPI Unknown object only; no input gesture is retried.'}, indent=2) + '\n')
     if not cleanup_errors:
