@@ -90,6 +90,25 @@ impl<Message: Clone + 'static> MenuSurface<'_, Message> {
             );
         }
     }
+    /// Whether the native menu is open, from the native state itself.
+    ///
+    /// `LocalState` is private to libcosmic, but its `overlay` returns a menu
+    /// exactly when that state is open, and building one has no side effects.
+    fn menu_open(&mut self, tree: &mut Tree, renderer: &Renderer, viewport: &Rectangle) -> bool {
+        if self.builder.is_some() && self.items == 0 {
+            return false;
+        }
+        let footprint = layout::Node::new(Size::ZERO);
+        self.native
+            .overlay(
+                &mut tree.children[0],
+                Layout::new(&footprint),
+                renderer,
+                viewport,
+                Vector::ZERO,
+            )
+            .is_some()
+    }
     /// The native widget's own tree, as `ContextMenu::diff` leaves it.
     ///
     /// `ContextMenu::children` also declares the legacy menu subtree, which the
@@ -214,6 +233,22 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             }
             self.native.diff(&mut tree.children[0]);
         }
+        // The native widget closes an open menu on Escape but leaves the key
+        // uncaptured, so the dialog or pane beneath would also take it as its
+        // own Escape. The menu is what Escape dismisses; claim it for the menu.
+        //
+        // Ask the native widget whether its menu is open *now*, rather than
+        // remembering what the last `overlay` call saw. A menu also closes
+        // without any later `overlay` call, for instance when its item opens
+        // a modal dialog, which then hides every other overlay; a remembered
+        // flag would stay set and swallow the dialog's first Escape.
+        let dismissing = matches!(
+            event,
+            Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+                ..
+            })
+        ) && self.menu_open(tree, renderer, viewport);
         // The native widget records the anchor it opens at from this cursor,
         // and the runtime drives the overlay it returns in window space. A
         // scrollable, though, hands its content an untranslated layout and a
@@ -255,6 +290,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         if opening {
             tree.state.downcast_mut::<MenuItems>().open = true;
             shell.invalidate_layout();
+            shell.request_redraw();
+        }
+        if dismissing {
+            shell.capture_event();
             shell.request_redraw();
         }
     }
@@ -1095,6 +1134,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn escape_that_dismisses_the_menu_is_not_left_for_the_surface_beneath() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless renderer");
+        let window = Size::new(400.0, 400.0);
+        let viewport = Rectangle::new(Point::ORIGIN, window);
+        let mut element: Element<'_, ()> = surface(widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![widget::menu::Item::Button("Action", None, Action)],
+        ));
+        let widget = element.as_widget_mut();
+        let mut tree = Tree::new(&*widget);
+        widget.diff(&mut tree);
+        let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+        let cursor = mouse::Cursor::Available(Point::new(40.0, 40.0));
+        let escape = Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+            key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+            modified_key: cosmic::iced::keyboard::Key::Named(
+                cosmic::iced::keyboard::key::Named::Escape,
+            ),
+            physical_key: cosmic::iced::keyboard::key::Physical::Code(
+                cosmic::iced::keyboard::key::Code::Escape,
+            ),
+            location: cosmic::iced::keyboard::Location::Standard,
+            modifiers: cosmic::iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let send =
+            |widget: &mut dyn Widget<(), Theme, Renderer>, tree: &mut Tree, event: &Event| {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                widget.update(
+                    tree,
+                    event,
+                    Layout::new(&row),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                shell.is_event_captured()
+            };
+        // A closed menu leaves Escape to whatever owns it.
+        assert!(!send(widget, &mut tree, &escape));
+        send(
+            widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+        );
+        assert!(
+            widget
+                .overlay(
+                    &mut tree,
+                    Layout::new(&row),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_some(),
+            "opened menu"
+        );
+        assert!(send(widget, &mut tree, &escape), "Escape closed the menu");
+        assert!(
+            widget
+                .overlay(
+                    &mut tree,
+                    Layout::new(&row),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_none(),
+            "the menu is closed"
+        );
+        assert!(!send(widget, &mut tree, &escape));
+
+        // A menu that closes without another `overlay` query, as when its item
+        // opens a modal dialog that hides every other overlay, leaves the
+        // dialog its first Escape.
+        send(
+            widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+        );
+        assert!(
+            widget
+                .overlay(
+                    &mut tree,
+                    Layout::new(&row),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_some(),
+            "reopened menu"
+        );
+        send(
+            widget,
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        );
+        assert!(
+            !send(widget, &mut tree, &escape),
+            "Escape after the menu closed unseen belongs to what is beneath"
+        );
     }
 
     #[test]
