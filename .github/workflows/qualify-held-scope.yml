@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: 0957b3a9b6fe1cb9e00d2170a6db90ed94344ab8
-      PRODUCT_TREE: 66cd3a548c5422a169581f7d619818b042acbef5
+      PRODUCT_SHA: 9ead6a2019db03485ebe1d608b697e1959ca1e54
+      PRODUCT_TREE: 55b02f04f3d297bae206c87ca0ef493e769508b7
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -111,9 +111,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Preserve the hosted lane after validation
-        # Full native/three-boundary archives exceed the repository's 10 GB
-        # ceiling. Preserve the existing 4.98 GB focus fallback instead of
-        # replacing it with an archive that cannot remain cached.
+        # Keep a focused build fallback when native capture never started.
+        # Skip another archive after native/three-boundary execution grows
+        # the target. Build artifacts are never passing-result evidence.
         if: always() && steps.cache.outcome == 'success' && steps.native.outcome == 'skipped'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
