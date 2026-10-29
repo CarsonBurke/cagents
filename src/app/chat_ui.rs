@@ -5561,6 +5561,11 @@ impl Cagents {
         provider: Provider,
         model: Option<String>,
     ) -> Task<Message> {
+        // A first Send is saving this draft's identity; its receipt decides
+        // what storage holds, so the draft's source is fixed until it answers.
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let models = self
             .account_ui
             .catalog(provider)
@@ -5687,6 +5692,9 @@ impl Cagents {
 
     /// Points a draft at account `id` of its own provider.
     fn choose_chat_account(&mut self, target: Target, id: AccountId) -> Task<Message> {
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let Some(account) = self.known_account(&id) else {
             return Task::none();
         };
@@ -6724,10 +6732,15 @@ impl Cagents {
     }
 
     /// A draft whose first publication was refused was never in a shared
-    /// view, so no other client closed it. Keep it in this window with its
-    /// draft, and say why it cannot be sent here.
-    pub(super) fn retain_draft_after_creation_refusal(&mut self, card: CardId) -> bool {
-        if !self.shared_chat_has_local_work(card)
+    /// view, so no other client closed it. Keep it in this window, where it
+    /// can still start, and say why other windows will not show it.
+    pub(super) fn retain_draft_after_creation_refusal(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+    ) -> bool {
+        if self.draft_start_scope(card).as_ref() != Some(scope)
+            || !self.shared_chat_has_local_work(card)
             || !self.card_state(card).is_some_and(|state| {
                 state.existence.is_open()
                     && matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())
@@ -6736,7 +6749,7 @@ impl Cagents {
             return false;
         }
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
-            runtime.error = Some("This pane could not be shared with your other windows, so it cannot start. Your draft is kept; copy it before closing this pane.".into());
+            runtime.error = Some("This pane could not be shared with your other windows. It stays in this window, and sending starts the conversation here.".into());
         }
         true
     }

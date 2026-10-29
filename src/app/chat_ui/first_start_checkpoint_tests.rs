@@ -1464,3 +1464,41 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         }
     }
 }
+
+#[test]
+fn draft_source_is_fixed_while_its_first_save_is_in_flight() {
+    // A switch keeps A's id, so a declined B -> A return queued behind it
+    // would replace the switch before it lands. The draft waits instead.
+    let (mut app, _directory, card, target) = fixture();
+    let source = runtime(&app, card).session.clone();
+    let task = app.start_chat_draft(target);
+    drop(app.handle_chat_ui(Action::DraftModel(target, Provider::Claude, None)));
+    drop(app.handle_chat_ui(Action::ChooseAccount(
+        target,
+        Account::system(Provider::Codex).id(),
+    )));
+    assert_eq!(runtime(&app, card).session, source);
+    assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(s) if s == &source));
+    let (target, attempt, result) = checkpoint(task);
+    assert!(result.is_ok());
+    app.settings_reset_confirm = true;
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    app.settings_reset_confirm = false;
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(stored(&app, card), source);
+    // Once the receipt answered, the same switch applies and saves.
+    drop(app.handle_chat_ui(Action::DraftModel(target, Provider::Claude, None)));
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let switched = stored(&app, card);
+    assert_eq!(switched.id, source.id);
+    assert_eq!(switched.launch.provider, Provider::Claude);
+}
