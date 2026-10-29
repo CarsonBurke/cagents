@@ -175,6 +175,27 @@ fn client(
                 let mut fixture = state.lock().unwrap();
                 let repaired = fixture.repaired;
                 let model = &mut fixture.model;
+                let edit_summary = match &edit {
+                    ModelEdit::SeedView { scope, panes, closed } => format!(
+                        "SeedView scope={scope:?} panes={:?} closed={closed:?}",
+                        panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+                    ),
+                    ModelEdit::ChangeView { scope, change, .. } => {
+                        let affected = match change {
+                            Change::Insert { pane, .. }
+                            | Change::InsertIfEmpty { pane }
+                            | Change::Update { pane, .. } => pane.id,
+                            Change::Remove { id }
+                            | Change::Move { id, .. }
+                            | Change::Transfer { id, .. } => *id,
+                        };
+                        format!("ChangeView scope={scope:?} affected={affected:?}")
+                    }
+                    ModelEdit::OpenProject { repository, .. } => format!("OpenProject repository={repository:?}"),
+                    #[cfg(held_product_after)]
+                    ModelEdit::SuggestConversationTitle { id, card, .. } => format!("SuggestConversationTitle channel={id:?} card={card:?}"),
+                    other => format!("Other {:?}", std::mem::discriminant(other)),
+                };
                 let result: Result<(), String> = (|| {
                     match edit {
                         ModelEdit::OpenProject { repository, name, kind }
@@ -196,11 +217,11 @@ fn client(
                                 return Err("Quarantined close was published".into());
                             }
                             for pane in &panes {
-                                pane.validate()?;
                                 if pane.id == bad_id && !repaired {
                                     record(&root, "UNEXPECTED-bad-shared-insert");
                                     return Err("Unverified synthetic pane was published".into());
                                 }
+                                pane.validate()?;
                             }
                             let view = model
                                 .views
@@ -264,7 +285,10 @@ fn client(
                             model: model.clone(),
                         },
                     },
-                    Err(_) => error("Synthetic fixture refused an inadmissible workspace edit"),
+                    Err(reason) => {
+                        record(&root, &format!("UNEXPECTED-model-edit-refused {edit_summary} reason={reason:?}"));
+                        error("Synthetic fixture refused an inadmissible workspace edit")
+                    }
                 }
             }
             ClientRequest::WatchTerminals => ServerMessage::Response {
@@ -890,7 +914,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         fixture.model.views.push(View::empty(Scope::Channel(active_channel)));
     }
-    if ordinary_mode {
+    {
         let mut fixture = state.lock().unwrap();
         let repository = fixture.model.projects[0].repository.clone();
         fixture.model.views.push(View::empty(Scope::Worktree { repository: repository.clone(), path: repository }));
