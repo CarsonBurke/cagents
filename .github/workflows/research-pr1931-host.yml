@@ -17,8 +17,8 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: 543de3bbc2592941aaec0e7b212c931793494425
-  EXPECTED_PRODUCT_TREE: cecb20a0bc8b2394fac6b1c1d7c9ffcad8e6fb8e
+  EXPECTED_PRODUCT_SHA: 82ae35d138a97687db9aa95ec782659828c0a37f
+  EXPECTED_PRODUCT_TREE: cf313bdd2ade7a39efb0a722a13d31ee477de526
 
 jobs:
   host:
@@ -61,7 +61,7 @@ jobs:
       - name: Check out the literal product
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: 543de3bbc2592941aaec0e7b212c931793494425
+          ref: 82ae35d138a97687db9aa95ec782659828c0a37f
           path: product
           persist-credentials: false
 
@@ -87,7 +87,7 @@ jobs:
           {
             git rev-parse HEAD 'HEAD^{tree}'
             git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
-            sha256sum Cargo.toml Cargo.lock src/lib.rs src/modules.rs .cargo/config.toml scripts/build-ceditor-product src/host/mod.rs src/host/chat.rs src/host/chat/capacity.rs src/host/chat/native_recovery.rs src/host/chat/retained_actor.rs src/host/chat/retained_actor_tests.rs src/host/chat/retained_admission_tests.rs src/chat/runtime/retained_actor/transport.rs
+            sha256sum Cargo.toml Cargo.lock src/lib.rs src/modules.rs .cargo/config.toml scripts/build-ceditor-product src/host/mod.rs src/host/chat.rs src/host/chat/capacity.rs src/host/chat/native_recovery.rs src/host/chat/retained_actor.rs src/host/chat/retained_actor_tests.rs src/host/chat/retained_admission_tests.rs src/chat/runtime/retained_actor/transport.rs src/host/state.rs
             sha256sum "$GITHUB_WORKSPACE/research/.github/workflows/research-pr1931-host.yml"
           } > "$RUNNER_TEMP/pr1931-logs/source-before.txt"
 
@@ -109,7 +109,12 @@ jobs:
       - name: Check literal product formatting and the isolated HOST
         run: |
           set -euo pipefail
+          set +e
           scripts/check-format > "$RUNNER_TEMP/pr1931-logs/format.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1931-logs/format.exit"
+          test "$task_status" -eq 0 || exit "$task_status"
           set +e
           cargo check --locked --no-default-features --features host --bin cagentsd > "$RUNNER_TEMP/pr1931-logs/host-check.txt" 2>&1
           task_status=$?
@@ -143,6 +148,20 @@ jobs:
           tail -n 80 "$RUNNER_TEMP/pr1931-logs/host-all-targets.txt"
           exit "$task_status"
 
+      - name: Always retain the post-test helper observation
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f "$RUNNER_TEMP/pr1931-logs/helper.sha256"; then
+            set +e
+            sha256sum --check "$RUNNER_TEMP/pr1931-logs/helper.sha256" > "$RUNNER_TEMP/pr1931-logs/helper-after-check.txt" 2>&1
+            task_status=$?
+            set -e
+            printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1931-logs/helper-after-check.exit"
+            exit "$task_status"
+          fi
+          printf '%s\n' 'Helper was not built; no post-test helper claim.' > "$RUNNER_TEMP/pr1931-logs/helper-after-unavailable.txt"
+
       - name: Require the exact startup-custody parents and unchanged source
         run: |
           set -euo pipefail
@@ -150,6 +169,11 @@ jobs:
           import os, pathlib, re
           log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1931-logs/host-all-targets.txt').read_text()
           names = [
+              "host::state::tests::upgrade_commit_failure_preserves_live_control_authority",
+              "host::state::tests::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown",
+              "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close",
+              "host::state::tests::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade",
+              "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
               "chat::native_holder::transport::tests::post_child_census_failure_preserves_live_ownership_and_services_control",
               "chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool",
               "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
@@ -183,7 +207,7 @@ jobs:
           ]
           for name in names:
               assert len(re.findall(r'^test ' + re.escape(name) + r' \.\.\. ok$', log, re.M)) == 1, name
-          print('All 27 capacity/retained-startup and three fixture parents passed once within the full HOST all-target invocation.')
+          print('All 27 capacity/retained-startup, three prior fixture and five upgrade fixture parents passed once within the full HOST all-target invocation.')
           PY
           sha256sum --check "$RUNNER_TEMP/pr1931-logs/helper.sha256"
           test -z "$(git status --porcelain --untracked-files=all)"
