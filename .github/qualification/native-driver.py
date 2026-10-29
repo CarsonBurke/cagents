@@ -31,6 +31,7 @@ receipts = []
 children = []
 stopped = set()
 viewport = (1280, 800)
+native_renderer = {'ICED_BACKEND': 'wgpu', 'WGPU_BACKEND': 'gl', 'LIBGL_ALWAYS_SOFTWARE': '1'}
 stale_accessibility_retries = 0
 active_arm = None
 command_sequence = 0
@@ -157,7 +158,10 @@ def capture(window, name, size):
             diverse = rgb.getcolors(maxcolors=15) is None
             metrics = {'size': list(picture.size), 'pixels_above_intensity_8_fraction': lit,
                        'luminance_range': max(levels) - min(levels), 'at_least_16_colors': diverse,
-                       'backend_requested': 'tiny-skia', 'capture': 'visible screen pixels for owned window'}
+                       'backend_requested': native_renderer['ICED_BACKEND'],
+                       'wgpu_backend_requested': native_renderer['WGPU_BACKEND'],
+                       'software_gl_requested': native_renderer['LIBGL_ALWAYS_SOFTWARE'],
+                       'capture': 'visible screen pixels for owned window'}
             (out / (name + '-frame.json')).write_text(json.dumps(metrics, indent=2) + '\n')
             return diverse and lit > .01 and metrics['luminance_range'] >= 16
     wait(rendered_frame, timeout=20)
@@ -423,8 +427,8 @@ try:
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
-            env['ICED_BACKEND'] = 'tiny-skia'
-            env['LIBGL_ALWAYS_SOFTWARE'] = '1'
+            env.update(native_renderer)
+            env['RUST_LOG'] = 'cagents=debug,cagentsd=debug,iced_wgpu=info,warn'
             with (out / (label + '-fixture.log')).open('w') as log:
                 fixture = subprocess.Popen([str(helper), str(root), mode], env=env, stdout=log,
                                            stderr=subprocess.STDOUT, start_new_session=True)
@@ -451,7 +455,10 @@ try:
             (out / (label + '-launch.json')).write_text(json.dumps({
                 'arm': label, 'revision': revision, 'window_id': window, 'pid': pid,
                 'executable': str(executable.resolve()), 'ui_sha256': ui_hash,
-                'backend_requested': env['ICED_BACKEND'], 'fixture_source_sha256': digest(source),
+                'backend_requested': env['ICED_BACKEND'],
+                'wgpu_backend_requested': env['WGPU_BACKEND'],
+                'software_gl_requested': env['LIBGL_ALWAYS_SOFTWARE'],
+                'fixture_source_sha256': digest(source),
                 'helper_sha256': digest(helper), 'scope': 'Owned native window binding before application input',
             }, indent=2) + '\n')
             with (out / (label + '-window.txt')).open('w') as log:
