@@ -132,6 +132,109 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
 }
 
 #[test]
+fn failed_reattachment_keeps_original_provider_exit_diagnostic() {
+    if isolated("failed_reattachment_keeps_original_provider_exit_diagnostic") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    let pair = fixture.worker.holder_identity().unwrap().clone();
+    fs::write(fixture.root.join("fail-reattach-initialize"), b"fail").unwrap();
+    // Exercise the actual restore poll and its first returned failure, before
+    // any chat snapshot can be installed or used to recover the diagnosis.
+    let refusal = restore(&fixture.host, CLIENT, &fixture.source).unwrap_err();
+    assert!(refusal.contains("Cannot reattach the retained native conversation"));
+    assert!(refusal.contains("status 7"), "{refusal}");
+    assert!(refusal.contains("reattach capacity fixture"), "{refusal}");
+    assert!(refusal.contains("redacted credential-bearing stderr line"));
+    assert!(!refusal.contains("NATIVE_REATTACH_PRIVATE_CANARY"));
+    assert!(!refusal.contains('\u{1b}'));
+    assert!(
+        refusal.contains(
+            "Provider ownership was preserved; no replacement was started or prompt resent"
+        )
+    );
+    assert!(!refusal.contains("cleanup is unconfirmed"));
+    {
+        let state = fixture.host.lock().unwrap();
+        assert!(!state.chats.contains_key(&fixture.source.id));
+        assert!(!state.chat_spawning.contains_key(&fixture.source.id));
+        assert!(!state.native_closing.contains_key(&fixture.source.id));
+        assert_eq!(
+            state.native_adoption_failures.get(&fixture.source),
+            Some(refusal.as_str())
+        );
+    }
+    assert_eq!(fixture.raw(), raw);
+    assert_eq!(fixture.worker.holder_identity(), Some(&pair));
+    assert!(pair.root.is_current());
+    assert!(
+        fixture.native.root.is_current(),
+        "original wait custody lost"
+    );
+    assert!(fixture.native.holder.is_current());
+    assert_eq!(
+        registry::evidence(
+            &registry::socket(
+                &registry::directory(Kind::Native).unwrap(),
+                fixture.source.id
+            ),
+            Kind::Native
+        )
+        .unwrap(),
+        Some(fixture.native.clone())
+    );
+    let (retained, _) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert_eq!(retained.source.launch, fixture.original.source.launch);
+    assert_eq!(retained.server_process, fixture.original.server_process);
+    assert_eq!(retained.server_identity, fixture.original.server_identity);
+    assert_eq!(retained.confirmed_thread.as_deref(), Some(THREAD));
+    assert_eq!(retained.paired_holder.as_ref(), Some(&pair));
+    assert!(retained.execution_environment == fixture.original.execution_environment);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("provider-launches")).unwrap(),
+        "launch\n"
+    );
+    let requests = fs::read_to_string(fixture.root.join("provider-requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "initialize")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "thread/start")
+            .count(),
+        1
+    );
+    assert!(!requests.lines().any(|method| method == "thread/resume"));
+    assert!(!requests.lines().any(|method| method.starts_with("turn/")));
+    let (mut holder, _) =
+        crate::chat::native_holder::adopt(&fixture.native, &fixture.source, &fixture.proof)
+            .unwrap();
+    holder.close().unwrap();
+    assert!(
+        !fixture.native.root.is_current(),
+        "exact Close did not reap original"
+    );
+    let projected = fixture
+        .host
+        .lock()
+        .unwrap()
+        .native_terminal_projection(fixture.source.id)
+        .unwrap();
+    fixture
+        .worker
+        .close_with_receipt(&projected, &fixture.proof)
+        .unwrap();
+    assert!(!pair.root.is_current());
+}
+
+#[test]
 fn retained_close_refuses_changed_pair_fields_and_unissued_sources() {
     if isolated("retained_close_refuses_changed_pair_fields_and_unissued_sources") {
         return;
@@ -1291,6 +1394,28 @@ fn provider() {
                 .open(root.join("provider-requests"))
                 .unwrap();
             writeln!(log, "{method}").unwrap();
+            if method == "initialize" && root.join("fail-reattach-initialize").exists() {
+                eprintln!("Authorization: Bearer NATIVE_REATTACH_PRIVATE_CANARY");
+                eprintln!("\x1b[31mreattach capacity fixture\x1b[0m");
+                std::io::stderr().flush().unwrap();
+                let original = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+                assert!(original >= 0);
+                let delayed_eof = unsafe { libc::fork() };
+                assert!(delayed_eof >= 0);
+                if delayed_eof == 0 {
+                    // Keep the inherited websocket open until the original is
+                    // kernel-exited, so its first diagnostic cannot be live.
+                    // After fork use only async-signal-safe libc operations.
+                    let mut event = libc::pollfd {
+                        fd: original as i32,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut event, 1, 5000) };
+                    unsafe { libc::_exit(if ready > 0 { 0 } else { 1 }) };
+                }
+                unsafe { libc::_exit(7) };
+            }
             let result = match method {
                 "initialize" => {
                     json!({"userAgent":"cagents/0.157.1 (Linux)", "codexHome":std::env::var("CODEX_HOME").unwrap()})
