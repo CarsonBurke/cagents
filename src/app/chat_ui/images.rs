@@ -2935,6 +2935,7 @@ mod tests {
             let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
                 panic!("draft chat");
             };
+            runtime.visible.store(true, Ordering::Relaxed);
             let mut item = image_item(hint.to_string_lossy().into_owned());
             if let ItemContent::Image { reference, .. } = &mut item.content {
                 *reference = backend_image.reference.clone();
@@ -2977,6 +2978,7 @@ mod tests {
         let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
             panic!("draft chat")
         };
+        runtime.visible.store(true, Ordering::Relaxed);
         let path = format!(
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(png())
