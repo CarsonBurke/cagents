@@ -56,7 +56,7 @@ impl Markdown {
     fn part(&mut self,part:&crate::agent_execution::TranscriptPart)->String {
         let prose=matches!(&part.item.content,crate::chat::ItemContent::Text{..}|crate::chat::ItemContent::Delivery{..});
         let continuation=prose && self.open_prose.as_deref()==Some(part.item.id.as_str());
-        let mut output=if self.open_prose.is_some() && !continuation {self.finish()} else {String::new()};
+        let mut output=if self.open_prose.is_some() && !continuation {self.finish().to_owned()} else {String::new()};
         output.push_str(&markdown(part,!continuation));
         if prose {self.open_prose=Some(part.item.id.clone());}
         output
