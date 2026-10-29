@@ -1959,8 +1959,13 @@ impl Cagents {
                 count(c, "chat", "chats")
             ),
         };
+        let sessions = if terminals + chats == 1 {
+            "its session"
+        } else {
+            "their sessions"
+        };
         Some(format!(
-            "This closes {parts} in {place} and ends their sessions."
+            "This closes {parts} in {place} and ends {sessions}."
         ))
     }
 
@@ -4347,6 +4352,11 @@ mod tests {
         );
         assert_eq!(captured(&inner), sorted(&in_nested));
         assert!(app.worktree_deletion_blocker(&inner).is_none());
+
+        assert_eq!(
+            app.worktree_cascade_summary(&target(sibling.id)).as_deref(),
+            Some("This closes 1 terminal in the worktree and ends its session.")
+        );
 
         let primary = target(primary.id);
         assert_eq!(primary.nested.len(), 3);
