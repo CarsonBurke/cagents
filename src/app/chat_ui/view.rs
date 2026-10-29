@@ -3600,6 +3600,7 @@ impl Runtime {
             ),
         );
         let choices = open.then(|| {
+            let source = Arc::new(self.session.clone());
             widget::column::with_children(
                 accounts
                     .choices
@@ -3632,22 +3633,25 @@ impl Runtime {
                                 .width(Length::Fill)
                                 .into(),
                         );
-                        widget::button::custom(
-                            widget::row::with_children(row)
-                                .spacing(step::GAP_S)
-                                .align_y(Alignment::Center),
+                        let owner = AccountChoice::new(Arc::clone(&source), choice.id);
+                        crate::ui_controls::owned(
+                            (target, owner.clone()),
+                            widget::button::custom(
+                                widget::row::with_children(row)
+                                    .spacing(step::GAP_S)
+                                    .align_y(Alignment::Center),
+                            )
+                            .name(choice.label)
+                            .id(card_control_id(
+                                target.card,
+                                &format!("chat-account-choice-{index}"),
+                            ))
+                            .selected(choice.selected)
+                            .class(crate::ui_controls::control_style(choice.selected, None))
+                            .padding([step::GAP_XS, step::GAP_S])
+                            .width(Length::Fill)
+                            .on_press(action(Action::ChooseAccount(target, owner))),
                         )
-                        .name(choice.label)
-                        .id(card_control_id(
-                            target.card,
-                            &format!("chat-account-choice-{index}"),
-                        ))
-                        .selected(choice.selected)
-                        .class(crate::ui_controls::control_style(choice.selected, None))
-                        .padding([step::GAP_XS, step::GAP_S])
-                        .width(Length::Fill)
-                        .on_press(action(Action::ChooseAccount(target, choice.id)))
-                        .into()
                     })
                     .chain(std::iter::once(
                         widget::button::custom(design::caption("Manage accounts…"))

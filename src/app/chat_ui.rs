@@ -134,6 +134,29 @@ pub struct Target {
     pub generation: u64,
 }
 
+/// The source and destination shown by one rendered account choice.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountChoice {
+    source: Arc<chat::Session>,
+    id: AccountId,
+}
+
+impl AccountChoice {
+    fn new(source: Arc<chat::Session>, id: AccountId) -> Self {
+        Self { source, id }
+    }
+}
+
+impl std::fmt::Debug for AccountChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountChoice")
+            .field("source", &self.source.id)
+            .field("provider", &self.source.launch.provider)
+            .field("account", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct Ready(Arc<Mutex<Option<Result<Arc<ClientHandle>, chat::StartFailure>>>>);
 impl std::fmt::Debug for Ready {
@@ -174,8 +197,8 @@ pub enum Action {
     /// model where none is named.
     DraftModel(Target, Provider, Option<String>),
     /// Points a draft at another account of its provider.
-    ChooseAccount(Target, AccountId),
-    RecoverAccount(CardId, AccountId),
+    ChooseAccount(Target, AccountChoice),
+    RecoverAccount(CardId, AccountChoice),
     /// Read-only actor readiness for one exact unadmitted manual choice.
     QueuedAccountGeneration(Target, AccountId, u64, Result<Option<u64>, String>),
     CancelAccountSwitch(Target, AccountId, u64),
@@ -5627,6 +5650,14 @@ impl Cagents {
         self.change_chat_account(card, id, None, AccountChange::SavedRecovery)
     }
 
+    fn account_choice_source_is_current(&self, card: CardId, choice: &AccountChoice) -> bool {
+        self.card_state(card)
+            .filter(|state| state.existence.is_open())
+            .is_some_and(|state| {
+                matches!(&state.kind, CardKind::Chat(source) if source == choice.source.as_ref())
+            })
+    }
+
     fn automatic_chat_account(
         &self,
         target: Target,
@@ -5848,8 +5879,11 @@ impl Cagents {
                     .into(),
             );
         }
+        let source = Arc::new(source.clone());
         for choice in choices {
-            content.push(
+            let owner = AccountChoice::new(Arc::clone(&source), choice.id);
+            content.push(crate::ui_controls::owned(
+                (card, owner.clone(), !pending),
                 crate::ui_controls::button::secondary(format!(
                     "{}{}",
                     choice.label,
@@ -5860,10 +5894,9 @@ impl Cagents {
                     }
                 ))
                 .on_press_maybe(
-                    (!pending).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
-                )
-                .into(),
-            );
+                    (!pending).then_some(Message::ChatUi(Action::RecoverAccount(card, owner))),
+                ),
+            ));
         }
         content.push(
             crate::ui_controls::button::secondary("Open Accounts")
@@ -8099,6 +8132,22 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        // Validate before picker/focus bookkeeping as well as before admission.
+        match &action {
+            Action::ChooseAccount(target, choice)
+                if !self.account_choice_source_is_current(target.card, choice)
+                    || !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+                        if runtime.target == *target && runtime.session == *choice.source) =>
+            {
+                return Task::none();
+            }
+            Action::RecoverAccount(card, choice)
+                if !self.account_choice_source_is_current(*card, choice) =>
+            {
+                return Task::none();
+            }
+            _ => {}
+        }
         let switch_observation = match &action {
             Action::Wake(target, _)
             | Action::CommandFinished(target, _, _)
@@ -8384,8 +8433,8 @@ impl Cagents {
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }
-            Action::ChooseAccount(target, id) => {
-                return self.choose_chat_account(target, id);
+            Action::ChooseAccount(target, choice) => {
+                return self.choose_chat_account(target, choice.id);
             }
             Action::QueuedAccountGeneration(target, id, query, result) => {
                 let canonical = self
@@ -8495,7 +8544,9 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
+            Action::RecoverAccount(card, choice) => {
+                return self.recover_chat_account(card, choice.id);
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -19948,7 +19999,7 @@ mod tests {
         };
         let _ = app.update(Message::ChatUi(Action::ChooseAccount(
             target,
-            managed.clone(),
+            rendered_account_choice(&app, target.card, managed.clone()),
         )));
         assert!(!app.chat_start_pending(card), "a choice starts nothing");
         // The composer outlives the move: what the reader attached is still
@@ -20557,7 +20608,7 @@ mod tests {
 
         let _ = app.update(Message::ChatUi(Action::ChooseAccount(
             target(&app),
-            managed.clone(),
+            rendered_account_choice(&app, target(&app).card, managed.clone()),
         )));
         assert!(!app.chat_start_pending(card));
         let moved = chat_runtime(&app, card).session.clone();
@@ -20625,7 +20676,10 @@ mod tests {
         };
         let source = chat_runtime(&app, card).session.clone();
         let _ = app.update(Message::ChatUi(Action::AccountPicker(target, true)));
-        let _ = app.update(Message::ChatUi(Action::ChooseAccount(target, managed)));
+        let _ = app.update(Message::ChatUi(Action::ChooseAccount(
+            target,
+            rendered_account_choice(&app, target.card, managed),
+        )));
         assert!(!app.chat_ui.phases.values().any(|phase| matches!(
             phase,
             Phase::Closing {
@@ -22525,7 +22579,7 @@ mod tests {
             app.chat_ui.removed_accounts.remove(&card);
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
-                system.clone(),
+                rendered_account_choice(&app, card, system.clone()),
             )));
             assert!(!app.chat_start_pending(card));
             assert_eq!(
@@ -22535,7 +22589,7 @@ mod tests {
             app.chat_ui.removed_accounts.insert(card);
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
-                system.clone(),
+                rendered_account_choice(&app, card, system.clone()),
             )));
             let target = chat_runtime_attempt(&app, card);
             assert_ne!(app.chat_ui.attempt(card).unwrap().session.id, source.id);
@@ -22556,7 +22610,7 @@ mod tests {
             );
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
-                system.clone(),
+                rendered_account_choice(&app, card, system.clone()),
             )));
             assert_eq!(
                 chat_runtime_attempt(&app, card),
@@ -22581,7 +22635,7 @@ mod tests {
             assert_eq!(saved(&app), CardKind::Chat(source.clone()));
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
-                system.clone(),
+                rendered_account_choice(&app, card, system.clone()),
             )));
             let target = chat_runtime_attempt(&app, card);
             let handle = fixture_handle(&app, card, Some("different-conversation"));
@@ -22595,7 +22649,7 @@ mod tests {
             for changed in ["candidate", "account"] {
                 let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                     card,
-                    system.clone(),
+                    rendered_account_choice(&app, card, system.clone()),
                 )));
                 let target = chat_runtime_attempt(&app, card);
                 let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
@@ -22622,7 +22676,7 @@ mod tests {
             }
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
-                system.clone(),
+                rendered_account_choice(&app, card, system.clone()),
             )));
             let target = chat_runtime_attempt(&app, card);
             let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
@@ -22665,7 +22719,10 @@ mod tests {
                 .rebind_chat_account(card, &competing, &source)
                 .unwrap();
 
-            let _ = app.update(Message::ChatUi(Action::RecoverAccount(card, system)));
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                rendered_account_choice(&app, card, system),
+            )));
             let target = chat_runtime_attempt(&app, card);
             let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
             let task = app.update(Message::ChatUi(Action::Ready(
@@ -27177,6 +27234,13 @@ mod tests {
     }
     // These tests deliver explicit immutable actor replies. They never poll a
     // provider/control task and do not claim a live daemon or native run.
+    fn rendered_account_choice(app: &Cagents, card: CardId, id: AccountId) -> AccountChoice {
+        let Some(CardKind::Chat(source)) = app.card_state(card).map(|state| &state.kind) else {
+            panic!("the fixture must retain its source conversation");
+        };
+        AccountChoice::new(Arc::new(source.clone()), id)
+    }
+
     fn account_switch_reply(app: &mut Cagents, card: CardId, recovery: chat::Recovery) {
         let target = chat_runtime_attempt(app, card);
         answer_start(
@@ -27206,7 +27270,7 @@ mod tests {
             Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
             drop(app.update(Message::ChatUi(Action::ChooseAccount(
                 target,
-                alternate.clone(),
+                rendered_account_choice(&app, target.card, alternate.clone()),
             ))));
             assert!(
                 app.chat_start_pending(card),
@@ -27292,7 +27356,7 @@ mod tests {
             assert_eq!(pending.is_some(), pending_command);
             drop(app.update(Message::ChatUi(Action::ChooseAccount(
                 target,
-                alternate.clone(),
+                rendered_account_choice(&app, target.card, alternate.clone()),
             ))));
             assert!(!app.chat_start_pending(card));
             let runtime = chat_runtime(&app, card);
@@ -27323,7 +27387,10 @@ mod tests {
             );
             assert!(chat_runtime(&app, card).pending.is_none());
             assert!(chat_runtime(&app, card).followups.is_empty());
-            drop(app.update(Message::ChatUi(Action::ChooseAccount(target, alternate))));
+            drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                target,
+                rendered_account_choice(&app, target.card, alternate),
+            ))));
             assert!(
                 app.chat_start_pending(card),
                 "a fresh explicit choice can now ask the actor"
@@ -27390,7 +27457,10 @@ mod tests {
         );
         let source = runtime.session.clone();
         let queued = runtime.queued.as_ref().unwrap().source.clone();
-        drop(app.update(Message::ChatUi(Action::ChooseAccount(target, alternate))));
+        drop(app.update(Message::ChatUi(Action::ChooseAccount(
+            target,
+            rendered_account_choice(&app, target.card, alternate),
+        ))));
         assert!(!app.chat_start_pending(card));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.session, source);
@@ -27799,6 +27869,348 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).unsent_attachments(), [unsent]);
     }
 
+    fn registry_with_account_choices() -> account::registry::Registry {
+        let mut registry = account::registry::Registry::default();
+        for (key, label) in [(502, "Choice D"), (503, "Choice E")] {
+            let key = uuid::Uuid::from_u128(key);
+            registry
+                .register(
+                    account::registry::Registered {
+                        key,
+                        provider: Provider::Codex,
+                        linked_home: None,
+                        label: Some(label.into()),
+                        email: Some(format!("{key}@example.com")),
+                        organization: None,
+                        added_at: 0,
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+        registry
+    }
+
+    fn cached_account_choice_frame(
+        app: &Cagents,
+        card: CardId,
+        saved: bool,
+        index: usize,
+        cache: &mut cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+        event: cosmic::iced::mouse::Event,
+        cursor: Option<iced::Point>,
+    ) -> (Vec<Message>, iced::Rectangle, Vec<iced::Rectangle>) {
+        use cosmic::iced::advanced::{clipboard, widget::Operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Rectangle, Size, mouse};
+        struct Buttons {
+            ids: Vec<widget::Id>,
+            saved: bool,
+            bounds: Vec<Rectangle>,
+        }
+        impl Operation for Buttons {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if self.saved || id.is_some_and(|id| self.ids.contains(id)) {
+                    self.bounds.push(bounds);
+                }
+            }
+        }
+        let mut buttons = Buttons {
+            ids: Vec::new(),
+            saved,
+            bounds: Vec::new(),
+        };
+        if !saved {
+            let runtime = chat_runtime(app, card);
+            let count = app
+                .chat_accounts(
+                    runtime.session.launch.provider,
+                    &runtime.session.launch.recipe,
+                )
+                .unwrap()
+                .choices
+                .len();
+            buttons.ids = (0..count)
+                .map(|index| card_control_id(card, &format!("chat-account-choice-{index}")))
+                .chain(std::iter::once(card_control_id(
+                    card,
+                    "chat-manage-accounts",
+                )))
+                .collect();
+        }
+        let element = if saved {
+            app.account_recovery_controls(card).unwrap()
+        } else {
+            app.chat_view(card)
+        };
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(1000.0, 900.0),
+            std::mem::replace(cache, Cache::new()),
+            renderer,
+        );
+        ui.operate(renderer, &mut buttons);
+        assert_eq!(
+            buttons.bounds.len(),
+            if saved { 3 } else { 4 },
+            "all choices and Accounts are mounted"
+        );
+        let button = buttons.bounds[index];
+        assert!(button.width > 0.0 && button.height > 0.0);
+        let cursor = cursor.unwrap_or_else(|| button.center());
+        assert!(
+            button.contains(cursor),
+            "the held cursor remains inside the replacement choice"
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Mouse(event)],
+            mouse::Cursor::Available(cursor),
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        *cache = ui.into_cache();
+        (messages, button, buttons.bounds)
+    }
+
+    // Real cached widgets and RegistryLoaded reducers; provider tasks stay unpolled.
+    fn exercise_cached_account_choice_replacement(saved: bool) {
+        use cosmic::iced::{mouse, runtime::user_interface::Cache};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = app.account_ui.add_managed_fixture(Provider::Codex, 501);
+        let second = app.account_ui.add_managed_fixture(Provider::Codex, 502);
+        app.account_ui.set_fixture_label(&first, Some("Choice C"));
+        app.account_ui.set_fixture_label(&second, Some("Choice D"));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "Keep the original unsent request");
+        let source = chat_runtime(&app, card).session.clone();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        if saved {
+            app.chat_ui.removed_accounts.insert(card);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot).exited = true;
+            runtime.disconnected = true;
+        } else {
+            drop(app.update(Message::ChatUi(Action::AccountPicker(target, true))));
+        }
+        let mut cache = Cache::new();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let index = if saved { 0 } else { 1 };
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+        let (messages, original_button, original_bounds) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            press,
+            None,
+        );
+        assert!(messages.is_empty());
+        let registry = registry_with_account_choices();
+        drop(
+            app.update(Message::AccountUi(account_ui::Action::RegistryLoaded(Ok(
+                registry.clone(),
+            )))),
+        );
+        let choices = app
+            .chat_accounts(source.launch.provider, &source.launch.recipe)
+            .unwrap();
+        assert!(!choices.choices.iter().any(|choice| choice.id == first));
+        assert_eq!(
+            choices.choices[1].id, second,
+            "D replaces C in the same account row"
+        );
+        let (messages, _, replacement_bounds) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            release,
+            Some(original_button.center()),
+        );
+        let vertical_bounds = |bounds: &[iced::Rectangle]| {
+            (
+                bounds.iter().map(|b| b.y).fold(f32::INFINITY, f32::min),
+                bounds.iter().map(|b| b.y + b.height).fold(0.0, f32::max),
+            )
+        };
+        assert_eq!(
+            vertical_bounds(&original_bounds),
+            vertical_bounds(&replacement_bounds),
+            "the upward popup keeps its full height, so rejection cannot rely on moving the hit target"
+        );
+        assert!(
+            messages.is_empty(),
+            "a held C click cannot select replacement D"
+        );
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(chat_runtime(&app, card).session, source);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep the original unsent request"
+        );
+        assert!(app.chat_ui.retiring.is_empty());
+
+        // A real fresh D release can queue a callback. Replacing its source
+        // before delivery must reject it even though the card/Target survive.
+        let (messages, button, _) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            press,
+            None,
+        );
+        assert!(messages.is_empty());
+        let (messages, _, _) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            release,
+            Some(button.center()),
+        );
+        assert_eq!(messages.len(), 1);
+        let queued = match &messages[0] {
+            Message::ChatUi(Action::ChooseAccount(found, owner)) if !saved => {
+                assert_eq!(*found, target);
+                assert_eq!(owner.id, second);
+                Action::ChooseAccount(*found, owner.clone())
+            }
+            Message::ChatUi(Action::RecoverAccount(found, owner)) if saved => {
+                assert_eq!(*found, card);
+                assert_eq!(owner.id, second);
+                Action::RecoverAccount(*found, owner.clone())
+            }
+            _ => panic!("the fresh release must retain the chosen account and source"),
+        };
+        let owner = match &queued {
+            Action::ChooseAccount(_, owner) | Action::RecoverAccount(_, owner) => owner,
+            _ => unreachable!(),
+        };
+        let debug = format!("{owner:?}");
+        for private_field in [
+            "Session",
+            "launch",
+            "recipe",
+            "environment",
+            "working_directory",
+        ] {
+            assert!(
+                !debug.contains(private_field),
+                "choice diagnostics must redact the source recipe"
+            );
+        }
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        let _ = app.install_chat_session(card, replacement.clone());
+        drop(app.update(Message::ChatUi(queued)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+        assert_eq!(chat_runtime(&app, card).session, source);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep the original unsent request"
+        );
+        let _ = app.install_chat_session(card, source.clone());
+
+        // An unchanged registry repaint preserves a current owner's press.
+        let (messages, button, _) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            press,
+            None,
+        );
+        assert!(messages.is_empty());
+        drop(
+            app.update(Message::AccountUi(account_ui::Action::RegistryLoaded(Ok(
+                registry,
+            )))),
+        );
+        let (messages, _, _) = cached_account_choice_frame(
+            &app,
+            card,
+            saved,
+            index,
+            &mut cache,
+            &mut renderer,
+            release,
+            Some(button.center()),
+        );
+        assert_eq!(messages.len(), 1);
+        for message in messages {
+            drop(app.update(message));
+        }
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("a fresh D click reaches the ordinary admission path");
+        let recovery = attempt.recovery.as_ref().unwrap();
+        assert_eq!(
+            app.chat_account(
+                attempt.session.launch.provider,
+                &attempt.session.launch.recipe
+            ),
+            Some(second)
+        );
+        assert_eq!(recovery.source, source);
+        assert_eq!(recovery.saved, saved);
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+    }
+
+    #[test]
+    fn cached_account_picker_press_cannot_switch_to_a_replacement_account() {
+        exercise_cached_account_choice_replacement(false);
+    }
+
+    #[test]
+    fn cached_saved_account_recovery_press_cannot_select_a_replacement_account() {
+        exercise_cached_account_choice_replacement(true);
+    }
+
     #[test]
     fn cached_continuation_press_cannot_move_to_a_replacement_account_choice() {
         use cosmic::iced::advanced::clipboard;
@@ -27989,7 +28401,7 @@ mod tests {
         assert!(!chat_runtime(&app, card).account_picker);
         drop(app.update(Message::ChatUi(Action::ChooseAccount(
             target,
-            alternate.clone(),
+            rendered_account_choice(&app, target.card, alternate.clone()),
         ))));
         assert!(!app.chat_start_pending(card));
         assert_eq!(chat_runtime(&app, card).session, original);
@@ -28011,7 +28423,7 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).pastes_pending, 0);
         drop(app.update(Message::ChatUi(Action::ChooseAccount(
             target,
-            alternate.clone(),
+            rendered_account_choice(&app, target.card, alternate.clone()),
         ))));
         assert!(app.chat_start_pending(card));
         assert_eq!(
