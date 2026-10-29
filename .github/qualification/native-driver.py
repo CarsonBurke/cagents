@@ -560,7 +560,7 @@ try:
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
         assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
-        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'stale', 'short', False, True)]:
+        for surface, mode, payload, hidden, ordinary in [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False)]:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             active_arm = label
             window = pid = None
@@ -867,7 +867,54 @@ try:
             names = accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)])
             (out / (label + '-accessibility.json')).write_text(json.dumps(names, indent=2))
             database = Path((root / 'database-path').read_text())
+            assert database.is_relative_to(root)
             key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:quarantined_panes'
+            def observe_durability(stage, checks, db=None, error=None):
+                healthy_id = '00000000-0000-4000-8000-000000003922'
+                bad_id = '00000000-0000-4000-8000-000000004922'
+                observation = {
+                    'stage': stage, 'monotonic': time.monotonic(), 'checks': checks,
+                    'source_workspace': (root / 'workspace-id').read_text().strip(),
+                    'read_error': str(error) if error else None,
+                    'read_error_type': type(error).__name__ if error else None,
+                    'scope': 'Read-only private fixture observations; payloads are represented only by byte counts and hashes. Multiple SELECTs are not an atomic snapshot.',
+                }
+                if db is not None:
+                    actor_path = root / 'ordinary-recovered-chat-id'
+                    actor = actor_path.read_text() if actor_path.exists() else None
+                    observation['recovered_actor'] = actor
+                    selected = []
+                    for card, owner, kind, content, existence in db.execute(
+                            'SELECT card_id, workspace_id, kind_tag, content_json, existence_json FROM cards WHERE card_id IN (?, ?) OR kind_tag=?',
+                            (healthy_id, bad_id, 'chat')):
+                        # Terminal descriptors use normalized side tables and
+                        # legitimately have no inline content_json.
+                        source = json.loads(content) if content is not None else {}
+                        if card in {healthy_id, bad_id} or (kind == 'chat' and actor and source.get('id') == actor):
+                            selected.append({
+                                'card_id': card, 'workspace_id': owner, 'kind': kind,
+                                'source_actor': source.get('id'),
+                                'source_sha256': hashlib.sha256(content.encode()).hexdigest() if content is not None else None,
+                                'existence': json.loads(existence),
+                            })
+                    observation['cards'] = selected
+                    ids = {row['card_id'] for row in selected}
+                    navigation = []
+                    for name, value in db.execute("SELECT key, value FROM metadata WHERE key LIKE 'workspace:%:navigation:%'"):
+                        if name.endswith(':chat_drafts'):
+                            drafts = json.loads(value)
+                            navigation.append({'key': name, 'selected_drafts': {
+                                card: {'bytes': len(draft.encode()), 'sha256': hashlib.sha256(draft.encode()).hexdigest()}
+                                for card, draft in drafts.items() if card in ids}})
+                        elif name.endswith(':quarantined_panes') or name.endswith(':local_only_cards'):
+                            navigation.append({'key': name, 'contains_rejected': bad_id in json.loads(value)})
+                        elif name.endswith(':threads'):
+                            navigation.append({'key': name, 'selected_memberships': [
+                                {'channel_id': channel['id'], 'cards': [card for card in channel['cards'] if card in ids]}
+                                for channel in json.loads(value) if any(card in ids for card in channel['cards'])]})
+                    observation['navigation'] = navigation
+                path = out / (label + '-' + stage + '-durability.json')
+                path.write_text(json.dumps(observation, indent=2) + '\n')
             if variant == 'after':
                 def durable_settled():
                     try:
@@ -877,14 +924,20 @@ try:
                             drafts_row = db.execute('SELECT value FROM metadata WHERE key=?', (draft_key,)).fetchone()
                             card_row = db.execute('SELECT existence_json FROM cards WHERE card_id=?', ('00000000-0000-4000-8000-000000004922',)).fetchone()
                             if not marker_row or not card_row or not drafts_row:
+                                observe_durability('saved', {'marker_row': bool(marker_row), 'rejected_card_row': bool(card_row),
+                                                           'drafts_row': bool(drafts_row)}, db)
                                 return False
                             marker = json.loads(marker_row[0])
                             is_closed = 'closed' in str(json.loads(card_row[0])).lower()
                             should_close = mode == 'closed' or ordinary
                             should_mark = hidden or ordinary or mode != 'stale' or payload != 'short'
                             healthy_saved = hidden or json.loads(drafts_row[0]).get('00000000-0000-4000-8000-000000003922') == healthy_text
-                            return healthy_saved and is_closed == should_close and ('00000000-0000-4000-8000-000000004922' in marker) == should_mark
-                    except sqlite3.Error:
+                            checks = {'healthy_draft_matches': healthy_saved, 'rejected_existence_matches': is_closed == should_close,
+                                      'rejected_marker_matches': ('00000000-0000-4000-8000-000000004922' in marker) == should_mark}
+                            observe_durability('saved', checks, db)
+                            return all(checks.values())
+                    except sqlite3.Error as error:
+                        observe_durability('saved', {}, error=error)
                         return False
                 wait(durable_settled)
             if ordinary:
@@ -896,9 +949,12 @@ try:
                                         if json.loads(row[1]).get('id') == actor), None)
                             draft_key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:chat_drafts'
                             drafts = db.execute('SELECT value FROM metadata WHERE key=?', (draft_key,)).fetchone()
-                            return (row is not None and 'open' in str(json.loads(row[2])).lower() and drafts is not None
-                                    and json.loads(drafts[0]).get(row[0]) == 'Fresh work after ordinary History recovery.')
-                    except (sqlite3.Error, FileNotFoundError):
+                            settled = (row is not None and 'open' in str(json.loads(row[2])).lower() and drafts is not None
+                                       and json.loads(drafts[0]).get(row[0]) == 'Fresh work after ordinary History recovery.')
+                            observe_durability('recovered', {'fresh_recovered_card_and_draft_match': settled}, db)
+                            return settled
+                    except (sqlite3.Error, FileNotFoundError) as error:
+                        observe_durability('recovered', {}, error=error)
                         return False
                 wait(recovered_durable_settled)
             stop(ui)
