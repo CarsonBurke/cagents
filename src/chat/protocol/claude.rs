@@ -4362,7 +4362,7 @@ impl Claude {
                             self.edit_tools
                                 .insert(ScopedId::new(Some(&parent), &item.id), name.clone());
                         }
-                        if !matches!(content, ItemContent::Tool { .. }) {
+                        if item.content != content {
                             item.content = content;
                             step.events.push(Event::Item(item.clone()));
                         }
@@ -6059,6 +6059,125 @@ mod tests {
             store.lock().unwrap().apply(event).unwrap();
         }
         adapter.committed();
+    }
+
+    #[test]
+    fn stopped_generic_tools_keep_canonical_input_and_accept_scoped_results() {
+        fn receive_committed(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            frame: Value,
+        ) {
+            let step = adapter.receive(frame).unwrap();
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            commit_tool_fixture(adapter, store, step);
+        }
+
+        for envelope_before_stop in [false, true] {
+            for evict in [false, true] {
+                let store = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::chat::runtime::Store::new().unwrap(),
+                ));
+                let mut adapter = Claude::default();
+                adapter
+                    .bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+                let scopes = [None, Some("one"), Some("two")];
+                let input = json!({"value":"x"});
+                for parent in scopes {
+                    let message = format!("message-{}", parent.unwrap_or("root"));
+                    let frame = |event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+                    for event in [
+                        json!({"type":"message_start","message":{"id":message}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"Opaque"}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{ \"value\" : \"x\" }"}}),
+                    ] {
+                        receive_committed(&mut adapter, &store, frame(event));
+                    }
+                    let envelope = scoped_call(parent, &message, "same", "Opaque", input.clone());
+                    if envelope_before_stop {
+                        receive_committed(&mut adapter, &store, envelope.clone());
+                    }
+                    receive_committed(
+                        &mut adapter,
+                        &store,
+                        frame(json!({"type":"content_block_stop","index":0})),
+                    );
+                    // This validates against the real committed Store before a
+                    // later envelope can hide a missing normalized Item write.
+                    assert_eq!(
+                        adapter
+                            .cached_tool(parent, "same")
+                            .unwrap()
+                            .unwrap()
+                            .content,
+                        ItemContent::Tool {
+                            name: "Opaque".into(),
+                            input: input.to_string(),
+                            output: String::new(),
+                            status: ToolStatus::Running,
+                        }
+                    );
+                    if !envelope_before_stop {
+                        receive_committed(&mut adapter, &store, envelope);
+                    }
+                }
+                if evict {
+                    for index in 0..3 {
+                        receive_committed(
+                            &mut adapter,
+                            &store,
+                            scoped_call(
+                                None,
+                                &format!("filler-{index}"),
+                                &format!("filler-{index}"),
+                                "Write",
+                                json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                            ),
+                        );
+                    }
+                    for parent in scopes {
+                        assert!(adapter.tools.get(parent, "same").is_none());
+                    }
+                }
+                for (index, parent) in scopes.into_iter().enumerate() {
+                    let output = format!("finished-{}", parent.unwrap_or("root"));
+                    let failed = index == 1;
+                    receive_committed(
+                        &mut adapter,
+                        &store,
+                        json!({"type":"user","uuid":format!("result-{index}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":"same","is_error":failed,"content":output}]}}),
+                    );
+                    let expected = ItemContent::Tool {
+                        name: "Opaque".into(),
+                        input: input.to_string(),
+                        output,
+                        status: if failed {
+                            ToolStatus::Failed
+                        } else {
+                            ToolStatus::Succeeded
+                        },
+                    };
+                    assert_eq!(
+                        adapter
+                            .cached_tool(parent, "same")
+                            .unwrap()
+                            .unwrap()
+                            .content,
+                        expected
+                    );
+                    let canonical = crate::chat::runtime::Store::adapter_reader_for_test(&store)
+                        .read(&super::super::CanonicalItemKey::new(parent, "same"))
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(canonical.content, expected);
+                }
+            }
+        }
     }
     #[test]
     fn byte_eviction_keeps_one_logical_identity_and_its_permission_input() {
