@@ -16,8 +16,8 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: 883726734a8194ec8b18161e3dbcb50367a7db4d
-  EXPECTED_PRODUCT_TREE: ff0c743dcf4d878bbae048bf8346c37e1a2a2d05
+  EXPECTED_PRODUCT_SHA: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
+  EXPECTED_PRODUCT_TREE: 4e436ed156df1f959014204fa58e663f359cf0bd
   EXPECTED_RECEIPT_SHA: 5ad7985a56aaac5760cb71a6ea3d1ed2ba2c956a
   EXPECTED_RECEIPT_TREE: 67cbc81261e9c0f2a6f1bdf8718b7fd12fd2e787
   EXPECTED_FIXTURE_SHA: 32bc36da066bcf0cb614cff704a94c442279d3b1
@@ -26,7 +26,7 @@ jobs:
   macos:
     if: github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' && github.event.pull_request.head.repo.full_name ==
       github.repository
-    name: Native Apple ARM CLI link run and sixteen owning roots
+    name: Native Apple ARM CLI link run and seventeen owning roots
     runs-on: macos-15
     timeout-minutes: 45
     defaults:
@@ -64,7 +64,7 @@ jobs:
     - name: Check out product
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: 883726734a8194ec8b18161e3dbcb50367a7db4d
+        ref: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
         path: product
         persist-credentials: false
     - name: Bind exact product and research sources
@@ -84,7 +84,7 @@ jobs:
         research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
         assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
         assert not git('status','--porcelain','--untracked-files=all',where=research)
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
         hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
         hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
         (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
@@ -151,9 +151,9 @@ jobs:
         assert reply['ok'] is True and reply['command']=='daemon.protocol_version' and reply['data']['protocol_version']==127, reply
         assert hashlib.sha256(binary.read_bytes()).hexdigest()==binary_hash
         phase('apple-lib-test-compile',['cargo','test','--locked','--no-default-features','--lib','--no-run'])
-        for index, selector in enumerate(['update::tests::unsupported_streaming_never_starts_a_command_and_keeps_cancellation', 'install_guard::tests::unsupported_installation_refuses_before_path_or_window_preparation', 'instance::tests::unsupported_process_census_never_reports_an_empty_owned_inventory', 'update::source::platform_tests::unsupported_source_cannot_be_classified_as_an_absent_daemon', 'daemon::unsupported_platform_tests::ownership_refusal_precedes_runtime_discovery_and_socket_or_lease_access', 'daemon::unsupported_platform_tests::unsupported_descriptor_sealing_preserves_errno_without_executing_child', 'control::unsupported_connection_tests::unsupported_control_connection_precedes_path_validation_and_deadline_arithmetic', 'daemon::holder_registry::connection::unsupported_tests::unsupported_holder_connection_precedes_deadline_and_endpoint_work', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::unavailable_anonymous_publication_leaves_no_named_fallback', 'fs_safety::platform::tests::native_access_acl_copy_replaces_existing_acl_and_removes_observed_absence', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links'], 1):
+        for index, selector in enumerate(['update::tests::unsupported_streaming_never_starts_a_command_and_keeps_cancellation', 'install_guard::tests::unsupported_installation_refuses_before_path_or_window_preparation', 'instance::tests::unsupported_process_census_never_reports_an_empty_owned_inventory', 'update::source::platform_tests::unsupported_source_cannot_be_classified_as_an_absent_daemon', 'daemon::unsupported_platform_tests::ownership_refusal_precedes_runtime_discovery_and_socket_or_lease_access', 'daemon::unsupported_platform_tests::unsupported_descriptor_sealing_preserves_errno_without_executing_child', 'control::unsupported_connection_tests::unsupported_control_connection_precedes_path_validation_and_deadline_arithmetic', 'daemon::holder_registry::connection::unsupported_tests::unsupported_holder_connection_precedes_deadline_and_endpoint_work', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::unavailable_anonymous_publication_leaves_no_named_fallback', 'fs_safety::platform::tests::native_access_acl_copy_replaces_existing_acl_and_removes_observed_absence', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links', 'worktree_cleanup::tests::root_operation_protection_uses_native_event_only_directory_pins'], 1):
             exact("apple-parent-%02d" % index, selector)
-        print('Sixteen native owning CLI parents passed exactly once.', flush=True)
+        print('Seventeen native owning CLI parents passed exactly once.', flush=True)
         PY
     - name: Always retain and require unchanged literal source
       if: always()
@@ -168,7 +168,7 @@ jobs:
         def git(*args,where=root):
             return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
         research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
         hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
         hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
         state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
@@ -228,7 +228,7 @@ jobs:
     - name: Check out product
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: 883726734a8194ec8b18161e3dbcb50367a7db4d
+        ref: ccb501ad4a65f726184d6e0d9aa5e7dc83d97825
         path: product
         persist-credentials: false
     - name: Check out receipt-product
@@ -260,7 +260,7 @@ jobs:
         research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
         assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
         assert not git('status','--porcelain','--untracked-files=all',where=research)
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
         hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
         hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
         (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
@@ -377,7 +377,7 @@ jobs:
         def git(*args,where=root):
             return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
         research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
-        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs', 'src/worktree_cleanup.rs']
         hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
         hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
         state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
