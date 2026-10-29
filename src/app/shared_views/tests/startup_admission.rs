@@ -1576,6 +1576,235 @@ fn queued_failed_remove_cannot_close_an_exactly_repaired_chat() {
 }
 
 #[test]
+fn keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click() {
+    if isolated("keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click") {
+        return;
+    }
+    use cosmic::iced::advanced::{
+        clipboard,
+        widget::{Operation, operation::Focusable},
+    };
+    use cosmic::iced::futures::StreamExt;
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    use cosmic::iced::{Event, Rectangle, Size, keyboard, mouse};
+
+    struct Bounds {
+        id: widget::Id,
+        bounds: Option<Rectangle>,
+    }
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            if id == Some(&self.id) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    fn assert_clipboard_write(task: Task<Message>, expected: &str) {
+        let copied = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects = cosmic::iced::runtime::task::into_stream(task)
+                    .expect("the actual copy callback produces clipboard work");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while let Some(effect) = effects.next().await {
+                        if let cosmic::iced::runtime::Action::Clipboard(
+                            cosmic::iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) = effect
+                        {
+                            return contents;
+                        }
+                    }
+                    panic!("the actual copy callback must emit a clipboard write");
+                })
+                .await
+                .expect("saved payload copy must complete promptly")
+            });
+        assert_eq!(copied, expected);
+    }
+
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    let draft = "Keep this saved draft 🦀\nwith its complete second line.";
+    let attachments = vec![
+        crate::chat::Attachment {
+            path: "/saved/first image.png".into(),
+            reference: None,
+        },
+        crate::chat::Attachment {
+            path: "/saved/second-image.png".into(),
+            reference: None,
+        },
+    ];
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        HashMap::from([(pane.id, draft.into())]),
+        HashMap::from([(pane.id, attachments.clone())]),
+    );
+    let healthy = CardId::new();
+    app.cards.insert(healthy, CardRuntime::Settings);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards.push(CardState {
+        id: healthy,
+        generation: durable.generation,
+        title: "Settings".into(),
+        width_fraction: 0.5,
+        kind: CardKind::Settings,
+        existence: Existence::Open,
+        exposure: Exposure::Visible,
+        residency: Residency::Hot,
+    });
+    durable.active_channel = Some(hidden);
+    durable.focused = Some(healthy);
+    let channel = durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == hidden)
+        .unwrap();
+    channel.cards.push(healthy);
+    channel.focused = Some(healthy);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.workspace.resize_viewport(1600.0);
+    app.context_inspector_open = false;
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut rejected = model(identity, active, hidden, view);
+    let mut owner = managed_owner(&pane, hidden);
+    owner.closed = true;
+    rejected.agents.push(owner);
+    app.workspace_model = rejected.clone();
+    app.refresh_managed_pane_quarantine(&rejected);
+    drop(app.sync_chrome());
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    let nonce = app.shared_views.quarantine_actions[&pane.id].nonce;
+    let mut cache = Cache::new();
+    let mut renderer = crate::app::tests::headless_renderer();
+    // Retain the real workspace, CardSurface and button state through each
+    // reducer/rerender. A fresh tree would hide an Enter-created pressed latch.
+    let mut frame = |app: &Cagents, control: &str, focus: bool, event: Event| {
+        let mut ui = UserInterface::build(
+            cosmic::Application::view(app),
+            Size::new(app.window_width, app.window_height),
+            std::mem::replace(&mut cache, Cache::new()),
+            &mut renderer,
+        );
+        let id = card_control_id(pane.id, control);
+        if focus {
+            ui.operate(
+                &renderer,
+                &mut cosmic::iced::advanced::widget::operation::focusable::focus(id.clone()),
+            );
+        }
+        let mut bounds = Bounds { id, bounds: None };
+        ui.operate(&renderer, &mut bounds);
+        let point = bounds
+            .bounds
+            .expect("actual saved-payload control")
+            .center();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[event],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        cache = ui.into_cache();
+        messages
+    };
+    let mut messages = frame(
+        &app,
+        "quarantine.copy",
+        true,
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }),
+    );
+    assert_eq!(messages.len(), 1, "Enter copies the saved draft once");
+    assert!(matches!(
+        &messages[0],
+        Message::CopyQuarantinedDraft(card, action) if *card == pane.id && *action == nonce
+    ));
+    assert_clipboard_write(app.update(messages.pop().unwrap()), draft);
+    assert!(
+        frame(
+            &app,
+            "quarantine.copy",
+            false,
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            }),
+        )
+        .is_empty(),
+        "releasing Enter must not copy again"
+    );
+    rejected.sequence += 1;
+    app.workspace_model = rejected.clone();
+    app.refresh_managed_pane_quarantine(&rejected);
+    assert_eq!(app.workspace.focused(), Some(healthy));
+    let mut messages = frame(
+        &app,
+        "quarantine.attachments",
+        false,
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+    );
+    assert_eq!(
+        messages.len(),
+        1,
+        "the first press activates its actual pane"
+    );
+    assert!(matches!(
+        &messages[0],
+        Message::Viewport { generation, event: WorkspaceViewportEvent::PointerFocused(card) }
+            if *generation == app.workspace_view_generation && *card == pane.id
+    ));
+    // Exercise the real pane-activation reducer before release. Its runtime
+    // scroll effects are outside this headless interaction regression.
+    drop(app.update(messages.pop().unwrap()));
+    assert_eq!(app.workspace.focused(), Some(pane.id));
+    let mut messages = frame(
+        &app,
+        "quarantine.attachments",
+        false,
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+    );
+    assert_eq!(
+        messages.len(),
+        1,
+        "the first click must copy the saved locations"
+    );
+    assert!(matches!(
+        &messages[0],
+        Message::CopyQuarantinedAttachmentPaths(card, action) if *card == pane.id && *action == nonce
+    ));
+    assert_clipboard_write(
+        app.update(messages.pop().unwrap()),
+        "/saved/first image.png\n/saved/second-image.png",
+    );
+    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+    assert_eq!(app.quarantined_pane_draft(pane.id), Some(draft));
+    assert_eq!(app.chat_ui.draft_attachments[&pane.id], attachments);
+    assert_eq!(app.shared_views.quarantine_actions[&pane.id].nonce, nonce);
+}
+
+#[test]
 fn held_failed_remove_press_cannot_migrate_to_a_successor_quarantine_presentation() {
     use cosmic::iced::advanced::{
         clipboard,

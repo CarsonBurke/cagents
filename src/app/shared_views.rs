@@ -553,7 +553,11 @@ impl Cagents {
             }
         }
         if attachments > 0 {
-            content.push(design::caption(format!("{attachments} saved attachments are kept. Copy their saved file locations to find them on the device where they were added.")).into());
+            content.push(design::caption(if attachments == 1 {
+                "1 saved attachment location is kept. Copy it to look for the file on the device where it was added.".to_owned()
+            } else {
+                format!("{attachments} saved attachment locations are kept. Copy them to look for the files on the device where they were added.")
+            }).into());
             content.push(
                 crate::ui_controls::owned(
                     (card, action, "attachments"),
