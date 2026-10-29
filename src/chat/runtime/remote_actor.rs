@@ -5,7 +5,10 @@ pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 mod deadline_io;
 pub(crate) mod final_snapshot;
-use super::{LocalHandle, Rejection, Update};
+use super::{
+    LocalHandle, Rejection, Update,
+    helper_custody::{HelperCustody, OrphanReapPermit},
+};
 use crate::{
     chat::{
         self, Command, Snapshot,
@@ -1570,6 +1573,7 @@ fn validate_pair(
 
 struct Server {
     actor: LocalHandle,
+    custody: HelperCustody,
     identity: ActorIdentity,
     source: chat::Session,
     lineage: Vec<chat::Session>,
@@ -1600,7 +1604,11 @@ struct Server {
     attachment_preserved: bool,
 }
 impl Server {
-    fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
+    fn start(
+        startup: Startup,
+        control: &UnixStream,
+        custody: &HelperCustody,
+    ) -> Result<Self, String> {
         if startup.protocol != PROTOCOL
             || startup.source.launch.provider != crate::agent::Provider::Claude
         {
@@ -1673,6 +1681,7 @@ impl Server {
             None,
             false,
             launch_account_scope,
+            Some(custody),
             move |update| {
                 let mut journal = outcomes.lock().unwrap_or_else(|p| p.into_inner());
                 if let Err(error) = journal.append(&update) {
@@ -1726,6 +1735,7 @@ impl Server {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             actor,
+            custody: custody.clone(),
             identity,
             source: startup.source,
             lineage: Vec::new(),
@@ -1749,6 +1759,10 @@ impl Server {
             session_stopping: false,
             attachment_preserved: false,
         })
+    }
+    fn reap_orphans(&self) -> Result<(), String> {
+        let permit = self.custody.reap_permit_until(Instant::now() + TIMEOUT)?;
+        reap_orphans(&permit)
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
@@ -2006,7 +2020,7 @@ impl Server {
                 let (generation,) = decode!((u64,));
                 let options = self.actor.close_for_account_switch(generation)?;
                 let publication = if options.is_some() {
-                    reap_orphans()?;
+                    self.reap_orphans()?;
                     self.finish_inputs();
                     Some(self.publish_close()?)
                 } else {
@@ -2325,7 +2339,7 @@ impl Server {
                 if self.closed_snapshot.is_none() {
                     self.actor
                         .close_until(Instant::now() + Duration::from_millis(millis.min(32_000)))?;
-                    reap_orphans()?;
+                    self.reap_orphans()?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -2334,7 +2348,7 @@ impl Server {
                 let (revision,) = decode!((u64,));
                 if self.closed_snapshot.is_none() {
                     self.actor.close_if_revision(revision)?;
-                    reap_orphans()?;
+                    self.reap_orphans()?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -2343,7 +2357,7 @@ impl Server {
                 let (generation,) = decode!((u64,));
                 if self.closed_snapshot.is_none() {
                     self.actor.close_if_idle(generation)?;
-                    reap_orphans()?;
+                    self.reap_orphans()?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -2351,7 +2365,7 @@ impl Server {
             "close" => {
                 if self.closed_snapshot.is_none() {
                     self.actor.close()?;
-                    reap_orphans()?;
+                    self.reap_orphans()?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -2431,7 +2445,7 @@ impl Server {
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
-                reap_orphans()?;
+                self.reap_orphans()?;
                 break;
             }
             match self.listener.accept() {
@@ -2573,7 +2587,9 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 }
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
-fn reap_orphans() -> Result<(), String> {
+fn reap_orphans(_permit: &OrphanReapPermit<'_>) -> Result<(), String> {
+    #[cfg(test)]
+    tests::note_reap_entry();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let children =
@@ -2636,7 +2652,7 @@ extern "C" fn serve_if_requested() {
         std::process::exit(2);
     }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
-    let result = (|| {
+    run_helper(&control, |custody| {
         // Startup control and the pinned directory survived helper exec;
         // seal them before spawning any provider or provider descendants.
         crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
@@ -2650,16 +2666,38 @@ extern "C" fn serve_if_requested() {
                 .ok_or("Retained startup lacks proof")?,
         )?;
         let _ = crate::daemon::process_scope::enroll_holder();
-        let server = Server::start(startup, &control)?;
+        let server = Server::start(startup, &control, custody)?;
         server.serve(control.try_clone().map_err(|error| error.to_string())?)
-    })();
+    });
+    std::process::exit(73);
+}
+
+fn run_helper(control: &UnixStream, serve: impl FnOnce(&HelperCustody) -> Result<(), String>) {
+    // This owner precedes all provider creation and survives every fallible
+    // construction/publication/serve path, including an unwound Server.
+    let custody = HelperCustody::default();
+    let result = {
+        let _recovered = crate::instance::recovered_panic_scope();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&custody)))
+    }
+    .unwrap_or_else(|_| Err("Retained helper panicked; exact provider cleanup is pending".into()));
     if let Err(error) = result {
         let _ = send(&control, &Err::<Attached, _>(error), TIMEOUT);
     }
-    while reap_orphans().is_err() {
-        thread::sleep(Duration::from_millis(100));
+    custody.seal();
+    loop {
+        match custody.reap_permit_until(Instant::now() + TIMEOUT) {
+            Ok(permit) => {
+                // Keep creation fenced throughout fallback. ECHILD, after
+                // all former waiters joined cleanly, is required for exit73.
+                while reap_orphans(&permit).is_err() {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                return;
+            }
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
     }
-    std::process::exit(73);
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {
@@ -2681,6 +2719,302 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::protocol::{Adapter, Step};
+
+    thread_local! {
+        static REAP_ENTRY: std::cell::RefCell<Option<crossbeam_channel::Sender<()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+        static TLS_CLEANUP: std::cell::RefCell<Option<LatchedTls>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn note_reap_entry() {
+        REAP_ENTRY.with(|entry| {
+            if let Some(entry) = &*entry.borrow() {
+                let _ = entry.try_send(());
+            }
+        });
+    }
+
+    struct LatchedTls {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        finished: crossbeam_channel::Sender<()>,
+    }
+    impl Drop for LatchedTls {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(10));
+            let _ = self.finished.send(());
+        }
+    }
+
+    struct ProbeAdapter {
+        probe: Option<super::super::ChildCleanupProbe>,
+        tls: Option<LatchedTls>,
+        installed: crossbeam_channel::Sender<()>,
+    }
+    impl Adapter for ProbeAdapter {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![chat::Event::Ready(true)],
+                ..Default::default()
+            })
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            if let Some(probe) = self.probe.take() {
+                super::super::CHILD_CLEANUP_PROBE.with(|slot| *slot.borrow_mut() = Some(probe));
+                TLS_CLEANUP.with(|slot| *slot.borrow_mut() = self.tls.take());
+                let _ = self.installed.send(());
+            }
+            Ok(Step::default())
+        }
+    }
+
+    fn probe_actor(
+        custody: &HelperCustody,
+        directory: &std::path::Path,
+        mut adapter: Box<dyn Adapter>,
+    ) -> Result<LocalHandle, String> {
+        // Only a known test shell, with no provider and no descendants.
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf '{}\\n'; exit 7".into()],
+            working_directory: directory.into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = adapter.initialize()?;
+        let store = super::super::preflight(&spec, &mut initial)?;
+        LocalHandle::start_inner(
+            spec,
+            adapter,
+            initial,
+            store,
+            None,
+            None,
+            None,
+            false,
+            Err("fixture has no account scope".into()),
+            Some(custody),
+            |_| {},
+        )
+    }
+
+    #[test]
+    fn helper_exception_boundary_retains_original_worker_until_join_and_echild() {
+        const CHILD: &str = "CAGENTS_HELPER_CUSTODY_ORACLE";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["error", "unwind", "poison-and-seal"] {
+                let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
+                let test = thread::current().name().unwrap().to_owned();
+                let output = ChildCommand::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &test, "--nocapture"])
+                    .env(CHILD, mode)
+                    .env("XDG_RUNTIME_DIR", isolated.path())
+                    .env("XDG_DATA_HOME", isolated.path().join("data"))
+                    .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+                    .env("XDG_CACHE_HOME", isolated.path().join("cache"))
+                    .env("HOME", isolated.path().join("home"))
+                    .env("CAGENTS_LOCAL_DEBUG", "0")
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(73),
+                    "{mode}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let mode = mode.to_str().unwrap().to_owned();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (control, _peer) = UnixStream::pair().unwrap();
+        let (observed, observation) = crossbeam_channel::bounded(1);
+        let (resume, resumed) = crossbeam_channel::bounded(1);
+        let (waited, original_wait) = crossbeam_channel::bounded(1);
+        let (tls_entered, entered) = crossbeam_channel::bounded(1);
+        let (release_tls, tls_released) = crossbeam_channel::bounded(1);
+        let (tls_finished, finished_tls) = crossbeam_channel::bounded(1);
+        let (installed, installation) = crossbeam_channel::bounded(1);
+        let (retained, original) = crossbeam_channel::bounded(1);
+        let (reaped, fallback) = crossbeam_channel::bounded(1);
+        let (done, completion) = crossbeam_channel::bounded(1);
+        let helper = thread::spawn(move || {
+            REAP_ENTRY.with(|slot| *slot.borrow_mut() = Some(reaped));
+            run_helper(&control, |custody| {
+                let actor = probe_actor(
+                    custody,
+                    directory.path(),
+                    Box::new(ProbeAdapter {
+                        probe: Some(super::super::ChildCleanupProbe {
+                            observed,
+                            resume: resumed,
+                            waited,
+                        }),
+                        tls: Some(LatchedTls {
+                            entered: tls_entered,
+                            release: tls_released,
+                            finished: tls_finished,
+                        }),
+                        installed,
+                    }),
+                )?;
+                installation.recv_timeout(Duration::from_secs(2)).unwrap();
+                let worker = actor
+                    .0
+                    .worker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .thread()
+                    .id();
+                retained.send((Arc::downgrade(&actor.0), worker)).unwrap();
+                if mode == "poison-and-seal" {
+                    let scope = custody.clone();
+                    assert!(
+                        thread::spawn(move || {
+                            let _admission = scope.admit().unwrap();
+                            panic!("controlled admission poison");
+                        })
+                        .join()
+                        .is_err()
+                    );
+                    custody.seal();
+                    let other = tempfile::tempdir_in("/var/tmp").unwrap();
+                    let (unexpected, late_start) = crossbeam_channel::bounded(1);
+                    struct NoLateWorker(crossbeam_channel::Sender<()>);
+                    impl Adapter for NoLateWorker {
+                        fn initialize(&mut self) -> Result<Step, String> {
+                            Ok(Step::default())
+                        }
+                        fn command(&mut self, _: Command) -> Result<Step, String> {
+                            Ok(Step::default())
+                        }
+                        fn receive(&mut self, _: Value) -> Result<Step, String> {
+                            let _ = self.0.send(());
+                            Ok(Step::default())
+                        }
+                    }
+                    let error =
+                        probe_actor(custody, other.path(), Box::new(NoLateWorker(unexpected)))
+                            .err()
+                            .expect("sealed creation must refuse constructor admission");
+                    assert!(error.contains("creation is sealed"));
+                    // This observes adapter admission only. Pre-OS-spawn
+                    // placement of the custody fence is source-reviewed.
+                    assert!(late_start.try_recv().is_err());
+                    assert_eq!(
+                        actor
+                            .0
+                            .worker
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .thread()
+                            .id(),
+                        worker
+                    );
+                }
+                // Model the exceptional boundary immediately after the actual
+                // constructor. This is not a socket/publication/serve fixture.
+                if mode == "unwind" {
+                    panic!("controlled post-constructor unwind");
+                }
+                Err("controlled post-constructor error".into())
+            });
+            done.send(()).unwrap();
+        });
+        let (owner, worker_id) = original.recv_timeout(Duration::from_secs(2)).unwrap();
+        let pidfd = observation.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        pidfd.as_raw_fd() as libc::id_t,
+                        &mut information,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if unsafe { information.si_pid() } != 0 {
+                assert_eq!(information.si_code, libc::CLD_EXITED);
+                assert_eq!(unsafe { information.si_status() }, 7);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        // The helper holds the original actor; the controller owns only Weak.
+        {
+            let retained = owner
+                .upgrade()
+                .expect("outer helper lost exact actor custody");
+            assert_eq!(
+                retained
+                    .worker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .thread()
+                    .id(),
+                worker_id
+            );
+        }
+        assert!(fallback.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(completion.try_recv().is_err());
+        resume.send(()).unwrap();
+        assert_eq!(
+            original_wait.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Some(7)
+        );
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        {
+            let retained = owner
+                .upgrade()
+                .expect("TLS teardown still belongs to helper");
+            assert!(retained.completed.load(Ordering::Acquire));
+            let worker = retained.worker.lock().unwrap();
+            assert!(worker.as_ref().is_none_or(thread::JoinHandle::is_finished));
+        }
+        assert!(finished_tls.try_recv().is_err());
+        assert!(fallback.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(completion.try_recv().is_err());
+        release_tls.send(()).unwrap();
+        finished_tls.recv_timeout(Duration::from_secs(2)).unwrap();
+        fallback.recv_timeout(Duration::from_secs(2)).unwrap();
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        helper.join().unwrap();
+        // The broker may briefly retain its last strong owner after publishing
+        // its join receipt. That reference is not an unsettled worker.
+        if let Some(retained) = owner.upgrade() {
+            assert!(retained.worker.lock().unwrap().is_none());
+            assert!(!retained.worker_joining.load(Ordering::Acquire));
+            assert!(!retained.worker_join_failed.load(Ordering::Acquire));
+            assert!(retained.completed.load(Ordering::Acquire));
+        }
+        // run_helper returns only after the actual fallback observed ECHILD.
+        std::process::exit(73);
+    }
+
     struct Fixture {
         server: Server,
         _root: tempfile::TempDir,
@@ -2734,7 +3068,21 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Idle);
         let mut initial = adapter.initialize().unwrap();
         let store = super::super::preflight(&spec, &mut initial).unwrap();
-        let actor = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let custody = HelperCustody::default();
+        let actor = LocalHandle::start_inner(
+            spec,
+            adapter,
+            initial,
+            store,
+            None,
+            None,
+            None,
+            false,
+            Err("fixture has no account scope".into()),
+            Some(&custody),
+            |_| {},
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !actor.0.state.lock().unwrap().ready {
             assert!(Instant::now() < deadline);
@@ -2749,6 +3097,7 @@ mod tests {
         Fixture {
             server: Server {
                 actor,
+                custody,
                 identity,
                 source,
                 lineage: Vec::new(),
@@ -3924,7 +4273,8 @@ done"#;
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
-        proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        proof.host_incarnation =
+            crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
         let _replacement_lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let replacement =
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();

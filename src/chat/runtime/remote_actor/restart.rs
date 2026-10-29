@@ -93,7 +93,7 @@ impl Server {
                     self.actor.cleanup(),
                     Ok(crate::chat::protocol::LaunchOutcome::NoProvider
                         | crate::chat::protocol::LaunchOutcome::TeardownProved)
-                ) && reap_orphans().is_ok()
+                ) && self.reap_orphans().is_ok()
                 {
                     failure.cleanup = RestartCleanup::TeardownProved;
                     state = self
@@ -146,7 +146,7 @@ impl Server {
             .actor
             .pinned_execution_directory(&request.working_directory)?;
         self.actor.close()?;
-        reap_orphans()?;
+        self.reap_orphans()?;
         self.journal
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -179,7 +179,7 @@ impl Server {
                     Ok(crate::chat::protocol::LaunchOutcome::NoProvider
                         | crate::chat::protocol::LaunchOutcome::TeardownProved)
                 )
-                && reap_orphans().is_ok();
+                && self.reap_orphans().is_ok();
             RestartFailure {
                 reason: reason.chars().take(4096).collect(),
                 cleanup: if proved {
@@ -252,6 +252,7 @@ impl Server {
             None,
             false,
             account_scope,
+            Some(&self.custody),
             notify,
         )?;
         {

@@ -22,6 +22,7 @@ use std::{
 };
 mod directory;
 mod execution;
+mod helper_custody;
 mod native_reconcile;
 mod worker_join;
 pub(crate) use directory::DirectoryProof;
@@ -332,6 +333,7 @@ impl LocalHandle {
             None,
             true,
             Err("This actor has no typed provider launch scope".into()),
+            None,
             notify,
         )
     }
@@ -358,6 +360,7 @@ impl LocalHandle {
             Some(NativeOwnership::New(source, recovery_environment)),
             true,
             launch_account_scope,
+            None,
             notify,
         )
     }
@@ -389,6 +392,7 @@ impl LocalHandle {
             Some(NativeOwnership::Adopted(holder, server)),
             true,
             launch_account_scope,
+            None,
             notify,
         )
     }
@@ -403,6 +407,7 @@ impl LocalHandle {
         ownership: Option<NativeOwnership>,
         manage_launch_ownership: bool,
         launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
+        helper_custody: Option<&helper_custody::HelperCustody>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         // Only the caller's retained startup context may own a strong cleanup
@@ -616,6 +621,9 @@ impl LocalHandle {
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);
+        // The outer helper retains this exact worker across constructor and
+        // serving failures. Admission is fenced before an OS worker exists.
+        let mut helper_admission = helper_custody.map(|scope| scope.admit()).transpose()?;
         let worker = thread::Builder::new()
             .name("cagents-chat".into())
             .spawn(move || {
@@ -883,6 +891,10 @@ impl LocalHandle {
             .map_err(|e| e.to_string())?;
         *inner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         let handle = Self(inner);
+        if let Some(admission) = &mut helper_admission {
+            admission.register(&handle);
+        }
+        drop(helper_admission);
         if external_launch_owner
             && !adopted_native
             && let Some(context) = &launch_context
@@ -2370,6 +2382,18 @@ struct ChildGuard {
     identity: OwnedFd,
     terminated: bool,
 }
+#[cfg(test)]
+struct ChildCleanupProbe {
+    observed: crossbeam_channel::Sender<OwnedFd>,
+    resume: crossbeam_channel::Receiver<()>,
+    waited: crossbeam_channel::Sender<Option<i32>>,
+}
+#[cfg(test)]
+thread_local! {
+    static CHILD_CLEANUP_PROBE: std::cell::RefCell<Option<ChildCleanupProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
 impl ChildGuard {
     /// Capture immediately after spawn, before any code can reap this child.
     fn new(mut child: Child) -> std::io::Result<Self> {
@@ -2467,6 +2491,23 @@ impl ChildGuard {
         // ECHILD or another observation failure does not establish authority
         // over the old numeric group. Refuse before any signal in that case.
         self.observed_exit_status()?;
+        #[cfg(test)]
+        let probe = CHILD_CLEANUP_PROBE.with(|probe| probe.borrow_mut().take());
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            let descriptor =
+                unsafe { libc::fcntl(self.identity.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _ = probe
+                .observed
+                .send(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            probe
+                .resume
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(std::io::Error::other)?;
+        }
         let pid = self.child.id() as i32;
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
@@ -2492,8 +2533,14 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
-        self.child.wait()?;
+        let status = self.child.wait()?;
         self.terminated = true;
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            let _ = probe.waited.send(status.code());
+        }
+        #[cfg(not(test))]
+        let _ = status;
         Ok(())
     }
 }
@@ -8140,6 +8187,7 @@ mod tests {
             None,
             false,
             Err("fixture has no account scope".into()),
+            None,
             |_| {},
         )
         .unwrap();
@@ -8183,6 +8231,7 @@ mod tests {
             None,
             false,
             Err("fixture has no account scope".into()),
+            None,
             |_| {},
         )
         .unwrap();
