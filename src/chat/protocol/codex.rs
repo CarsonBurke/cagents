@@ -5563,6 +5563,15 @@ mod tests {
             assert_eq!(after.outcome, before.outcome);
             assert_eq!(after.turn_generation, before.turn_generation);
             assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new")));
+            // Settle only this fixture's surviving turn after every ownership
+            // assertion. Production close must not wait for an interruption
+            // reply that the transport-free fixture can never deliver.
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "newer", "completed")],
+            );
+            assert!(!handle.snapshot(None).unwrap().busy);
             handle.close().unwrap();
         }
     }
@@ -5709,6 +5718,13 @@ mod tests {
                             json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}}),
                             turn_frame("thread-exact", "old", status),
                         ],
+                        // Cleanup follows the assertions below. Make an
+                        // unidentified surviving turn explicit, then finish
+                        // that exact fixture turn through the real adapter.
+                        vec![
+                            turn_frame("thread-exact", "new", "inProgress"),
+                            turn_frame("thread-exact", "new", "completed"),
+                        ],
                     ],
                 );
                 handle.command(Command::Compact).unwrap();
@@ -5732,6 +5748,8 @@ mod tests {
                 let updates = updates.try_iter().collect::<Vec<_>>();
                 assert!(updates.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(evidence) if evidence.key == "codex:thread-exact:old" && evidence.kind == outcome)));
                 assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+                handle.command(Command::Compact).unwrap();
+                assert!(!handle.snapshot(None).unwrap().busy);
                 handle.close().unwrap();
             }
         }
