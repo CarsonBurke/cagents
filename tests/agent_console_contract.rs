@@ -64,8 +64,8 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
-        // Project discovery requires a checkout with a HEAD. Keep its Git
-        // identity, configuration and initial commit inside this fixture.
+        // These console scenarios use a private checkout with a HEAD. Keep
+        // its Git identity, configuration and initial commit in this fixture.
         for arguments in [
             vec!["init", "--initial-branch=main", "--template="],
             vec!["commit", "--allow-empty", "-m", "fixture"],
