@@ -780,7 +780,18 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
     app.persist();
     let observed = app.card_state(alias.id).unwrap().kind.clone();
     assert!(exact_issued_terminal_end(&alias.kind, &observed));
-    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Update { before, pane }, .. } if before.kind == alias.kind && pane.kind == observed)));
+    let published = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let update = published
+        .iter()
+        .find_map(|edit| match edit {
+            ModelEdit::ChangeView {
+                operation,
+                change: Change::Update { before, pane },
+                ..
+            } if before.kind == alias.kind && pane.kind == observed => Some(*operation),
+            _ => None,
+        })
+        .expect("the production end reducer publishes its exact source update");
     assert!(app.shared_views.pending.iter().any(
         |(_, _, change)| matches!(change, Change::Update { pane, .. } if pane.kind == observed)
     ));
@@ -800,7 +811,7 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
             .contains(&alias.id),
         "an end cannot launder a changed captured host proof"
     );
-    drop(app.apply_workspace_model_update(ModelUpdate::Read(full)));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(full.clone())));
     assert!(!app.pane_is_quarantined(alias.id));
     assert_eq!(app.card_state(alias.id).unwrap().kind, observed);
     assert!(!matches!(
@@ -808,6 +819,80 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
         Some(CardRuntime::Failed(_))
     ));
     assert!(app.terminal_starts.lock().unwrap().is_empty());
+    let mut ended_model = full;
+    ended_model.sequence += 1;
+    ended_model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .find(|pane| pane.id == alias.id)
+        .unwrap()
+        .kind = observed.clone();
+    assert!(
+        quarantined_managed_panes(
+            &ended_model,
+            &app.durable,
+            &HashSet::new(),
+            &app.shared_views.pending
+        )
+        .is_empty(),
+        "installing the ended snapshot before ACK cannot briefly quarantine the retained surface"
+    );
+    assert!(
+        quarantined_managed_panes(&ended_model, &app.durable, &HashSet::new(), &changed_proof)
+            .contains(&alias.id),
+        "an ended raw descriptor cannot hide a foreign captured proof"
+    );
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(ended_model.clone())));
+    assert!(
+        app.shared_views
+            .pending
+            .iter()
+            .any(|(operation, _, _)| *operation == update)
+    );
+    assert!(!app.pane_is_quarantined(alias.id));
+    assert!(matches!(
+        app.cards.get(&alias.id),
+        Some(CardRuntime::Completed)
+    ));
+    drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(hidden),
+        operation: Some(update),
+        model: ended_model.clone(),
+    }));
+    assert!(
+        !app.shared_views
+            .pending
+            .iter()
+            .any(|(operation, _, _)| *operation == update)
+    );
+    assert!(!app.pane_is_quarantined(alias.id));
+    assert!(!app.shared_views.quarantine_actions.contains_key(&alias.id));
+    assert!(matches!(
+        app.cards.get(&alias.id),
+        Some(CardRuntime::Completed)
+    ));
+    assert_eq!(app.card_state(alias.id).unwrap().kind, observed);
+    // A different window may still have the exact live source cached when
+    // this valid end arrives, including after its managed owner closes.
+    for closed_owner in [false, true] {
+        app.card_state_mut(alias.id).unwrap().kind = alias.kind.clone();
+        app.cards.insert(alias.id, CardRuntime::Loading);
+        ended_model.sequence += 1;
+        ended_model.agents[0].closed = closed_owner;
+        assert!(
+            quarantined_managed_panes(&ended_model, &app.durable, &HashSet::new(), &[]).is_empty()
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(ended_model.clone())));
+        assert!(!app.pane_is_quarantined(alias.id));
+        assert!(matches!(
+            app.cards.get(&alias.id),
+            Some(CardRuntime::Completed)
+        ));
+        assert_eq!(app.card_state(alias.id).unwrap().kind, observed);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+    }
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Update { pane, .. }, .. } if pane.id == alias.id && pane.kind == alias.kind)), "an older live cache cannot publish over the observed end");
 }
 
 #[test]

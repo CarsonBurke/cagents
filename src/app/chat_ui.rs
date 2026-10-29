@@ -26367,7 +26367,9 @@ mod tests {
                     "The newer saved draft"
                 },
             );
-            assert_chat_copy_task_has_no_effects(
+            // MessageCopied already scheduled its normal copied-state expiry.
+            // That timer may settle, but the deferred clipboard write must not.
+            assert_chat_copy_task_has_no_clipboard_write(
                 deferred,
                 "older transcript write cannot overwrite either newer saved-payload copy",
             );

@@ -125,14 +125,17 @@ fn quarantined_managed_panes(
         .collect::<HashMap<_, _>>();
     let managed_source =
         |kind: &CardKind| resource(kind).is_some_and(|key| issuers.contains_key(&key));
-    let permits = |agent: &crate::agent_execution::Agent, pane: &Pane| {
+    let permits = |agent: &crate::agent_execution::Agent, pane: &Pane, require_open_owner: bool| {
         // An exact observed terminal end is display evidence only. Preserve
         // that existing exception, including archived automation consoles.
-        (!agent.closed
+        (!require_open_owner
+            || !agent.closed
             || matches!(&pane.kind, CardKind::Terminal(session) if terminal_ended(session)))
             && display_index.permits_projection(agent, pane)
     };
-    let refused = |pane: &Pane| {
+    // Captured source proof remains checkable after the raw alias records its
+    // end. This deliberately excludes comparison with that newer descriptor.
+    let ownership_refused = |pane: &Pane, require_open_owner: bool| {
         let issuer = resource(&pane.kind).and_then(|key| issuers.get(&key));
         if issuer == Some(&None)
             || (authoritative.get(&pane.id) == Some(&None)
@@ -141,18 +144,7 @@ fn quarantined_managed_panes(
             return true;
         }
         if let Some(owner) = managed.get(&pane.id) {
-            return owner.is_none_or(|agent| !permits(agent, pane));
-        }
-        let source = authoritative
-            .get(&pane.id)
-            .and_then(|pane| pane.map(|pane| &pane.kind))
-            .or_else(|| local_sources.get(&pane.id).copied());
-        if source.is_some_and(|source| {
-            managed_source(source)
-                && source != &pane.kind
-                && !exact_issued_terminal_end(source, &pane.kind)
-        }) {
-            return true;
+            return owner.is_none_or(|agent| !permits(agent, pane, require_open_owner));
         }
         if let Some(owner) = issuer {
             let Some(owner) = owner else {
@@ -161,9 +153,30 @@ fn quarantined_managed_panes(
             let canonical = CardId::from_uuid(owner.as_uuid());
             let mut claimed = pane.clone();
             claimed.id = canonical;
-            return managed[&canonical].is_none_or(|agent| !permits(agent, &claimed));
+            return managed[&canonical]
+                .is_none_or(|agent| !permits(agent, &claimed, require_open_owner));
         }
         false
+    };
+    let refused = |pane: &Pane| {
+        let authoritative_source = authoritative
+            .get(&pane.id)
+            .and_then(|pane| pane.map(|pane| &pane.kind));
+        let receiving_exact_end = authoritative_source
+            .is_some_and(|source| exact_issued_terminal_end(&pane.kind, source));
+        if ownership_refused(pane, !receiving_exact_end) {
+            return true;
+        }
+        if managed.contains_key(&pane.id) {
+            return false;
+        }
+        let source = authoritative_source.or_else(|| local_sources.get(&pane.id).copied());
+        source.is_some_and(|source| {
+            managed_source(source)
+                && source != &pane.kind
+                && !exact_issued_terminal_end(source, &pane.kind)
+                && !receiving_exact_end
+        })
     };
     for pane in model.views.iter().flat_map(|view| &view.panes) {
         if refused(pane) {
@@ -195,7 +208,8 @@ fn quarantined_managed_panes(
             && !managed.contains_key(&pane.id)
             && managed_source(&before.kind)
             && before.kind != pane.kind
-            && !(exact_issued_terminal_end(&before.kind, &pane.kind) && !refused(before))
+            && !(exact_issued_terminal_end(&before.kind, &pane.kind)
+                && !ownership_refused(before, false))
         {
             rejected.insert(pane.id);
             quarantined.insert(pane.id);
@@ -2471,7 +2485,12 @@ impl Cagents {
                     // replacing it would discard the first start's reply.
                     // A different canonical descriptor still needs attachment.
                     let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
-                    if !self.cards.contains_key(&pane.id) && !starting {
+                    let ended_placeholder = matches!(&pane.kind, CardKind::Terminal(session) if terminal_ended(session))
+                        && matches!(
+                            self.cards.get(&pane.id),
+                            Some(CardRuntime::Loading | CardRuntime::Failed(_))
+                        );
+                    if ended_placeholder || (!self.cards.contains_key(&pane.id) && !starting) {
                         tasks.push(self.attach_shared_pane(pane));
                     }
                 }

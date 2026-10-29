@@ -8027,7 +8027,12 @@ mod tests {
                 healthy.id = CardId::new();
                 match &mut healthy.kind {
                     CardKind::Terminal(session) => session.id = TerminalId::new(),
-                    CardKind::Chat(session) => session.id = TerminalId::new(),
+                    CardKind::Chat(session) => {
+                        session.id = TerminalId::new();
+                        if let Some(source) = &mut session.terminal {
+                            source.id = session.id;
+                        }
+                    }
                     _ => unreachable!(),
                 }
                 workspace.cards.push(healthy.clone());
