@@ -21659,6 +21659,12 @@ mod tests {
 
     #[test]
     fn resetting_settings_restores_autosave_for_an_already_open_editor() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::resetting_settings_restores_autosave_for_an_already_open_editor",
+        ) {
+            return;
+        }
+
         #[derive(Debug, Default)]
         struct SaveDiagnostics {
             auto_save_due_delivered: usize,
