@@ -89,7 +89,7 @@ use xkeysym::Keysym;
 use super::{
     SubsurfaceInstance,
     event_loop::state::{Common, CommonSurface, SctkState},
-    keymap::raw_keycode_to_physicalkey,
+    keymap::scancode_to_physicalkey,
     subsurface_widget::remove_iced_subsurface,
     winit_window::SctkWinitWindow,
 };
@@ -607,10 +607,7 @@ impl SctkEvent {
                     KeyboardEventVariant::Press(ke) => {
                         let (key, location) =
                             keysym_to_vkey_location(ke.keysym);
-                        let physical_key =
-                            raw_keycode_to_physicalkey(ke.raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
+                        let physical_key = sctk_physical_key(ke.raw_code);
                         events.push((
                             surface_ids.get(&surface.id()).map(|id| id.inner()),
                             iced_runtime::core::Event::Keyboard(
@@ -633,9 +630,7 @@ impl SctkEvent {
                         ..
                     }) => {
                         let (key, location) = keysym_to_vkey_location(keysym);
-                        let physical_key = raw_keycode_to_physicalkey(raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
+                        let physical_key = sctk_physical_key(raw_code);
 
                         events.push((
                             surface_ids.get(&surface.id()).map(|id| id.inner()),
@@ -654,10 +649,7 @@ impl SctkEvent {
                     }
                     KeyboardEventVariant::Release(ke) => {
                         let (k, location) = keysym_to_vkey_location(ke.keysym);
-                        let physical_key =
-                            raw_keycode_to_physicalkey(ke.raw_code);
-                        let physical_key =
-                            crate::conversion::physical_key(physical_key);
+                        let physical_key = sctk_physical_key(ke.raw_code);
                         events.push((
                             surface_ids.get(&surface.id()).map(|id| id.inner()),
                             iced_runtime::core::Event::Keyboard(
@@ -1733,6 +1725,12 @@ impl SctkEvent {
     }
 }
 
+fn sctk_physical_key(raw_code: u32) -> key::Physical {
+    // SCTK preserves the wl_keyboard evdev code. Only its XKB lookup adds 8;
+    // applying the X11-style mapper here would subtract that offset again.
+    crate::conversion::physical_key(scancode_to_physicalkey(raw_code))
+}
+
 fn keysym_to_vkey_location(keysym: Keysym) -> (Key, Location) {
     let raw = keysym.raw();
     let mut key = keysym_to_key(raw);
@@ -1750,4 +1748,55 @@ fn keysym_to_vkey_location(keysym: Keysym) -> (Key, Location) {
 
     let location = keymap::keysym_location(raw);
     (key, location)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{key, keymap, sctk_physical_key};
+
+    #[test]
+    fn sctk_evdev_keys_match_expected_and_normalized_winit_identity() {
+        use key::Code;
+
+        for (raw_code, expected) in [
+            (1, Code::Escape),
+            (15, Code::Tab),
+            (20, Code::KeyT),
+            (28, Code::Enter),
+            (29, Code::ControlLeft),
+            (42, Code::ShiftLeft),
+            (54, Code::ShiftRight),
+            (56, Code::AltLeft),
+            (57, Code::Space),
+            (96, Code::NumpadEnter),
+            (97, Code::ControlRight),
+            (100, Code::AltRight),
+            (111, Code::Delete),
+        ] {
+            // This seam is shared by the actual SCTK Press, Repeat and Release
+            // producers. A correctly offset X11/winit code must name the same
+            // physical key, including when a held key crosses those routes.
+            let sctk = sctk_physical_key(raw_code);
+            assert_eq!(sctk, key::Physical::Code(expected), "evdev {raw_code}");
+            let normalized_winit = crate::conversion::physical_key(
+                keymap::raw_keycode_to_physicalkey(raw_code + 8),
+            );
+            assert_eq!(sctk, normalized_winit, "evdev {raw_code}");
+        }
+    }
+
+    #[test]
+    fn sctk_unidentified_keys_keep_their_original_native_code() {
+        for raw_code in [0, 0x12345, u32::MAX] {
+            assert_eq!(
+                sctk_physical_key(raw_code),
+                key::Physical::Unidentified(key::NativeCode::Xkb(raw_code)),
+                "evdev {raw_code}",
+            );
+        }
+        assert_eq!(
+            sctk_physical_key(240),
+            key::Physical::Unidentified(key::NativeCode::Unidentified),
+        );
+    }
 }
