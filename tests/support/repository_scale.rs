@@ -4,8 +4,60 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+pub(super) struct Phase {
+    name: &'static str,
+    started: Instant,
+}
+
+pub(super) fn phase(name: &'static str) -> Phase {
+    eprintln!("pathspec phase={name} begin elapsed_ms=0");
+    Phase {
+        name,
+        started: Instant::now(),
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        eprintln!(
+            "pathspec phase={} end elapsed_ms={} result={}",
+            self.name,
+            self.started.elapsed().as_millis(),
+            if std::thread::panicking() {
+                "panicking"
+            } else {
+                "finished"
+            }
+        );
+    }
+}
+
+pub(super) fn fixture_git_environment(mut command: CommandSpec) -> CommandSpec {
+    // Fixture environment hardening, not a demonstrated timeout fix: this
+    // contract exercises pathspecs rather than automatic repository maintenance.
+    const CONFIG: [(&str, &str); 6] = [
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", "/dev/null"),
+        ("commit.gpgsign", "false"),
+        ("init.templateDir", ""),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    ];
+    command = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", CONFIG.len().to_string());
+    for (index, (key, value)) in CONFIG.into_iter().enumerate() {
+        command = command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    command
+}
 
 /// Runs `contract` as the only test of a private libtest subprocess,
 /// against a repository in a 0700 namespace under `/var/tmp`; the
@@ -31,6 +83,7 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
         .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
         .unwrap_or(name);
     if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
+        let entry = phase("child entry");
         // SAFETY: prctl takes no pointers here. Adopting orphans is
         // confined to this dedicated single-test subprocess.
         assert_eq!(
@@ -45,8 +98,12 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
         )
         .join("repository");
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        drop(entry);
+        let running = phase("contract");
         contract(&root);
+        drop(running);
         eprintln!("Contract passed; settling its process family");
+        let settlement = phase("settlement");
         // The kernel reparents an orphan to this subreaper as its
         // parent exits, so while any descendant lives this process
         // still has a child of its own; ECHILD is settlement.
@@ -62,6 +119,7 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
                 _ => panic!("settling the contract's process family: {error}"),
             }
         }
+        drop(settlement);
         return;
     }
 
@@ -105,21 +163,9 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
             command = command.env_remove(key);
         }
     }
-    command = command
+    let command = fixture_git_environment(command)
         .env("CAGENTS_LARGE_PATHSPEC_CONTRACT", name)
-        .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory.0)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "4")
-        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_1", "/dev/null")
-        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .env("GIT_CONFIG_KEY_3", "init.templateDir")
-        .env("GIT_CONFIG_VALUE_3", "");
+        .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory.0);
     let (success, stdout, stderr, status) =
         match SystemProcessExecutor.execute(&command, &CancellationToken::new()) {
             Ok(output) => (
