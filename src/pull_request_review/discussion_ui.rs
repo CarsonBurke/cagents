@@ -391,7 +391,6 @@ impl State {
                 | Action::Finished { .. }
                 | Action::AcknowledgeUnknown
                 | Action::Event(_)
-                | Action::Reanchored { .. }
                 | Action::Begin(_)
                 | Action::BeginFile(_)
                 | Action::Reply(_)
@@ -583,6 +582,8 @@ impl State {
                             composer.authority.merge_base =
                                 self.range.as_ref().map(|range| range.merge_base.clone());
                             composer.range = self.range.clone();
+                            self.cache_dirty = true;
+                            self.discussion.drafts_saved = false;
                             self.notice = Some("Draft re-anchored to the current head. Check its line before posting.".into());
                         }
                     }
@@ -1804,6 +1805,249 @@ mod tests {
             side: ReviewDiffSide::Right,
             start_line: 4,
             line: 7,
+        }
+    }
+
+    mod reanchor_receipt_tests {
+        use super::*;
+        use crate::pull_request_review::Action as ReviewAction;
+        use cosmic::iced::futures::StreamExt;
+
+        const BODY: &str = "Keep this saved line draft";
+
+        async fn outputs(task: ActionTask) -> Vec<ReviewAction> {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                let mut outputs = Vec::new();
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = effect {
+                        outputs.push(action);
+                    }
+                }
+                outputs
+            })
+            .await
+            .expect("the owned Git/cache fixture must finish")
+        }
+
+        async fn finish_cache(state: &mut State, task: ActionTask) {
+            let receipts = outputs(task).await;
+            assert_eq!(receipts.len(), 1, "one real cache write must finish");
+            for receipt in receipts {
+                let ReviewAction::CacheSaved { result, .. } = &receipt else {
+                    panic!("expected the cache's actual receipt, got {receipt:?}");
+                };
+                assert!(result.is_ok(), "{result:?}");
+                drop(state.update(receipt));
+            }
+            assert!(!state.drafts_need_save());
+            assert!(state.restart_blocker().is_none());
+        }
+
+        fn git(root: &Path, arguments: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Review fixture",
+                    "-c",
+                    "user.email=review-fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .arg("-C")
+                .arg(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        async fn saved_draft() -> (tempfile::TempDir, State, Loaded, Loaded) {
+            let directory = tempfile::tempdir().unwrap();
+            git(directory.path(), &["init", "--quiet"]);
+            let commit = |text: &str| {
+                std::fs::write(directory.path().join("file.rs"), text).unwrap();
+                git(directory.path(), &["add", "--", "file.rs"]);
+                git(directory.path(), &["commit", "--quiet", "-m", "fixture"]);
+                Oid::parse(git(directory.path(), &["rev-parse", "HEAD"])).unwrap()
+            };
+            let base = commit("base\n");
+            let old_head = commit("a\nb\nc\nd\ne\nf\ng\nh\n");
+            let new_head = commit("inserted\na\nb\nc\nd\ne\nf\ng\nh\n");
+            let load = |head: Oid| {
+                let mut load = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+                load.context.head_oid = head.as_str().to_owned();
+                load.context.base_oid = base.as_str().to_owned();
+                load.pull_request.head_ref_oid = head.as_str().to_owned();
+                load.pull_request.base_ref_oid = Some(base.as_str().to_owned());
+                load.range.head = head;
+                load.range.base_tip = base.clone();
+                load.range.merge_base = base.clone();
+                load
+            };
+            let old = load(old_head);
+            let current = load(new_head);
+            let mut state = ready();
+            state.cache = Some(Arc::new(cache::JsonStore::new(
+                directory.path().join("review-cache.json"),
+            )));
+            state.target = Some(ReviewTarget {
+                worktree: directory.path().to_path_buf(),
+                pull_request: Arc::new(old.pull_request.clone()),
+                ..target(1)
+            });
+            state.adopt(&old);
+            let save = state.update(ReviewAction::Discussion(Action::Begin(anchor())));
+            finish_cache(&mut state, save).await;
+            let save = state.update(ReviewAction::Discussion(Action::Composer(
+                text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(BODY.into()))),
+            )));
+            finish_cache(&mut state, save).await;
+            state.adopt(&current);
+            // Finish the refresh's real cache write before starting the mapping.
+            let save = state.update(ReviewAction::Discussion(Action::Preview));
+            finish_cache(&mut state, save).await;
+            (directory, state, old, current)
+        }
+
+        async fn mapped_receipt(task: ActionTask) -> ReviewAction {
+            let mut receipts = outputs(task).await;
+            assert_eq!(receipts.len(), 1, "one real mapping receipt expected");
+            let receipt = receipts.pop().unwrap();
+            assert!(matches!(
+                receipt,
+                ReviewAction::Discussion(Action::Reanchored { .. })
+            ));
+            receipt
+        }
+
+        #[tokio::test]
+        async fn reanchor_receipts_after_close_do_not_dirty_an_empty_review_or_block_reopening() {
+            for success_queued_before_close in [true, false] {
+                let (_directory, mut state, old, _) = saved_draft().await;
+                let original = state.target.clone().unwrap();
+                let mapping = state.update(ReviewAction::Discussion(Action::Reanchor));
+                let (queued, pending) = if success_queued_before_close {
+                    (Some(mapped_receipt(mapping).await), None)
+                } else {
+                    (None, Some(mapping))
+                };
+                assert!(!state.discussion_is_busy());
+                assert!(!state.drafts_need_save());
+                let order = state.cache_order;
+                let closed = state.update(ReviewAction::Close);
+                assert!(outputs(closed).await.is_empty());
+                assert!(state.target.is_none() && state.range.is_none());
+                assert!(state.discussion.composer.is_none());
+
+                let receipt = match queued {
+                    Some(receipt) => receipt,
+                    None => mapped_receipt(pending.unwrap()).await,
+                };
+                let ReviewAction::Discussion(Action::Reanchored { result, .. }) = &receipt else {
+                    unreachable!()
+                };
+                assert_eq!(result.is_ok(), success_queued_before_close, "{result:?}");
+                let ignored = state.update(receipt);
+                assert!(outputs(ignored).await.is_empty(), "no orphan cache save");
+                assert!(state.target.is_none() && state.range.is_none());
+                assert!(state.discussion.composer.is_none());
+                assert!(!state.drafts_need_save());
+                assert!(state.restart_blocker().is_none());
+                assert_eq!(state.cache_order, order);
+
+                let mut another = target(2);
+                another.worktree = original.worktree.clone();
+                drop(state.update(ReviewAction::Open(another)));
+                assert_eq!(state.target.as_ref().unwrap().pull_request.number, 2);
+                drop(state.update(ReviewAction::Close));
+                drop(state.update(ReviewAction::Open(original)));
+                let composer = state.discussion.composer.as_ref().unwrap();
+                assert_eq!(composer.content.text(), BODY);
+                assert_eq!(composer.destination, Destination::Line(anchor()));
+                assert_eq!(composer.authority.context, old.context);
+                assert_eq!(composer.range.as_ref(), Some(&old.range));
+                assert!(state.restart_blocker().is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn current_reanchor_success_saves_its_change_but_failure_keeps_the_saved_draft() {
+            let (_directory, mut state, old, current) = saved_draft().await;
+            let mapping = state.update(ReviewAction::Discussion(Action::Reanchor));
+            let receipt = mapped_receipt(mapping).await;
+            let mut failed = receipt.clone();
+            let ReviewAction::Discussion(Action::Reanchored { result, .. }) = &mut failed else {
+                unreachable!()
+            };
+            *result = Err("The anchor is ambiguous; choose its new line.".into());
+            let unchanged = state.update(failed);
+            assert!(outputs(unchanged).await.is_empty());
+            assert!(!state.drafts_need_save());
+            assert!(state.restart_blocker().is_none());
+            assert_eq!(
+                state
+                    .discussion
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .authority
+                    .context,
+                old.context
+            );
+            assert!(state.notice.as_ref().unwrap().contains("ambiguous"));
+
+            let save = state.update(receipt);
+            assert!(state.drafts_need_save());
+            assert!(
+                state.restart_blocker().is_some(),
+                "the changed draft must save"
+            );
+            let mut mapped = anchor();
+            mapped.start_line += 1;
+            mapped.line += 1;
+            let composer = state.discussion.composer.as_ref().unwrap();
+            assert_eq!(composer.destination, Destination::Line(mapped.clone()));
+            assert_eq!(composer.authority.context, current.context);
+            assert_eq!(composer.range.as_ref(), Some(&current.range));
+            assert_eq!(composer.content.text(), BODY);
+            finish_cache(&mut state, save).await;
+
+            let target = state.target.clone().unwrap();
+            let cache = state.cache.clone().unwrap();
+            let mut reopened = State::new(
+                Arc::new(ScriptedApi::new()),
+                RepositoryService::system("git"),
+            )
+            .with_cache(Some(cache));
+            let open = reopened.update(ReviewAction::Open(target));
+            let mut receipts = outputs(open).await;
+            assert_eq!(receipts.len(), 1);
+            let receipt = receipts.pop().unwrap();
+            assert!(matches!(
+                &receipt,
+                ReviewAction::Cached {
+                    result: Ok(Some(_)),
+                    ..
+                }
+            ));
+            // The subsequent live GitHub refresh is outside this local-cache contract.
+            drop(reopened.update(receipt));
+            let composer = reopened.discussion.composer.as_ref().unwrap();
+            assert_eq!(composer.content.text(), BODY);
+            assert_eq!(composer.destination, Destination::Line(mapped));
+            assert_eq!(composer.authority.context, current.context);
+            assert_eq!(composer.range.as_ref(), Some(&current.range));
+            assert!(reopened.restart_blocker().is_none());
         }
     }
 
