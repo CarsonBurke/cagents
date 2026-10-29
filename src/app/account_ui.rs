@@ -105,8 +105,11 @@ pub(super) struct State {
     popover: Option<AccountId>,
     cache: Option<Cache>,
     logins: Vec<Login>,
+    /// Preparations keep custody until their exact completion is consumed,
+    /// including a cancelled preparation that may already have made a home.
+    home_requests: BTreeMap<uuid::Uuid, HomeRequest>,
     /// Set before asynchronous CLI discovery/home creation, not after it.
-    browser_preparing: bool,
+    browser_preparing: Option<uuid::Uuid>,
     /// Existing-account login preparation, fenced by account-home generation.
     preparing_logins: BTreeSet<u64>,
     preparing_browser_login: Option<u64>,
@@ -243,7 +246,8 @@ impl State {
             popover: None,
             cache,
             logins: Vec::new(),
-            browser_preparing: false,
+            home_requests: BTreeMap::new(),
+            browser_preparing: None,
             preparing_logins: BTreeSet::new(),
             preparing_browser_login: None,
             asking_host: false,
@@ -826,6 +830,37 @@ enum LoginPhase {
     Settling,
     /// The callback could not be acquired; retain the row until dismissed.
     CallbackBlocked,
+    /// One code alternative owns this failed browser login's recovery.
+    PreparingCode(uuid::Uuid),
+    /// Its code alternative opened; the failed browser home can be dismissed.
+    CodeStarted,
+    /// The exact dismissal that owns this home's cleanup.
+    Dismissing(uuid::Uuid),
+    /// Cleanup failed. Keep an explicit dismissal retry, without probing.
+    DismissFailed,
+}
+
+impl LoginPhase {
+    fn has_request_custody(self) -> bool {
+        matches!(
+            self,
+            Self::PreparingCode(_) | Self::CodeStarted | Self::Dismissing(_) | Self::DismissFailed
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HomeRequest {
+    provider: Provider,
+    device: bool,
+    blocked_login: Option<uuid::Uuid>,
+    cancelled: bool,
+}
+
+struct PreparedHome {
+    key: uuid::Uuid,
+    home: PathBuf,
+    launch: Option<LaunchRecipe>,
 }
 
 impl Login {
@@ -858,7 +893,10 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
+    RemoteHomeReady {
+        request: uuid::Uuid,
+        result: Result<crate::account::remote::Created, String>,
+    },
     RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
     Install(Provider),
@@ -902,6 +940,8 @@ pub enum Action {
         expected: Registered,
     },
     SignInWithCode(AccountId),
+    /// The code alternative rendered by one failed browser sign-in row.
+    UseCodeForBlockedLogin(uuid::Uuid),
     /// The CLI and browser callback were checked off the interface thread.
     LoginReady {
         owner: u64,
@@ -930,9 +970,13 @@ pub enum Action {
     },
     /// The new account's home and CLI are ready, or could not be.
     HomeReady {
-        provider: Provider,
-        device: bool,
+        request: uuid::Uuid,
         result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+    },
+    LoginDismissed {
+        key: uuid::Uuid,
+        request: uuid::Uuid,
+        result: Result<Option<Registry>, String>,
     },
     LoginTick,
     LoginCallbackBlocked(uuid::Uuid),
@@ -995,6 +1039,7 @@ impl Action {
                 | Self::UseReportedLogin { .. }
                 | Self::SignIn(_)
                 | Self::SignInWithCode(_)
+                | Self::UseCodeForBlockedLogin(_)
                 | Self::Add { .. }
                 | Self::LinkStart(_)
                 | Self::LinkCommit
@@ -2196,21 +2241,14 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::RemoteHomeReady(provider, result) => match result {
-                Ok(created) => {
-                    let task = self.begin_account_login(
-                        provider,
-                        created.key,
-                        created.home,
-                        created.recipe,
-                    );
-                    Task::batch([task, self.reload_registry()])
-                }
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(error));
-                    Task::none()
-                }
-            },
+            Action::RemoteHomeReady { request, result } => self.finish_home_request(
+                request,
+                result.map(|created| PreparedHome {
+                    key: created.key,
+                    home: created.home,
+                    launch: Some(created.recipe),
+                }),
+            ),
             Action::RemoteLoaded(result) => {
                 let snapshot = match result {
                     Ok(snapshot) => snapshot,
@@ -2527,6 +2565,9 @@ impl Cagents {
                 }
                 Task::none()
             }
+            Action::UseCodeForBlockedLogin(key) => {
+                self.prepare_account_home(Provider::Codex, true, Some(key))
+            }
             Action::Add { provider, device } => self.add_account(provider, device),
             Action::LinkStart(provider) => {
                 self.account_ui.table.add_menu = false;
@@ -2579,11 +2620,12 @@ impl Cagents {
                     }
                 }
             }
-            Action::HomeReady {
-                provider,
-                device,
+            Action::HomeReady { request, result } => self.open_account_login(request, result),
+            Action::LoginDismissed {
+                key,
+                request,
                 result,
-            } => self.open_account_login(provider, device, result),
+            } => self.login_dismissed(key, request, result),
             Action::LoginTick => self.check_logins(),
             Action::LoginCallbackBlocked(key) => {
                 if let Some(login) = self
@@ -2645,8 +2687,8 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                if login.phase == LoginPhase::CallbackBlocked {
-                    return self.discard_home(key, login.provider);
+                if login.phase.has_request_custody() || login.phase == LoginPhase::CallbackBlocked {
+                    return self.dismiss_login(key);
                 }
                 match self.sign_in_card(login.provider, &login.home) {
                     // Closing the terminal ends the login; the next check
@@ -3020,7 +3062,7 @@ impl Cagents {
 
     /// A synchronous fence covering discovery and terminals awaiting spawn.
     fn codex_browser_busy(&self) -> bool {
-        self.account_ui.browser_preparing || self.account_ui.preparing_browser_login.is_some() || self.durable.cards.iter().any(|card| {
+        self.account_ui.browser_preparing.is_some() || self.account_ui.preparing_browser_login.is_some() || self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                 && matches!(&card.kind, CardKind::Terminal(session)
@@ -3419,10 +3461,66 @@ impl Cagents {
     /// Creates the new account's home off the interface thread, with the
     /// reader's shared entries linked in, and finds its CLI.
     fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
+        self.prepare_account_home(provider, device, None)
+    }
+
+    fn prepare_account_home(
+        &mut self,
+        provider: Provider,
+        device: bool,
+        blocked_login: Option<uuid::Uuid>,
+    ) -> Task<Message> {
+        if let Some(key) = blocked_login
+            && !self.account_ui.logins.iter().any(|login| {
+                login.key == key
+                    && login.provider == Provider::Codex
+                    && login.phase == LoginPhase::CallbackBlocked
+            })
+        {
+            return Task::none();
+        }
+        let remote = crate::device::is_remote();
+        if !remote {
+            if login_arguments(provider, device).is_none() {
+                return Task::none();
+            }
+            if self.account_ui.homes.is_none() {
+                self.status = Some(TransientNotice::error(
+                    "Accounts cannot be added: this system offers no data directory.",
+                ));
+                return Task::none();
+            }
+            if provider == Provider::Codex && !device && self.codex_browser_busy() {
+                self.status = Some(TransientNotice::warning(account::login::BUSY));
+                return Task::none();
+            }
+        }
+        let request = uuid::Uuid::new_v4();
+        self.account_ui.home_requests.insert(
+            request,
+            HomeRequest {
+                provider,
+                device,
+                blocked_login,
+                cancelled: false,
+            },
+        );
+        if let Some(key) = blocked_login {
+            self.account_ui
+                .logins
+                .iter_mut()
+                .find(|login| login.key == key)
+                .expect("blocked login validated above")
+                .phase = LoginPhase::PreparingCode(request);
+        }
+        if !remote && provider == Provider::Codex && !device {
+            self.account_ui.browser_preparing = Some(request);
+        }
+        // Only an admitted action may close the popups it acted through.
+        self.account_ui.table.close_popups();
+        self.account_ui.popover = None;
         if crate::device::is_remote() {
             let copy_codex_config = self.account_ui.table.own_codex_config;
-            self.account_ui.table.close_popups();
-            self.account_ui.popover = None;
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle(account::remote::Operation::Create {
@@ -3433,7 +3531,7 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-                Message::AccountUi(Action::RemoteHomeReady(provider, result))
+                Message::AccountUi(Action::RemoteHomeReady { request, result })
             });
         }
         let codex_config = if self.account_ui.table.own_codex_config {
@@ -3441,24 +3539,11 @@ impl Cagents {
         } else {
             account::home::CodexConfig::Shared
         };
-        self.account_ui.table.close_popups();
-        self.account_ui.popover = None;
-        if login_arguments(provider, device).is_none() {
-            return Task::none();
-        }
-        let Some(homes) = self.account_ui.homes.clone() else {
-            self.status = Some(TransientNotice::error(
-                "Accounts cannot be added: this system offers no data directory.",
-            ));
-            return Task::none();
-        };
-        if provider == Provider::Codex && !device {
-            if self.codex_browser_busy() {
-                self.status = Some(TransientNotice::warning(account::login::BUSY));
-                return Task::none();
-            }
-            self.account_ui.browser_preparing = true;
-        }
+        let homes = self
+            .account_ui
+            .homes
+            .clone()
+            .expect("homes validated above");
         let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
@@ -3480,45 +3565,134 @@ impl Cagents {
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::AccountUi(Action::HomeReady {
-                provider,
-                device,
-                result,
-            })
+            Message::AccountUi(Action::HomeReady { request, result })
         })
     }
 
     fn open_account_login(
         &mut self,
-        provider: Provider,
-        device: bool,
+        request: uuid::Uuid,
         result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
     ) -> Task<Message> {
-        if provider == Provider::Codex && !device {
-            self.account_ui.browser_preparing = false;
+        let Some(preparation) = self.account_ui.home_requests.get(&request) else {
+            return Task::none();
+        };
+        let provider = preparation.provider;
+        let device = preparation.device;
+        let result = result.map(|(key, home, program)| {
+            let account = Account::managed(provider, key, home.clone());
+            let launch = std::env::var_os("HOME").and_then(|reader_home| {
+                login_launch(&account, &program, PathBuf::from(reader_home), device)
+            });
+            PreparedHome { key, home, launch }
+        });
+        self.finish_home_request(request, result)
+    }
+
+    fn finish_home_request(
+        &mut self,
+        request: uuid::Uuid,
+        result: Result<PreparedHome, String>,
+    ) -> Task<Message> {
+        let Some(preparation) = self.account_ui.home_requests.remove(&request) else {
+            // A replay must not retire a newer request or delete a home whose
+            // successful completion already handed it to a login terminal.
+            return Task::none();
+        };
+        if self.account_ui.browser_preparing == Some(request) {
+            self.account_ui.browser_preparing = None;
         }
-        let (key, home, program) = match result {
-            Ok(ready) => ready,
-            Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "A {} account could not be added: {error}",
-                    provider.label()
-                )));
-                return Task::none();
+        let current = preparation.blocked_login.is_none_or(|key| {
+            self.account_ui
+                .logins
+                .iter()
+                .any(|login| login.key == key && login.phase == LoginPhase::PreparingCode(request))
+        });
+        if preparation.cancelled || !current {
+            return match result {
+                Ok(ready) => self.cleanup_prepared_home(preparation.provider, ready),
+                Err(_) => Task::none(),
+            };
+        }
+        let ready = match result {
+            Ok(ready) if ready.launch.is_some() => ready,
+            result => {
+                if let Some(key) = preparation.blocked_login {
+                    self.account_ui
+                        .logins
+                        .iter_mut()
+                        .find(|login| login.key == key)
+                        .expect("current blocked login checked above")
+                        .phase = LoginPhase::CallbackBlocked;
+                }
+                let (error, cleanup) = match result {
+                    Err(error) => (error, Task::none()),
+                    Ok(ready) => (
+                        format!(
+                            "{} could not be started to sign in.",
+                            probe::cli_name(preparation.provider)
+                        ),
+                        self.cleanup_prepared_home(preparation.provider, ready),
+                    ),
+                };
+                let mut notice = TransientNotice::error(format!(
+                    "A {} account could not be added.",
+                    preparation.provider.label()
+                ))
+                .with_details(error);
+                if let Some(key) = preparation.blocked_login {
+                    notice = notice.with_key(NoticeKey::SignIn(key));
+                }
+                self.status = Some(notice);
+                return cleanup;
             }
         };
-        let account = Account::managed(provider, key, home.clone());
-        let launch = std::env::var_os("HOME").and_then(|reader_home| {
-            login_launch(&account, &program, PathBuf::from(reader_home), device)
+        if let Some(key) = preparation.blocked_login {
+            self.account_ui
+                .logins
+                .iter_mut()
+                .find(|login| login.key == key)
+                .expect("current blocked login checked above")
+                .phase = LoginPhase::CodeStarted;
+            self.resolve_notice(NoticeKey::SignIn(key));
+        }
+        let task = self.begin_account_login(
+            preparation.provider,
+            ready.key,
+            ready.home,
+            ready.launch.expect("launch checked above"),
+        );
+        if crate::device::is_remote() {
+            Task::batch([task, self.reload_registry()])
+        } else {
+            task
+        }
+    }
+
+    /// A cancelled preparation may have created a home before it received
+    /// the cancellation. Keep that home's cleanup visible and retryable.
+    fn cleanup_prepared_home(&mut self, provider: Provider, ready: PreparedHome) -> Task<Message> {
+        if self
+            .account_ui
+            .logins
+            .iter()
+            .any(|login| login.key == ready.key)
+            || self.account_ui.registry.find(ready.key).is_some()
+        {
+            // Never repurpose an already-owned home as cancelled cleanup.
+            return Task::none();
+        }
+        self.account_ui.logins.push(Login {
+            provider,
+            key: ready.key,
+            home: ready.home,
+            phase: LoginPhase::DismissFailed,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
         });
-        let Some(launch) = launch else {
-            self.status = Some(TransientNotice::error(format!(
-                "{} could not be started to sign in.",
-                probe::cli_name(provider)
-            )));
-            return self.discard_home(key, provider);
-        };
-        self.begin_account_login(provider, key, home, launch)
+        self.dismiss_login(ready.key)
     }
 
     fn begin_account_login(
@@ -3542,6 +3716,82 @@ impl Cagents {
             recovered: false,
         });
         task
+    }
+
+    fn dismiss_login(&mut self, key: uuid::Uuid) -> Task<Message> {
+        let Some(login) = self
+            .account_ui
+            .logins
+            .iter_mut()
+            .find(|login| login.key == key)
+        else {
+            return Task::none();
+        };
+        if matches!(login.phase, LoginPhase::Dismissing(_)) {
+            return Task::none();
+        }
+        if let LoginPhase::PreparingCode(request) = login.phase
+            && let Some(preparation) = self.account_ui.home_requests.get_mut(&request)
+        {
+            preparation.cancelled = true;
+        }
+        let request = uuid::Uuid::new_v4();
+        let provider = login.provider;
+        login.phase = LoginPhase::Dismissing(request);
+        self.discard_home(key, provider)
+            .map(move |message| match message {
+                cosmic::Action::App(Message::AccountUi(Action::LoginSettled {
+                    key: settled_key,
+                    result,
+                })) if settled_key == key => {
+                    let result = result.and_then(|settled| match settled {
+                        Settled::Abandoned(registry) => Ok(registry),
+                        _ => Err("The sign-in cleanup returned an unexpected result.".into()),
+                    });
+                    cosmic::Action::App(Message::AccountUi(Action::LoginDismissed {
+                        key,
+                        request,
+                        result,
+                    }))
+                }
+                message => message,
+            })
+    }
+
+    fn login_dismissed(
+        &mut self,
+        key: uuid::Uuid,
+        request: uuid::Uuid,
+        result: Result<Option<Registry>, String>,
+    ) -> Task<Message> {
+        let Some(index) =
+            self.account_ui.logins.iter().position(|login| {
+                login.key == key && login.phase == LoginPhase::Dismissing(request)
+            })
+        else {
+            return Task::none();
+        };
+        match result {
+            Err(error) => {
+                self.account_ui.logins[index].phase = LoginPhase::DismissFailed;
+                self.status = Some(
+                    TransientNotice::error(
+                        "The cancelled sign-in could not be removed. Retry dismissing it.",
+                    )
+                    .with_details(error)
+                    .with_key(NoticeKey::SignIn(key)),
+                );
+                Task::none()
+            }
+            Ok(registry) => {
+                let login = self.account_ui.logins.remove(index);
+                if let Some(registry) = registry {
+                    self.account_ui.set_registry(registry);
+                }
+                self.resolve_notice(NoticeKey::SignIn(key));
+                self.close_settled_sign_in(login.provider, &login.home)
+            }
+        }
     }
 
     /// Deletes a home that never became an account, and its pending entry.
@@ -3700,6 +3950,9 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if login.phase.has_request_custody() {
+            return Task::none();
+        }
         login.phase = LoginPhase::Verifying;
         if browser_terminal.is_some_and(|(_, blocked)| blocked) {
             login.phase = LoginPhase::CallbackBlocked;
@@ -3776,6 +4029,9 @@ impl Cagents {
             return Task::none();
         };
         let login = &mut self.account_ui.logins[index];
+        if login.phase.has_request_custody() {
+            return Task::none();
+        }
         let (identity, snapshot) = match outcome {
             Outcome::Answered {
                 identity, snapshot, ..
@@ -3905,6 +4161,9 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if self.account_ui.logins[index].phase.has_request_custody() {
+            return Task::none();
+        }
         if let Err(error) = &result {
             let login = &mut self.account_ui.logins[index];
             if login.attempts < LOGIN_ATTEMPTS {
@@ -5728,9 +5987,9 @@ mod app_tests {
             .account
             .resolved_home()
             .unwrap();
-        app.account_ui.browser_preparing = true;
+        app.account_ui.browser_preparing = Some(uuid::Uuid::from_u128(1954));
         let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
-        assert!(app.account_ui.browser_preparing);
+        assert!(app.account_ui.browser_preparing.is_some());
         assert!(
             app.account_ui.logins.is_empty(),
             "re-login must not add another home"
@@ -5752,7 +6011,7 @@ mod app_tests {
             "same-home login cannot race"
         );
         let _ = app.open_login(&id, Provider::Codex, true, Err("fixture".into()));
-        assert!(app.account_ui.browser_preparing);
+        assert!(app.account_ui.browser_preparing.is_some());
     }
 
     #[test]
@@ -5831,7 +6090,7 @@ mod app_tests {
         let mut app = context_inspector_test_app(false);
         app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
         let _first = app.add_account(Provider::Codex, false);
-        assert!(app.account_ui.browser_preparing);
+        let browser_request = app.account_ui.browser_preparing.unwrap();
         let _second = app.add_account(Provider::Codex, false);
         assert!(app.account_ui.logins.is_empty());
         assert!(
@@ -5840,22 +6099,32 @@ mod app_tests {
                 .is_some_and(|notice| notice.message == account::login::BUSY)
         );
         // A device-code request is independent and cannot clear the browser fence.
-        let _ = app.open_account_login(Provider::Codex, true, Err("fixture".into()));
-        assert!(app.account_ui.browser_preparing);
-        let _ = app.open_account_login(Provider::Codex, false, Err("fixture".into()));
-        assert!(!app.account_ui.browser_preparing);
+        let _device = app.add_account(Provider::Codex, true);
+        let device_request = *app
+            .account_ui
+            .home_requests
+            .keys()
+            .find(|request| **request != browser_request)
+            .unwrap();
+        let _ = app.open_account_login(device_request, Err("fixture".into()));
+        assert!(app.account_ui.browser_preparing.is_some());
+        let _ = app.open_account_login(browser_request, Err("fixture".into()));
+        assert!(app.account_ui.browser_preparing.is_none());
+        let _newer = app.add_account(Provider::Codex, false);
+        let newer_request = app.account_ui.browser_preparing;
+        let _ = app.open_account_login(browser_request, Err("stale fixture".into()));
+        assert_eq!(app.account_ui.browser_preparing, newer_request);
     }
 
     #[test]
     fn callback_spawn_failure_retains_pending_row_and_device_choice() {
         let mut app = context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let _preparation = app.add_account(Provider::Codex, false);
+        let request = app.account_ui.browser_preparing.unwrap();
         let key = uuid::Uuid::from_u128(511);
         let home = PathBuf::from("/cagents-fixture/accounts/codex").join(key.to_string());
-        let _ = app.open_account_login(
-            Provider::Codex,
-            false,
-            Ok((key, home, "/tools/codex".into())),
-        );
+        let _ = app.open_account_login(request, Ok((key, home, "/tools/codex".into())));
         let card = app
             .sign_in_card(Provider::Codex, &app.account_ui.logins[0].home)
             .unwrap();
@@ -6454,7 +6723,7 @@ mod app_tests {
         assert_eq!(app.durable.cards.len(), cards);
         assert_eq!(app.account_ui.preparing_logins.len(), 1);
         // Another Add-account callback reservation is unrelated to this ready reply.
-        app.account_ui.browser_preparing = true;
+        app.account_ui.browser_preparing = Some(uuid::Uuid::from_u128(1954));
         let _ = app.update(Message::AccountUi(Action::LoginReady {
             owner,
             id,
@@ -6463,7 +6732,7 @@ mod app_tests {
             program: Err("CLI unavailable".into()),
         }));
         assert!(!app.account_sign_in_running(&account));
-        assert!(app.account_ui.browser_preparing);
+        assert!(app.account_ui.browser_preparing.is_some());
     }
 
     #[test]
