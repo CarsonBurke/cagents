@@ -1509,8 +1509,9 @@ fn process_keyboard_events<Message: Clone + 'static>(
     };
     let key = match key {
         Key::Named(key) => key,
-        // XKB/winit reports a physical Space as Character, including release.
-        Key::Character(text) if text.as_str() == " " => &Named::Space,
+        // Pinned iced reports Space as Character, including release. It uses
+        // the same selected-item activation path as Enter.
+        Key::Character(text) if text.as_str() == " " => &Named::Enter,
         _ => return None,
     };
     if !matches!(
@@ -1522,7 +1523,6 @@ fn process_keyboard_events<Message: Clone + 'static>(
             | Named::ArrowRight
             | Named::ArrowLeft
             | Named::Enter
-            | Named::Space
     ) {
         return None;
     }
@@ -1613,7 +1613,7 @@ fn process_keyboard_events<Message: Clone + 'static>(
             } else if *key != Named::ArrowRight
                 && let Some(message) = &item.keyboard_action
             {
-                shell.publish(message.as_ref().clone());
+                shell.publish(message.with_data(Clone::clone));
                 #[cfg(wayland_platform)]
                 if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
                     && let Some(handler) = &menu.on_surface_action

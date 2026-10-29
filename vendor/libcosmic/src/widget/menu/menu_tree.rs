@@ -11,7 +11,7 @@ use iced_widget::core::{Element, renderer};
 
 use crate::widget::menu::action::MenuAction;
 use crate::widget::menu::key_bind::KeyBind;
-use crate::widget::{Button, RcElementWrapper, icon};
+use crate::widget::{Button, RcElementWrapper, RcWrapper, icon};
 use crate::{theme, widget};
 use iced_core::{Alignment, Length};
 
@@ -39,8 +39,9 @@ pub struct MenuTree<Message> {
     /// The height of the menu tree
     pub(crate) height: Option<u16>,
     /// The same action as the generated button, for keyboard activation.
+    /// Share the widget's owner-thread wrapper contract for native popups.
     /// Custom widgets, disabled items and separators have no implicit action.
-    pub(crate) keyboard_action: Option<Rc<Message>>,
+    pub(crate) keyboard_action: Option<RcWrapper<Message>>,
 }
 
 impl<Message: Clone + 'static> MenuTree<Message> {
@@ -301,7 +302,7 @@ pub fn menu_items<
                     let menu_button = menu_button(items).on_press(message.clone());
                     let mut tree =
                         MenuTree::<Message>::from(Element::from(menu_button)).width(width);
-                    tree.keyboard_action = Some(Rc::new(message));
+                    tree.keyboard_action = Some(RcWrapper::new(message));
                     trees.push(tree);
                 }
                 MenuItem::ButtonDisabled(label, icon, action) => {
@@ -390,7 +391,7 @@ pub fn menu_items<
                     let message = action.message();
                     let mut tree =
                         MenuTree::from(Element::from(menu_button(items).on_press(message.clone())));
-                    tree.keyboard_action = Some(Rc::new(message));
+                    tree.keyboard_action = Some(RcWrapper::new(message));
                     trees.push(tree);
                 }
                 MenuItem::Folder(label, children) => {

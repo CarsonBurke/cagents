@@ -487,16 +487,16 @@ mod tests {
             ),
             (
                 checkbox.clone(),
-                named(vec![Named::ArrowDown, Named::Space]),
+                vec![
+                    keyboard::Key::Named(Named::ArrowDown),
+                    keyboard::Key::Character(" ".into()),
+                ],
                 vec![5],
                 Some("Check"),
             ),
             (
                 checkbox,
-                vec![
-                    keyboard::Key::Named(Named::ArrowDown),
-                    keyboard::Key::Character(" ".into()),
-                ],
+                named(vec![Named::ArrowDown, Named::Enter]),
                 vec![5],
                 Some("Check"),
             ),
@@ -578,7 +578,7 @@ mod tests {
             measured = popup.as_overlay_mut().layout(&renderer, window);
             for key in keys {
                 if let Some(visible) = visible.filter(|_| {
-                    matches!(key, keyboard::Key::Named(Named::Enter | Named::Space))
+                    matches!(key, keyboard::Key::Named(Named::Enter))
                         || matches!(&key, keyboard::Key::Character(text) if text.as_str() == " ")
                 }) {
                     #[derive(Default)]
@@ -697,6 +697,120 @@ mod tests {
                     .is_none(),
                 "keyboard activation closes the menu"
             );
+        }
+    }
+
+    #[test]
+    fn generated_menu_actions_retain_their_captured_local_message_for_keyboard() {
+        use cosmic::iced::keyboard::{self, key::Named};
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Native popup builders require these auto traits even when the
+        // generated widget/message belongs to its original UI thread.
+        fn popup_compatible<T: Send + Sync>() {}
+        popup_compatible::<widget::menu::Tree<Rc<usize>>>();
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        struct CountedAction;
+        impl widget::menu::Action for CountedAction {
+            type Message = Rc<usize>;
+
+            fn message(&self) -> Self::Message {
+                Rc::new(CALLS.fetch_add(1, Ordering::Relaxed))
+            }
+        }
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let window = Size::new(900.0, 300.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = mouse::Cursor::Available(Point::new(850.0, 250.0));
+        for checkbox in [false, true] {
+            for activation in [
+                keyboard::Key::Named(Named::Enter),
+                keyboard::Key::Character(" ".into()),
+            ] {
+                let captured = CALLS.load(Ordering::Relaxed);
+                let item = if checkbox {
+                    widget::menu::Item::CheckBox("Local action", None, false, CountedAction)
+                } else {
+                    widget::menu::Item::Button("Local action", None, CountedAction)
+                };
+                let mut element = surface(widget::menu::items(
+                    &std::collections::HashMap::new(),
+                    vec![item],
+                ));
+                assert_eq!(CALLS.load(Ordering::Relaxed), captured + 1);
+                let widget = element.as_widget_mut();
+                let mut tree = Tree::new(&*widget);
+                widget.diff(&mut tree);
+                let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                let mut messages = Vec::new();
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    anchor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut popup = widget
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&row),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .expect("opened local-message menu");
+                let mut node = popup.as_overlay_mut().layout(&renderer, window);
+                popup.as_overlay_mut().update(
+                    &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    Layout::new(&node),
+                    anchor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                node = popup.as_overlay_mut().layout(&renderer, window);
+                for key in [keyboard::Key::Named(Named::ArrowDown), activation] {
+                    let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: key.clone(),
+                        modified_key: key,
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    });
+                    let mut shell = Shell::new(&mut messages);
+                    popup.as_overlay_mut().update(
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                    );
+                    assert!(shell.is_event_captured());
+                    node = popup.as_overlay_mut().layout(&renderer, window);
+                }
+                assert_eq!(
+                    messages.iter().map(|message| **message).collect::<Vec<_>>(),
+                    [captured],
+                    "keyboard activation must publish the originally generated message"
+                );
+                assert_eq!(
+                    CALLS.load(Ordering::Relaxed),
+                    captured + 1,
+                    "keyboard activation must not regenerate the menu action"
+                );
+            }
         }
     }
 
