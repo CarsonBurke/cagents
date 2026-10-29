@@ -118,6 +118,29 @@ impl Slot {
     pub fn cancel_before_start(&self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).running = false;
     }
+    pub async fn run_worker(
+        &self,
+        action: &'static str,
+        run: impl FnOnce(Self) -> Option<String> + Send + 'static,
+    ) -> Option<String> {
+        let slot = self.clone();
+        match tokio::task::spawn_blocking(move || run(slot)).await {
+            Ok(report) => report,
+            Err(error) => {
+                let report = Some(format!(
+                    "{action} worker failed; completion is unconfirmed: {error}"
+                ));
+                // A failed worker never reaches finish_*'s normal tail. Retire
+                // its running state before publication: a stale App completion
+                // may be rejected. Keep the original receipt/source and every
+                // unresolved recovery obligation unchanged.
+                let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                entry.running = false;
+                entry.error = report.clone();
+                report
+            }
+        }
+    }
     pub fn same_physical_source(&self, active: &ReadSource) -> bool {
         let original = self
             .0
@@ -576,6 +599,57 @@ mod tests {
             confirmed: false,
         }
     }
+    pub(super) fn worker_panic(slot: &Slot, action: &'static str) -> Option<String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(slot.run_worker(action, |_| {
+                panic!("discard worker panic oracle");
+            }))
+    }
+
+    #[test]
+    fn discard_worker_join_failure_retires_before_rejected_completion() {
+        use cosmic::Application;
+
+        let (_temp, source) = source();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.discard_ui.active = Some(source.clone());
+        let mut request = request(&source);
+        assert!(app.discard_ui.confirm_intent(source.id, &request));
+        request.confirmed = true;
+        let slot = app
+            .discard_ui
+            .reserve_confirmed(source.id, &request)
+            .unwrap();
+        assert!(app.discard_ui.has_inflight());
+
+        let report = worker_panic(&slot, "Discard");
+        assert!(report.as_ref().unwrap().contains("Discard worker failed"));
+        assert!(report.as_ref().unwrap().contains("panicked"));
+        assert!(!app.discard_ui.has_inflight());
+        {
+            let entry = slot.0.lock().unwrap();
+            assert_eq!(entry.error, report);
+            assert!(entry.receipt.is_none());
+            assert_eq!(entry.source.id, source.id);
+        }
+        // No matching operation exists. The App must be allowed to reject this
+        // completion without leaving the already-failed worker running.
+        drop(app.update(Message::DiscardFinished {
+            key: source.key,
+            operation: uuid::Uuid::new_v4(),
+            slot: slot.clone(),
+            report: report.clone(),
+        }));
+        assert!(!app.discard_ui.has_inflight());
+        assert_eq!(slot.0.lock().unwrap().error, report);
+        app.discard_ui.prune();
+        assert!(app.discard_ui.slots.is_empty());
+        assert!(app.discard_ui.close_block_reason().is_none());
+    }
+
     #[test]
     fn discard_inspector_rendered_controls_carry_the_original_snapshot_actor() {
         use cosmic::iced::{

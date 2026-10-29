@@ -15522,15 +15522,15 @@ impl Application for Cagents {
                 );
                 let completed = slot.clone();
                 cosmic::task::future(async move {
-                    let joined = tokio::task::spawn_blocking(move || {
-                        if let Some(nonce) = original { slot.finish_recover_original(nonce) }
-                        else { slot.finish_undo(resolve) }
-                    }).await;
-                    let report = joined.unwrap_or_else(|e| {
-                        Some(format!(
-                            "Undo worker failed; original receipt retained: {e}"
-                        ))
-                    });
+                    let report = slot
+                        .run_worker("Undo", move |slot| {
+                            if let Some(nonce) = original {
+                                slot.finish_recover_original(nonce)
+                            } else {
+                                slot.finish_undo(resolve)
+                            }
+                        })
+                        .await;
                     Message::DiscardFinished {
                         key,
                         operation,
@@ -16046,8 +16046,9 @@ impl Application for Cagents {
                         known.sort();known.dedup();
                         let completed=slot.clone();
                         cosmic::task::future(async move {
-                            let joined=tokio::task::spawn_blocking(move ||slot.finish_discard(request,known)).await;
-                            let report=joined.unwrap_or_else(|e|Some(format!("Discard worker failed; recovery custody retained: {e}")));
+                            let report = slot
+                                .run_worker("Discard", move |slot| slot.finish_discard(request, known))
+                                .await;
                             Message::DiscardFinished {key,operation,slot:completed,report}
                         })
                     }

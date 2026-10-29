@@ -1298,6 +1298,104 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
 }
 
 #[test]
+fn discard_app_undo_worker_panic_keeps_receipt_for_retry() {
+    const NAME: &str =
+        "app::discard_ui::actual_tests::discard_app_undo_worker_panic_keeps_receipt_for_retry";
+    if isolated(NAME) {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("file"), b"index baseline\n").unwrap();
+    git(&root, &["add", "--all"]);
+    fs::write(root.join("file"), b"precious original\n").unwrap();
+    fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o640)).unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
+    drop(app.update(loaded));
+    let source = app.discard_ui.source().unwrap().clone();
+    let discarded = source
+        .mutation_service()
+        .unwrap()
+        .discard_recoverable(
+            &DiscardRequest {
+                worktree: root.clone(),
+                tracked: vec![crate::repository::PathSelection::new(
+                    RepoPath::parse("file").unwrap(),
+                )],
+                untracked: vec![],
+                confirmed: true,
+            },
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    assert!(matches!(
+        discarded.outcome,
+        crate::repository::MutationOutcome::Applied { .. }
+    ));
+    let receipt = discarded.recovery;
+    let index = fs::read(root.join(".git/index")).unwrap();
+    let slot = Slot(Arc::new(Mutex::new(Entry {
+        id: uuid::Uuid::new_v4(),
+        source: source.clone(),
+        receipt: Some(receipt.clone()),
+        running: false,
+        error: None,
+    })));
+    app.discard_ui.slots.push(slot.clone());
+    assert!(app.discard_ui.begin_undo(slot.id(), false).is_some());
+    let report = super::tests::worker_panic(&slot, "Undo");
+    assert!(report.as_ref().unwrap().contains("Undo worker failed"));
+    assert!(report.as_ref().unwrap().contains("panicked"));
+    assert!(!app.discard_ui.has_inflight());
+    {
+        let entry = slot.0.lock().unwrap();
+        assert_eq!(entry.error, report);
+        assert_eq!(entry.receipt.as_ref(), Some(&receipt));
+        assert_eq!(entry.source.id, source.id);
+    }
+    assert_eq!(receipt.remaining_paths(), 1);
+    assert!(receipt.can_undo());
+    assert!(!receipt.live_recovery.needs_resolution());
+    assert!(app.discard_ui.close_block_reason().is_none());
+    assert_eq!(fs::read(root.join("file")).unwrap(), b"index baseline\n");
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+
+    let task = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
+    assert!(app.discard_ui.has_inflight());
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(
+        &finished,
+        Message::DiscardFinished { report: None, .. }
+    ));
+    drop(app.update(finished));
+    assert!(!app.discard_ui.has_inflight());
+    assert!(app.discard_ui.slot(slot.id()).is_none());
+    assert!(app.discard_ui.close_block_reason().is_none());
+    assert_eq!(receipt.remaining_paths(), 0);
+    assert_eq!(fs::read(root.join("file")).unwrap(), b"precious original\n");
+    assert_eq!(
+        fs::metadata(root.join("file")).unwrap().mode() & 0o7777,
+        0o640
+    );
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+}
+
+#[test]
 fn discard_app_recover_original_uses_nonce_and_original_slot_across_navigation() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_recover_original_uses_nonce_and_original_slot_across_navigation";
     if isolated(NAME) {
@@ -1395,6 +1493,25 @@ fn discard_app_recover_original_uses_nonce_and_original_slot_across_navigation()
     })));
     app.discard_ui.slots.push(slot.clone());
     assert!(app.discard_ui.close_block_reason().is_some());
+    assert!(
+        app.discard_ui
+            .begin_recover_original(slot.id(), choice.nonce)
+            .is_some()
+    );
+    let report = super::tests::worker_panic(&slot, "Undo");
+    assert!(report.as_ref().unwrap().contains("Undo worker failed"));
+    assert!(!app.discard_ui.has_inflight());
+    assert_eq!(slot.0.lock().unwrap().error, report);
+    assert_eq!(slot.0.lock().unwrap().receipt.as_ref(), Some(&receipt));
+    assert_eq!(
+        receipt.live_recovery.recoverable_originals()[0].nonce,
+        choice.nonce
+    );
+    assert!(receipt.live_recovery.needs_resolution());
+    assert_eq!(
+        app.discard_ui.close_block_reason(),
+        Some("Resolve the pending discard recovery before closing.")
+    );
     drop(app.update(Message::DiscardRecoverOriginal {
         id: slot.id(),
         nonce: uuid::Uuid::new_v4(),
