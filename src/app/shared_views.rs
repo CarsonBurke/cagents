@@ -14,6 +14,15 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+#[derive(Clone)]
+pub(super) struct TerminalReturnOrigin {
+    registry: uuid::Uuid,
+    sequence: u64,
+    scope: Scope,
+    revision: u64,
+    pane: Pane,
+}
+
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
@@ -151,6 +160,180 @@ impl State {
 }
 
 impl Cagents {
+    pub(super) fn capture_terminal_return_origin(
+        &self,
+        card: CardId,
+        source: &crate::chat::Session,
+    ) -> Result<Option<TerminalReturnOrigin>, String> {
+        if self
+            .save_health
+            .as_ref()
+            .is_some_and(|health| health.window_state_refused())
+        {
+            return Err(
+                "Save this window's pending changes before returning the conversation to terminal."
+                    .into(),
+            );
+        }
+        let mut owners = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| view.panes.iter().any(|pane| pane.id == card));
+        let Some(owner) = owners.next() else {
+            let shared = self.shared_views.attached.contains(&card)
+                || self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.shared && channel.cards.contains(&card));
+            return if shared {
+                Err("The chat's shared view is not ready. Wait for it to reconnect, then retry Return to terminal.".into())
+            } else {
+                Ok(None)
+            };
+        };
+        if owners.next().is_some()
+            || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            || owner.retired.contains(&card)
+            || self.shared_views.blocked.contains(&owner.scope)
+            || !self.shared_views.initialized.contains(&owner.scope)
+            || self.shared_views.seeding.contains(&owner.scope)
+            || self.chat_awaiting_admission(card)
+            || blocked_managed_view_scopes(&self.workspace_model, &self.workspace_model.views)
+                .contains(&owner.scope)
+        {
+            return Err("The chat's shared pane no longer has one current owner.".into());
+        }
+        let pane = owner.panes.iter().find(|pane| pane.id == card).unwrap();
+        if !matches!(&pane.kind, CardKind::Chat(current)
+            if super::chat_ui::closed_draft_source_matches(source, current))
+        {
+            return Err("The shared conversation changed. Wait for its current view before returning it to terminal.".into());
+        }
+        Ok(Some(TerminalReturnOrigin {
+            registry: self.workspace_model.identity,
+            sequence: self.workspace_model.sequence,
+            scope: owner.scope.clone(),
+            revision: owner.revision,
+            pane: pane.clone(),
+        }))
+    }
+
+    fn terminal_return_view<'a>(&'a self, origin: &TerminalReturnOrigin) -> Option<&'a View> {
+        if self.workspace_model.identity != origin.registry
+            || self.workspace_model.sequence < origin.sequence
+        {
+            return None;
+        }
+        let mut owners = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| view.panes.iter().any(|pane| pane.id == origin.pane.id));
+        let owner = owners.next()?;
+        (owners.next().is_none()
+            && owner.scope == origin.scope
+            && owner.revision >= origin.revision
+            && !owner.retired.contains(&origin.pane.id)
+            && !self.shared_views.blocked.contains(&owner.scope)
+            && self.shared_views.initialized.contains(&owner.scope)
+            && !self.shared_views.seeding.contains(&owner.scope)
+            && !self.chat_awaiting_admission(origin.pane.id)
+            && !blocked_managed_view_scopes(&self.workspace_model, &self.workspace_model.views)
+                .contains(&owner.scope))
+        .then_some(owner)
+    }
+
+    pub(super) fn shared_terminal_return_source_admitted(
+        &self,
+        origin: &TerminalReturnOrigin,
+    ) -> bool {
+        let Some(view) = self.terminal_return_view(origin) else {
+            return false;
+        };
+        let current = view
+            .panes
+            .iter()
+            .find(|pane| pane.id == origin.pane.id)
+            .unwrap();
+        current.scope == origin.pane.scope
+            && match (&origin.pane.kind, &current.kind) {
+                (CardKind::Chat(source), CardKind::Chat(current)) => {
+                    super::chat_ui::closed_draft_source_matches(source, current)
+                }
+                _ => false,
+            }
+    }
+
+    pub(super) fn shared_terminal_return_admitted(
+        &self,
+        origin: &TerminalReturnOrigin,
+        terminal: &TerminalSession,
+    ) -> bool {
+        let Some(view) = self.terminal_return_view(origin) else {
+            return false;
+        };
+        let Some(proof) = terminal
+            .continuity
+            .live_proof()
+            .filter(HostSessionProof::is_complete)
+        else {
+            return false;
+        };
+        let CardKind::Chat(source) = &origin.pane.kind else {
+            return false;
+        };
+        source.proof.as_ref() == Some(&proof)
+            && view.revision > origin.revision
+            && view.panes.iter().any(|pane| {
+                pane.id == origin.pane.id
+                    && pane.scope == origin.pane.scope
+                    && matches!(&pane.kind, CardKind::Terminal(current) if current == terminal)
+            })
+    }
+
+    pub(super) fn publish_shared_terminal_return_change(
+        &mut self,
+        origin: &TerminalReturnOrigin,
+        terminal: &TerminalSession,
+    ) -> Result<uuid::Uuid, String> {
+        if !self.shared_terminal_return_source_admitted(origin) {
+            return Err("The original shared conversation or its destination changed. No other pane was replaced.".into());
+        }
+        let CardKind::Chat(source) = &origin.pane.kind else {
+            unreachable!();
+        };
+        let proof = terminal.continuity.live_proof();
+        if proof.as_ref().is_none_or(|proof| !proof.is_complete()) || source.proof != proof {
+            return Err("The returned terminal does not belong to the original host.".into());
+        }
+        let view = self.terminal_return_view(origin).unwrap();
+        let revision = view.revision;
+        let before = view
+            .panes
+            .iter()
+            .find(|pane| pane.id == origin.pane.id)
+            .unwrap()
+            .clone();
+        let mut pane = before.clone();
+        pane.kind = CardKind::Terminal(terminal.clone());
+        let operation = uuid::Uuid::new_v4();
+        let change = Change::Update { before, pane };
+        // This transition has its own exact native-return custody. An
+        // optimistic Terminal must never replace the still-authoritative Chat
+        // in the ordinary pending overlay or its raw capability validation.
+        self.workspace_model_tx
+            .try_send(ModelEdit::ChangeView {
+                scope: origin.scope.clone(),
+                expected_revision: revision,
+                operation,
+                change,
+            })
+            .map_err(|_| "The shared view could not be queued. The conversation and returned terminal are kept; retry Return to terminal after reconnecting.".to_owned())?;
+        Ok(operation)
+    }
+
     pub(super) fn capture_view_update_source(&mut self, edit: &ModelEdit) {
         let ModelEdit::ChangeView {
             scope,
@@ -189,6 +372,9 @@ impl Cagents {
         {
             return Task::none();
         }
+        // The return operation is independent of the ordinary pending slot.
+        // Raw admission may retire that slot before this conflict is handled.
+        let returned = self.refuse_native_terminal_return_operation(operation, error.clone());
         let repository = |model: &crate::workspace_model::WorkspaceModel, scope: &Scope| match scope
         {
             Scope::Channel(channel) => model
@@ -212,7 +398,7 @@ impl Cagents {
                 })
         else {
             // An old-scope receipt cannot retire an already retargeted retry.
-            return self.reconcile_workspace_model();
+            return Task::batch([returned, self.reconcile_workspace_model()]);
         };
         let mut retry = None;
         if let Change::Update { before, pane } = &change
@@ -295,7 +481,7 @@ impl Cagents {
         self.notices.record(TransientNotice::warning(
             "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
         ));
-        self.reconcile_workspace_model()
+        Task::batch([returned, self.reconcile_workspace_model()])
     }
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
@@ -1151,6 +1337,7 @@ impl Cagents {
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
+        let returned = self.settle_shared_terminal_returns();
         self.retarget_transferred_pane_updates(None);
         self.shared_views.prune_restoration_requests(&self.durable);
         // A delayed tombstone must not borrow a newer local actor's identity.
@@ -1194,7 +1381,7 @@ impl Cagents {
             self.shared_views.observed_chats.remove(&id);
         }
         self.shared_views.applying = true;
-        let mut tasks = Vec::new();
+        let mut tasks = vec![returned];
         let mut views = self.workspace_model.views.clone();
         for (_, source, change) in &self.shared_views.pending {
             if let Change::Transfer {
@@ -1312,6 +1499,7 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
+        tasks.push(self.drain_pending_terminal_adoptions());
         Task::batch(tasks)
     }
 
@@ -1549,6 +1737,11 @@ impl Cagents {
         }
         current.extend(retained_upgrades);
         for shared in &view.panes {
+            // The optimistic replacement is not a canonical acceptance. The
+            // original readable chat stays mounted until its exact ACK arrives.
+            if self.hold_shared_terminal_return_projection(shared.id) {
+                continue;
+            }
             self.shared_views.closed_chats.remove(&shared.id);
             self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);

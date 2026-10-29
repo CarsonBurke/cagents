@@ -7684,6 +7684,10 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
+        self.snapshot_workspace_scope();
+        if !self.terminal_return_canonically_accepted(&session) {
+            self.publish_view_changes();
+        }
         let saved = self.persistent_workspace();
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(saved);
@@ -7703,6 +7707,9 @@ impl Cagents {
     /// The flush is ordered after conversion snapshots. Never release daemon
     /// replay evidence based only on receiving or attaching its replacement.
     fn commit_terminal_handoffs(&mut self) -> Task<Message> {
+        // This existing refresh/save wake also releases observations when a
+        // return was retired by closing or replacing its original card.
+        let adopted = self.drain_pending_terminal_adoptions();
         if self.terminal_handoff_commit_inflight
             || self.pending_terminal_handoffs.is_empty()
             || self.save_health.as_ref().is_some_and(|health| {
@@ -7712,21 +7719,25 @@ impl Cagents {
                 ) || health.window_state_refused()
             })
         {
-            return Task::none();
+            return adopted;
         }
-        let Some(writer) = &self.session else {
-            return Task::none();
-        };
-        let Ok(flush) = writer.request_flush() else {
-            return Task::none();
-        };
         let terminals = self
             .pending_terminal_handoffs
             .values()
+            .filter(|terminal| self.terminal_return_can_commit(terminal))
             .cloned()
             .collect::<Vec<_>>();
+        if terminals.is_empty() {
+            return adopted;
+        }
+        let Some(writer) = &self.session else {
+            return adopted;
+        };
+        let Ok(flush) = writer.request_flush() else {
+            return adopted;
+        };
         self.terminal_handoff_commit_inflight = true;
-        cosmic::task::future(async move {
+        let committed = cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 flush
                     .recv_timeout(Duration::from_secs(30))
@@ -7738,7 +7749,8 @@ impl Cagents {
             let result = joined
                 .unwrap_or_else(|error| Err(format!("handoff acknowledgement worker: {error}")));
             Message::TerminalHandoffsCommitted { result }
-        })
+        });
+        Task::batch([adopted, committed])
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
@@ -14589,12 +14601,15 @@ impl Application for Cagents {
                     Ok(results) => {
                         let mut failures = Vec::new();
                         for (terminal, result) in results {
-                            if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) {
+                            if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal)
+                                || !self.terminal_return_can_commit(&terminal)
+                            {
                                 continue;
                             }
                             match result {
                                 Ok(()) => {
                                     self.pending_terminal_handoffs.remove(&terminal.id);
+                                    self.terminal_return_receipt_committed(&terminal);
                                 }
                                 Err(error) => failures.push((terminal.id, error)),
                             }
