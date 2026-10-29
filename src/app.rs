@@ -2744,7 +2744,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
         Message::SidebarSnapshot { action, .. } => !answers_discard_confirmation(action),
-        Message::DiscardUndo { .. } | Message::DiscardRecoverOriginal { .. } | Message::DiscardCopyRecoveryDetails { .. } => true,
+        Message::DiscardUndo { .. } | Message::DiscardRecoverOriginal { .. } | Message::DiscardCopyRecoveryDetails { .. } | Message::DiscardCopyFailureDetails { .. } => true,
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
@@ -2766,6 +2766,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::DiscardUndo { .. }
                 | Message::DiscardRecoverOriginal { .. }
                 | Message::DiscardCopyRecoveryDetails { .. }
+                | Message::DiscardCopyFailureDetails { .. }
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
@@ -4265,6 +4266,9 @@ pub enum Message {
     DiscardCopyRecoveryDetails {
         id: uuid::Uuid,
         nonce: uuid::Uuid,
+    },
+    DiscardCopyFailureDetails {
+        id: uuid::Uuid,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -15480,6 +15484,12 @@ impl Application for Cagents {
             }
             Message::DiscardCopyRecoveryDetails { id, nonce } => {
                 self.discard_ui.original_details(id, nonce).map_or_else(Task::none, |details| {
+                    chat_ui::invalidate_copy_intent();
+                    iced::clipboard::write(details).map(cosmic::Action::App)
+                })
+            }
+            Message::DiscardCopyFailureDetails { id } => {
+                self.discard_ui.failure_details(id).map_or_else(Task::none, |details| {
                     chat_ui::invalidate_copy_intent();
                     iced::clipboard::write(details).map(cosmic::Action::App)
                 })

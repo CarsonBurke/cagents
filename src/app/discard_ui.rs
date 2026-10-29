@@ -97,9 +97,30 @@ pub(super) struct Slot(Arc<Mutex<Entry>>);
 struct Entry {
     id: uuid::Uuid,
     source: ReadSource,
+    original_request: Option<DiscardRequest>,
     receipt: Option<DiscardRecovery>,
+    unconfirmed: Option<UnconfirmedDiscard>,
     running: bool,
     error: Option<String>,
+}
+struct UnconfirmedDiscard {
+    request: Option<DiscardRequest>,
+    error: String,
+}
+struct WorkerSettlement {
+    slot: Slot,
+    action: &'static str,
+    completed: bool,
+}
+impl Drop for WorkerSettlement {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.slot.worker_failed(
+                self.action,
+                "The worker stopped without returning its result.",
+            );
+        }
+    }
 }
 impl fmt::Debug for Slot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -123,23 +144,45 @@ impl Slot {
         action: &'static str,
         run: impl FnOnce(Self) -> Option<String> + Send + 'static,
     ) -> Option<String> {
-        let slot = self.clone();
-        match tokio::task::spawn_blocking(move || run(slot)).await {
+        // The closure owns settlement even if its JoinHandle is dropped. A
+        // never-started closure also retains this guard until it is dropped.
+        let settlement = WorkerSettlement {
+            slot: self.clone(),
+            action,
+            completed: false,
+        };
+        match tokio::task::spawn_blocking(move || {
+            let mut settlement = settlement;
+            let report = run(settlement.slot.clone());
+            settlement.completed = true;
+            report
+        })
+        .await
+        {
             Ok(report) => report,
-            Err(error) => {
-                let report = Some(format!(
-                    "{action} worker failed; completion is unconfirmed: {error}"
-                ));
-                // A failed worker never reaches finish_*'s normal tail. Retire
-                // its running state before publication: a stale App completion
-                // may be rejected. Keep the original receipt/source and every
-                // unresolved recovery obligation unchanged.
-                let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                entry.running = false;
-                entry.error = report.clone();
-                report
+            Err(error) => self.worker_failed(action, &error.to_string()),
+        }
+    }
+    fn worker_failed(&self, action: &str, reason: &str) -> Option<String> {
+        let report = format!("{action} worker failed; completion is unconfirmed: {reason}");
+        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entry.running = false;
+        if entry.receipt.is_none() {
+            // Missing receipt does not prove a negative outcome: the backend
+            // may have changed files before unwinding. Keep original intent
+            // and source for diagnosis; never manufacture an Undo receipt.
+            if let Some(unconfirmed) = &mut entry.unconfirmed {
+                unconfirmed.error = report.clone();
+            } else {
+                let request = entry.original_request.take();
+                entry.unconfirmed = Some(UnconfirmedDiscard {
+                    request,
+                    error: report.clone(),
+                });
             }
         }
+        entry.error = Some(report.clone());
+        Some(report)
     }
     pub fn same_physical_source(&self, active: &ReadSource) -> bool {
         let original = self
@@ -267,6 +310,16 @@ impl State {
     pub fn close_block_reason(&self) -> Option<&'static str> {
         if self.has_inflight() {
             Some("Wait for discard or Undo to finish before closing.")
+        } else if self.slots.iter().any(|slot| {
+            slot.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unconfirmed
+                .is_some()
+        }) {
+            Some(
+                "Discard completion is unknown. Closing is blocked; copy failure details for manual recovery.",
+            )
         } else if !self.unresolved_authorities().is_empty() {
             Some("Resolve the pending discard recovery before closing.")
         } else {
@@ -353,6 +406,12 @@ impl State {
         request: &DiscardRequest,
     ) -> Result<Slot, String> {
         self.prune();
+        if self.slots.iter().any(|slot| {
+            let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            entry.unconfirmed.is_some() && entry.source.key.canonical_path == request.worktree
+        }) {
+            return Err("The earlier discard result is unknown. Further discard is blocked; copy failure details for manual recovery.".into());
+        }
         if self.slots.len() >= 8 {
             return Err(
                 "Resolve or finish existing discard recovery before another discard".into(),
@@ -372,7 +431,9 @@ impl State {
         let slot = Slot(Arc::new(Mutex::new(Entry {
             id: uuid::Uuid::new_v4(),
             source: source.clone(),
+            original_request: Some(request.clone()),
             receipt: None,
+            unconfirmed: None,
             running: true,
             error: None,
         })));
@@ -421,6 +482,7 @@ impl State {
         self.slots.retain(|slot| {
             let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
             entry.running
+                || entry.unconfirmed.is_some()
                 || entry
                     .receipt
                     .as_ref()
@@ -461,11 +523,55 @@ impl State {
             guidance,
         ))
     }
+    pub fn failure_details(&self, id: uuid::Uuid) -> Option<String> {
+        use std::fmt::Write;
+        let slot = self.slot(id)?;
+        let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        let failure = entry.unconfirmed.as_ref()?;
+        let mut details = format!(
+            "Discard completion is unknown\nOriginal checkout (diagnostic path): {}\nOriginal operation: {}\n{}\n\nFiles may have changed. No complete Undo receipt was returned. Automatic recovery and safe close are not confirmed. Inspect the original checkout and system Trash; preserve files and any recovery holdings. These details do not authorize recovery from replacement paths.\n",
+            display_path(&entry.source.key.canonical_path),
+            entry.id,
+            failure.error,
+        );
+        if let Some(request) = &failure.request {
+            let _ = writeln!(
+                details,
+                "\nOriginal request: {} tracked selections, {} untracked paths; confirmed: {}",
+                request.tracked.len(),
+                request.untracked.len(),
+                request.confirmed
+            );
+            for selection in request.tracked.iter().take(64) {
+                let _ = writeln!(details, "Tracked: {}", selection.path);
+                if let Some(old) = &selection.old_path {
+                    let _ = writeln!(details, "  Original rename path: {old}");
+                }
+            }
+            for path in request.untracked.iter().take(64) {
+                let _ = writeln!(details, "Untracked: {path}");
+            }
+            if request.tracked.len() > 64 || request.untracked.len() > 64 {
+                details.push_str("Only the first 64 paths of each kind are shown; the complete original request remains held.\n");
+            }
+        }
+        Some(details)
+    }
     pub fn banner(&self, disabled: bool) -> Element<'_, Message> {
         use cosmic::iced::{advanced::text::EllipsizeHeightLimit, widget::text::Ellipsize};
         let mut rows = Vec::new();
         for slot in &self.slots {
             let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            if entry.unconfirmed.is_some() {
+                rows.push(widget::container(widget::column::with_children(vec![
+                    design::body(format!("{} · Discard completion is unknown", display_path(&entry.source.key.canonical_path)))
+                        .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).width(Length::Fill).into(),
+                    design::caption("Files may have changed. No complete Undo receipt was returned. Copy the details and inspect the original checkout and system Trash; closing remains blocked.").into(),
+                    crate::ui_controls::button::secondary("Copy failure details")
+                        .on_press_maybe((!disabled).then_some(Message::DiscardCopyFailureDetails { id: entry.id })).into(),
+                ]).spacing(space::S)).padding(space::S).into());
+                continue;
+            }
             let Some(receipt) = &entry.receipt else {
                 continue;
             };
@@ -646,8 +752,22 @@ mod tests {
         assert!(!app.discard_ui.has_inflight());
         assert_eq!(slot.0.lock().unwrap().error, report);
         app.discard_ui.prune();
-        assert!(app.discard_ui.slots.is_empty());
-        assert!(app.discard_ui.close_block_reason().is_none());
+        assert_eq!(app.discard_ui.slots.len(), 1);
+        assert!(
+            app.discard_ui
+                .close_block_reason()
+                .unwrap()
+                .contains("unknown")
+        );
+        let entry = slot.0.lock().unwrap();
+        assert_eq!(
+            entry.unconfirmed.as_ref().unwrap().request.as_ref(),
+            Some(&request)
+        );
+        drop(entry);
+        let details = app.discard_ui.failure_details(slot.id()).unwrap();
+        assert!(details.contains("Discard completion is unknown"));
+        assert!(details.contains("No complete Undo receipt was returned"));
     }
 
     #[test]

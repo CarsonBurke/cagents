@@ -1298,6 +1298,169 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
 }
 
 #[test]
+fn discard_app_post_restore_panic_retains_unconfirmed_owner_without_awaiter() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_post_restore_panic_retains_unconfirmed_owner_without_awaiter";
+    if isolated(NAME) {
+        return;
+    }
+    use crate::process::{ProcessFailure, ProcessOutput};
+    use cosmic::iced::{
+        Size,
+        advanced::mouse,
+        futures::FutureExt,
+        runtime::user_interface::{Cache, UserInterface},
+    };
+    struct PanicAfterRestore {
+        restored: std::sync::mpsc::SyncSender<()>,
+        proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ProcessExecutor for PanicAfterRestore {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(command, cancellation)?;
+            if output.success && command.arguments.iter().any(|arg| arg == "restore") {
+                self.restored.send(()).unwrap();
+                self.proceed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap();
+                panic!("discard panic after actual Git restore");
+            }
+            Ok(output)
+        }
+    }
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    for dropped_awaiter in [false, true] {
+        let path = if dropped_awaiter {
+            "detached"
+        } else {
+            "awaited"
+        };
+        fs::write(root.join(path), b"indexed baseline\n").unwrap();
+        let baseline_mode = fs::metadata(root.join(path)).unwrap().mode() & 0o7777;
+        git(&root, &["add", "--", path]);
+        let index = fs::read(root.join(".git/index")).unwrap();
+        fs::write(root.join(path), b"precious original\n").unwrap();
+        fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o640)).unwrap();
+        let key = ActiveWorktreeKey {
+            project_id: crate::model::ProjectId::new(),
+            worktree_id: crate::model::WorktreeId::new(),
+            canonical_path: root.clone(),
+        };
+        let source = ReadSource::new(key.clone());
+        source.read_service().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.discard_ui.active = Some(source.clone());
+        let mut request = DiscardRequest {
+            worktree: root.clone(),
+            tracked: vec![crate::repository::PathSelection::new(
+                RepoPath::parse(path).unwrap(),
+            )],
+            untracked: vec![],
+            confirmed: false,
+        };
+        assert!(app.discard_ui.confirm_intent(source.id, &request));
+        request.confirmed = true;
+        let slot = app
+            .discard_ui
+            .reserve_confirmed(source.id, &request)
+            .unwrap();
+        let (restored, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, proceed) = std::sync::mpsc::sync_channel(1);
+        let service = RepositoryService::new(
+            "git",
+            Arc::new(PanicAfterRestore {
+                restored,
+                proceed: Mutex::new(proceed),
+            }),
+        )
+        .with_worktree_authority(source.authority.get().unwrap().clone().unwrap())
+        .unwrap();
+        let worker_request = request.clone();
+        let known = vec![root.clone()];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut worker = Box::pin(slot.run_worker("Discard", move |_| {
+            let _ = service.discard_recoverable(&worker_request, &CancellationToken::new(), &known);
+            panic!("expected the actual post-restore injection");
+        }));
+        assert!(
+            runtime
+                .block_on(async { worker.as_mut().now_or_never() })
+                .is_none()
+        );
+        observed.recv_timeout(Duration::from_secs(15)).unwrap();
+        // The real restore completed, but the backend has not returned any
+        // RecoverableDiscard. These are effects, not a pre-effect panic fixture.
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"indexed baseline\n");
+        assert_eq!(
+            fs::metadata(root.join(path)).unwrap().mode() & 0o7777,
+            baseline_mode
+        );
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        if dropped_awaiter {
+            drop(worker);
+            release.send(()).unwrap();
+        } else {
+            release.send(()).unwrap();
+            let report = runtime.block_on(worker).unwrap();
+            assert!(report.contains("panicked"));
+        }
+        runtime.shutdown_timeout(Duration::from_secs(15));
+        assert!(!app.discard_ui.has_inflight());
+        {
+            let entry = slot.0.lock().unwrap();
+            assert!(entry.receipt.is_none());
+            assert_eq!(entry.source.id, source.id);
+            let failure = entry.unconfirmed.as_ref().unwrap();
+            assert_eq!(failure.request.as_ref(), Some(&request));
+            assert_eq!(Some(&failure.error), entry.error.as_ref());
+            assert!(failure.error.contains("completion is unconfirmed"));
+        }
+        app.discard_ui.select(None);
+        app.discard_ui.prune();
+        assert!(app.discard_ui.slot(slot.id()).is_some());
+        assert!(
+            app.discard_ui
+                .close_block_reason()
+                .unwrap()
+                .contains("unknown")
+        );
+        assert!(app.window_update_blocker().unwrap().contains("unknown"));
+        assert!(app.discard_ui.begin_undo(slot.id(), false).is_none());
+        let details = app.discard_ui.failure_details(slot.id()).unwrap();
+        assert!(details.contains("No complete Undo receipt was returned"));
+        assert!(details.contains(&root.display().to_string()));
+        assert!(details.contains(path));
+        let mut renderer = crate::app::tests::headless_renderer();
+        let ui = UserInterface::build(
+            app.discard_ui.banner(false),
+            Size::new(1280.0, 900.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        assert!(
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|node| node.node().label() == Some("Copy failure details")
+                    && !node.node().is_disabled())
+        );
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"indexed baseline\n");
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+    }
+}
+
+#[test]
 fn discard_app_undo_worker_panic_keeps_receipt_for_retry() {
     const NAME: &str =
         "app::discard_ui::actual_tests::discard_app_undo_worker_panic_keeps_receipt_for_retry";
@@ -1349,7 +1512,9 @@ fn discard_app_undo_worker_panic_keeps_receipt_for_retry() {
     let slot = Slot(Arc::new(Mutex::new(Entry {
         id: uuid::Uuid::new_v4(),
         source: source.clone(),
+        original_request: None,
         receipt: Some(receipt.clone()),
+        unconfirmed: None,
         running: false,
         error: None,
     })));
@@ -1487,7 +1652,9 @@ fn discard_app_recover_original_uses_nonce_and_original_slot_across_navigation()
     let slot = Slot(Arc::new(Mutex::new(Entry {
         id: uuid::Uuid::new_v4(),
         source,
+        original_request: None,
         receipt: Some(receipt.clone()),
+        unconfirmed: None,
         running: false,
         error: Some("Original parent changed".into()),
     })));
