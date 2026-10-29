@@ -1778,9 +1778,8 @@ mod tests {
             // physical key, including when a held key crosses those routes.
             let sctk = sctk_physical_key(raw_code);
             assert_eq!(sctk, key::Physical::Code(expected), "evdev {raw_code}");
-            let normalized_winit = crate::conversion::physical_key(
-                keymap::raw_keycode_to_physicalkey(raw_code + 8),
-            );
+            let normalized_winit =
+                crate::conversion::physical_key(keymap::raw_keycode_to_physicalkey(raw_code + 8));
             assert_eq!(sctk, normalized_winit, "evdev {raw_code}");
         }
     }
