@@ -1229,7 +1229,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
                 .size(design::ROW_ICON_SIZE)
                 .into()
         } else {
-            crate::ui_controls::activity_spinner(
+            crate::ui_controls::activity_spinner::<Message>(
                 f32::from(design::ROW_ICON_SIZE),
                 design::accent_color,
             )
