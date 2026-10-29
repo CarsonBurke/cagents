@@ -6256,8 +6256,95 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
+    fn upgrade_fixture_in_fresh_process() -> bool {
+        // Capability validation consults process-global retained child custody.
+        // These metadata-only fixtures need a fresh service, not another test's
+        // legitimate retained ownership. Preserve the caller's environment.
+        const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
+        let current = std::thread::current();
+        let selector = current.name().expect("named test thread");
+        match std::env::var_os(SELECTOR_ENV) {
+            Some(value) => {
+                assert_eq!(value, selector, "unexpected fixture selector");
+                true
+            }
+            None => {
+                struct OriginalChild(std::process::Child);
+                impl Drop for OriginalChild {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let mut output = tempfile::tempdir().unwrap();
+                output.disable_cleanup(true);
+                eprintln!("Upgrade fixture output: {}", output.path().display());
+                let stdout_path = output.path().join("stdout");
+                let stderr_path = output.path().join("stderr");
+                let mut child = OriginalChild(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            selector,
+                            "--nocapture",
+                            "--test-threads=1",
+                            "--color=never",
+                        ])
+                        .env(SELECTOR_ENV, selector)
+                        .stdout(fs::File::create(&stdout_path).unwrap())
+                        .stderr(fs::File::create(&stderr_path).unwrap())
+                        .spawn()
+                        .unwrap(),
+                );
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let status = loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.0.kill();
+                        let _ = child.0.wait();
+                        let retained = output.keep();
+                        panic!(
+                            "upgrade fixture timed out; retained at {}; stdout: {}; stderr: {}",
+                            retained.display(),
+                            fs::read_to_string(&stdout_path).unwrap_or_default(),
+                            fs::read_to_string(&stderr_path).unwrap_or_default()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let stdout = fs::read_to_string(stdout_path).unwrap();
+                let stderr = fs::read_to_string(stderr_path).unwrap();
+                let named = stdout
+                    .lines()
+                    .filter(|line| *line == format!("test {selector} ... ok"))
+                    .count()
+                    == 1;
+                let summaries = stdout
+                    .lines()
+                    .filter(|line| line.starts_with("test result:"))
+                    .collect::<Vec<_>>();
+                let qualified = summaries.len() == 1
+                    && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
+                if !status.success() || !named || !qualified {
+                    let retained = output.keep();
+                    panic!(
+                        "upgrade fixture child failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
+                        retained.display()
+                    );
+                }
+                output.close().unwrap();
+                false
+            }
+        }
+    }
+
     #[test]
     fn upgrade_commit_failure_preserves_live_control_authority() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         // An open directory descriptor is retained but cannot create files after
@@ -6278,6 +6365,9 @@ for line in sys.stdin:
 
     #[test]
     fn upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let mut state = test_host();
         let now = Instant::now();
         let stale = state.shutdown_preflight(now).unwrap().capability;
@@ -6294,6 +6384,9 @@ for line in sys.stdin:
 
     #[test]
     fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
@@ -6331,6 +6424,9 @@ for line in sys.stdin:
 
     #[test]
     fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Launch, Session},
@@ -6394,7 +6490,10 @@ for line in sys.stdin:
         let live = retain(Instant::now() + Duration::from_secs(3600));
         let failure =
             prepare_upgrade_with(&host, live, || Store::open(directory.path())).unwrap_err();
-        assert!(failure.message.contains("not durably acknowledged"));
+        assert!(
+            failure.message.contains("not durably acknowledged"),
+            "expected the live receipt to block upgrade; actual error: {failure:?}"
+        );
         // Nothing is destroyed by a refused upgrade: the window this receipt
         // belongs to can still replay its replacement afterwards.
         assert!(
@@ -6801,6 +6900,32 @@ for line in sys.stdin:
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
         restored.observe_agent().unwrap();
+        // FIFO control observation is not idle-shell proof. Wait for an
+        // actually inactive frozen observation, releasing our own stops before
+        // retrying or asking the host to prepare its independent snapshot.
+        let idle_started = Instant::now();
+        let mut idle_attempts = 0;
+        loop {
+            idle_attempts += 1;
+            let snapshot = restored.prepare_upgrade().unwrap_or_else(|error| {
+                panic!("restored shell observation failed after {idle_attempts} attempts: {error}")
+            });
+            let active = snapshot.active;
+            let hint = snapshot.hint.clone();
+            drop(snapshot);
+            if !active {
+                break;
+            }
+            assert!(
+                idle_started.elapsed() < Duration::from_secs(5),
+                "restored shell stayed active after {idle_attempts} observations ({:?}); hint: {hint:?}; completed: {}; startup unresolved: {}; startup: {:?}",
+                idle_started.elapsed(),
+                restored.is_completed(),
+                restored.startup_unresolved(),
+                restored.startup_diagnostic()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
