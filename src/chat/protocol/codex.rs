@@ -4025,15 +4025,48 @@ mod tests {
     }
     #[test]
     fn native_started_snapshot_retains_original_clipping_accounting_for_next_delta() {
-        let mut adapter = adapter();
-        adapter.busy = true;
-        let mut source = large_window_output();
-        adapter.receive(output_window_started(&source)).unwrap();
-        assert_window_accounting(&adapter, &source);
-        let delta = "new-tail🦀\n";
-        source.push_str(delta);
-        adapter.receive(output_window_delta(delta)).unwrap();
-        assert_window_accounting(&adapter, &source);
+        for whole_turn in [false, true] {
+            for initial in [
+                large_window_output(),
+                format!("first{}last", "x".repeat(MAX_ITEM_BYTES * 2)),
+            ] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                let mut source = initial;
+                let snapshot = if whole_turn {
+                    json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(&source)]}}})
+                } else {
+                    output_window_started(&source)
+                };
+                adapter.receive(snapshot).unwrap();
+                assert_window_accounting(&adapter, &source);
+                let key = item_key("window-turn", "window-cmd");
+                let initial_omitted = adapter.output_windows[&key].omitted;
+                for delta in ["new-tail🦀\n".to_owned(), "y".repeat(2048)] {
+                    source.push_str(&delta);
+                    let streamed = adapter.receive(output_window_delta(&delta)).unwrap();
+                    assert_window_accounting(&adapter, &source);
+                    let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                    else {
+                        panic!("missing command");
+                    };
+                    assert!(streamed.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Command { output: shown, .. }, .. }) if shown == output
+                    )));
+                    assert!(adapter.output_windows[&key].omitted >= initial_omitted);
+                }
+                let mut completed = output_window_command("authoritative final output🦀\n");
+                completed["status"] = json!("completed");
+                let finished = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"window-turn","item":completed}})).unwrap();
+                assert!(finished.events.iter().any(|event| matches!(event,
+                    Event::Item(Item { content: ItemContent::Command { status: ToolStatus::Succeeded, output, .. }, .. })
+                    if output == "authoritative final output🦀\n"
+                )));
+                assert!(!adapter.active_items.contains_key(&key));
+                assert!(!adapter.output_windows.contains_key(&key));
+                assert!(!adapter.output_streams.contains_key(&key));
+            }
+        }
     }
     #[test]
     fn active_history_hydration_retains_clipping_window_without_replacing_live_owner() {
