@@ -1934,10 +1934,148 @@ mod tests {
         }
     }
 
+    const HOLDER_TEST_LIFETIME_READER: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_LIFETIME_READER";
+
+    fn coordinator_lifetime_pipe() -> (OwnedFd, OwnedFd) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
+
+    fn inherit_lifetime_reader(command: &mut Command, reader: &OwnedFd) {
+        use std::os::unix::process::CommandExt;
+        assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
+        let descriptor = reader.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        command.env(HOLDER_TEST_LIFETIME_READER, descriptor.to_string());
+        // Only the read end survives this exec. The sole coordinator writer
+        // retains pipe2's CLOEXEC, so no stage0/holder copy can suppress EOF.
+        // The owning reader remains alive until Command::spawn has returned.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    struct CoordinatorLifetime(OwnedFd);
+    impl CoordinatorLifetime {
+        fn inherited() -> io::Result<Self> {
+            let descriptor = std::env::var(HOLDER_TEST_LIFETIME_READER)
+                .map_err(io::Error::other)?
+                .parse::<RawFd>()
+                .map_err(io::Error::other)?;
+            let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            if descriptor < 3 || descriptor_flags < 0 {
+                return Err(refused("missing inherited coordinator lifetime reader"));
+            }
+            // This exact selfexec command issued one owned inherited read fd;
+            // its number is metadata, never a process ownership constructor.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let mut metadata: libc::stat = unsafe { mem::zeroed() };
+            if unsafe { libc::fstat(descriptor.as_raw_fd(), &mut metadata) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+            if metadata.st_mode & libc::S_IFMT != libc::S_IFIFO
+                || flags < 0
+                || flags & libc::O_ACCMODE != libc::O_RDONLY
+                || flags & libc::O_NONBLOCK == 0
+            {
+                return Err(refused("invalid inherited coordinator lifetime reader"));
+            }
+            // Restore close-on-exec BEFORE creating the original holder. It
+            // inherits neither the coordinator's writer nor this read copy.
+            if unsafe {
+                libc::fcntl(
+                    descriptor.as_raw_fd(),
+                    libc::F_SETFD,
+                    descriptor_flags | libc::FD_CLOEXEC,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(descriptor))
+        }
+
+        fn alive(&self) -> io::Result<bool> {
+            let mut byte = 0u8;
+            let result =
+                unsafe { libc::read(self.0.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            if result == 0 {
+                return Ok(false);
+            }
+            if result > 0 {
+                return Err(refused(
+                    "coordinator lifetime pipe unexpectedly carried data",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(true)
+            } else {
+                // Even repeated interruption cannot create an unbounded retry
+                // here: errors unwind through the actual original Child guard.
+                Err(error)
+            }
+        }
+
+        fn wait_until(&self, deadline: Instant) -> io::Result<&'static str> {
+            loop {
+                if !self.alive()? {
+                    return Ok("coordinator-eof");
+                }
+                if Instant::now() >= deadline {
+                    return Ok("stage0-deadline");
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let mut descriptor = libc::pollfd {
+                    fd: self.0.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe {
+                    libc::poll(
+                        &mut descriptor,
+                        1,
+                        remaining.as_millis().min(50).max(1) as i32,
+                    )
+                };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+                    return Err(refused("coordinator lifetime reader became unavailable"));
+                }
+            }
+        }
+    }
+
     fn acknowledged_stage0_body() {
         let root = PathBuf::from(std::env::var_os(HOLDER_TEST_ROOT).unwrap());
+        let lifetime = CoordinatorLifetime::inherited().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if !lifetime.alive().unwrap() {
+            return;
+        }
         let terminal = terminal_holder_terminal_from_environment().unwrap();
         let mut original = child("exec /bin/sleep 30");
+        original.status_path = Some(root.join("lifetime-original-child-status.json"));
         register_original_terminal_holder(
             &mut original.child,
             original.descriptor.as_fd(),
@@ -1946,12 +2084,14 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("stage0-observed-ack"), b"acknowledged").unwrap();
-        // Keep the actual original Child and startup guard on this stack. The
-        // test deliberately kills this daemon only after its real ACK returned.
-        // An ordinary panic here still uses OriginalChild's own kill/wait.
-        loop {
-            thread::sleep(Duration::from_millis(5));
-        }
+        // Keep the actual startup guard on this stack until the deliberate
+        // crash. If the coordinator instead dies (including outer timeout),
+        // its sole writer closes and we return through the original kill/wait.
+        // The finite local deadline also prevents indefinite orphan waiting.
+        let reason = lifetime.wait_until(deadline).unwrap();
+        drop(original);
+        fs::write(root.join("child-original-wait-completed"), b"waited").unwrap();
+        fs::write(root.join("stage0-lifetime-ended"), reason).unwrap();
     }
 
     fn holder_crash_coordinator(root: &Path) {
@@ -1970,9 +2110,12 @@ mod tests {
         let mut sentinel = child("exec /bin/sleep 30");
         let stage0 = root.join("stage0");
         fs::DirBuilder::new().mode(0o700).create(&stage0).unwrap();
+        let (reader, lifetime_writer) = coordinator_lifetime_pipe();
         let mut command = holder_child_command(&stage0, "crash-stage0");
+        inherit_lifetime_reader(&mut command, &reader);
         let parent =
             TerminalHolderParent::spawn_stage0(&stage0, TerminalId::new(), &mut command).unwrap();
+        drop(reader);
         let mut custody = HolderCrashCustody {
             parent: Some(parent),
             wait: None,
@@ -2042,6 +2185,7 @@ mod tests {
             b"original-only",
         )
         .unwrap();
+        drop(lifetime_writer);
     }
 
     #[test]
@@ -2053,6 +2197,7 @@ mod tests {
                 holder_crash_coordinator(&root);
             }
             Err(std::env::VarError::NotPresent) => {
+                assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
                 let root = tempfile::tempdir().unwrap();
                 let mut command = holder_child_command(root.path(), "crash-coordinator");
                 let mut coordinator = OriginalChild::spawn(&mut command).unwrap();
@@ -2081,5 +2226,56 @@ mod tests {
             }
             _ => panic!("unknown post-ACK crash test role"),
         }
+    }
+
+    #[test]
+    fn single_holder_coordinator_eof_returns_through_original_child_cleanup() {
+        match std::env::var(HOLDER_TEST_CHILD).as_deref() {
+            Ok("eof-stage0") => {
+                acknowledged_stage0_body();
+                return;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            _ => panic!("unknown coordinator EOF test role"),
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (reader, lifetime_writer) = coordinator_lifetime_pipe();
+        let mut command = holder_child_command(root.path(), "eof-stage0");
+        inherit_lifetime_reader(&mut command, &reader);
+        let mut parent =
+            TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
+                .unwrap();
+        drop(reader);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        parent.await_registration_until(deadline).unwrap();
+        while !root.path().join("stage0-observed-ack").exists() {
+            assert!(
+                parent
+                    .stage0_child_after_ack()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Closing the ONLY writer models its owning coordinator's death. No
+        // test-side holder signal or parent fallback precedes source cleanup.
+        drop(lifetime_writer);
+        assert_holder_child_success(&mut parent, root.path(), deadline);
+        assert_eq!(
+            fs::read(root.path().join("stage0-lifetime-ended")).unwrap(),
+            b"coordinator-eof",
+            "the finite deadline must not masquerade as observed coordinator EOF"
+        );
+        let status: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("lifetime-original-child-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["signal"], libc::SIGKILL);
+        assert!(status["code"].is_null());
+        parent.confirm_holder_exit_until(deadline).unwrap();
+        assert!(!parent.holder.as_ref().unwrap().armed);
     }
 }
