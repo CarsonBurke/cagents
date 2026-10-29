@@ -591,7 +591,7 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
         host.lock().unwrap().request_shutdown();
         crate::daemon::wake();
         eprintln!(
-            "Failure-only fixture HOST shutdown requested after owned cleanup; production shutdown stimulus was not reached"
+            "Failure-only fixture HOST shutdown requested after owned cleanup; production shutdown request was not completed or acknowledged"
         );
     }
     if host_result.is_none() {
