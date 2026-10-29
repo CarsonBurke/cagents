@@ -1065,6 +1065,40 @@ struct TerminalWakeup {
     generation: u64,
 }
 
+/// How much of the workspace projection an update has to rebuild. Busy
+/// terminals wake about once per frame each, so a wake that changed nothing a
+/// projection reads must not pay for every card's sidebar, chrome and
+/// protection bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// Nothing any projection reads changed: grid output, repaint ticks.
+    Unchanged,
+    /// Only a runtime-reported card title changed. Card chrome and the window
+    /// title are the only projections that read it.
+    Chrome,
+    /// Anything else, including every user action.
+    Full,
+}
+
+/// Runtime-reported terminal titles can animate several times a second
+/// (spinners, step counters). The durable card follows each one at once, so
+/// chrome stays current, but saving it, and publishing it to shared views,
+/// waits for this window: a burst of reported titles costs at most one save
+/// per window, and the last title is saved within one window of the burst
+/// ending. Any earlier save carries the titles with it.
+const REPORTED_TITLE_SAVE_DELAY: Duration = Duration::from_secs(3);
+
+/// Saving of runtime-reported titles, deferred by [`REPORTED_TITLE_SAVE_DELAY`].
+#[derive(Debug, Default)]
+struct ReportedTitleSave {
+    /// Cards whose reported title changed since the last save that published
+    /// titles. Shared views hold those titles back until that save.
+    cards: HashSet<CardId>,
+    /// A `ReportedTitleSaveDue` timer is outstanding. Kept apart from
+    /// `cards` so a burst interleaved with other saves still arms one timer.
+    scheduled: bool,
+}
+
 #[derive(Clone)]
 struct TerminalWakeSource(async_channel::Receiver<TerminalWakeup>);
 
@@ -2543,6 +2577,24 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
     }
 }
 
+/// Whether a Wayland compositor fills the screen with a window or tiles its
+/// right edge, either of which removes the shell's resize border along it.
+fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
+    use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+    use iced::event::{PlatformSpecific, wayland};
+
+    match event {
+        iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+            wayland::WindowEvent::WindowState(state),
+        ))) => Some(Message::WindowEdgeState {
+            window,
+            filled: state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN),
+            right_edge_tiled: state.contains(WindowState::TILED_RIGHT),
+        }),
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -2736,6 +2788,17 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusBrowserAddress(_)
         | Message::BrowserAddressChanged { .. }
         | Message::BrowserNavigate(_) => true,
+        _ => false,
+    }
+}
+
+/// Timers that exist only to repaint elapsed time or a progress animation.
+/// Their handlers change nothing a workspace projection reads.
+fn repaint_tick(message: &Message) -> bool {
+    match message {
+        Message::ChatUi(chat_ui::Action::Tick) => true,
+        #[cfg(feature = "integrated-browser")]
+        Message::BrowserProgressTick => true,
         _ => false,
     }
 }
@@ -4386,6 +4449,8 @@ pub enum Message {
     LifecycleSweepElapsed(u64),
     /// The delay on saving a change of focus alone has passed.
     FocusSaveDue,
+    /// The delay on saving runtime-reported card titles has passed.
+    ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
@@ -4417,6 +4482,12 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowEdgeState {
+        window: window::Id,
+        filled: bool,
+        right_edge_tiled: bool,
+    },
+    WindowFilled(window::Id, bool),
     ActivateUi {
         token: Option<String>,
     },
@@ -5077,6 +5148,9 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    /// The workspace `card_indices` was built from. Holding it weakly pins
+    /// its allocation, so a changed workspace always has a different address.
+    card_indices_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
@@ -5107,6 +5181,8 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// See [`REPORTED_TITLE_SAVE_DELAY`].
+    reported_title_save: ReportedTitleSave,
     /// Where the camera was heading when the last sweep found cards on screen
     /// that it was only passing, which that sweep left cold. The camera
     /// coming to rest or heading elsewhere is then a reason to sweep again.
@@ -5187,6 +5263,17 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// Whether the main window is maximized or fullscreen, so the shell offers
+    /// no resize border. Tracked here rather than read from `core`, which only
+    /// learns it from Wayland window states.
+    window_filled: bool,
+    /// Whether a Wayland window state has arrived for the main window. Those
+    /// events then report maximized and fullscreen, so only a backend without
+    /// them, such as X11, needs `query_window_filled` on every resize.
+    window_state_observed: bool,
+    /// Whether the compositor reports the main window's right edge as tiled,
+    /// so the shell offers no resize border there.
+    right_edge_tiled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -6074,6 +6161,56 @@ impl Cagents {
         }
     }
 
+    /// The trailing inset that keeps the interface out of the window's resize
+    /// border.
+    ///
+    /// While the right window edge is free, the shell starts a resize from any
+    /// press within [`design::WINDOW_RESIZE_BORDER`] of it, before the press
+    /// reaches a widget. Panes put their scrollbars at their right edge, so the
+    /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
+    /// fullscreen and right-tiled windows have no border there and stay flush.
+    fn window_edge_inset(&self) -> f32 {
+        if self.window_filled || self.right_edge_tiled {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
+        }
+    }
+
+    /// The window width left to the interface beside the resize border.
+    fn content_width(&self) -> f32 {
+        (self.window_width - self.window_edge_inset()).max(0.0)
+    }
+
+    /// Re-derives what depends on [`Self::content_width`], such as whether the
+    /// inspector docks or overlays, after the window or its inset changes.
+    fn content_width_changed(&mut self) -> Task<Message> {
+        if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
+            self.context_inspector_open = false;
+            self.context_inspector_transition = None;
+        }
+        self.sync_context_overlay_state()
+    }
+
+    /// Reads whether the main window is maximized or fullscreen from the
+    /// windowing backend, which is what the shell's resize border consults.
+    /// Wayland reports this through window states, which make the query
+    /// redundant; X11 has no such event, so there every resize asks again.
+    fn query_window_filled(&self) -> Task<Message> {
+        if self.window_state_observed {
+            return Task::none();
+        }
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        iced::window::is_maximized(window)
+            .then(move |maximized| {
+                iced::window::mode(window)
+                    .map(move |mode| maximized || mode == iced::window::Mode::Fullscreen)
+            })
+            .map(move |filled| cosmic::Action::App(Message::WindowFilled(window, filled)))
+    }
+
     fn new_pane_fraction(&self, configured: f32) -> f32 {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
@@ -6087,12 +6224,12 @@ impl Cagents {
                 self.settings
                     .inspector_width
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                    .min(self.window_width.max(0.0))
+                    .min(self.content_width())
                     * self.context_inspector_progress()
             } else {
                 0.0
             };
-            (self.window_width - sidebar - inspector).max(0.0)
+            (self.content_width() - sidebar - inspector).max(0.0)
         } else {
             self.workspace.viewport_width()
         };
@@ -7393,7 +7530,15 @@ impl Cagents {
         Arc::make_mut(&mut self.durable).focused = focused;
     }
 
+    /// Saves the workspace and publishes its views, reported titles included.
     fn persist(&mut self) {
+        self.reported_title_save.cards.clear();
+        self.save_workspace();
+    }
+
+    /// [`Self::persist`] that leaves reported titles waiting for their
+    /// deferred save held back from shared views.
+    fn save_workspace(&mut self) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7410,6 +7555,8 @@ impl Cagents {
                 .retain(|id| open.contains(id));
         }
         self.focus_save_pending = false;
+        #[cfg(test)]
+        terminal_output_tests::record_persist();
         self.snapshot_workspace_scope();
         self.publish_view_changes();
         let saved = self.persistent_workspace();
@@ -7910,13 +8057,16 @@ impl Cagents {
         false
     }
 
-    /// Builds chrome for cards that appeared or were renamed, drops entries for
-    /// cards the workspace no longer holds, and renames the window.
-    fn sync_chrome(&mut self) -> Task<Message> {
-        self.terminal_working_directories
-            .retain(|card, _| self.cards.contains_key(card));
-        self.terminal_find
-            .retain(|card, _| self.cards.contains_key(card));
+    /// Rebuilds `card_indices` when the durable workspace is not the one it was
+    /// built from. Copy-on-write gives every changed workspace a new address,
+    /// and the weak reference keeps the old address from being reused.
+    fn index_cards(&mut self) {
+        if self.card_indices_source.as_ptr() == Arc::as_ptr(&self.durable) {
+            return;
+        }
+        #[cfg(test)]
+        terminal_output_tests::record_card_index();
+        self.card_indices_source = Arc::downgrade(&self.durable);
         self.card_indices.clear();
         self.card_indices.extend(
             self.durable
@@ -7925,6 +8075,18 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+    }
+
+    /// Builds chrome for cards that appeared or were renamed, drops entries for
+    /// cards the workspace no longer holds, and renames the window.
+    fn sync_chrome(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_chrome();
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.index_cards();
         // A moved worktree keeps its pane numbers. Reconcile its new scope's
         // counter before minting a number, including when insertion precedes
         // an existing pane in the saved order.
@@ -7964,10 +8126,27 @@ impl Cagents {
                 self.chrome_ui.terminal_ordinals.insert(card.id, *next);
             }
         }
+        // The first titled channel holding each card, as `card_display_title`
+        // finds it, in one pass rather than one channel scan per chat.
+        let mut titled_channels = HashMap::new();
+        for channel in self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| !channel.title.is_empty())
+        {
+            for card in &channel.cards {
+                titled_channels.entry(*card).or_insert(channel);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let (title, file_caption) = self.repository_chrome(card);
+            let (title, file_caption) = self.repository_chrome_with(card, || {
+                self.card_display_title_with_chat_title(card, || {
+                    self.chat_channel_title(card, titled_channels.get(&card.id).copied())
+                })
+            });
             if matches!(card.kind, CardKind::Browser(_))
                 && self
                     .workspace
@@ -8041,6 +8220,16 @@ impl Cagents {
         &'a self,
         card: &'a CardState,
     ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+        self.repository_chrome_with(card, || self.card_display_title(card))
+    }
+
+    /// `repository_chrome` with the card's display title supplied, so a pass
+    /// over every card can resolve channel titles once.
+    fn repository_chrome_with<'a>(
+        &'a self,
+        card: &'a CardState,
+        display_title: impl FnOnce() -> &'a str,
+    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
             && let Some(path) = runtime.selected_path()
             && let Some(name) = path.file_name()
@@ -8055,7 +8244,7 @@ impl Cagents {
                 )),
             );
         }
-        let title = self.card_display_title(card);
+        let title = display_title();
         if let CardKind::Terminal(session) = &card.kind
             && !self.chrome_ui.user_titles.contains_key(&card.id)
         {
@@ -8092,18 +8281,32 @@ impl Cagents {
     /// Provider activity belongs in the status icon, including restored titles.
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
         self.card_display_title_with_chat_title(card, || {
-            let CardKind::Chat(session) = &card.kind else {
-                return None;
-            };
-            let channel =
-                self.durable.channels.iter().find(|channel| {
-                    channel.cards.contains(&card.id) && !channel.title.is_empty()
-                })?;
-            (card.title == chat_ui::chat_card_title(session.launch.provider)
-                || (channel.title_source == crate::model::ChannelTitleSource::Manual
-                    && self.channel_primary_chat(channel) == Some(card.id)))
-            .then_some(channel.title.as_str())
+            self.chat_channel_title(
+                card,
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty()),
+            )
         })
+    }
+
+    /// The title a chat card shows from `channel`, the first titled channel
+    /// holding it: a provider-default chat, or the primary chat of a channel
+    /// the user named, is presented by its channel's name.
+    fn chat_channel_title<'a>(
+        &self,
+        card: &CardState,
+        channel: Option<&'a crate::model::ProjectChannel>,
+    ) -> Option<&'a str> {
+        let CardKind::Chat(session) = &card.kind else {
+            return None;
+        };
+        let channel = channel?;
+        (card.title == chat_ui::chat_card_title(session.launch.provider)
+            || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                && self.channel_primary_chat(channel) == Some(card.id)))
+        .then_some(channel.title.as_str())
     }
 
     /// Batch projections can resolve channel membership once while sharing the
@@ -8838,6 +9041,19 @@ impl Cagents {
         })
     }
 
+    /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
+    /// together with whatever else changes by then.
+    fn save_reported_titles_soon(&mut self, card: CardId) -> Task<Message> {
+        self.reported_title_save.cards.insert(card);
+        if std::mem::replace(&mut self.reported_title_save.scheduled, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            tokio::time::sleep(REPORTED_TITLE_SAVE_DELAY).await;
+            Message::ReportedTitleSaveDue
+        })
+    }
+
     /// Arms a timer for `deadline`, superseding any timer already pending.
     fn arm_lifecycle_sweep(&mut self, deadline: Instant) -> Task<Message> {
         self.lifecycle_sweep_deadline = Some(deadline);
@@ -9140,20 +9356,27 @@ impl Cagents {
     }
 
     /// Drain controls and lifecycle events on every wake, independently of grid
-    /// repaint. Only actual metadata changes need the workspace projection tail.
-    fn drain_terminal_update(&mut self, card: CardId, _generation: u64) -> (Task<Message>, bool) {
+    /// repaint. Answers how much of the workspace projection the wake changed.
+    fn drain_terminal_update(
+        &mut self,
+        card: CardId,
+        _generation: u64,
+    ) -> (Task<Message>, Projection) {
         if self.chat_start_pending(card) {
-            return (Task::none(), false);
+            return (Task::none(), Projection::Unchanged);
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return (Task::none(), false);
+                return (Task::none(), Projection::Unchanged);
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
         let mut durable_changed = false;
         let mut metadata_changed = false;
+        // A reported title is durable, but only chrome reads it and its save
+        // can wait; see `REPORTED_TITLE_SAVE_DELAY`.
+        let mut title_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
         if let Some(proof) = proof
@@ -9191,7 +9414,7 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
-                    durable_changed |= self.apply_reported_title(card, title);
+                    title_changed |= self.apply_reported_title(card, title);
                 }
                 TerminalEvent::WorkingDirectoryChanged(path) => {
                     if self.terminal_working_directories.get(&card) != Some(&path) {
@@ -9358,9 +9581,15 @@ impl Cagents {
             }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
-        if durable_changed {
+        // A save now carries any reported title with it.
+        let title_save = if durable_changed {
             self.persist();
-        }
+            Task::none()
+        } else if title_changed {
+            self.save_reported_titles_soon(card)
+        } else {
+            Task::none()
+        };
         if let Some((session, visible, hibernated)) = recovery {
             // A hibernated agent kept attached for its row goes back to
             // waiting for its card: it may be attached again, but launching it
@@ -9375,7 +9604,10 @@ impl Cagents {
                 }
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
-                return (self.attach_next_restored_agent(), true);
+                return (
+                    Task::batch([title_save, self.attach_next_restored_agent()]),
+                    Projection::Full,
+                );
             }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
@@ -9394,11 +9626,28 @@ impl Cagents {
                 Instant::now(),
             );
             self.cards.insert(card, CardRuntime::Loading);
-            return (self.start_terminal(card, session, visible, false), true);
+            return (
+                Task::batch([
+                    title_save,
+                    self.start_terminal(card, session, visible, false),
+                ]),
+                Projection::Full,
+            );
         }
+        let projection = if metadata_changed || durable_changed {
+            Projection::Full
+        } else if title_changed {
+            Projection::Chrome
+        } else {
+            Projection::Unchanged
+        };
         (
-            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
-            metadata_changed || durable_changed,
+            Task::batch([
+                clipboard_task,
+                title_save,
+                self.refresh_live_terminal_find(card),
+            ]),
+            projection,
         )
     }
 
@@ -12302,7 +12551,7 @@ impl Cagents {
             .inspector_width
             .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
         Some(
-            if self.window_width - navigation - inspector
+            if self.content_width() - navigation - inspector
                 >= crate::workspace::WidthLimits::default().minimum
             {
                 InspectorLayout::Docked
@@ -12461,6 +12710,7 @@ impl Cagents {
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             // A request's answer is rendered by this very panel, so dismissing
@@ -13888,6 +14138,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -13949,6 +14200,9 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -14061,6 +14315,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
@@ -14107,7 +14362,7 @@ impl Application for Cagents {
             };
         let _ = app
             .workspace
-            .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
+            .resize_viewport((app.content_width() - sidebar_width - inspector_width).max(0.0));
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app
@@ -14318,7 +14573,11 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut terminal_metadata_unchanged = false;
+        let mut projection = if repaint_tick(&message) {
+            Projection::Unchanged
+        } else {
+            Projection::Full
+        };
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
@@ -14370,7 +14629,9 @@ impl Application for Cagents {
             }
             Message::WorkspaceModelObserved(update) => {
                 let (task, changed) = self.apply_workspace_model_update_effect(update);
-                terminal_metadata_unchanged = !changed;
+                if !changed {
+                    projection = Projection::Unchanged;
+                }
                 task
             }
             Message::TerminalStarted {
@@ -14405,8 +14666,8 @@ impl Application for Cagents {
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                let (task, metadata_changed) = self.drain_terminal_update(card, generation);
-                terminal_metadata_unchanged = !metadata_changed;
+                let (task, wake_projection) = self.drain_terminal_update(card, generation);
+                projection = wake_projection;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -16376,6 +16637,13 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::ReportedTitleSaveDue => {
+                self.reported_title_save.scheduled = false;
+                if !self.reported_title_save.cards.is_empty() {
+                    self.persist();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -16405,6 +16673,36 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowEdgeState {
+                window,
+                filled,
+                right_edge_tiled,
+            } => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_state_observed = true;
+                self.window_filled = filled;
+                self.right_edge_tiled = right_edge_tiled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
+            Message::WindowFilled(window, filled) => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_filled = filled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -16412,11 +16710,7 @@ impl Application for Cagents {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
-                    self.context_inspector_open = false;
-                    self.context_inspector_transition = None;
-                }
-                self.sync_context_overlay_state()
+                Task::batch([self.content_width_changed(), self.query_window_filled()])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -16869,7 +17163,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
+                // A held chord copies once, so its repeats must not cancel the
+                // copy its first press started.
+                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
                     chat_ui::invalidate_copy_intent();
@@ -16890,12 +17186,38 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                if let Some(gallery) = &self.chat_ui.image_viewer {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
                         match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                            // Layout-independent, like the other Ctrl chords.
+                            keyboard::Key::Character(_)
+                                if modifiers.command()
+                                    && !modifiers.shift()
+                                    && !modifiers.alt()
+                                    && !modifiers.logo()
+                                    && key
+                                        .to_latin(*physical_key)
+                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                            {
+                                // A held chord copies once.
+                                if *repeat {
+                                    return Task::none();
+                                }
+                                let image = gallery.selected_image();
+                                return self.handle_chat_ui(chat_ui::Action::Image(
+                                    image,
+                                    chat_ui::images::ImageCommand::Copy,
+                                ));
                             }
+                            // Escape is the viewer's own (`Gallery::view`), so that
+                            // one an open context menu claims closes only the menu.
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                                 self.chat_ui.image_viewer.as_mut().unwrap().next(false);
                             }
@@ -17668,7 +17990,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        if !terminal_metadata_unchanged {
+        if projection == Projection::Full {
             self.sync_worktree_protections();
         }
         self.sync_popup_keyboard_nav();
@@ -17708,12 +18030,27 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        if terminal_metadata_unchanged {
-            return Task::batch([
-                task,
-                self.reconcile_notice_popup(),
-                self.release_deferred_navigation_if_unblocked(),
-            ]);
+        match projection {
+            Projection::Unchanged => {
+                return Task::batch([
+                    task,
+                    self.reconcile_notice_popup(),
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            // A reported title reaches the tabs and window title; nothing in
+            // the sidebar, worktree ownership or protections reads it.
+            Projection::Chrome => {
+                let notices = self.reconcile_notice_popup();
+                let chrome = self.sync_chrome();
+                return Task::batch([
+                    task,
+                    chrome,
+                    notices,
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            Projection::Full => {}
         }
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
@@ -17841,6 +18178,9 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(event_window, false),
                 )),
                 iced::Event::Window(event) => window_geometry_message(&event),
+                event @ iced::Event::PlatformSpecific(_) => {
+                    window_edge_message(&event, event_window)
+                }
                 _ => None,
             }),
         ];
@@ -18262,7 +18602,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let window_width = self.window_width;
+        let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
             &self.sidebar_model,
@@ -18516,7 +18856,7 @@ impl Application for Cagents {
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                .min(window_width.max(0.0));
+                .min(content_width);
             let progress = self.context_inspector_progress();
             let visible_width = width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
@@ -18634,6 +18974,11 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        // Only the inset changes with the window state, so the tree, and
+        // every scroll offset and focus in it, survives a maximize.
+        let surface: Element<'_, Message> = widget::container(surface)
+            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -19888,10 +20233,12 @@ mod tests {
 
     #[test]
     fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
+        // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
+        // content, so the third case sits exactly at the narrow threshold.
         for (window, seed, with_project, inspector_open, expected, measured) in [
             (1280.0, 1340.0, false, false, 1.0, 1020.0),
             (1600.0, 600.0, false, false, 0.5, 1340.0),
-            (1360.0, 1340.0, false, false, 0.5, 1100.0),
+            (1368.0, 1340.0, false, false, 0.5, 1100.0),
             (1600.0, 1340.0, true, true, 1.0, 960.0),
             (2000.0, 600.0, true, true, 0.5, 1360.0),
             (900.0, 1340.0, true, true, 1.0, 640.0),
@@ -23044,6 +23391,111 @@ mod tests {
             let _ = app.update(Message::CancelDialog);
             assert!(app.pull_request_dialog.is_none());
         }
+    }
+
+    #[test]
+    fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let state = |state| {
+            iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+                wayland::WindowEvent::WindowState(state),
+            )))
+        };
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        // The border is in compositor pixels; the interface scale enlarges
+        // every interface pixel.
+        app.settings.ui_scale = 1.25;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER / 1.25);
+        app.settings.ui_scale = 1.0;
+
+        // Another window's state does not move the main window's content.
+        let other = window_edge_message(&state(WindowState::TILED), window::Id::unique())
+            .expect("window state event");
+        let _ = app.update(other);
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+
+        // A tiled right edge has no border, so content returns to the edge.
+        // Other tiled edges leave the right border in place.
+        for (flags, inset) in [
+            (
+                WindowState::TILED_LEFT | WindowState::TILED_TOP,
+                design::WINDOW_RESIZE_BORDER,
+            ),
+            (WindowState::TILED_RIGHT | WindowState::ACTIVATED, 0.0),
+            (WindowState::ACTIVATED, design::WINDOW_RESIZE_BORDER),
+        ] {
+            let message = window_edge_message(&state(flags), main).expect("window state event");
+            let _ = app.update(message);
+            assert_eq!(app.window_edge_inset(), inset, "{flags:?}");
+        }
+
+        // A maximized or fullscreen window has no border at all, whether the
+        // Wayland state or the backend query reports it.
+        let maximized =
+            window_edge_message(&state(WindowState::MAXIMIZED), main).expect("window state event");
+        let _ = app.update(maximized);
+        assert_eq!(app.window_edge_inset(), 0.0);
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(window::Id::unique(), true));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert_eq!(app.window_edge_inset(), 0.0);
+        assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
+    }
+
+    #[test]
+    fn resizes_query_the_window_state_only_until_wayland_reports_it() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let mut app = context_inspector_test_app(false);
+        let resize = |app: &mut Cagents| app.update(Message::WindowResized(1600.0, 900.0)).units();
+        let without_query = resize(&mut app);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        // X11 sends no window states, so every resize asks the backend.
+        assert!(resize(&mut app) > without_query);
+        assert!(resize(&mut app) > without_query);
+
+        let state = iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
+            wayland::Event::Window(wayland::WindowEvent::WindowState(WindowState::ACTIVATED)),
+        ));
+        let _ = app.update(window_edge_message(&state, main).expect("window state event"));
+        assert_eq!(resize(&mut app), without_query);
+    }
+
+    #[test]
+    fn a_resize_border_change_alone_redocks_the_inspector() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        let _ = app.update(Message::WindowFilled(main, true));
+        // The narrowest window that still docks the inspector without a
+        // border, so the border's width alone decides between the layouts.
+        let docked = (600..3000)
+            .map(|width| width as f32)
+            .find(|&width| {
+                app.window_width = width;
+                !app.context_inspector_is_overlay()
+            })
+            .expect("a width that docks the inspector");
+        let _ = app.update(Message::WindowResized(docked, 900.0));
+        assert!(!app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert!(!app.context_inspector_overlay_active);
     }
 
     #[test]
@@ -28685,6 +29137,7 @@ mod tests {
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -28701,6 +29154,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
@@ -28758,6 +29212,9 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),

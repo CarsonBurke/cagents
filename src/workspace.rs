@@ -298,12 +298,17 @@ impl StripGeometry {
         current_offset: f32,
     ) -> Option<f32> {
         let card = self.card(id)?;
-        let target = if card.width() > viewport_width {
+        let viewport_width = finite_nonnegative(viewport_width);
+        // A pane as wide as the viewport can still end an ulp past
+        // `start + viewport_width`, so the lower bound is capped at `start`
+        // rather than trusting `width() <= viewport_width` to order them.
+        let lowest = (card.end - viewport_width).min(card.start);
+        let target = if card.width() > viewport_width || !current_offset.is_finite() {
             card.start
         } else {
             // Keep a fully visible pane stationary; otherwise expose only its
             // hidden edge, preserving as much of its neighbor as possible.
-            current_offset.clamp(card.end - viewport_width, card.start)
+            current_offset.clamp(lowest, card.start)
         };
         Some(target.clamp(0.0, self.max_offset(viewport_width)))
     }
@@ -2332,6 +2337,54 @@ mod tests {
         assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
         assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
         assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    /// Full-width cycling sized a pane to the viewport, where rounding left
+    /// `end - viewport` an ulp above `start` and `clamp` panicked.
+    #[test]
+    fn focus_offset_tolerates_a_pane_rounded_to_the_viewport_width() {
+        for viewport in [552.6667_f32, 700.0, 1023.3, 1658.0, 1919.7] {
+            for fraction in [1.0_f32, 2.0 / 3.0, 0.5, 1.0 / 3.0] {
+                let workspace = workspace_with_widths(
+                    &[
+                        CardWidth::Fraction(fraction),
+                        CardWidth::Fraction(fraction),
+                        CardWidth::Fraction(fraction),
+                    ],
+                    viewport,
+                );
+                let geometry = workspace.geometry();
+                for id in workspace.order() {
+                    let card = geometry.card(id).unwrap();
+                    for current in [0.0, card.start, card.end, f32::NAN, f32::INFINITY] {
+                        let offset = geometry.focus_offset(id, viewport, current).unwrap();
+                        assert!(
+                            (0.0..=geometry.max_offset(viewport)).contains(&offset),
+                            "offset {offset} outside the strip at viewport {viewport}"
+                        );
+                    }
+                    assert!(geometry.focus_offset(id, f32::NAN, 0.0).is_some());
+                }
+            }
+        }
+
+        // In f32, this pane is exactly as wide as the viewport, yet
+        // `end - viewport` is 100.30005, above `start`.
+        let (start, viewport) = (100.3_f32, 1658.7_f32);
+        let end = start + viewport;
+        assert!(end - start <= viewport && end - viewport > start);
+        let id = CardId::new();
+        let geometry = StripGeometry {
+            cards: vec![CardGeometry {
+                id,
+                index: 0,
+                start,
+                end,
+            }],
+            prefix_ends: vec![end],
+            total_width: end + 8.0,
+        };
+        assert_eq!(geometry.focus_offset(id, viewport, 0.0), Some(start));
     }
 
     #[test]
