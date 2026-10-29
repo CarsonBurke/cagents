@@ -648,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let recovered = saved.cards.iter().find(|card| matches!(&card.kind, CardKind::Chat(session) if session.id.to_string() == recovered)).ok_or("Recovered ordinary conversation missing")?;
             if !recovered.existence.is_open()
                 || saved.chat_drafts.get(&recovered.id).map(String::as_str) != Some("Fresh work after ordinary History recovery.")
+                || saved.chat_draft_attachments.get(&recovered.id).is_some_and(|attachments| !attachments.is_empty())
             { return Err("Recovered ordinary conversation did not keep fresh work".into()); }
         }
         if std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1") {

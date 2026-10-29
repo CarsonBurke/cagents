@@ -554,6 +554,8 @@ try:
                 wait(lambda: field.queryText().getText(0, -1) == healthy_text)
                 (root / 'healthy-draft-expected').write_text(healthy_text)
             if ordinary:
+                assert 'ordinary-exact-history-start-accepted' not in receipt.read_text(), (
+                    'Ordinary saved work started before an explicit Resume')
                 open_ordinary_history(pid)
                 capture(window, label + '-ordinary-history', (1280, 800))
                 if variant == 'after':
@@ -569,6 +571,8 @@ try:
                                      and visible(node) for node in live_tree(pid)))
                     assert receipt.read_text().count('effect-request-') == before_denied
                     capture(window, label + '-denied-history', (1280, 800))
+                assert 'ordinary-exact-history-start-accepted' not in receipt.read_text(), (
+                    'Ordinary saved work started before its Resume control')
                 click(pid, 'Resume Ordinary retained conversation')
                 wait(lambda: receipt.read_text().count('ordinary-exact-history-start-accepted') == 1)
                 wait(lambda: not any(node.name == 'Resume conversation' and visible(node) for node in live_tree(pid)))
