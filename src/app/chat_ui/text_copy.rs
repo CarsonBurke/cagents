@@ -202,17 +202,19 @@ impl Cagents {
             return Task::none();
         };
         let request = FailureRequest {
-            context,
+            context: context.clone(),
             intent,
             handle: handle.clone(),
             scope: runtime.selected_subagent.clone(),
             plan: plan.clone(),
         };
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || plan.read(&handle))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                plan.read(&handle, || context.is_current(intent))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::ChatUi(Action::FailureCopied(target, key, request, result))
         })
     }
@@ -236,13 +238,16 @@ impl Cagents {
             || !runtime
                 .handle()
                 .is_some_and(|handle| Arc::ptr_eq(handle, &request.handle))
-            || runtime.failure_copy_plan(&key).ok().flatten().as_ref() != Some(&request.plan)
-            || !request.plan.is_current(&request.handle.snapshot())
         {
             return Task::none();
         }
         match result {
             Ok(text) => {
+                if runtime.failure_copy_plan(&key).ok().flatten().as_ref() != Some(&request.plan)
+                    || !request.plan.is_current(&request.handle.snapshot())
+                {
+                    return Task::none();
+                }
                 let context = request.context.clone();
                 let intent = request.intent;
                 clipboard_write(context, intent, text, move || {
@@ -250,7 +255,13 @@ impl Cagents {
                 })
             }
             Err(error) => {
-                runtime.error = Some(format!("Original diagnostic unavailable: {error}"));
+                if runtime.failure_plan_still_shown(&key, &request.plan)
+                    && request
+                        .plan
+                        .is_current_or_withdrawn(&request.handle.snapshot())
+                {
+                    runtime.error = Some(format!("Original diagnostic unavailable: {error}"));
+                }
                 Task::none()
             }
         }

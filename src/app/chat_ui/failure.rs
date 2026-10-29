@@ -67,20 +67,60 @@ impl CopyPlan {
             .all(|(identity, source, text)| match (identity, source) {
                 (Source::ChildItem(child, item), Some(source)) => {
                     child_copy_source(snapshot, child, item).as_ref() == Some(source)
+                        && child_source(snapshot, identity) == Some(text.as_str())
                 }
                 (_, None) => child_source(snapshot, identity) == Some(text.as_str()),
                 _ => false,
             })
     }
 
-    pub(super) fn read(&self, handle: &ClientHandle) -> Result<String, String> {
+    pub(super) fn is_current_or_withdrawn(&self, snapshot: &Snapshot) -> bool {
+        self.parts.iter().all(|(identity, source, preview)| {
+            if child_source(snapshot, identity) != Some(preview.as_str()) {
+                return false;
+            }
+            match (identity, source) {
+                (Source::ChildItem(child, item), Some(captured)) => {
+                    child_copy_source(snapshot, child, item)
+                        .as_ref()
+                        .is_none_or(|current| current == captured)
+                }
+                (_, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    pub(super) fn read(
+        &self,
+        handle: &ClientHandle,
+        current: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        self.read_with(current, |source| handle.copy_text(source.clone()))
+    }
+
+    fn read_with(
+        &self,
+        current: impl Fn() -> bool,
+        mut read: impl FnMut(&chat::TextCopySource) -> Result<String, String>,
+    ) -> Result<String, String> {
         let mut originals = Vec::new();
         let mut bytes = 0usize;
+        let started = Instant::now();
         for (_, source, literal) in &self.parts {
+            // Do not keep admitting independent reads after the user has
+            // copied something else, or accumulate per-source timeouts forever.
+            // An in-flight read retains the client's existing bounded timeout.
+            if !current() || started.elapsed() >= Duration::from_secs(30) {
+                return Err("Diagnostic copy was superseded or exceeded its read window".into());
+            }
             let text = match source {
-                Some(source) => handle.copy_text(source.clone())?,
+                Some(source) => read(source)?,
                 None => literal.clone(),
             };
+            if !current() {
+                return Err("Diagnostic copy was superseded".into());
+            }
             if !originals.contains(&text) {
                 bytes = bytes.saturating_add(text.len()).saturating_add(7);
                 if bytes > chat::TEXT_COPY_LIMIT_BYTES {
@@ -90,6 +130,73 @@ impl CopyPlan {
             }
         }
         Ok(originals.join("\n\n---\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod retained_original_tests {
+    use super::*;
+
+    #[test]
+    fn worker_assembles_distinct_originals_and_stops_after_superseding_copy() {
+        let first = format!(
+            "first request-id\r\n{}\nTAIL λ",
+            "猫 original A\n".repeat(20_000)
+        );
+        let second = "second request-id\nDistinct original B\n".to_owned();
+        let cache = uuid::Uuid::new_v4();
+        let plan = CopyPlan {
+            parts: (1..=3)
+                .map(|token| {
+                    (
+                        Source::ChildItem("child".into(), token.to_string()),
+                        Some(chat::TextCopySource {
+                            cache,
+                            scope: chat::TextCopyScope::Subagent { id: "child".into() },
+                            token,
+                            revision: 1,
+                            bytes: if token == 2 {
+                                second.len()
+                            } else {
+                                first.len()
+                            } as u64,
+                        }),
+                        "bounded preview".into(),
+                    )
+                })
+                .collect(),
+        };
+        let mut reads = Vec::new();
+        let actual = plan
+            .read_with(
+                || true,
+                |source| {
+                    reads.push(source.token);
+                    Ok(if source.token == 2 {
+                        second.clone()
+                    } else {
+                        first.clone()
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(reads, vec![1, 2, 3]);
+        assert_eq!(actual, format!("{first}\n\n---\n\n{second}"));
+        let current = std::cell::Cell::new(true);
+        let mut reads = 0;
+        let result = plan.read_with(
+            || current.get(),
+            |_| {
+                reads += 1;
+                current.set(false);
+                Ok(first.clone())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            reads, 1,
+            "a superseded worker cannot keep reading every source"
+        );
     }
 }
 
@@ -599,6 +706,20 @@ struct Preview {
 }
 
 impl Runtime {
+    pub(super) fn failure_plan_still_shown(&self, key: &str, plan: &CopyPlan) -> bool {
+        self.failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+            .is_some_and(|incident| {
+                incident.sources.len() == plan.parts.len()
+                    && incident
+                        .sources
+                        .iter()
+                        .zip(&plan.parts)
+                        .all(|(source, (captured, _, _))| source == captured)
+            })
+    }
     pub(super) fn failure_originals_retained(&self, key: &str) -> Option<bool> {
         let incident = self
             .failure_ui
@@ -676,12 +797,9 @@ impl Runtime {
                 Source::ChildDetail(_) => None,
                 _ => return Err("Original diagnostic unavailable in this view".into()),
             };
-            let literal = if source.is_none() {
-                text.into()
-            } else {
-                String::new()
-            };
-            parts.push((identity.clone(), source, literal));
+            // Capture only the bounded resident preview, including for paged
+            // originals, so withdrawal errors cannot attach to a replacement.
+            parts.push((identity.clone(), source, text.into()));
         }
         Ok(Some(CopyPlan { parts }))
     }

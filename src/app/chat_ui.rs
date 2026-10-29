@@ -25479,6 +25479,46 @@ mod tests {
     }
 
     #[test]
+    fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedback() {
+        let _context = text_copy::isolated_context();
+        for change in ["withdrawn", "replacement"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (target, key, request, _) = valid_child_failure_copy_completion(&mut app);
+            let handle = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .handle()
+                .unwrap()
+                .clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            let source = &mut snapshot
+                .text_copy_sources
+                .children
+                .get_mut("child")
+                .unwrap()[0];
+            if change == "withdrawn" {
+                *source = None;
+            } else {
+                source.as_mut().unwrap().cache = uuid::Uuid::new_v4();
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            let task = app.handle_chat_ui(Action::FailureCopied(
+                target,
+                key,
+                request,
+                Err("owned backing read failed".into()),
+            ));
+            assert_chat_copy_task_has_no_clipboard_write(task, "read errors cannot copy a preview");
+            let error = app.chat_runtime_mut(target).unwrap().error.as_deref();
+            assert_eq!(
+                error.is_some_and(|error| error.contains("Original diagnostic unavailable")),
+                change == "withdrawn"
+            );
+        }
+    }
+
+    #[test]
     fn logical_message_copy_completion_survives_parent_window_eviction() {
         let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);

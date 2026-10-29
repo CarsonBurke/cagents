@@ -11,8 +11,11 @@ const ORIGINAL_BYTES: usize = 1024 * 1024;
 const TOTAL_BYTES: usize = 8 * ORIGINAL_BYTES;
 const METADATA_BYTES: usize = 1024 * 1024;
 const RECORDS: usize = 32 * 64;
-const PREVIEW_BYTES: usize = 8192;
 const OMITTED: &str = "\n[Diagnostic preview; the original requires its retained copy source.]";
+// Match Failure::parse's complete classification prefix even for four-byte
+// Unicode scalars, while staying below the child resident item budget.
+const PREVIEW_CHARS: usize = 8192;
+const PREVIEW_BYTES: usize = PREVIEW_CHARS * 4 + OMITTED.len();
 
 struct Entry {
     key: String,
@@ -41,15 +44,17 @@ pub(super) fn project(item: &mut Item) {
     if !marked(item) {
         return;
     }
-    if let ItemContent::Delivery { body, .. } = &mut item.content
-        && body.len() > PREVIEW_BYTES
-    {
-        let mut end = PREVIEW_BYTES - OMITTED.len();
-        while !body.is_char_boundary(end) {
-            end -= 1;
+    if let ItemContent::Delivery { body, .. } = &mut item.content {
+        if let Some((end, _)) = body.char_indices().nth(PREVIEW_CHARS) {
+            let mut preview = String::with_capacity(end + OMITTED.len());
+            preview.push_str(&body[..end]);
+            preview.push_str(OMITTED);
+            // Truncation alone retains the potentially refused 32-MiB frame
+            // allocation. Replace its owner before entering resident state.
+            *body = preview;
+        } else if body.capacity() > PREVIEW_BYTES {
+            *body = body.as_str().to_owned();
         }
-        body.truncate(end);
-        body.push_str(OMITTED);
     }
 }
 
@@ -336,6 +341,9 @@ mod tests {
         assert!(marked(projected));
         assert!(projected.content.byte_len() <= 64 * 1024);
         assert!(
+            matches!(&projected.content, ItemContent::Delivery { body, .. } if body.capacity() <= PREVIEW_BYTES)
+        );
+        assert!(
             crate::chat::failure::provider_error_text(Provider::Codex, projected)
                 .unwrap()
                 .contains("Diagnostic preview")
@@ -370,6 +378,9 @@ mod tests {
         );
         assert!(state.text_copy_sources.children["child"][0].is_none());
         assert!(marked(&state.subagents[0].items[0]));
+        assert!(
+            matches!(&state.subagents[0].items[0].content, ItemContent::Delivery { body, .. } if body.capacity() <= PREVIEW_BYTES)
+        );
         assert!(backing.read("child", "same", &replacement, 0).is_err());
         assert!(backing.is_empty());
     }
@@ -452,6 +463,39 @@ mod tests {
             assert!(!directory.join("transcript.sqlite-wal").exists());
             assert!(!directory.join("transcript.sqlite-shm").exists());
         }
+    }
+
+    #[test]
+    fn unicode_classification_prefix_and_small_text_with_large_capacity_stay_truthful() {
+        let raw = format!(
+            "{}You've hit your limit · resets 3:40pm (America/Vancouver)\n{}",
+            "猫".repeat(3000),
+            "🙂".repeat(10_000)
+        );
+        let before = crate::chat::failure::Failure::parse(Provider::Codex, &raw).unwrap();
+        let mut backing = Backing::default();
+        let mut state = Snapshot::default();
+        apply(&mut backing, &mut state, notice("child", "unicode", &raw));
+        let body = crate::chat::failure::provider_error_text(
+            Provider::Codex,
+            &state.subagents[0].items[0],
+        )
+        .unwrap();
+        let after = crate::chat::failure::Failure::parse(Provider::Codex, body).unwrap();
+        assert_eq!(before.kind, after.kind);
+        assert_eq!(before.summary, after.summary);
+        assert_eq!(before.action, after.action);
+        let Event::SubagentItem { mut item, .. } = notice("child", "capacity", "small diagnostic")
+        else {
+            unreachable!()
+        };
+        if let ItemContent::Delivery { body, .. } = &mut item.content {
+            body.reserve(2 * ORIGINAL_BYTES);
+        }
+        project(&mut item);
+        assert!(
+            matches!(&item.content, ItemContent::Delivery { body, .. } if body == "small diagnostic" && body.capacity() <= PREVIEW_BYTES)
+        );
     }
 
     #[test]
