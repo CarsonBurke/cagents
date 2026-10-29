@@ -63,6 +63,8 @@ use crate::agent::Provider;
 
 mod creation;
 pub(crate) use creation::NewHomeCreationReceipt;
+mod seed;
+pub(crate) use seed::PreparedSeed;
 
 /// Where a removal parks a home while it is deleted, so a removal that is
 /// interrupted leaves a name nothing else uses, and the next start finishes
@@ -237,6 +239,43 @@ impl Homes {
                 )));
             }
             link_shared(provider, system_home, &path, codex_config);
+        }
+        created.sync_completed()?;
+        Ok((key, path))
+    }
+
+    /// Applies an already captured seed only through the fresh creation
+    /// receipt. The owning Store validates the seed before consuming Planned;
+    /// no source is reopened after mkdir, and enrollment still precedes writes.
+    pub(crate) fn create_prepared_seeded_initialized(
+        &self,
+        provider: Provider,
+        key: Uuid,
+        seed: &PreparedSeed,
+        initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        let parent = self.provider_directory(provider);
+        crate::secure_file::prepare_private_directory(&self.root)?;
+        crate::secure_file::prepare_private_directory(&parent)?;
+        let path = self.path(provider, key);
+        let created = creation::create(&parent, provider, key)?;
+        if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Account initialization failed; files were retained at {} for explicit recovery: {error}",
+                    path.display(),
+                ),
+            ));
+        }
+        if let Err(error) = seed.apply_to(&created) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Account seeding failed; files were retained at {} for explicit recovery: {error}",
+                    path.display(),
+                ),
+            ));
         }
         created.sync_completed()?;
         Ok((key, path))

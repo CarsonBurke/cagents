@@ -515,6 +515,18 @@ fn ensure_startup_recovery_request(
     ))
 }
 
+pub(super) fn admit_preparation_create(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: &ClientRequest,
+) -> Result<(), ProtocolError> {
+    ensure_request_open(host, request)?;
+    ensure_startup_recovery_request(host, request)?;
+    super::agent_execution::terminals::admit(host, client_id, request)?;
+    super::account_lifecycle::admit(host, request)?;
+    super::worktree_removal::admit(host, request)
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
@@ -523,6 +535,28 @@ pub(super) fn process_request(
     ensure_request_open(host, &request)?;
     ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
+    // Create installs a short physical writer and later enrolls its receipt
+    // under another short writer. Never carry the ordinary metadata reader
+    // into either boundary or into filesystem work.
+    if let ClientRequest::DeviceOperation {
+        operation:
+            crate::device_service::Operation::AccountPreparation {
+                request:
+                    request @ crate::account::preparation::AccountPreparationRequest::Preparation(
+                        crate::account::preparation::PreparationRequest::Create { .. },
+                    ),
+            },
+    } = &request
+    {
+        let reply = super::account_preparation::create(host, client_id, request.clone())?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountPreparation(reply),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -631,10 +665,7 @@ pub(super) fn process_request(
                     // upgrade cannot cross this admitted operation. No
                     // HostState guard is retained during filesystem work.
                     super::account_lifecycle::ensure_idle(host)?;
-                    let reply = match (
-                        crate::account::registry::Store::installation(),
-                        crate::account::home::Homes::installation(),
-                    ) {
+                    let reply = match super::account_preparation::metadata_stores() {
                         (Some(store), Some(homes)) => {
                             crate::account::preparation_api::MetadataPreparationApi::new(store, homes)
                                 .handle(request)

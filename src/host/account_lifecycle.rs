@@ -266,6 +266,16 @@ impl Reservation {
         store: Store,
         installed_homes: Option<&crate::account::home::Homes>,
     ) -> Result<Self, ProtocolError> {
+        Self::install_with_store_authorized(host, accounts, store, installed_homes, || Ok(()))
+    }
+
+    fn install_with_store_authorized(
+        host: &SharedHost,
+        accounts: &[Account],
+        store: Store,
+        installed_homes: Option<&crate::account::home::Homes>,
+        authorize_original: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<Self, ProtocolError> {
         let gate = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -347,6 +357,9 @@ impl Reservation {
         }
         let writer = super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
+        // The callback may inspect HostState. It must precede the map mutex
+        // and may not perform filesystem work or retain a state guard.
+        authorize_original()?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
             return Err(refusal(
@@ -715,6 +728,162 @@ impl Reservation {
             }
         }
         Ok(())
+    }
+}
+
+/// Physical authority for exactly one persisted preparation. No request can
+/// deserialize, clone, replace, or select the operands of this token.
+pub(super) struct PreparedCreationReservation {
+    reservation: Reservation,
+    binding: crate::account::preparation::PreparationBinding,
+    homes: crate::account::home::Homes,
+    seed: crate::account::home::PreparedSeed,
+}
+
+pub(super) enum PreparedAdmission {
+    ReplayNeeded,
+    Reserved(PreparedCreationReservation),
+}
+
+impl PreparedCreationReservation {
+    pub(super) fn reserve(
+        host: &SharedHost,
+        store: Store,
+        homes: crate::account::home::Homes,
+        binding: &crate::account::preparation::PreparationBinding,
+        source: impl FnOnce() -> std::io::Result<super::account_preparation::SeedSelection>,
+        authorize_original: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<PreparedAdmission, ProtocolError> {
+        use crate::account::{AccountHome, home::CodexConfig, preparation::PreparationState};
+        // Stable retained replay has no dependency on the current System
+        // selector or physical homes. Do this before even calling source().
+        let registry = store
+            .try_load()
+            .map_err(|error| refusal(error.to_string()))?;
+        let planned = registry
+            .preparation(binding.request_id)
+            .filter(|record| {
+                &record.binding == binding
+                    && registry.installation_id() == Some(binding.installation_id)
+            })
+            .ok_or_else(|| refusal("The account setup binding does not match this installation"))?;
+        if planned.state != PreparationState::Planned {
+            return Ok(PreparedAdmission::ReplayNeeded);
+        }
+        let planned = planned.clone();
+        let source = source().map_err(|error| refusal(error.to_string()))?;
+        let provider = binding.payload.provider;
+        let accounts = [
+            Account {
+                provider,
+                home: AccountHome::SystemAt {
+                    path: source.system.clone(),
+                },
+            },
+            Account::managed(provider, binding.key, homes.path(provider, binding.key)),
+        ];
+        let mut reservation = Reservation::install_with_store_authorized(
+            host,
+            &accounts,
+            store,
+            Some(&homes),
+            authorize_original,
+        )?;
+        let captured = reservation
+            .registered
+            .iter()
+            .find(|(key, ..)| *key == binding.key)
+            .ok_or_else(|| refusal("The planned setup is absent from its reservation"))?;
+        if captured.1.is_some()
+            || captured.2.is_some()
+            || captured.3.as_ref() != Some(&planned)
+            || captured.4.is_some()
+            || captured.5
+        {
+            return Err(refusal(
+                "The planned account setup changed during physical admission",
+            ));
+        }
+        let current = reservation.current().map_err(refusal)?;
+        if current.homes.get(1).is_none_or(|home| home.pin.is_some()) {
+            return Err(refusal(
+                "The planned new home already exists; it was not adopted or changed",
+            ));
+        }
+        reservation.create = Some((provider, binding.key));
+        let system = current
+            .homes
+            .first()
+            .ok_or_else(|| refusal("The original System source is absent from its reservation"))?;
+        let seed = crate::account::home::PreparedSeed::capture(
+            provider,
+            if binding.payload.copy_codex_config {
+                CodexConfig::Copy
+            } else {
+                CodexConfig::Shared
+            },
+            &source.system,
+            system.pin.as_deref(),
+            source.claude_global.as_deref(),
+        )
+        .map_err(|error| refusal(error.to_string()))?;
+        reservation.verify().map_err(refusal)?;
+        Ok(PreparedAdmission::Reserved(Self {
+            reservation,
+            binding: binding.clone(),
+            homes,
+            seed,
+        }))
+    }
+
+    pub(super) fn create(&self) -> std::io::Result<crate::account::preparation::Preparation> {
+        self.create_initialized(|_| Ok(()), |_| Ok(()))
+    }
+
+    fn create_initialized(
+        &self,
+        initialize: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>,
+        after_seed: impl FnOnce(&(uuid::Uuid, PathBuf)) -> std::io::Result<()>,
+    ) -> std::io::Result<crate::account::preparation::Preparation> {
+        let binding = &self.binding;
+        self.reservation.store.create_prepared(
+            &self.homes,
+            binding,
+            true,
+            |registry| {
+                if self.reservation.create != Some((binding.payload.provider, binding.key)) {
+                    return Err(std::io::Error::other(
+                        "Creation no longer matches its exact reservation",
+                    ));
+                }
+                self.reservation
+                    .verify_registry(registry)
+                    .map_err(std::io::Error::other)?;
+                self.seed.revalidate()
+            },
+            || {
+                let result = self.homes.create_prepared_seeded_initialized(
+                    binding.payload.provider,
+                    binding.key,
+                    &self.seed,
+                    |created| {
+                        self.reservation.enroll_created_home(created)?;
+                        initialize(created)
+                    },
+                )?;
+                after_seed(&result)?;
+                Ok(result)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_for_test(
+        &self,
+        initialize: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>,
+        after_seed: impl FnOnce(&(uuid::Uuid, PathBuf)) -> std::io::Result<()>,
+    ) -> std::io::Result<crate::account::preparation::Preparation> {
+        self.create_initialized(initialize, after_seed)
     }
 }
 

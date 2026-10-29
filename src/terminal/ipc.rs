@@ -197,10 +197,11 @@ use crate::{
 /// reserved for the separate native Goal integration and is not adopted here.
 /// Version 143 preserves this branch's version-127 contracts and appends typed
 /// AccountPreparation device request/reply variants. Its owning host requires
-/// explicit User connection scope and metadata admission. Matched executables
+/// explicit User connection scope and metadata/physical admission. Matched executables
 /// are required; this does not adopt unrelated private protocol experiments.
-/// Create and installation-less observations remain pre-storage refusals in
-/// the metadata facade; transport does not complete the account setup flow.
+/// The metadata facade refuses Create without physical authority; owning HOST
+/// admission can create its exact planned home. Installation-less observations
+/// remain refused. Transport alone does not complete the account setup flow.
 pub const PROTOCOL_VERSION: u16 = 143;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

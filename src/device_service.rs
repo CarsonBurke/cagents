@@ -79,8 +79,8 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
-    /// Retained setup metadata on the selected daemon. Appended wire tag;
-    /// this route grants no home creation, login, or registration authority.
+    /// Retained setup on the selected daemon. Create additionally requires its
+    /// exact physical reservation; replies grant no login/registration authority.
     AccountPreparation {
         request: crate::account::preparation::AccountPreparationRequest,
     },

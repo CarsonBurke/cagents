@@ -54,8 +54,17 @@ fn operation(request: AccountPreparationRequest) -> Operation {
     Operation::AccountPreparation { request }
 }
 
-fn create() -> AccountPreparationRequest {
-    AccountPreparationRequest::Preparation(PreparationRequest::Create { binding: binding() })
+fn refused_metadata() -> AccountPreparationRequest {
+    // Policy tests must not enter physical Create or inspect ambient System
+    // configuration. This request is explicitly refused before storage.
+    AccountPreparationRequest::ExistingPending(ExistingPendingRequest::Resume {
+        target: ExistingPendingTarget::Observed {
+            provider: Provider::Codex,
+            key: Uuid::from_u128(3),
+            started_at: 17,
+            expected_installation: None,
+        },
+    })
 }
 
 fn authenticate_user(host: &SharedHost, client: u64) {
@@ -102,13 +111,15 @@ fn account_preparation_requires_registered_explicit_user_without_delegation_fall
     let host = host();
     for client in [USER, AGENT, 99] {
         assert_eq!(
-            dispatch(&host, client, create()).unwrap_err().code,
+            dispatch(&host, client, refused_metadata())
+                .unwrap_err()
+                .code,
             ProtocolErrorCode::PermissionDenied
         );
     }
     authenticate_user(&host, USER);
-    let reply = dispatch(&host, USER, create()).unwrap();
-    assert_eq!(reply.request, create());
+    let reply = dispatch(&host, USER, refused_metadata()).unwrap();
+    assert_eq!(reply.request, refused_metadata());
     assert!(matches!(
         reply.outcome,
         AccountPreparationOutcome::NotAttempted { .. }
@@ -118,12 +129,12 @@ fn account_preparation_requires_registered_explicit_user_without_delegation_fall
     // but default authentication cannot upgrade a verified delegated client.
     authenticate_user(&host, AGENT);
     assert_eq!(
-        dispatch(&host, AGENT, create()).unwrap_err().code,
+        dispatch(&host, AGENT, refused_metadata()).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
     authenticate_user(&host, 99);
     assert_eq!(
-        dispatch(&host, 99, create()).unwrap_err().code,
+        dispatch(&host, 99, refused_metadata()).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
 
@@ -139,12 +150,12 @@ fn account_preparation_requires_registered_explicit_user_without_delegation_fall
     .unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
     assert_eq!(
-        dispatch(&host, USER, create()).unwrap_err().code,
+        dispatch(&host, USER, refused_metadata()).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
     authenticate_user(&host, USER);
     assert_eq!(
-        dispatch(&host, USER, create()).unwrap_err().code,
+        dispatch(&host, USER, refused_metadata()).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
 }
@@ -168,7 +179,7 @@ fn account_preparation_scope_is_removed_at_both_disconnect_edges_and_id_reuse() 
             assert!(!state.account_preparation_callers.contains_key(&USER));
         }
         assert_eq!(
-            dispatch(&host, USER, create()).unwrap_err().code,
+            dispatch(&host, USER, refused_metadata()).unwrap_err().code,
             ProtocolErrorCode::PermissionDenied
         );
     }
@@ -183,14 +194,18 @@ fn account_preparation_preserves_recovery_shutdown_and_physical_lifecycle_admiss
         .unwrap()
         .retain_startup_recovery("original owner retained".into());
     assert_eq!(
-        dispatch(&recovering, USER, create()).unwrap_err().code,
+        dispatch(&recovering, USER, refused_metadata())
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::TerminalUnavailable
     );
     let shutdown = host();
     authenticate_user(&shutdown, USER);
     shutdown.lock().unwrap().shutting_down = true;
     assert_eq!(
-        dispatch(&shutdown, USER, create()).unwrap_err().code,
+        dispatch(&shutdown, USER, refused_metadata())
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::TerminalUnavailable
     );
     let host = host();
@@ -203,7 +218,7 @@ fn account_preparation_preserves_recovery_shutdown_and_physical_lifecycle_admiss
         &Homes::at(root.path().join("homes")),
     )
     .unwrap();
-    let error = dispatch(&host, USER, create()).unwrap_err();
+    let error = dispatch(&host, USER, refused_metadata()).unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
     assert!(
         error
@@ -212,7 +227,7 @@ fn account_preparation_preserves_recovery_shutdown_and_physical_lifecycle_admiss
     );
     drop(reservation);
     assert!(matches!(
-        dispatch(&host, USER, create()).unwrap().outcome,
+        dispatch(&host, USER, refused_metadata()).unwrap().outcome,
         AccountPreparationOutcome::NotAttempted { .. }
     ));
 }
@@ -220,7 +235,7 @@ fn account_preparation_preserves_recovery_shutdown_and_physical_lifecycle_admiss
 #[test]
 fn account_preparation_cannot_bypass_host_admission_through_generic_execute() {
     assert!(
-        crate::device_service::execute(operation(create()))
+        crate::device_service::execute(operation(refused_metadata()))
             .unwrap_err()
             .contains("explicit user and daemon admission")
     );
@@ -273,7 +288,7 @@ fn account_preparation_actual_host_wire_refuses_anonymous_failed_delegation_and_
         }
     ));
     let request = || ClientRequest::DeviceOperation {
-        operation: operation(create()),
+        operation: operation(refused_metadata()),
     };
     let refused = |message| {
         let ServerMessage::Error(error) = message else {
@@ -343,24 +358,32 @@ fn account_preparation_actual_host_wire_mutates_only_the_selected_installation_m
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let serving = Arc::clone(&host);
+    let server_store = Store::installation().unwrap();
+    let server_homes = Homes::installation().unwrap();
+    let source = crate::host::account_preparation::SeedSelection {
+        system: root.join("unused-private-metadata-source"),
+        claude_global: None,
+    };
     let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    super::serve(stream, 10, serving);
-                    break;
+        crate::host::account_preparation::with_fixture(server_store, server_homes, source, || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        super::serve(stream, 10, serving);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "private HOST connection was not opened"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("private HOST listener: {error}"),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "private HOST connection was not opened"
-                    );
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => panic!("private HOST listener: {error}"),
             }
-        }
+        })
     });
     let mut client = crate::control::ControlClient::connect(&socket).unwrap();
     // Predetermined synthetic User policy fixture, unrelated to inherited scope.
@@ -397,12 +420,7 @@ fn account_preparation_actual_host_wire_mutates_only_the_selected_installation_m
     );
     let before_refusal = store.load().unwrap();
     assert!(matches!(
-        ask(
-            &mut client,
-            AccountPreparationRequest::Preparation(PreparationRequest::Create {
-                binding: planned.binding.clone(),
-            })
-        ),
+        ask(&mut client, refused_metadata()),
         AccountPreparationOutcome::NotAttempted { .. }
     ));
     assert_eq!(store.load().unwrap(), before_refusal);
