@@ -476,7 +476,11 @@ impl Cagents {
                 .is_some_and(|card| card.existence.is_open())
     }
 
-    pub(super) fn quarantine_copy_allowed(&self, card: CardId, nonce: uuid::Uuid) -> bool {
+    pub(super) fn quarantine_presentation_action_allowed(
+        &self,
+        card: CardId,
+        nonce: uuid::Uuid,
+    ) -> bool {
         self.quarantine_action_allowed(card)
             && self
                 .shared_views
@@ -522,10 +526,15 @@ impl Cagents {
                         .map(|nonce| Message::CopyQuarantinedDraft(card, nonce)),
                 )
                 .into(),
-            crate::ui_controls::button::secondary("Remove saved pane")
-                .id(card_control_id(card, "quarantine.remove"))
-                .on_press(Message::CloseCard(card))
-                .into(),
+            crate::ui_controls::owned(
+                (card, action, "remove"),
+                crate::ui_controls::button::secondary("Remove saved pane")
+                    .id(card_control_id(card, "quarantine.remove"))
+                    .on_press_maybe(
+                        action.map(|nonce| Message::RemoveQuarantinedPane(card, nonce)),
+                    ),
+            )
+            .into(),
         ])
         .spacing(space::S as u16);
         let mut content = vec![
@@ -620,7 +629,7 @@ impl Cagents {
     }
 
     pub(super) fn dismiss_quarantined_pane(&mut self, card: CardId) -> Task<Message> {
-        if !self.shared_views.quarantined.contains(&card)
+        if !self.pane_is_quarantined(card)
             || !self
                 .card_state(card)
                 .is_some_and(|card| card.existence.is_open())

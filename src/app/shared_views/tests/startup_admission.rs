@@ -85,6 +85,8 @@ fn current_owner(pane: &mut Pane) -> Session {
 struct ScriptedDaemon {
     providers: Arc<Mutex<Vec<Session>>>,
     resolutions: Arc<Mutex<Vec<Session>>>,
+    controls: Arc<Mutex<Vec<ClientRequest>>>,
+    inventory: Arc<Mutex<Vec<Session>>>,
     connections: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     stopped: Arc<AtomicBool>,
     visibility_cancellations: Arc<AtomicUsize>,
@@ -119,6 +121,13 @@ impl ScriptedDaemon {
         listener.set_nonblocking(true).unwrap();
         let providers = Arc::new(Mutex::new(Vec::new()));
         let resolutions = Arc::new(Mutex::new(Vec::new()));
+        let controls = Arc::new(Mutex::new(Vec::new()));
+        let inventory = Arc::new(Mutex::new(
+            upgrade
+                .as_ref()
+                .map(|script| vec![script.canonical.clone()])
+                .unwrap_or_default(),
+        ));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let visibility_cancellations = Arc::new(AtomicUsize::new(0));
@@ -126,6 +135,8 @@ impl ScriptedDaemon {
         let cancellations = visibility_cancellations.clone();
         let recorded = providers.clone();
         let resolved = resolutions.clone();
+        let control_requests = controls.clone();
+        let listed_inventory = inventory.clone();
         let sockets = connections.clone();
         let stop = stopped.clone();
         let worker = std::thread::spawn(move || {
@@ -150,6 +161,8 @@ impl ScriptedDaemon {
                 drop(held);
                 let recorded = recorded.clone();
                 let resolved = resolved.clone();
+                let control_requests = control_requests.clone();
+                let listed_inventory = listed_inventory.clone();
                 let proof = proof.clone();
                 let upgrade = upgrade.clone();
                 let stop = stop.clone();
@@ -171,6 +184,7 @@ impl ScriptedDaemon {
                             ClientRequest::ChatVisibility { chat_id, .. }
                                 if upgrade.as_ref().is_some_and(|script| *chat_id == script.canonical.id)
                         );
+                        control_requests.lock().unwrap().push(request.request.clone());
                         let message = match request.request {
                             ClientRequest::Connect { .. } => ServerMessage::Response {
                                 response: ServerResponse::Connected {
@@ -178,6 +192,11 @@ impl ScriptedDaemon {
                                     resumed: Vec::new(),
                                 },
                             },
+                            ClientRequest::List => ServerMessage::Response { response: ServerResponse::Listed { terminals: Vec::new() } },
+                            ClientRequest::ChatList => ServerMessage::Response { response: ServerResponse::ChatListed { sessions: listed_inventory.lock().unwrap().clone() } },
+                            ClientRequest::ChatClose { chat_id } => ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot: Default::default() } },
+                            ClientRequest::ChatCloseRetained { .. } => ServerMessage::Response { response: ServerResponse::Accepted },
+                            ClientRequest::CloseTerminalChecked { terminal_id, .. } => ServerMessage::Response { response: ServerResponse::TerminalCloseChecked { terminal_id, outcome: crate::terminal::ipc::TerminalCloseResult::Closed } },
                             ClientRequest::ResolveUpgradeChat { source } => {
                                 resolved.lock().unwrap().push(source.clone());
                                 if let Some(script) = &upgrade {
@@ -298,6 +317,8 @@ impl ScriptedDaemon {
         Self {
             providers,
             resolutions,
+            controls,
+            inventory,
             connections,
             stopped,
             visibility_cancellations,
@@ -1236,6 +1257,302 @@ fn stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence() {
         !matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(_))),
         "fresh exact validation clears the fixed failure and re-enters normal admission"
     );
+}
+
+#[test]
+fn quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner() {
+    assert!(
+        crate::agent_execution::Authority::from_environment()
+            .token()
+            .is_none(),
+        "This scripted IPC fixture requires a genuine User invocation before subprocess isolation; inherited caller authority must not be cleared"
+    );
+    if isolated("quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner") {
+        return;
+    }
+    let (_, _, _, mut initial_pane, _) = cached_chat();
+    let source = current_owner(&mut initial_pane);
+    let daemon = ScriptedDaemon::with_owner(source);
+    for retained in [false, true] {
+        for route in ["chrome", "failed-button", "unasked", "commit", "chat-entry"] {
+            let (mut app, active, hidden, mut pane, identity) = cached_chat();
+            current_owner(&mut pane);
+            let CardKind::Chat(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            if retained {
+                session.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            }
+            let source = session.clone();
+            *daemon.inventory.lock().unwrap() = vec![source.clone()];
+            app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+            Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+                pane.id,
+                "Keep local removal payload".into(),
+            )]));
+            let mut view = View::empty(hidden);
+            view.panes.push(pane.clone());
+            let mut full = model(identity, active, hidden, view);
+            let mut owner = managed_owner(&pane, hidden);
+            owner.closed = true;
+            full.agents.push(owner);
+            app.workspace_model = full.clone();
+            app.refresh_managed_pane_quarantine(&full);
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Failed(_))
+            ));
+            let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
+            let inventory = crate::control::ControlClient::connect(&socket)
+                .unwrap()
+                .list_chats()
+                .unwrap();
+            assert_eq!(
+                inventory,
+                vec![source.clone()],
+                "the rejected identity is still a real inventory target"
+            );
+            let before = daemon.controls.lock().unwrap().len();
+            let task = match route {
+                "chrome" => app.update(Message::CloseCard(pane.id)),
+                "failed-button" => {
+                    let message = click_quarantined_remove(&app, pane.id);
+                    app.update(message)
+                }
+                "unasked" => app.update(Message::CloseCardUnasked(pane.id)),
+                "commit" => app.update(Message::CommitClose(pane.id)),
+                "chat-entry" => app.begin_chat_close(pane.id),
+                _ => unreachable!(),
+            };
+            settle(&mut app, task);
+            assert_eq!(
+                daemon.controls.lock().unwrap().len(),
+                before,
+                "{route}/{retained}: local presentation removal does not even query or attach inventory"
+            );
+            assert!(
+                daemon.requests().is_empty(),
+                "no provider start or attachment"
+            );
+            assert!(!app.chat_close_owned(pane.id));
+            let saved = app.persistent_workspace();
+            let history = saved.cards.iter().find(|card| card.id == pane.id).unwrap();
+            assert!(!history.existence.is_open(), "{route}/{retained}");
+            assert_eq!(history.kind, pane.kind);
+            assert_eq!(saved.quarantined_panes.get(&pane.id), Some(&pane.kind));
+            assert_eq!(saved.chat_drafts[&pane.id], "Keep local removal payload");
+            assert!(!app.workspace.order().any(|id| id == pane.id));
+            assert_eq!(
+                crate::control::ControlClient::connect(&socket)
+                    .unwrap()
+                    .list_chats()
+                    .unwrap(),
+                vec![source]
+            );
+        }
+    }
+    assert!(
+        !daemon
+            .controls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(
+                request,
+                ClientRequest::ChatClose { .. }
+                    | ClientRequest::ChatCloseRetained { .. }
+                    | ClientRequest::CloseTerminalChecked { .. }
+            ))
+    );
+}
+
+fn click_quarantined_remove(app: &Cagents, card: CardId) -> Message {
+    use cosmic::iced::advanced::{
+        Layout, Shell, clipboard, layout,
+        widget::{Operation, Tree, operation::Focusable},
+    };
+    use cosmic::iced::{Event, Rectangle, Size, mouse};
+    struct Bounds {
+        id: widget::Id,
+        bounds: Option<Rectangle>,
+    }
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            if id == Some(&self.id) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = app.quarantined_pane_view(card);
+    let mut tree = Tree::new(element.as_widget());
+    let size = Size::new(1200.0, 900.0);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, size),
+    );
+    let mut bounds = Bounds {
+        id: card_control_id(card, "quarantine.remove"),
+        bounds: None,
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+    let point = bounds
+        .bounds
+        .expect("the actual failed view exposes its Remove saved pane control")
+        .center();
+    let mut messages = Vec::new();
+    for event in [
+        mouse::Event::ButtonPressed(mouse::Button::Left),
+        mouse::Event::ButtonReleased(mouse::Button::Left),
+    ] {
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(size),
+        );
+    }
+    assert_eq!(messages.len(), 1);
+    let message = messages.pop().unwrap();
+    assert!(
+        matches!(&message, Message::RemoveQuarantinedPane(id, nonce) if *id == card && *nonce == app.shared_views.quarantine_actions[&card].nonce)
+    );
+    message
+}
+
+#[test]
+fn queued_failed_remove_cannot_close_an_exactly_repaired_chat() {
+    for retained in [false, true] {
+        let (mut app, active, hidden, mut pane, identity) = cached_chat();
+        current_owner(&mut pane);
+        if retained {
+            let CardKind::Chat(source) = &mut pane.kind else {
+                unreachable!()
+            };
+            source.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let mut rejected = model(identity, active, hidden, view);
+        let mut owner = managed_owner(&pane, hidden);
+        owner.closed = true;
+        rejected.agents.push(owner);
+        app.workspace_model = rejected.clone();
+        app.refresh_managed_pane_quarantine(&rejected);
+        let queued = click_quarantined_remove(&app, pane.id);
+        let mut repaired = rejected;
+        repaired.sequence += 1;
+        repaired.agents[0].closed = false;
+        app.refresh_managed_pane_quarantine(&repaired);
+        app.workspace_model = repaired;
+        assert!(!app.pane_is_quarantined(pane.id));
+        let task = app.update(queued);
+        assert!(
+            cosmic::iced::runtime::task::into_stream(task).is_none(),
+            "stale failed-pane removal emits no host close task after exact repair"
+        );
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(!app.chat_close_owned(pane.id));
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn held_failed_remove_press_cannot_migrate_to_a_successor_quarantine_presentation() {
+    use cosmic::iced::advanced::{
+        clipboard,
+        widget::{Operation, operation::Focusable},
+    };
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    use cosmic::iced::{Event, Rectangle, Size, mouse};
+    struct Bounds {
+        id: widget::Id,
+        bounds: Option<Rectangle>,
+    }
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            if id == Some(&self.id) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    for replacement in ["source", "presentation"] {
+        let (mut app, _, _, pane, _) = cached_chat();
+        app.shared_views.quarantined.insert(pane.id);
+        app.present_quarantined_pane(pane.id);
+        let original = app.shared_views.quarantine_actions[&pane.id].nonce;
+        let mut cache = Cache::new();
+        let mut renderer = crate::app::tests::headless_renderer();
+        // The runtime cache extracts and restores the actual named button's
+        // native state across frames, including a held mouse press.
+        let mut frame = |app: &Cagents, event| {
+            let mut ui = UserInterface::build(
+                app.quarantined_pane_view(pane.id),
+                Size::new(1200.0, 900.0),
+                std::mem::replace(&mut cache, Cache::new()),
+                &mut renderer,
+            );
+            let mut bounds = Bounds {
+                id: card_control_id(pane.id, "quarantine.remove"),
+                bounds: None,
+            };
+            ui.operate(&renderer, &mut bounds);
+            let point = bounds.bounds.expect("actual failed Remove button").center();
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            cache = ui.into_cache();
+            messages
+        };
+        assert!(frame(&app, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+        if replacement == "source" {
+            let CardKind::Chat(source) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+                unreachable!()
+            };
+            source.id = TerminalId::new();
+        } else {
+            app.shared_views.quarantine_actions.remove(&pane.id);
+        }
+        app.present_quarantined_pane(pane.id);
+        let successor = app.shared_views.quarantine_actions[&pane.id].nonce;
+        assert_ne!(successor, original);
+        assert!(
+            frame(&app, mouse::Event::ButtonReleased(mouse::Button::Left)).is_empty(),
+            "a held {replacement} press must not remove the replacement saved pane"
+        );
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(frame(&app, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+        let messages = frame(&app, mouse::Event::ButtonReleased(mouse::Button::Left));
+        assert_eq!(messages.len(), 1, "a fresh press remains usable");
+        assert!(matches!(
+            &messages[0],
+            Message::RemoveQuarantinedPane(card, nonce) if *card == pane.id && *nonce == successor
+        ));
+    }
 }
 
 #[test]

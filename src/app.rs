@@ -2752,6 +2752,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::RecheckQuarantinedPane(_)
         | Message::CopyQuarantinedDraft(..)
         | Message::CopyQuarantinedAttachmentPaths(..)
+        | Message::RemoveQuarantinedPane(..)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -4529,6 +4530,7 @@ pub enum Message {
     RecheckQuarantinedPane(CardId),
     CopyQuarantinedDraft(CardId, uuid::Uuid),
     CopyQuarantinedAttachmentPaths(CardId, uuid::Uuid),
+    RemoveQuarantinedPane(CardId, uuid::Uuid),
     QuarantinedPaneChecked {
         card: CardId,
         check: shared_views::PaneRecheck,
@@ -16166,6 +16168,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::CloseCard(id) | Message::CloseCardUnasked(id) if self.pane_is_quarantined(id) => self.dismiss_quarantined_pane(id),
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
@@ -16555,6 +16558,7 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
+                if self.pane_is_quarantined(id) { return self.dismiss_quarantined_pane(id); }
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
@@ -16847,7 +16851,7 @@ impl Application for Cagents {
             Message::RetryCard(card) => self.retry_card(card),
             Message::RecheckQuarantinedPane(card) => self.recheck_quarantined_pane(card),
             Message::CopyQuarantinedDraft(card, nonce) => {
-                if !self.quarantine_copy_allowed(card, nonce) { return Task::none(); }
+                if !self.quarantine_presentation_action_allowed(card, nonce) { return Task::none(); }
                 if let Some(text) = self.quarantined_pane_draft(card).filter(|text| !text.is_empty()).map(str::to_owned) {
                     chat_ui::invalidate_copy_intent();
                     self.status = Some(TransientNotice::success("Copied saved draft"));
@@ -16855,6 +16859,10 @@ impl Application for Cagents {
                 } else { Task::none() }
             },
             Message::CopyQuarantinedAttachmentPaths(card, nonce) => self.copy_quarantined_attachment_paths(card, nonce),
+            Message::RemoveQuarantinedPane(card, nonce) => {
+                if !self.quarantine_presentation_action_allowed(card, nonce) { return Task::none(); }
+                self.dismiss_quarantined_pane(card)
+            }
             Message::QuarantinedPaneChecked { card, check, result } => {
                 if self.shared_views.rechecking.get(&card) != Some(&check) { return Task::none(); }
                 self.shared_views.rechecking.remove(&card);

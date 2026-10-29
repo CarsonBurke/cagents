@@ -6729,7 +6729,7 @@ impl Cagents {
         card: CardId,
         nonce: uuid::Uuid,
     ) -> Task<Message> {
-        if !self.quarantine_copy_allowed(card, nonce) {
+        if !self.quarantine_presentation_action_allowed(card, nonce) {
             return Task::none();
         }
         let paths = self
@@ -7035,6 +7035,9 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_is_quarantined(card) {
+            return self.dismiss_quarantined_pane(card);
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -26403,6 +26406,7 @@ mod tests {
                 Message::RecheckQuarantinedPane(id),
                 Message::CopyQuarantinedDraft(id, nonce),
                 Message::CopyQuarantinedAttachmentPaths(id, nonce),
+                Message::RemoveQuarantinedPane(id, nonce),
             ] {
                 assert_chat_copy_task_has_no_effects(app.update(message), block);
                 assert!(app.shared_views.rechecking.is_empty());
@@ -26453,6 +26457,7 @@ mod tests {
             for message in [
                 Message::CopyQuarantinedDraft(id, old),
                 Message::CopyQuarantinedAttachmentPaths(id, old),
+                Message::RemoveQuarantinedPane(id, old),
             ] {
                 assert_chat_copy_task_has_no_effects(app.update(message), replacement);
             }
