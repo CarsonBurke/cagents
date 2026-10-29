@@ -71,6 +71,36 @@ pub fn restore_cached_named_states(tree: &mut widget::Tree) {
     }
 }
 
+/// Focus only a current enabled accessibility target that actually offers
+/// focus. Activating a ComboBox first transfers real widget focus; activating
+/// one of its options leaves focus on the owning control.
+#[cfg(feature = "a11y")]
+pub fn accessibility_focus_target(
+    nodes: &iced_accessibility::A11yTree,
+    request: &iced_accessibility::accesskit::ActionRequest,
+) -> Option<widget::Id> {
+    use iced_accessibility::accesskit::{Action, NodeId, Role};
+    let node = nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .find(|node| NodeId::from(node.id().clone()) == request.target_node)?
+        .node();
+    if node.is_disabled() || !node.supports_action(Action::Focus) {
+        return None;
+    }
+    match request.action {
+        Action::Focus => Some(widget::Id::from(request.target_node.0)),
+        Action::Click | Action::Expand
+            if node.role() == Role::ComboBox
+                && node.supports_action(request.action) =>
+        {
+            Some(widget::Id::from(request.target_node.0))
+        }
+        _ => None,
+    }
+}
+
 impl<'a, Message, Theme, Renderer> UserInterface<'a, Message, Theme, Renderer>
 where
     Renderer: crate::core::Renderer,
@@ -719,6 +749,28 @@ where
             &self.state,
             cursor,
         )
+    }
+
+    /// Apply the same focus preflight before queuing native accessibility
+    /// events. A later queued target supersedes an earlier one; widgets must
+    /// not recreate focus merely by replaying their older queued request.
+    #[cfg(feature = "a11y")]
+    pub fn focus_accessibility_action(
+        &mut self,
+        renderer: &Renderer,
+        request: &iced_accessibility::accesskit::ActionRequest,
+    ) -> bool {
+        let Some(target) = accessibility_focus_target(
+            &self.a11y_nodes(mouse::Cursor::Unavailable),
+            request,
+        ) else {
+            return false;
+        };
+        self.operate(
+            renderer,
+            &mut widget::operation::focusable::focus::<()>(target),
+        );
+        true
     }
 
     /// Find widget with given id

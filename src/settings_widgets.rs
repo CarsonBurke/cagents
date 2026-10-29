@@ -186,6 +186,9 @@ pub fn editor_options<'a, Message: Clone + 'static>(
             "Syntax theme",
             "Syntax highlighting in editors and diffs. Match app follows the application appearance theme.",
             crate::ui_controls::field::select(
+                "Syntax theme",
+                "settings.syntax-theme",
+                "editor-syntax-themes",
                 EditorSyntaxTheme::ALL
                     .iter()
                     .map(|theme| theme.label().to_owned())

@@ -5195,6 +5195,8 @@ impl Editor {
                                     .position(|theme| *theme == self.settings.app_theme),
                                 |index| Message::Theme(AppTheme::ALL[index]),
                             )
+                            .name("App theme")
+                            .id(widget::Id::new("ceditor.settings.app-theme"))
                             .into(),
                         ),
                         settings_field(
