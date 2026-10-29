@@ -1290,6 +1290,16 @@ fn write_with_directory_sync(
     registry: &Registry,
     sync: impl FnOnce(&super::durability::Directories) -> io::Result<()>,
 ) -> io::Result<()> {
+    write_with_io(directory, path, registry, || Ok(()), sync)
+}
+
+fn write_with_io(
+    directory: &Path,
+    path: &Path,
+    registry: &Registry,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync: impl FnOnce(&super::durability::Directories) -> io::Result<()>,
+) -> io::Result<()> {
     registry.validate_preparations()?;
     let namespace = super::durability::Directories::capture(directory)?;
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
@@ -1308,6 +1318,7 @@ fn write_with_directory_sync(
         .tempfile_in(directory)?;
     temporary.write_all(document.as_bytes())?;
     temporary.as_file().sync_all()?;
+    before_publish()?;
     // The rename replaces whatever is at `path` - a link included - rather
     // than writing through it.
     temporary.persist(path).map_err(|error| error.error)?;

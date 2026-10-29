@@ -235,6 +235,27 @@ impl Store {
         validate: impl FnOnce(&Registry) -> io::Result<()>,
         create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
     ) -> io::Result<Preparation> {
+        self.create_prepared_with_io(
+            homes,
+            binding,
+            nonblocking,
+            validate,
+            create,
+            |registry| self.persist_preparation(registry),
+            |namespace| namespace.sync(),
+        )
+    }
+
+    fn create_prepared_with_io(
+        &self,
+        homes: &Homes,
+        binding: &PreparationBinding,
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+        mut persist: impl FnMut(&mut Registry) -> io::Result<()>,
+        sync_replay: impl FnOnce(&super::super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<Preparation> {
         let _lifecycle = if nonblocking {
             homes.try_lifecycle_lock()?
         } else {
@@ -254,7 +275,9 @@ impl Store {
         }
         let existing = registry.exact_preparation(binding)?.clone();
         if existing.state != PreparationState::Planned {
-            sync_registry_directory(&self.directory)?;
+            sync_replay(&super::super::durability::Directories::capture(
+                &self.directory,
+            )?)?;
             return Ok(existing);
         }
         validate(&registry)?;
@@ -264,7 +287,7 @@ impl Store {
             .find(|entry| entry.binding.request_id == binding.request_id)
             .unwrap()
             .state = PreparationState::Uncertain;
-        self.persist_preparation(&mut registry)?;
+        persist(&mut registry)?;
         let (key, home) = create()?;
         if key != binding.key || home != homes.path(binding.payload.provider, binding.key) {
             return Err(io::Error::other(
@@ -282,7 +305,7 @@ impl Store {
             .map(|time| time.as_millis().min(u64::MAX as u128) as u64)
             .unwrap_or_default();
         registry.begin(binding.payload.provider, binding.key, now);
-        self.persist_preparation(&mut registry)?;
+        persist(&mut registry)?;
         Ok(registry.exact_preparation(binding)?.clone())
     }
 
@@ -295,13 +318,28 @@ impl Store {
         registry: &mut Registry,
         sync: impl FnOnce(&super::super::durability::Directories) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.persist_preparation_with_io(registry, || Ok(()), sync)
+    }
+
+    fn persist_preparation_with_io(
+        &self,
+        registry: &mut Registry,
+        before_publish: impl FnOnce() -> io::Result<()>,
+        sync: impl FnOnce(&super::super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<()> {
         registry.version = VERSION;
         registry.revision = registry
             .revision
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Accounts revision exhausted"))?;
         registry.validate_preparations()?;
-        write_with_directory_sync(&self.directory, &self.path(), registry, sync)
+        write_with_io(
+            &self.directory,
+            &self.path(),
+            registry,
+            before_publish,
+            sync,
+        )
     }
 
     fn preparation_transaction<T>(
@@ -860,7 +898,10 @@ mod tests {
             PreparationState::CancelledRetained,
             PreparationState::Uncertain,
         ] {
-            let fixture = Fixture::new();
+            let mut fixture = Fixture::new();
+            let extra = fixture._directory.path().join("extra");
+            fs::create_dir(&extra).unwrap();
+            fixture.homes = Homes::at(extra.join("../homes"));
             let planned = fixture.plan();
             fixture.create(&planned.binding);
             if state == PreparationState::CancelledRetained {
@@ -905,6 +946,16 @@ mod tests {
                 .unwrap();
             let registry = fixture.store.load().unwrap();
             assert!(registry.contains_managed_home(
+                &fixture.homes,
+                Provider::Codex,
+                planned.binding.key
+            ));
+            assert!(!registry.has_registered_home(
+                &fixture.homes,
+                Provider::Codex,
+                planned.binding.key
+            ));
+            assert!(registry.registered_home_is_eligible(
                 &fixture.homes,
                 Provider::Codex,
                 planned.binding.key
@@ -1018,6 +1069,229 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry, registered);
+    }
+
+    fn assert_consumed_replay_requires_sync(fixture: &Fixture, binding: &PreparationBinding) {
+        let before = fs::read(fixture.store.path()).unwrap();
+        let registry = fixture.store.load().unwrap();
+        let expected = registry.exact_preparation(binding).unwrap().clone();
+        let barriers = std::cell::Cell::new(0);
+        for fail in [true, false] {
+            let result = fixture.store.create_prepared_with_io(
+                &fixture.homes,
+                binding,
+                false,
+                |_| panic!("consumed replay validated physical admission"),
+                || panic!("consumed replay recreated a home"),
+                |_| panic!("consumed replay rewrote its record"),
+                |namespace| {
+                    barriers.set(barriers.get() + 1);
+                    if fail {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        namespace.sync()
+                    }
+                },
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            } else {
+                assert_eq!(result.unwrap(), expected);
+            }
+            assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            assert_eq!(fixture.store.load().unwrap(), registry);
+        }
+        assert_eq!(barriers.get(), 2);
+    }
+
+    #[test]
+    fn creation_save_failures_preserve_consumed_attempts_and_require_replay_sync() {
+        for target in [PreparationState::Uncertain, PreparationState::Created] {
+            for after_rename in [false, true] {
+                let fixture = Fixture::new();
+                let planned = fixture.plan();
+                let original = fs::read(fixture.store.path()).unwrap();
+                let revision = fixture.store.load().unwrap().revision;
+                let creations = std::cell::Cell::new(0);
+                let validations = std::cell::Cell::new(0);
+                let fence_bytes = std::cell::RefCell::new(None);
+                let result = fixture.store.create_prepared_with_io(
+                    &fixture.homes,
+                    &planned.binding,
+                    false,
+                    |_| {
+                        validations.set(validations.get() + 1);
+                        Ok(())
+                    },
+                    || {
+                        creations.set(creations.get() + 1);
+                        *fence_bytes.borrow_mut() = Some(fs::read(fixture.store.path())?);
+                        let created = fixture.homes.create_planned_with_config_initialized(
+                            Provider::Codex,
+                            planned.binding.key,
+                            None,
+                            super::super::super::home::CodexConfig::Copy,
+                            |_| Ok(()),
+                        )?;
+                        fs::write(created.1.join("retained"), b"original bytes")?;
+                        Ok(created)
+                    },
+                    |registry| {
+                        if registry.exact_preparation(&planned.binding)?.state != target {
+                            return fixture.store.persist_preparation(registry);
+                        }
+                        fixture.store.persist_preparation_with_io(
+                            registry,
+                            || {
+                                if after_rename {
+                                    Ok(())
+                                } else {
+                                    Err(io::Error::from_raw_os_error(libc::EIO))
+                                }
+                            },
+                            |namespace| {
+                                if after_rename {
+                                    Err(io::Error::from_raw_os_error(libc::EIO))
+                                } else {
+                                    namespace.sync()
+                                }
+                            },
+                        )
+                    },
+                    |namespace| namespace.sync(),
+                );
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+                assert_eq!(validations.get(), 1);
+                let expected_state = if target == PreparationState::Uncertain && !after_rename {
+                    PreparationState::Planned
+                } else if target == PreparationState::Created && after_rename {
+                    PreparationState::Created
+                } else {
+                    PreparationState::Uncertain
+                };
+                let registry = fixture.store.load().unwrap();
+                assert_eq!(
+                    registry.exact_preparation(&planned.binding).unwrap().state,
+                    expected_state
+                );
+                let expected_writes = if expected_state == PreparationState::Planned {
+                    0
+                } else if expected_state == PreparationState::Created {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(registry.revision, revision + expected_writes);
+                assert_eq!(
+                    creations.get(),
+                    usize::from(target == PreparationState::Created)
+                );
+                assert_eq!(
+                    registry.pending.len(),
+                    usize::from(expected_state == PreparationState::Created)
+                );
+                let path = fixture.homes.path(Provider::Codex, planned.binding.key);
+                if target == PreparationState::Created {
+                    assert_eq!(fs::read(path.join("retained")).unwrap(), b"original bytes");
+                    if !after_rename {
+                        assert_eq!(
+                            fs::read(fixture.store.path()).unwrap(),
+                            *fence_bytes.borrow().as_ref().unwrap()
+                        );
+                    }
+                } else {
+                    assert!(!path.exists());
+                }
+                if expected_state == PreparationState::Planned {
+                    assert_eq!(fs::read(fixture.store.path()).unwrap(), original);
+                    assert_eq!(
+                        fixture.create(&planned.binding).state,
+                        PreparationState::Created
+                    );
+                } else {
+                    assert_consumed_replay_requires_sync(&fixture, &planned.binding);
+                }
+                if target == PreparationState::Created {
+                    assert_eq!(fs::read(path.join("retained")).unwrap(), b"original bytes");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn creation_size_limits_refuse_before_effects_or_retain_the_consumed_home() {
+        for overflow_before_creation in [true, false] {
+            let fixture = Fixture::new();
+            let planned = fixture.plan();
+            let mut prospective = fixture.store.load().unwrap();
+            prospective.preparations[0].state = PreparationState::Uncertain;
+            prospective.revision += 1;
+            prospective
+                .system_labels
+                .insert("codex".into(), String::new());
+            let serialized = toml::to_string_pretty(&prospective).unwrap();
+            assert!(serialized.ends_with('\n'));
+            let target_size = MAX_BYTES as usize + usize::from(overflow_before_creation);
+            let padding = "x".repeat(target_size - serialized.len());
+            fixture
+                .store
+                .update(|registry| registry.system_labels.insert("codex".into(), padding))
+                .unwrap();
+            let original = fs::read(fixture.store.path()).unwrap();
+            let revision = fixture.store.load().unwrap().revision;
+            let creations = std::cell::Cell::new(0);
+            let fence_bytes = std::cell::RefCell::new(None);
+            let result = fixture.store.create_prepared(
+                &fixture.homes,
+                &planned.binding,
+                false,
+                |_| Ok(()),
+                || {
+                    creations.set(creations.get() + 1);
+                    *fence_bytes.borrow_mut() = Some(fs::read(fixture.store.path())?);
+                    let created = fixture.homes.create_planned_with_config_initialized(
+                        Provider::Codex,
+                        planned.binding.key,
+                        None,
+                        super::super::super::home::CodexConfig::Copy,
+                        |_| Ok(()),
+                    )?;
+                    fs::write(created.1.join("retained"), b"kept after size refusal")?;
+                    Ok(created)
+                },
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(creations.get(), usize::from(!overflow_before_creation));
+            let registry = fixture.store.load().unwrap();
+            assert_eq!(
+                registry.revision,
+                revision + u64::from(!overflow_before_creation)
+            );
+            assert!(registry.pending.is_empty());
+            let path = fixture.homes.path(Provider::Codex, planned.binding.key);
+            if overflow_before_creation {
+                assert_eq!(
+                    registry.exact_preparation(&planned.binding).unwrap().state,
+                    PreparationState::Planned
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), original);
+                assert!(!path.exists());
+            } else {
+                assert_eq!(
+                    registry.exact_preparation(&planned.binding).unwrap().state,
+                    PreparationState::Uncertain
+                );
+                assert_eq!(
+                    fs::read(fixture.store.path()).unwrap(),
+                    *fence_bytes.borrow().as_ref().unwrap()
+                );
+                assert_eq!(
+                    fs::read(path.join("retained")).unwrap(),
+                    b"kept after size refusal"
+                );
+                assert_consumed_replay_requires_sync(&fixture, &planned.binding);
+            }
+        }
     }
 
     #[test]
