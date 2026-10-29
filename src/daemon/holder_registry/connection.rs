@@ -1,15 +1,16 @@
 //! Deadline-bound Unix connection, including a full listener backlog. A socket
 //! read timeout does not bound connect(2), so connect itself must be nonblocking.
+use std::{io, os::unix::net::UnixStream, path::Path, time::Instant};
+#[cfg(target_os = "linux")]
 use std::{
-    io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, net::UnixStream},
+        unix::ffi::OsStrExt,
     },
-    path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+#[cfg(target_os = "linux")]
 fn remaining(deadline: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -22,6 +23,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         })
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     super::with_socket_address(path, |address| {
         let bytes = address.as_os_str().as_bytes();
@@ -120,7 +122,15 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
     })
 }
 
-#[cfg(test)]
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn connect_until(_: &Path, _: Instant) -> io::Result<UnixStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Deadline-bound holder connections are unavailable on this platform",
+    ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
@@ -159,5 +169,42 @@ mod tests {
             connect_until(&path, Instant::now()).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_holder_connection_precedes_deadline_and_endpoint_work() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("listener");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for endpoint in [
+            path.as_path(),
+            Path::new("missing-parent/socket"),
+            Path::new("invalid\0socket"),
+        ] {
+            for deadline in [
+                Instant::now(),
+                Instant::now() + std::time::Duration::from_secs(1),
+            ] {
+                assert_eq!(
+                    connect_until(endpoint, deadline).unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+            }
+        }
+        let long = root.path().join("x".repeat(1024));
+        assert_eq!(
+            connect_until(&long, Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

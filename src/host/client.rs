@@ -127,6 +127,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_request);
 }
 
+#[cfg(target_os = "linux")]
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
@@ -146,6 +147,11 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         && credentials.uid == unsafe { libc::geteuid() }
         && credentials.pid > 0)
         .then_some(credentials.pid as u32)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_: &UnixStream) -> Option<u32> {
+    None
 }
 
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {

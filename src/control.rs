@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -11,6 +11,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 
 use clap::{Parser, Subcommand, error::ErrorKind as ClapErrorKind};
 use serde::{Deserialize, Serialize};
@@ -571,6 +574,7 @@ pub struct ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
+#[cfg(target_os = "linux")]
 pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
@@ -632,6 +636,14 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
         thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
         delay = (delay * 2).min(Duration::from_millis(20));
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn connect_control_socket(_: &Path, _: Duration) -> io::Result<UnixStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Deadline-bound daemon connections are unavailable on this platform",
+    ))
 }
 
 impl ControlClient {
@@ -5084,6 +5096,7 @@ mod tests {
         include!("control/handshake_deadline_tests.rs");
     }
 
+    #[cfg(target_os = "linux")]
     fn saturated_control_listener(
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
@@ -5096,6 +5109,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -5112,6 +5126,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -5157,6 +5172,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn control_socket_connection_preserves_missing_and_refused_error_classification() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -7202,5 +7218,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(handshake_reports_already_running(&already_running));
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_connection_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_control_connection_precedes_path_validation_and_deadline_arithmetic() {
+        for path in [
+            Path::new(""),
+            Path::new("invalid\0socket"),
+            Path::new("missing-parent/socket"),
+        ] {
+            for timeout in [Duration::ZERO, Duration::MAX] {
+                assert_eq!(
+                    connect_control_socket(path, timeout).unwrap_err().kind(),
+                    io::ErrorKind::Unsupported
+                );
+            }
+            assert!(
+                matches!(ControlClient::connect(path), Err(ControlError::Connect(error)) if error.kind() == io::ErrorKind::Unsupported)
+            );
+        }
+        let long = PathBuf::from("x".repeat(1024));
+        assert_eq!(
+            connect_control_socket(&long, Duration::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }

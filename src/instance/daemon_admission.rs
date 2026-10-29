@@ -399,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn descriptor_sealing_preserves_only_explicit_forwarded_authority() {
         const CHILD: &str = "CAGENTS_TEST_DAEMON_FENCE_FORWARDING";
         if env::var_os(CHILD).is_none() {
