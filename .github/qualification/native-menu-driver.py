@@ -7,6 +7,9 @@ synthetic IPC fixture and acceptance claims are deliberately absent.
 """
 import ast
 import ctypes
+import csv
+import io
+import math
 import hashlib
 import json
 import os
@@ -24,6 +27,7 @@ OUT = Path(os.environ['MENU_EVIDENCE_ROOT']).resolve()
 TARGET = Path(os.environ['CARGO_TARGET_DIR']).resolve()
 EVENTS, COMMANDS, ARMS, OWNED, CHILDREN = [], [], [], {}, []
 ACTIVE, CRITICAL = None, False
+PIXEL_MENU, CAPTURES, CANCEL_SIGNAL = None, {}, None
 original_home, original_codex_home = os.environ.get('HOME'), os.environ.get('CODEX_HOME')
 menu_cargo_cache = os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))
 menu_rustup_cache = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
@@ -124,7 +128,10 @@ def cmd(args, env=None, cwd=None, timeout=20, expected=0):
     guard()
     args = [str(arg) for arg in args]
     if CRITICAL:
-        assert args[:2] == ['import', '-window'] or (args[0] == 'xdotool' and args[1] in
+        ocr_read = (ACTIVE == 'before' and len(args) == 10 and args[0] == 'tesseract' and
+            args[2:] == ['stdout', '-l', 'eng', '--psm', '11', '--oem', '1', 'tsv'] and
+            Path(args[1]).resolve() in CAPTURES and CAPTURES[Path(args[1]).resolve()]['arm'] == 'before')
+        assert ocr_read or args[:2] == ['import', '-window'] or (args[0] == 'xdotool' and args[1] in
             ('getwindowgeometry', 'getmouselocation', 'getwindowfocus')), 'UI repair command refused during wheel→activation'
     directory = OUT / 'commands' / f'{len(COMMANDS):05d}'
     directory.mkdir(parents=True)
@@ -194,7 +201,204 @@ def tree(pid):
     return result
 
 
+class PixelRow:
+    """An explicit OCR observation, never an accessibility node or product fixture."""
+    def __init__(self, row):
+        self.name, self.native_bounds = row['text'], tuple(row['bounds'])
+        self.observation = row
+
+
+def tsv_lines(raw, size):
+    # TSV schema: https://tesseract-ocr.github.io/tessdoc/Command-Line-Usage.html#tsv-output
+    reader = csv.DictReader(io.StringIO(raw), delimiter='\t')
+    assert reader.fieldnames == ['level', 'page_num', 'block_num', 'par_num', 'line_num', 'word_num',
+                                'left', 'top', 'width', 'height', 'conf', 'text'], 'Unknown TSV schema'
+    grouped, identities = {}, set()
+    for row in reader:
+        assert None not in row, 'Malformed TSV columns'
+        if int(row['level']) != 5 or not row['text'].strip():
+            continue
+        key = tuple(int(row[name]) for name in ('page_num', 'block_num', 'par_num', 'line_num'))
+        identity = (*key, int(row['word_num']))
+        assert key[0] == 1 and identity not in identities
+        identities.add(identity)
+        confidence = float(row['conf'])
+        bounds = tuple(int(row[name]) for name in ('left', 'top', 'width', 'height'))
+        assert math.isfinite(confidence) and 0 <= confidence <= 100 and on_screen(bounds, size)
+        assert not any(ord(character) < 32 for character in row['text'])
+        grouped.setdefault(key, []).append(dict(text=row['text'], bounds=bounds, confidence=confidence, word_num=identity[-1]))
+    result = []
+    for key, words in grouped.items():
+        words.sort(key=lambda word: word['word_num'])
+        left, top = min(word['bounds'][0] for word in words), min(word['bounds'][1] for word in words)
+        right = max(word['bounds'][0] + word['bounds'][2] for word in words)
+        bottom = max(word['bounds'][1] + word['bounds'][3] for word in words)
+        result.append(dict(text=' '.join(word['text'] for word in words), bounds=(left, top, right-left, bottom-top),
+                           min_confidence=min(word['confidence'] for word in words), words=words, line_id=key))
+    assert result, 'No readable native OCR lines'
+    return result
+
+
+def exact_pixel_label(lines, label):
+    matches = [row for row in lines if row['text'] == label]
+    assert len(matches) <= 1, 'Duplicate exact OCR label: ' + label
+    if not matches:
+        return None
+    assert matches[0]['min_confidence'] >= M['ocr']['minimum_word_confidence'], 'Low-confidence exact OCR label: ' + label
+    return matches[0]
+
+
+def ocr_frame(window, size, name):
+    assert ACTIVE == 'before', 'OCR is baseline-only; product accessibility gates are unchanged'
+    record = capture(window, name, size)
+    png = (OUT / (name + '.png')).resolve()
+    assert png in CAPTURES and CAPTURES[png]['arm'] == 'before'
+    raw = cmd(['tesseract', png, 'stdout', '-l', 'eng', '--psm', '11', '--oem', '1', 'tsv'], timeout=20)
+    (OUT / (name + '.tsv')).write_text(raw)
+    assert digest(png) == record['png_sha256'], 'OCR input changed after native capture'
+    rows = tsv_lines(raw, size)
+    put(OUT / (name + '-ocr.json'), dict(native_capture=record, rows=rows,
+        policy='Exact full literal labels only; no fuzzy, punctuation aliases, scaling or image preprocessing'))
+    return dict(name=name, rows=rows, png=png, capture=record)
+
+
+class BaselinePixels:
+    def __init__(self, pid, window, size, label):
+        assert ACTIVE == 'before'
+        self.pid, self.window, self.size, self.label = pid, window, size, label
+        self.opened, self.number, self.context, self.last = False, 0, None, None
+
+    def frame(self, purpose):
+        self.number += 1
+        return ocr_frame(self.window, self.size, f'{self.label}-pixel-{self.number:03d}-{purpose}')
+
+    def column(self, frame):
+        left, top = self.context['left'], self.context['top']
+        # A conservative observation domain, not a guessed activation rectangle.
+        # Unknown text in this source-supported label column invalidates the read.
+        return [row for row in frame['rows'] if left-4 <= row['bounds'][0] <= left + M['ocr']['column_start_span_pixels']
+                and row['bounds'][1] >= top-4 and sum(character.isalpha() for character in row['text']) >= 3]
+
+    def validate_slice(self, frame):
+        candidates = self.column(frame)
+        assert len(candidates) >= 2, 'Insufficient readable menu labels; OCR absence is not a feature negative'
+        names = set()
+        for row in candidates:
+            assert row['text'] in M['baseline_menu_labels'], 'Unknown/partial OCR menu label: ' + row['text']
+            assert row['min_confidence'] >= M['ocr']['minimum_word_confidence'], 'Low-confidence menu text'
+            assert row['text'] not in names, 'Ambiguous repeated native menu label'
+            names.add(row['text'])
+        frame['menu_rows'] = candidates
+        self.last = frame
+        return frame
+
+    def read(self, purpose='slice'):
+        assert self.opened
+        return self.validate_slice(self.frame(purpose))
+
+    def lookup(self, label):
+        frame = self.read('lookup')
+        row = exact_pixel_label(frame['menu_rows'], label)
+        return PixelRow(row) if row else None
+
+    def open(self, inputs, rect):
+        assert not CRITICAL and not self.opened
+        x, y, width, height = rect
+        inputs.move(x + width // 2, y + height // 2)
+        time.sleep(.7)
+        before = self.frame('before-open')
+        inputs.click(3)
+        time.sleep(.6)
+        opened = self.frame('opened')
+        labels = ['Open folder', 'New terminal', 'New channel']
+        rows = [exact_pixel_label(opened['rows'], label) for label in labels]
+        assert all(rows), 'Native menu anchors unavailable; no guessed baseline coordinates'
+        assert all(exact_pixel_label(before['rows'], label) is None for label in labels), 'Menu labels already present before opening; ambiguous menu binding'
+        assert rows[0]['bounds'][1] < rows[1]['bounds'][1] < rows[2]['bounds'][1]
+        left = min(row['bounds'][0] for row in rows)
+        assert max(row['bounds'][0] for row in rows)-left <= 8, 'Initial menu labels are not one independent native column'
+        self.context = dict(left=left, top=rows[0]['bounds'][1], anchor=rect,
+                            before_capture=before['name'], open_capture=opened['name'])
+        self.opened = True
+        self.validate_slice(opened)
+        put(OUT / (opened['name'] + '-binding.json'), self.context)
+        return opened
+
+    def crop_hashes(self, frame, rows):
+        with Image.open(frame['png']) as image:
+            return [hashlib.sha256(image.crop((row['bounds'][0], row['bounds'][1],
+                row['bounds'][0]+row['bounds'][2], row['bounds'][1]+row['bounds'][3])).tobytes()).hexdigest() for row in rows]
+
+    def closed(self):
+        if not self.opened:
+            return True
+        old = self.last
+        assert old and len(old['menu_rows']) >= 2
+        frame = self.frame('after-escape')
+        candidates = self.column(frame)
+        for row in candidates:
+            if row['text'] in M['baseline_menu_labels']:
+                assert row['min_confidence'] >= M['ocr']['minimum_word_confidence'], 'Uncertain OCR after dismissal'
+                return False
+        assert not candidates, 'Unknown native text prevents proving menu dismissal'
+        changed = sum(a != b for a,b in zip(self.crop_hashes(old, old['menu_rows']), self.crop_hashes(frame, old['menu_rows'])))
+        assert changed >= 2, 'OCR absence without changed native menu glyph regions is ambiguous'
+        self.opened = False
+        put(OUT / (frame['name'] + '-closed.json'), dict(previous=old['name'], changed_glyph_regions=changed,
+            status='No menu text remains in independently bound column; native glyph regions changed'))
+        return True
+
+    def modal_closed(self, label):
+        # Called only after the unchanged strict native exact-target modal oracle.
+        self.opened = False
+        put(OUT / (label + '-pixel-menu-closed-by-modal.json'), dict(reason='Exact native modal/Cancel oracle passed; image retained separately'))
+
+    def calibrate(self, inputs, rect, label):
+        self.open(inputs, rect)
+        first = exact_pixel_label(self.last['menu_rows'], 'Open folder')
+        assert first
+        b = first['bounds']
+        wheel_point = (b[0]+b[2]//2, b[1]+b[3]//2)
+        inputs.move(*wheel_point)
+        seen, slices, event_start = set(), [], len(EVENTS)
+        final = None
+        for index in range(21):
+            frame = self.read(f'calibration-{index}')
+            seen.update(row['text'] for row in frame['menu_rows'] if row['text'] in M['editor_labels'])
+            final = exact_pixel_label(frame['menu_rows'], 'Remove project…')
+            slices.append(dict(capture=frame['name'], rows=frame['menu_rows'], pixel_hashes=self.crop_hashes(frame, frame['menu_rows'])))
+            if final and set(M['editor_labels']).issubset(seen):
+                break
+            if index < 20:
+                inputs.wheel(5, 3)
+        if final is None:
+            assert len(slices) >= 3 and slices[-1]['rows'] == slices[-2]['rows'] == slices[-3]['rows']
+            assert slices[-1]['pixel_hashes'] == slices[-2]['pixel_hashes'] == slices[-3]['pixel_hashes'], 'Unstable/unreadable end state is not unreachable-row evidence'
+            assert (pointer()['X'], pointer()['Y']) == wheel_point, 'Calibration pointer drift is not unreachable-row evidence'
+            observation = dict(activation_attempted=False, final_target=None, anchor=rect, point=wheel_point,
+                geometry=geometry(self.window), event_start=event_start, event_end=len(EVENTS), slices=slices,
+                observed_editor_labels=sorted(seen), missing_editor_labels=sorted(set(M['editor_labels'])-seen),
+                missing_before_states=['reachable Remove row','keyboard/click activation at that row','exact target dialog'],
+                negative_basis='No literal Remove row observed after bounded real wheel; readable native slices and glyph regions stayed unchanged. Independent pixel review must confirm physical unreachability.')
+            put(OUT / (label + '-unreachable.json'), observation)
+            raise BaselineRemoveUnreachable(observation)
+        assert set(M['editor_labels']).issubset(seen), 'Missing editor OCR coverage is not a passing calibration'
+        inputs.wheel(5, 60)
+        frame = self.read('calibration-bottom')
+        final = exact_pixel_label(frame['menu_rows'], 'Remove project…')
+        assert final, 'Previously reached row became unavailable; no coordinate repair'
+        b = final['bounds']
+        point = (b[0]+b[2]//2, b[1]+b[3]//2)
+        put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=b,
+            coordinate_source='This baseline native PNG/TSV only', observed_editor_labels=sorted(seen), slices=slices))
+        inputs.key('Escape')
+        wait(self.closed)
+        return rect, point
+
+
 def box(node):
+    if isinstance(node, PixelRow):
+        return node.native_bounds
     b = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
     return (b.x, b.y, b.width, b.height)
 
@@ -221,6 +425,8 @@ def snapshot(pid, name):
 
 
 def unique(pid, name, enabled=True):
+    if ACTIVE == 'before' and PIXEL_MENU is not None and name in M['baseline_menu_labels']:
+        return PIXEL_MENU.lookup(name) if PIXEL_MENU.opened else None
     found = [node for node in tree(pid) if node.name == name and visible(node)
              and (not enabled or node.getState().contains(pyatspi.STATE_ENABLED))]
     actionable = [node for node in found if node.getRole() in (pyatspi.ROLE_PUSH_BUTTON, pyatspi.ROLE_MENU_ITEM)]
@@ -254,6 +460,8 @@ def capture(window, name, size):
     assert geometry(window) == actual and pointer() == point
     result = dict(geometry=actual, pointer=point, png_sha256=digest(png), webp_sha256=digest(OUT / (name + '.webp')),
                   monotonic=time.monotonic(), critical=CRITICAL, capture='Actual native pixels, lossless WebP, no resize')
+    result.update(arm=ACTIVE, window=window)
+    CAPTURES[png.resolve()] = result
     put(OUT / (name + '-capture.json'), result)
     return result
 
@@ -297,15 +505,19 @@ class Inputs:
             symbol = self.x.XStringToKeysym(value.encode('ascii'))
             code = self.x.XKeysymToKeycode(self.display, symbol)
             assert symbol and code
-            result = self.t.XTestFakeKeyEvent(self.display, code, int(down), 0)
             pressed = self.keys
+            if down:
+                pressed.add(value)  # Pending injection is owned even if interrupted before its receipt.
+            result = self.t.XTestFakeKeyEvent(self.display, code, int(down), 0)
         else:
             code = value
-            result = self.t.XTestFakeButtonEvent(self.display, code, int(down), 0)
             pressed = self.buttons
+            if down:
+                pressed.add(value)
+            result = self.t.XTestFakeButtonEvent(self.display, code, int(down), 0)
         self.x.XSync(self.display, 0)
-        if result:
-            (pressed.add if down else pressed.discard)(value)
+        if result and not down:
+            pressed.discard(value)
         EVENTS.append(dict(arm=ACTIVE, monotonic=time.monotonic(), kind=kind, value=value, actual_code=code,
                            pressed=down, injection_return=result, purpose=purpose, critical=CRITICAL,
                            pointer=pointer(), focus=query(['getwindowfocus'])))
@@ -313,14 +525,20 @@ class Inputs:
         assert result, 'XTest injection refused'
 
     def key(self, value, purpose='control'):
-        self.event('key', value, True, purpose)
-        time.sleep(.04)
-        self.event('key', value, False, purpose)
+        try:
+            self.event('key', value, True, purpose)
+            time.sleep(.04)
+        finally:
+            if value in self.keys:
+                self.event('key', value, False, purpose)
 
     def click(self, button, purpose='control'):
-        self.event('button', button, True, purpose)
-        time.sleep(.04)
-        self.event('button', button, False, purpose)
+        try:
+            self.event('button', button, True, purpose)
+            time.sleep(.04)
+        finally:
+            if button in self.buttons:
+                self.event('button', button, False, purpose)
 
     def wheel(self, button, count):
         assert button in (4, 5) and 0 < count <= 80
@@ -335,10 +553,13 @@ class Inputs:
 
     def shortcut(self, keys):
         assert not CRITICAL
-        for key in keys:
-            self.event('key', key, True)
-        for key in reversed(keys):
-            self.event('key', key, False)
+        try:
+            for key in keys:
+                self.event('key', key, True)
+        finally:
+            for key in reversed(keys):
+                if key in self.keys:
+                    self.event('key', key, False)
 
     def type_text(self, text):
         assert not CRITICAL and len(text) <= 64 and re.fullmatch(r'[a-z0-9-]+', text)
@@ -363,14 +584,23 @@ class Inputs:
         EVENTS.append(dict(arm=ACTIVE, monotonic=time.monotonic(), kind='WM_DELETE_WINDOW', window=window, injection_return=result))
         assert result, 'Native close request refused'
 
-    def close(self):
+    def release_held(self):
         global CRITICAL
         CRITICAL = False
-        for key in list(self.keys):
-            self.event('key', key, False, 'cleanup')
-        for button in list(self.buttons):
-            self.event('button', button, False, 'cleanup')
-        self.x.XCloseDisplay(self.display)
+        errors = []
+        for kind, values in [('key', self.keys), ('button', self.buttons)]:
+            for value in list(values):
+                try:
+                    self.event(kind, value, False, 'cleanup')
+                except BaseException as error:
+                    errors.append(str(error))
+        assert not errors and not self.keys and not self.buttons, 'Input release unqualified: ' + '; '.join(errors)
+
+    def close(self):
+        try:
+            self.release_held()
+        finally:
+            self.x.XCloseDisplay(self.display)
 
 
 def inside(rect, point):
@@ -408,19 +638,27 @@ def files(projects):
 def conserve(binary, env, projects, expected_rows, expected_files, stub, label):
     rows = cli(binary, env, ['project', 'list'], label + '-projects')['projects']
     terminals = cli(binary, env, ['terminal', 'list', '--all'], label + '-terminals')
+    channels = cli(binary, env, ['channel', 'list'], label + '-channels')
+    capacity = cli(binary, env, ['chat', 'capacity'], label + '-capacity')
     actual_files = files(projects)
     put(OUT / (label + '-fixture.json'), actual_files)
     assert rows == expected_rows, 'Unexpected project membership/order/metadata change'
     assert terminals['terminals'] == [], 'Unexpected terminal created'
+    assert channels['channels'] == [], 'Unexpected channel created'
+    assert all(capacity[key] == 0 for key in ('used', 'resident', 'spawning')), 'Unexpected native chat residency/startup'
     assert actual_files == expected_files, 'Fixture files/refs/status changed'
     assert not stub.read_text(), 'Unexpected editor invocation; original receipt retained'
 
 
 def menu_slice(pid, size):
+    if ACTIVE == 'before' and PIXEL_MENU is not None:
+        return [(row['text'], tuple(row['bounds'])) for row in PIXEL_MENU.read()['menu_rows']]
     return [(node.name, box(node)) for node in tree(pid) if node.name in M['menu_labels'] and visible(node) and on_screen(box(node), size)]
 
 
 def menu_gone(pid):
+    if ACTIVE == 'before' and PIXEL_MENU is not None:
+        return PIXEL_MENU.closed()
     return unique(pid, 'Open folder') is None and unique(pid, 'Remove project…') is None
 
 
@@ -468,6 +706,8 @@ def anchor(inputs, pid, size):
 
 
 def open_menu(inputs, rect, pid):
+    if ACTIVE == 'before' and PIXEL_MENU is not None:
+        return PIXEL_MENU.open(inputs, rect)
     x, y, width, height = rect
     inputs.move(x + width // 2, y + height // 2)
     inputs.click(3)
@@ -478,6 +718,8 @@ def calibrate(inputs, pid, window, size, label):
     rect = anchor(inputs, pid, size)
     snapshot(pid, label + '-anchor')
     capture(window, label + '-anchor', size)
+    if ACTIVE == 'before' and PIXEL_MENU is not None:
+        return PIXEL_MENU.calibrate(inputs, rect, label)
     open_menu(inputs, rect, pid)
     first = box(wait(lambda: unique(pid, 'Open folder')))
     inputs.move(first[0] + first[2] // 2, first[1] + first[3] // 2)
@@ -560,6 +802,12 @@ class BaselineKeyboardNegative(RuntimeError):
         super().__init__('Observed no Remove confirmation after baseline keyboard activation; not a passing case')
 
 
+class BaselineRemoveUnreachable(BaselineKeyboardNegative):
+    def __init__(self, observation):
+        self.observation = observation
+        RuntimeError.__init__(self, 'Observed no reachable Remove row during bounded baseline wheel; activation states are unrun')
+
+
 def observe_remove(pid, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -576,8 +824,11 @@ def observe_remove(pid, timeout=5):
 
 def reset_baseline_negative(error, inputs, pid, window, size, label, activation,
                             binary, env, projects, rows, initial_files, stub, checkout, pin):
-    assert ACTIVE == 'before' and activation in ('Return', 'space') and not CRITICAL
-    observation = dict(error.observation, status='observed_negative_reset_UNVERIFIED', product_oracle_passed=False)
+    unreachable = isinstance(error, BaselineRemoveUnreachable)
+    assert ACTIVE == 'before' and (unreachable or activation in ('Return', 'space')) and not CRITICAL
+    assert not inputs.keys and not inputs.buttons, 'Held input prevents safe negative reset'
+    observation = dict(error.observation, status='observed_negative_reset_UNVERIFIED', product_oracle_passed=False,
+                       negative_kind='unreachable_row' if unreachable else 'keyboard_nonactivation')
     # Preserve the original post-input truth before any dismissal/reset input.
     snapshot(pid, label + '-post-activation-negative')
     capture(window, label + '-post-activation-negative', size)
@@ -647,6 +898,8 @@ def trial(inputs, pid, window, size, label, activation, target, binary, env, pro
             raise BaselineKeyboardNegative(observation)
         raise RuntimeError('Expected Remove confirmation absent after native activation')
     cancel = modal(pid, target, size, label)
+    if ACTIVE == 'before' and PIXEL_MENU is not None:
+        PIXEL_MENU.modal_closed(label)
     snapshot(pid, label + '-dialog')
     capture(window, label + '-dialog', size)
     put(OUT / (label + '-trial.json'), dict(activation=activation, anchor=rect, point=point, geometry=initial_geometry,
@@ -787,8 +1040,9 @@ def matched(window, pin, env, label):
 
 
 def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
-    global ACTIVE, CRITICAL
+    global ACTIVE, CRITICAL, PIXEL_MENU
     ACTIVE = label
+    PIXEL_MENU = None
     result = dict(arm=label, pin=pin, status='running', cases=[], unrun_cases=list(M['cases']))
     ARMS.append(result)
     root = base / label
@@ -836,8 +1090,15 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                 configured_ui_scale=1.5, settings_sha256=digest(settings), current_native_scale_factor='UNMEASURED',
                 startup_scale_guess='Supporting log only, never a current per-window measurement',
                 display_configuration={k: os.environ.get(k) for k in ('DISPLAY', 'WINIT_X11_SCALE_FACTOR', 'GDK_SCALE', 'GDK_DPI_SCALE')}))
+            PIXEL_MENU = BaselinePixels(pid, window, size, label + '-' + size_name) if label == 'before' else None
+            blocked_by_unreachable = None
             for activation, short in [('Return', 'return'), ('space', 'space'), ('click', 'click'), (None, 'limits'), (None, 'tooltip')]:
+                if CANCEL_SIGNAL is not None:
+                    raise QualificationCancelled('Collection remains cancelled; next case refused')
                 case = size_name + '-' + short
+                if label == 'before' and blocked_by_unreachable and short in ('return', 'space', 'click', 'limits'):
+                    result['cases'].append(dict(case=case, status='UNRUN_no_observed_activation_target', reason=blocked_by_unreachable))
+                    continue
                 result['unrun_cases'].remove(case)
                 row = dict(case=case, status='running')
                 result['cases'].append(row)
@@ -849,19 +1110,40 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                     except BaselineKeyboardNegative as error:
                         negative = reset_baseline_negative(error, inputs, pid, window, size, case_label, activation,
                             binary, env, projects, rows, initial_files, stub, checkout, pin)
-                        row.update(status='observed_negative_missing_keyboard_activation', product_oracle_passed=False,
-                                   failure=str(error), reset=negative['reset'])
+                        row.update(status='observed_negative_unreachable_row' if isinstance(error, BaselineRemoveUnreachable) else 'observed_negative_missing_keyboard_activation',
+                                   product_oracle_passed=False, failure=str(error), reset=negative['reset'],
+                                   negative_kind=negative['negative_kind'])
+                        if isinstance(error, BaselineRemoveUnreachable):
+                            blocked_by_unreachable = case_label + '-unreachable.json'
+                            row['missing_before_states'] = negative['missing_before_states']
                 elif short == 'limits':
-                    limits(inputs, pid, window, size, case_label)
-                    row['status'] = 'machine_oracle_complete_visual_review_pending'
+                    try:
+                        limits(inputs, pid, window, size, case_label)
+                        row['status'] = 'machine_oracle_complete_visual_review_pending'
+                    except BaselineRemoveUnreachable as error:
+                        negative = reset_baseline_negative(error, inputs, pid, window, size, case_label, activation,
+                            binary, env, projects, rows, initial_files, stub, checkout, pin)
+                        row.update(status='observed_negative_unreachable_row', product_oracle_passed=False,
+                                   failure=str(error), reset=negative['reset'], missing_before_states=negative['missing_before_states'])
+                        blocked_by_unreachable = case_label + '-unreachable.json'
                 else:
                     tooltip(inputs, pid, window, size, case_label)
                     row['status'] = 'images_recorded_visual_oracle_UNQUALIFIED'
                 conserve(binary, env, projects, rows, initial_files, stub, case_label + '-final')
-        result['status'] = ('machine_flow_complete_with_observed_baseline_negatives' if
-            any(row['status'] == 'observed_negative_missing_keyboard_activation' for row in result['cases'])
+        result['status'] = ('baseline_observations_complete_with_explicit_negative_or_unrun_states' if
+            any(row['status'].startswith('observed_negative') for row in result['cases'])
             else 'machine_flow_complete_visual_review_pending')
+    except QualificationCancelled as error:
+        result.update(status='cancelled', error=str(error), cancellation_signal=CANCEL_SIGNAL)
+        if result['cases'] and result['cases'][-1]['status'] == 'running':
+            result['cases'][-1]['status'] = 'cancelled'
+        raise
     except Exception as error:
+        if CANCEL_SIGNAL is not None:
+            result.update(status='cancelled', error=str(error), cancellation_signal=CANCEL_SIGNAL)
+            if result['cases'] and result['cases'][-1]['status'] == 'running':
+                result['cases'][-1]['status'] = 'cancelled'
+            raise QualificationCancelled('Original cancellation remains fatal after input/receipt failure') from error
         result.update(status='failed', error=str(error))
         if result['cases'] and result['cases'][-1]['status'] == 'running':
             result['cases'][-1].update(status='failed', error=str(error))
@@ -874,6 +1156,12 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                 result['missing_failure_capture'] = str(capture_error)
     finally:
         CRITICAL = False
+        inputs_released = False
+        try:
+            inputs.release_held()
+            inputs_released = True
+        except BaseException as error:
+            cleanup_errors.append('Held input release failed: ' + str(error))
         if binary:
             try:
                 inventory = cli(binary, env, ['project', 'list'], label + '-cleanup-projects')
@@ -884,7 +1172,7 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
                         result.update(status='failed', error='Unexpected project change; original inventory retained')
             except Exception as error:
                 cleanup_errors.append('Final project inventory unavailable: ' + str(error))
-        if runner and runner.poll() is None and window and pid:
+        if inputs_released and runner and runner.poll() is None and window and pid:
             try:
                 dismiss(inputs, pid)
                 inputs.request_close(window)  # Never XDestroyWindow/windowclose.
@@ -920,8 +1208,15 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
     return result
 
 
+class QualificationCancelled(BaseException):
+    pass
+
+
 def cancelled(signum, frame):
-    raise RuntimeError('Native control cancelled; closing identity-stamped owned processes')
+    global CANCEL_SIGNAL
+    CANCEL_SIGNAL = signum
+    put(OUT / 'cancellation.json', dict(signal=signum, monotonic=time.monotonic(), arm=ACTIVE, critical=CRITICAL))
+    raise QualificationCancelled('Native control cancelled; stop collection and close owned identities')
 
 
 def main():
@@ -949,6 +1244,10 @@ def main():
         assert re.search(r'resolution:\s+96x96 dots per inch', display)
         cmd(['xrandr', '--current'])
         cmd(['xprop', '-root', 'RESOURCE_MANAGER'], expected=None)
+        (OUT / 'tesseract-version.txt').write_text(cmd(['tesseract', '--version']))
+        languages = cmd(['tesseract', '--list-langs'])
+        (OUT / 'tesseract-languages.txt').write_text(languages)
+        assert 'eng' in languages.splitlines(), 'Exact English OCR model unavailable'
         bootstrap(base)
         import pyatspi
         from PIL import Image
@@ -975,6 +1274,8 @@ def main():
             path.chmod(0o700)
         put(OUT / 'editor-stubs.json', {name: digest(stubs / name) for name in M['editor_executables']})
         for label, checkout in [('before', BEFORE), ('after', AFTER)]:
+            if CANCEL_SIGNAL is not None:
+                raise QualificationCancelled('Collection remains cancelled; next arm refused')
             record = run_arm(label, checkout, M[label], base, projects, initial_files, inputs, stubs)
             if label == 'after' and record['status'] != 'machine_flow_complete_visual_review_pending':
                 failed = True
@@ -1002,7 +1303,7 @@ def main():
         put(OUT / 'cleanup.json', dict(errors=cleanup_errors, subreaper=True, live_owned=live(),
             identity_rule='PID/start/group recorded before wait; each signal revalidates start identity'))
         baseline_failed = any(arm['arm'] == 'before' and arm['status'] == 'failed' for arm in ARMS)
-        baseline_negatives = sum(row['status'] == 'observed_negative_missing_keyboard_activation' for arm in ARMS for row in arm['cases'])
+        baseline_negatives = sum(row['status'].startswith('observed_negative') for arm in ARMS for row in arm['cases'])
         put(OUT / 'result.json', dict(collection_status='failed' if failed or cleanup_errors else ('completed_with_baseline_failure' if baseline_failed else ('completed_with_baseline_negatives' if baseline_negatives else 'completed')), arms=ARMS, baseline_negative_count=baseline_negatives,
             acceptance='UNQUALIFIED pending independent actual-image/UX review and remaining PR gates', limits=M['limits']))
         (OUT / 'sha256.txt').write_text(''.join(f'{digest(p)}  {p.relative_to(OUT)}\n' for p in sorted(OUT.rglob('*'))

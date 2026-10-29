@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y xvfb xauth openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 x11-utils x11-xserver-utils
+          sudo apt-get install -y xvfb xauth openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 x11-utils x11-xserver-utils tesseract-ocr tesseract-ocr-eng
           {
             rustc -vV
             cargo --version
