@@ -1,311 +1,347 @@
-name: Research PR 1853 native portability and Linux preservation
-
-on:
+name: Research PR 1951 native CLI and Linux preservation
+'on':
   pull_request:
-    types: [opened, synchronize, reopened]
+    types:
+    - opened
+    - synchronize
+    - reopened
     paths:
-      - .github/workflows/research-pr1853-bd88.yml
-
+    - .github/workflows/research-pr1853-bd88.yml
 permissions:
   contents: read
-
 concurrency:
-  group: research-pr1853-bd88-${{ github.event.pull_request.number }}
+  group: research-pr1951-${{ github.event.pull_request.number }}
   cancel-in-progress: true
-
 env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: bd88f565f9e4f2078d11dcc85a027bf0cd2a5091
-  EXPECTED_PRODUCT_TREE: 1e8b0fdb5d065ea5cb50d704d4637b0bef79f4b6
-  EXPECTED_BASELINE_SHA: 6871a2cc806bb12e489b2265219f67578342624e
-
+  EXPECTED_PRODUCT_SHA: 883726734a8194ec8b18161e3dbcb50367a7db4d
+  EXPECTED_PRODUCT_TREE: ff0c743dcf4d878bbae048bf8346c37e1a2a2d05
 jobs:
   macos:
-    if: >-
-      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    name: Native Apple ARM CLI and four unsupported-platform roots
+    if: github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' && github.event.pull_request.head.repo.full_name ==
+      github.repository
+    name: Native Apple ARM CLI link run and sixteen owning roots
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
         working-directory: product
     steps:
-      - name: Require a natural User execution context
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-          present = [name for name in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_AGENT_TOKEN', 'CAGENTS_SESSION_TOKEN') if name in os.environ]
-          if present:
-              print('Natural User qualification refused: ' + ', '.join(present), file=sys.stderr)
-              raise SystemExit(1)
-          PY
-          printf '%s\n' "CARGO_TARGET_DIR=$RUNNER_TEMP/pr1853-target-apple-cli" >> "$GITHUB_ENV"
+    - name: Require natural User context and private fixture paths
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json, os, pathlib, sys, tempfile
+        logs=pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-apple-logs'
+        logs.mkdir(mode=0o700)
+        names=sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+        (logs/'natural-context.json').write_text(json.dumps({'present_names':names})+'\n')
+        if names:
+            raise SystemExit('Natural User qualification refused: '+', '.join(names))
+        fixture=pathlib.Path(tempfile.mkdtemp(prefix='c1951',dir='/tmp'))
+        with open(os.environ['GITHUB_ENV'],'a') as env:
+            print('EVIDENCE_DIR='+str(logs),file=env)
+            print('CARGO_TARGET_DIR='+str(pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-apple-target'),file=env)
+            print('TMPDIR='+str(fixture),file=env)
+            for name,leaf in [('XDG_RUNTIME_DIR','runtime'),('XDG_DATA_HOME','data'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_STATE_HOME','state')]:
+                (fixture/leaf).mkdir(mode=0o700)
+                print(name+'='+str(fixture/leaf),file=env)
+        PY
+    - name: Check out research
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: research
+        persist-credentials: false
+    - name: Check out product
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: 883726734a8194ec8b18161e3dbcb50367a7db4d
+        path: product
+        persist-credentials: false
+    - name: Bind exact product and research sources
+      env:
+        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path.cwd()
+        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        def git(*args,where=root):
+            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
+        assert git('rev-parse','HEAD')==os.environ['EXPECTED_PRODUCT_SHA']
+        assert git('rev-parse','HEAD^{tree}')==os.environ['EXPECTED_PRODUCT_TREE']
+        assert not git('status','--porcelain','--untracked-files=all')
+        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
+        assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
+        assert not git('status','--porcelain','--untracked-files=all',where=research)
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
+        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
+        (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
+        PY
+    - name: Prepare and record native Apple toolchain
+      run: |
+        set -euo pipefail
+        test "$(uname -m)" = arm64
+        rustup toolchain install 1.93.0 --profile minimal
+        { rustc -vV; cargo --version; sw_vers; uname -m; xcrun --show-sdk-path; cc --version; git --version; } > "$EVIDENCE_DIR/tools.txt"
+        grep -Fx 'host: aarch64-apple-darwin' "$EVIDENCE_DIR/tools.txt"
+    - name: Run literal apple qualification and retain every original exit
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, re, subprocess, sys, time
+        logs = pathlib.Path(os.environ['EVIDENCE_DIR'])
+        records = []
 
-      - name: Check out the research workflow
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: research
-          persist-credentials: false
+        def phase(label, command):
+            record = dict(label=label, command=command, started=time.time())
+            records.append(record)
+            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
+            print('Starting ' + label, flush=True)
+            path = logs / (label + '.txt')
+            with path.open('wb') as output:
+                result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
+            record.update(exit=result.returncode, finished=time.time(), log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            (logs / (label + '.exit')).write_text(str(result.returncode) + '\n')
+            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
+            print(path.read_text(errors='replace')[-14000:], flush=True)
+            if result.returncode:
+                raise SystemExit(result.returncode)
+            return path.read_text(errors='replace')
 
-      - name: Check out the literal product
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: bd88f565f9e4f2078d11dcc85a027bf0cd2a5091
-          path: product
-          persist-credentials: false
+        def exact(label, selector, feature=None):
+            command = ['cargo', 'test', '--locked', '--no-default-features']
+            if feature:
+                command += ['--features', feature]
+            command += ['--lib', selector, '--', '--exact', '--show-output', '--test-threads=1', '--color=never']
+            output = phase(label, command)
+            assert len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. ok$', output, re.M)) == 1, selector
+            assert re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output, re.M) == [('1', '0', '0')], selector
+            return output
 
-      - name: Check out the matching main baseline
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: 6871a2cc806bb12e489b2265219f67578342624e
-          path: baseline
-          persist-credentials: false
-
-      - name: Verify sources and prepare native Apple tools
-        env:
-          EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
-          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
-          test "$(git -C "$GITHUB_WORKSPACE/baseline" rev-parse HEAD)" = "$EXPECTED_BASELINE_SHA"
-          test "$(git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD)" = "$EXPECTED_RESEARCH_SHA"
-          test "$(uname -m)" = arm64
-          install -d -m 700 "$RUNNER_TEMP/pr1853-logs"
-          rustup toolchain install 1.93.0 --profile minimal
-          rustc -vV | tee "$RUNNER_TEMP/pr1853-logs/rustc.txt"
-          grep -Fx 'host: aarch64-apple-darwin' "$RUNNER_TEMP/pr1853-logs/rustc.txt"
-          {
-            printf 'product\n'
-            git rev-parse HEAD 'HEAD^{tree}'
-            printf 'baseline\n'
-            git -C "$GITHUB_WORKSPACE/baseline" rev-parse HEAD 'HEAD^{tree}'
-            printf 'research\n'
-            git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
-            sw_vers
-            uname -m
-            xcrun --show-sdk-path
-            cargo --version
-            git --version
-            cc --version
-          } | tee "$RUNNER_TEMP/pr1853-logs/source-tools.txt"
-          python3 - <<'PY'
-          import hashlib, os, pathlib
-          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
-          paths = ['src/install_guard.rs', 'src/instance.rs', 'src/update.rs', 'src/update/source.rs']
-          rows = [hashlib.sha256((root / 'product' / path).read_bytes()).hexdigest() + '  ' + path for path in paths]
-          rows.append(hashlib.sha256((root / 'research/.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest() + '  research-workflow')
-          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1853-logs/source-sha256.txt').write_text('\n'.join(rows) + '\n')
-          PY
-
-      - name: Check the real native Apple CLI with a failure control
-        run: |
-          set -euo pipefail
-          set +e
-          cargo check --locked --no-default-features --bin cagents 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/apple-cli-check.txt"
-          product_status=${PIPESTATUS[0]}
-          set -e
-          printf '%s\n' "$product_status" > "$RUNNER_TEMP/pr1853-logs/apple-cli-check.exit"
-          if [ "$product_status" -ne 0 ]; then
-            set +e
-            (cd "$GITHUB_WORKSPACE/baseline" && cargo check --locked --no-default-features --bin cagents) 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/baseline-apple-cli-check.txt"
-            baseline_status=${PIPESTATUS[0]}
-            set -e
-            printf '%s\n' "$baseline_status" > "$RUNNER_TEMP/pr1853-logs/baseline-apple-cli-check.exit"
-            exit "$product_status"
-          fi
-
-      - name: Compile the ordinary native Apple CLI library tests with a failure control
-        run: |
-          set -euo pipefail
-          set +e
-          cargo test --locked --no-default-features --lib --no-run 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/apple-lib-test-compile.txt"
-          product_status=${PIPESTATUS[0]}
-          set -e
-          printf '%s\n' "$product_status" > "$RUNNER_TEMP/pr1853-logs/apple-lib-test-compile.exit"
-          if [ "$product_status" -ne 0 ]; then
-            set +e
-            (cd "$GITHUB_WORKSPACE/baseline" && cargo test --locked --no-default-features --lib --no-run) 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/baseline-apple-lib-test-compile.txt"
-            baseline_status=${PIPESTATUS[0]}
-            set -e
-            printf '%s\n' "$baseline_status" > "$RUNNER_TEMP/pr1853-logs/baseline-apple-lib-test-compile.exit"
-            exit "$product_status"
-          fi
-
-      - name: Run the four actual non-Linux refusal contracts
-        run: |
-          set -euo pipefail
-          for selector in \
-            update::tests::unsupported_streaming_never_starts_a_command_and_keeps_cancellation \
-            install_guard::tests::unsupported_installation_refuses_before_path_or_window_preparation \
-            instance::tests::unsupported_process_census_never_reports_an_empty_owned_inventory \
-            update::source::platform_tests::unsupported_source_cannot_be_classified_as_an_absent_daemon
-          do
-            log="$RUNNER_TEMP/pr1853-logs/apple-${selector//::/_}.txt"
-            cargo test --locked --no-default-features --lib "$selector" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-            grep -F "test $selector ... ok" "$log"
-            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
-          done
-
-      - name: Verify unchanged product and baseline
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
-          git diff --exit-code
-          git diff --cached --exit-code
-          git -C "$GITHUB_WORKSPACE/baseline" diff --exit-code
-          git -C "$GITHUB_WORKSPACE/baseline" diff --cached --exit-code
-
-      - name: Retain native Apple evidence including any matching baseline failure
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: research-pr1853-apple-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pr1853-logs/
-          if-no-files-found: warn
-          retention-days: 14
-
+        phase('apple-cli-check', ['cargo','check','--locked','--no-default-features','--bin','cagents'])
+        build = phase('apple-cli-build', ['cargo','build','--locked','--no-default-features','--bin','cagents','--message-format=json-render-diagnostics'])
+        artifacts=[]
+        for line in build.splitlines():
+            try:
+                item=json.loads(line)
+            except ValueError:
+                continue
+            if item.get('reason')=='compiler-artifact' and item.get('target',{}).get('name')=='cagents' and item.get('executable'):
+                assert item.get('features')==[], item
+                artifacts.append(item)
+        assert len(artifacts)==1, artifacts
+        binary=pathlib.Path(artifacts[0]['executable']).resolve(strict=True)
+        assert binary.is_relative_to(pathlib.Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True))
+        binary_hash=hashlib.sha256(binary.read_bytes()).hexdigest()
+        (logs/'linked-cli.json').write_text(json.dumps(dict(path=str(binary),sha256=binary_hash,artifact=artifacts[0]),indent=2)+'\n')
+        output=phase('apple-cli-protocol-version', [str(binary),'--json','--device','unconfigured-portability-device','daemon','protocol-version'])
+        reply=json.loads(output)
+        assert reply['ok'] is True and reply['command']=='daemon.protocol_version' and reply['data']['protocol_version']==127, reply
+        assert hashlib.sha256(binary.read_bytes()).hexdigest()==binary_hash
+        phase('apple-lib-test-compile',['cargo','test','--locked','--no-default-features','--lib','--no-run'])
+        for index, selector in enumerate(['update::tests::unsupported_streaming_never_starts_a_command_and_keeps_cancellation', 'install_guard::tests::unsupported_installation_refuses_before_path_or_window_preparation', 'instance::tests::unsupported_process_census_never_reports_an_empty_owned_inventory', 'update::source::platform_tests::unsupported_source_cannot_be_classified_as_an_absent_daemon', 'daemon::unsupported_platform_tests::ownership_refusal_precedes_runtime_discovery_and_socket_or_lease_access', 'daemon::unsupported_platform_tests::unsupported_descriptor_sealing_preserves_errno_without_executing_child', 'control::unsupported_connection_tests::unsupported_control_connection_precedes_path_validation_and_deadline_arithmetic', 'daemon::holder_registry::connection::unsupported_tests::unsupported_holder_connection_precedes_deadline_and_endpoint_work', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::unavailable_anonymous_publication_leaves_no_named_fallback', 'fs_safety::platform::tests::native_access_acl_copy_replaces_existing_acl_and_removes_observed_absence', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links'], 1):
+            exact("apple-parent-%02d" % index, selector)
+        print('Sixteen native owning CLI parents passed exactly once.', flush=True)
+        PY
+    - name: Always retain and require unchanged literal source
+      if: always()
+      env:
+        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path.cwd()
+        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        def git(*args,where=root):
+            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
+        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
+        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
+        state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
+        (logs/'source-after-always.json').write_text(json.dumps(state,indent=2)+'\n')
+        assert state['head']==os.environ['EXPECTED_PRODUCT_SHA'] and state['tree']==os.environ['EXPECTED_PRODUCT_TREE']
+        assert state['research_head']==os.environ['EXPECTED_RESEARCH_SHA']
+        assert not state['product_status'] and not state['research_status']
+        before=json.loads((logs/'source-before.json').read_text())
+        assert state['sha256']==before['sha256']
+        assert state['research_tree']==before['research_tree']
+        PY
+    - name: Retain original apple qualification evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: research-pr1951-apple-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/pr1951-apple-logs/
+        if-no-files-found: error
+        retention-days: 14
   linux:
     needs: macos
-    name: Isolated Linux CLI HOST UI and six supervision contracts
+    name: Linux full CLI then isolated HOST and UI
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash
         working-directory: product
     steps:
-      - name: Require a natural User execution context
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-          present = [name for name in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_AGENT_TOKEN', 'CAGENTS_SESSION_TOKEN') if name in os.environ]
-          if present:
-              print('Natural User qualification refused: ' + ', '.join(present), file=sys.stderr)
-              raise SystemExit(1)
-          PY
+    - name: Require natural User context and private fixture paths
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json, os, pathlib, sys, tempfile
+        logs=pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-linux-logs'
+        logs.mkdir(mode=0o700)
+        names=sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+        (logs/'natural-context.json').write_text(json.dumps({'present_names':names})+'\n')
+        if names:
+            raise SystemExit('Natural User qualification refused: '+', '.join(names))
+        fixture=pathlib.Path(tempfile.mkdtemp(prefix='c1951',dir='/tmp'))
+        with open(os.environ['GITHUB_ENV'],'a') as env:
+            print('EVIDENCE_DIR='+str(logs),file=env)
+            print('CARGO_TARGET_DIR='+str(pathlib.Path(os.environ['RUNNER_TEMP'])/'pr1951-linux-target'),file=env)
+            print('TMPDIR='+str(fixture),file=env)
+            for name,leaf in [('XDG_RUNTIME_DIR','runtime'),('XDG_DATA_HOME','data'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),('XDG_STATE_HOME','state')]:
+                (fixture/leaf).mkdir(mode=0o700)
+                print(name+'='+str(fixture/leaf),file=env)
+        PY
+    - name: Check out research
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: research
+        persist-credentials: false
+    - name: Check out product
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      with:
+        ref: 883726734a8194ec8b18161e3dbcb50367a7db4d
+        path: product
+        persist-credentials: false
+    - name: Bind exact product and research sources
+      env:
+        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path.cwd()
+        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        def git(*args,where=root):
+            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
+        assert git('rev-parse','HEAD')==os.environ['EXPECTED_PRODUCT_SHA']
+        assert git('rev-parse','HEAD^{tree}')==os.environ['EXPECTED_PRODUCT_TREE']
+        assert not git('status','--porcelain','--untracked-files=all')
+        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
+        assert git('rev-parse','HEAD',where=research)==os.environ['EXPECTED_RESEARCH_SHA']
+        assert not git('status','--porcelain','--untracked-files=all',where=research)
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
+        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
+        (logs/'source-before.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes},indent=2)+'\n')
+        PY
+    - name: Set up the literal product Linux build environment
+      uses: ./product/.github/actions/setup-linux-build
+    - name: Prepare and record Linux tools
+      run: |
+        set -euo pipefail
+        test "$(id -u)" -ne 0
+        rustup component add --toolchain 1.93.0 rustfmt
+        { rustc -vV; cargo --version; rustfmt --version; zig version; cc --version; git --version; id; } > "$EVIDENCE_DIR/tools.txt"
+    - name: Run literal linux qualification and retain every original exit
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, re, subprocess, sys, time
+        logs = pathlib.Path(os.environ['EVIDENCE_DIR'])
+        records = []
 
-      - name: Check out the research workflow
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: research
-          persist-credentials: false
+        def phase(label, command):
+            record = dict(label=label, command=command, started=time.time())
+            records.append(record)
+            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
+            print('Starting ' + label, flush=True)
+            path = logs / (label + '.txt')
+            with path.open('wb') as output:
+                result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
+            record.update(exit=result.returncode, finished=time.time(), log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            (logs / (label + '.exit')).write_text(str(result.returncode) + '\n')
+            (logs / 'phases.json').write_text(json.dumps(records, indent=2) + '\n')
+            print(path.read_text(errors='replace')[-14000:], flush=True)
+            if result.returncode:
+                raise SystemExit(result.returncode)
+            return path.read_text(errors='replace')
 
-      - name: Check out the literal product
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: bd88f565f9e4f2078d11dcc85a027bf0cd2a5091
-          path: product
-          persist-credentials: false
+        def exact(label, selector, feature=None):
+            command = ['cargo', 'test', '--locked', '--no-default-features']
+            if feature:
+                command += ['--features', feature]
+            command += ['--lib', selector, '--', '--exact', '--show-output', '--test-threads=1', '--color=never']
+            output = phase(label, command)
+            assert len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. ok$', output, re.M)) == 1, selector
+            assert re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output, re.M) == [('1', '0', '0')], selector
+            return output
 
-      - name: Verify source and private fixture paths
-        env:
-          EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
-          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
-          test "$(git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD)" = "$EXPECTED_RESEARCH_SHA"
-          install -d -m 700 "$RUNNER_TEMP/pr1853-logs"
-          fixture_root=$(mktemp -d /tmp/c1853XXXXXX)
-          install -d -m 700 "$fixture_root/runtime" "$fixture_root/data"
-          printf '%s\n' "TMPDIR=$fixture_root" "XDG_RUNTIME_DIR=$fixture_root/runtime" "XDG_DATA_HOME=$fixture_root/data" >> "$GITHUB_ENV"
-          {
-            printf 'product\n'
-            git rev-parse HEAD 'HEAD^{tree}'
-            printf 'research\n'
-            git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
-            sha256sum src/install_guard.rs src/instance.rs src/update.rs src/update/source.rs "$GITHUB_WORKSPACE/research/.github/workflows/research-pr1853-bd88.yml"
-          } | tee "$RUNNER_TEMP/pr1853-logs/source.txt"
+        phase('format',['scripts/check-format'])
+        phase('linux-cli-check',['cargo','check','--locked','--no-default-features','--bin','cagents'])
+        output=phase('linux-cli-all-targets',['cargo','test','--locked','--no-default-features','--all-targets','--','--test-threads=2','--color=never'])
+        expected=['fs_safety::tests::a_root_reports_its_own_identity', 'fs_safety::tests::a_relative_path_resolves_and_reads', 'fs_safety::tests::a_symlinked_final_component_is_rejected', 'fs_safety::tests::a_symlinked_intermediate_component_is_rejected', 'fs_safety::tests::an_absolute_path_and_a_parent_component_are_rejected', 'fs_safety::tests::metadata_beneath_describes_a_symlink_as_itself', 'fs_safety::tests::exclusive_publication_preserves_existing_entries_and_dangling_links', 'fs_safety::tests::retained_directory_listing_and_permissions_ignore_replaced_names', 'fs_safety::tests::creation_modes_preserve_target_width_before_creating_entries', 'fs_safety::tests::a_temporary_file_is_renamed_over_its_target_atomically', 'fs_safety::tests::only_the_user_and_access_control_namespaces_are_reproduced', 'fs_safety::tests::a_fifo_opens_without_blocking_and_is_identifiable', 'fs_safety::directory_creation::tests::publication_retains_original_before_public_target_replacement', 'fs_safety::directory_creation::tests::different_parent_preserves_native_creation_as_unverified', 'fs_safety::directory_creation::tests::shared_namespace_returns_unverified_without_permission_claim', 'fs_safety::directory_creation::tests::restrictive_umask_creation_uses_retained_descriptor', 'fs_safety::directory_creation::tests::mode_restore_failure_keeps_published_identity_and_explicit_retry', 'fs_safety::directory_creation::tests::pending_mode_retry_preserves_observed_newer_public_permissions', 'fs_safety::directory_creation::tests::sticky_parent_effective_access_checks_the_retained_original_before_creation', 'fs_safety::directory_creation::tests::postpublication_cleanup_error_retains_cached_identity_and_stage', 'fs_safety::directory_creation::tests::failed_publication_retains_prepared_identity_and_retries_cleanup', 'update::tests::streaming_capture_failure_cleans_fresh_original_before_returning_error', 'update::tests::bounded_stream_preserves_success_and_size_failure', 'update::tests::bounded_stream_keeps_live_timeout_and_cancellation_cleanup', 'update::tests::streaming_child_observation_keeps_leader_until_final_cleanup', 'update::tests::streaming_signal_error_reaps_exited_leader_and_refuses_live_wait', 'update::tests::bounded_failed_stream_cleans_owned_descendants_after_exit', 'update::tests::a_failed_build_requires_a_later_matched_installation_to_be_superseded']
+        for selector in expected:
+            count=len(re.findall(r'^test '+re.escape(selector)+r' \.\.\. ok$',output,re.M))
+            assert count>=1, selector
+            if selector!='fs_safety::directory_creation::tests::restrictive_umask_creation_uses_retained_descriptor':
+                assert count==1, (selector,count)
+        assert 'test update::tests::streaming_child_refuses_a_kernel_reused_original_pid ... ignored' in output
+        print('All '+str(len(expected))+' strict Linux filesystem/supervision roots passed; nested self-exec output is nonadditive and ignored PID-reuse remains ignored.',flush=True)
 
-      - name: Set up the literal product Linux build environment
-        uses: ./product/.github/actions/setup-linux-build
+        phase('linux-host-check',['cargo','check','--locked','--no-default-features','--features','host','--bin','cagentsd'])
+        for index, selector in enumerate(['worktree_setup::tests::anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names', 'worktree_setup::tests::anonymous_copy_preserves_mode_under_restrictive_umask', 'worktree_setup::tests::changed_source_cannot_publish_new_private_bytes_with_old_permissions', 'worktree_setup::tests::source_changes_after_permission_application_refuse_publication', 'worktree_setup::tests::copy_preserves_restrictive_access_acl_and_removes_inherited_acl'], 1):
+            output = exact("linux-host-parent-%02d" % index,selector,"host")
+            if selector.endswith("::copy_preserves_restrictive_access_acl_and_removes_inherited_acl"):
+                assert "SETUP_ACL_COPY_VERIFIED" in output
+                assert "SETUP_ACL_FIXTURE_UNSUPPORTED" not in output
 
-      - name: Record Linux build tools
-        run: |
-          set -euo pipefail
-          {
-            rustc -vV
-            cargo --version
-            zig version
-            clang --version
-            git --version
-          } | tee "$RUNNER_TEMP/pr1853-logs/toolchain.txt"
-
-      - name: Check formatting and isolated CLI
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1853-target-host
-        run: |
-          set -euo pipefail
-          rustup component add rustfmt --toolchain 1.93.0
-          scripts/check-format 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/format.txt"
-          cargo check --locked --no-default-features --bin cagents 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/linux-cli-check.txt"
-
-      - name: Run the Linux supervision families once
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1853-target-host
-        run: |
-          set -euo pipefail
-          cargo test --locked --no-default-features --lib update::tests::bounded_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/linux-bounded-tests.txt"
-          cargo test --locked --no-default-features --lib update::tests::streaming_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/linux-streaming-tests.txt"
-          python3 - <<'PY'
-          import os, pathlib, re
-          logs = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1853-logs'
-          expected = {
-              'update::tests::streaming_capture_failure_cleans_fresh_original_before_returning_error',
-              'update::tests::bounded_stream_preserves_success_and_size_failure',
-              'update::tests::bounded_stream_keeps_live_timeout_and_cancellation_cleanup',
-              'update::tests::streaming_child_observation_keeps_leader_until_final_cleanup',
-              'update::tests::streaming_signal_error_reaps_exited_leader_and_refuses_live_wait',
-              'update::tests::bounded_failed_stream_cleans_owned_descendants_after_exit',
-          }
-          bounded = (logs / 'linux-bounded-tests.txt').read_text()
-          streaming = (logs / 'linux-streaming-tests.txt').read_text()
-          actual = set(re.findall(r'test (update::tests::\w+) \.\.\. ok', bounded + streaming))
-          assert actual == expected, {'missing': sorted(expected - actual), 'unexpected': sorted(actual - expected)}
-          assert 'test result: ok. 3 passed; 0 failed; 0 ignored;' in bounded
-          assert 'test result: ok. 3 passed; 0 failed; 1 ignored;' in streaming
-          assert 'test update::tests::streaming_child_refuses_a_kernel_reused_original_pid ... ignored' in streaming
-          print('Six active supervision parents passed; the original PID-namespace root remains ignored, not passed.')
-          PY
-
-      - name: Check the isolated HOST executable
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1853-target-host
-        run: |
-          set -euo pipefail
-          cargo check --locked --no-default-features --features host --bin cagentsd 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/linux-host-check.txt"
-
-      - name: Check the isolated browserless UI executable
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/pr1853-target-ui
-        run: |
-          set -euo pipefail
-          cargo check --locked --no-default-features --features ui --bin cagents-ui 2>&1 | tee "$RUNNER_TEMP/pr1853-logs/linux-ui-check.txt"
-
-      - name: Verify unchanged literal product
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
-          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
-          git diff --exit-code
-          git diff --cached --exit-code
-
-      - name: Retain isolated Linux evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: research-pr1853-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pr1853-logs/
-          if-no-files-found: warn
-          retention-days: 14
+        phase('linux-ui-check',['cargo','check','--locked','--no-default-features','--features','ui','--bin','cagents-ui'])
+        PY
+    - name: Always retain and require unchanged literal source
+      if: always()
+      env:
+        EXPECTED_RESEARCH_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path.cwd()
+        logs=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        def git(*args,where=root):
+            return subprocess.check_output(['git',*args],cwd=where,text=True).strip()
+        research=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'research'
+        paths=['Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'src/modules.rs', '.cargo/config.toml', 'scripts/build-ceditor-product', 'src/chat/attachment_assets.rs', 'src/control.rs', 'src/daemon.rs', 'src/daemon/holder_registry/connection.rs', 'src/fs_safety.rs', 'src/fs_safety/darwin.rs', 'src/fs_safety/directory_creation.rs', 'src/fs_safety/linux.rs', 'src/host/client.rs', 'src/install_guard.rs', 'src/instance.rs', 'src/instance/daemon_admission.rs', 'src/update.rs', 'src/update/source.rs', 'src/worktree_setup.rs']
+        hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in paths}
+        hashes['research-workflow']=hashlib.sha256((research/'.github/workflows/research-pr1853-bd88.yml').read_bytes()).hexdigest()
+        state={'head':git('rev-parse','HEAD'),'tree':git('rev-parse','HEAD^{tree}'),'research_head':git('rev-parse','HEAD',where=research),'research_tree':git('rev-parse','HEAD^{tree}',where=research),'sha256':hashes,'product_status':git('status','--porcelain','--untracked-files=all'),'research_status':git('status','--porcelain','--untracked-files=all',where=research)}
+        (logs/'source-after-always.json').write_text(json.dumps(state,indent=2)+'\n')
+        assert state['head']==os.environ['EXPECTED_PRODUCT_SHA'] and state['tree']==os.environ['EXPECTED_PRODUCT_TREE']
+        assert state['research_head']==os.environ['EXPECTED_RESEARCH_SHA']
+        assert not state['product_status'] and not state['research_status']
+        before=json.loads((logs/'source-before.json').read_text())
+        assert state['sha256']==before['sha256']
+        assert state['research_tree']==before['research_tree']
+        PY
+    - name: Retain original linux qualification evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: research-pr1951-linux-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/pr1951-linux-logs/
+        if-no-files-found: error
+        retention-days: 14
