@@ -46,8 +46,7 @@ pub(super) fn start(
             .map_err(|failure| unavailable(failure.to_string()))?;
         runtime.block_on(crate::account::probe::search_path())
     };
-    let session = prepare_configuration(&intent, configuration, &store, &homes, search.as_deref())
-        .map_err(error)?;
+    let session = prepare_configuration(&intent, configuration, &store, &homes, search.as_deref())?;
     // Use the existing owning launch worker, including its final reservation,
     // account lifecycle authorization, process factory and issued descriptor.
     // Recovery, preview tokens and preserved source environments never enter
@@ -92,10 +91,10 @@ fn prepare_at(
     store: &Store,
     homes: &Homes,
     search_path: Option<&OsStr>,
-) -> Result<Session, String> {
+) -> Result<Session, ProtocolError> {
     prepare_configuration(
         intent,
-        capture_configuration(intent.provider, settings_path)?,
+        capture_configuration(intent.provider, settings_path).map_err(error)?,
         store,
         homes,
         search_path,
@@ -124,10 +123,12 @@ fn prepare_configuration(
     store: &Store,
     homes: &Homes,
     search_path: Option<&OsStr>,
-) -> Result<Session, String> {
-    intent.validate()?;
+) -> Result<Session, ProtocolError> {
+    intent.validate().map_err(error)?;
     if !intent.working_directory.is_dir() {
-        return Err("The conversation directory is unavailable on the selected device".into());
+        return Err(error(
+            "The conversation directory is unavailable on the selected device",
+        ));
     }
     // The UI has already selected its effective conversation controls. None
     // means clear, not an invitation to replace them with another window's
@@ -137,15 +138,15 @@ fn prepare_configuration(
     if let Some(path) = search_path {
         let path = path
             .to_str()
-            .ok_or("The provider search path is not UTF-8")?;
+            .ok_or_else(|| error("The provider search path is not UTF-8"))?;
         configuration
             .environment
             .entry("PATH".into())
             .or_insert_with(|| path.into());
     }
-    let registry = store.load().map_err(|failure| failure.to_string())?;
+    let registry = store.load().map_err(|failure| error(failure.to_string()))?;
     if registry.is_newer() {
-        return Err("Account registry needs a newer cagents version".into());
+        return Err(error("Account registry needs a newer cagents version"));
     }
     let system = Account::system(intent.provider);
     let account = if intent.account == system.id() {
@@ -155,16 +156,24 @@ fn prepare_configuration(
             .accounts(Some(homes))
             .into_iter()
             .find(|account| account.provider == intent.provider && account.id() == intent.account)
-            .ok_or("The selected provider account was removed on this device")?
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::AccountRemoved,
+                    "The selected provider account was removed on this device",
+                    false,
+                )
+            })?
     };
     if account.registry_key().is_some() && account.resolved_home().is_none_or(|home| !home.is_dir())
     {
-        return Err("The selected account home is unavailable on this device".into());
+        return Err(error(
+            "The selected account home is unavailable on this device",
+        ));
     }
     let cli = Cli::configured(intent.provider, search_path, configuration).map_err(|failure| {
         match failure {
             crate::account::probe::CliFailure::Unavailable(reason)
-            | crate::account::probe::CliFailure::Invalid(reason) => reason,
+            | crate::account::probe::CliFailure::Invalid(reason) => error(reason),
         }
     })?;
     let mut captured = cli.configuration;
@@ -172,7 +181,7 @@ fn prepare_configuration(
         cli.program
             .into_os_string()
             .into_string()
-            .map_err(|_| "The provider executable is not a UTF-8 path")?,
+            .map_err(|_| error("The provider executable is not a UTF-8 path"))?,
     );
     let mut session = chat::fresh_session_configured(
         intent.provider,
@@ -185,7 +194,8 @@ fn prepare_configuration(
             effort: intent.effort.as_deref(),
             permission_mode: intent.permission_mode.as_deref(),
         },
-    )?;
+    )
+    .map_err(error)?;
     if intent.automatic {
         session
             .launch
@@ -257,7 +267,7 @@ mod tests {
                 intent,
             }
         }
-        fn prepare(&self) -> Result<Session, String> {
+        fn prepare(&self) -> Result<Session, ProtocolError> {
             prepare_at(&self.intent, &self.settings, &self.store, &self.homes, None)
         }
     }
@@ -310,9 +320,8 @@ mod tests {
         let survivor = TerminalId::new();
         let survivor_owner = capacity::Reservation::fresh(&host, survivor).unwrap();
         fs::remove_file(&fixture.executable).unwrap();
-        let result = (|| -> Result<Session, String> {
-            let _owner = capacity::Reservation::fresh(&host, fixture.intent.id)
-                .map_err(|error| error.message)?;
+        let result = (|| -> Result<Session, ProtocolError> {
+            let _owner = capacity::Reservation::fresh(&host, fixture.intent.id)?;
             // The same saved-policy factory used by ingress fails after the
             // reservation, before any provider process can be constructed.
             fixture.prepare()
@@ -326,6 +335,94 @@ mod tests {
         assert_eq!(capacity::usage(&state), 1);
         drop(state);
         drop(survivor_owner);
+    }
+
+    #[test]
+    fn configured_removed_account_keeps_typed_refusal_and_exact_factory_cleanup() {
+        let mut fixture = Fixture::new();
+        let key = uuid::Uuid::new_v4();
+        fs::create_dir_all(fixture.homes.path(Provider::Codex, key)).unwrap();
+        fixture
+            .store
+            .update(|registry| {
+                registry.register(
+                    crate::account::registry::Registered {
+                        key,
+                        provider: Provider::Codex,
+                        linked_home: None,
+                        label: None,
+                        email: None,
+                        organization: None,
+                        added_at: 1,
+                    },
+                    &[],
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
+        fixture.intent.account = Account::managed(
+            Provider::Codex,
+            key,
+            fixture.homes.path(Provider::Codex, key),
+        )
+        .id();
+        assert!(fixture.prepare().unwrap().is_unstarted());
+        assert!(
+            fixture
+                .store
+                .remove_home(&fixture.homes, Provider::Codex, key, true)
+                .unwrap()
+                .1
+                .is_none()
+        );
+
+        let host = crate::host::AccountReservation::test_host();
+        let survivor = TerminalId::new();
+        let survivor_owner = capacity::Reservation::fresh(&host, survivor).unwrap();
+        let failure = (|| -> Result<Session, ProtocolError> {
+            let _owner = capacity::Reservation::fresh(&host, fixture.intent.id)?;
+            fixture.prepare()
+        })()
+        .unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::AccountRemoved);
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.message,
+            "The selected provider account was removed on this device"
+        );
+        // The existing client typed-error contract maps AccountRemoved to
+        // Recovery::Account. No provider or connection is constructed here.
+        let state = host.lock().unwrap();
+        assert!(!state.contains_session_identity(fixture.intent.id));
+        assert!(survivor_owner.holds(&state, survivor));
+        assert_eq!(state.chat_preparing.len(), 1);
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
+        assert_eq!(capacity::usage(&state), 1);
+        drop(state);
+        drop(survivor_owner);
+    }
+
+    #[test]
+    fn configured_invalid_execution_policy_keeps_nonretryable_invalid_request() {
+        let fixture = Fixture::new();
+        let mut configuration = capture_configuration(Provider::Codex, &fixture.settings).unwrap();
+        configuration.environment.insert(
+            "CODEX_HOME".into(),
+            fixture.directory.path().to_string_lossy().into_owned(),
+        );
+        let failure = prepare_configuration(
+            &fixture.intent,
+            configuration,
+            &fixture.store,
+            &fixture.homes,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!failure.retryable);
+        assert!(failure.message.contains("reserved for account isolation"));
     }
 
     #[test]
@@ -382,14 +479,16 @@ mod tests {
     fn missing_executable_account_and_invalid_intent_refuse_without_fallback() {
         let mut fixture = Fixture::new();
         fs::remove_file(&fixture.executable).unwrap();
-        assert!(fixture.prepare().is_err());
+        let failure = fixture.prepare().unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!failure.retryable);
         fixture.intent.account = Account::managed(
             Provider::Codex,
             uuid::Uuid::new_v4(),
             fixture.directory.path().join("not-enrolled"),
         )
         .id();
-        assert!(fixture.prepare().unwrap_err().contains("removed"));
+        assert!(fixture.prepare().unwrap_err().message.contains("removed"));
         fixture.intent.account = Account::system(Provider::Claude).id();
         assert!(fixture.prepare().is_err());
         fixture.intent.id = TerminalId::from_uuid(uuid::Uuid::nil());
@@ -425,7 +524,13 @@ mod tests {
             fixture.directory.path().join("untrusted-ui-home"),
         )
         .id();
-        assert!(fixture.prepare().unwrap_err().contains("account home"));
+        assert!(
+            fixture
+                .prepare()
+                .unwrap_err()
+                .message
+                .contains("account home")
+        );
         fs::create_dir_all(fixture.homes.path(Provider::Codex, key)).unwrap();
         let session = fixture.prepare().unwrap();
         assert_eq!(
