@@ -774,6 +774,19 @@ try:
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'Fresh work after ordinary History recovery.'])
                 wait(lambda: field.queryText().getText(0, -1) == 'Fresh work after ordinary History recovery.')
                 capture(window, label + '-ordinary-recovered', (1280, 800))
+                # Ordinary typing has no idle snapshot timer in either
+                # revision. Exercise the real save-on-navigation contract.
+                def saved_channel_control():
+                    candidates = [node for node in live_tree(pid)
+                                  if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                  and node.name.startswith('Open channel Saved recovery model received, ')
+                                  and visible(node) and node.getState().contains(pyatspi.STATE_ENABLED)]
+                    assert len(candidates) <= 1, 'The intended saved channel must be unique'
+                    return candidates[0].name if candidates else None
+                click(pid, wait(saved_channel_control))
+                wait(lambda: not any('Ordinary History recovery is ready.' in node.name and visible(node)
+                                     for node in live_tree(pid)))
+                capture(window, label + '-ordinary-returned-to-saved-scope', (1280, 800))
             elif variant == 'after' and not hidden and payload == 'short' and mode == 'stale':
                 capture(window, label + '-controls', (1280, 800))
                 copy_exact(pid, 'Copy saved draft', (root / 'expected-draft.txt').read_bytes(), keyboard=True)
@@ -949,10 +962,14 @@ try:
                                         if json.loads(row[1]).get('id') == actor), None)
                             draft_key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:chat_drafts'
                             drafts = db.execute('SELECT value FROM metadata WHERE key=?', (draft_key,)).fetchone()
+                            scope_key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:active_thread'
+                            scope = db.execute('SELECT value FROM metadata WHERE key=?', (scope_key,)).fetchone()
                             settled = (row is not None and 'open' in str(json.loads(row[2])).lower() and drafts is not None
                                        and json.loads(drafts[0]).get(row[0]) == 'Fresh work after ordinary History recovery.')
-                            observe_durability('recovered', {'fresh_recovered_card_and_draft_match': settled}, db)
-                            return settled
+                            returned = scope is not None and json.loads(scope[0]) == '00000000-0000-4000-8000-000000002922'
+                            observe_durability('recovered', {'fresh_recovered_card_and_draft_match': settled,
+                                                           'returned_to_saved_channel': returned}, db)
+                            return settled and returned
                     except (sqlite3.Error, FileNotFoundError) as error:
                         observe_durability('recovered', {}, error=error)
                         return False
