@@ -1549,6 +1549,17 @@ mod tests {
         assert!(holder_acknowledgment(&receiver, binding, Instant::now() + IO_BOUND).is_err());
     }
 
+    fn holder_test_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Original-holder admission requires a private namespace, independently
+        // of the ambient umask used by tempfile's default directory builder.
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     const HOLDER_TEST_CHILD: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_CHILD";
     const HOLDER_TEST_ROOT: &str = "CAGENTS_TEST_ORIGINAL_HOLDER_ROOT";
     fn holder_test_child_body(expect_ack: bool) {
@@ -1634,7 +1645,7 @@ mod tests {
             holder_test_child_body(true);
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = holder_test_root();
         let terminal = TerminalId::new();
         let mut command = holder_child_command(root.path(), "ack");
         let mut parent =
@@ -1664,7 +1675,7 @@ mod tests {
             holder_test_child_body(false);
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = holder_test_root();
         let mut command = holder_child_command(root.path(), "no-ack");
         let mut parent =
             TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
@@ -1688,7 +1699,7 @@ mod tests {
 
     #[test]
     fn single_holder_foreign_peer_closes_queued_descriptor_without_enrollment() {
-        let root = tempfile::tempdir().unwrap();
+        let root = holder_test_root();
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "exec /bin/sleep 30"])
@@ -1799,7 +1810,7 @@ mod tests {
             Err(error) => panic!("invalid rejection test role: {error}"),
         }
         for mode in modes {
-            let root = tempfile::tempdir().unwrap();
+            let root = holder_test_root();
             let mut command = holder_child_command(root.path(), mode);
             let mut parent =
                 TerminalHolderParent::spawn_stage0(root.path(), TerminalId::new(), &mut command)
@@ -2296,7 +2307,7 @@ mod tests {
             }
             Err(std::env::VarError::NotPresent) => {
                 assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
-                let root = tempfile::tempdir().unwrap();
+                let root = holder_test_root();
                 let mut coordinator =
                     CooperativeCoordinator::spawn(root.path(), "crash-coordinator");
                 let deadline = Instant::now() + Duration::from_secs(15);
@@ -2336,7 +2347,7 @@ mod tests {
             Err(std::env::VarError::NotPresent) => {}
             _ => panic!("unknown coordinator EOF test role"),
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = holder_test_root();
         let (reader, lifetime_writer) = coordinator_lifetime_pipe();
         let mut command = holder_child_command(root.path(), "eof-stage0");
         inherit_lifetime_reader(&mut command, &reader, HOLDER_TEST_LIFETIME_READER);
@@ -2393,7 +2404,7 @@ mod tests {
             _ => panic!("unknown post-stage0-death cancellation role"),
         }
         assert!(std::env::var_os(HOLDER_TEST_LIFETIME_READER).is_none());
-        let root = tempfile::tempdir().unwrap();
+        let root = holder_test_root();
         struct PostStage0OuterTimeout;
         let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> () {
             let mut coordinator = CooperativeCoordinator::spawn(root.path(), "cancel-coordinator");
