@@ -702,13 +702,40 @@ try:
                 (root / 'hold-check').touch()
                 click(pid, 'Check session again')
                 wait(lambda: 'held-read-started' in receipt.read_text())
-                pending = wait(lambda: next((node for node in live_tree(pid) if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and node.name == 'Checking session…'), None))
-                assert not pending.getState().contains(pyatspi.STATE_ENABLED)
+                pending_state = {}
+                def disabled_pending():
+                    candidates = [node for node in live_tree(pid)
+                                  if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                  and node.name == 'Checking session…']
+                    assert len(candidates) <= 1, 'Pending recheck must expose one control'
+                    if not candidates:
+                        pending_state.update({'target_missing': True})
+                        return None
+                    node = candidates[0]
+                    node.clearCache()
+                    states = node.getState()
+                    bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    pending_state.update({
+                        'target_missing': False, 'monotonic': time.monotonic(),
+                        'enabled': states.contains(pyatspi.STATE_ENABLED),
+                        'sensitive': states.contains(pyatspi.STATE_SENSITIVE),
+                        'defunct': states.contains(pyatspi.STATE_DEFUNCT),
+                        'showing': states.contains(pyatspi.STATE_SHOWING),
+                        'bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
+                    })
+                    return node if (pending_state['showing'] and not pending_state['defunct']
+                                    and not pending_state['enabled'] and not pending_state['sensitive']
+                                    and bounds.width > 0 and bounds.height > 0) else None
+                try:
+                    wait(disabled_pending)
+                finally:
+                    event({'event': 'pending-recheck-state', 'pid': pid, 'state': pending_state})
+                assert not pending_state['enabled'] and not pending_state['sensitive']
                 run(['import', '-window', window, str(out / (label + '-pending.png'))])
                 with Image.open(out / (label + '-pending.png')) as picture:
                     picture.save(out / (label + '-pending.webp'), lossless=True)
-                bounds = pending.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
-                run(['xdotool', 'mousemove', '--sync', str(bounds.x + bounds.width // 2), str(bounds.y + bounds.height // 2), 'click', '1', 'click', '1'])
+                x, y, width, height = pending_state['bounds']
+                run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1', 'click', '1'])
                 assert receipt.read_text().count('explicit-read-started') == starts + 1
                 (root / 'hold-check').unlink()
                 wait(lambda: receipt.read_text().count('explicit-read-replied') > reads)

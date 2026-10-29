@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -96,6 +97,51 @@ def digest(path):
     return value.hexdigest()
 
 
+def file_identity(info):
+    return dict(device=info.st_dev, inode=info.st_ino, size=info.st_size,
+                mode=stat.S_IMODE(info.st_mode), uid=info.st_uid, links=info.st_nlink,
+                mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+
+
+def observe_helper(path):
+    before = path.lstat()
+    assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+    observation = dict(path=str(path), identity=file_identity(before), sha256=digest(path))
+    assert file_identity(path.lstat()) == observation['identity'], 'Helper changed during observation'
+    return observation
+
+
+def freeze_helper(source, artifact, directory):
+    source = Path(source).resolve(strict=True)
+    target = Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
+    assert source.is_relative_to(target)
+    assert not directory.is_relative_to(target)
+    directory.mkdir(mode=0o700)
+    frozen = directory / 'cagentsd'
+    copied_digest = hashlib.sha256()
+    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), 'rb') as original:
+        before = os.fstat(original.fileno())
+        assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and before.st_mode & 0o111
+        descriptor = os.open(frozen, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, 'wb') as output:
+            for block in iter(lambda: original.read(1024 * 1024), b''):
+                copied_digest.update(block)
+                output.write(block)
+            output.flush()
+            os.fchmod(output.fileno(), 0o500)
+            os.fsync(output.fileno())
+        assert file_identity(os.fstat(original.fileno())) == file_identity(before)
+    observed = observe_helper(frozen)
+    assert observed['sha256'] == copied_digest.hexdigest()
+    assert observed['identity']['links'] == 1 and observed['identity']['mode'] == 0o500
+    assert (observed['identity']['device'], observed['identity']['inode']) != (before.st_dev, before.st_ino)
+    record = dict(head=os.environ['PRODUCT_SHA'], tree=os.environ['PRODUCT_TREE'],
+                  artifact=artifact, source=dict(path=str(source), identity=file_identity(before),
+                                                 sha256=copied_digest.hexdigest()), frozen=observed)
+    (evidence / 'host-helper.json').write_text(json.dumps(record, indent=2) + '\n')
+    return frozen, observed
+
+
 try:
     user_context()
     unchanged()
@@ -117,6 +163,14 @@ try:
     }, indent=2) + '\n')
     lane = ['--locked', '--no-default-features', '--features', 'ui']
     if '--suites-only' not in sys.argv[3:]:
+        state_output = run('atspi-disabled-state-tests', ['cargo', 'test', '--locked', '--no-default-features',
+                           '--features', 'cagents/ui', '-p', 'accesskit_atspi_common', '--lib',
+                           'node::disabled_state_tests::', '--', '--test-threads=1', '--color=never'])
+        state_text = state_output.read_text()
+        for selector in ['disabled_action_controls_do_not_advertise_enabled_or_sensitive',
+                         'read_only_text_state_behavior_is_preserved']:
+            assert state_text.splitlines().count('test node::disabled_state_tests::' + selector + ' ... ok') == 1
+        assert 'test result: ok. 2 passed; 0 failed; 0 ignored;' in state_text
         run('ui-check', ['cargo', 'check', *lane, '--bin', 'cagents-ui'])
         artifacts = run('ui-all-targets-compile', ['cargo', 'test', *lane, '--all-targets', '--no-run', '--message-format=json'], True)
         rows = [json.loads(line) for line in artifacts.read_text().splitlines() if line.startswith('{')]
@@ -157,11 +211,26 @@ try:
                and row.get('target', {}).get('name') == 'cagentsd' and row.get('executable')
                and set(row.get('features', [])) == {'host'}]
     assert len(helpers) == 1
-    os.environ['CAGENTS_TEST_RETAINED_ACTOR_HELPER'] = helpers[0]
-    helper_hash = digest(Path(helpers[0]))
-    (evidence / 'host-helper.json').write_text(json.dumps({'executable': helpers[0], 'sha256': helper_hash}, indent=2) + '\n')
-    run('host-all-targets-suite', ['cargo', 'test', *host, '--all-targets', '--', '--test-threads=1'], required=False)
-    assert digest(Path(helpers[0])) == helper_hash, 'HOST helper changed during suite execution'
+    selected_artifact = next(row for row in rows if row.get('reason') == 'compiler-artifact'
+                             and row.get('executable') == helpers[0] and row.get('target', {}).get('name') == 'cagentsd')
+    helper, helper_before = freeze_helper(helpers[0], selected_artifact, private_tmp / 'frozen-host-helper')
+    os.environ['CAGENTS_TEST_RETAINED_ACTOR_HELPER'] = str(helper)
+    assert observe_helper(helper) == helper_before, 'HOST helper changed before suite execution'
+    try:
+        run('host-all-targets-suite', ['cargo', 'test', *host, '--all-targets', '--', '--test-threads=1'], required=False)
+    finally:
+        preceding_error = repr(sys.exc_info()[1]) if sys.exc_info()[1] else None
+        try:
+            helper_after = observe_helper(helper)
+        except BaseException as error:
+            (evidence / 'host-helper-after.json').write_text(json.dumps({
+                'preceding_error': preceding_error, 'observation_error': repr(error), 'matches': False,
+            }, indent=2) + '\n')
+            raise
+        (evidence / 'host-helper-after.json').write_text(json.dumps({
+            'preceding_error': preceding_error, 'observed': helper_after, 'matches': helper_after == helper_before,
+        }, indent=2) + '\n')
+        assert helper_after == helper_before, 'HOST helper changed during suite execution'
     run('ui-all-targets-suite', ['cargo', 'test', *lane, '--all-targets', '--', '--test-threads=1'], required=False)
     if failures:
         raise RuntimeError('Qualification failures: ' + ', '.join(failures))
