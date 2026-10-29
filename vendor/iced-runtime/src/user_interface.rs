@@ -71,36 +71,6 @@ pub fn restore_cached_named_states(tree: &mut widget::Tree) {
     }
 }
 
-/// Focus only a current enabled accessibility target that actually offers
-/// focus. Activating a ComboBox first transfers real widget focus; activating
-/// one of its options leaves focus on the owning control.
-#[cfg(feature = "a11y")]
-pub fn accessibility_focus_target(
-    nodes: &iced_accessibility::A11yTree,
-    request: &iced_accessibility::accesskit::ActionRequest,
-) -> Option<widget::Id> {
-    use iced_accessibility::accesskit::{Action, NodeId, Role};
-    let node = nodes
-        .root()
-        .iter()
-        .chain(nodes.children())
-        .find(|node| NodeId::from(node.id().clone()) == request.target_node)?
-        .node();
-    if node.is_disabled() || !node.supports_action(Action::Focus) {
-        return None;
-    }
-    match request.action {
-        Action::Focus => Some(widget::Id::from(request.target_node.0)),
-        Action::Click | Action::Expand
-            if node.role() == Role::ComboBox
-                && node.supports_action(request.action) =>
-        {
-            Some(widget::Id::from(request.target_node.0))
-        }
-        _ => None,
-    }
-}
-
 impl<'a, Message, Theme, Renderer> UserInterface<'a, Message, Theme, Renderer>
 where
     Renderer: crate::core::Renderer,
@@ -307,60 +277,6 @@ where
                 event_cursor
             })
             .collect();
-        // Accessibility actions must keep overlay and base delivery in the
-        // same order. Otherwise a later option Click can run before an
-        // earlier root Collapse, or pre-focusing a later control can retire
-        // an earlier queued option before it is selected. Preserve the
-        // original cursor replay when taking this bounded slow path.
-        #[cfg(feature = "a11y")]
-        if events.len() > 1
-            && events.iter().any(|event| matches!(event, Event::A11y(..)))
-        {
-            let mut outdated = false;
-            let mut redraw_request = window::RedrawRequest::Wait;
-            let mut input_method = InputMethod::Disabled;
-            let mut has_layout_changed = false;
-            let mut mouse_interaction = mouse::Interaction::None;
-            let mut statuses = Vec::with_capacity(events.len());
-            for (event, cursor) in events.iter().zip(event_cursors) {
-                let (state, event_statuses) = self.update(
-                    std::slice::from_ref(event),
-                    cursor,
-                    renderer,
-                    clipboard,
-                    messages,
-                );
-                statuses.extend(event_statuses);
-                match state {
-                    State::Outdated => outdated = true,
-                    State::Updated {
-                        mouse_interaction: interaction,
-                        redraw_request: redraw,
-                        input_method: method,
-                        has_layout_changed: changed,
-                    } => {
-                        mouse_interaction = interaction;
-                        redraw_request = redraw_request.min(redraw);
-                        input_method.merge(&method);
-                        has_layout_changed |= changed;
-                    }
-                }
-            }
-            return (
-                if outdated {
-                    State::Outdated
-                } else {
-                    State::Updated {
-                        mouse_interaction,
-                        redraw_request,
-                        input_method,
-                        has_layout_changed,
-                    }
-                },
-                statuses,
-            );
-        }
-
         // Redraws can run before the queued input is drained and already carry
         // its final position. They must not overwrite the last INPUT position.
         // Keep an explicit leave unavailable until another motion/enter arrives:
@@ -374,13 +290,6 @@ where
         let mut input_method = InputMethod::Disabled;
         let mut has_layout_changed = false;
         let viewport = Rectangle::with_size(self.bounds);
-
-        // Apply actual focus at this event's delivery boundary, before an
-        // existing overlay sees it. Option actions never retarget focus.
-        #[cfg(feature = "a11y")]
-        if let [Event::A11y(_, request)] = events {
-            self.focus_accessibility_action(renderer, request);
-        }
 
         let mut maybe_overlay = self
             .root
@@ -810,28 +719,6 @@ where
             &self.state,
             cursor,
         )
-    }
-
-    /// Apply focus for the current native accessibility event before its
-    /// overlay and base delivery. Callers must not pre-focus later queued
-    /// requests before earlier inputs have been delivered.
-    #[cfg(feature = "a11y")]
-    pub fn focus_accessibility_action(
-        &mut self,
-        renderer: &Renderer,
-        request: &iced_accessibility::accesskit::ActionRequest,
-    ) -> bool {
-        let Some(target) = accessibility_focus_target(
-            &self.a11y_nodes(mouse::Cursor::Unavailable),
-            request,
-        ) else {
-            return false;
-        };
-        self.operate(
-            renderer,
-            &mut widget::operation::focusable::focus::<()>(target),
-        );
-        true
     }
 
     /// Find widget with given id

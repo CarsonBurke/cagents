@@ -37,21 +37,10 @@ fn select<'a>(
     setting_field(
         field.label(),
         "Used for new conversations. Each composer can override this choice.",
-        crate::ui_controls::field::select(
-            format!("{} {}", provider.label(), field.label()),
-            format!(
-                "settings.agent.{}.{}",
-                settings::agents::provider_key(provider),
-                field.key()
-            ),
-            format!("{values:?}"),
-            labels,
-            index,
-            move |index| Message::SettingsChanged {
-                field: SettingsField::Agent(provider, field),
-                value: values[index].clone(),
-            },
-        )
+        crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged {
+            field: SettingsField::Agent(provider, field),
+            value: values[index].clone(),
+        })
         .into(),
     )
     .keywords(format!(

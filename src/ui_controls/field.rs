@@ -73,15 +73,7 @@ pub fn clear<'a, Message: Clone + 'a>(on_clear: Message) -> Element<'a, Message>
 }
 
 /// A choice among a few named options, at the shell's type size.
-///
-/// `name` describes the task. `control_id` identifies this logical control
-/// owner, independently of its label; replacement dialogs need a new owner.
-/// `source_id` identifies the ordered backing choices, including IDs hidden
-/// behind duplicate labels, so old option actions cannot select replacements.
 pub fn select<'a, S, Message>(
-    name: impl Into<Cow<'static, str>>,
-    control_id: impl Into<Cow<'static, str>>,
-    source_id: impl Into<Cow<'static, str>>,
     options: impl Into<Cow<'a, [S]>>,
     selected: Option<usize>,
     on_select: impl Fn(usize) -> Message + Send + Sync + 'static,
@@ -92,9 +84,6 @@ where
     Message: Clone + 'static,
 {
     widget::dropdown(options, selected, on_select)
-        .name(name)
-        .id(widget::Id::new(control_id))
-        .source_id(source_id)
         .text_size(design::TEXT_BODY)
         .padding([INSET_Y, space::S])
 }

@@ -35,11 +35,6 @@ where
     id: Option<Id>,
     #[setters(skip)]
     on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync>,
-    #[setters(strip_option, into)]
-    name: Option<Cow<'static, str>>,
-    /// Opaque backing-choice identity, independent of displayed labels.
-    #[setters(strip_option, into)]
-    source_id: Option<Cow<'static, str>>,
     #[setters(skip)]
     selections: Cow<'a, [S]>,
     #[setters]
@@ -89,8 +84,6 @@ where
         Self {
             id: Some(Id::unique()),
             on_selected: Arc::new(on_selected),
-            name: None,
-            source_id: None,
             selections,
             icons: Cow::Borrowed(&[]),
             selected,
@@ -121,8 +114,6 @@ where
         let Self {
             id,
             on_selected,
-            name,
-            source_id,
             selections,
             icons,
             selected,
@@ -140,8 +131,6 @@ where
         Dropdown::<'a, S, Message, NewAppMessage> {
             id,
             on_selected,
-            name,
-            source_id,
             selections,
             icons,
             selected,
@@ -191,12 +180,7 @@ where
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        // Named controls retain the Tree's numeric identity across rebuilds.
-        // A different explicit owner ID creates a fresh Tree and root target.
-        self.id = tree.id.clone().or_else(|| self.id.clone());
         let state = tree.state.downcast_mut::<State>();
-        #[cfg(feature = "a11y")]
-        state.menu.set_accessibility_name(self.name.as_deref());
 
         let font = self.font.unwrap_or_else(crate::font::default);
         let metrics = (
@@ -207,8 +191,7 @@ where
         // Retained menus belong to the exact choices, selection and metrics.
         // In particular, a native provider captures the old text size and must
         // retire rather than reuse its old dimensions after typography changes.
-        if state.source_id.as_deref() != self.source_id.as_deref()
-            || state.selection_metrics != Some(metrics)
+        if state.selection_metrics != Some(metrics)
             || state.selected != self.selected
             || state
                 .source
@@ -217,11 +200,6 @@ where
                 .ne(self.selections.iter().map(AsRef::as_ref))
         {
             state.source_epoch.fetch_add(1, Ordering::SeqCst);
-            #[cfg(feature = "a11y")]
-            {
-                state.selected_display_id = Id::unique();
-            }
-            state.source_id = self.source_id.as_deref().map(str::to_owned);
             state.source = self
                 .selections
                 .iter()
@@ -303,40 +281,6 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        #[cfg(feature = "a11y")]
-        if let Event::A11y(target, request) = event {
-            use iced_accessibility::{IdEq, accesskit::Action};
-            if self
-                .id
-                .as_ref()
-                .is_some_and(|id| IdEq::eq(target, &id.clone().into()))
-            {
-                let state = tree.state.downcast_mut::<State>();
-                match request.action {
-                    Action::Focus if !self.selections.is_empty() => {}
-                    Action::Click if !self.selections.is_empty() && state.focused => {
-                        if state.is_open.load(Ordering::SeqCst) && !state.close_operation {
-                            state.close_operation = true;
-                        } else {
-                            state.open_operation = true;
-                        }
-                    }
-                    Action::Expand if !self.selections.is_empty() && state.focused => {
-                        if !state.is_open.load(Ordering::SeqCst) || state.close_operation {
-                            state.open_operation = true;
-                        }
-                    }
-                    Action::Collapse => {
-                        if state.is_open.load(Ordering::SeqCst) {
-                            state.close_operation = true;
-                        }
-                    }
-                    _ => return,
-                }
-                shell.capture_event();
-                shell.request_redraw();
-            }
-        }
         update::<S, Message, AppMessage>(
             &event,
             layout,
@@ -460,108 +404,16 @@ where
         )
     }
 
-    #[cfg(feature = "a11y")]
-    fn a11y_nodes(
-        &self,
-        layout: Layout<'_>,
-        tree: &Tree,
-        _cursor: mouse::Cursor,
-    ) -> iced_accessibility::A11yTree {
-        use iced_accessibility::{
-            A11yNode, A11yTree,
-            accesskit::{Action, Node, Rect, Role},
-        };
-        let Some(id) = self.id.clone() else {
-            return A11yTree::default();
-        };
-        let state = tree.state.downcast_ref::<State>();
-        let bounds = layout.bounds() - layout.virtual_offset();
-        let mut node = Node::new(Role::ComboBox);
-        node.set_bounds(Rect::new(
-            bounds.x as f64,
-            bounds.y as f64,
-            (bounds.x + bounds.width) as f64,
-            (bounds.y + bounds.height) as f64,
-        ));
-        if let Some(name) = &self.name {
-            node.set_label(name.to_string());
-        }
-        if let Some(value) = self.selected.and_then(|index| self.selections.get(index)) {
-            node.set_value(value.as_ref().to_owned());
-        }
-        let open = state.is_open.load(Ordering::SeqCst) && !state.close_operation;
-        node.set_expanded(open);
-        if self.selections.is_empty() {
-            node.set_disabled();
-        } else {
-            node.add_action(Action::Focus);
-            node.add_action(Action::Click);
-            // Keep native action indices stable across expand/collapse.
-            // Both operations are idempotent for this current control.
-            node.add_action(Action::Expand);
-            node.add_action(Action::Collapse);
-        }
-        let active = *state.hovered_option.lock().unwrap();
-        let popup = if open && self.window_id.is_none() {
-            state
-                .menu
-                .accessibility_tree(&self.selections, self.selected, active)
-        } else {
-            A11yTree::default()
-        };
-        // A separate native popup owns another tree. Only reference options
-        // actually exported in this owner's controlled popup tree.
-        if let Some(active) = popup
-            .root()
-            .iter()
-            .find_map(|node| node.node().active_descendant())
-        {
-            node.set_active_descendant(active);
-        }
-        node.set_controls(
-            popup
-                .root()
-                .iter()
-                .map(|node| node.id().clone().into())
-                .collect::<Vec<_>>(),
-        );
-        // This is the selected text actually painted in the closed control.
-        // Keep it distinct from popup choices: a sibling popup preserves one
-        // ComboBox Selection item even when its selected option is clipped.
-        let displayed =
-            if let Some(value) = self.selected.and_then(|index| self.selections.get(index)) {
-                let mut selected = Node::new(Role::ListBoxOption);
-                selected.set_label(value.as_ref().to_owned());
-                selected.set_selected(true);
-                selected.set_read_only();
-                let icon_width = self
-                    .selected
-                    .and_then(|index| self.icons.get(index))
-                    .map_or(0.0, |_| 24.0);
-                let text_height = f32::from(
-                    self.text_line_height
-                        .to_absolute(Pixels(self.text_size.unwrap_or(14.0))),
-                );
-                let left = (bounds.x + self.padding.left + icon_width).min(bounds.x + bounds.width);
-                let right = (bounds.x + bounds.width - self.padding.right).max(left);
-                selected.set_bounds(Rect::new(
-                    left as f64,
-                    (bounds.center_y() - text_height / 2.0) as f64,
-                    right as f64,
-                    (bounds.center_y() + text_height / 2.0) as f64,
-                ));
-                A11yTree::leaf(selected, state.selected_display_id.clone())
-            } else {
-                A11yTree::default()
-            };
-        A11yTree::join(
-            [
-                A11yTree::node_with_child_tree(A11yNode::new(node, id), displayed),
-                popup,
-            ]
-            .into_iter(),
-        )
-    }
+    // #[cfg(feature = "a11y")]
+    // /// get the a11y nodes for the widget
+    // fn a11y_nodes(
+    //     &self,
+    //     layout: Layout<'_>,
+    //     state: &Tree,
+    //     p: mouse::Cursor,
+    // ) -> iced_accessibility::A11yTree {
+    //     // TODO
+    // }
 }
 
 impl<
@@ -579,7 +431,7 @@ where
 }
 
 /// The local state of a [`Dropdown`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     icon: Option<svg::Handle>,
     menu: menu::State,
@@ -596,10 +448,6 @@ pub struct State {
     selection_metrics: Option<(crate::font::Font, Pixels, text::LineHeight)>,
     source_epoch: Arc<AtomicU64>,
     opening_epoch: u64,
-    source_id: Option<String>,
-    #[cfg(feature = "a11y")]
-    selected_display_id: Id,
-    owns_control: bool,
 }
 
 impl State {
@@ -624,47 +472,6 @@ impl State {
             selection_metrics: None,
             source_epoch: Arc::new(AtomicU64::new(0)),
             opening_epoch: 0,
-            source_id: None,
-            #[cfg(feature = "a11y")]
-            selected_display_id: Id::unique(),
-            owns_control: true,
-        }
-    }
-}
-
-// Popup providers borrow the control's live authorization; only the owning
-// retained Tree retires it when a logical control is removed or replaced.
-impl Clone for State {
-    fn clone(&self) -> Self {
-        Self {
-            icon: self.icon.clone(),
-            menu: self.menu.clone(),
-            keyboard_modifiers: self.keyboard_modifiers,
-            is_open: self.is_open.clone(),
-            close_operation: self.close_operation,
-            open_operation: self.open_operation,
-            hovered_option: self.hovered_option.clone(),
-            selections: self.selections.clone(),
-            popup_id: self.popup_id,
-            focused: self.focused,
-            source: self.source.clone(),
-            selected: self.selected,
-            selection_metrics: self.selection_metrics,
-            source_epoch: self.source_epoch.clone(),
-            opening_epoch: self.opening_epoch,
-            source_id: self.source_id.clone(),
-            #[cfg(feature = "a11y")]
-            selected_display_id: self.selected_display_id.clone(),
-            owns_control: false,
-        }
-    }
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        if self.owns_control {
-            self.source_epoch.fetch_add(1, Ordering::SeqCst);
-            self.is_open.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -825,7 +632,7 @@ pub fn update<
             .source_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        state.menu.begin_open(selections.len());
+        state.menu.begin_open();
         state.is_open.store(true, Ordering::Relaxed);
         shell.request_redraw();
         let mut hovered_guard = state.hovered_option.lock().unwrap();

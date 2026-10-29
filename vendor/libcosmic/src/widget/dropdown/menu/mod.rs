@@ -180,99 +180,10 @@ pub struct State {
     follow_highlight: Arc<AtomicBool>,
     viewport_size: Arc<Mutex<Option<Size>>>,
     retired: Arc<AtomicBool>,
-    #[cfg(feature = "a11y")]
-    accessibility: Arc<Mutex<Accessibility>>,
-    #[cfg(feature = "a11y")]
-    accessibility_name: Option<String>,
-}
-
-#[cfg(feature = "a11y")]
-#[derive(Debug)]
-struct Accessibility {
-    list: iced_core::widget::Id,
-    options: Vec<iced_core::widget::Id>,
-    geometry: Option<(Rectangle, Rectangle, f32)>,
-    name: Option<String>,
-}
-
-#[cfg(feature = "a11y")]
-impl Accessibility {
-    fn new(count: usize) -> Self {
-        Self {
-            list: iced_core::widget::Id::unique(),
-            options: (0..count)
-                .map(|_| iced_core::widget::Id::unique())
-                .collect(),
-            geometry: None,
-            name: None,
-        }
-    }
-}
-
-#[cfg(feature = "a11y")]
-struct ListGeometry;
-
-#[cfg(feature = "a11y")]
-fn accessibility_nodes<S: AsRef<str>>(
-    accessibility: &Accessibility,
-    options: &[S],
-    selected: Option<usize>,
-    active: Option<usize>,
-) -> iced_accessibility::A11yTree {
-    use iced_accessibility::{
-        A11yNode, A11yTree,
-        accesskit::{Action, Node, Rect, Role},
-    };
-    let Some((bounds, viewport, row_height)) = accessibility.geometry else {
-        return Default::default();
-    };
-    let mut root = Node::new(Role::ListBox);
-    root.set_bounds(Rect::new(
-        viewport.x as f64,
-        viewport.y as f64,
-        (viewport.x + viewport.width) as f64,
-        (viewport.y + viewport.height) as f64,
-    ));
-    root.set_clips_children();
-    root.add_action(Action::Collapse);
-    if let Some(id) = active
-        .filter(|index| *index < options.len())
-        .and_then(|index| accessibility.options.get(index))
-    {
-        root.set_active_descendant(iced_accessibility::accesskit::NodeId::from(
-            iced_accessibility::A11yId::from(id.clone()),
-        ));
-    }
-    if let Some(name) = &accessibility.name {
-        root.set_label(format!("{name} options"));
-    }
-    let options =
-        options
-            .iter()
-            .zip(&accessibility.options)
-            .enumerate()
-            .map(|(index, (label, id))| {
-                let y = bounds.y + index as f32 * row_height;
-                let mut node = Node::new(Role::ListBoxOption);
-                node.set_label(label.as_ref().to_owned());
-                node.set_selected(selected == Some(index));
-                node.set_bounds(Rect::new(
-                    bounds.x as f64,
-                    y as f64,
-                    (bounds.x + bounds.width) as f64,
-                    (y + row_height) as f64,
-                ));
-                node.add_action(Action::Click);
-                A11yTree::leaf(node, id.clone())
-            });
-    A11yTree::node_with_child_tree(
-        A11yNode::new(root, accessibility.list.clone()),
-        A11yTree::join(options),
-    )
 }
 
 impl State {
-    pub(super) fn begin_open(&mut self, _option_count: usize) {
+    pub(super) fn begin_open(&mut self) {
         self.reveal.store(true, Ordering::SeqCst);
         self.follow_highlight.store(true, Ordering::SeqCst);
         *self.viewport_size.lock().unwrap() = None;
@@ -280,36 +191,6 @@ impl State {
         // newer opening gets its own retirement receipt; rebuilding an old
         // provider must not regain permission to close or select again.
         self.retired = Arc::new(AtomicBool::new(false));
-        #[cfg(feature = "a11y")]
-        {
-            let mut accessibility = Accessibility::new(_option_count);
-            accessibility.name = self.accessibility_name.clone();
-            self.accessibility = Arc::new(Mutex::new(accessibility));
-        }
-    }
-
-    #[cfg(feature = "a11y")]
-    pub(super) fn set_accessibility_name(&mut self, name: Option<&str>) {
-        if self.accessibility_name.as_deref() == name {
-            return;
-        }
-        self.accessibility_name = name.map(str::to_owned);
-        self.accessibility.lock().unwrap().name = self.accessibility_name.clone();
-    }
-
-    #[cfg(feature = "a11y")]
-    pub(super) fn accessibility_tree<S: AsRef<str>>(
-        &self,
-        options: &[S],
-        selected: Option<usize>,
-        active: Option<usize>,
-    ) -> iced_accessibility::A11yTree {
-        accessibility_nodes(
-            &self.accessibility.lock().unwrap(),
-            options,
-            selected,
-            active,
-        )
     }
 
     /// Creates a new [`State`] for a [`Menu`].
@@ -320,10 +201,6 @@ impl State {
             follow_highlight: Arc::new(AtomicBool::new(true)),
             viewport_size: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "a11y")]
-            accessibility: Arc::new(Mutex::new(Accessibility::new(0))),
-            #[cfg(feature = "a11y")]
-            accessibility_name: None,
         }
     }
 }
@@ -345,8 +222,6 @@ struct Overlay<'a, Message> {
     hovered_option: Arc<Mutex<Option<usize>>>,
     row_height: f32,
     padding_top: f32,
-    #[cfg(feature = "a11y")]
-    accessibility: Arc<Mutex<Accessibility>>,
 }
 
 impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
@@ -388,8 +263,6 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
                 text_size,
                 text_line_height,
                 padding,
-                #[cfg(feature = "a11y")]
-                accessibility: state.accessibility.clone(),
             })
             .padding(padding),
         ))
@@ -411,54 +284,7 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             row_height: f32::from(text_line_height.to_absolute(Pixels(text_size.unwrap_or(14.0))))
                 + padding.y(),
             padding_top: padding.top,
-            #[cfg(feature = "a11y")]
-            accessibility: state.accessibility.clone(),
         }
-    }
-
-    #[cfg(feature = "a11y")]
-    fn capture_accessibility(&mut self, layout: Layout<'_>, renderer: &crate::Renderer) {
-        #[derive(Default)]
-        struct Geometry {
-            list: Option<Rectangle>,
-            viewport: Option<Rectangle>,
-        }
-        impl iced_core::widget::Operation for Geometry {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced_core::widget::Operation)) {
-                visit(self);
-            }
-            fn scrollable(
-                &mut self,
-                _: Option<&iced_core::widget::Id>,
-                bounds: Rectangle,
-                _: Rectangle,
-                _: Vector,
-                _: &mut dyn iced_core::widget::operation::Scrollable,
-            ) {
-                self.viewport = Some(bounds);
-            }
-            fn custom(
-                &mut self,
-                _: Option<&iced_core::widget::Id>,
-                bounds: Rectangle,
-                state: &mut dyn std::any::Any,
-            ) {
-                if state.is::<ListGeometry>() {
-                    self.list = Some(bounds);
-                }
-            }
-        }
-        let mut geometry = Geometry::default();
-        if self.keyboard.as_ref().is_some_and(Keyboard::valid) {
-            self.state.with_data_mut(|tree| {
-                self.container
-                    .operate(tree, layout, renderer, &mut geometry)
-            });
-        }
-        self.accessibility.lock().unwrap().geometry = geometry
-            .list
-            .zip(geometry.viewport)
-            .map(|(list, viewport)| (list, viewport, self.row_height));
     }
 
     fn reveal(&mut self, layout: Layout<'_>, renderer: &crate::Renderer) {
@@ -557,8 +383,6 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             self.position - Vector::new(0.0, node_size.height)
         });
         self.reveal(Layout::new(&node), renderer);
-        #[cfg(feature = "a11y")]
-        self.capture_accessibility(Layout::new(&node), renderer);
         node
     }
 
@@ -597,8 +421,6 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             )
         });
         self.reveal(layout, renderer);
-        #[cfg(feature = "a11y")]
-        self.capture_accessibility(layout, renderer);
     }
 
     fn _mouse_interaction(
@@ -699,20 +521,6 @@ impl<'a, Message: Clone + 'a> iced_core::Overlay<Message, crate::Theme, crate::R
 impl<'a, Message: Clone + 'a> crate::widget::Widget<Message, crate::Theme, crate::Renderer>
     for Overlay<'a, Message>
 {
-    #[cfg(feature = "a11y")]
-    fn a11y_nodes(
-        &self,
-        layout: Layout<'_>,
-        _tree: &Tree,
-        cursor: mouse::Cursor,
-    ) -> iced_accessibility::A11yTree {
-        if !self.keyboard.as_ref().is_some_and(Keyboard::valid) {
-            return Default::default();
-        }
-        self.state
-            .with_data(|tree| self.container.a11y_nodes(layout, tree, cursor))
-    }
-
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fixed(self.width), Length::Shrink)
     }
@@ -729,8 +537,6 @@ impl<'a, Message: Clone + 'a> crate::widget::Widget<Message, crate::Theme, crate
             .state
             .with_data_mut(|tree| self.container.layout(tree, renderer, &limits));
         self.reveal(Layout::new(&node), renderer);
-        #[cfg(feature = "a11y")]
-        self.capture_accessibility(Layout::new(&node), renderer);
         node
     }
 
@@ -805,8 +611,6 @@ where
     padding: Padding,
     text_size: Option<f32>,
     text_line_height: text::LineHeight,
-    #[cfg(feature = "a11y")]
-    accessibility: Arc<Mutex<Accessibility>>,
 }
 
 impl<S: AsRef<str>, Message> Widget<Message, crate::Theme, crate::Renderer> for List<'_, S, Message>
@@ -814,40 +618,6 @@ where
     [S]: std::borrow::ToOwned,
     Message: Clone,
 {
-    #[cfg(feature = "a11y")]
-    fn a11y_nodes(
-        &self,
-        _layout: Layout<'_>,
-        _tree: &Tree,
-        _cursor: mouse::Cursor,
-    ) -> iced_accessibility::A11yTree {
-        if !self.keyboard.as_ref().is_some_and(Keyboard::valid) {
-            return Default::default();
-        }
-        let active = *self.hovered_option.lock().unwrap();
-        accessibility_nodes(
-            &self.accessibility.lock().unwrap(),
-            &self.options,
-            self.selected_option,
-            active,
-        )
-    }
-
-    fn operate(
-        &mut self,
-        _tree: &mut Tree,
-        layout: Layout<'_>,
-        _renderer: &crate::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
-    ) {
-        #[cfg(feature = "a11y")]
-        operation.custom(
-            None,
-            layout.bounds() - layout.virtual_offset(),
-            &mut ListGeometry,
-        );
-    }
-
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
     }
@@ -909,36 +679,6 @@ where
                     shell.capture_event();
                 }
                 return;
-            }
-            #[cfg(feature = "a11y")]
-            if let Event::A11y(target, request) = event {
-                use iced_accessibility::{IdEq, accesskit::Action};
-                let accessibility = self.accessibility.lock().unwrap();
-                let selected = (request.action == Action::Click)
-                    .then(|| {
-                        accessibility
-                            .options
-                            .iter()
-                            .position(|id| IdEq::eq(target, &id.clone().into()))
-                    })
-                    .flatten();
-                let collapse = request.action == Action::Collapse
-                    && IdEq::eq(target, &accessibility.list.clone().into());
-                drop(accessibility);
-                if selected.is_some() || collapse {
-                    if keyboard.open.swap(false, Ordering::SeqCst) {
-                        keyboard.retired.store(true, Ordering::SeqCst);
-                        if let Some(index) = selected.filter(|index| *index < self.options.len()) {
-                            shell.publish((self.on_selected)(index));
-                        }
-                        if let Some(close) = &self.close_on_selected {
-                            shell.publish(close.clone());
-                        }
-                        shell.request_redraw();
-                    }
-                    shell.capture_event();
-                    return;
-                }
             }
             if let Event::Keyboard(keyboard::Event::KeyPressed {
                 key,

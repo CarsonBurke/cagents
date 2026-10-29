@@ -270,8 +270,6 @@ struct DraftValues {
 }
 
 pub struct Draft {
-    // Logical dialog ownership, distinct from visible names and option labels.
-    select_owner: Uuid,
     baseline: Option<DraftValues>,
     base: Option<(Uuid, u64)>,
     name: String,
@@ -317,7 +315,6 @@ impl Draft {
         existing: Option<&Automation>,
     ) -> Self {
         let mut value = Self {
-            select_owner: Uuid::new_v4(),
             baseline: None,
             base: None,
             name: String::new(),
@@ -2737,15 +2734,6 @@ impl Draft {
             input("Name", &self.name, Field::Name),
             crate::design::caption("Project / working directory").into(),
             crate::ui_controls::field::select(
-                "Automation project / working directory",
-                format!("automation.{}.target", self.select_owner),
-                format!(
-                    "{:?}",
-                    self.targets
-                        .iter()
-                        .map(|choice| &choice.target)
-                        .collect::<Vec<_>>()
-                ),
                 self.targets
                     .iter()
                     .map(|target| target.label.clone())
@@ -2756,9 +2744,6 @@ impl Draft {
             .into(),
             crate::design::caption("Provider").into(),
             crate::ui_controls::field::select(
-                "Automation provider",
-                format!("automation.{}.provider", self.select_owner),
-                "automation-providers",
                 PROVIDERS.to_vec(),
                 Some(self.provider),
                 Action::Provider,
@@ -2766,16 +2751,6 @@ impl Draft {
             .into(),
             crate::design::caption("Account").into(),
             crate::ui_controls::field::select(
-                "Automation account",
-                format!("automation.{}.account", self.select_owner),
-                format!(
-                    "{}:{:?}",
-                    self.provider,
-                    provider_accounts
-                        .iter()
-                        .map(|(_, choice)| &choice.id)
-                        .collect::<Vec<_>>()
-                ),
                 provider_accounts
                     .iter()
                     .map(|(_, account)| account.label.clone())
@@ -2800,9 +2775,6 @@ impl Draft {
         let mut schedule = widget::column::with_children(vec![
             crate::design::caption("Repeat").into(),
             crate::ui_controls::field::select(
-                "Automation repeat",
-                format!("automation.{}.repeat", self.select_owner),
-                "automation-schedules",
                 SCHEDULES.to_vec(),
                 Some(self.schedule),
                 Action::Schedule,
@@ -2822,9 +2794,6 @@ impl Draft {
             schedule = schedule.push(widget::row::with_children(time).spacing(space::S));
             if self.schedule == 3 {
                 schedule = schedule.push(crate::ui_controls::field::select(
-                    "Automation weekday",
-                    format!("automation.{}.weekday", self.select_owner),
-                    "weekdays",
                     WEEKDAYS.to_vec(),
                     Some(self.weekday),
                     Action::Weekday,
@@ -3044,22 +3013,15 @@ impl Draft {
             .collect::<Vec<_>>();
         let mut column = widget::column::with_children(vec![
             crate::design::body("Model").into(),
-            crate::ui_controls::field::select(
-                "Automation model",
-                format!("automation.{}.model", self.select_owner),
-                format!("{}:{ids:?}", self.provider),
-                labels,
-                Some(selected),
-                move |index| {
-                    Action::Model(match index {
-                        0 => ModelChoice::Default,
-                        index => ids
-                            .get(index - 1)
-                            .cloned()
-                            .map_or(ModelChoice::Custom, ModelChoice::Listed),
-                    })
-                },
-            )
+            crate::ui_controls::field::select(labels, Some(selected), move |index| {
+                Action::Model(match index {
+                    0 => ModelChoice::Default,
+                    index => ids
+                        .get(index - 1)
+                        .cloned()
+                        .map_or(ModelChoice::Custom, ModelChoice::Listed),
+                })
+            })
             .into(),
         ])
         .spacing(space::XS);
@@ -3099,20 +3061,13 @@ impl Draft {
             .collect::<Vec<_>>();
         widget::column::with_children(vec![
             crate::design::body("Reasoning effort").into(),
-            crate::ui_controls::field::select(
-                "Automation reasoning effort",
-                format!("automation.{}.effort", self.select_owner),
-                format!("{}:{}:{efforts:?}", self.provider, self.model),
-                labels,
-                Some(selected),
-                move |index| {
-                    Action::Effort(
-                        index
-                            .checked_sub(1)
-                            .and_then(|index| efforts.get(index).cloned()),
-                    )
-                },
-            )
+            crate::ui_controls::field::select(labels, Some(selected), move |index| {
+                Action::Effort(
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| efforts.get(index).cloned()),
+                )
+            })
             .into(),
         ])
         .spacing(space::XS)
