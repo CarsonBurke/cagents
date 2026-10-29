@@ -2627,6 +2627,9 @@ mod tests {
                 view.apply(&Change::Remove { id: card }).unwrap();
                 view.revision += 1;
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(removed.clone())));
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![primary]);
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert!(!app.pane_is_quarantined(card));
                 drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                     scope: scope.clone(),
                     operation: Some(*operation),
@@ -2634,7 +2637,10 @@ mod tests {
                 }));
                 assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![primary]);
                 assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert!(!app.pane_is_quarantined(card));
                 assert_eq!(app.workspace_model.views, removed.views);
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+                    matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
             }
         }
     }

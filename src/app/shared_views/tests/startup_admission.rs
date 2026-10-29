@@ -534,6 +534,371 @@ fn managed_owner(pane: &Pane, channel: ChannelId) -> crate::agent_execution::Age
     }
 }
 
+fn validated_retirement_fixture() -> (Cagents, crate::workspace_model::WorkspaceModel, Pane) {
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let mut view = View::empty(hidden);
+    view.revision = 7;
+    view.panes.push(pane.clone());
+    let mut full = model(identity, active, hidden, view);
+    full.sequence = 10;
+    full.agents.push(managed_owner(&pane, hidden));
+    assert!(app.install_workspace_model_snapshot(full.clone()));
+    assert!(!app.pane_is_quarantined(pane.id));
+    assert!(app.shared_views.validated_managed.contains_key(&pane.id));
+    let view = &mut full.views[1];
+    view.apply(&Change::Remove { id: pane.id }).unwrap();
+    view.revision += 1;
+    full.sequence += 1;
+    (app, full, pane)
+}
+
+#[test]
+fn verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence() {
+    let (mut app, mut retired, pane) = validated_retirement_fixture();
+    // A previous transfer's source tombstone is unrelated to this exact
+    // destination membership and its later authoritative removal.
+    retired.views[0].retired.push(pane.id);
+    // An unrelated folded metadata edge advances only the outer sequence.
+    app.workspace_model.sequence = 100;
+    let folded = app.workspace_model.clone();
+    app.refresh_managed_pane_quarantine(&folded);
+    assert!(app.install_workspace_model_snapshot(retired.clone()));
+    for _ in 0..3 {
+        app.refresh_managed_pane_quarantine(&retired);
+        assert!(!app.pane_is_quarantined(pane.id));
+    }
+    // Passive retirement retains ordinary closed history across a restart;
+    // an explicit durable rejection still wins over the same valid source.
+    app.card_state_mut(pane.id).unwrap().existence = Existence::Closed {
+        tombstone: crate::model::Tombstone {
+            operation_id: None,
+            closed_at_unix_ms: 1,
+            reason: Some("removed by peer".into()),
+        },
+    };
+    app.shared_views.validated_managed.clear();
+    app.refresh_managed_pane_quarantine(&retired);
+    assert!(!app.pane_is_quarantined(pane.id));
+    Arc::make_mut(&mut app.durable)
+        .quarantined_panes
+        .insert(pane.id, pane.kind.clone());
+    app.refresh_managed_pane_quarantine(&retired);
+    assert!(app.pane_is_quarantined(pane.id));
+}
+
+#[test]
+fn verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources() {
+    for case in 0..24 {
+        let (mut app, mut retired, pane) = validated_retirement_fixture();
+        match case {
+            0 => {
+                app.shared_views.quarantined.insert(pane.id);
+            }
+            1 => {
+                Arc::make_mut(&mut app.durable)
+                    .quarantined_panes
+                    .insert(pane.id, pane.kind.clone());
+            }
+            2 => app.shared_views.validated_managed.clear(),
+            3..=6 => {
+                let CardKind::Chat(source) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+                    unreachable!()
+                };
+                match case {
+                    3 => source.proof.as_mut().unwrap().boot_id = "replaced-boot".into(),
+                    4 => source.launch.recipe.arguments.push("changed".into()),
+                    5 => source.id = TerminalId::new(),
+                    6 => source.launch.session_id = Some("changed-thread".into()),
+                    _ => unreachable!(),
+                }
+            }
+            7 => retired.identity = uuid::Uuid::new_v4(),
+            8 => retired.views[1].scope = Scope::Channel(ChannelId::new()),
+            9 => retired.agents.push(retired.agents[0].clone()),
+            10 => {
+                let mut duplicate = retired.agents[0].clone();
+                duplicate.id = crate::model::AgentId::new();
+                retired.agents.push(duplicate);
+            }
+            11 => {
+                let mut alias = pane.clone();
+                alias.id = CardId::new();
+                retired.views[0].panes.push(alias);
+            }
+            12 => app.shared_views.pending.push((
+                uuid::Uuid::new_v4(),
+                retired.views[1].scope.clone(),
+                Change::Insert {
+                    pane: pane.clone(),
+                    before: None,
+                },
+            )),
+            13 => retired.views[1].revision -= 1,
+            14 => {
+                let durable = Arc::make_mut(&mut app.durable);
+                for channel in &mut durable.channels {
+                    channel.cards.retain(|id| *id != pane.id);
+                }
+                durable.channels[0].cards.push(pane.id);
+            }
+            15 => retired.agents[0].placement = Scope::Channel(ChannelId::new()),
+            16 => retired
+                .views
+                .push(View::empty(retired.views[1].scope.clone())),
+            17 => retired.sequence -= 1,
+            18 => {
+                let Some(crate::agent_execution::HostedSession::Chat(source)) =
+                    &mut retired.agents[0].session
+                else {
+                    unreachable!()
+                };
+                source.proof.as_mut().unwrap().host_incarnation = "replaced-owner".into();
+            }
+            19 => retired.views[1].retired.push(pane.id),
+            20 => {
+                let Some(crate::agent_execution::HostedSession::Chat(source)) =
+                    &mut retired.agents[0].session
+                else {
+                    unreachable!()
+                };
+                source.launch.session_id = Some("replaced-issuer-thread".into());
+            }
+            21 => retired.channels[1].repository = "/other-repository".into(),
+            22 => {
+                retired.channels.remove(1);
+            }
+            23 => retired.channels.push(retired.channels[1].clone()),
+            _ => unreachable!(),
+        }
+        assert!(app.install_workspace_model_snapshot(retired.clone()));
+        assert!(app.pane_is_quarantined(pane.id), "case {case}");
+        assert!(
+            !app.shared_views.validated_managed.contains_key(&pane.id),
+            "case {case}"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().existence, Existence::Open);
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        app.refresh_managed_pane_quarantine(&retired);
+        assert!(app.pane_is_quarantined(pane.id), "repeat case {case}");
+    }
+}
+
+#[test]
+fn closed_retirement_history_still_requires_exact_proof_and_scope() {
+    for case in 0..6 {
+        let (mut app, mut retired, pane) = validated_retirement_fixture();
+        app.card_state_mut(pane.id).unwrap().existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        app.shared_views.validated_managed.clear();
+        match case {
+            0 => retired.channels[1].repository = "/other-repository".into(),
+            1 => {
+                retired.channels.remove(1);
+            }
+            2 => retired.channels.push(retired.channels[1].clone()),
+            3 => retired.views[1].scope = Scope::Channel(ChannelId::new()),
+            4 | 5 => {
+                let CardKind::Chat(local) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+                    unreachable!()
+                };
+                if case == 4 {
+                    local.proof = None;
+                } else {
+                    local.proof.as_mut().unwrap().boot_id = "".into();
+                }
+                retired.agents[0].session =
+                    Some(crate::agent_execution::HostedSession::Chat(local.clone()));
+            }
+            _ => unreachable!(),
+        }
+        assert!(app.install_workspace_model_snapshot(retired.clone()));
+        assert!(app.pane_is_quarantined(pane.id), "closed case {case}");
+        assert!(!app.shared_views.validated_managed.contains_key(&pane.id));
+    }
+}
+
+#[test]
+fn verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof() {
+    for closed_owner in [false, true] {
+        let (mut app, mut retired, pane) = validated_retirement_fixture();
+        let Scope::Channel(channel) = retired.views[1].scope else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+            pane.id,
+            "Keep this unsent draft after peer removal".into(),
+        )]));
+        retired.agents[0].closed = closed_owner;
+        assert!(app.install_workspace_model_snapshot(retired.clone()));
+        assert!(!app.pane_is_quarantined(pane.id));
+        drop(app.project_shared_view(&retired.views[1], &HashSet::new()));
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(app.durable.local_only_cards.contains(&pane.id));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![pane.id]);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some("Keep this unsent draft after peer removal")
+        );
+        app.refresh_managed_pane_quarantine(&retired);
+        assert!(!app.pane_is_quarantined(pane.id));
+    }
+}
+
+#[test]
+fn retirement_witness_requires_the_full_issuer_before_canonical_admission() {
+    let (mut app, mut full, pane) = validated_retirement_fixture();
+    // Return to a raw canonical snapshot, but change only the issuing thread
+    // before admission. Process-level equality cannot mint this source receipt.
+    full.views[1].panes.push(pane.clone());
+    full.views[1].retired.clear();
+    app.shared_views.validated_managed.clear();
+    let Some(crate::agent_execution::HostedSession::Chat(issuer)) = &mut full.agents[0].session
+    else {
+        unreachable!()
+    };
+    issuer.launch.session_id = Some("different-before-admission".into());
+    assert!(app.install_workspace_model_snapshot(full.clone()));
+    assert!(!app.shared_views.validated_managed.contains_key(&pane.id));
+    full.views[1]
+        .apply(&Change::Remove { id: pane.id })
+        .unwrap();
+    full.views[1].revision += 1;
+    full.sequence += 1;
+    assert!(app.install_workspace_model_snapshot(full));
+    assert!(app.pane_is_quarantined(pane.id));
+}
+
+#[test]
+fn verified_terminal_retirement_preserves_exact_ended_and_archived_sources() {
+    use crate::agent_execution::{HostedSession, Origin, Surface};
+    for end in 0..3 {
+        for console in [false, true] {
+            for invalid in 0..4 {
+                let (mut app, active, hidden, mut pane, identity) = cached_chat();
+                let mut owner = managed_owner(&pane, hidden);
+                let mut issued = attention_terminal_source();
+                issued.launch.working_directory = "/fixture-project".into();
+                let mut shown = issued.clone();
+                let exit = crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                };
+                shown.continuity = match end {
+                    0 => issued.continuity.clone(),
+                    1 => TerminalContinuity::Exited { last_exit: exit },
+                    2 => TerminalContinuity::RelaunchAvailable {
+                        recipe: issued.launch.clone(),
+                        last_exit: Some(exit),
+                    },
+                    _ => unreachable!(),
+                };
+                owner.spec.surface = Surface::Terminal;
+                if console {
+                    owner.origin = Origin::Automation {
+                        id: uuid::Uuid::new_v4(),
+                    };
+                    owner.session = None;
+                    owner.console = Some(issued.clone());
+                } else {
+                    owner.session = Some(HostedSession::Terminal(issued));
+                }
+                pane.kind = CardKind::Terminal(shown);
+                app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+                let mut view = View::empty(hidden);
+                view.revision = 7;
+                view.panes.push(pane.clone());
+                let mut full = model(identity, active, hidden, view);
+                full.sequence = 10;
+                full.agents.push(owner);
+                assert!(app.install_workspace_model_snapshot(full.clone()));
+                assert!(!app.pane_is_quarantined(pane.id));
+                assert!(app.shared_views.validated_managed.contains_key(&pane.id));
+                // An unchanged archived console may close its owner before
+                // the separately ordered pane-removal snapshot arrives.
+                if console && end != 0 {
+                    full.agents[0].closed = true;
+                    full.sequence += 1;
+                    assert!(app.install_workspace_model_snapshot(full.clone()));
+                    assert!(!app.pane_is_quarantined(pane.id));
+                    assert!(app.shared_views.validated_managed.contains_key(&pane.id));
+                }
+                match invalid {
+                    0 => {}
+                    1 | 2 => {
+                        let issuer = if console {
+                            full.agents[0].console.as_mut().unwrap()
+                        } else {
+                            let Some(HostedSession::Terminal(issuer)) = &mut full.agents[0].session
+                            else {
+                                unreachable!()
+                            };
+                            issuer
+                        };
+                        if invalid == 1 {
+                            issuer.continuity = TerminalContinuity::RelaunchAvailable {
+                                recipe: issuer.launch.clone(),
+                                last_exit: None,
+                            };
+                        } else {
+                            issuer.transcript_path = Some("/changed-terminal-transcript".into());
+                        }
+                    }
+                    3 => {
+                        let CardKind::Terminal(local) =
+                            &mut app.card_state_mut(pane.id).unwrap().kind
+                        else {
+                            unreachable!()
+                        };
+                        local.transcript_path = Some("/changed-local-transcript".into());
+                    }
+                    _ => unreachable!(),
+                }
+                full.views[1]
+                    .apply(&Change::Remove { id: pane.id })
+                    .unwrap();
+                full.views[1].revision += 1;
+                full.sequence += 1;
+                assert!(app.install_workspace_model_snapshot(full.clone()));
+                for _ in 0..2 {
+                    app.refresh_managed_pane_quarantine(&full);
+                    assert_eq!(
+                        app.pane_is_quarantined(pane.id),
+                        invalid != 0,
+                        "end {end}, console {console}, invalid {invalid}"
+                    );
+                }
+                if invalid == 0 {
+                    app.card_state_mut(pane.id).unwrap().existence = Existence::Closed {
+                        tombstone: crate::model::Tombstone {
+                            operation_id: None,
+                            closed_at_unix_ms: 1,
+                            reason: None,
+                        },
+                    };
+                    app.shared_views.validated_managed.clear();
+                    app.refresh_managed_pane_quarantine(&full);
+                    assert!(!app.pane_is_quarantined(pane.id));
+                    assert!(app.terminal_starts.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+}
+
 fn install_held_pane(app: &mut Cagents, channel: ChannelId, pane: &Pane) {
     let durable = Arc::make_mut(&mut app.durable);
     durable
@@ -628,7 +993,14 @@ fn managed_quarantine_uses_full_ownership_proof_and_pending_sources() {
         }
         authoritative.agents.push(owner);
         assert_eq!(
-            quarantined_managed_panes(&authoritative, &app.durable, &HashSet::new(), &pending),
+            quarantined_managed_panes(
+                &authoritative,
+                &app.durable,
+                &HashSet::new(),
+                &pending,
+                0,
+                &mut HashMap::new()
+            ),
             HashSet::from([pane.id]),
             "{invalid}"
         );
@@ -727,7 +1099,14 @@ fn managed_alias_duplicates_and_pending_resource_swaps_remain_quarantined() {
             HashSet::from([alias])
         };
         assert_eq!(
-            quarantined_managed_panes(&full, &app.durable, &HashSet::new(), &pending),
+            quarantined_managed_panes(
+                &full,
+                &app.durable,
+                &HashSet::new(),
+                &pending,
+                0,
+                &mut HashMap::new()
+            ),
             expected,
             "{mode}"
         );
@@ -832,8 +1211,15 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
         }
     }
     assert!(
-        quarantined_managed_panes(&full, &app.durable, &HashSet::new(), &changed_proof)
-            .contains(&alias.id),
+        quarantined_managed_panes(
+            &full,
+            &app.durable,
+            &HashSet::new(),
+            &changed_proof,
+            0,
+            &mut HashMap::new()
+        )
+        .contains(&alias.id),
         "an end cannot launder a changed captured host proof"
     );
     drop(app.apply_workspace_model_update(ModelUpdate::Read(full.clone())));
@@ -858,14 +1244,23 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
             &ended_model,
             &app.durable,
             &HashSet::new(),
-            &app.shared_views.pending
+            &app.shared_views.pending,
+            0,
+            &mut HashMap::new(),
         )
         .is_empty(),
         "installing the ended snapshot before ACK cannot briefly quarantine the retained surface"
     );
     assert!(
-        quarantined_managed_panes(&ended_model, &app.durable, &HashSet::new(), &changed_proof)
-            .contains(&alias.id),
+        quarantined_managed_panes(
+            &ended_model,
+            &app.durable,
+            &HashSet::new(),
+            &changed_proof,
+            0,
+            &mut HashMap::new()
+        )
+        .contains(&alias.id),
         "an ended raw descriptor cannot hide a foreign captured proof"
     );
     drop(app.apply_workspace_model_update(ModelUpdate::Read(ended_model.clone())));
@@ -906,7 +1301,15 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
         ended_model.sequence += 1;
         ended_model.agents[0].closed = closed_owner;
         assert!(
-            quarantined_managed_panes(&ended_model, &app.durable, &HashSet::new(), &[]).is_empty()
+            quarantined_managed_panes(
+                &ended_model,
+                &app.durable,
+                &HashSet::new(),
+                &[],
+                0,
+                &mut HashMap::new()
+            )
+            .is_empty()
         );
         drop(app.apply_workspace_model_update(ModelUpdate::Read(ended_model.clone())));
         assert!(!app.pane_is_quarantined(alias.id));

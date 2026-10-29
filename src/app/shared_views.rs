@@ -2,7 +2,7 @@
 //! are layered over snapshots until acknowledged; snapshots never erase them.
 use super::*;
 use crate::workspace_model::{
-    ModelEdit,
+    ModelEdit, NO_REGISTRY,
     views::{self, Change, Pane, Scope, View},
 };
 
@@ -42,6 +42,10 @@ fn exact_issued_terminal_end(before: &CardKind, current: &CardKind) -> bool {
     let (CardKind::Terminal(before), CardKind::Terminal(current)) = (before, current) else {
         return false;
     };
+    exact_issued_terminal_end_source(before, current)
+}
+
+fn exact_issued_terminal_end_source(before: &TerminalSession, current: &TerminalSession) -> bool {
     before
         .continuity
         .live_proof()
@@ -63,6 +67,44 @@ fn exact_issued_terminal_end(before: &CardKind, current: &CardKind) -> bool {
         && before.predecessor == current.predecessor
 }
 
+fn exact_issued_managed_source(
+    issued: &crate::agent_execution::HostedSession,
+    current: &CardKind,
+) -> bool {
+    use crate::agent_execution::HostedSession;
+    match (issued, current) {
+        (HostedSession::Chat(issued), CardKind::Chat(current)) => {
+            issued
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+                && issued == current
+        }
+        (HostedSession::Terminal(issued), CardKind::Terminal(current)) => {
+            issued
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete())
+                && (issued == current || exact_issued_terminal_end_source(issued, current))
+        }
+        _ => false,
+    }
+}
+
+/// A verified raw membership, never an optimistic Insert or a saved draft.
+/// It permits only passive retirement of this exact source, not admission.
+struct ValidatedManagedPane {
+    registry: uuid::Uuid,
+    snapshot_sequence: u64,
+    scope: Scope,
+    revision: u64,
+    placement: Scope,
+    repository: PathBuf,
+    issuer: crate::agent_execution::HostedSession,
+    source: CardKind,
+    path: Option<PathBuf>,
+}
+
 /// Classify against the complete snapshot, before filtering panes or adopting
 /// aliases. Filtering first would turn duplicate ownership into apparent proof.
 fn quarantined_managed_panes(
@@ -70,6 +112,8 @@ fn quarantined_managed_panes(
     workspace: &WorkspaceState,
     previous: &HashSet<CardId>,
     pending: &[(uuid::Uuid, Scope, Change)],
+    snapshot_sequence: u64,
+    validated: &mut HashMap<CardId, ValidatedManagedPane>,
 ) -> HashSet<CardId> {
     let mut quarantined = previous
         .iter()
@@ -118,6 +162,28 @@ fn quarantined_managed_panes(
             .and_modify(|owner| *owner = None)
             .or_insert(Some(pane));
     }
+    let mut scope_counts = HashMap::new();
+    let mut retired = HashMap::new();
+    let mut displayed_resources = HashSet::new();
+    for view in &model.views {
+        *scope_counts.entry(&view.scope).or_insert(0usize) += 1;
+        for id in &view.retired {
+            retired
+                .entry((*id, &view.scope))
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(view));
+        }
+        displayed_resources.extend(view.panes.iter().filter_map(|pane| resource(&pane.kind)));
+    }
+    let mut local_channels = HashMap::new();
+    for channel in &workspace.channels {
+        for id in &channel.cards {
+            local_channels
+                .entry(*id)
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(channel.id));
+        }
+    }
     let local_sources = workspace
         .cards
         .iter()
@@ -125,6 +191,36 @@ fn quarantined_managed_panes(
         .collect::<HashMap<_, _>>();
     let managed_source =
         |kind: &CardKind| resource(kind).is_some_and(|key| issuers.contains_key(&key));
+    let mut channel_repositories = HashMap::new();
+    for channel in &model.channels {
+        channel_repositories
+            .entry(channel.id)
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(&channel.repository));
+    }
+    let exact_issuer = |agent: &crate::agent_execution::Agent,
+                        source: &crate::agent_execution::HostedSession| {
+        agent.session.as_ref() == Some(source)
+            || matches!(source, crate::agent_execution::HostedSession::Terminal(source)
+                if agent.console.as_ref() == Some(source))
+    };
+    let complete_source_matches = |agent: &crate::agent_execution::Agent, pane: &Pane| {
+        agent
+            .session
+            .as_ref()
+            .is_some_and(|issued| exact_issued_managed_source(issued, &pane.kind))
+            || agent.console.as_ref().is_some_and(|issued| {
+                matches!(&pane.kind, CardKind::Terminal(current)
+                    if issued.continuity.live_proof().is_some_and(|proof| proof.is_complete())
+                        && (issued == current || exact_issued_terminal_end_source(issued, current)))
+            })
+    };
+    let scope_matches_issuer = |scope: &Scope, agent: &crate::agent_execution::Agent| match scope {
+        Scope::Channel(channel) => {
+            channel_repositories.get(channel) == Some(&Some(&agent.spec.target.repository))
+        }
+        Scope::Worktree { repository, .. } => repository == &agent.spec.target.repository,
+    };
     let permits = |agent: &crate::agent_execution::Agent, pane: &Pane, require_open_owner: bool| {
         // An exact observed terminal end is display evidence only. Preserve
         // that existing exception, including archived automation consoles.
@@ -178,6 +274,81 @@ fn quarantined_managed_panes(
                 && !receiving_exact_end
         })
     };
+    let exact_retirement = |pane: &Pane, open: bool| {
+        if previous.contains(&pane.id)
+            || workspace.quarantined_panes.contains_key(&pane.id)
+            || authoritative.contains_key(&pane.id)
+        {
+            return false;
+        }
+        let Some(Some(agent)) = managed.get(&pane.id) else {
+            return false;
+        };
+        let Some(key) = resource(&pane.kind) else {
+            return false;
+        };
+        let witness = validated.get(&pane.id);
+        if open && witness.is_none() {
+            return false;
+        }
+        let source_scope = witness.map_or(&agent.placement, |witness| &witness.scope);
+        let Some(Some(view)) = retired.get(&(pane.id, source_scope)) else {
+            return false;
+        };
+        if issuers.get(&key) != Some(&Some(agent.id))
+            || displayed_resources.contains(&key)
+            || scope_counts.get(&view.scope) != Some(&1)
+            || !scope_matches_issuer(&view.scope, agent)
+            || !(views::managed_pane_matches(agent, pane) || complete_source_matches(agent, pane))
+        {
+            return false;
+        }
+        if let Some(witness) = witness {
+            let local_scope_matches = match &witness.scope {
+                Scope::Channel(channel) => {
+                    local_channels.get(&pane.id) == Some(&Some(*channel))
+                        || (!open && !local_channels.contains_key(&pane.id))
+                }
+                Scope::Worktree { path, .. } => {
+                    !local_channels.contains_key(&pane.id) && pane.scope.as_ref() == Some(path)
+                }
+            };
+            if model.identity != NO_REGISTRY
+                && witness.registry == model.identity
+                && snapshot_sequence > witness.snapshot_sequence
+                && view.scope == witness.scope
+                && view.revision > witness.revision
+                && agent.placement == witness.placement
+                && agent.spec.target.repository == witness.repository
+                && witness.issuer.has_complete_proof()
+                && exact_issuer(agent, &witness.issuer)
+                && exact_issued_managed_source(&witness.issuer, &pane.kind)
+                && pane.kind == witness.source
+                && pane.scope == witness.path
+                && local_scope_matches
+            {
+                return true;
+            }
+        }
+        // Closed, unmarked history grants no projection authority. Do not
+        // manufacture a proof failure merely because its volatile witness
+        // was lost on restart; the complete current source still checks out.
+        if !open {
+            return complete_source_matches(agent, pane)
+                && model.identity != NO_REGISTRY
+                && workspace.workspace_model_identity == Some(model.identity)
+                && view.scope == agent.placement
+                && match &view.scope {
+                    Scope::Channel(channel) => local_channels
+                        .get(&pane.id)
+                        .is_none_or(|owner| *owner == Some(*channel)),
+                    Scope::Worktree { path, .. } => {
+                        !local_channels.contains_key(&pane.id) && pane.scope.as_ref() == Some(path)
+                    }
+                };
+        }
+        false
+    };
     for pane in model.views.iter().flat_map(|view| &view.panes) {
         if refused(pane) {
             rejected.insert(pane.id);
@@ -215,6 +386,7 @@ fn quarantined_managed_panes(
             quarantined.insert(pane.id);
         }
     }
+    let mut exact_retirements = HashSet::new();
     for card in &workspace.cards {
         if !card.existence.is_open()
             && workspace.local_only_cards.contains(&card.id)
@@ -261,7 +433,11 @@ fn quarantined_managed_panes(
                                     || (source == &card.kind && source == &pane.kind))
                         })
                     });
-            if refused(&pane) && !canonical_update {
+            let retiring = exact_retirement(&pane, card.existence.is_open());
+            if retiring {
+                exact_retirements.insert(card.id);
+            }
+            if refused(&pane) && !canonical_update && !retiring {
                 quarantined.insert(card.id);
             } else if !rejected.contains(&card.id) && retained_source_admitted {
                 quarantined.remove(&card.id);
@@ -274,6 +450,82 @@ fn quarantined_managed_panes(
         }
     }
     quarantined.extend(rejected);
+    // Keep an exact retirement witness across repeated reconciliation and
+    // after local detach. A later rejection permanently invalidates it until
+    // a new explicit canonical descriptor passes ordinary validation.
+    let mut validated_now = exact_retirements;
+    for view in &model.views {
+        if scope_counts.get(&view.scope) != Some(&1) || model.identity == NO_REGISTRY {
+            continue;
+        }
+        for pane in &view.panes {
+            if quarantined.contains(&pane.id)
+                || pane.pending_terminal_start
+                || authoritative.get(&pane.id) == Some(&None)
+                || !managed.get(&pane.id).is_some_and(Option::is_some)
+                || refused(pane)
+                || !scope_matches_issuer(&view.scope, managed[&pane.id].unwrap())
+            {
+                continue;
+            }
+            let path = match &view.scope {
+                Scope::Worktree { path, .. } => Some(path.clone()),
+                Scope::Channel(_) => pane.scope.clone(),
+            };
+            let placement = &managed[&pane.id].unwrap().placement;
+            if let Some(witness) = validated.get_mut(&pane.id)
+                && witness.registry == model.identity
+                && witness.scope == view.scope
+                && witness.placement == *placement
+                && witness.repository == managed[&pane.id].unwrap().spec.target.repository
+                && exact_issuer(managed[&pane.id].unwrap(), &witness.issuer)
+                && exact_issued_managed_source(&witness.issuer, &pane.kind)
+                && witness.source == pane.kind
+                && witness.path == path
+            {
+                witness.snapshot_sequence = snapshot_sequence;
+                witness.revision = view.revision;
+            } else {
+                let agent = managed[&pane.id].unwrap();
+                if agent.closed {
+                    continue;
+                }
+                let issuer = match &pane.kind {
+                    CardKind::Chat(_) => agent.session.clone(),
+                    CardKind::Terminal(session) => agent.session.as_ref()
+                        .filter(|source| matches!(source, crate::agent_execution::HostedSession::Terminal(issued) if issued.id == session.id))
+                        .cloned()
+                        .or_else(|| agent.console.clone().map(crate::agent_execution::HostedSession::Terminal)),
+                    _ => None,
+                };
+                let Some(issuer) =
+                    issuer.filter(|issued| exact_issued_managed_source(issued, &pane.kind))
+                else {
+                    continue;
+                };
+                validated.insert(
+                    pane.id,
+                    ValidatedManagedPane {
+                        registry: model.identity,
+                        snapshot_sequence,
+                        scope: view.scope.clone(),
+                        revision: view.revision,
+                        placement: placement.clone(),
+                        repository: agent.spec.target.repository.clone(),
+                        issuer,
+                        source: pane.kind.clone(),
+                        path,
+                    },
+                );
+            }
+            validated_now.insert(pane.id);
+        }
+    }
+    validated.retain(|id, witness| {
+        witness.registry == model.identity
+            && validated_now.contains(id)
+            && !quarantined.contains(id)
+    });
     quarantined
 }
 
@@ -362,6 +614,7 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    validated_managed: HashMap<CardId, ValidatedManagedPane>,
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
@@ -720,6 +973,8 @@ impl Cagents {
             &self.durable,
             &self.shared_views.quarantined,
             &self.shared_views.pending,
+            self.shared_views.snapshot_sequence,
+            &mut self.shared_views.validated_managed,
         );
         let released = self
             .shared_views
