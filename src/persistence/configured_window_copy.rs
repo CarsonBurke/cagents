@@ -163,6 +163,9 @@ fn fork_private_drafts(
         if let Some(value) = state.chat_drafts.remove(&old) {
             state.chat_drafts.insert(new, value);
         }
+        if let Some(value) = state.chat_draft_attachments.remove(&old) {
+            state.chat_draft_attachments.insert(new, value);
+        }
         if let Some(value) = state.configured_chat_drafts.remove(&old) {
             state.configured_chat_drafts.insert(new, value);
         }
@@ -189,6 +192,10 @@ fn fork_private_drafts(
         (CHANNELS_FIELD, to_json(&state.channels)?),
         ("card_scopes", to_json(&state.card_scopes)?),
         ("chat_drafts", to_json(&state.chat_drafts)?),
+        (
+            "chat_draft_attachments",
+            to_json(&state.chat_draft_attachments)?,
+        ),
         (
             "configured_chat_drafts",
             to_json(&state.configured_chat_drafts)?,
@@ -483,6 +490,99 @@ mod tests {
                     .is_open()
             );
         }
+    }
+
+    #[test]
+    fn new_window_copy_keeps_managed_draft_images_under_the_new_card_after_reopen() {
+        // Exercise real SQLite files and the New Window copy transaction.
+        // These valid managed-reference descriptors do not decode image files
+        // or exercise a provider, image ingestion, or a native UI.
+        fn image(number: u64, extension: &str, digest: &str) -> crate::chat::Attachment {
+            let reference = crate::chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number,
+                device: uuid::Uuid::from_u128(11),
+                name: format!("Image {number}.{extension}"),
+                sha256: digest.repeat(64),
+                extension: extension.into(),
+            };
+            reference.validate().unwrap();
+            crate::chat::Attachment {
+                path: format!("/private/owned/image-{number}.{extension}").into(),
+                reference: Some(reference),
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite3");
+        let destination = directory.path().join("copied.sqlite3");
+        let boot = BootId::new("private-image-window-copy");
+        let store = StateStore::open(&source, boot.clone()).unwrap();
+        let mut original = configured_workspace();
+        let old = original.cards[0].id;
+        let legacy = original.cards[1].id;
+        let images = vec![image(37, "png", "a"), image(12, "webp", "b")];
+        let legacy_images = vec![image(91, "png", "c")];
+        original
+            .chat_drafts
+            .insert(old, "Compare [Image 37] and [Image 12]".into());
+        original.chat_draft_attachments.insert(old, images.clone());
+        original
+            .chat_draft_attachments
+            .insert(legacy, legacy_images.clone());
+        store
+            .save_workspace(
+                &original,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let database_before = std::fs::read(&source).unwrap();
+        let wal = sqlite_sidecar_path(&source, "-wal");
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(
+            !wal_before.is_empty(),
+            "copy the live source including its committed WAL"
+        );
+
+        StateStore::copy_window_snapshot(&source, &destination, boot.clone()).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), database_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        let copied = StateStore::open(&destination, boot.clone()).unwrap();
+        let state = copied.load_workspace(original.id, None).unwrap().unwrap();
+        let (&new, _) = state.configured_chat_drafts.iter().next().unwrap();
+        assert_ne!(new, old);
+        assert_eq!(state.chat_draft_attachments.len(), 2);
+        assert_eq!(state.chat_draft_attachments[&new], images);
+        assert!(!state.chat_draft_attachments.contains_key(&old));
+        assert_eq!(state.chat_draft_attachments[&legacy], legacy_images);
+        assert_eq!(state.chat_drafts[&new], original.chat_drafts[&old]);
+        drop(copied);
+
+        let reopened = StateStore::open(&destination, boot).unwrap();
+        let manifest = reopened
+            .load_workspace_manifest(original.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manifest.chat_draft_attachments,
+            state.chat_draft_attachments
+        );
+        assert_eq!(manifest.chat_draft_attachments[&new], images);
+        assert!(!manifest.chat_draft_attachments.contains_key(&old));
+        let source_state = store.load_workspace(original.id, None).unwrap().unwrap();
+        assert_eq!(
+            source_state.chat_draft_attachments,
+            original.chat_draft_attachments
+        );
+        assert_eq!(source_state.chat_drafts, original.chat_drafts);
+        assert_eq!(
+            source_state.configured_chat_drafts,
+            original.configured_chat_drafts
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), database_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
     }
 
     #[test]
