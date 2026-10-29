@@ -25,7 +25,7 @@ runner and every CLI command with the same fixture environment:
 
 ```sh
 fixture_env() {
-  env -u CAGENTS_AGENT_AUTHORITY \
+  env -u CAGENTS_AGENT_AUTHORITY -u CLAUDE_CONFIG_DIR \
     HOME="$fixture_root/home" XDG_RUNTIME_DIR="$fixture_runtime" \
     XDG_DATA_HOME="$fixture_root/data" XDG_CONFIG_HOME="$fixture_root/config" \
     XDG_CACHE_HOME="$fixture_root/cache" PATH="$fixture_root/bin:$PATH" \
