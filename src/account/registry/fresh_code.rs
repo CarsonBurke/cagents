@@ -84,6 +84,44 @@ impl Registry {
 }
 
 impl Store {
+    /// Observation must not use the ordinary registry reader: that reader
+    /// intentionally repairs legacy file permissions for mutation callers.
+    fn fresh_code_observation(&self) -> io::Result<Registry> {
+        let directory = if self.directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &self.directory
+        };
+        let path = self.path();
+        crate::secure_file::reject_symlink_components(&path)?;
+        match crate::secure_file::validate_owned_directory(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Registry::default());
+            }
+            Err(error) => return Err(error),
+        }
+        let file = match crate::secure_file::open_existing_private_file_readonly(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Registry::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut text = String::new();
+        file.take(MAX_BYTES + 1).read_to_string(&mut text)?;
+        if text.len() as u64 > MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the accounts file is too large",
+            ));
+        }
+        let registry: Registry = toml::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        registry.validate_preparations()?;
+        Ok(registry)
+    }
+
     /// Resolve a lost Plan reply by its actual original request UUID. This
     /// reads existing metadata only; it never repeats Plan or invents a key.
     pub(crate) fn inspect_fresh_code_plan(
@@ -91,7 +129,7 @@ impl Store {
         request: &ConditionalPlan,
     ) -> io::Result<Option<Preparation>> {
         request.validate()?;
-        let registry = read(&self.path())?;
+        let registry = self.fresh_code_observation()?;
         if registry.is_newer() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -226,7 +264,7 @@ impl Store {
         request: &FreshCodeStart,
     ) -> io::Result<Option<CodeOwner>> {
         request.validate()?;
-        let registry = read(&self.path())?;
+        let registry = self.fresh_code_observation()?;
         if registry.is_newer() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

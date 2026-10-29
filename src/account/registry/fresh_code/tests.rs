@@ -127,6 +127,52 @@ fn frozen_v6_load_preserves_preparations_retention_timestamps_and_bytes() {
 }
 
 #[test]
+fn observation_never_repairs_permissions_links_or_missing_namespace() {
+    let fixture = Fixture::new();
+    let plan = ConditionalPlan {
+        request_id: fixture.request.binding.request_id,
+        expected_installation: fixture.request.binding.installation_id,
+        payload: fixture.request.binding.payload.clone(),
+    };
+    let before = fixture.bytes();
+    let assert_refusal = || {
+        assert!(fixture.store.inspect_fresh_code_plan(&plan).is_err());
+        assert!(fixture.store.observe_fresh_code(&fixture.request).is_err());
+        assert_eq!(fixture.bytes(), before);
+    };
+
+    fs::set_permissions(fixture.store.path(), fs::Permissions::from_mode(0o640)).unwrap();
+    assert_refusal();
+    assert_eq!(
+        fs::metadata(fixture.store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+
+    fs::set_permissions(fixture.store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    let linked = fixture.store.directory.join("linked-registry");
+    fs::hard_link(fixture.store.path(), &linked).unwrap();
+    assert_refusal();
+    fs::remove_file(&linked).unwrap();
+    fs::rename(fixture.store.path(), &linked).unwrap();
+    std::os::unix::fs::symlink(&linked, fixture.store.path()).unwrap();
+    assert_refusal();
+    assert!(
+        fs::symlink_metadata(fixture.store.path())
+            .unwrap()
+            .is_symlink()
+    );
+
+    let missing = Store::at(fixture._directory.path().join("missing-registry"));
+    assert!(missing.inspect_fresh_code_plan(&plan).is_err());
+    assert!(missing.observe_fresh_code(&fixture.request).is_err());
+    assert!(!missing.directory.exists());
+}
+
+#[test]
 fn conditional_plan_never_mints_missing_identity_and_refuses_changed_installation() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::at(directory.path().join("missing"));
