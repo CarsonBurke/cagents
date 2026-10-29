@@ -209,7 +209,7 @@ pub struct Target {
     repository: PathBuf,
     path: PathBuf,
     label: String,
-    /// The project's other worktrees inside `path`, as a linked worktree
+    /// Other projects and worktrees inside `path`, as a linked worktree
     /// created from within this one is. They are not part of this worktree:
     /// its count, close set and checks leave them, and its deletion is
     /// refused while any exist, because Git would remove them with it.
@@ -1046,12 +1046,7 @@ impl Cagents {
         };
         let path =
             selected.map_or_else(|| row.repository.clone(), |worktree| worktree.path.clone());
-        let nested = nested_worktree_paths(
-            &path,
-            row.worktrees.iter().map(|worktree| worktree.path.as_path()),
-        )
-        .map(Path::to_path_buf)
-        .collect();
+        let nested = self.known_nested_roots(&path);
         Some(Target {
             project,
             worktree,
@@ -1062,6 +1057,26 @@ impl Cagents {
             path,
             nested,
         })
+    }
+
+    /// A foreign repository may be filed under a different project, and its
+    /// primary directory may have no loaded worktree rows yet.
+    fn known_nested_roots(&self, path: &Path) -> Vec<PathBuf> {
+        nested_worktree_paths(
+            path,
+            self.sidebar_model.projects.iter().flat_map(|project| {
+                std::iter::once(project.repository.as_path()).chain(
+                    project
+                        .worktrees
+                        .iter()
+                        .map(|worktree| worktree.path.as_path()),
+                )
+            }),
+        )
+        .map(Path::to_path_buf)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
     }
 
     /// Whether `worktree` is the project's primary checkout, which only
@@ -1871,16 +1886,9 @@ impl Cagents {
         if sidebar::is_primary_worktree(&project.repository, &worktree.path) {
             return Some(PRIMARY_WORKTREE_KEPT.into());
         }
-        if let Some(reason) = crate::repository::nested_worktrees_refusal(
-            nested_worktree_paths(
-                &target.path,
-                project
-                    .worktrees
-                    .iter()
-                    .map(|worktree| worktree.path.as_path()),
-            )
-            .count(),
-        ) {
+        if let Some(reason) =
+            crate::repository::nested_worktrees_refusal(self.known_nested_roots(&target.path).len())
+        {
             return Some(reason);
         }
         if worktree.locked {
@@ -2491,6 +2499,13 @@ fn remove_project_from_cagents(
 /// Returns what was removed, by which its creation is released, or `None`
 /// when Git could not say where the worktree's administrative files were.
 fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
+    delete_worktree_with_sessions(target, close_worktree_sessions)
+}
+
+fn delete_worktree_with_sessions(
+    target: &Target,
+    close_sessions: impl FnOnce(&Target) -> Result<(), String>,
+) -> Result<Option<RemovedWorktree>, String> {
     let id = target.worktree.ok_or(PRIMARY_WORKTREE_KEPT)?;
     let service = RepositoryService::system("git");
     let cancellation = CancellationToken::default();
@@ -2504,7 +2519,9 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if records.first().is_some_and(|primary| primary.id == id) || record.bare {
         return Err(PRIMARY_WORKTREE_KEPT.into());
     }
-    if let Some(reason) = crate::repository::nested_worktrees_refusal_in(&target.path, &records) {
+    if let Some(reason) =
+        crate::repository::nested_worktrees_refusal_in(&target.path, &records, &cancellation)
+    {
         return Err(reason);
     }
     if record.lock.locked {
@@ -2528,7 +2545,7 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
             );
         })
         .ok();
-    close_worktree_sessions(target)?;
+    close_sessions(target)?;
     // Confirmation authorizes discarding this worktree's changes. Git owns
     // directory removal and still refuses locked worktrees with one --force.
     let command = worktree_removal_command(target);
@@ -4155,6 +4172,109 @@ mod tests {
     }
 
     #[test]
+    fn foreign_nested_worktree_refuses_before_closing_sessions_or_removing_files() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::foreign_nested_worktree_refuses_before_closing_sessions_or_removing_files"
+        )) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("A");
+        let foreign_repository = root.join("B");
+        let outer = root.join("outer");
+        for name in ["A", "B"] {
+            git(&root, &["init", "-b", "main", name]);
+            git(
+                &root.join(name),
+                &["commit", "--allow-empty", "-m", "initial"],
+            );
+        }
+        std::fs::write(repository.join(".git/info/exclude"), "/.worktrees/\n").unwrap();
+        std::fs::write(
+            foreign_repository.join(".git/info/exclude"),
+            "/ignored.txt\n",
+        )
+        .unwrap();
+        git(
+            &repository,
+            &["worktree", "add", "-b", "outer", outer.to_str().unwrap()],
+        );
+        let foreign = outer.join(".worktrees/foreign");
+        git(
+            &foreign_repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "foreign",
+                foreign.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(foreign.join("uncommitted.txt"), "uncommitted work").unwrap();
+        std::fs::write(foreign.join("ignored.txt"), "ignored work").unwrap();
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = service.list_worktrees(&repository, &cancellation).unwrap();
+        assert!(!records.iter().any(|record| record.path == foreign));
+        assert_ne!(
+            service.common_dir(&repository, &cancellation).unwrap(),
+            service.common_dir(&foreign, &cancellation).unwrap()
+        );
+        assert!(
+            !service
+                .status(&outer, &cancellation)
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(
+                records
+                    .iter()
+                    .find(|record| record.path == outer)
+                    .unwrap()
+                    .id,
+            ),
+            repository,
+            path: outer.clone(),
+            label: "outer".into(),
+            // Neither the catalog nor A's Git listing knows B's worktree.
+            nested: Vec::new(),
+        };
+        let closed = std::cell::Cell::new(false);
+        let reason = delete_worktree_with_sessions(&target, |_| {
+            closed.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(reason.contains("another repository"), "{reason}");
+        assert!(
+            !closed.get(),
+            "refusal must precede the session-close effect"
+        );
+        assert!(outer.is_dir());
+        assert_eq!(
+            std::fs::read(foreign.join("uncommitted.txt")).unwrap(),
+            b"uncommitted work"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("ignored.txt")).unwrap(),
+            b"ignored work"
+        );
+        let foreign_records = service
+            .list_worktrees(&foreign_repository, &cancellation)
+            .unwrap();
+        assert!(
+            foreign_records
+                .iter()
+                .any(|record| record.path == foreign && record.prunable_reason.is_none())
+        );
+    }
+
+    #[test]
     fn dirty_worktree_confirmation_warns_without_blocking() {
         let repository = PathBuf::from("/repo");
         let primary = SidebarWorktree::from_durable(
@@ -4362,6 +4482,71 @@ mod tests {
                 .as_deref(),
             Some("This closes 5 terminals in these worktrees and ends their sessions.")
         );
+    }
+
+    #[test]
+    fn foreign_project_sessions_are_excluded_from_worktree_deletion_scope() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join(".worktrees/outer"),
+            Some("outer".into()),
+        );
+        let foreign = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            linked.path.join(".worktrees/foreign"),
+            Some("foreign".into()),
+        );
+        for (foreign_repository, foreign_rows) in [
+            (PathBuf::from("/foreign"), vec![foreign.clone()]),
+            (foreign.path.clone(), Vec::new()),
+            (foreign.path.clone(), vec![foreign.clone()]),
+        ] {
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            app.sidebar_model.projects.push(SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "foreign".into(),
+                foreign_repository,
+                foreign_rows,
+                Vec::new(),
+            ));
+            drop(app.add_terminal(linked.path.clone()));
+            let own = app.durable.cards.last().unwrap().id;
+            drop(app.add_terminal(foreign.path.join("src")));
+            let foreign_card = app.durable.cards.last().unwrap().id;
+            let target = app.project_target(project, Some(linked.id)).unwrap();
+            assert_eq!(target.nested, [foreign.path.clone()]);
+            assert!(!target.contains(&foreign.path.join("src")));
+            assert!(!target.owns_card(app.card_state(foreign_card).unwrap()));
+            let captured = app.capture_worktree_removal(&target);
+            assert_eq!(
+                captured
+                    .cards
+                    .iter()
+                    .map(|owner| owner.state.id)
+                    .collect::<Vec<_>>(),
+                [own]
+            );
+            assert_eq!(
+                app.worktree_cascade_summary(&target).as_deref(),
+                Some("This closes 1 terminal in the worktree and ends its session.")
+            );
+            let close_scope =
+                ProjectSessionScope::new(vec![target.path.clone()], target.nested.clone());
+            assert!(close_scope.contains(&linked.path));
+            assert!(!close_scope.contains(&foreign.path.join("src")));
+            assert!(
+                app.worktree_deletion_blocker(&target)
+                    .unwrap()
+                    .contains("contains another worktree")
+            );
+        }
     }
 
     #[test]
