@@ -751,7 +751,7 @@ impl Session {
     }
 
     fn close_interrupted(&mut self, all: bool) -> Result<CommandOutput, AppError> {
-        if all && self.authority.token().is_some() {
+        if all && self.context.authority.token().is_some() {
             return Err(AppError {
                 kind: "permission_denied",
                 message: "Only the user may close other callers' interrupted agents; omit --all to close this caller's agents".into(),
@@ -1763,11 +1763,12 @@ mod tests {
             );
         });
         let client = ControlClient::from_stream(client_stream).unwrap();
-        let mut session = Session {
+        let context = ServiceRequestContext {
             authority,
-            connection: Some((client, PathBuf::from("/fixture"))),
-            summaries: None,
+            remote: false,
         };
+        let mut session = Session::new(&context);
+        session.connection = Some(client);
         let error = session.close_interrupted(false).err().unwrap();
         assert_eq!(error.kind, "protocol");
         let details = error.details.unwrap();
@@ -1787,11 +1788,12 @@ mod tests {
             assert!(next.is_none(), "User-only cleanup reached the wire");
         });
         let client = ControlClient::from_stream(client_stream).unwrap();
-        let mut session = Session {
+        let context = ServiceRequestContext {
             authority: Authority::session("synthetic-owning-session".into()),
-            connection: Some((client, PathBuf::from("/fixture"))),
-            summaries: None,
+            remote: false,
         };
+        let mut session = Session::new(&context);
+        session.connection = Some(client);
         let error = session.close_interrupted(true).err().unwrap();
         assert_eq!(error.kind, "permission_denied");
         assert_eq!(error.details.unwrap()["attempts_complete"], false);
@@ -1859,11 +1861,12 @@ mod tests {
                 }
             });
             let client = ControlClient::from_stream(client_stream).unwrap();
-            let mut session = Session {
+            let context = ServiceRequestContext {
                 authority: Authority::default(),
-                connection: Some((client, PathBuf::from("/fixture"))),
-                summaries: None,
+                remote: false,
             };
+            let mut session = Session::new(&context);
+            session.connection = Some(client);
             let result = session.close_interrupted(false);
             if lose_final_reply {
                 let error = result.err().unwrap();
@@ -1911,11 +1914,12 @@ mod tests {
                 );
             });
             let client = ControlClient::from_stream(client_stream).unwrap();
-            let mut session = Session {
+            let context = ServiceRequestContext {
                 authority: Authority::default(),
-                connection: Some((client, PathBuf::from("/fixture"))),
-                summaries: None,
+                remote: false,
             };
+            let mut session = Session::new(&context);
+            session.connection = Some(client);
             if all {
                 let error = session.close_interrupted(all).err().unwrap();
                 assert!(error.message.contains(&failed_id.to_string()));
