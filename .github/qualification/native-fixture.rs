@@ -52,7 +52,8 @@ fn snapshot(session: &Session) -> Snapshot {
     Snapshot {
         ready: true,
         session_id: session.launch.session_id.clone(),
-        title: None,
+        title: (std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1"))
+            .then(|| "Hidden conversation recovered".into()),
         items: if std::env::var("HELD_FIXTURE_PAYLOAD").as_deref() == Ok("long") {
             (0..200).map(|index| Arc::new(cagents::chat::Item {
                 id: format!("synthetic-history-{index}"),
@@ -192,6 +193,20 @@ fn client(
                                 .ok_or("Unknown synthetic scope")?
                                 .apply(&change)?;
                         }
+                        #[cfg(held_product_after)]
+                        ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source }
+                            if std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1")
+                                && id == model.channels[0].id
+                                && card == CardId::from_uuid(model.agents[0].id.as_uuid())
+                                && model.views.iter().any(|view| view.scope == Scope::Channel(id)
+                                    && view.revision == expected_revision && view.primary_chat() == Some(card))
+                                && title == "Hidden conversation recovered"
+                                && source == cagents::model::ChannelTitleSource::Provider =>
+                        {
+                            model.channels[0].title = title;
+                            model.channels[0].title_source = source;
+                            record(&root, "hidden-healthy-ready-title-published");
+                        }
                         _ => return Err("Mutation outside this native fixture".into()),
                     }
                     model.sequence += 1;
@@ -217,6 +232,17 @@ fn client(
             ClientRequest::ChatAttach { session } => {
                 let repaired = state.lock().unwrap().repaired;
                 if session == healthy || (repaired && session == held) {
+                    if session == healthy && std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1") {
+                        record(&root, "healthy-attach-held-before-ready");
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        while !root.join("release-hidden-healthy").exists() {
+                            if std::time::Instant::now() >= deadline {
+                                record(&root, "UNEXPECTED-hidden-attach-deadline");
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
                     record(
                         &root,
                         if session == healthy {
@@ -469,6 +495,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        if std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1") {
+            let active: ChannelId = "00000000-0000-4000-8000-000000008922".parse()?;
+            let settings: CardId = "00000000-0000-4000-8000-000000009922".parse()?;
+            if saved.active_channel != Some(active) || saved.focused != Some(settings)
+                || saved.channels.iter().find(|channel| channel.id == active).and_then(|channel| channel.focused) != Some(settings)
+            { return Err("Hidden recovery changed the active saved scope or focus".into()); }
+        }
         let bad = saved.cards.iter().find(|card| card.id == bad_id).ok_or("Saved rejected pane missing")?;
         if bad.kind != cards[1].kind { return Err("Saved rejected source changed".into()); }
         let should_be_closed = std::env::args().nth(4).as_deref() == Some("closed");
@@ -480,6 +513,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("typed-saved-source-draft-attachments-and-existence-verified");
         return Ok(());
     }
+    let hidden_mode = std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1");
+    let held_channel_title_source = if hidden_mode {
+        cagents::model::ChannelTitleSource::Prompt
+    } else {
+        Default::default()
+    };
     let mut workspace = WorkspaceState {
         project_order: vec![project],
         cards: cards.to_vec(),
@@ -498,7 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: channel,
         project_id: project,
         title: "Saved recovery fixture".into(),
-        title_source: Default::default(),
+        title_source: held_channel_title_source,
         ordinal: 1,
         shared: true,
         cards: workspace
@@ -509,6 +548,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         focused: Some(healthy_id),
     });
+    let active_channel: ChannelId = "00000000-0000-4000-8000-000000008922".parse()?;
+    if hidden_mode {
+        let settings: CardId = "00000000-0000-4000-8000-000000009922".parse()?;
+        workspace.cards.push(CardState {
+            id: settings,
+            generation: 0,
+            title: "Active settings".into(),
+            width_fraction: 1.0,
+            kind: CardKind::Settings,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Cold,
+        });
+        workspace.channels.push(ProjectChannel {
+            id: active_channel,
+            project_id: project,
+            title: "Active settings fixture".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: true,
+            cards: vec![settings],
+            focused: Some(settings),
+        });
+        workspace.active_channel = Some(active_channel);
+        workspace.focused = Some(settings);
+    }
     let database = SessionRuntime::default_database_path()?;
     if database.exists() {
         return Err(
@@ -609,7 +674,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: channel,
                 repository,
                 title: "Saved recovery fixture".into(),
-                title_source: Default::default(),
+                title_source: held_channel_title_source,
                 ordinal: 1,
             }],
             views: vec![View {
@@ -622,6 +687,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     }));
+    if hidden_mode {
+        let mut fixture = state.lock().unwrap();
+        let repository = fixture.model.projects[0].repository.clone();
+        fixture.model.channels.push(ModelChannel {
+            id: active_channel,
+            repository,
+            title: "Active settings fixture".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+        });
+        fixture.model.views.push(View::empty(Scope::Channel(active_channel)));
+    }
     let socket = terminal_ipc::daemon_socket_path()?;
     fs::create_dir_all(socket.parent().ok_or("Socket parent missing")?)?;
     let listener = UnixListener::bind(&socket)?;

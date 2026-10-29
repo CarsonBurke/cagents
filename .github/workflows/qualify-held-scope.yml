@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: 945400e7fd1470ec563bc311cfc22e0268f7b37c
-      PRODUCT_TREE: 60b949a6897fd2474d916220d93ea81e80245841
+      PRODUCT_SHA: 41f9b9deb9bb4f3780fc71e4c60d27f709f74081
+      PRODUCT_TREE: 439e15672d8773d627f442e0d13f655e0144305d
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -54,6 +54,17 @@ jobs:
       - name: Install native evidence tools
         shell: bash
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0
+      - name: Restore the isolated hosted build lane
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: |
+            held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
       - name: Check exact UI source and execute User startup parents
         id: focus
         shell: bash
@@ -77,6 +88,15 @@ jobs:
             cd "$QUALIFICATION_EVIDENCE"
             find . -type f ! -name sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > sha256.txt
           fi
+      - name: Preserve the hosted lane after validation
+        if: always() && steps.cache.outcome == 'success'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Upload source and validation receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

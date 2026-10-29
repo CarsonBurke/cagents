@@ -137,9 +137,12 @@ try:
                      'hidden_mixed_managed_saved_scope_recovers_healthy_panes_only',
                      'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner']:
             test = 'app::shared_views::tests::startup_admission::' + name
-            output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'])
+            output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
-            assert test in text and '1 passed; 0 failed' in text
+            if name not in failures:
+                assert test in text and '1 passed; 0 failed' in text
+        if failures:
+            raise RuntimeError('User startup qualification failed: ' + ', '.join(failures))
     if '--focused-only' in sys.argv[3:]:
         sys.exit(0)
     run('cli-check', ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents'])

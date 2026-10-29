@@ -329,13 +329,15 @@ try:
         helper = base / (variant + '-fixture')
         command = ['rustc', '--edition=2024', str(source), '--extern', 'cagents=' + libs[0],
                    '-L', 'dependency=' + str(target / 'dev-runtime/deps'), '-o', str(helper)]
+        if variant == 'after':
+            command += ['--cfg', 'held_product_after']
         for row in rows:
             if row.get('reason') == 'build-script-executed':
                 for path in row.get('linked_paths', []):
                     command += ['-L', path]
         run(command, timeout=180)
-        for surface, mode, payload in [('chat', 'stale', 'short'), ('chat', 'stale', 'long'), ('chat', 'closed', 'short'), ('chat', 'closed', 'empty'), ('terminal', 'closed', 'empty')]:
-            label = f'{variant}-{surface}-{mode}-{payload}'
+        for surface, mode, payload, hidden in [('chat', 'stale', 'short', False), ('chat', 'stale', 'long', False), ('chat', 'closed', 'short', False), ('chat', 'closed', 'empty', False), ('terminal', 'closed', 'empty', False), ('chat', 'stale', 'short', True)]:
+            label = f'{variant}-' + ('hidden-' if hidden else '') + f'{surface}-{mode}-{payload}'
             root = base / label
             root.mkdir(mode=0o700)
             env = os.environ.copy()
@@ -349,6 +351,7 @@ try:
             env['RUSTUP_HOME'] = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
             env['HELD_FIXTURE_PAYLOAD'] = payload
             env['HELD_FIXTURE_SURFACE'] = surface
+            env['HELD_FIXTURE_HIDDEN'] = '1' if hidden else '0'
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
@@ -379,12 +382,37 @@ try:
             run(['xdotool', 'windowactivate', '--sync', window])
             run(['xdotool', 'key', 'ctrl+shift+i'])
             time.sleep(.4)
+            hidden_field = None
+            if hidden:
+                hidden_field = wait(lambda: next((node for node in tree(pid)
+                                                 if node.name == 'Search settings' and visible(node)
+                                                 and node.getState().contains(pyatspi.STATE_EDITABLE)), None))
+                assert hidden_field.queryComponent().grabFocus()
+                wait(lambda: hidden_field.getState().contains(pyatspi.STATE_FOCUSED))
+                run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'active '])
+                wait(lambda: hidden_field.queryText().getText(0, -1) == 'active ')
+                if variant == 'after':
+                    wait(lambda: 'healthy-attach-held-before-ready' in receipt.read_text())
+                    (root / 'release-hidden-healthy').touch()
             if variant == 'after':
-                wait(lambda: any(node.name == 'Saved pane unavailable' for node in tree(pid)))
+                if not hidden:
+                    wait(lambda: any(node.name == 'Saved pane unavailable' for node in tree(pid)))
                 wait(lambda: 'healthy-attach-requested' in receipt.read_text())
             else:
                 time.sleep(5)
-                assert 'healthy-attach-requested' not in receipt.read_text(), 'Baseline did not reproduce whole-scope block'
+                baseline_receipts = receipt.read_text()
+                assert not any(marker in baseline_receipts for marker in
+                               ('healthy-attach-requested', 'healthy-attach-held-before-ready')), \
+                    'Baseline did not reproduce whole-scope block'
+            if hidden:
+                if variant == 'after':
+                    wait(lambda: 'hidden-healthy-ready-title-published' in receipt.read_text())
+                    wait(lambda: any('Hidden conversation recovered' in node.name and visible(node)
+                                     for node in live_tree(pid)))
+                assert hidden_field.getState().contains(pyatspi.STATE_FOCUSED), 'Background saved recovery stole native active-pane focus'
+                run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', 'scope preserved'])
+                wait(lambda: hidden_field.queryText().getText(0, -1) == 'active scope preserved')
+                assert not any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid))
             capture(window, label + '-wide', (1280, 800))
             capture(window, label + '-narrow', (900, 700))
             run(['xdotool', 'key', 'Tab', 'shift+Tab'])
@@ -398,7 +426,7 @@ try:
                                      for node in live_tree(pid)))
                 capture(window, label + '-performance-wide', (1280, 800))
                 responsiveness(window, pid, fixture, root, label, pixel_helper)
-            if variant == 'after':
+            if variant == 'after' and not hidden:
                 capture(window, label + '-wide-restored', (1280, 800))
                 fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
                           and node.getState().contains(pyatspi.STATE_EDITABLE)]
@@ -410,7 +438,7 @@ try:
                 run(['xdotool', 'type', '--clearmodifiers', '--delay', '1', healthy_text])
                 wait(lambda: field.queryText().getText(0, -1) == healthy_text)
                 (root / 'healthy-draft-expected').write_text(healthy_text)
-            if variant == 'after' and payload == 'short' and mode == 'stale':
+            if variant == 'after' and not hidden and payload == 'short' and mode == 'stale':
                 capture(window, label + '-controls', (1280, 800))
                 copy_exact(pid, 'Copy saved draft', (root / 'expected-draft.txt').read_bytes(), keyboard=True)
                 copy_exact(pid, 'Copy saved attachment locations', (root / 'expected-attachment.txt').read_bytes())
@@ -494,8 +522,8 @@ try:
                             marker = json.loads(marker_row[0])
                             is_closed = 'closed' in str(json.loads(card_row[0])).lower()
                             should_close = mode == 'closed'
-                            should_mark = mode != 'stale' or payload != 'short'
-                            healthy_saved = json.loads(drafts_row[0]).get('00000000-0000-4000-8000-000000003922') == healthy_text
+                            should_mark = hidden or mode != 'stale' or payload != 'short'
+                            healthy_saved = hidden or json.loads(drafts_row[0]).get('00000000-0000-4000-8000-000000003922') == healthy_text
                             return healthy_saved and is_closed == should_close and ('00000000-0000-4000-8000-000000004922' in marker) == should_mark
                     except sqlite3.Error:
                         return False
@@ -512,7 +540,7 @@ try:
                     key = 'workspace:' + (root / 'workspace-id').read_text().strip() + ':navigation:quarantined_panes'
                     marker = json.loads(db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()[0])
                     bad_id = '00000000-0000-4000-8000-000000004922'
-                    assert (bad_id in marker) == (mode != 'stale' or payload != 'short')
+                    assert (bad_id in marker) == (hidden or mode != 'stale' or payload != 'short')
                     before_rows = list(db.iterdump())
                 old_reader = subprocess.run([str(base / 'before-fixture'), str(root), mode, '--inspect', expected_existence],
                                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
