@@ -95,6 +95,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for PageText {
     fn diff(&mut self, tree: &mut Tree) {
         self.widget_mut().diff(tree);
     }
+    fn id(&self) -> Option<widget::Id> {
+        self.widget().id()
+    }
+    fn set_id(&mut self, id: widget::Id) {
+        self.widget_mut().set_id(id);
+    }
     fn size(&self) -> Size<Length> {
         self.widget().size()
     }
@@ -181,6 +187,27 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for PageText {
     ) {
         self.widget()
             .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        // Match COSMIC SelectableText's native keyboard-focus treatment even
+        // when there is no selected range to provide another visible cue.
+        use iced::advanced::Renderer as _;
+        type TextState = iced::advanced::widget::text::State<
+            <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+        if tree.state.downcast_ref::<TextState>().is_keyboard_focused() {
+            let cosmic = theme.cosmic();
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: iced::Border {
+                        color: cosmic.accent.base.into(),
+                        width: 1.0,
+                        radius: cosmic.corner_radii.radius_s.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                iced::Color::TRANSPARENT,
+            );
+        }
     }
 
     fn a11y_nodes(
@@ -664,7 +691,7 @@ impl Cagents {
             let handle = runtime.handle().unwrap().clone();
             let visible = runtime.visible.clone();
             let mut write = Some(text_copy::write_shared_literal(text));
-            return Task::done(()).then(move |_| {
+            return iced::Task::done(()).then(move |_| {
                 let effect = write.take();
                 if visible.load(Ordering::Relaxed) && snapshot_keeps(&handle.snapshot(), &key) {
                     effect.unwrap_or_else(Task::none)
@@ -1326,5 +1353,127 @@ mod tests {
             "hidden page".into(),
         );
         assert_eq!(clipboard.0, ["Saved final line"]);
+    }
+
+    fn page_text_fixture() -> PageText {
+        let (_app, _target, handle, source) = fixture();
+        PageText {
+            text: widget::text(SAVED.to_owned())
+                .selectable()
+                .font(iced::Font::MONOSPACE)
+                .size(design::TEXT_CAPTION)
+                .width(Length::Fill),
+            selection: Rc::default(),
+            key: Key {
+                id: "owned-report".into(),
+                source,
+                conversation_revision: 4,
+            },
+            handle,
+            visible: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn saved_output_page_retains_native_accessibility_identity_across_view_rebuilds() {
+        let mut first = page_text_fixture();
+        let id = first.id().expect("the native text ID must be forwarded");
+        let mut tree = Tree::new(&first as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        assert_eq!(tree.id, Some(id.clone()));
+        let node = layout::Node::new(Size::new(240.0, 80.0));
+        for _ in 0..3 {
+            let mut rebuilt = PageText {
+                text: widget::text(SAVED.to_owned()).selectable(),
+                selection: first.selection.clone(),
+                key: first.key.clone(),
+                handle: first.handle.clone(),
+                visible: first.visible.clone(),
+            };
+            assert_ne!(
+                rebuilt.id(),
+                Some(id.clone()),
+                "the rebuilt native text begins with a fresh ID"
+            );
+            tree.diff(&mut rebuilt as &mut dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+            assert_eq!(rebuilt.id(), Some(id.clone()));
+            assert_eq!(tree.id, Some(id.clone()));
+            assert!(
+                rebuilt
+                    .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable)
+                    .contains(&id.clone().into())
+            );
+            first = rebuilt;
+        }
+    }
+
+    #[test]
+    fn saved_output_page_keyboard_focus_paints_without_selection_and_clears_on_blur() {
+        use iced::advanced::{Renderer as _, renderer::Headless as _};
+        use widget::HasSelectableText;
+        struct Focus(bool);
+        impl Operation for Focus {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _id: Option<&widget::Id>,
+                _bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if self.0 {
+                    state.focus();
+                } else {
+                    state.unfocus();
+                }
+            }
+        }
+        let mut renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut page = page_text_fixture();
+        let mut tree = Tree::new(&page as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        let node = page
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(200.0, 56.0)),
+            )
+            .move_to(iced::Point::new(8.0, 4.0));
+        let viewport = Rectangle::with_size(Size::new(220.0, 64.0));
+        let theme = cosmic::Theme::default();
+        let paint = |renderer: &mut cosmic::Renderer, page: &PageText, tree: &Tree| {
+            renderer.reset(viewport);
+            page.draw(
+                tree,
+                renderer,
+                &theme,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            renderer.screenshot(Size::new(220, 64), 1.0, iced::Color::WHITE)
+        };
+        let unfocused = paint(&mut renderer, &page, &tree);
+        page.operate(&mut tree, Layout::new(&node), &renderer, &mut Focus(true));
+        assert!(
+            page.text.selected_text(&tree).is_none(),
+            "focus alone must not select text"
+        );
+        let focused = paint(&mut renderer, &page, &tree);
+        assert_ne!(
+            focused, unfocused,
+            "actual page draw must reveal keyboard focus even with an empty selection"
+        );
+        page.operate(&mut tree, Layout::new(&node), &renderer, &mut Focus(false));
+        assert_eq!(paint(&mut renderer, &page, &tree), unfocused);
     }
 }
