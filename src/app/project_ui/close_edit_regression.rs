@@ -195,6 +195,22 @@ async fn close_output(task: Task<Message>) -> Message {
     panic!("fresh cleanup must emit its own completion");
 }
 
+async fn recovery_output(task: Task<Message>) -> Message {
+    let mut stream =
+        iced::runtime::task::into_stream(task).expect("public recovery retry was admitted");
+    while let Some(action) = stream.next().await {
+        if let iced::runtime::Action::Output(cosmic::Action::App(
+            message @ Message::OperationRecovery(crate::operation_recovery::Action::Finished {
+                ..
+            }),
+        )) = action
+        {
+            return message;
+        }
+    }
+    panic!("the public retry must emit its actual completion receipt");
+}
+
 fn respond(stream: &mut UnixStream, request: ClientEnvelope, response: ServerResponse) {
     write_frame(
         stream,
@@ -567,9 +583,17 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             // A bounded synthetic producer tests clean recovery custody
             // independently of dirty text, save tickets and durability. It
             // performs no filesystem mutation and grants no process authority.
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let retries = attempts.clone();
             let authority = crate::recovery_authority::RecoverySlot::reserve()
                 .unwrap()
-                .retain("close-editor recovery fixture".into(), || Ok(()));
+                .retain("close-editor recovery fixture".into(), move || {
+                    if retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Err("fixture recovery is still pending".into())
+                    } else {
+                        Ok(())
+                    }
+                });
             drop(app.update(Message::Repository(
                 RepositoryAction::RetainedSaveFinished {
                     identity,
@@ -586,7 +610,8 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             assert!(!editor(&app, card).is_dirty());
             assert!(!editor(&app, card).is_saving());
             assert!(!editor(&app, card).has_durability_warning());
-            recovery = Some(authority);
+            assert!(app.operation_recovery_pending());
+            recovery = Some((authority, attempts));
         }
         Case::ReopenBeforeCompletion => {
             edits
@@ -693,13 +718,69 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             // The earlier Undo is still visible. Explicit Discard now adopts
             // the completed save's bytes, rather than throwing that write away.
             app.update(Message::Repository(RepositoryAction::DiscardEdits { card }))
+        } else if let Some((authority, attempts)) = recovery {
+            // The typed producer result registered this exact authority with
+            // the window. Its Retry control captures the same clone. Drive
+            // both real public workers and their original Finished receipts;
+            // resolving the leaf directly would miss the application wakeup.
+            let retry = app.update(Message::OperationRecovery(
+                crate::operation_recovery::Action::Retry(authority.clone()),
+            ));
+            assert!(editor(&app, card).has_editor_recovery());
+            assert!(!editor(&app, card).is_dirty());
+            assert!(!app.project_ui.close_in_flight.contains(&project));
+            let failed = tokio::time::timeout(WAIT, recovery_output(retry))
+                .await
+                .unwrap();
+            assert!(matches!(&failed,
+                Message::OperationRecovery(crate::operation_recovery::Action::Finished {
+                    result: Err(error), ..
+                }) if error == "fixture recovery is still pending"));
+            drop(app.update(failed));
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!authority.is_resolved());
+            assert!(app.operation_recovery_pending());
+            assert!(editor(&app, card).has_editor_recovery());
+            assert!(editor(&app, card).blocks_navigation());
+            assert!(!editor(&app, card).is_dirty());
+            assert!(!editor(&app, card).is_saving());
+            assert_eq!(editor(&app, card).editor_text().as_deref(), Some(BASELINE));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.project_ui.closing.get(&project), Some(&root));
+            assert_eq!(
+                app.project_ui.close_generation.get(&project),
+                Some(&generation)
+            );
+            assert!(!app.project_ui.close_in_flight.contains(&project));
+            assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let retry = app.update(Message::OperationRecovery(
+                crate::operation_recovery::Action::Retry(authority.clone()),
+            ));
+            assert!(editor(&app, card).blocks_navigation());
+            assert!(!app.project_ui.close_in_flight.contains(&project));
+            let resolved = tokio::time::timeout(WAIT, recovery_output(retry))
+                .await
+                .unwrap();
+            assert!(matches!(
+                &resolved,
+                Message::OperationRecovery(crate::operation_recovery::Action::Finished {
+                    result: Ok(()),
+                    ..
+                })
+            ));
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(authority.is_resolved());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(!app.project_ui.close_in_flight.contains(&project));
+            let resume = app.update(resolved);
+            assert!(!app.operation_recovery_pending());
+            assert!(!editor(&app, card).has_editor_recovery());
+            assert_eq!(editor(&app, card).editor_text().as_deref(), Some(BASELINE));
+            // A clean resolved editor needs no Reload or incidental file
+            // event. Finished itself must resume fresh checked cleanup.
+            resume
         } else {
-            if let Some(authority) = recovery {
-                tokio::task::spawn_blocking(move || authority.retry())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            }
             let reload = app.update(Message::Repository(RepositoryAction::Reload { card }));
             // Reload keeps the old document fenced until its actual read lands.
             assert!(editor(&app, card).blocks_navigation());
