@@ -451,7 +451,7 @@ impl Store {
         } else {
             body0.len() as i64
         };
-        let copy_prefix = if matches!(item.content, ItemContent::Text { .. }) {
+        let copy_prefix = if item.logical_copy_body().is_some() {
             self.copy_parent_prefix(&item.id, &body0)?
         } else {
             false
@@ -475,7 +475,7 @@ impl Store {
         let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
-            matches!(item.content, ItemContent::Text { .. }).then_some(len0 as usize),
+            item.logical_copy_body().is_some().then_some(len0 as usize),
             copy_prefix,
         )?;
         transaction.commit().map_err(|e| e.to_string())?;
@@ -1247,7 +1247,7 @@ impl Store {
                 {
                     break 'records;
                 }
-                let copy_source = if matches!(base.content, ItemContent::Text { .. }) {
+                let copy_source = if base.logical_copy_body().is_some() {
                     self.copy_parent_source(&id)?
                 } else {
                     None

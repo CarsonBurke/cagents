@@ -13959,7 +13959,7 @@ mod tests {
         );
     }
 
-    fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
+    pub(super) fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
         history_fixture_for_provider(app, Provider::Codex)
     }
     fn history_fixture_for_provider(
