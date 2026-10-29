@@ -2138,6 +2138,10 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
+    /// Notices raised while an earlier page is shown. That page holds
+    /// neither the latest prompt nor the latest work, so they are recorded
+    /// when the latest page next arrives.
+    unplaced_failures: Vec<String>,
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
@@ -3029,6 +3033,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
@@ -3088,6 +3093,7 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
         self.listed_models = 0;
@@ -3104,12 +3110,25 @@ impl Runtime {
     }
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
+        if self.snapshot.has_later {
+            self.defer_note(notice);
+            self.refresh_failure_ui();
+            return;
+        }
         let anchor = self
             .notice_anchor(&self.snapshot, &self.turns)
             .map(str::to_owned);
         let after = failure::closing_item(&self.snapshot, &self.turns).map(str::to_owned);
         if self.note_at(anchor, after, notice) {
             self.refresh_failure_ui();
+        }
+    }
+    fn defer_note(&mut self, notice: String) {
+        if !self.unplaced_failures.contains(&notice) {
+            if self.unplaced_failures.len() == 32 {
+                self.unplaced_failures.remove(0);
+            }
+            self.unplaced_failures.push(notice);
         }
     }
     /// Records `notice` for the prompt message `anchor`, drawn after the
@@ -3129,14 +3148,17 @@ impl Runtime {
             });
             changed = self.failures.len() != before;
         }
-        if let Some(note) = self.failures.iter_mut().find(|note| {
+        if let Some(index) = self.failures.iter().position(|note| {
             failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
                 && note.text == notice
         }) {
             // The same failure recurring later in this exchange is still one
-            // notice, now after the work that produced it again.
-            if after.is_some() && note.after != after {
+            // notice, now after the work that produced it again. It becomes
+            // the latest note, which places an incident it shares.
+            if after.is_some() && self.failures[index].after != after {
+                let mut note = self.failures.remove(index);
                 note.after = after;
+                self.failures.push(note);
                 changed = true;
             }
             return changed;
@@ -4325,11 +4347,20 @@ impl Runtime {
             self.find_disclosure
                 .retain(&self.expanded, &self.unfolded, &self.opened);
         }
+        // Presentation refreshes below, once the snapshot is installed.
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
-            // Presentation refreshes below, once the snapshot is installed.
-            self.note_at(next_anchor, next_after, error.clone());
+            if snapshot.has_later {
+                self.defer_note(error.clone());
+            } else {
+                self.note_at(next_anchor.clone(), next_after.clone(), error.clone());
+            }
+        }
+        if !snapshot.has_later {
+            for notice in std::mem::take(&mut self.unplaced_failures) {
+                self.note_at(next_anchor.clone(), next_after.clone(), notice);
+            }
         }
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {

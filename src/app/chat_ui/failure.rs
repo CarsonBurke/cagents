@@ -491,6 +491,26 @@ impl State {
             }
         }
 
+        let item_groups: HashMap<&str, &str> = if runtime.failures.is_empty() {
+            HashMap::new()
+        } else {
+            runtime
+                .turns
+                .iter()
+                .flat_map(|turn| {
+                    turn.prompt
+                        .iter()
+                        .chain(
+                            turn.steps
+                                .iter()
+                                .chain(&turn.prose)
+                                .map(|placed| &placed.index),
+                        )
+                        .filter_map(|index| runtime.snapshot.items.get(*index))
+                        .map(|item| (item.id.as_str(), turn.key.as_str()))
+                })
+                .collect()
+        };
         // A note keeps its message's scope after paging removes the message,
         // so its incident identity, and an expanded notice, stay put.
         let note_contexts: Vec<String> = runtime
@@ -516,12 +536,25 @@ impl State {
             }
         }
         // The current error joins the note recorded for it, wherever paging
-        // has left that note's message.
+        // has left that note's message, but only a note drawn here: an error
+        // still awaiting the latest page has no note yet, and must not adopt
+        // an older one with the same text.
         let snapshot_context = runtime
             .snapshot
             .error
             .as_deref()
-            .and_then(|error| runtime.failures.iter().rposition(|note| note.text == error))
+            .filter(|error| {
+                !runtime
+                    .unplaced_failures
+                    .iter()
+                    .any(|notice| notice == error)
+            })
+            .and_then(|error| {
+                runtime.failures.iter().rposition(|note| {
+                    note.text == error
+                        && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
+                })
+            })
             .map_or(context.as_str(), |index| note_contexts[index].as_str());
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
@@ -550,26 +583,6 @@ impl State {
                 state.push(provider, text, source, false, scope);
             }
         }
-        let item_groups: HashMap<&str, &str> = if runtime.failures.is_empty() {
-            HashMap::new()
-        } else {
-            runtime
-                .turns
-                .iter()
-                .flat_map(|turn| {
-                    turn.prompt
-                        .iter()
-                        .chain(
-                            turn.steps
-                                .iter()
-                                .chain(&turn.prose)
-                                .map(|placed| &placed.index),
-                        )
-                        .filter_map(|index| runtime.snapshot.items.get(*index))
-                        .map(|item| (item.id.as_str(), turn.key.as_str()))
-                })
-                .collect()
-        };
         let recovering = runtime.auth_error().is_some();
         for incident in &mut state.incidents {
             incident.active_recovery = recovering
@@ -1326,22 +1339,51 @@ mod tests {
     }
 
     #[test]
-    fn notice_recorded_on_an_earlier_page_is_placed_by_its_message() {
+    fn a_failure_while_an_earlier_page_is_shown_is_recorded_on_the_latest_page() {
         let provider = Provider::Claude;
-        let message = "ffffffff-ffff-4fff-8fff-ffffffffffff";
-        let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
+        let older = "12121212-1212-4212-8212-121212121212";
+        let latest = "34343434-3434-4434-8434-343434343434";
+        let raw = "Opaque provider failure";
+        let mut items = vec![
+            text(&part(provider, older, 0), chat::Role::User, "Earlier"),
+            text("older-reply", chat::Role::Assistant, "Done."),
+        ];
+        items.extend(delivered_work(provider, latest));
+        let (mut runtime, handle) = live_fixture(provider, items.clone());
+
+        // The reader pages back to the older exchange; the failure arrives.
         publish(&mut runtime, &handle, |page| {
             page.has_later = true;
-            page.error = Some("Opaque provider failure".into());
+            page.items.truncate(2);
+            page.error = Some(raw.into());
         });
-        assert_eq!(
-            runtime.failures[0].after, None,
-            "this page's end is not the latest work"
+        assert!(
+            runtime.failures.is_empty(),
+            "not attributed to the older prompt"
         );
-        assert_eq!(
-            runtime.failure_ui.incidents[0].anchor.as_deref(),
-            Some("finished")
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        assert!(
+            notice_visible(&mut runtime, &key),
+            "the live error stays visible"
         );
+
+        // Back on the latest page, it belongs to the latest prompt and is
+        // drawn after the latest work.
+        publish(&mut runtime, &handle, |page| {
+            page.has_later = false;
+            page.items = items.into_iter().map(Arc::new).collect();
+        });
+        assert_eq!(runtime.failures.len(), 1);
+        assert_eq!(
+            runtime.failures[0].message.as_deref(),
+            Some(part(provider, latest, 0).as_str())
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        let incident = &runtime.failure_ui.incidents[0];
+        assert!(incident.sources.contains(&Source::Snapshot));
+        assert_eq!(incident.anchor.as_deref(), Some("finished"));
+        let key = incident.key.clone();
+        assert!(notice_visible(&mut runtime, &key));
     }
 
     #[test]
@@ -1366,6 +1408,22 @@ mod tests {
         assert_eq!(
             runtime.failure_ui.incidents[0].anchor.as_deref(),
             Some("finished-again")
+        );
+
+        // The first wording recurring after still more work moves there too.
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items.extend([
+                Arc::new(delivery("finished-third", "Background command completed")),
+                Arc::new(text("still-more", chat::Role::Assistant, "Once more.")),
+            ]);
+        });
+        publish_error(&mut runtime, &handle, first);
+        assert_eq!(runtime.failures.len(), 2);
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(
+            runtime.failure_ui.incidents[0].anchor.as_deref(),
+            Some("finished-third")
         );
     }
 
