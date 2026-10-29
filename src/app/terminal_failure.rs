@@ -651,6 +651,144 @@ mod tests {
         );
         (app, card, session)
     }
+
+    #[test]
+    fn authority_pending_retry_failure_settles_operation_and_preserves_whole_source() {
+        for shared in [false, true] {
+            let (mut app, card, mut source) = app_and_session();
+            let proof = HostSessionProof {
+                host_session_id: "saved-pending-host".into(),
+                boot_id: "saved-pending-boot".into(),
+                host_incarnation: "saved-pending-incarnation".into(),
+            };
+            source.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
+            source
+                .launch
+                .environment
+                .insert("SAVED_HOME".into(), "/saved/account".into());
+            source
+                .launch
+                .unset_environment
+                .insert("OTHER_ACCOUNT".into());
+            source.recovery_origin = Some(TerminalId::new());
+            source.predecessor = Some(TerminalId::new());
+            app.card_state_mut(card).unwrap().kind = CardKind::Terminal(source.clone());
+            if shared {
+                app.shared_views.attached.insert(card);
+            }
+            app.fail_runtime(card, "automatic attachment refused".into());
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("pending-retry.sqlite3"),
+                proof.boot_id.clone(),
+            )
+            .unwrap();
+            let store = writer.operation_store();
+            writer.snapshot(app.durable.clone());
+            writer.flush(Duration::from_secs(5)).unwrap();
+            app.session = Some(writer);
+
+            // The UI future remains unpolled: inject its actual operation-tagged
+            // completion rather than bypassing RetryFinished bookkeeping.
+            drop(app.retry_card(card));
+            let operation = app.terminal_failure.attempts[&card].operation;
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Terminal(source.clone())
+            );
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            let mut pending = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                source.id,
+                source.launch.clone(),
+                None,
+            );
+            pending.session.continuity = TerminalContinuity::Failed {
+                typed_error: RuntimeError {
+                    code: "terminal_authority_rebind_pending".into(),
+                    message: "durable binding still unavailable".into(),
+                },
+                retryable: true,
+            };
+            pending.upgrade_sources = vec![source.clone()];
+            drop(app.observe_hosted_descriptors(vec![pending.clone()]));
+            assert_eq!(app.pending_adoptions.len(), 1);
+            drop(app.retry_card(card));
+            assert_eq!(app.terminal_failure.attempts[&card].operation, operation);
+
+            let completion = Action::RetryFinished {
+                card,
+                operation,
+                terminal: source.id,
+                result: Err("reconciliation still unavailable".into()),
+            };
+            drop(app.update_terminal_failure(completion.clone()));
+            assert_eq!(app.terminal_starts_in_flight(), 0);
+            assert!(app.pending_adoptions.is_empty());
+            assert!(!app.terminal_failure.attempts.contains_key(&card));
+            assert!(!app.terminal_failure.outstanding.contains_key(&operation));
+            assert!(app.terminal_retry_view(card).is_none());
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Terminal(source.clone())
+            );
+            drop(app.update_terminal_failure(completion));
+            assert_eq!(
+                app.terminal_starts_in_flight(),
+                0,
+                "duplicate completion cannot settle another start"
+            );
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                store.load_card(card, Some(&proof)).unwrap().unwrap().kind,
+                CardKind::Terminal(source.clone())
+            );
+
+            drop(app.retry_card(card));
+            let next = app.terminal_failure.attempts[&card].operation;
+            assert_ne!(
+                next, operation,
+                "a failed Retry must allow another explicit attempt"
+            );
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Terminal(source.clone())
+            );
+            drop(app.observe_hosted_descriptors(vec![pending]));
+            drop(app.update_terminal_failure(Action::RetryFinished {
+                card,
+                operation: next,
+                terminal: source.id,
+                result: Err("still unavailable".into()),
+            }));
+            assert!(app.terminal_retry_view(card).is_none());
+            assert_eq!(app.terminal_starts_in_flight(), 0);
+            assert!(app.pending_adoptions.is_empty());
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Terminal(source.clone())
+            );
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                store.load_card(card, Some(&proof)).unwrap().unwrap().kind,
+                CardKind::Terminal(source)
+            );
+            app.session.as_mut().unwrap().shutdown();
+        }
+    }
+
     #[test]
     fn diagnostics_copy_uses_known_fields_and_never_raw_errors_or_launch_secrets() {
         let (_, _, mut session) = app_and_session();

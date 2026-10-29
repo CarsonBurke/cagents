@@ -115,40 +115,6 @@ fn queued_pending_inventory_preserves_the_whole_source_through_failed_attach_and
             store.load_card(card, Some(&proof)).unwrap().unwrap().kind,
             CardKind::Terminal(source.clone())
         );
-        // Exercise the owning Retry reducer. Its future is deliberately not
-        // polled here; the request-capture test covers the real reconcile RPC.
-        drop(app.update(Message::RetryCard(card)));
-        assert_eq!(
-            app.card_state(card).unwrap().kind,
-            CardKind::Terminal(source.clone())
-        );
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        drop(app.observe_hosted_descriptors(vec![pending_descriptor(&source)]));
-        assert_eq!(app.pending_adoptions.len(), 1);
-        assert_eq!(
-            app.card_state(card).unwrap().kind,
-            CardKind::Terminal(source.clone())
-        );
-        drop(app.terminal_started(
-            card,
-            source.id,
-            Err("reconciliation still unavailable".into()),
-        ));
-        assert_eq!(
-            app.card_state(card).unwrap().kind,
-            CardKind::Terminal(source.clone())
-        );
-        assert_eq!(app.terminal_starts_in_flight(), 0);
-        assert!(app.pending_adoptions.is_empty());
-        app.session
-            .as_ref()
-            .unwrap()
-            .flush(Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(
-            store.load_card(card, Some(&proof)).unwrap().unwrap().kind,
-            CardKind::Terminal(source)
-        );
         app.session.as_mut().unwrap().shutdown();
     }
 }
