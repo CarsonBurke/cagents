@@ -579,7 +579,7 @@ impl Cagents {
         };
         crate::ui_controls::owned(
             intent.clone(),
-            widget::row::with_children(vec![
+            widget::flex_row(vec![
                 crate::ui_controls::button::secondary("Copy details")
                     .id(card_control_id(card, "failure.copy"))
                     .on_press(Message::TerminalFailure(Action::Copy(intent)))
@@ -590,8 +590,7 @@ impl Cagents {
                         .map(|intent| Message::TerminalFailure(Action::Reveal(intent))),
                 ),
             ])
-            .spacing(space::S)
-            .wrap(),
+            .spacing(space::S as u16),
         )
     }
     pub(super) fn terminal_transcript_control(
@@ -970,7 +969,11 @@ mod tests {
         use iced::advanced::clipboard;
         use iced::runtime::user_interface::{Cache, UserInterface};
 
-        fn bounds(tree: &iced_accessibility::A11yTree, name: &str) -> iced::Rectangle {
+        fn bounds(
+            tree: &iced_accessibility::A11yTree,
+            name: &str,
+            size: iced::Size,
+        ) -> iced::Rectangle {
             let nodes: Vec<_> = tree
                 .root()
                 .iter()
@@ -979,11 +982,21 @@ mod tests {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label() == Some(name)
                         && !node.node().is_hidden()
+                        && !node.node().is_disabled()
                 })
                 .filter_map(|node| node.node().bounds())
                 .collect();
             assert_eq!(nodes.len(), 1, "one actual diagnostic button: {name}");
             let rect = nodes[0];
+            assert!(
+                rect.x0 >= 0.0
+                    && rect.y0 >= 0.0
+                    && rect.x1 > rect.x0
+                    && rect.y1 > rect.y0
+                    && rect.x1 <= f64::from(size.width)
+                    && rect.y1 <= f64::from(size.height),
+                "diagnostic button must remain inside the viewport: {name}"
+            );
             iced::Rectangle {
                 x: rect.x0 as f32,
                 y: rect.y0 as f32,
@@ -992,12 +1005,12 @@ mod tests {
             }
         }
 
-        for copy in [false, true] {
+        for (copy, width) in [(false, 320.0), (false, 600.0), (true, 320.0), (true, 600.0)] {
             for scenario in 0..6 {
                 let (mut app, card, _) = app_and_session();
                 ready_diagnostic_probe(&mut app, card);
                 let mut renderer = super::super::tests::headless_renderer();
-                let size = iced::Size::new(600.0, 100.0);
+                let size = iced::Size::new(width, 100.0);
                 let name = if copy {
                     "Copy details"
                 } else {
@@ -1010,7 +1023,7 @@ mod tests {
                     &mut renderer,
                 );
                 let pointer =
-                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name).center();
+                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name, size).center();
                 let mut messages = Vec::new();
                 ui.update(
                     &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
@@ -1031,7 +1044,7 @@ mod tests {
                     &mut renderer,
                 );
                 let pointer =
-                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name).center();
+                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name, size).center();
                 ui.update(
                     &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
