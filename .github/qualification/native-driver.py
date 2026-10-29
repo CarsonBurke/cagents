@@ -425,7 +425,19 @@ try:
             executable = Path('/proc') / str(pid) / 'exe'
             assert executable.resolve() == (target / 'dev-runtime/cagents-ui').resolve()
             ui_hash = digest(executable)
+            (out / (label + '-launch.json')).write_text(json.dumps({
+                'arm': label, 'revision': revision, 'window_id': window, 'pid': pid,
+                'executable': str(executable.resolve()), 'ui_sha256': ui_hash,
+                'backend_requested': env['ICED_BACKEND'], 'fixture_source_sha256': digest(source),
+                'helper_sha256': digest(helper), 'scope': 'Owned native window binding before application input',
+            }, indent=2) + '\n')
             run(['xdotool', 'windowactivate', '--sync', window])
+            wait(lambda: 'full-model-delivered' in receipt.read_text())
+            wait(lambda: any(node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                             and node.name.startswith('Open channel Saved recovery model received, ')
+                             and visible(node)
+                             for node in live_tree(pid)))
+            capture(window, label + '-launch-wide', (1280, 800))
             run(['xdotool', 'key', 'ctrl+shift+i'])
             time.sleep(.4)
             hidden_field = None

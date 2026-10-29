@@ -409,6 +409,9 @@ fn client(
                 error("Request outside this synthetic native fixture")
             }
         };
+        let full_model_delivered = matches!(&response, ServerMessage::Response {
+            response: ServerResponse::WorkspaceModel { .. },
+        });
         if terminal_ipc::write_frame(
             &mut *writer.lock().unwrap(),
             &ServerEnvelope {
@@ -422,6 +425,7 @@ fn client(
         {
             break;
         }
+        if full_model_delivered { record(&root, "full-model-delivered"); }
         if let Some(chat_id) = visible_chat {
             if terminal_ipc::write_frame(&mut *writer.lock().unwrap(), &ServerEnvelope {
                 version: terminal_ipc::PROTOCOL_VERSION, request_id: None,
@@ -816,7 +820,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             channels: vec![ModelChannel {
                 id: channel,
                 repository,
-                title: "Saved recovery fixture".into(),
+                title: "Saved recovery model received".into(),
                 title_source: held_channel_title_source,
                 ordinal: 1,
             }],
