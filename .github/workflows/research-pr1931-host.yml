@@ -1,0 +1,210 @@
+name: Research PR 1931 exact HOST qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/research-pr1931-host.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-pr1931-host-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.93.0
+  EXPECTED_PRODUCT_SHA: 6a287ca24f2c701fc4daea6265cf9cb98d559c71
+  EXPECTED_PRODUCT_TREE: 92970c09b529c07db918c77ee388f4799cc30ba9
+
+jobs:
+  host:
+    if: >-
+      github.event.pull_request.head.ref == 'research/fw16-pr1931-host-qualification' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Require a natural User execution context
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          present = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+          if present:
+              print('Natural User qualification refused: ' + ', '.join(present), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Check out the research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out the pinned Linux setup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: c727f886628897c1749290213e9d65037253095a
+          path: setup-main
+          persist-credentials: false
+
+      - name: Check out the literal product
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 6a287ca24f2c701fc4daea6265cf9cb98d559c71
+          path: product
+          persist-credentials: false
+
+      - name: Verify source and prepare isolated fixture paths
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          test "$(git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD)" = "$EXPECTED_CONTROL_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE/setup-main" rev-parse HEAD)" = c727f886628897c1749290213e9d65037253095a
+          test "$(git -C "$GITHUB_WORKSPACE/setup-main" rev-parse 'HEAD^{tree}')" = 6d4f36e2b4dd48fc9744305d34c78469384edcc5
+          test -z "$(git -C "$GITHUB_WORKSPACE/setup-main" status --porcelain --untracked-files=all)"
+          test "$(sha256sum "$GITHUB_WORKSPACE/setup-main/.github/actions/setup-linux-build/action.yml" | cut -d ' ' -f 1)" = 82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052
+          install -d -m 700 "$RUNNER_TEMP/pr1931-logs"
+          fixture_root=$(mktemp -d /tmp/c1931XXXXXX)
+          install -d -m 700 "$fixture_root/runtime" "$fixture_root/data" "$fixture_root/config" "$fixture_root/cache" "$fixture_root/state"
+          printf '%s\n' "TMPDIR=$fixture_root" "XDG_RUNTIME_DIR=$fixture_root/runtime" \
+            "XDG_DATA_HOME=$fixture_root/data" "XDG_CONFIG_HOME=$fixture_root/config" \
+            "XDG_CACHE_HOME=$fixture_root/cache" "XDG_STATE_HOME=$fixture_root/state" \
+            "CARGO_TARGET_DIR=$RUNNER_TEMP/pr1931-host-target" >> "$GITHUB_ENV"
+          {
+            git rev-parse HEAD 'HEAD^{tree}'
+            git -C "$GITHUB_WORKSPACE/research" rev-parse HEAD 'HEAD^{tree}'
+            sha256sum Cargo.toml Cargo.lock src/lib.rs src/modules.rs .cargo/config.toml scripts/build-ceditor-product src/host/mod.rs src/host/chat.rs src/host/chat/capacity.rs src/host/chat/native_recovery.rs src/host/chat/retained_actor.rs src/host/chat/retained_actor_tests.rs src/host/chat/retained_admission_tests.rs src/chat/runtime/retained_actor/transport.rs
+            sha256sum "$GITHUB_WORKSPACE/research/.github/workflows/research-pr1931-host.yml"
+          } > "$RUNNER_TEMP/pr1931-logs/source-before.txt"
+
+      - name: Install the pinned main Linux Rust and Zig setup
+        uses: ./setup-main/.github/actions/setup-linux-build
+
+      - name: Retain build tool versions
+        run: |
+          set -euo pipefail
+          rustup component add --toolchain 1.93.0 rustfmt
+          {
+            rustc -vV
+            cargo --version
+            rustfmt --version
+            zig version
+            git --version
+          } > "$RUNNER_TEMP/pr1931-logs/tools.txt"
+
+      - name: Check literal product formatting and the isolated HOST
+        run: |
+          set -euo pipefail
+          scripts/check-format > "$RUNNER_TEMP/pr1931-logs/format.txt" 2>&1
+          set +e
+          cargo check --locked --no-default-features --features host --bin cagentsd > "$RUNNER_TEMP/pr1931-logs/host-check.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1931-logs/host-check.exit"
+          exit "$task_status"
+
+      - name: Build and bind the literal matched retained-actor helper
+        run: |
+          set -euo pipefail
+          set +e
+          cargo build --locked --no-default-features --features host --bin cagentsd > "$RUNNER_TEMP/pr1931-logs/helper-build.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1931-logs/helper-build.exit"
+          test "$task_status" -eq 0 || exit "$task_status"
+          test -x "$CARGO_TARGET_DIR/debug/cagentsd"
+          sha256sum "$CARGO_TARGET_DIR/debug/cagentsd" > "$RUNNER_TEMP/pr1931-logs/helper.sha256"
+          printf '%s\n' "CAGENTS_TEST_RETAINED_ACTOR_HELPER=$CARGO_TARGET_DIR/debug/cagentsd" >> "$GITHUB_ENV"
+
+      - name: Run every owning HOST target
+        run: |
+          set -euo pipefail
+          test "$CAGENTS_TEST_RETAINED_ACTOR_HELPER" = "$CARGO_TARGET_DIR/debug/cagentsd"
+          sha256sum --check "$RUNNER_TEMP/pr1931-logs/helper.sha256"
+          set +e
+          cargo test --locked --no-default-features --features host --all-targets -- --test-threads=2 > "$RUNNER_TEMP/pr1931-logs/host-all-targets.txt" 2>&1
+          task_status=$?
+          set -e
+          printf '%s\n' "$task_status" > "$RUNNER_TEMP/pr1931-logs/host-all-targets.exit"
+          tail -n 80 "$RUNNER_TEMP/pr1931-logs/host-all-targets.txt"
+          exit "$task_status"
+
+      - name: Require the exact startup-custody parents and unchanged source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr1931-logs/host-all-targets.txt').read_text()
+          names = [
+              "host::chat::retained_actor_tests::pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown",
+              "host::chat::retained_admission_tests::installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry",
+              "host::chat::capacity::tests::rejected_start_precedes_account_setup_and_provider_history_reads",
+              "host::chat::capacity::tests::last_slot_is_reserved_atomically_until_its_owner_finishes",
+              "host::chat::capacity::tests::failed_start_and_stale_guard_do_not_leak_or_remove_successor_reservations",
+              "host::chat::capacity::tests::pending_same_conversation_is_rejected_before_another_slot_is_consumed",
+              "host::chat::capacity::tests::pending_recovery_rejects_close_without_stopping_retained_actor",
+              "host::chat::capacity::tests::close_fences_replacement_before_retirement_and_after_resident_removal",
+              "host::chat::capacity::tests::recovery_reservation_counts_existing_resident_once_above_lowered_limit",
+              "host::chat::capacity::tests::failed_exact_recovery_keeps_the_previous_resident_actor_at_capacity",
+              "host::chat::capacity::tests::release_dry_run_and_exact_nonce_preserve_history_and_successor",
+              "host::chat::capacity::tests::release_refuses_attached_transition_and_missing_provider_history",
+              "host::chat::capacity::tests::exact_recovery_has_one_reservation_and_rejects_the_second_before_setup",
+              "host::chat::capacity::tests::live_read_only_paging_worker_can_be_released_without_provider_execution",
+              "host::chat::capacity::tests::live_writers_are_protected_and_completed_writers_require_full_coverage",
+              "host::chat::capacity::tests::completed_writer_release_checks_saved_bytes_and_stale_generation",
+              "host::chat::capacity::tests::truncated_or_changed_provider_history_cannot_release_the_only_cached_body",
+              "host::chat::capacity::tests::pending_launches_and_retained_managed_authorities_block_resident_release",
+              "host::chat::capacity::tests::account_operation_refuses_inspection_before_opening_provider_history",
+              "host::chat::capacity::tests::history_release_reservation_prevents_a_new_attached_view",
+              "host::chat::capacity::tests::unavailable_managed_registry_preserves_reader_until_verified_empty_registry_returns",
+              "host::chat::capacity::tests::pending_inventory_proves_the_daemon_without_replacing_its_reservation",
+              "host::chat::capacity::tests::proofless_client_restore_of_a_pending_start_reports_transition_not_identity_mismatch",
+              "host::chat::capacity::tests::released_history_reopens_through_real_client_restore_even_when_directory_returns",
+              "host::chat::capacity::tests::missing_saved_history_refuses_unknown_ownership_and_native_writer_descriptors",
+              "host::chat::capacity::tests::old_epoch_history_recovery_uses_real_handshake_without_launching_65_providers",
+              "host::chat::capacity::tests::history_preview_preserves_an_attached_view_and_unrelated_live_consent"
+          ]
+          for name in names:
+              assert len(re.findall(r'^test ' + re.escape(name) + r' \.\.\. ok$', log, re.M)) == 1, name
+          print('All 27 capacity/retained-startup parents passed once within the full HOST all-target invocation.')
+          PY
+          sha256sum --check "$RUNNER_TEMP/pr1931-logs/helper.sha256"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/pr1931-logs/source-after.txt"
+
+      - name: Retain final literal source state
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            git rev-parse HEAD 'HEAD^{tree}'
+            git status --porcelain --untracked-files=all
+          } > "$RUNNER_TEMP/pr1931-logs/source-after-always.txt"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_PRODUCT_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Retain original qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr1931-exact-host-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/pr1931-logs/
+          if-no-files-found: error
+          retention-days: 14
