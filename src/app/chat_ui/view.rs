@@ -7593,22 +7593,34 @@ mod tests {
                     } else {
                         "Deny"
                     };
-                    let explicit_choice = request
+                    let explicit_result = if *method == "item/permissions/requestApproval" {
+                        explicit.clone()
+                    } else {
+                        json!({"decision":explicit})
+                    };
+                    let explicit_reply = json!({"id":71,"result":explicit_result});
+                    // Description is display text, including serialized JSON
+                    // whose key order can differ between feature graphs. The
+                    // original wire result uniquely identifies this deliberate
+                    // action without deriving authority from its presentation.
+                    let mut explicit_choices = request
                         .actions
                         .iter()
-                        .find(|choice| choice.description == explicit.to_string())
-                        .unwrap();
+                        .filter(|choice| replies.get(choice.id.as_str()) == Some(&explicit_reply));
+                    let explicit_choice = explicit_choices
+                        .next()
+                        .expect("the exact explicit wire reply must have an offered control");
+                    assert!(
+                        explicit_choices.next().is_none(),
+                        "the exact explicit wire reply must identify one control"
+                    );
                     let (focus, key, expected) = match focused {
                         "card" => ("card", keyboard::key::Named::Escape, refusal.clone()),
                         "refusal" => (refusal_label, keyboard::key::Named::Escape, refusal.clone()),
                         _ => (
                             explicit_choice.label.as_str(),
                             keyboard::key::Named::Enter,
-                            if *method == "item/permissions/requestApproval" {
-                                explicit.clone()
-                            } else {
-                                json!({"decision":explicit})
-                            },
+                            explicit_result.clone(),
                         ),
                     };
                     let (messages, labels) =
