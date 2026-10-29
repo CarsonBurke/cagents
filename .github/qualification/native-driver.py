@@ -171,9 +171,18 @@ def capture(window, name, size, *, neutral_pointer=False):
     if neutral_pointer:
         # Match comparison frames without hovering unrelated navigation. This
         # moves only the pointer; keyboard focus and all gestures stay intact.
-        point = (size[0] - 1, size[1] - 1)
+        # An outer-border leave can retain the previous client hover. The
+        # fixture has no provider chips in the middle of its 24px status strip.
+        point = (size[0] // 2, size[1] - 13)
+        focus = subprocess.check_output(['xdotool', 'getwindowfocus'], text=True).strip()
+        assert int(subprocess.check_output(['xdotool', 'getwindowpid', focus], text=True)) == pid
         run(['xdotool', 'mousemove', '--sync', *map(str, point)])
-        event({'event': 'comparison-pointer-parked', 'capture': name, 'point': list(point)})
+        location = dict(line.split('=', 1) for line in subprocess.check_output(
+            ['xdotool', 'getmouselocation', '--shell'], text=True).splitlines())
+        assert (int(location['X']), int(location['Y'])) == point
+        assert subprocess.check_output(['xdotool', 'getwindowfocus'], text=True).strip() == focus
+        event({'event': 'comparison-pointer-parked', 'capture': name, 'point': list(point),
+               'actual_pointer': location, 'unchanged_input_focus': focus, 'focus_pid': pid})
     time.sleep(.6)
     png = out / (name + '.png')
     def rendered_frame():
@@ -191,8 +200,27 @@ def capture(window, name, size, *, neutral_pointer=False):
                        'wgpu_backend_requested': native_renderer['WGPU_BACKEND'],
                        'software_gl_requested': native_renderer['LIBGL_ALWAYS_SOFTWARE'],
                        'capture': 'visible screen pixels for owned window'}
+            tooltip_free = True
+            if name in ('before-terminal-closed-empty-wide', 'after-terminal-closed-empty-wide'):
+                # Both regions are empty backgrounds in this fixed fixture.
+                # The previously observed Work/Search tips occupy these pixels
+                # and lack an accessibility tooltip node. Observe full frames;
+                # never alter pixels or retry an input gesture to hide them.
+                assert size == (1280, 800)
+                metrics['comparison_tooltip_regions'] = []
+                for label, box, reference in [
+                    ('work', (1016, 94, 1264, 105), (1260, 132)),
+                    ('search', (164, 94, 212, 105), (240, 100)),
+                ]:
+                    color = rgb.getpixel(reference)
+                    delta = max(max(abs(a - b) for a, b in zip(pixel, color))
+                                for pixel in rgb.crop(box).getdata())
+                    metrics['comparison_tooltip_regions'].append({
+                        'label': label, 'box': list(box), 'reference': list(reference),
+                        'maximum_background_delta': delta, 'tolerance': 8})
+                    tooltip_free &= delta <= 8
             (out / (name + '-frame.json')).write_text(json.dumps(metrics, indent=2) + '\n')
-            return diverse and lit > .01 and metrics['luminance_range'] >= 16
+            return diverse and lit > .01 and metrics['luminance_range'] >= 16 and tooltip_free
     wait(rendered_frame, timeout=20)
     if name.endswith('-wide'):
         run(['import', '-window', window, str(out / (name + '-drawable.png'))])
