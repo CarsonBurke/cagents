@@ -582,7 +582,15 @@ impl LocalHandle {
                             kind: crate::notifications::Kind::Interrupted,
                         }
                     });
-                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
+                    let native_diagnostic = actor
+                        .native_holder
+                        .as_mut()
+                        .and_then(|holder| holder.exit_diagnostic().ok())
+                        .and_then(|diagnostic| diagnostic.failure_summary());
+                    let failure_message = native_diagnostic.as_ref().map_or_else(
+                        || error.clone(),
+                        |diagnostic| format!("{error}\n{diagnostic}"),
+                    );
                     let stderr =
                         String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
                     let message = if stderr.is_empty() {
@@ -590,15 +598,14 @@ impl LocalHandle {
                     } else {
                         format!("{error}\nProvider stderr (last 16 KiB): {stderr}")
                     };
-                    let message = actor
-                        .native_holder
-                        .as_mut()
-                        .and_then(|holder| holder.exit_diagnostic().ok())
-                        .and_then(|diagnostic| diagnostic.failure_summary())
-                        .map_or_else(
-                            || message.clone(),
-                            |diagnostic| format!("{message}\n{diagnostic}"),
-                        );
+                    let message = native_diagnostic.map_or_else(
+                        || message.clone(),
+                        |diagnostic| format!("{message}\n{diagnostic}"),
+                    );
+                    // Restore polls this lightweight handoff before installing
+                    // a snapshot. Publish only the complete native diagnosis;
+                    // direct-stdio failures retain their existing raw error.
+                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(failure_message);
                     actor.apply(Event::Error {
                         message,
                         fatal: true,
