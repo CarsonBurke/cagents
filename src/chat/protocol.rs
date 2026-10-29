@@ -101,6 +101,9 @@ pub(crate) trait LaunchCleanup: Send + Sync {
     fn retained_handle(&self) -> Option<super::runtime::Handle> {
         None
     }
+    fn cleanup_diagnostic(&self) -> Option<String> {
+        None
+    }
     #[cfg(test)]
     fn cleanup_waiters_for_test(&self) -> usize {
         0
@@ -136,6 +139,7 @@ pub(crate) struct LaunchOwnershipSnapshot {
     pub ordinary_requested: bool,
     pub original_helper: HelperWaitProof,
     pub remote: Option<super::runtime::Handle>,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Default)]
@@ -326,12 +330,11 @@ impl ExecutionContext {
                 state.original_helper.clone(),
             )
         };
-        let original_helper = original_helper
-            .as_ref()
-            .or(owner.as_ref())
-            .map_or(HelperWaitProof::NoParentChild, |owner| {
-                owner.original_helper_wait_proof()
-            });
+        let progress_owner = original_helper.as_ref().or(owner.as_ref());
+        let original_helper = progress_owner.map_or(HelperWaitProof::NoParentChild, |owner| {
+            owner.original_helper_wait_proof()
+        });
+        let diagnostic = progress_owner.and_then(|owner| owner.cleanup_diagnostic());
         LaunchOwnershipSnapshot {
             token,
             kind,
@@ -339,6 +342,7 @@ impl ExecutionContext {
             ordinary_requested,
             original_helper,
             remote: owner.and_then(|owner| owner.retained_handle()),
+            diagnostic,
         }
     }
     pub(crate) fn request_ordinary_cleanup(&self) -> LaunchOwnershipSnapshot {

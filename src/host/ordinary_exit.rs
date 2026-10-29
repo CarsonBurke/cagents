@@ -36,13 +36,20 @@ impl Coordinator {
         host: &SharedHost,
         stop_producers: impl FnOnce() + Send + 'static,
     ) -> Result<Option<Self>, std::io::Error> {
-        let contexts = {
+        let (contexts, startups) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.has_committed_upgrade() {
                 return Ok(None);
             }
             state.begin_ordinary_exit_cleanup();
-            contexts(&state)
+            (
+                contexts(&state),
+                state
+                    .native_actor_startups
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         };
         request_all(&contexts);
         let progress = Arc::new(Mutex::new(Progress::default()));
@@ -53,7 +60,7 @@ impl Coordinator {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     stop_producers();
-                    run(&worker_host, &worker_progress);
+                    run(&worker_host, &worker_progress, &startups);
                 }));
                 if result.is_err() {
                     worker_progress
@@ -129,9 +136,27 @@ struct ActorWork {
     identity: ActorIdentity,
     capture: chat::retained_actor::startup_shutdown::Capture,
     origin: Option<Handle>,
+    bindings: Vec<(
+        Arc<ExecutionContext>,
+        crate::chat::protocol::LaunchOwnershipSnapshot,
+    )>,
     semantic_done: bool,
     attempted: bool,
     worker: Option<(mpsc::Receiver<Result<(), String>>, JoinHandle<()>)>,
+}
+
+fn bindings(
+    contexts: &[Arc<ExecutionContext>],
+    identity: &ActorIdentity,
+) -> Vec<(
+    Arc<ExecutionContext>,
+    crate::chat::protocol::LaunchOwnershipSnapshot,
+)> {
+    contexts.iter().filter_map(|context| {
+        let snapshot = context.ownership_snapshot();
+        matches!(&snapshot.kind, LaunchOwnerKind::RemoteActor { identity: current } if current == identity)
+            .then(|| (context.clone(), snapshot))
+    }).collect()
 }
 
 struct LocalWork {
@@ -176,7 +201,11 @@ fn collect_job(
     )
 }
 
-fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
+fn run(
+    host: &SharedHost,
+    progress: &Arc<Mutex<Progress>>,
+    startups: &[chat::retained_actor::Startup],
+) {
     let gate = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -233,9 +262,10 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
                                 &record.handle,
                             ) {
                                 Ok(capture) => actors.push(ActorWork {
-                                    identity,
+                                    identity: identity.clone(),
                                     capture,
                                     origin: Some(record.handle.clone()),
+                                    bindings: bindings(&pending, &identity),
                                     semantic_done: false,
                                     attempted: false,
                                     worker: None,
@@ -256,7 +286,18 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
                         });
                     }
                 }
-                for startup in state.native_actor_startups.values() {
+                for startup in startups {
+                    if state
+                        .native_actor_startups
+                        .get(&startup.source.id)
+                        .is_none_or(|current| !current.matches(startup))
+                    {
+                        diagnostic = Some(
+                            "An original startup descriptor/context was replaced; custody retained"
+                                .into(),
+                        );
+                        continue;
+                    }
                     let snapshot = startup.context.ownership_snapshot();
                     if let LaunchOwnerKind::RemoteActor { identity } = &snapshot.kind {
                         if !actors.iter().any(|work| &work.identity == identity) {
@@ -267,6 +308,28 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
                                     identity: identity.clone(),
                                     capture,
                                     origin: snapshot.remote,
+                                    bindings: bindings(&pending, identity),
+                                    semantic_done: false,
+                                    attempted: false,
+                                    worker: None,
+                                }),
+                                Err(error) => diagnostic = Some(error),
+                            }
+                        }
+                    }
+                }
+                for (agent, (intent, context)) in &state.execution_startups {
+                    let snapshot = context.ownership_snapshot();
+                    if let LaunchOwnerKind::RemoteActor { identity } = &snapshot.kind {
+                        if !actors.iter().any(|work| &work.identity == identity) {
+                            match chat::retained_actor::startup_shutdown::capture_execution(
+                                &state, *agent, intent, context,
+                            ) {
+                                Ok(capture) => actors.push(ActorWork {
+                                    identity: identity.clone(),
+                                    capture,
+                                    origin: snapshot.remote,
+                                    bindings: bindings(&pending, identity),
                                     semantic_done: false,
                                     attempted: false,
                                     worker: None,
@@ -383,12 +446,16 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
             let snapshot = context.ownership_snapshot();
             match &snapshot.kind {
                 LaunchOwnerKind::RemoteActor { identity } => {
-                    if actors
+                    for work in actors
                         .iter()
-                        .any(|work| &work.identity == identity && work.semantic_done)
+                        .filter(|work| &work.identity == identity && work.semantic_done)
                     {
-                        if let Some(token) = snapshot.token {
-                            context.complete_semantic_cleanup(token, identity);
+                        for (original, captured) in &work.bindings {
+                            if Arc::ptr_eq(original, context) && captured.kind == snapshot.kind {
+                                if let Some(token) = captured.token {
+                                    context.complete_semantic_cleanup(token, identity);
+                                }
+                            }
                         }
                     }
                 }
@@ -406,6 +473,9 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
                 .native_actor_startups
                 .iter()
                 .filter_map(|(id, startup)| {
+                    if !startups.iter().any(|original| startup.matches(original)) {
+                        return None;
+                    }
                     let snapshot = startup.context.ownership_snapshot();
                     let proved = matches!(
                         snapshot.outcome,
@@ -443,8 +513,27 @@ fn run(host: &SharedHost, progress: &Arc<Mutex<Progress>>) {
                         origin.original_helper_wait_proof() != HelperWaitProof::Pending
                     })
             });
+            // Failed capture is retained custody, not an empty work list.
+            // Every current attachment must have its own completed exact job.
+            let inventory_done = state.chats.values().all(|record| {
+                if let Some(identity) = record.handle.actor_identity() {
+                    actors.iter().any(|work| {
+                        work.identity == identity
+                            && work.semantic_done
+                            && work
+                                .origin
+                                .as_ref()
+                                .is_some_and(|origin| origin.same_attachment(&record.handle))
+                    })
+                } else {
+                    locals
+                        .iter()
+                        .any(|work| work.done && work.handle.same_attachment(&record.handle))
+                }
+            });
             if terminals_done
                 && actors_done
+                && inventory_done
                 && locals.iter().all(|work| work.done && work.worker.is_none())
                 && state.native_actor_startups.is_empty()
                 && state.execution_startups.is_empty()

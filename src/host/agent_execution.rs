@@ -20,6 +20,8 @@ use std::{
 mod account_info;
 mod directory;
 pub(super) use directory::{live_sessions, named};
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod dispatch_fixture;
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod terminals;
@@ -376,6 +378,8 @@ fn dispatch(
             .clone();
         session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
         session.proof = Some(proof);
+        #[cfg(all(test, target_os = "linux"))]
+        dispatch_fixture::prepare(accepted.agent.id, &mut session, &context);
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -856,6 +860,12 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                                 "The startup cleanup owner does not match the retained launch"
                                     .into(),
                             );
+                        }
+                        if matches!(
+                            context.ownership_snapshot().kind,
+                            chat::protocol::LaunchOwnerKind::RemoteActor { .. }
+                        ) {
+                            super::chat::retained_actor::startup_shutdown::cleanup_execution_startup(host, id, session, &context)?;
                         }
                         match context.reconcile_cleanup()? {
                             chat::protocol::LaunchOutcome::NoProvider

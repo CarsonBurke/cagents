@@ -245,6 +245,9 @@ struct StartupOwner {
     cancelled: AtomicBool,
     progress: Mutex<StartupProgress>,
     finished: std::sync::Condvar,
+    // An unexpected watcher-admission loss must never drop the original Child
+    // and leave only a PID. This retained custody cannot publish wait proof.
+    unwatched_child: Mutex<Option<std::process::Child>>,
     #[cfg(test)]
     cleanup_waiters: std::sync::atomic::AtomicUsize,
 }
@@ -275,6 +278,8 @@ impl StartupOwner {
         // Release this short mutex before spawn. A concurrent cancellation
         // must see uncertainty even before the Child has been returned.
         progress.outcome = chat::protocol::LaunchOutcome::Uncertain;
+        drop(progress);
+        crate::daemon::wake();
         Ok(())
     }
     fn publish_outcome(&self, outcome: chat::protocol::LaunchOutcome) {
@@ -309,6 +314,23 @@ impl StartupOwner {
         self.finished.notify_all();
         crate::daemon::wake();
         waited
+    }
+    fn publish_child(
+        &self,
+        publish: &std::sync::mpsc::SyncSender<std::process::Child>,
+        child: std::process::Child,
+    ) -> Result<(), String> {
+        if let Err(error) = publish.send(child) {
+            *self
+                .unwatched_child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(error.0);
+            self.cancelled.store(true, Ordering::Release);
+            self.cancel_control();
+            crate::daemon::wake();
+            return Err("Retained actor startup lost its exact child reaper; original child custody is retained".into());
+        }
+        Ok(())
     }
 }
 struct StartupAttempt {
@@ -389,6 +411,13 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
                 chat::protocol::HelperWaitProof::TeardownProved
             }
         }
+    }
+    fn cleanup_diagnostic(&self) -> Option<String> {
+        self.unwatched_child
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|_| "Retained actor startup lost its exact child reaper; original child custody is retained".into())
     }
     #[cfg(test)]
     fn cleanup_waiters_for_test(&self) -> usize {
@@ -948,6 +977,7 @@ impl RemoteActor {
                 ordinary_deferred: false,
             }),
             finished: std::sync::Condvar::new(),
+            unwatched_child: Mutex::new(None),
             #[cfg(test)]
             cleanup_waiters: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -989,9 +1019,7 @@ impl RemoteActor {
                 startup_observation::capture(&child),
             ));
         }
-        publish
-            .send(child)
-            .map_err(|_| "Retained actor startup lost its exact child reaper")?;
+        owner.publish_child(&publish, child)?;
         drop(remote);
         // Keep this channel through installation. EOF before commit asks the
         // helper to clean its still-private actor and every descendant.

@@ -98,7 +98,7 @@ impl Fixture {
 }
 
 #[test]
-fn captured_startup_refuses_changed_descriptors_context_owner_and_failed_target() {
+fn captured_startup_refuses_changed_descriptors_context_and_failed_target() {
     let fixture = Fixture::new();
     let capture = fixture.capture();
     assert!(capture.matches_startup(&fixture.pending));
@@ -140,13 +140,67 @@ fn captured_startup_refuses_changed_descriptors_context_owner_and_failed_target(
             .native_actor_startups
             .insert(fixture.pending.source.id, fixture.pending.clone());
     }
-    // Reusing the same Arc cannot reuse a captured owner generation.
-    fixture
+    // A late startup claim cannot downgrade permanent semantic ownership or
+    // replace the exact generation captured by ordinary shutdown.
+    let before = fixture.pending.context.ownership_snapshot();
+    let token = fixture
         .pending
         .context
         .claim_startup_owner(Arc::new(Pending));
-    assert!(!capture.matches_startup(&fixture.pending));
+    assert_eq!(Some(token), before.token);
+    assert_eq!(
+        fixture.pending.context.ownership_snapshot().kind,
+        before.kind
+    );
+    assert!(capture.matches_startup(&fixture.pending));
+    assert!(capture.require_host(&fixture.host).is_ok());
+}
+
+#[test]
+fn execution_capture_without_native_row_refuses_replaced_intent_and_context() {
+    let fixture = Fixture::new();
+    let agent = crate::model::AgentId::new();
+    let intent = crate::agent_execution::HostedSession::Chat(fixture.pending.source.clone());
+    {
+        let mut state = fixture.host.lock().unwrap();
+        state.native_actor_startups.clear();
+        state
+            .execution_startups
+            .insert(agent, (intent.clone(), fixture.pending.context.clone()));
+    }
+    let capture = capture_execution(
+        &fixture.host.lock().unwrap(),
+        agent,
+        &intent,
+        &fixture.pending.context,
+    )
+    .unwrap();
+    assert!(capture.require_host(&fixture.host).is_ok());
+    let mut successor = fixture.pending.source.clone();
+    successor.launch.recipe.arguments.push("successor".into());
+    fixture.host.lock().unwrap().execution_startups.insert(
+        agent,
+        (
+            crate::agent_execution::HostedSession::Chat(successor),
+            fixture.pending.context.clone(),
+        ),
+    );
     assert!(capture.require_host(&fixture.host).is_err());
+    fixture.host.lock().unwrap().execution_startups.insert(
+        agent,
+        (
+            intent.clone(),
+            Arc::new(chat::protocol::ExecutionContext::default()),
+        ),
+    );
+    assert!(capture.require_host(&fixture.host).is_err());
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .execution_startups
+        .insert(agent, (intent, fixture.pending.context.clone()));
+    assert!(capture.require_host(&fixture.host).is_ok());
 }
 
 #[test]
@@ -180,6 +234,33 @@ fn captured_attachment_refuses_same_actor_replacement_and_keeps_public_close_fen
             .require_current_with_shutdown(&fixture.host, Some(&capture))
             .is_err()
     );
+}
+
+#[test]
+fn failed_target_capture_refuses_another_attachment_of_the_same_actor() {
+    let mut fixture = Fixture::new();
+    let original = fixture.record(fixture.attachment.clone());
+    fixture.pending.failed_close = Some(super::super::super::CloseTarget::from_record(&original));
+    {
+        let mut state = fixture.host.lock().unwrap();
+        state.chats.insert(fixture.pending.source.id, original);
+        state
+            .native_actor_startups
+            .insert(fixture.pending.source.id, fixture.pending.clone());
+    }
+    let capture = fixture.capture();
+    let mut successor = fixture.pending.clone();
+    successor.failed_close = Some(super::super::super::CloseTarget::from_record(
+        &fixture.record(fixture.successor.clone()),
+    ));
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .native_actor_startups
+        .insert(successor.source.id, successor.clone());
+    assert!(!capture.matches_startup(&successor));
+    assert!(capture.require_host(&fixture.host).is_err());
 }
 
 #[test]
@@ -348,6 +429,21 @@ fn ordinary_semantic_persistence_failure_retries_in_the_same_host() {
     let original =
         Handle::start_remote_owned(spec, source.clone(), prepared, environment, |_| {}).unwrap();
     let identity = original.actor_identity().unwrap();
+    struct Cleanup(crate::daemon::holder_registry::Record);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            // Failed fixture teardown only. Process existence is never used
+            // as a semantic or original-Child.wait cleanup receipt.
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(identity.record.clone());
     wait(
         || original.attachment_snapshot().ready,
         "actual helper did not initialize its provider",

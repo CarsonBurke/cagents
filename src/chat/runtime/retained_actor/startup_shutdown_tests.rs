@@ -11,6 +11,7 @@ fn owner() -> Arc<StartupOwner> {
             ordinary_deferred: false,
         }),
         finished: std::sync::Condvar::new(),
+        unwatched_child: Mutex::new(None),
         cleanup_waiters: std::sync::atomic::AtomicUsize::new(0),
     })
 }
@@ -293,6 +294,52 @@ fn an_actual_status_one_never_proves_startup_teardown() {
     owner.request_ordinary_cleanup();
     assert_eq!(owner.poll_cleanup(), LaunchOutcome::Uncertain);
     assert_eq!(owner.original_helper_wait_proof(), HelperWaitProof::Pending);
+}
+
+#[test]
+fn failed_watcher_admission_retains_the_original_child_and_uncertain_owner() {
+    let context = ExecutionContext::default();
+    let owner = owner();
+    let retained = Arc::downgrade(&owner);
+    context.claim_startup_owner(owner.clone());
+    let (publish, incoming) = std::sync::mpsc::sync_channel(1);
+    drop(incoming);
+    let child = owner
+        .spawn_child(&mut ChildCommand::new("/bin/true"))
+        .unwrap();
+    let child_id = child.id();
+    assert!(
+        owner
+            .publish_child(&publish, child)
+            .unwrap_err()
+            .contains("custody is retained")
+    );
+    drop(owner);
+    let captured = context.request_ordinary_cleanup();
+    assert_eq!(
+        context.poll_cleanup(&captured).outcome,
+        LaunchOutcome::Uncertain
+    );
+    assert_eq!(captured.original_helper, HelperWaitProof::Pending);
+    assert!(
+        captured
+            .diagnostic
+            .as_ref()
+            .unwrap()
+            .contains("custody is retained")
+    );
+    let retained = retained
+        .upgrade()
+        .expect("context must retain exact child owner");
+    let mut child = retained.unwatched_child.lock().unwrap().take().unwrap();
+    assert_eq!(child.id(), child_id);
+    // Sole test cleanup consumes the retained Child itself. No replacement
+    // waiter or synthetic production status is installed on the owner.
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        context.poll_cleanup(&captured).outcome,
+        LaunchOutcome::Uncertain
+    );
 }
 
 #[test]

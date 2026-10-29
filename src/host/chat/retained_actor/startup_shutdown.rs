@@ -61,6 +61,10 @@ impl StartupBinding {
         {
             return false;
         }
+        self.owner_is_current()
+    }
+
+    fn owner_is_current(&self) -> bool {
         let snapshot = self.context.ownership_snapshot();
         snapshot.token == Some(self.token)
             && snapshot.kind
@@ -96,6 +100,78 @@ impl StartupBinding {
     }
 }
 
+#[derive(Clone)]
+struct ExecutionBinding {
+    agent: crate::model::AgentId,
+    source: Session,
+    context: Arc<chat::protocol::ExecutionContext>,
+    token: LaunchOwnerToken,
+    identity: chat::runtime::ActorIdentity,
+    _remote: Option<Handle>,
+}
+
+impl ExecutionBinding {
+    fn capture(
+        state: &HostState,
+        agent: crate::model::AgentId,
+        source: &Session,
+        context: &Arc<chat::protocol::ExecutionContext>,
+    ) -> Result<Self, String> {
+        let snapshot = context.ownership_snapshot();
+        let LaunchOwnerKind::RemoteActor { identity } = snapshot.kind else {
+            return Err("The execution startup has no transferred semantic actor".into());
+        };
+        let binding = Self {
+            agent,
+            source: source.clone(),
+            context: context.clone(),
+            token: snapshot
+                .token
+                .ok_or("The execution startup lost its owner generation")?,
+            identity,
+            _remote: snapshot.remote,
+        };
+        binding.require_state(state)?;
+        Ok(binding)
+    }
+
+    fn require_state(&self, state: &HostState) -> Result<(), String> {
+        let snapshot = self.context.ownership_snapshot();
+        if state
+            .execution_startups
+            .get(&self.agent)
+            .is_none_or(|(intent, context)| {
+                intent != &crate::agent_execution::HostedSession::Chat(self.source.clone())
+                    || !Arc::ptr_eq(context, &self.context)
+            })
+            || snapshot.token != Some(self.token)
+            || snapshot.kind
+                != (LaunchOwnerKind::RemoteActor {
+                    identity: self.identity.clone(),
+                })
+        {
+            return Err("The captured execution launch, context or semantic actor changed".into());
+        }
+        Ok(())
+    }
+
+    fn native_binding(&self, state: &HostState) -> Result<Option<StartupBinding>, String> {
+        let Some(pending) = state.native_actor_startups.get(&self.source.id) else {
+            return Ok(None);
+        };
+        if (pending.source != self.source && pending.requested != self.source)
+            || !Arc::ptr_eq(&pending.context, &self.context)
+        {
+            return Err("A different native startup owns this execution descriptor".into());
+        }
+        let binding = StartupBinding::capture(pending)?;
+        if binding.token != self.token || binding.identity != self.identity {
+            return Err("The native and execution startup owners differ".into());
+        }
+        Ok(Some(binding))
+    }
+}
+
 /// This value is deliberately private to HOST and has no wire representation.
 /// Only an ordinary-exit transaction can mint it; every publication checks the
 /// same original proof and current exact attachment or startup owner again.
@@ -106,6 +182,7 @@ pub(in crate::host) struct Capture {
     requested: Session,
     identity: chat::runtime::ActorIdentity,
     startup: Option<StartupBinding>,
+    execution: Option<ExecutionBinding>,
     target: Option<super::super::CloseTarget>,
 }
 
@@ -139,6 +216,7 @@ pub(in crate::host) fn capture_startup(
         requested: pending.requested.clone(),
         identity: startup.identity.clone(),
         startup: Some(startup),
+        execution: None,
         target,
     };
     // Cancellation is requested outside HOST after capture, so the latch is
@@ -185,7 +263,57 @@ pub(in crate::host) fn capture_hosted(
             .map_or_else(|| source.clone(), |startup| startup.requested.clone()),
         identity,
         startup,
+        execution: None,
         target: Some(super::super::CloseTarget::from_record(record)),
+    };
+    capture.require_ordinary_intent(state)?;
+    Ok(capture)
+}
+
+pub(in crate::host) fn capture_execution(
+    state: &HostState,
+    agent: crate::model::AgentId,
+    intent: &crate::agent_execution::HostedSession,
+    context: &Arc<chat::protocol::ExecutionContext>,
+) -> Result<Capture, String> {
+    let crate::agent_execution::HostedSession::Chat(source) = intent else {
+        return Err("A terminal launch has no retained semantic actor".into());
+    };
+    let execution = ExecutionBinding::capture(state, agent, source, context)?;
+    let startup = execution.native_binding(state)?;
+    let target = state
+        .chats
+        .get(&source.id)
+        .map(|record| -> Result<super::super::CloseTarget, String> {
+            if record.handle.actor_identity().as_ref() != Some(&execution.identity)
+                || record.execution_instance != execution.identity.instance
+                || startup
+                    .as_ref()
+                    .and_then(|startup| startup.failed_close.as_ref())
+                    .is_some_and(|failed| !failed.matches(record))
+            {
+                return Err("The execution startup's semantic attachment changed".into());
+            }
+            Ok(super::super::CloseTarget::from_record(record))
+        })
+        .transpose()?;
+    if target.is_none()
+        && startup
+            .as_ref()
+            .is_some_and(|startup| startup.failed_close.is_some())
+    {
+        return Err("The execution startup lost its exact failed attachment".into());
+    }
+    let capture = Capture {
+        proof: state.proof().clone(),
+        source: startup
+            .as_ref()
+            .map_or_else(|| source.clone(), |startup| startup.source.clone()),
+        requested: source.clone(),
+        identity: execution.identity.clone(),
+        startup,
+        execution: Some(execution),
+        target,
     };
     capture.require_ordinary_intent(state)?;
     Ok(capture)
@@ -223,6 +351,15 @@ impl Capture {
             startup.require_state(state)?;
             if !startup.context.ownership_snapshot().ordinary_requested {
                 return Err("The original startup cancellation has not been requested".into());
+            }
+        }
+        if let Some(execution) = &self.execution {
+            execution.require_state(state)?;
+            if !execution.context.ownership_snapshot().ordinary_requested {
+                return Err("The original execution cancellation has not been requested".into());
+            }
+            if self.startup.is_none() && state.native_actor_startups.contains_key(&self.source.id) {
+                return Err("A different native startup appeared after execution capture".into());
             }
         }
         if self.target.as_ref().is_some_and(|target| {
@@ -276,7 +413,7 @@ impl Capture {
     ) -> Result<(), String> {
         self.require_host(host)?;
         self.require_inspection(identity, issued, aliases)?;
-        if self.startup.is_none() {
+        if self.startup.is_none() && self.execution.is_none() {
             // Ordinary hosted cleanup never gains a missing ownership row.
             return verify_close_ownership(host, identity, issued, aliases, scope).map(|_| ());
         }
@@ -308,10 +445,57 @@ pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(
 /// usable after live discovery disappears; no disappearance is itself proof.
 pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Result<(), String> {
     let binding = StartupBinding::capture(pending)?;
+    cleanup_normal_bound(host, &binding, |state| binding.require_state(state))
+}
+
+/// An execution intent can outlive normal forget_startup after its durable
+/// clear failed. Its original context and exact AgentId remain cleanup custody
+/// even without a native startup row or a current presentation attachment.
+pub(in crate::host) fn cleanup_execution_startup(
+    host: &SharedHost,
+    agent: crate::model::AgentId,
+    source: &Session,
+    context: &Arc<chat::protocol::ExecutionContext>,
+) -> Result<(), String> {
+    let (execution, native) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let execution = ExecutionBinding::capture(&state, agent, source, context)?;
+        let native = execution.native_binding(&state)?;
+        (execution, native)
+    };
+    let binding = native.clone().unwrap_or_else(|| StartupBinding {
+        source: source.clone(),
+        requested: source.clone(),
+        context: context.clone(),
+        token: execution.token,
+        identity: execution.identity.clone(),
+        failed_close: None,
+        _remote: execution._remote.clone(),
+    });
+    cleanup_normal_bound(host, &binding, |state| {
+        execution.require_state(state)?;
+        match &native {
+            Some(native) => native.require_state(state),
+            None if state.native_actor_startups.contains_key(&source.id) => {
+                Err("A different native startup appeared during execution cleanup".into())
+            }
+            None => Ok(()),
+        }
+    })
+}
+
+fn cleanup_normal_bound(
+    host: &SharedHost,
+    binding: &StartupBinding,
+    require_owner: impl Fn(&HostState) -> Result<(), String>,
+) -> Result<(), String> {
     let proof = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        binding.require_state(&state)?;
-        if state.shutting_down || state.chat_spawning.contains_key(&pending.source.id) {
+        require_owner(&state)?;
+        if !binding.owner_is_current()
+            || state.shutting_down
+            || state.chat_spawning.contains_key(&binding.source.id)
+        {
             return Err("The pending startup is still transitioning or shutting down".into());
         }
         state.proof().clone()
@@ -320,7 +504,7 @@ pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Re
         Handle::inspect_retained_retirement(&binding.identity.record, &proof)?,
         RetirementInspection::Running
     ) {
-        let inspection = Handle::inspect_remote(&binding.identity.record, proof)?;
+        let inspection = Handle::inspect_remote(&binding.identity.record, proof.clone())?;
         binding.require_inspection(
             &inspection.identity,
             &inspection.source,
@@ -328,8 +512,12 @@ pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Re
         )?;
         {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            binding.require_state(&state)?;
-            if state.shutting_down || state.chat_spawning.contains_key(&pending.source.id) {
+            require_owner(&state)?;
+            if !binding.owner_is_current()
+                || state.proof() != &proof
+                || state.shutting_down
+                || state.chat_spawning.contains_key(&binding.source.id)
+            {
                 return Err("The exact pending startup changed before cleanup enrollment".into());
             }
         }
@@ -347,13 +535,19 @@ pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Re
     }
     close_with_target(
         host,
-        &pending.source,
+        &binding.source,
         Some(binding.identity.record.clone()),
         None,
         None,
         None,
     )?;
-    if !pending
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    require_owner(&state)?;
+    if state.proof() != &proof || state.shutting_down || !binding.owner_is_current() {
+        return Err("The exact launch owner changed after semantic retirement".into());
+    }
+    drop(state);
+    if !binding
         .context
         .complete_semantic_cleanup(binding.token, &binding.identity)
     {
