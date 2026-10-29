@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "never_merge": true,
+  "setup_head": "c727f886628897c1749290213e9d65037253095a",
+  "setup_tree": "6d4f36e2b4dd48fc9744305d34c78469384edcc5",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "products": [
+    {
+      "pr": 1354,
+      "head": "7ca8dc7b82090381a43e64c59c4bc4db2037b7f5",
+      "tree": "402b0e88fdf714cc2d8aa3631c0628898588164e",
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "interaction::context_menu::tests::tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge"
+      ],
+      "source_paths": [
+        "src/interaction.rs",
+        "src/interaction/context_menu.rs",
+        "vendor/libcosmic/src/widget/menu/menu_inner.rs"
+      ]
+    },
+    {
+      "pr": 1564,
+      "head": "d5856815491720bf13acb3897fb911bfc00f535f",
+      "tree": "0447d60db1839353e90b33f83fc107f9838f4b7e",
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::chat_ui::tests::preview_pressure_admits_newer_images_only_after_retained_trees_release_pixels",
+        "app::chat_ui::images::tests::managed_gallery_cannot_open_a_different_local_hint_externally",
+        "app::chat_ui::images::tests::inline_image_gallery_never_offers_a_filesystem_external_link"
+      ],
+      "source_paths": [
+        "src/app.rs",
+        "src/app/chat_ui.rs",
+        "src/app/chat_ui/images.rs"
+      ]
+    },
+    {
+      "pr": 1294,
+      "head": "7b26db7f3a75e3845302d6623a7d51f70f45aa1c",
+      "tree": "a3efe3979798c7715ae6fa66dfa641f238d6da62",
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "repository_widget::text_editor::tests::enter_replaces_selection_and_keeps_bracket_aware_indentation"
+      ],
+      "source_paths": [
+        "src/repository_widget.rs",
+        "src/editor_widget.rs"
+      ]
+    },
+    {
+      "pr": 1228,
+      "head": "22c0d9350fc658b58f44700298577494312b9c10",
+      "tree": "d4c1ba1f3cd32bf9633b5b209403ee08c8c97948",
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "daemon::holder_registry::tests::terminal_and_native_v4_are_discovered_without_accepting_native_v5"
+      ],
+      "source_paths": [
+        "src/daemon.rs",
+        "src/daemon/holder_registry.rs"
+      ]
+    }
+  ],
+  "limits": [
+    "Temporary hosted research only; close without merging after retaining immutable evidence.",
+    "Four exact owning executable checks and six exact headless library parents only.",
+    "No whole feature suite, native interaction, screenshots, performance, integrated-browser, provider or merge acceptance.",
+    "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
+    "Natural hosted User context is required; inherited CAGENTS_ names are refused, never removed.",
+    "GNU timeout bounds each command; its wrapper return and direct completion are recorded. No detached-process census or whole-family closure is claimed.",
+    "No local build, test, provider, daemon or native execution is authorized by this research file."
+  ]
+}
