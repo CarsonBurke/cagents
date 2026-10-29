@@ -2097,8 +2097,6 @@ pub(super) fn removed_existence(reason: &str) -> Existence {
     }
 }
 
-/// Whether a card lives inside the worktree at `path`: its process runs there,
-/// or it views files there.
 fn project_worktree_roots(project: &SidebarProject) -> Vec<PathBuf> {
     if project.kind == ProjectKind::Folder {
         return vec![project.repository.clone()];
@@ -2119,6 +2117,8 @@ fn project_worktree_roots(project: &SidebarProject) -> Vec<PathBuf> {
     roots
 }
 
+/// Whether a card lives inside the worktree at `path`: its process runs there,
+/// or it views files there.
 fn card_belongs_to(card: &CardState, path: &Path) -> bool {
     card_directory(card).is_some_and(|directory| directory.starts_with(path))
 }
@@ -2507,7 +2507,14 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if let Some(reason) = crate::repository::nested_worktrees_refusal(
         nested_worktree_paths(
             &target.path,
-            records.iter().map(|record| record.path.as_path()),
+            records
+                .iter()
+                // A prunable record whose directory is gone loses nothing;
+                // one that is still on disk would go with this worktree.
+                .filter(|record| {
+                    record.prunable_reason.is_none() || record.path.symlink_metadata().is_ok()
+                })
+                .map(|record| record.path.as_path()),
         )
         .count(),
     ) {

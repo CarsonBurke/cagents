@@ -154,7 +154,14 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     if let Some(reason) = crate::repository::nested_worktrees_refusal(
         crate::repository::nested_worktree_paths(
             &record.path,
-            records.iter().map(|record| record.path.as_path()),
+            records
+                .iter()
+                // A prunable record whose directory is gone loses nothing;
+                // one that is still on disk would go with this worktree.
+                .filter(|record| {
+                    record.prunable_reason.is_none() || record.path.symlink_metadata().is_ok()
+                })
+                .map(|record| record.path.as_path()),
         )
         .count(),
     ) {
@@ -344,7 +351,14 @@ pub(crate) fn remove_fenced(
     if let Some(reason) = crate::repository::nested_worktrees_refusal(
         crate::repository::nested_worktree_paths(
             &target.path,
-            records.iter().map(|record| record.path.as_path()),
+            records
+                .iter()
+                // A prunable record whose directory is gone loses nothing;
+                // one that is still on disk would go with this worktree.
+                .filter(|record| {
+                    record.prunable_reason.is_none() || record.path.symlink_metadata().is_ok()
+                })
+                .map(|record| record.path.as_path()),
         )
         .count(),
     ) {
@@ -1017,10 +1031,17 @@ mod tests {
                 .unwrap_err()
                 .starts_with("This worktree contains another worktree")
         );
-        git(
-            &repository,
-            &["worktree", "remove", "--force", inner.to_str().unwrap()],
+        // Prunable yet still on disk, its files would still go with it.
+        std::fs::remove_file(inner.join(".git")).unwrap();
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .starts_with("This worktree contains another worktree")
         );
+        // Only once its directory is gone does it stop holding the outer one.
+        std::fs::remove_dir_all(&inner).unwrap();
+        checked_record(&request).unwrap();
+        git(&repository, &["worktree", "prune"]);
         git(&repository, &["branch", "-D", "inner"]);
         checked_record(&request).unwrap();
 
