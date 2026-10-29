@@ -5062,7 +5062,22 @@ impl RepositoryRuntime {
                 self.disk_stamp = Some(Some(stamp));
                 self.disk_retry_after = None;
                 self.disk_retry_delay = Duration::from_secs(1);
-                match crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) {
+                let decision = if version.source != document.source {
+                    // Identical bytes at a different destination are still a
+                    // replacement. Dirty buffers keep their original source.
+                    if document.dirty {
+                        crate::editor_reload::Decision::Conflict
+                    } else {
+                        crate::editor_reload::Decision::Reload
+                    }
+                } else {
+                    crate::editor_reload::decide(
+                        document.disk_hash,
+                        Some(version.content_hash),
+                        document.dirty,
+                    )
+                };
+                match decision {
                     crate::editor_reload::Decision::Unchanged => {
                         if document.external_version.is_some() || document.external_deleted {
                             document.external_version = None; document.external_deleted = false; self.disk_comparison = None;
@@ -5095,8 +5110,13 @@ impl RepositoryRuntime {
                 let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
                 if document.active_save.is_some() { return Task::none(); }
                 if let Some(version) = document.external_version.take() {
-                    document.disk_hash = version.content_hash; document.saved_text = version.text;
-                    document.dirty = !content_matches(&document.content, &document.saved_text);
+                    // Save still belongs to the source the buffer was read
+                    // from. A new link target cannot validate that baseline
+                    // or make those unsaved edits clean.
+                    if version.source == document.source {
+                        document.disk_hash = version.content_hash; document.saved_text = version.text;
+                        document.dirty = !content_matches(&document.content, &document.saved_text);
+                    }
                 } else if document.external_deleted { document.recreate_missing = true; document.dirty = true; }
                 else { return self.request_save(card, true); }
                 document.conflict = false; document.error = None;
@@ -12496,6 +12516,306 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file"), "data").unwrap();
         crate::editor_reload::stamp(root.path(), Path::new("file"), Path::new("file")).unwrap().unwrap()
+    }
+
+    #[derive(Default)]
+    struct DocumentWorkerOutputs {
+        metadata: usize,
+        loaded: usize,
+        saved: usize,
+    }
+
+    // Drain follow-up tasks too: metadata alone does not execute the content
+    // read, and submitting Save alone does not establish that bytes reached disk.
+    async fn drain_document_workers(
+        runtime: &mut RepositoryRuntime,
+        task: Task<RepositoryAction>,
+    ) -> DocumentWorkerOutputs {
+        use cosmic::iced::futures::StreamExt;
+        let mut pending = std::collections::VecDeque::from([task]);
+        let mut outputs = DocumentWorkerOutputs::default();
+        let mut count = 0;
+        while let Some(task) = pending.pop_front() {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = action {
+                        count += 1;
+                        assert!(count < 64, "document workers must settle");
+                        match &action {
+                            RepositoryAction::DiskMetadata { .. } => outputs.metadata += 1,
+                            RepositoryAction::DiskLoaded { .. } => outputs.loaded += 1,
+                            RepositoryAction::SaveFinished { .. } => outputs.saved += 1,
+                            _ => {}
+                        }
+                        pending.push_back(runtime.update(action));
+                    }
+                }
+            }
+        }
+        outputs
+    }
+
+    async fn open_link_document(root: &Path, card: CardId) -> RepositoryRuntime {
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.to_path_buf(),
+            worktree: root.to_path_buf(),
+            selected_file: None,
+        });
+        runtime.set_auto_save(true);
+        let open = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "alias.txt".into(),
+        });
+        drain_document_workers(&mut runtime, open).await;
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document)
+            if document.source == Path::new("a.txt") && !document.dirty)
+        );
+        runtime
+    }
+
+    fn replace_link_buffer(runtime: &mut RepositoryRuntime, card: CardId, text: &str) {
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::SelectAll,
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.into()))),
+        }));
+    }
+
+    fn retarget_fixture_link(root: &Path, target: &str) {
+        std::os::unix::fs::symlink(target, root.join("next-link")).unwrap();
+        std::fs::rename(root.join("next-link"), root.join("alias.txt")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreign_disk_version_cannot_suppress_the_original_source_save() {
+        for foreign in ["NEW\n", "different foreign bytes\n", "OLD\n"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), "OLD\n").unwrap();
+            std::fs::write(root.path().join("b.txt"), foreign).unwrap();
+            std::os::unix::fs::symlink("a.txt", root.path().join("alias.txt")).unwrap();
+            let card = CardId::new();
+            let mut runtime = open_link_document(root.path(), card).await;
+            replace_link_buffer(&mut runtime, card, "NEW\n");
+            retarget_fixture_link(root.path(), "b.txt");
+
+            let observe = runtime.refresh_open_document(card);
+            let outputs = drain_document_workers(&mut runtime, observe).await;
+            assert_eq!((outputs.metadata, outputs.loaded, outputs.saved), (1, 1, 0));
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document)
+                if document.source == Path::new("a.txt")
+                    && document.saved_text == "OLD\n"
+                    && document.disk_hash == blake3::hash(b"OLD\n")
+                    && document.content.text() == "NEW\n"
+                    && document.dirty && document.conflict
+                    && document.external_version.as_ref().is_some_and(|version|
+                        version.source == Path::new("b.txt") && version.text == foreign))
+            );
+            assert!(runtime.can_save() && runtime.blocks_navigation());
+            assert!(runtime.auto_save_revision().is_none());
+
+            let save = runtime.update(RepositoryAction::KeepMine { card });
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document)
+                if document.source == Path::new("a.txt")
+                    && document.saved_text == "OLD\n"
+                    && document.disk_hash == blake3::hash(b"OLD\n")
+                    && document.dirty
+                    && document.active_save.as_ref().is_some_and(|save| save.snapshot == "NEW\n"))
+            );
+            assert!(runtime.blocks_navigation());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                "OLD\n"
+            );
+            let outputs = drain_document_workers(&mut runtime, save).await;
+            assert_eq!(outputs.saved, 1);
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document)
+                if document.source == Path::new("a.txt") && document.saved_text == "NEW\n"
+                    && document.disk_hash == blake3::hash(b"NEW\n")
+                    && !document.dirty && !document.conflict && document.error.is_none())
+            );
+            assert!(!runtime.can_save() && !runtime.blocks_navigation());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                "NEW\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+                foreign
+            );
+            assert_eq!(
+                std::fs::read_link(root.path().join("alias.txt")).unwrap(),
+                Path::new("b.txt")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_selected_link_reloads_its_new_source_after_the_old_source_disappears() {
+        for foreign in ["OLD\n", "new target\n"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), "OLD\n").unwrap();
+            std::fs::write(root.path().join("b.txt"), foreign).unwrap();
+            std::os::unix::fs::symlink("a.txt", root.path().join("alias.txt")).unwrap();
+            let card = CardId::new();
+            let mut runtime = open_link_document(root.path(), card).await;
+            retarget_fixture_link(root.path(), "b.txt");
+            std::fs::remove_file(root.path().join("a.txt")).unwrap();
+
+            for expected_reads in [1, 1, 0] {
+                let observe = runtime.refresh_open_document(card);
+                let outputs = drain_document_workers(&mut runtime, observe).await;
+                assert_eq!(outputs.metadata, 1);
+                assert_eq!(outputs.loaded, expected_reads);
+                assert_eq!(runtime.selected_path(), Some(Path::new("alias.txt")));
+                assert!(
+                    matches!(&runtime.document, DocumentState::Editable(document)
+                    if document.source == Path::new("b.txt") && document.content.text() == foreign
+                        && document.saved_text == foreign
+                        && document.disk_hash == blake3::hash(foreign.as_bytes())
+                        && !document.dirty && !document.conflict && !document.external_deleted
+                        && document.error.is_none())
+                );
+            }
+            replace_link_buffer(&mut runtime, card, "edited B\n");
+            let save = runtime.update(RepositoryAction::Save {
+                card,
+                overwrite: false,
+            });
+            let outputs = drain_document_workers(&mut runtime, save).await;
+            assert_eq!(outputs.saved, 1);
+            assert!(!runtime.blocks_navigation());
+            assert!(!root.path().join("a.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+                "edited B\n"
+            );
+            assert_eq!(
+                std::fs::read_link(root.path().join("alias.txt")).unwrap(),
+                Path::new("b.txt")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_retarget_does_not_recreate_or_overwrite_a_changed_original_source() {
+        for removed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), "OLD\n").unwrap();
+            std::fs::write(root.path().join("b.txt"), "NEW\n").unwrap();
+            std::os::unix::fs::symlink("a.txt", root.path().join("alias.txt")).unwrap();
+            let card = CardId::new();
+            let mut runtime = open_link_document(root.path(), card).await;
+            replace_link_buffer(&mut runtime, card, "NEW\n");
+            retarget_fixture_link(root.path(), "b.txt");
+            if removed {
+                std::fs::remove_file(root.path().join("a.txt")).unwrap();
+            } else {
+                std::fs::write(root.path().join("a.txt"), "concurrent A\n").unwrap();
+            }
+            for _ in 0..2 {
+                let observe = runtime.refresh_open_document(card);
+                drain_document_workers(&mut runtime, observe).await;
+                assert!(
+                    matches!(&runtime.document, DocumentState::Editable(document)
+                    if document.source == Path::new("a.txt") && document.content.text() == "NEW\n"
+                        && document.saved_text == "OLD\n"
+                        && document.disk_hash == blake3::hash(b"OLD\n")
+                        && document.dirty && document.conflict && !document.recreate_missing)
+                );
+                assert!(runtime.can_save() && runtime.blocks_navigation());
+                assert!(runtime.auto_save_revision().is_none());
+            }
+            let save = runtime.update(RepositoryAction::KeepMine { card });
+            let outputs = drain_document_workers(&mut runtime, save).await;
+            assert_eq!(outputs.saved, 1);
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document)
+                if document.source == Path::new("a.txt") && document.content.text() == "NEW\n"
+                    && document.saved_text == "OLD\n" && document.dirty
+                    && document.error.is_some() && !document.recreate_missing)
+            );
+            assert!(runtime.can_save() && runtime.blocks_navigation());
+            assert_eq!(root.path().join("a.txt").exists(), !removed);
+            if !removed {
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                    "concurrent A\n"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+                "NEW\n"
+            );
+            assert_eq!(
+                std::fs::read_link(root.path().join("alias.txt")).unwrap(),
+                Path::new("b.txt")
+            );
+            // Explicit Reload remains a usable way to adopt the selected B.
+            let reload = runtime.update(RepositoryAction::Reload { card });
+            drain_document_workers(&mut runtime, reload).await;
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document)
+                if document.source == Path::new("b.txt") && document.content.text() == "NEW\n"
+                    && !document.dirty && !document.conflict && document.error.is_none())
+            );
+            assert!(!runtime.blocks_navigation());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_original_source_does_not_bypass_selected_link_refusals() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside bytes\n").unwrap();
+        for target in [
+            Path::new("missing.txt"),
+            Path::new("alias.txt"),
+            outside_file.as_path(),
+        ] {
+            for dirty in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::write(root.path().join("a.txt"), "OLD\n").unwrap();
+                std::os::unix::fs::symlink("a.txt", root.path().join("alias.txt")).unwrap();
+                let card = CardId::new();
+                let mut runtime = open_link_document(root.path(), card).await;
+                if dirty {
+                    replace_link_buffer(&mut runtime, card, "unsaved\n");
+                }
+                std::os::unix::fs::symlink(target, root.path().join("next-link")).unwrap();
+                std::fs::rename(root.path().join("next-link"), root.path().join("alias.txt"))
+                    .unwrap();
+                std::fs::remove_file(root.path().join("a.txt")).unwrap();
+                let observe = runtime.refresh_open_document(card);
+                let outputs = drain_document_workers(&mut runtime, observe).await;
+                assert_eq!((outputs.metadata, outputs.loaded, outputs.saved), (1, 1, 0));
+                assert!(
+                    matches!(&runtime.document, DocumentState::Editable(document)
+                    if document.source == Path::new("a.txt") && document.saved_text == "OLD\n"
+                        && document.disk_hash == blake3::hash(b"OLD\n")
+                        && document.content.text() == if dirty { "unsaved\n" } else { "OLD\n" }
+                        && document.dirty == dirty && document.conflict && document.error.is_some()
+                        && document.external_version.is_none() && !document.recreate_missing)
+                );
+                assert_eq!(runtime.blocks_navigation(), dirty);
+                assert!(!root.path().join("a.txt").exists());
+                assert_eq!(
+                    std::fs::read_link(root.path().join("alias.txt")).unwrap(),
+                    target
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&outside_file).unwrap(),
+                    "outside bytes\n"
+                );
+            }
+        }
     }
 
     fn simulate_disk_version(runtime: &mut RepositoryRuntime, card: CardId, before: &str, after: &str) {

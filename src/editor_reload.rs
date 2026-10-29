@@ -10,7 +10,7 @@ impl From<Metadata> for FileStamp {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamp { selected: FileStamp, source: FileStamp }
+pub struct Stamp { selected: FileStamp, source: Option<FileStamp> }
 
 pub fn stamp(worktree: &Path, selected: &Path, source: &Path) -> Result<Option<Stamp>, String> {
     let root = Root::open(worktree).map_err(|error| error.to_string())?;
@@ -20,11 +20,13 @@ pub fn stamp(worktree: &Path, selected: &Path, source: &Path) -> Result<Option<S
         Err(error) => return Err(error.to_string()),
     };
     let source = match fs_safety::metadata_beneath(&root, source) {
-        Ok(metadata) => metadata,
-        Err(error) if error.is_not_found() => return Ok(None),
+        Ok(metadata) => Some(metadata.into()),
+        // The selected link may now resolve to another file. Let the rooted
+        // content reader resolve it before declaring the document unavailable.
+        Err(error) if error.is_not_found() => None,
         Err(error) => return Err(error.to_string()),
     };
-    Ok(Some(Stamp { selected: selected.into(), source: source.into() }))
+    Ok(Some(Stamp { selected: selected.into(), source }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,5 +120,29 @@ mod tests {
         assert_ne!(first, stamp(root.path(), path, path).unwrap());
         std::fs::remove_file(root.path().join(path)).unwrap();
         assert_eq!(stamp(root.path(), path, path).unwrap(), None);
+    }
+    #[test]
+    fn a_missing_previous_source_does_not_hide_an_existing_selected_link() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("b.txt"), "new target").unwrap();
+        std::os::unix::fs::symlink("b.txt", root.path().join("alias.txt")).unwrap();
+        let observed = stamp(root.path(), Path::new("alias.txt"), Path::new("a.txt"))
+            .unwrap()
+            .expect("the selected path still exists");
+        assert!(observed.source.is_none());
+        let version = load(
+            root.path(),
+            Path::new("alias.txt"),
+            "old",
+            PdfTone::Original,
+        )
+        .unwrap();
+        assert_eq!(version.source, Path::new("b.txt"));
+        assert_eq!(version.text, "new target");
+        std::fs::remove_file(root.path().join("alias.txt")).unwrap();
+        assert_eq!(
+            stamp(root.path(), Path::new("alias.txt"), Path::new("a.txt")).unwrap(),
+            None
+        );
     }
 }
