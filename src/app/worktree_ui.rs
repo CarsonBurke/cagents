@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::ChannelId;
+use crate::{chat, model::ChannelId};
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
