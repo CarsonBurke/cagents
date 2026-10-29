@@ -17,6 +17,35 @@ use std::{
 const RETRY: Duration = Duration::from_millis(20);
 const MAX_JOBS: usize = 4;
 
+/// Cursor spans every cleanup class. First attempts take priority; retries
+/// resume after the last dispatched owner rather than restarting at actor zero.
+#[derive(Default)]
+struct FairQueue {
+    next: usize,
+}
+
+impl FairQueue {
+    fn choose(&mut self, eligible: &[bool], first_attempt: &[bool]) -> Option<usize> {
+        assert_eq!(eligible.len(), first_attempt.len());
+        let count = eligible.len();
+        if count == 0 {
+            return None;
+        }
+        let new_owner = eligible
+            .iter()
+            .zip(first_attempt)
+            .any(|(ready, first)| *ready && *first);
+        for offset in 0..count {
+            let index = (self.next % count + offset) % count;
+            if eligible[index] && (!new_owner || first_attempt[index]) {
+                self.next = (index + 1) % count;
+                return Some(index);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Default)]
 struct Progress {
     drain: Option<ExitDrain>,
@@ -267,6 +296,7 @@ fn run(
     let mut generics: Vec<GenericWork> = Vec::new();
     let mut terminals = None;
     let mut terminals_done = false;
+    let mut fair = FairQueue::default();
     loop {
         let pending = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -436,34 +466,53 @@ fn run(
                 + locals.iter().filter(|w| w.worker.is_some()).count()
                 + generics.iter().filter(|w| w.worker.is_some()).count(),
         );
-        for retry in [false, true] {
-            for work in &mut actors {
-                if slots == 0 {
-                    break;
-                }
-                if work.semantic_done || work.worker.is_some() || work.attempted != retry {
-                    continue;
-                }
+        while slots > 0 {
+            let eligible = actors
+                .iter()
+                .map(|work| !work.semantic_done && work.worker.is_none())
+                .chain(
+                    locals
+                        .iter()
+                        .map(|work| !work.done && work.worker.is_none()),
+                )
+                .chain(generics.iter().map(|work| {
+                    let snapshot = work.context.ownership_snapshot();
+                    snapshot.outcome == LaunchOutcome::Uncertain
+                        && snapshot.kind == LaunchOwnerKind::Generic
+                        && work.worker.is_none()
+                        && !locals.iter().any(|local| {
+                            !local.done
+                                && local
+                                    .bindings
+                                    .iter()
+                                    .any(|(owner, _)| Arc::ptr_eq(owner, &work.context))
+                        })
+                }))
+                .collect::<Vec<_>>();
+            let first = actors
+                .iter()
+                .map(|work| !work.attempted)
+                .chain(locals.iter().map(|work| !work.attempted))
+                .chain(generics.iter().map(|work| !work.attempted))
+                .collect::<Vec<_>>();
+            let Some(index) = fair.choose(&eligible, &first) else {
+                break;
+            };
+            slots -= 1;
+            if index < actors.len() {
+                let work = &mut actors[index];
+                work.attempted = true;
                 let worker_host = host.clone();
                 let capture = work.capture.clone();
                 match spawn_job("cagents-startup-semantic-close", move || {
                     chat::retained_actor::startup_shutdown::cleanup(&worker_host, &capture)
                 }) {
-                    Ok(job) => {
-                        work.worker = Some(job);
-                        work.attempted = true;
-                        slots -= 1;
-                    }
+                    Ok(job) => work.worker = Some(job),
                     Err(error) => diagnostic = Some(error),
                 }
-            }
-            for work in &mut locals {
-                if slots == 0 {
-                    break;
-                }
-                if work.done || work.worker.is_some() || work.attempted != retry {
-                    continue;
-                }
+            } else if index < actors.len() + locals.len() {
+                let work = &mut locals[index - actors.len()];
+                work.attempted = true;
                 let worker_host = host.clone();
                 let source = work.source.clone();
                 let handle = work.handle.clone();
@@ -489,33 +538,12 @@ fn run(
                     agent_execution::retired(&worker_host, &source)?;
                     require_current()
                 }) {
-                    Ok(job) => {
-                        work.worker = Some(job);
-                        work.attempted = true;
-                        slots -= 1;
-                    }
+                    Ok(job) => work.worker = Some(job),
                     Err(error) => diagnostic = Some(error),
                 }
-            }
-            for work in &mut generics {
-                if slots == 0 {
-                    break;
-                }
-                let snapshot = work.context.ownership_snapshot();
-                if snapshot.outcome != LaunchOutcome::Uncertain
-                    || snapshot.kind != LaunchOwnerKind::Generic
-                    || work.worker.is_some()
-                    || work.attempted != retry
-                    || locals.iter().any(|local| {
-                        !local.done
-                            && local
-                                .bindings
-                                .iter()
-                                .any(|(owner, _)| Arc::ptr_eq(owner, &work.context))
-                    })
-                {
-                    continue;
-                }
+            } else {
+                let work = &mut generics[index - actors.len() - locals.len()];
+                work.attempted = true;
                 let context = work.context.clone();
                 match spawn_job("cagents-launch-cleanup", move || {
                     match context.reconcile_cleanup()? {
@@ -525,11 +553,7 @@ fn run(
                         }
                     }
                 }) {
-                    Ok(job) => {
-                        work.worker = Some(job);
-                        work.attempted = true;
-                        slots -= 1;
-                    }
+                    Ok(job) => work.worker = Some(job),
                     Err(error) => diagnostic = Some(error),
                 }
             }
@@ -690,5 +714,63 @@ fn run(
             progress.diagnostic = Some(error);
         }
         thread::sleep(RETRY);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_rotate_past_four_failing_actors_to_repaired_local_and_generic_owners() {
+        // Four retained actors always fail. The local and generic owners each
+        // fail once and are then repaired; both must get another attempt while
+        // the original four still need cleanup. This is greater than MAX_JOBS.
+        let mut fair = FairQueue::default();
+        let mut attempts = vec![0usize; MAX_JOBS + 2];
+        let mut done = vec![false; attempts.len()];
+        for _ in 0..8 {
+            let eligible = done.iter().map(|done| !done).collect::<Vec<_>>();
+            let first = attempts
+                .iter()
+                .map(|attempts| *attempts == 0)
+                .collect::<Vec<_>>();
+            let mut in_round = eligible;
+            for _ in 0..MAX_JOBS {
+                let Some(owner) = fair.choose(&in_round, &first) else {
+                    break;
+                };
+                in_round[owner] = false;
+                attempts[owner] += 1;
+                if owner >= MAX_JOBS && attempts[owner] >= 2 {
+                    done[owner] = true;
+                }
+            }
+            if done[MAX_JOBS] && done[MAX_JOBS + 1] {
+                break;
+            }
+        }
+        assert!(
+            done[MAX_JOBS] && done[MAX_JOBS + 1],
+            "repaired owners starved behind failing actors: {attempts:?}"
+        );
+        assert!(attempts[..MAX_JOBS].iter().all(|attempts| *attempts >= 1));
+    }
+
+    #[test]
+    fn a_new_owner_gets_its_first_attempt_before_an_eligible_retry() {
+        let mut fair = FairQueue { next: 0 };
+        assert_eq!(
+            fair.choose(&[true, true, true], &[false, false, true]),
+            Some(2)
+        );
+        assert_eq!(
+            fair.choose(&[true, true, true], &[false, false, false]),
+            Some(0)
+        );
+        assert_eq!(
+            fair.choose(&[true, true, true], &[false, false, false]),
+            Some(1)
+        );
     }
 }

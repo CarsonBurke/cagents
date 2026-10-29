@@ -744,13 +744,38 @@ impl Registry {
         id: AgentId,
         source: &HostedSession,
     ) -> Result<(), String> {
-        self.db
-            .execute(
-                "DELETE FROM agent_launches WHERE agent = ?1 AND source = ?2",
-                params![id.to_string(), encode(source)?],
+        let expected = encode(source)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_launches WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get(0),
             )
-            .map_err(|e| e.to_string())?;
-        Ok(())
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if current.as_ref().is_some_and(|current| current != &expected) {
+            return Err("The durable launch intent changed before exact cleanup; its successor was preserved".into());
+        }
+        tx.execute(
+            "DELETE FROM agent_launches WHERE agent = ?1 AND source = ?2",
+            params![id.to_string(), expected],
+        )
+        .map_err(|error| error.to_string())?;
+        let remaining: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE agent = ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if remaining {
+            return Err("The exact durable launch intent remains pending after cleanup".into());
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
     /// A post-commit once-only fence, shared by interactive and scheduled
     /// dispatch. The caller performs no launch/send until this commit returns.

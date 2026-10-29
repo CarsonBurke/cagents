@@ -13,6 +13,7 @@ fn owner() -> Arc<StartupOwner> {
         finished: std::sync::Condvar::new(),
         unwatched_child: Mutex::new(None),
         cleanup_waiters: std::sync::atomic::AtomicUsize::new(0),
+        fail_next_wait: AtomicBool::new(false),
     })
 }
 
@@ -64,6 +65,7 @@ impl DirectChildGuard {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .take()
+                    .map(|retained| retained._child)
             })
             .ok_or("The fixture no longer owns an unwaited original Child")?;
         self.owner.wait_for_child(child)
@@ -79,6 +81,7 @@ impl Drop for DirectChildGuard {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
+                .map(|retained| retained._child)
         });
         if let Some(child) = child {
             let pid = child.id();
@@ -425,12 +428,59 @@ fn failed_watcher_admission_retains_the_original_child_and_uncertain_owner() {
             .unwrap()
             .as_ref()
             .unwrap()
+            ._child
             .id(),
         child_id
     );
     // Sole test cleanup consumes the retained Child itself. No replacement
     // waiter or synthetic production status is installed on the owner.
     assert!(child.wait().unwrap().success());
+    assert_eq!(
+        context.poll_cleanup(&captured).outcome,
+        LaunchOutcome::Uncertain
+    );
+}
+
+#[test]
+fn failed_original_wait_retains_that_child_and_only_a_pending_diagnostic() {
+    let context = ExecutionContext::default();
+    let owner = owner();
+    context.claim_startup_owner(owner.clone());
+    let mut child = DirectChildGuard::new(owner.clone(), None);
+    child.spawn(&mut ChildCommand::new("/bin/true")).unwrap();
+    let child_id = child.child.as_ref().unwrap().id();
+    owner.fail_next_wait.store(true, Ordering::Release);
+    let error = child.wait().unwrap_err();
+    assert!(error.contains("Child.wait failed"));
+    assert_eq!(
+        owner
+            .unwatched_child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            ._child
+            .id(),
+        child_id
+    );
+    let captured = context.request_ordinary_cleanup();
+    assert_eq!(captured.original_helper, HelperWaitProof::Pending);
+    assert!(
+        captured
+            .diagnostic
+            .as_ref()
+            .unwrap()
+            .contains("without an automatic retry or cleanup proof")
+    );
+    assert_eq!(
+        context.poll_cleanup(&captured).outcome,
+        LaunchOutcome::Uncertain
+    );
+    // The original fixture custodian alone recovers the same retained Child
+    // on Drop and performs its actual wait. Status zero cannot mint proof73.
+    drop(child);
+    assert!(owner.unwatched_child.lock().unwrap().is_none());
+    assert_eq!(owner.original_helper_wait_proof(), HelperWaitProof::Pending);
     assert_eq!(
         context.poll_cleanup(&captured).outcome,
         LaunchOutcome::Uncertain

@@ -101,6 +101,52 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
     fault
         .execute_batch("DROP TRIGGER refuse_owned_launch_clear;")
         .unwrap();
+    // A successful no-op DELETE is not a receipt for a different durable
+    // source. Inject only the row replacement; keep the original memory owner
+    // and its no-provider evidence unchanged.
+    let mut successor = intent.clone();
+    let HostedSession::Chat(session) = &mut successor else {
+        unreachable!()
+    };
+    session.launch.recipe.arguments.push("successor".into());
+    fault
+        .execute(
+            "UPDATE agent_launches SET source = ?2 WHERE agent = ?1",
+            rusqlite::params![
+                accepted.agent.id.to_string(),
+                serde_json::to_string(&successor).unwrap()
+            ],
+        )
+        .unwrap();
+    assert!(
+        finish_ordinary_startups(&host)
+            .unwrap_err()
+            .contains("successor was preserved")
+    );
+    {
+        let state = host.lock().unwrap();
+        let (original, owner) = &state.execution_startups[&accepted.agent.id];
+        assert_eq!(original, &intent);
+        assert!(Arc::ptr_eq(owner, &context));
+    }
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap(),
+        Some(successor)
+    );
+    fault
+        .execute(
+            "UPDATE agent_launches SET source = ?2 WHERE agent = ?1",
+            rusqlite::params![
+                accepted.agent.id.to_string(),
+                serde_json::to_string(&intent).unwrap()
+            ],
+        )
+        .unwrap();
     finish_ordinary_startups(&host).unwrap();
     assert!(host.lock().unwrap().execution_startups.is_empty());
     assert_eq!(

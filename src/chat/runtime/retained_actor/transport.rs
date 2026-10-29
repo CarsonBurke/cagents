@@ -241,16 +241,22 @@ struct StartupProgress {
     outcome: chat::protocol::LaunchOutcome,
     ordinary_deferred: bool,
 }
+struct RetainedChild {
+    _child: std::process::Child,
+    diagnostic: String,
+}
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
     cancelled: AtomicBool,
     progress: Mutex<StartupProgress>,
     finished: std::sync::Condvar,
-    // An unexpected watcher-admission loss must never drop the original Child
-    // and leave only a PID. This retained custody cannot publish wait proof.
-    unwatched_child: Mutex<Option<std::process::Child>>,
+    // Watcher-admission loss or a failed wait must never drop the original
+    // Child and leave only a PID. Retained custody cannot publish wait proof.
+    unwatched_child: Mutex<Option<RetainedChild>>,
     #[cfg(test)]
     cleanup_waiters: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_next_wait: AtomicBool,
 }
 #[cfg(test)]
 struct CleanupWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -305,7 +311,35 @@ impl StartupOwner {
         &self,
         mut child: std::process::Child,
     ) -> Result<std::process::ExitStatus, String> {
-        let waited = child.wait().map_err(|error| error.to_string());
+        #[cfg(not(test))]
+        let waited = child.wait();
+        #[cfg(test)]
+        let waited = if self.fail_next_wait.swap(false, Ordering::AcqRel) {
+            // Failure injection can only retain real custody. It cannot
+            // fabricate a child status or publish successful teardown.
+            Err(std::io::Error::other(
+                "fixture refused the original wait before syscall",
+            ))
+        } else {
+            child.wait()
+        };
+        let waited = match waited {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                let diagnostic = format!(
+                    "Original retained actor Child.wait failed: {error}; exact Child custody is retained without an automatic retry or cleanup proof"
+                );
+                *self
+                    .unwatched_child
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(RetainedChild {
+                    _child: child,
+                    diagnostic: diagnostic.clone(),
+                });
+                self.publish_outcome(chat::protocol::LaunchOutcome::Uncertain);
+                Err(diagnostic)
+            }
+        };
         if waited
             .as_ref()
             .is_ok_and(|status| status.code() == Some(73))
@@ -325,7 +359,10 @@ impl StartupOwner {
             *self
                 .unwatched_child
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(error.0);
+                .unwrap_or_else(|p| p.into_inner()) = Some(RetainedChild {
+                _child: error.0,
+                diagnostic: "Retained actor startup lost its exact child reaper; original child custody is retained".into(),
+            });
             self.cancelled.store(true, Ordering::Release);
             self.cancel_control();
             crate::daemon::wake();
@@ -418,7 +455,7 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|_| "Retained actor startup lost its exact child reaper; original child custody is retained".into())
+            .map(|retained| retained.diagnostic.clone())
     }
     #[cfg(test)]
     fn cleanup_waiters_for_test(&self) -> usize {
@@ -1034,6 +1071,8 @@ impl RemoteActor {
             unwatched_child: Mutex::new(None),
             #[cfg(test)]
             cleanup_waiters: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_wait: AtomicBool::new(false),
         });
         let mut attempt = StartupAttempt {
             owner: owner.clone(),

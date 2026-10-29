@@ -880,6 +880,7 @@ fn restore_actor(
 ) -> Result<ServerResponse, String> {
     if let Some(capture) = shutdown {
         capture.require_reserved_host(host)?;
+        capture.require_live_adoption()?;
     }
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
@@ -1183,7 +1184,7 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None, None, None, false)
+    close_with_target(host, requested, discovered, None, None, None, false, false)
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -1193,7 +1194,16 @@ pub(super) fn close_captured(
     target: &super::CloseTarget,
     closing: Option<&super::capacity::Reservation>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target), closing, None, false)
+    close_with_target(
+        host,
+        requested,
+        None,
+        Some(target),
+        closing,
+        None,
+        false,
+        false,
+    )
 }
 
 fn close_with_target(
@@ -1204,6 +1214,7 @@ fn close_with_target(
     closing: Option<&super::capacity::Reservation>,
     shutdown: Option<&startup_shutdown::Capture>,
     retain_startup: bool,
+    retired_only: bool,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -1228,6 +1239,7 @@ fn close_with_target(
             )
             || state.chat_handoffs.contains_key(&requested.id)
             || state.native_closing.contains_key(&requested.id)
+            || (retired_only && state.chats.contains_key(&requested.id))
         {
             return Err("Native ownership changed or another exact transition is pending".into());
         }
@@ -1258,6 +1270,9 @@ fn close_with_target(
         if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
             return close_verified_unattached(host, requested, &proof, verified, shutdown);
         }
+        if retired_only {
+            return Err("The captured failed target lacks exact durable verified retirement; live adoption was refused".into());
+        }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
             return Err(
@@ -1275,6 +1290,9 @@ fn close_with_target(
             None,
             shutdown,
         )?;
+    }
+    if retired_only {
+        return Err("A HOST attachment appeared during receipt-only failed-target cleanup".into());
     }
     let (handle, source, paired, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());

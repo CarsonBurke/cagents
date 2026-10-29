@@ -42,6 +42,13 @@ impl StartupBinding {
         let token = snapshot
             .token
             .ok_or("The transferred startup lost its exact owner generation")?;
+        if pending.failed_close.as_ref().is_some_and(|failed| {
+            failed.instance != identity.instance
+                || failed.source.id != pending.source.id
+                || failed.handle.actor_identity().as_ref() != Some(&identity)
+        }) {
+            return Err("The failed startup target belongs to another exact semantic actor".into());
+        }
         Ok(Self {
             source: pending.source.clone(),
             requested: pending.requested.clone(),
@@ -82,6 +89,14 @@ impl StartupBinding {
             return Err(
                 "The captured startup source, context, actor or failed attachment changed".into(),
             );
+        }
+        if self.failed_close.as_ref().is_some_and(|failed| {
+            state
+                .chats
+                .get(&self.source.id)
+                .is_some_and(|record| !failed.matches(record))
+        }) {
+            return Err("The failed startup's exact semantic attachment changed".into());
         }
         Ok(())
     }
@@ -201,6 +216,10 @@ pub(in crate::host) struct Capture {
     startup: Option<StartupBinding>,
     execution: Option<ExecutionBinding>,
     target: Option<super::super::CloseTarget>,
+    /// A normal close can retire its HOST record before the original child
+    /// wait completes. Preserve that exact failed attachment, but permit only
+    /// its verified retirement capsule; no live attachment may replace it.
+    retired_target: Option<super::super::CloseTarget>,
 }
 
 pub(in crate::host) fn capture_startup(
@@ -222,11 +241,12 @@ pub(in crate::host) fn capture_startup(
             }
             Some(super::super::CloseTarget::from_record(record))
         }
-        None if startup.failed_close.is_some() => {
-            return Err("The failed startup lost its exact semantic attachment".into());
-        }
         None => None,
     };
+    let retired_target = target
+        .is_none()
+        .then(|| startup.failed_close.clone())
+        .flatten();
     let capture = Capture {
         proof: state.proof().clone(),
         source: pending.source.clone(),
@@ -235,6 +255,7 @@ pub(in crate::host) fn capture_startup(
         startup: Some(startup),
         execution: None,
         target,
+        retired_target,
     };
     // Cancellation is requested outside HOST after capture, so the latch is
     // checked when the capability is used rather than while it is minted.
@@ -282,6 +303,7 @@ pub(in crate::host) fn capture_hosted(
         startup,
         execution: None,
         target: Some(super::super::CloseTarget::from_record(record)),
+        retired_target: None,
     };
     capture.require_ordinary_intent(state)?;
     Ok(capture)
@@ -314,13 +336,14 @@ pub(in crate::host) fn capture_execution(
             Ok(super::super::CloseTarget::from_record(record))
         })
         .transpose()?;
-    if target.is_none()
-        && startup
-            .as_ref()
-            .is_some_and(|startup| startup.failed_close.is_some())
-    {
-        return Err("The execution startup lost its exact failed attachment".into());
-    }
+    let retired_target = target
+        .is_none()
+        .then(|| {
+            startup
+                .as_ref()
+                .and_then(|startup| startup.failed_close.clone())
+        })
+        .flatten();
     let capture = Capture {
         proof: state.proof().clone(),
         source: startup
@@ -331,6 +354,7 @@ pub(in crate::host) fn capture_execution(
         startup,
         execution: Some(execution),
         target,
+        retired_target,
     };
     capture.require_ordinary_intent(state)?;
     Ok(capture)
@@ -391,6 +415,11 @@ impl Capture {
         }) {
             return Err("The captured current semantic attachment changed".into());
         }
+        if self.retired_target.is_some() && state.chats.contains_key(&self.source.id) {
+            return Err(
+                "A HOST attachment appeared after exact failed-target retirement capture".into(),
+            );
+        }
         if state.chats.get(&self.source.id).is_some_and(|record| {
             record.execution_instance != self.identity.instance
                 || record.handle.actor_identity().as_ref() != Some(&self.identity)
@@ -403,6 +432,7 @@ impl Capture {
     fn cleanup_source(&self) -> &Session {
         self.target
             .as_ref()
+            .or(self.retired_target.as_ref())
             .map_or(&self.source, |target| &target.source)
     }
 
@@ -424,6 +454,13 @@ impl Capture {
 
     pub(super) fn require_host(&self, host: &SharedHost) -> Result<(), String> {
         self.require_state(&host.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(super) fn require_live_adoption(&self) -> Result<(), String> {
+        if self.retired_target.is_some() {
+            return Err("The captured failed target permits verified retirement only; live adoption was refused".into());
+        }
+        Ok(())
     }
 
     pub(super) fn inherit_original_helper(&self, handle: &Handle) -> Result<(), String> {
@@ -459,6 +496,15 @@ impl Capture {
         } else if issued != &self.source && !aliases.contains(&self.source) {
             return Err("The authenticated actor does not recognize its captured source".into());
         }
+        if self
+            .retired_target
+            .as_ref()
+            .is_some_and(|failed| issued != &failed.source && !aliases.contains(&failed.source))
+        {
+            return Err(
+                "The verified actor does not recognize the exact retired failed target".into(),
+            );
+        }
         Ok(())
     }
 
@@ -472,6 +518,7 @@ impl Capture {
         installed: bool,
     ) -> Result<(), String> {
         self.require_host(host)?;
+        self.require_live_adoption()?;
         self.require_inspection(identity, issued, aliases)?;
         if self.startup.is_none() && self.execution.is_none() {
             // Ordinary hosted cleanup never gains a missing ownership row.
@@ -486,6 +533,12 @@ impl Capture {
 /// the original helper's separate Child.wait may still need to be polled.
 pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(), String> {
     capture.require_host(host)?;
+    if capture.retired_target.is_some() {
+        require_verified_failed_retirement(
+            capture,
+            Handle::inspect_retained_retirement(&capture.identity.record, &capture.proof)?,
+        )?;
+    }
     let requested = capture.cleanup_source();
     close_with_target(
         host,
@@ -495,6 +548,7 @@ pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(
         None,
         Some(capture),
         true,
+        capture.retired_target.is_some(),
     )
 }
 
@@ -503,18 +557,7 @@ pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(
 /// usable after live discovery disappears; no disappearance is itself proof.
 pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Result<(), String> {
     let binding = StartupBinding::capture(pending)?;
-    cleanup_normal_bound(host, &binding, |state| {
-        binding.require_state(state)?;
-        if binding.failed_close.as_ref().is_some_and(|failed| {
-            state
-                .chats
-                .get(&binding.source.id)
-                .is_some_and(|record| !failed.matches(record))
-        }) {
-            return Err("The failed startup's exact semantic attachment changed".into());
-        }
-        Ok(())
-    })?;
+    cleanup_normal_bound(host, &binding, |state| binding.require_state(state))?;
     binding.forget_proved(host)
 }
 
@@ -563,7 +606,7 @@ fn cleanup_normal_bound(
     binding: &StartupBinding,
     require_owner: impl Fn(&HostState) -> Result<(), String>,
 ) -> Result<(), String> {
-    let proof = {
+    let (proof, retired_only, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_owner(&state)?;
         if !binding.owner_is_current()
@@ -572,12 +615,53 @@ fn cleanup_normal_bound(
         {
             return Err("The pending startup is still transitioning or shutting down".into());
         }
-        state.proof().clone()
+        let target = state
+            .chats
+            .get(&binding.source.id)
+            .map(super::super::CloseTarget::from_record);
+        if binding.failed_close.as_ref().is_some_and(|failed| {
+            state
+                .chats
+                .get(&binding.source.id)
+                .is_some_and(|record| !failed.matches(record))
+        }) {
+            return Err("The failed startup's exact semantic attachment changed".into());
+        }
+        (
+            state.proof().clone(),
+            binding.failed_close.is_some() && target.is_none(),
+            target,
+        )
     };
-    if matches!(
-        Handle::inspect_retained_retirement(&binding.identity.record, &proof)?,
-        RetirementInspection::Running
-    ) {
+    let retirement = Handle::inspect_retained_retirement(&binding.identity.record, &proof)?;
+    if retired_only {
+        match &retirement {
+            RetirementInspection::Verified(verified) => {
+                let receipt = verified.receipt();
+                binding.require_inspection(
+                    &receipt.identity,
+                    &receipt.source,
+                    &receipt.previous_sources,
+                )?;
+                let failed = binding
+                    .failed_close
+                    .as_ref()
+                    .expect("retired-only mode requires exact failed target");
+                if receipt.source != failed.source
+                    && !receipt.previous_sources.contains(&failed.source)
+                {
+                    return Err(
+                        "The verified receipt does not recognize the exact failed startup target"
+                            .into(),
+                    );
+                }
+            }
+            RetirementInspection::Running | RetirementInspection::ExitedUnproved => {
+                return Err("The absent failed startup target requires exact verified retirement; live adoption was refused".into());
+            }
+        }
+    }
+    if matches!(retirement, RetirementInspection::Running) {
         let inspection = Handle::inspect_remote(&binding.identity.record, proof.clone())?;
         binding.require_inspection(
             &inspection.identity,
@@ -607,14 +691,19 @@ fn cleanup_normal_bound(
             inspection.state.installed,
         )?;
     }
+    let requested = target
+        .as_ref()
+        .or(binding.failed_close.as_ref())
+        .map_or(&binding.source, |target| &target.source);
     close_with_target(
         host,
-        &binding.source,
+        requested,
         Some(binding.identity.record.clone()),
-        None,
+        target.as_ref(),
         None,
         None,
         true,
+        retired_only,
     )?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     require_owner(&state)?;
@@ -632,6 +721,21 @@ fn cleanup_normal_bound(
         );
     }
     Ok(())
+}
+
+fn require_verified_failed_retirement(
+    capture: &Capture,
+    retirement: RetirementInspection,
+) -> Result<(), String> {
+    let RetirementInspection::Verified(verified) = retirement else {
+        return Err("The absent failed startup target requires exact verified retirement; live adoption was refused".into());
+    };
+    let receipt = verified.receipt();
+    capture.require_inspection(
+        &receipt.identity,
+        &receipt.source,
+        &receipt.previous_sources,
+    )
 }
 
 #[cfg(test)]

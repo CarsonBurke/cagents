@@ -1813,41 +1813,15 @@ fn start_with_execution(
                         // record and semantic consumer until normal Close commits all
                         // attention/loss evidence, retires the helper and revokes its
                         // authority. A successful attachment must not hide SDK exit.
-                        let target = {
-                            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                            if state.shutting_down {
-                                return Err(unavailable(format!(
-                                    "{message}. Ordinary shutdown retains the exact semantic cleanup owner"
-                                )));
-                            }
-                            let record = state.chats.get(&id).ok_or_else(|| {
-                                unavailable("The unconfirmed conversation lost its cleanup owner")
-                            })?;
-                            if !record.handle.same_attachment(&installed_handle) {
-                                // A new authenticated proxy for this very same
-                                // installed actor owns cleanup now. Release
-                                // only this obsolete startup reservation; a
-                                // different actor keeps its original evidence.
-                                let same_actor = record.execution_instance == execution_instance
-                                    && record.handle.same_actor(&installed_handle);
-                                drop(state);
-                                if same_actor && let Some(context) = &execution {
-                                    retained_actor::forget_startup(host, &startup_source, context);
-                                }
-                                return Err(unavailable(
-                                    "The unconfirmed conversation changed its owner",
-                                ));
-                            }
-                            let target = CloseTarget::from_record(record);
-                            let pending =
-                                state.native_actor_startups.get_mut(&id).ok_or_else(|| {
-                                    unavailable(
-                                        "The unconfirmed conversation lost its startup reservation",
-                                    )
-                                })?;
-                            pending.failed_close = Some(target.clone());
-                            target
-                        };
+                        let target = capture_failed_startup_close(
+                            host,
+                            &installed_handle,
+                            execution_instance,
+                            &startup_source,
+                            &requested_source,
+                            execution.as_ref(),
+                            &message,
+                        )?;
                         // Publication now owns capacity. Do not hold the startup
                         // reservation while normal Close takes its own exact fence.
                         drop(admission.take());
@@ -1874,6 +1848,69 @@ fn start_with_execution(
     })();
     drop(admission);
     result
+}
+
+/// Publish failed named confirmation only while the original exact startup
+/// and attachment still own this transition. Ordinary intent freezes the
+/// captured failed-target state before this HOST transaction can mutate it.
+fn capture_failed_startup_close(
+    host: &SharedHost,
+    installed_handle: &Handle,
+    execution_instance: uuid::Uuid,
+    startup_source: &Session,
+    requested_source: &Session,
+    context: Option<&Arc<chat::protocol::ExecutionContext>>,
+    message: &str,
+) -> Result<CloseTarget, ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down {
+        return Err(unavailable(format!(
+            "{message}. Ordinary shutdown retains the exact semantic cleanup owner"
+        )));
+    }
+    let record = state
+        .chats
+        .get(&startup_source.id)
+        .ok_or_else(|| unavailable("The unconfirmed conversation lost its cleanup owner"))?;
+    if !record.handle.same_attachment(installed_handle) {
+        // A new authenticated proxy for this very same installed actor owns
+        // cleanup now. Release only this obsolete startup reservation; a
+        // different actor keeps its original evidence.
+        let same_actor = record.execution_instance == execution_instance
+            && record.handle.same_actor(installed_handle);
+        drop(state);
+        if same_actor && let Some(context) = context {
+            retained_actor::forget_startup(host, startup_source, context);
+        }
+        return Err(unavailable(
+            "The unconfirmed conversation changed its owner",
+        ));
+    }
+    if record.execution_instance != execution_instance {
+        return Err(unavailable(
+            "The unconfirmed conversation changed its owner",
+        ));
+    }
+    let target = CloseTarget::from_record(record);
+    let pending = state
+        .native_actor_startups
+        .get_mut(&startup_source.id)
+        .ok_or_else(|| unavailable("The unconfirmed conversation lost its startup reservation"))?;
+    if pending.source != *startup_source
+        || pending.requested != *requested_source
+        || context.is_none_or(|context| !Arc::ptr_eq(&pending.context, context))
+        || pending.failed_close.as_ref().is_some_and(|failed| {
+            failed.source != target.source
+                || failed.instance != target.instance
+                || !failed.handle.same_attachment(&target.handle)
+        })
+    {
+        return Err(unavailable(
+            "The unconfirmed conversation changed its startup reservation",
+        ));
+    }
+    pending.failed_close = Some(target.clone());
+    Ok(target)
 }
 
 /// Attach a CLI view without stopping the server-owned thread or its native
