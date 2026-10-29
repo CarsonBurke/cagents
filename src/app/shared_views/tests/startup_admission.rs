@@ -758,27 +758,49 @@ fn verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof() {
 }
 
 #[test]
-fn retirement_witness_requires_the_full_issuer_before_canonical_admission() {
-    let (mut app, mut full, pane) = validated_retirement_fixture();
-    // Return to a raw canonical snapshot, but change only the issuing thread
-    // before admission. Process-level equality cannot mint this source receipt.
-    full.views[1].panes.push(pane.clone());
-    full.views[1].retired.clear();
-    app.shared_views.validated_managed.clear();
-    let Some(crate::agent_execution::HostedSession::Chat(issuer)) = &mut full.agents[0].session
-    else {
-        unreachable!()
-    };
-    issuer.launch.session_id = Some("different-before-admission".into());
-    assert!(app.install_workspace_model_snapshot(full.clone()));
-    assert!(!app.shared_views.validated_managed.contains_key(&pane.id));
-    full.views[1]
-        .apply(&Change::Remove { id: pane.id })
-        .unwrap();
-    full.views[1].revision += 1;
-    full.sequence += 1;
-    assert!(app.install_workspace_model_snapshot(full));
-    assert!(app.pane_is_quarantined(pane.id));
+fn retirement_witness_binds_canonical_metadata_and_issuer_separately() {
+    for metadata in 0..2 {
+        let (mut app, mut full, mut pane) = validated_retirement_fixture();
+        // Provider observations enrich the shared pane without rewriting the
+        // Agent's issued descriptor. Both records must keep their own identity.
+        let CardKind::Chat(source) = &mut pane.kind else {
+            unreachable!()
+        };
+        if metadata == 0 {
+            source.launch.session_id = Some("00000000-0000-4000-8000-000000000099".into());
+        } else {
+            source.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        }
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+        let Some(crate::agent_execution::HostedSession::Chat(issuer)) = &mut full.agents[0].session
+        else {
+            unreachable!()
+        };
+        issuer.launch.session_id = None;
+        full.views[1].panes.push(pane.clone());
+        full.views[1].retired.clear();
+        assert!(app.install_workspace_model_snapshot(full.clone()));
+        assert!(!app.pane_is_quarantined(pane.id));
+        assert!(app.shared_views.validated_managed.contains_key(&pane.id));
+        full.views[1]
+            .apply(&Change::Remove { id: pane.id })
+            .unwrap();
+        full.views[1].revision += 1;
+        full.sequence += 1;
+        assert!(app.install_workspace_model_snapshot(full.clone()));
+        app.refresh_managed_pane_quarantine(&full);
+        assert!(!app.pane_is_quarantined(pane.id));
+        app.card_state_mut(pane.id).unwrap().existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        app.shared_views.validated_managed.clear();
+        app.refresh_managed_pane_quarantine(&full);
+        assert!(!app.pane_is_quarantined(pane.id));
+    }
 }
 
 #[test]

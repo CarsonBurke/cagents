@@ -67,7 +67,10 @@ fn exact_issued_terminal_end_source(before: &TerminalSession, current: &Terminal
         && before.predecessor == current.predecessor
 }
 
-fn exact_issued_managed_source(
+/// Process ownership allows independently published thread/presentation metadata.
+/// Retirement separately binds the full pane and full issuer to their own
+/// verified snapshot values; neither descriptor substitutes for the other.
+fn managed_issued_source_matches(
     issued: &crate::agent_execution::HostedSession,
     current: &CardKind,
 ) -> bool {
@@ -78,14 +81,15 @@ fn exact_issued_managed_source(
                 .proof
                 .as_ref()
                 .is_some_and(crate::model::HostSessionProof::is_complete)
-                && issued == current
+                && crate::agent_execution::same_chat_process(issued, current)
         }
         (HostedSession::Terminal(issued), CardKind::Terminal(current)) => {
             issued
                 .continuity
                 .live_proof()
                 .is_some_and(|proof| proof.is_complete())
-                && (issued == current || exact_issued_terminal_end_source(issued, current))
+                && (crate::agent_execution::same_terminal_process(issued, current)
+                    || exact_issued_terminal_end_source(issued, current))
         }
         _ => false,
     }
@@ -208,11 +212,12 @@ fn quarantined_managed_panes(
         agent
             .session
             .as_ref()
-            .is_some_and(|issued| exact_issued_managed_source(issued, &pane.kind))
+            .is_some_and(|issued| managed_issued_source_matches(issued, &pane.kind))
             || agent.console.as_ref().is_some_and(|issued| {
                 matches!(&pane.kind, CardKind::Terminal(current)
                     if issued.continuity.live_proof().is_some_and(|proof| proof.is_complete())
-                        && (issued == current || exact_issued_terminal_end_source(issued, current)))
+                        && (crate::agent_execution::same_terminal_process(issued, current)
+                    || exact_issued_terminal_end_source(issued, current)))
             })
     };
     let scope_matches_issuer = |scope: &Scope, agent: &crate::agent_execution::Agent| match scope {
@@ -322,7 +327,7 @@ fn quarantined_managed_panes(
                 && agent.spec.target.repository == witness.repository
                 && witness.issuer.has_complete_proof()
                 && exact_issuer(agent, &witness.issuer)
-                && exact_issued_managed_source(&witness.issuer, &pane.kind)
+                && managed_issued_source_matches(&witness.issuer, &pane.kind)
                 && pane.kind == witness.source
                 && pane.scope == witness.path
                 && local_scope_matches
@@ -479,7 +484,7 @@ fn quarantined_managed_panes(
                 && witness.placement == *placement
                 && witness.repository == managed[&pane.id].unwrap().spec.target.repository
                 && exact_issuer(managed[&pane.id].unwrap(), &witness.issuer)
-                && exact_issued_managed_source(&witness.issuer, &pane.kind)
+                && managed_issued_source_matches(&witness.issuer, &pane.kind)
                 && witness.source == pane.kind
                 && witness.path == path
             {
@@ -499,7 +504,7 @@ fn quarantined_managed_panes(
                     _ => None,
                 };
                 let Some(issuer) =
-                    issuer.filter(|issued| exact_issued_managed_source(issued, &pane.kind))
+                    issuer.filter(|issued| managed_issued_source_matches(issued, &pane.kind))
                 else {
                     continue;
                 };
