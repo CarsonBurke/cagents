@@ -27,7 +27,9 @@ OUT = Path(os.environ['MENU_EVIDENCE_ROOT']).resolve()
 TARGET = Path(os.environ['CARGO_TARGET_DIR']).resolve()
 EVENTS, COMMANDS, ARMS, OWNED, CHILDREN = [], [], [], {}, []
 ACTIVE, CRITICAL = None, False
-PIXEL_MENU, CAPTURES, CANCEL_SIGNAL = None, {}, None
+PIXEL_MENU, CAPTURES, CANCEL_SIGNAL, SCREEN = None, {}, None, None
+CLIENT_RECT = None
+A11Y_READ, A11Y_QUERIES = None, []
 original_home, original_codex_home = os.environ.get('HOME'), os.environ.get('CODEX_HOME')
 menu_cargo_cache = os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))
 menu_rustup_cache = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
@@ -131,7 +133,8 @@ def cmd(args, env=None, cwd=None, timeout=20, expected=0):
         ocr_read = (ACTIVE in ('before', 'after') and len(args) == 10 and args[0] == 'tesseract' and
             args[2:] == ['stdout', '-l', 'eng', '--psm', '11', '--oem', '1', 'tsv'] and
             Path(args[1]).resolve() in CAPTURES and CAPTURES[Path(args[1]).resolve()]['arm'] == ACTIVE)
-        assert ocr_read or args[:2] == ['import', '-window'] or (args[0] == 'xdotool' and args[1] in
+        pixel_read = len(args) == 4 and args[:2] == ['import', '-window']
+        assert ocr_read or pixel_read or (args[0] == 'xdotool' and args[1] in
             ('getwindowgeometry', 'getmouselocation', 'getwindowfocus')), 'UI repair command refused during wheel→activation'
     directory = OUT / 'commands' / f'{len(COMMANDS):05d}'
     directory.mkdir(parents=True)
@@ -185,6 +188,50 @@ def source(root, pin):
     return record
 
 
+def stale_a11y(error):
+    get_name = getattr(error, 'get_dbus_name', None)
+    if callable(get_name) and get_name() == 'org.freedesktop.DBus.Error.UnknownObject':
+        return True
+    return (isinstance(error, GLib.Error) and error.domain == 'atspi_error' and error.code == 1 and
+            re.fullmatch(r"Unknown object '/org/a11y/atspi/(?:accessible|cache)(?:/[A-Za-z0-9_]+)*'", error.message) is not None)
+
+
+def a11y_read(function):
+    # Only decorate complete, read-only queries. Never an input/gesture/reset.
+    def query(*args, **kwargs):
+        global A11Y_READ
+        if A11Y_READ is not None:
+            return function(*args, **kwargs)
+        record = dict(query=function.__name__, arm=ACTIVE, started=time.monotonic(), attempts=[])
+        A11Y_QUERIES.append(record)
+        A11Y_READ = record
+        deadline = time.monotonic() + 5
+        try:
+            for attempt in range(3):
+                if CANCEL_SIGNAL is not None:
+                    raise QualificationCancelled('Cancelled accessibility query')
+                assert attempt == 0 or time.monotonic() < deadline, 'Whole accessibility query retry deadline exceeded'
+                try:
+                    value = function(*args, **kwargs)
+                    record['attempts'].append(dict(attempt=attempt+1, status='complete'))
+                    return value
+                except Exception as error:
+                    get_name = getattr(error, 'get_dbus_name', None)
+                    name = get_name() if callable(get_name) else None
+                    record['attempts'].append(dict(attempt=attempt+1, type=type(error).__name__, name=name, error=str(error)))
+                    if CANCEL_SIGNAL is not None:
+                        raise QualificationCancelled('Cancelled accessibility query') from error
+                    if not stale_a11y(error) or attempt == 2 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+        finally:
+            record['returned'] = time.monotonic()
+            put(OUT / 'accessibility-queries.json', A11Y_QUERIES)
+            A11Y_READ = None
+    return query
+
+
+@a11y_read
 def tree(pid):
     desktop = pyatspi.Registry.getDesktop(0)
     apps = [desktop.getChildAtIndex(i) for i in range(desktop.childCount)]
@@ -203,9 +250,12 @@ def tree(pid):
 
 class PixelRow:
     """An explicit OCR observation, never an accessibility node or product fixture."""
-    def __init__(self, row):
-        self.name, self.native_bounds = row['text'], tuple(row['bounds'])
+    def __init__(self, row, geometry):
+        b = row['bounds']
+        self.name = row['text']
+        self.native_bounds = (b[0]+geometry['X'], b[1]+geometry['Y'], b[2], b[3])
         self.observation = row
+        self.client_geometry = geometry
 
 
 def tsv_lines(raw, size):
@@ -224,7 +274,7 @@ def tsv_lines(raw, size):
         identities.add(identity)
         confidence = float(row['conf'])
         bounds = tuple(int(row[name]) for name in ('left', 'top', 'width', 'height'))
-        assert math.isfinite(confidence) and 0 <= confidence <= 100 and on_screen(bounds, size)
+        assert math.isfinite(confidence) and 0 <= confidence <= 100 and on_screen(bounds, size, origin=(0, 0))
         assert not any(ord(character) < 32 for character in row['text'])
         grouped.setdefault(key, []).append(dict(text=row['text'], bounds=bounds, confidence=confidence, word_num=identity[-1]))
     result = []
@@ -304,7 +354,7 @@ class NativeMenuPixels:
     def lookup(self, label):
         frame = self.read('lookup')
         row = exact_pixel_label(frame['menu_rows'], label)
-        return PixelRow(row) if row else None
+        return PixelRow(row, frame['capture']['geometry']) if row else None
 
     def open(self, inputs, rect):
         assert not CRITICAL and not self.opened
@@ -365,7 +415,8 @@ class NativeMenuPixels:
         first = exact_pixel_label(self.last['menu_rows'], 'Open folder')
         assert first
         b = first['bounds']
-        wheel_point = (b[0]+b[2]//2, b[1]+b[3]//2)
+        origin = self.last['capture']['geometry']
+        wheel_point = (origin['X']+b[0]+b[2]//2, origin['Y']+b[1]+b[3]//2)
         inputs.move(*wheel_point)
         seen, slices, event_start = set(), [], len(EVENTS)
         final = None
@@ -400,7 +451,8 @@ class NativeMenuPixels:
         final = exact_pixel_label(frame['menu_rows'], 'Remove project…')
         assert final, 'Previously reached row became unavailable; no coordinate repair'
         b = final['bounds']
-        point = (b[0]+b[2]//2, b[1]+b[3]//2)
+        origin = frame['capture']['geometry']
+        point = (origin['X']+b[0]+b[2]//2, origin['Y']+b[1]+b[3]//2)
         put(OUT / (label + '-calibration.json'), dict(anchor=rect, stationary_point=point, final_bounds=b,
             coordinate_source='This arm native PNG/TSV only', arm=self.arm, observed_editor_labels=sorted(seen), slices=slices))
         inputs.key('Escape')
@@ -430,12 +482,14 @@ def describe(node):
     return row
 
 
+@a11y_read
 def snapshot(pid, name):
     nodes = tree(pid)
     assert nodes, 'PID-filtered native accessibility tree disappeared'
     put(OUT / (name + '-a11y.json'), dict(pid=pid, monotonic=time.monotonic(), nodes=[describe(node) for node in nodes]))
 
 
+@a11y_read
 def unique(pid, name, enabled=True):
     if name in M['menu_labels']:
         assert PIXEL_MENU is not None and PIXEL_MENU.arm == ACTIVE, 'Menu labels require this arm native pixels'
@@ -452,8 +506,7 @@ def query(tool):
 
 
 def geometry(window):
-    data = dict(line.split('=', 1) for line in query(['getwindowgeometry', '--shell', window]).splitlines() if '=' in line)
-    return {key: int(data[key]) for key in ('X', 'Y', 'WIDTH', 'HEIGHT', 'SCREEN')}
+    return SCREEN.client(window)
 
 
 def pointer():
@@ -461,22 +514,188 @@ def pointer():
     return {key: int(data[key]) for key in ('X', 'Y', 'SCREEN')}
 
 
+def pixel_metrics(image):
+    rgb = image.convert('RGB')
+    luminance = rgb.convert('L')
+    histogram = luminance.histogram()
+    count = sum(histogram)
+    mean = sum(value*number for value, number in enumerate(histogram))/count
+    deviation = math.sqrt(sum(number*(value-mean)**2 for value, number in enumerate(histogram))/count)
+    occupied = [value for value, number in enumerate(histogram) if number]
+    colors = rgb.getcolors(maxcolors=256)
+    return dict(luminance_min=occupied[0], luminance_max=occupied[-1], luminance_stddev=deviation,
+                nonblack_fraction=sum(histogram[9:])/count, distinct_rgb_colors=len(colors) if colors is not None else 257)
+
+
+def nonblank(metrics):
+    thresholds = M['capture']['nonblank']
+    return (metrics['luminance_max']-metrics['luminance_min'] >= thresholds['minimum_luminance_span'] and
+            metrics['luminance_stddev'] >= thresholds['minimum_luminance_stddev'] and
+            metrics['nonblack_fraction'] >= thresholds['minimum_nonblack_fraction'] and
+            metrics['distinct_rgb_colors'] >= thresholds['minimum_distinct_rgb_colors'])
+
+
 def capture(window, name, size):
-    # Pure pixel read: never resize/move/focus/change pointer or invoke AT-SPI actions.
-    actual, point = geometry(window), pointer()
-    assert (actual['WIDTH'], actual['HEIGHT']) == size
-    png = OUT / (name + '.png')
-    cmd(['import', '-window', window, png])
-    with Image.open(png) as image:
-        assert image.size == size
-        image.save(OUT / (name + '.webp'), lossless=True)
-    assert geometry(window) == actual and pointer() == point
-    result = dict(geometry=actual, pointer=point, png_sha256=digest(png), webp_sha256=digest(OUT / (name + '.webp')),
-                  monotonic=time.monotonic(), critical=CRITICAL, capture='Actual native pixels, lossless WebP, no resize')
-    result.update(arm=ACTIVE, window=window)
-    CAPTURES[png.resolve()] = result
+    # Pure visible-screen pixels: no resize/move/focus/pointer or accessibility action.
+    state, point, focus = SCREEN.state(window), pointer(), query(['getwindowfocus'])
+    actual = state['client']
+    result = dict(arm=ACTIVE, window=window, geometry=actual, pointer=point, focus=focus,
+        x11_before=state, xdotool_relative_diagnostic=geometry_diagnostic(window), critical=CRITICAL,
+        capture='Visible root pixels cropped at independently verified absolute client bounds; no scale/repair')
     put(OUT / (name + '-capture.json'), result)
+    root_png, direct_png, png = (OUT / (name + suffix) for suffix in ('-root.png', '-drawable-diagnostic.png', '.png'))
+    cmd(['import', '-window', 'root', root_png])
+    direct_command = len(COMMANDS)
+    cmd(['import', '-window', window, direct_png], expected=None)
+    result.update(root_png_sha256=digest(root_png), drawable_command_index=direct_command,
+                  drawable_exit=COMMANDS[direct_command]['exit'])
+    if direct_png.exists():
+        result['drawable_png_sha256'] = digest(direct_png)
+        with Image.open(direct_png) as diagnostic:
+            result['drawable_size'] = diagnostic.size
+            result['drawable_metrics'] = pixel_metrics(diagnostic)
+    with Image.open(root_png) as root:
+        result['root_size'] = root.size
+        bounds = (actual['X'], actual['Y'], actual['X']+actual['WIDTH'], actual['Y']+actual['HEIGHT'])
+        result['client_crop_bounds'] = bounds
+        put(OUT / (name + '-capture.json'), result)
+        assert root.size == (state['root']['WIDTH'], state['root']['HEIGHT'])
+        assert on_screen((actual['X'], actual['Y'], actual['WIDTH'], actual['HEIGHT']), root.size, origin=(0, 0)), 'Client crop is outside visible root'
+        client = root.crop(bounds)
+        client.save(png)
+        client.save(OUT / (name + '.webp'), lossless=True)
+        result.update(client_crop_bounds=bounds, client_metrics=pixel_metrics(client), client_size=client.size)
+    result.update(x11_after=SCREEN.state(window), pointer_after=pointer(), focus_after=query(['getwindowfocus']),
+                  png_sha256=digest(png), webp_sha256=digest(OUT / (name + '.webp')), monotonic=time.monotonic())
+    put(OUT / (name + '-capture.json'), result)
+    assert actual == CLIENT_RECT and (actual['WIDTH'], actual['HEIGHT']) == size, 'Unexpected absolute client geometry'
+    assert result['client_size'] == size and not state['occluders'], 'Mapped sibling obscures the native client'
+    assert result['x11_after'] == state and result['pointer_after'] == point and result['focus_after'] == focus, 'Capture state changed'
+    assert nonblank(result['client_metrics']), 'Blank/ambiguous visible client pixels; no OCR or acceptance'
+    CAPTURES[png.resolve()] = result
     return result
+
+
+def geometry_diagnostic(window):
+    # xdotool may report parent-relative geometry under a reparenting WM; diagnostic only.
+    return query(['getwindowgeometry', '--shell', window])
+
+
+class WindowAttributes(ctypes.Structure):
+    # Xlib.h XWindowAttributes, including the fields needed to preserve ABI layout.
+    _fields_ = [(name, ctypes.c_int) for name in ('x', 'y', 'width', 'height', 'border_width', 'depth')] + [
+        ('visual', ctypes.c_void_p), ('root', ctypes.c_ulong), ('window_class', ctypes.c_int),
+        ('bit_gravity', ctypes.c_int), ('win_gravity', ctypes.c_int), ('backing_store', ctypes.c_int),
+        ('backing_planes', ctypes.c_ulong), ('backing_pixel', ctypes.c_ulong), ('save_under', ctypes.c_int),
+        ('colormap', ctypes.c_ulong), ('map_installed', ctypes.c_int), ('map_state', ctypes.c_int),
+        ('all_event_masks', ctypes.c_long), ('your_event_mask', ctypes.c_long), ('do_not_propagate_mask', ctypes.c_long),
+        ('override_redirect', ctypes.c_int), ('screen', ctypes.c_void_p)]
+
+
+class XError(ctypes.Structure):
+    _fields_ = [('type', ctypes.c_int), ('display', ctypes.c_void_p), ('resourceid', ctypes.c_ulong),
+                ('serial', ctypes.c_ulong), ('error_code', ctypes.c_ubyte), ('request_code', ctypes.c_ubyte), ('minor_code', ctypes.c_ubyte)]
+
+
+class NativeScreen:
+    """Read-only Xlib geometry/stacking queries; no geometry or focus mutations."""
+    def __init__(self):
+        self.x = ctypes.CDLL('libX11.so.6')
+        self.x.XOpenDisplay.argtypes, self.x.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
+        self.display = self.x.XOpenDisplay(None)
+        assert self.display
+        self.x.XDefaultRootWindow.argtypes, self.x.XDefaultRootWindow.restype = [ctypes.c_void_p], ctypes.c_ulong
+        self.root = self.x.XDefaultRootWindow(self.display)
+        self.x.XDefaultScreen.argtypes, self.x.XDefaultScreen.restype = [ctypes.c_void_p], ctypes.c_int
+        assert self.x.XDefaultScreen(self.display) == 0
+        self.x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(WindowAttributes)]
+        self.x.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+        self.x.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]
+        self.x.XFree.argtypes = [ctypes.c_void_p]
+        self.x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.x.XSetErrorHandler.argtypes, self.x.XSetErrorHandler.restype = [ctypes.c_void_p], ctypes.c_void_p
+        self.errors = []
+        def error(display, event):
+            e = event.contents
+            self.errors.append(dict(resource=e.resourceid, serial=e.serial, code=e.error_code,
+                request=e.request_code, minor=e.minor_code))
+            return 0
+        self.handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XError))(error)
+        self.previous = self.x.XSetErrorHandler(ctypes.cast(self.handler, ctypes.c_void_p))
+
+    def checked(self, status):
+        self.x.XSync(self.display, 0)
+        if self.errors:
+            put(OUT / 'x11-query-errors.json', self.errors)
+        assert status and not self.errors, 'Ambiguous/stale X11 query; no native capture acceptance'
+
+    def attributes(self, window):
+        a = WindowAttributes()
+        self.checked(self.x.XGetWindowAttributes(self.display, window, ctypes.byref(a)))
+        assert a.root == self.root
+        return a
+
+    def client(self, window):
+        window = int(window)
+        a = self.attributes(window)
+        x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        self.checked(self.x.XTranslateCoordinates(self.display, window, self.root, 0, 0,
+            ctypes.byref(x), ctypes.byref(y), ctypes.byref(child)))
+        assert a.map_state == 2 and a.window_class == 1, 'Client is not viewable InputOutput'
+        return dict(X=x.value, Y=y.value, WIDTH=a.width, HEIGHT=a.height, SCREEN=0)
+
+    def children(self, window):
+        root, parent, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        try:
+            self.checked(self.x.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
+                ctypes.byref(children), ctypes.byref(count)))
+            assert root.value == self.root and count.value < 10000
+            return parent.value, [children[i] for i in range(count.value)]
+        finally:
+            if children:
+                self.x.XFree(children)
+
+    def state(self, window):
+        client, root = self.client(window), self.client(self.root)
+        path, occluders, above = [int(window)], [], []
+        current = int(window)
+        while current != self.root:
+            assert len(path) <= 16, 'Ambiguous X11 ancestor chain'
+            parent, _ = self.children(current)
+            _, siblings = self.children(parent)
+            assert current in siblings and parent not in path
+            # XQueryTree returns siblings bottom-to-top; inspect every level,
+            # including WM frame/override-redirect windows absent from EWMH lists.
+            for sibling in siblings[siblings.index(current)+1:]:
+                a = self.attributes(sibling)
+                item = dict(window=sibling, parent=parent, map_state=a.map_state, window_class=a.window_class)
+                if a.map_state == 2 and a.window_class == 1:
+                    rect = self.client(sibling)
+                    # Include native borders as potential visible occluders.
+                    item['outer'] = dict(X=rect['X']-a.border_width, Y=rect['Y']-a.border_width,
+                        WIDTH=rect['WIDTH']+2*a.border_width, HEIGHT=rect['HEIGHT']+2*a.border_width)
+                    if rectangles_overlap(client, item['outer']):
+                        occluders.append(item)
+                above.append(item)
+            current = parent
+            path.append(current)
+        return dict(client=client, root=root, ancestor_path=path, siblings_above=above, occluders=occluders)
+
+    def close(self):
+        try:
+            self.checked(True)
+        finally:
+            self.x.XCloseDisplay(self.display)
+            self.x.XSetErrorHandler(self.previous)
+
+
+def rectangles_overlap(a, b):
+    return (a['X'] < b['X']+b['WIDTH'] and b['X'] < a['X']+a['WIDTH'] and
+            a['Y'] < b['Y']+b['HEIGHT'] and b['Y'] < a['Y']+a['HEIGHT'])
 
 
 class ClientData(ctypes.Union):
@@ -621,9 +840,12 @@ def inside(rect, point):
     return width > 0 and height > 0 and x <= point[0] < x + width and y <= point[1] < y + height
 
 
-def on_screen(rect, size):
+def on_screen(rect, size, origin=None):
     x, y, width, height = rect
-    return width > 0 and height > 0 and x >= 0 and y >= 0 and x + width <= size[0] and y + height <= size[1]
+    if origin is None:
+        origin = (CLIENT_RECT['X'], CLIENT_RECT['Y']) if CLIENT_RECT is not None else (0, 0)
+    return (width > 0 and height > 0 and x >= origin[0] and y >= origin[1]
+            and x+width <= origin[0]+size[0] and y+height <= origin[1]+size[1])
 
 
 def click_node(inputs, node):
@@ -683,35 +905,55 @@ def dismiss(inputs, pid):
     wait(lambda: menu_gone(pid) and unique(pid, 'Remove project from cagents?', False) is None)
 
 
+@a11y_read
 def search(pid):
     nodes = [node for node in tree(pid) if visible(node) and node.getState().contains(pyatspi.STATE_EDITABLE)
              and node.name == 'Search projects, branches, channels']
     return nodes[0] if len(nodes) == 1 else None
 
 
+@a11y_read
+def search_state(pid):
+    field = search(pid)
+    return dict(focused=field.getState().contains(pyatspi.STATE_FOCUSED), text=field.queryText().getText(0, -1)) if field else None
+
+
 def clear_search(inputs, pid):
     inputs.shortcut(['Control_L', 'Shift_L', 'f'])
     field = wait(lambda: search(pid))
-    wait(lambda: field.getState().contains(pyatspi.STATE_FOCUSED))
+    wait(lambda: (state := search_state(pid)) and state['focused'])
     inputs.shortcut(['Control_L', 'a'])
     inputs.key('BackSpace')
-    wait(lambda: field.queryText().getText(0, -1) == '')
+    wait(lambda: (state := search_state(pid)) and state['text'] == '')
     click_node(inputs, wait(lambda: unique(pid, 'Search projects')))
     wait(lambda: search(pid) is None)
 
 
+@a11y_read
+def project_rects(pid, size, lower_target=False):
+    name = 'Open project menu-project-12'
+    rows = [node for node in tree(pid) if node.name.startswith('Open project menu-project-') and visible(node) and on_screen(box(node), size)]
+    if lower_target:
+        rows = [node for node in rows if node.name == name and box(node)[1] >= CLIENT_RECT['Y']+size[1]*.55]
+    return [box(node) for node in rows]
+
+
+@a11y_read
+def project_present(pid):
+    return any(node.name.startswith('Open project menu-project-') for node in tree(pid))
+
+
 def anchor(inputs, pid, size):
     clear_search(inputs, pid)
-    rows = [node for node in tree(pid) if node.name.startswith('Open project menu-project-') and visible(node) and on_screen(box(node), size)]
+    rows = project_rects(pid, size)
     assert rows
-    x, y, width, height = box(rows[0])
+    x, y, width, height = rows[0]
     inputs.move(x + width // 2, y + height // 2)
     inputs.wheel(4, 60)
     for _ in range(40):
-        rows = [node for node in tree(pid) if node.name == 'Open project menu-project-12' and visible(node)
-                and on_screen(box(node), size) and box(node)[1] >= size[1] * .55]
+        rows = project_rects(pid, size, True)
         if len(rows) == 1:
-            rect = box(rows[0])
+            rect = rows[0]
             assert rect[2] >= 30 and rect[3] >= 10
             return rect
         inputs.wheel(5, 2)
@@ -731,6 +973,7 @@ def calibrate(inputs, pid, window, size, label):
     return PIXEL_MENU.calibrate(inputs, rect, label)
 
 
+@a11y_read
 def modal(pid, target, size, label):
     nodes = tree(pid)
     titles = [node for node in nodes if node.name == 'Remove project from cagents?' and visible(node)]
@@ -767,16 +1010,16 @@ def recovery(inputs, pid, window, size, label):
     wait(lambda: menu_gone(pid))
     inputs.shortcut(['Control_L', 'Shift_L', 'f'])
     field = wait(lambda: search(pid))
-    wait(lambda: field.getState().contains(pyatspi.STATE_FOCUSED))
+    wait(lambda: (state := search_state(pid)) and state['focused'])
     inputs.shortcut(['Control_L', 'a'])
     inputs.type_text('menu-project-12')
-    wait(lambda: field.queryText().getText(0, -1) == 'menu-project-12')
+    wait(lambda: (state := search_state(pid)) and state['text'] == 'menu-project-12')
     snapshot(pid, label + '-recovery')
     capture(window, label + '-recovery', size)
     inputs.shortcut(['Control_L', 'a'])
     inputs.key('BackSpace')
-    wait(lambda: field.queryText().getText(0, -1) == '')
-    wait(lambda: any(node.name == 'Open project menu-project-01' for node in tree(pid)))
+    wait(lambda: (state := search_state(pid)) and state['text'] == '')
+    wait(lambda: unique(pid, 'Open project menu-project-01'))
     click_node(inputs, wait(lambda: unique(pid, 'Search projects')))
     wait(lambda: search(pid) is None)
 
@@ -793,15 +1036,28 @@ class BaselineRemoveUnreachable(BaselineKeyboardNegative):
         RuntimeError.__init__(self, 'Observed no reachable Remove row during bounded baseline wheel; activation states are unrun')
 
 
+@a11y_read
+def remove_titles(pid):
+    nodes = tree(pid)
+    assert nodes, 'Native accessibility tree unavailable; cannot classify feature-negative'
+    titles = [node for node in nodes if node.name == 'Remove project from cagents?' and visible(node)]
+    assert len(titles) <= 1, 'Ambiguous multiple confirmations'
+    return titles
+
+
+@a11y_read
+def no_dialog(pid):
+    nodes = tree(pid)
+    assert nodes and not any(visible(node) and (node.getRole() == pyatspi.ROLE_DIALOG or
+        node.name in ('Cancel', 'Remove project', 'Remove project from cagents?')) for node in nodes), 'Other/ambiguous modal prevents safe baseline reset'
+    return True
+
+
 def observe_remove(pid, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         assert any(row['pid'] == pid for row in live(ACTIVE)), 'Owned native UI identity disappeared'
-        nodes = tree(pid)
-        assert nodes, 'Native accessibility tree unavailable; cannot classify feature-negative'
-        titles = [node for node in nodes if node.name == 'Remove project from cagents?' and visible(node)]
-        assert len(titles) <= 1, 'Ambiguous multiple confirmations'
-        if titles:
+        if remove_titles(pid):
             return True
         time.sleep(.1)
     return False
@@ -821,9 +1077,7 @@ def reset_baseline_negative(error, inputs, pid, window, size, label, activation,
     assert geometry(window) == observation['geometry']
     assert (pointer()['X'], pointer()['Y']) == tuple(observation['point'])
     assert any(row['pid'] == pid for row in live('before'))
-    nodes = tree(pid)
-    assert nodes and not any(visible(node) and (node.getRole() == pyatspi.ROLE_DIALOG or
-        node.name in ('Cancel', 'Remove project', 'Remove project from cagents?')) for node in nodes), 'Other/ambiguous modal prevents safe baseline reset'
+    no_dialog(pid)
     conserve(binary, env, projects, rows, initial_files, stub, label + '-negative-before-reset')
     observation['source_before_reset'] = source(checkout, pin)
     dismiss(inputs, pid)  # Outside the completed accepted interval; never repairs its outcome.
@@ -930,7 +1184,7 @@ def tooltip(inputs, pid, window, size, label):
     button = wait(lambda: unique(pid, 'Search projects'))
     b = box(button)
     center = (b[0] + b[2] // 2, b[1] + b[3] // 2)
-    inputs.move(size[0] - 20, size[1] // 2)
+    inputs.move(CLIENT_RECT['X']+size[0]-20, CLIENT_RECT['Y']+size[1]//2)
     time.sleep(.3)
     inputs.move(*center)
     time.sleep(.8)
@@ -944,7 +1198,7 @@ def tooltip(inputs, pid, window, size, label):
     time.sleep(.8)
     capture(window, label + '-released', size)
     snapshot(pid, label + '-released')
-    inputs.move(size[0] - 20, size[1] // 2)
+    inputs.move(CLIENT_RECT['X']+size[0]-20, CLIENT_RECT['Y']+size[1]//2)
     time.sleep(.8)
     capture(window, label + '-left', size)
     inputs.move(*center)
@@ -966,7 +1220,7 @@ def private_env(root):
         env[key] = str(path)
     env.update(CARGO_HOME=menu_cargo_cache, RUSTUP_HOME=menu_rustup_cache, CARGO_BUILD_JOBS='2',
         ACCESSIBILITY_ENABLED='1', NO_AT_BRIDGE='0', WINIT_UNIX_BACKEND='x11', LIBGL_ALWAYS_SOFTWARE='1',
-        RUST_LOG='cagents=debug,cagentsd=debug,winit_x11=info,warn')
+        ICED_BACKEND='tiny-skia', RUST_LOG='cagents=debug,cagentsd=debug,winit_x11=info,warn')
     assert env.get('HOME') == original_home and env.get('CODEX_HOME') == original_codex_home
     return env
 
@@ -997,6 +1251,7 @@ def matched(window, pin, env, label):
     assert len(ui_identity) == 1, 'Native window PID is not an owned arm identity'
     actual = (Path('/proc') / str(pid) / 'exe').resolve()
     assert actual == (TARGET / 'dev-runtime/cagents-ui').resolve(), 'Wrong native UI binary'
+    assert b'ICED_BACKEND=tiny-skia' in (Path('/proc') / str(pid) / 'environ').read_bytes().split(b'\0'), 'Native child backend differs'
     records = {}
     for name in ('cagents', 'cagentsd', 'cagents-ui'):
         path = actual.parent / name
@@ -1025,9 +1280,9 @@ def matched(window, pin, env, label):
 
 
 def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
-    global ACTIVE, CRITICAL, PIXEL_MENU
+    global ACTIVE, CRITICAL, PIXEL_MENU, CLIENT_RECT
     ACTIVE = label
-    PIXEL_MENU = None
+    PIXEL_MENU, CLIENT_RECT = None, None
     result = dict(arm=label, pin=pin, status='running', cases=[], unrun_cases=list(M['cases']))
     ARMS.append(result)
     root = base / label
@@ -1040,6 +1295,7 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
     settings.parent.mkdir(mode=0o700)
     settings.write_text(M['settings'])
     result.update(source_before=source(checkout, pin), settings_sha256=digest(settings), home_unchanged=True,
+        inherited_iced_backend=os.environ.get('ICED_BACKEND'), configured_child_backend=env['ICED_BACKEND'],
         codex_home_unchanged=True, private_paths={k: env[k] for k in env if k.startswith('XDG_') or k == 'TMPDIR'})
     runner, binary, pid, window = None, None, None, None
     cleanup_errors = []
@@ -1058,14 +1314,19 @@ def run_arm(label, checkout, pin, base, projects, initial_files, inputs, stubs):
             cli(binary, env, ['project', 'open', str(project)], label + '-seed-' + project.name)
         rows = cli(binary, env, ['project', 'list'], label + '-initial-projects')['projects']
         assert [row['repository'] for row in rows] == [str(project) for project in projects]
-        wait(lambda: any(node.name.startswith('Open project menu-project-') for node in tree(pid)))
+        wait(lambda: project_present(pid))
         conserve(binary, env, projects, rows, initial_files, stub, label + '-initial')
         for size_name, size in [('wide', (1280, 800)), ('narrow', (900, 600))]:
             assert not CRITICAL
             query(['windowactivate', '--sync', window])
             query(['windowsize', '--sync', window, *map(str, size)])
             query(['windowmove', '--sync', window, '0', '0'])
-            wait(lambda: geometry(window) == dict(X=0, Y=0, WIDTH=size[0], HEIGHT=size[1], SCREEN=0))
+            def viewport_ready():
+                actual = geometry(window)
+                return ((actual['WIDTH'], actual['HEIGHT']) == size and actual['SCREEN'] == 0 and
+                    on_screen((actual['X'], actual['Y'], *size), tuple(M['capture']['root_size']), origin=(0, 0)))
+            wait(viewport_ready)
+            CLIENT_RECT = geometry(window)
             time.sleep(.6)
             configured = settings.read_text()
             assert re.search(r'^ui_scale\s*=\s*1\.5\s*$', configured, re.M)
@@ -1207,11 +1468,12 @@ def cancelled(signum, frame):
 
 
 def main():
-    global pyatspi, Image
+    global pyatspi, Image, GLib, SCREEN
     guard()
     OUT.mkdir(mode=0o700, parents=True, exist_ok=True)
     put(OUT / 'context.json', dict(hosted=True, inherited_cagents_names=[], wayland_names=[],
         home_unchanged=True, codex_home_unchanged=True,
+        inherited_iced_backend=os.environ.get('ICED_BACKEND'), configured_child_backend='tiny-skia',
         display_configuration={k: os.environ.get(k) for k in ('DISPLAY', 'WINIT_X11_SCALE_FACTOR', 'GDK_SCALE', 'GDK_DPI_SCALE')},
         policy='No inherited authority or scale variable removed/replaced'))
     assert M['never_merge'] is True and len(M['cases']) == 10
@@ -1227,7 +1489,7 @@ def main():
     inputs, failed, cleanup_errors = None, False, []
     try:
         display = cmd(['xdpyinfo'])
-        assert re.search(r'dimensions:\s+1280x800 pixels', display)
+        assert re.search(r'dimensions:\s+1600x1000 pixels', display)
         assert re.search(r'resolution:\s+96x96 dots per inch', display)
         cmd(['xrandr', '--current'])
         cmd(['xprop', '-root', 'RESOURCE_MANAGER'], expected=None)
@@ -1237,7 +1499,9 @@ def main():
         assert 'eng' in languages.splitlines(), 'Exact English OCR model unavailable'
         bootstrap(base)
         import pyatspi
+        from gi.repository import GLib
         from PIL import Image
+        SCREEN = NativeScreen()
         inputs = Inputs()
         projects = []
         project_root = base / 'projects'
@@ -1283,6 +1547,11 @@ def main():
             close_owned()
         except Exception as error:
             cleanup_errors.append(str(error))
+        try:
+            if SCREEN:
+                SCREEN.close()
+        except Exception as error:
+            cleanup_errors.append('Read-only X11 connection: ' + str(error))
         put(OUT / 'owned-processes.json', OWNED)
         put(OUT / 'inputs.json', EVENTS)
         put(OUT / 'commands.json', COMMANDS)

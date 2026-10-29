@@ -131,7 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          timeout --signal=TERM --kill-after=45s 12600s xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 "$GITHUB_WORKSPACE/control/.github/qualification/native-menu-driver.py" "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/after" > "$MENU_EVIDENCE_ROOT/native-wrapper.stdout" 2> "$MENU_EVIDENCE_ROOT/native-wrapper.stderr"
+          timeout --signal=TERM --kill-after=45s 12600s xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 "$GITHUB_WORKSPACE/control/.github/qualification/native-menu-driver.py" "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/after" > "$MENU_EVIDENCE_ROOT/native-wrapper.stdout" 2> "$MENU_EVIDENCE_ROOT/native-wrapper.stderr"
           status=$?
           set -e
           printf '%s\n' "$status" > "$MENU_EVIDENCE_ROOT/native-wrapper.exit"

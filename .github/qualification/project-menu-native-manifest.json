@@ -82,7 +82,8 @@
     "vendor/iced-winit/src/conversion.rs",
     "vendor/iced-winit/src/window/state.rs",
     "src/control/chat.rs",
-    "src/workspace_model.rs"
+    "src/workspace_model.rs",
+    "vendor/libcosmic/Cargo.toml"
   ],
   "limits": [
     "Source-only temporary research control; never merge. No local Cargo, native app, helper, provider, fixture or workflow execution is authorized while preparing it.",
@@ -101,7 +102,9 @@
     "Only a readable before menu with no Remove row after bounded real wheel may yield an explicit negative observation with no activation target; related activation/limit cases remain UNRUN. Missing editor/Before activation states are recorded. AFTER missing target/editor labels, unreachable rows, OCR ambiguity or any input/cancel/conservation/cleanup failure remains failure, never a scoped before negative.",
     "Cancellation propagates globally and refuses later cases/arms. Every gesture releases tracked keys/buttons in finally; arm cleanup verifies releases before dismissal or any later arm. Release failure and cleanup uncertainty remain fatal.",
     "Matched read-only channel list must stay empty and chat capacity used/resident/spawning must remain zero, alongside project order/membership, empty terminals, editor receipts and Git file/ref conservation. No unexpected New channel action is waived.",
-    "Menu::operate and Widget::a11y_nodes are separate. Source on both pins does not publish menu rows into the native accessibility tree; header accessibility is separate and retained. This control uses pixels for menu rows and does not establish native menu accessibility. Native modal/Cancel and header/focus checks still use their actual PID-filtered accessibility tree. Existing follow-up #1768 tracks native MenuSurface/ContextMenu accessibility publication; no duplicate issue is created by this control."
+    "Menu::operate and Widget::a11y_nodes are separate. Source on both pins does not publish menu rows into the native accessibility tree; header accessibility is separate and retained. This control uses pixels for menu rows and does not establish native menu accessibility. Native modal/Cancel and header/focus checks still use their actual PID-filtered accessibility tree. Existing follow-up #1768 tracks native MenuSurface/ContextMenu accessibility publication; no duplicate issue is created by this control.",
+    "Both arms explicitly configure supported tiny-skia; inherited ICED_BACKEND is recorded before the identical child override. Accepted captures are visible-root client crops, never direct-drawable images; original black/blank diagnostics are retained and cannot qualify. Mapped occlusion, state drift or failed numeric nonblank gates stop affected evidence. This does not establish default GPU/rendering performance.",
+    "Only recognized stale accessibility objects permit up to3 complete read-only query attempts within a5s retry budget, including property enumeration. Input gestures remain exactly once; unrelated/exhausted errors and cancellation propagate without feature-negative classification."
   ],
   "previous_product_head": "7c0022e23ea8548dea4df050f68d76fba94bca53",
   "product_successor_note": "Public independently reviewed test-only E0282 correction of Vec<keyboard::Key> inference. Production/native behavior is unchanged; compiler gate still must succeed at this exact successor.",
@@ -133,5 +136,58 @@
     "Sublime Text",
     "Remove project\u2026"
   ],
-  "native_menu_accessibility_follow_up": "https://github.com/CarsonBurke/cagents/issues/1768"
+  "native_menu_accessibility_follow_up": "https://github.com/CarsonBurke/cagents/issues/1768",
+  "backend": {
+    "configured_for_both_arms": "tiny-skia",
+    "inherited_value": "Retained in context and arm receipts; identical explicit child override only, HOME/CODEX/authority unchanged",
+    "upstream_revision": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+    "source_route": [
+      "vendor/libcosmic/Cargo.toml: iced tiny-skia feature enabled on both product pins",
+      "iced/renderer/src/fallback.rs: ICED_BACKEND candidate routing",
+      "iced/tiny_skia/src/window/compositor.rs: exact tiny-skia accepted; wgpu rejects that name"
+    ],
+    "runtime_receipt": "Matched live native UI /proc environment must contain ICED_BACKEND=tiny-skia; runner/UI logs retained. No original-default GPU/performance equivalence is claimed.",
+    "upstream_source_sha256": {
+      "iced/renderer/src/fallback.rs": "f80b49312a79a26aba7368507762dac25e76bf053b23b735d8b95cf99e9a9bc0",
+      "iced/tiny_skia/src/window/compositor.rs": "0c136f2f3b781cb899a49fc829405911224b8e437c6b3bbf4b2374de39d84e4c"
+    },
+    "iced_gitlink": "87c0358985cae50fefdcb15eabb0271e19ecf4a2"
+  },
+  "capture": {
+    "accepted_route": "Actual visible root pixels, unscaled crop at Xlib XTranslateCoordinates absolute client bounds; root and drawable diagnostics retained",
+    "geometry": "XGetWindowAttributes plus XTranslateCoordinates to root; SCREEN0, actual1280x800/900x600 client must fit wholly inside the identical1600x1000 root. xdotool parent-relative geometry is diagnostic only. Native bounds remain absolute; OCR bounds remain original crop-local data and are translated for input only using that same frame actual client origin. No offset guesses, crop padding or repair during capture.",
+    "occlusion": "XQueryTree bottom-to-top siblings above every ancestor to root, including frame and override-redirect siblings; any mapped InputOutput overlap or changing/ambiguous state refuses OCR/acceptance",
+    "nonblank": {
+      "minimum_luminance_span": 8,
+      "minimum_luminance_stddev": 2.0,
+      "minimum_nonblack_fraction": 0.05,
+      "minimum_distinct_rgb_colors": 16
+    },
+    "retained": [
+      "Original full root PNG",
+      "Original direct-drawable diagnostic PNG and actual command exit",
+      "Unscaled client PNG and lossless WebP",
+      "Root/client absolute geometry, stacking, pointer/focus before and after",
+      "Original image digests and numeric nonblank metrics"
+    ],
+    "scope": "Nonblank thresholds are a refusal gate, not visual correctness proof. Actual unchanged images still need independent review; no capture repair or retry.",
+    "root_size": [
+      1600,
+      1000
+    ],
+    "xlib_api_references": [
+      "https://www.x.org/archive/X11R7.5/doc/man/man3/XQueryTree.3.html",
+      "https://www.x.org/archive/X11R7.5/doc/man/man3/XTranslateCoordinates.3.html"
+    ]
+  },
+  "accessibility_retry": {
+    "scope": "Complete read-only query including traversal AND requested properties; never native input/gesture/reset",
+    "maximum_attempts": 3,
+    "retry_budget_seconds": 5,
+    "recognized_stale_errors": [
+      "org.freedesktop.DBus.Error.UnknownObject",
+      "GLib.Error domain atspi_error code1 with exact Unknown object /org/a11y/atspi/accessible or cache path message family"
+    ],
+    "failure": "Exhausted, other errors, disappearance or cancellation propagate; never absent-modal/feature-negative success. Original attempts/errors retained."
+  }
 }
