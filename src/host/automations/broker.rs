@@ -601,26 +601,27 @@ impl Handle {
                 return Ok(true);
             }
             Ok(Status::Complete(outcome)) => {
-                let (accepted, released) = {
-                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
-                    let accepted = registry.finish_automation_precheck(firing.id, outcome, now)?;
-                    let released = accepted.is_none()
-                        && registry.retired_automation_precheck(firing.id)?.is_some();
-                    (accepted, released)
+                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
+                let completion = if let Some(accepted) = accepted {
+                    let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
+                    match service::validate_target(host, &automation.definition, &automation.target_identity) {
+                        Ok(directory) => agent_execution::dispatch_accepted_in_directory(host, accepted, directory),
+                        Err(error) => self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).fail_automation_start(firing.id, error, now, true),
+                    }
+                } else {
+                    Ok(())
                 };
+                // Acceptance may also release ownership when target validation
+                // or dispatch fails. Inspect the committed continuation before
+                // returning its result, even when that result is an error.
+                let released = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).retired_automation_precheck(firing.id)?.is_some();
                 if released {
                     // The last precheck may have cancelled the idle deadline.
                     // Reconsider it only after durable ownership is released,
                     // with neither registry nor worker/HostState locks held.
                     crate::daemon::wake();
                 }
-                if let Some(accepted) = accepted {
-                    let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
-                    match service::validate_target(host, &automation.definition, &automation.target_identity) {
-                        Ok(directory) => agent_execution::dispatch_accepted_in_directory(host, accepted, directory)?,
-                        Err(error) => self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).fail_automation_start(firing.id, error, now, true)?,
-                    }
-                }
+                completion?;
             }
             Ok(Status::CleanupUnconfirmed) | Err(_) if firing.state == FiringState::Interrupted => {}
             Ok(Status::CleanupUnconfirmed) => self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).interrupt_automation_precheck(firing.id, "The precheck owner ended without a cleanup receipt; its effects and descendants are uncertain".into(), now)?,
