@@ -54,7 +54,7 @@ pub(super) struct Entry {
 type Buffered = LinkedList<io::Result<Entry>>;
 
 enum Frame {
-    Open(ReadDir),
+    Open { directory: ReadDir, parent: PathBuf },
     Buffered(Buffered),
 }
 
@@ -99,15 +99,19 @@ impl Traversal {
     }
 
     fn entry(
-        &mut self,
         entry: io::Result<std::fs::DirEntry>,
+        parent: &Path,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<io::Result<Entry>, Stop> {
         let result = match entry {
             Ok(entry) => {
-                self.poll(cancelled)?;
+                if cancelled() {
+                    return Err(Stop::Cancelled);
+                }
                 entry.file_type().map(|kind| Entry {
-                    path: entry.path(),
+                    // The iterator was opened through /proc. Keep only the
+                    // logical path beneath the selected root outside it.
+                    path: parent.join(entry.file_name()),
                     kind,
                 })
             }
@@ -115,7 +119,7 @@ impl Traversal {
         };
         match result {
             Err(error) if descriptor_exhausted(&error) => {
-                self.stop(Stop::Resource(format!("Directory descriptors: {error}")))
+                Err(Stop::Resource(format!("Directory descriptors: {error}")))
             }
             result => Ok(result),
         }
@@ -129,10 +133,12 @@ impl Traversal {
         let index = self
             .frames
             .iter()
-            .position(|frame| matches!(frame, Frame::Open(_)))
+            .position(|frame| matches!(frame, Frame::Open { .. }))
             .expect("the open-descriptor limit has an open frame");
-        let Frame::Open(mut directory) =
-            std::mem::replace(&mut self.frames[index], Frame::Buffered(Buffered::new()))
+        let Frame::Open {
+            mut directory,
+            parent,
+        } = std::mem::replace(&mut self.frames[index], Frame::Buffered(Buffered::new()))
         else {
             unreachable!()
         };
@@ -143,7 +149,10 @@ impl Traversal {
             let Some(entry) = directory.next() else {
                 break;
             };
-            let entry = self.entry(entry, cancelled)?;
+            let entry = match Self::entry(entry, &parent, cancelled) {
+                Ok(entry) => entry,
+                Err(stop) => return self.stop(stop),
+            };
             let bytes = Self::path_bytes(&entry);
             if self.buffered_entries >= self.limits.buffered_entries
                 || bytes
@@ -172,6 +181,7 @@ impl Traversal {
 
     pub(super) fn descend(
         &mut self,
+        root: &crate::fs_safety::Root,
         path: &Path,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<io::Result<()>, Stop> {
@@ -180,9 +190,35 @@ impl Traversal {
             self.spill_oldest(cancelled)?;
         }
         self.poll(cancelled)?;
-        match std::fs::read_dir(path) {
+        let Ok(relative) = path.strip_prefix(root.path()) else {
+            return Ok(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Search directory is outside its selected root",
+            )));
+        };
+        let opened = if relative.as_os_str().is_empty() {
+            // Root is already retained. Avoid an extra clone descriptor so
+            // the root iterator still needs only its own new descriptor.
+            std::fs::read_dir(root.process_path())
+        } else {
+            let directory = match crate::fs_safety::open_directory_beneath(root, relative) {
+                Ok(directory) => directory,
+                Err(error) if error.is_resource_exhausted() => {
+                    return self.stop(Stop::Resource(format!("Directory descriptors: {error}")));
+                }
+                Err(error) => return Ok(Err(io::Error::other(error))),
+            };
+            self.poll(cancelled)?;
+            // ReadDir owns its new descriptor before this temporary retained
+            // directory drops. Never reopen a replaceable directory pathname.
+            std::fs::read_dir(directory.process_path())
+        };
+        match opened {
             Ok(directory) => {
-                self.frames.push(Frame::Open(directory));
+                self.frames.push(Frame::Open {
+                    directory,
+                    parent: path.to_path_buf(),
+                });
                 self.open += 1;
                 Ok(Ok(()))
             }
@@ -193,6 +229,11 @@ impl Traversal {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn open_directories(&self) -> usize {
+        self.open
+    }
+
     pub(super) fn next(
         &mut self,
         cancelled: &mut impl FnMut() -> bool,
@@ -200,8 +241,13 @@ impl Traversal {
         loop {
             self.poll(cancelled)?;
             match self.frames.last_mut() {
-                Some(Frame::Open(directory)) => match directory.next() {
-                    Some(entry) => return self.entry(entry, cancelled).map(Some),
+                Some(Frame::Open { directory, parent }) => match directory.next() {
+                    Some(entry) => {
+                        return match Self::entry(entry, parent, cancelled) {
+                            Ok(entry) => Ok(Some(entry)),
+                            Err(stop) => self.stop(stop),
+                        };
+                    }
                     None => {
                         self.frames.pop();
                         self.open -= 1;
@@ -255,6 +301,7 @@ mod tests {
     #[test]
     fn spill_budgets_are_global_and_cancellation_releases_partial_buffers() {
         let directory = branching_fixture();
+        let root = crate::fs_safety::Root::open(directory.path()).unwrap();
         let mut traversal = Traversal::new(Limits {
             open: 1,
             buffered_entries: 2,
@@ -262,20 +309,20 @@ mod tests {
         });
         let mut running = || false;
         traversal
-            .descend(directory.path(), &mut running)
+            .descend(&root, directory.path(), &mut running)
             .ok()
             .unwrap()
             .unwrap();
         let first = traversal.next(&mut running).ok().unwrap().unwrap().unwrap();
         traversal
-            .descend(&first.path, &mut running)
+            .descend(&root, &first.path, &mut running)
             .ok()
             .unwrap()
             .unwrap();
         assert_eq!(traversal.buffered_entries, 2);
         let next = traversal.next(&mut running).ok().unwrap().unwrap().unwrap();
         assert!(matches!(
-            traversal.descend(&next.path, &mut running),
+            traversal.descend(&root, &next.path, &mut running),
             Err(Stop::Resource(_))
         ));
         empty(&traversal);
@@ -286,12 +333,12 @@ mod tests {
             buffered_path_bytes: 1,
         });
         traversal
-            .descend(directory.path(), &mut running)
+            .descend(&root, directory.path(), &mut running)
             .ok()
             .unwrap()
             .unwrap();
         assert!(matches!(
-            traversal.descend(&directory.path().join("0"), &mut running),
+            traversal.descend(&root, &directory.path().join("0"), &mut running),
             Err(Stop::Resource(_))
         ));
         empty(&traversal);
@@ -301,7 +348,7 @@ mod tests {
             ..Limits::default()
         });
         traversal
-            .descend(directory.path(), &mut running)
+            .descend(&root, directory.path(), &mut running)
             .ok()
             .unwrap()
             .unwrap();
@@ -313,7 +360,7 @@ mod tests {
             polls == 6
         };
         assert!(matches!(
-            traversal.descend(&directory.path().join("0"), &mut cancel),
+            traversal.descend(&root, &directory.path().join("0"), &mut cancel),
             Err(Stop::Cancelled)
         ));
         assert_eq!(polls, 6);
@@ -321,7 +368,7 @@ mod tests {
         // Ordinary permission/absence failures retain the caller's skipped
         // accounting, rather than becoming a resource error.
         assert!(matches!(
-            traversal.descend(&directory.path().join("absent"), &mut running),
+            traversal.descend(&root, &directory.path().join("absent"), &mut running),
             Ok(Err(_))
         ));
         empty(&traversal);

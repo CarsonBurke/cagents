@@ -99,8 +99,47 @@ fn search_with_limits(
     root: &Path,
     options: &Options,
     cancellation: &CancellationToken,
+    publish: impl FnMut(Progress) -> bool,
+    limits: traversal::Limits,
+) {
+    search_with_clock(
+        root,
+        options,
+        cancellation,
+        publish,
+        limits,
+        &mut SearchTime,
+    );
+}
+
+trait SearchClock {
+    fn now(&mut self) -> Instant;
+
+    #[cfg(test)]
+    fn traversal(&mut self, _pending: usize, _open_directories: usize) {}
+
+    #[cfg(test)]
+    fn before_traversal_step(&mut self) {}
+
+    #[cfg(test)]
+    fn before_directory_open(&mut self, _relative: &Path) {}
+}
+
+struct SearchTime;
+
+impl SearchClock for SearchTime {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+}
+
+fn search_with_clock(
+    root: &Path,
+    options: &Options,
+    cancellation: &CancellationToken,
     mut publish: impl FnMut(Progress) -> bool,
     limits: traversal::Limits,
+    clock: &mut impl SearchClock,
 ) {
     if cancellation.is_cancelled() {
         return;
@@ -220,7 +259,7 @@ fn search_with_limits(
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut total = 0;
     let mut skipped = 0;
-    let mut last_batch = Instant::now();
+    let mut last_batch = clock.now();
     let mut bytes = Vec::with_capacity(SEARCH_BLOCK_BYTES);
     if cancellation.is_cancelled() {
         return;
@@ -241,7 +280,7 @@ fn search_with_limits(
             return;
         }};
     }
-    match directories.descend(root, &mut cancelled) {
+    match directories.descend(&guarded_root, root, &mut cancelled) {
         Ok(Ok(())) => {}
         Ok(Err(_)) => skipped += 1,
         Err(stop) => stop!(stop),
@@ -257,6 +296,21 @@ fn search_with_limits(
         {
             stop!(traversal::Stop::Resource(error));
         }
+        #[cfg(test)]
+        clock.traversal(batch.len(), directories.open_directories());
+        // Directory, ignore and metadata-only paths can bypass the content
+        // loop for a long time. Publish due matches before advancing them.
+        if !batch.is_empty() && clock.now().duration_since(last_batch) >= BATCH_DELAY {
+            if !publish(Progress::Batch(std::mem::take(&mut batch))) {
+                return;
+            }
+            last_batch = clock.now();
+            if cancellation.is_cancelled() {
+                return;
+            }
+        }
+        #[cfg(test)]
+        clock.before_traversal_step();
         let entry = match directories.next(&mut cancelled) {
             Ok(Some(Ok(entry))) => entry,
             Ok(Some(Err(_))) => {
@@ -283,7 +337,9 @@ fn search_with_limits(
             return;
         }
         if kind.is_dir() {
-            match directories.descend(&path, &mut cancelled) {
+            #[cfg(test)]
+            clock.before_directory_open(path.strip_prefix(root).expect("logical root descendant"));
+            match directories.descend(&guarded_root, &path, &mut cancelled) {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => skipped += 1,
                 Err(stop) => stop!(stop),
@@ -476,29 +532,31 @@ fn search_with_limits(
                             highlight,
                         });
                         total += 1;
-                        if batch.len() >= BATCH_SIZE || last_batch.elapsed() >= BATCH_DELAY {
+                        if batch.len() >= BATCH_SIZE
+                            || clock.now().duration_since(last_batch) >= BATCH_DELAY
+                        {
                             if !publish(Progress::Batch(std::mem::take(&mut batch))) {
                                 return;
                             }
-                            last_batch = Instant::now();
+                            last_batch = clock.now();
                         }
                     }
-                    if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
+                    if !batch.is_empty() && clock.now().duration_since(last_batch) >= BATCH_DELAY {
                         if !publish(Progress::Batch(std::mem::take(&mut batch))) {
                             return;
                         }
-                        last_batch = Instant::now();
+                        last_batch = clock.now();
                     }
                     line += 1;
                 }
             } else {
                 line += native_lines(text).count();
             }
-            if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
+            if !batch.is_empty() && clock.now().duration_since(last_batch) >= BATCH_DELAY {
                 if !publish(Progress::Batch(std::mem::take(&mut batch))) {
                     return;
                 }
-                last_batch = Instant::now();
+                last_batch = clock.now();
             }
         }
     }
@@ -1267,5 +1325,204 @@ mod tests {
                 "a cancelled final batch cannot finish a query: {events:?}"
             );
         }
+    }
+
+    #[test]
+    fn sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct TraversalTime {
+            now: Instant,
+            advanced: bool,
+            depth: Rc<Cell<usize>>,
+            due_pending: Rc<Cell<usize>>,
+            boundaries: Rc<Cell<usize>>,
+            steps: Rc<Cell<usize>>,
+        }
+        impl SearchClock for TraversalTime {
+            fn now(&mut self) -> Instant {
+                self.now
+            }
+
+            fn traversal(&mut self, pending: usize, directory_depth: usize) {
+                self.boundaries.set(self.boundaries.get() + 1);
+                self.depth.set(directory_depth);
+                if !self.advanced && pending > 0 && directory_depth > 0 {
+                    self.now += BATCH_DELAY;
+                    self.advanced = true;
+                    self.due_pending.set(pending);
+                }
+            }
+
+            fn before_traversal_step(&mut self) {
+                self.steps.set(self.steps.get() + 1);
+            }
+        }
+
+        // The clock advances only after the real scanner has accumulated a
+        // sparse batch and still owns a directory iterator. No wall-clock or
+        // filesystem entry order decides whether that batch is due.
+        for stop in ["continue", "refuse", "cancel"] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(fixture.path().join("outer/inner")).unwrap();
+            std::fs::write(fixture.path().join(".ignore"), "*.ignored\n").unwrap();
+            std::fs::write(fixture.path().join("hidden.ignored"), "λ sparse_marker\n").unwrap();
+            std::fs::write(
+                fixture.path().join("outer/inner/only.txt"),
+                "λ sparse_marker\n",
+            )
+            .unwrap();
+            let depth = Rc::new(Cell::new(0));
+            let due_pending = Rc::new(Cell::new(0));
+            let boundaries = Rc::new(Cell::new(0));
+            let steps = Rc::new(Cell::new(0));
+            let mut clock = TraversalTime {
+                now: Instant::now(),
+                advanced: false,
+                depth: depth.clone(),
+                due_pending: due_pending.clone(),
+                boundaries: boundaries.clone(),
+                steps: steps.clone(),
+            };
+            let cancellation = CancellationToken::default();
+            let mut batches = 0;
+            let mut finished = 0;
+            let mut stopped_at = None;
+            search_with_clock(
+                fixture.path(),
+                &options("sparse_marker"),
+                &cancellation,
+                |event| {
+                    match event {
+                        Progress::Batch(batch) => {
+                            batches += 1;
+                            assert_eq!(batches, 1);
+                            assert_eq!(batch.len(), 1);
+                            assert_eq!(due_pending.get(), 1);
+                            assert!(depth.get() > 0, "final-tail publication is too late");
+                            let matched = &batch[0];
+                            assert_eq!(matched.path, Path::new("outer/inner/only.txt"));
+                            assert_eq!((matched.line, matched.column, matched.length), (0, 3, 13));
+                            assert!(matched.line_identity.matches("λ sparse_marker"));
+                            assert_eq!(matched.snippet, "λ sparse_marker");
+                            assert_eq!(
+                                &matched.snippet[matched.highlight.clone()],
+                                "sparse_marker"
+                            );
+                            if stop != "continue" {
+                                stopped_at = Some((depth.get(), boundaries.get(), steps.get()));
+                            }
+                            if stop == "cancel" {
+                                cancellation.cancel();
+                            }
+                        }
+                        Progress::Finished { capped, skipped } => {
+                            finished += 1;
+                            assert!(!capped);
+                            assert_eq!(skipped, 0);
+                        }
+                        Progress::Error(error) => panic!("unexpected search error: {error}"),
+                    }
+                    stop != "refuse"
+                },
+                traversal::Limits::default(),
+                &mut clock,
+            );
+            assert!(clock.advanced);
+            assert_eq!(batches, 1);
+            assert_eq!(finished, usize::from(stop == "continue"));
+            if let Some((stopped_depth, stopped_boundary, stopped_step)) = stopped_at {
+                assert_eq!(
+                    depth.get(),
+                    stopped_depth,
+                    "delivery stop must not reach another traversal boundary"
+                );
+                assert_eq!(boundaries.get(), stopped_boundary);
+                assert_eq!(
+                    steps.get(),
+                    stopped_step,
+                    "delivery stop must not call next"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_replaced_after_admission_cannot_enumerate_an_outside_tree() {
+        struct ReplaceDirectory {
+            root: PathBuf,
+            outside: PathBuf,
+            replaced: bool,
+        }
+        impl SearchClock for ReplaceDirectory {
+            fn now(&mut self) -> Instant {
+                Instant::now()
+            }
+
+            fn before_directory_open(&mut self, relative: &Path) {
+                if relative == Path::new("swap") {
+                    assert!(!self.replaced);
+                    std::fs::rename(self.root.join("swap"), self.root.join(".original-swap"))
+                        .unwrap();
+                    std::os::unix::fs::symlink(&self.outside, self.root.join("swap")).unwrap();
+                    self.replaced = true;
+                }
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("swap")).unwrap();
+        std::fs::write(fixture.path().join("healthy.txt"), "inside_marker\n").unwrap();
+        for name in ["first.txt", "second.txt"] {
+            std::fs::write(outside.path().join(name), "outside_marker\n").unwrap();
+        }
+        let mut clock = ReplaceDirectory {
+            root: fixture.path().into(),
+            outside: outside.path().into(),
+            replaced: false,
+        };
+        let mut opts = options("marker");
+        opts.include_ignored = true;
+        let mut events = Vec::new();
+        search_with_clock(
+            fixture.path(),
+            &opts,
+            &CancellationToken::default(),
+            |event| {
+                events.push(event);
+                true
+            },
+            traversal::Limits::default(),
+            &mut clock,
+        );
+        assert!(clock.replaced);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, Progress::Error(_)))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Progress::Finished { .. }))
+                .count(),
+            1
+        );
+        // A pathname reopen would enumerate both outside files, then fail
+        // their already-guarded content opens (two skips). Refuse the swapped
+        // directory itself once, without depending on filesystem entry order.
+        assert_eq!(
+            events.last(),
+            Some(&Progress::Finished {
+                capped: false,
+                skipped: 1,
+            })
+        );
+        let found = matches(events);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, Path::new("healthy.txt"));
+        assert_eq!((found[0].line, found[0].column, found[0].length), (0, 7, 6));
+        assert!(found[0].line_identity.matches("inside_marker"));
     }
 }
