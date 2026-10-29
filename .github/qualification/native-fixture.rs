@@ -694,12 +694,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if card.existence.is_open() || card.kind != CardKind::Chat(original.clone())
                 || !saved.local_only_cards.contains(&id)
                 || saved.pending_chat_admissions.contains_key(&id)
-                || saved.chat_drafts.get(&id).map(String::as_str) != Some(ORDINARY_DRAFT)
-                || saved.chat_draft_attachments.get(&id) != Some(&vec![attachment.clone()])
-            { return Err("Ordinary closed source or its saved payload changed".into()); }
+            { return Err("Ordinary closed source, existence, local custody or admission changed".into()); }
             #[cfg(held_product_after)]
-            if saved.quarantined_panes.contains_key(&id) {
-                return Err("Ordinary closed copy acquired false denial evidence".into());
+            {
+                if saved.chat_drafts.get(&id).map(String::as_str) != Some(ORDINARY_DRAFT)
+                    || saved.chat_draft_attachments.get(&id) != Some(&vec![attachment.clone()])
+                { return Err("Ordinary closed saved draft or attachments changed".into()); }
+                if saved.quarantined_panes.contains_key(&id) {
+                    return Err("Ordinary closed copy acquired false denial evidence".into());
+                }
+                println!("ordinary-closed-source-custody-and-full-saved-payload-preserved");
+            }
+            #[cfg(not(held_product_after))]
+            {
+                // c727's persistent_workspace filters saved payloads to open
+                // cards. Record this existing loss as the Before behavior;
+                // all identity/custody checks above still apply to both arms.
+                if saved.chat_drafts.contains_key(&id)
+                    || saved.chat_draft_attachments.contains_key(&id)
+                { return Err("Baseline closed-payload observation changed".into()); }
+                println!("baseline-existing-closed-payload-loss: source-and-custody-preserved draft-absent attachments-absent");
             }
             let recovered = fs::read_to_string(root.join("ordinary-recovered-chat-id"))?;
             let recovered = saved.cards.iter().find(|card| matches!(&card.kind, CardKind::Chat(session) if session.id.to_string() == recovered)).ok_or("Recovered ordinary conversation missing")?;

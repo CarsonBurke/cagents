@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: 11b7caf13a4636861b600e5b8ab3e40dca402d8e
-      PRODUCT_TREE: 4d553a793d29249f31e10721f5c7bdc3079e71b7
+      PRODUCT_SHA: 061a243b6a8ccb0ffe5958488fa4994968b3fa52
+      PRODUCT_TREE: 244f6842d0fb463b87567d8763c548e45d80657d
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -83,10 +83,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Run every affected isolated suite after native cleanup
-        if: success() && steps.focus.outcome == 'success' && steps.native.outcome == 'success'
+        if: ${{ !cancelled() && steps.focus.outcome == 'success' && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         shell: bash
         run: |
           test -f "$QUALIFICATION_EVIDENCE/native/cleanup-complete"
+          python3 -c 'import json, os; from pathlib import Path; p = Path(os.environ["QUALIFICATION_EVIDENCE"]) / "native/cleanup.json"; assert json.loads(p.read_text())["errors"] == []'
           python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --suites-only
       - name: Recompute all artifact checksums
         if: always()

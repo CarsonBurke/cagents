@@ -979,7 +979,7 @@ try:
             assert icon_config.read_text() == '"Adwaita"\n', 'Private icon setting changed during native interaction'
             expected_existence = 'closed' if variant == 'after' and (mode == 'closed' or ordinary) else 'open'
             with (out / (label + '-typed-persistence.log')).open('w') as log:
-                run([str(helper), str(root), mode, '--inspect', expected_existence], env=env, stdout=log)
+                run([str(helper), str(root), mode, '--inspect', expected_existence], env=env, stdout=log, stderr=subprocess.STDOUT)
             database = Path((root / 'database-path').read_text())
             assert database.is_relative_to(root)
             if variant == 'after':
