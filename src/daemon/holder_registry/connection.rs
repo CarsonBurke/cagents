@@ -178,7 +178,7 @@ mod unsupported_tests {
 
     #[test]
     fn unsupported_holder_connection_precedes_deadline_and_endpoint_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("listener");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();

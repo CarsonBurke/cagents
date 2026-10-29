@@ -1759,7 +1759,10 @@ pub(crate) mod tests {
         let metadata = metadata_of(&file).expect("metadata");
 
         assert!(!metadata.is_file());
-        assert_eq!(metadata.mode() & libc::S_IFMT, libc::S_IFIFO);
+        assert_eq!(
+            metadata.mode() & u32::from(libc::S_IFMT),
+            u32::from(libc::S_IFIFO)
+        );
     }
 
     #[test]
@@ -1872,13 +1875,16 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let non_utf8 = OsString::from_vec(vec![b'n', 0xff]);
-        fs::write(retained.join(&non_utf8), b"retained bytes").unwrap();
+        #[cfg(target_os = "linux")]
+        let retained_name = OsString::from_vec(vec![b'n', 0xff]);
+        #[cfg(not(target_os = "linux"))]
+        let retained_name = OsString::from("retained-λ");
+        fs::write(retained.join(&retained_name), b"retained bytes").unwrap();
         fs::create_dir(retained.join("child")).unwrap();
         fs::write(retained.join("child/inside"), b"child bytes").unwrap();
         let mut names = directory_entries_beneath(&root, Path::new(""), 2).unwrap();
         names.sort();
-        let mut expected = vec![non_utf8, OsString::from("child")];
+        let mut expected = vec![retained_name, OsString::from("child")];
         expected.sort();
         assert_eq!(names, expected);
         assert!(directory_entries_beneath(&root, Path::new(""), 1).is_err());
@@ -1920,6 +1926,39 @@ pub(crate) mod tests {
             );
             assert!(create_temporary_in(&root, u32::MAX).is_err());
             assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
+
+            let assert_rejected_before_creation =
+                |parent: &Root, result: Result<DirectoryCreation, DirectoryCreateError>| {
+                    let error = result.expect_err("mode overflow must reject creation");
+                    assert_eq!(
+                        error.cause(),
+                        &ResolveError::io(parent.path(), &native_mode(u32::MAX).unwrap_err())
+                    );
+                    assert!(error.recovery().is_none(), "{error:?}");
+                    assert!(fs::read_dir(parent.path()).unwrap().next().is_none());
+                };
+            let namespace = DirectoryNamespace::acquire(&root).unwrap();
+            assert_rejected_before_creation(
+                &root,
+                create_directory_in_namespace(
+                    &namespace,
+                    &root,
+                    Path::new("private-must-not-exist"),
+                    u32::MAX,
+                ),
+            );
+            let shared = tempfile::tempdir().unwrap();
+            fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o777)).unwrap();
+            let shared_root = Root::open(shared.path()).unwrap();
+            assert!(DirectoryNamespace::acquire(&shared_root).is_err());
+            assert_rejected_before_creation(
+                &shared_root,
+                create_directory_beneath(
+                    &shared_root,
+                    Path::new("shared-must-not-exist"),
+                    u32::MAX,
+                ),
+            );
         }
     }
 
@@ -1934,6 +1973,13 @@ pub(crate) mod tests {
         assert!(link_anonymous_new(&root, &source, OsStr::new("must-not-exist")).is_err());
         assert!(!fixture.path().join("must-not-exist").exists());
         assert_eq!(source.metadata().unwrap().nlink(), 1);
+        assert_eq!(
+            fs::read_dir(fixture.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![OsString::from("source")]
+        );
     }
 
     #[test]
