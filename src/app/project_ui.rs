@@ -782,6 +782,15 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        // Editors remain usable while session cleanup runs. Recheck their
+        // navigation fence before retiring any local owner; saving or recovery
+        // will resume the pending close through complete_closed_projects.
+        if self.project_has_unsaved_editors(id) {
+            self.status = Some(TransientNotice::warning(
+                "Project closed in another window; save your edits or resolve file recovery before removing its local row.",
+            ));
+            return Task::none();
+        }
         // An accepted checkout can begin after session census but before this
         // callback. Keep its owner and the committed close pending until it settles.
         if let Some(reason) = self.project_review_checkout_blocker(id) {
@@ -2466,6 +2475,10 @@ fn worktree_removal_command(target: &Target) -> CommandSpec {
         .timeout(Duration::from_secs(30))
         .output_limits(64 * 1024, 64 * 1024)
 }
+
+#[cfg(all(test, unix))]
+#[path = "project_ui/close_edit_regression.rs"]
+mod close_edit_regression;
 
 #[cfg(test)]
 mod tests {
