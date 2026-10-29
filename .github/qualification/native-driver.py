@@ -156,6 +156,17 @@ def copy_exact(pid, name, expected, keyboard=False):
     wait(lambda: clipboard() == expected)
 
 
+def open_ordinary_history(pid):
+    plus = wait(lambda: next((node for node in live_tree(pid)
+                             if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                             and node.name.startswith('New tab · Thread ')
+                             and visible(node)), None))
+    click(pid, plus.name)
+    click(pid, 'New Resume conversation tab')
+    wait(lambda: any(node.name == 'Resume Ordinary retained conversation' and visible(node)
+                     for node in live_tree(pid)))
+
+
 def processes():
     result = {}
     for path in Path('/proc').glob('[0-9]*/stat'):
@@ -440,20 +451,15 @@ try:
                 wait(lambda: field.queryText().getText(0, -1) == healthy_text)
                 (root / 'healthy-draft-expected').write_text(healthy_text)
             if ordinary:
+                open_ordinary_history(pid)
+                capture(window, label + '-ordinary-history', (1280, 800))
                 if variant == 'after':
+                    run(['xdotool', 'key', 'Escape'])
+                    wait(lambda: not any(node.name == 'Resume conversation' and visible(node) for node in live_tree(pid)))
                     focus_failed_pane(pid)
                     click(pid, 'Remove saved pane')
                     wait(lambda: not any(node.name == 'Saved pane unavailable' for node in live_tree(pid)))
-                plus = wait(lambda: next((node for node in live_tree(pid)
-                                         if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                                         and node.name.startswith('New tab · Thread ')
-                                         and visible(node)), None))
-                click(pid, plus.name)
-                click(pid, 'New Resume conversation tab')
-                wait(lambda: any(node.name == 'Resume Ordinary retained conversation' and visible(node)
-                                 for node in live_tree(pid)))
-                capture(window, label + '-ordinary-history', (1280, 800))
-                if variant == 'after':
+                    open_ordinary_history(pid)
                     before_denied = receipt.read_text().count('effect-request-')
                     click(pid, 'Resume Unavailable saved pane')
                     wait(lambda: any('This saved pane could not be verified and cannot be reopened here.' in node.name
