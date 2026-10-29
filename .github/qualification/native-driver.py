@@ -102,7 +102,7 @@ def wait(predicate, timeout=30):
                 incomplete_accessibility_retries += 1
             last_stale = error
             result = None
-        if result:
+        if result and time.monotonic() < end:
             return result
         time.sleep(.15)
     raise RuntimeError('Native condition did not settle within its deadline') from last_stale
@@ -195,9 +195,32 @@ def click(pid, name, keyboard=False):
         return nodes[0] if len(nodes) == 1 else None
     node = wait(find)
     if keyboard:
-        event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'keyboard'})
+        def input_focus():
+            return int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
+        def focus_state(target):
+            states = target.getState()
+            return {'object': repr(target), 'focused': states.contains(pyatspi.STATE_FOCUSED),
+                    'enabled': states.contains(pyatspi.STATE_ENABLED), 'showing': visible(target),
+                    'native_input_focus': input_focus(), 'owned_window': int(window)}
+        before_focus = focus_state(node)
+        event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'keyboard',
+               'before_focus': before_focus})
         assert node.queryComponent().grabFocus(), 'Recovery control refused keyboard focus'
-        wait(lambda: node.getState().contains(pyatspi.STATE_FOCUSED))
+        last_focus = {}
+        def focused_control():
+            nonlocal last_focus
+            current = find()
+            if current is None:
+                last_focus = {'target_missing_or_ambiguous': True, 'native_input_focus': input_focus()}
+                return None
+            current.clearCache()
+            last_focus = focus_state(current)
+            return current if (last_focus['focused'] and last_focus['enabled'] and last_focus['showing']
+                               and last_focus['native_input_focus'] == int(window)) else None
+        try:
+            wait(focused_control)
+        finally:
+            event({'event': 'keyboard-focus-readback', 'pid': pid, 'name': name, 'state': last_focus})
         run(['xdotool', 'key', 'Return'])
         return
     bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
@@ -391,7 +414,7 @@ def responsiveness(window, pid, fixture, root, label, helper):
             'completed_phases': completed_phases,
             'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
             'synthetic_workload': '200-item healthy transcript, 32 managed registry entries (30 idle peers), 150 channel-title events at nominal 5Hz',
-            'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe covers its recorded sample interval, resources cover the full 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
+            'scope': 'Actual X11 app input-to-observed-window-pixels; pixel probe and resources cover their recorded sample intervals during the 150-event stream. No physical presentation/GPU or live-provider claim. Baseline blocks healthy transcript admission.',
             'probe_sha256': digest(helper), 'samples': samples,
         }, indent=2) + '\n')
 
@@ -814,7 +837,7 @@ finally:
                         bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
                         value['desktop_bounds'] = [bounds.x, bounds.y, bounds.width, bounds.height]
                         if editable:
-                            value['text_preview'] = node.queryText().getText(0, 256)
+                            value['text_preview'] = node.queryText().getText(0, -1)[:256]
                         values.append(value)
                     return values
                 (out / (active_arm + '-failure-accessibility.json')).write_text(
