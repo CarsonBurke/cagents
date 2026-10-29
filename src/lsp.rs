@@ -5946,9 +5946,15 @@ pub(crate) mod tests {
         json!({ "textDocumentSync": { "openClose": true, "change": 2, "save": true } })
     }
 
+    /// Positive fixture roots must match discovery's canonical session keys.
+    pub(super) fn canonical_tempdir() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().expect("temp parent");
+        tempfile::tempdir_in(parent).expect("tempdir")
+    }
+
     /// A worktree with a root marker and one Rust file.
     fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path().to_path_buf();
         std::fs::write(worktree.join("Cargo.toml"), "[package]\n").expect("marker");
         let file = worktree.join("main.rs");
@@ -6378,7 +6384,7 @@ pub(crate) mod tests {
                     "[package]\nname=\"island\"\n[workspace]\n",
                     "[package]\nname=\"island\"\n",
                 ] {
-                    let root = tempfile::tempdir().unwrap();
+                    let root = canonical_tempdir();
                     let worktree = root.path();
                     std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\nexclude=[\"tools/island\"]\n[package]\nname=\"outer\"\n").unwrap();
                     for name in ["crates/a", "crates/b", "tools/island"] {
@@ -6616,7 +6622,7 @@ pub(crate) mod tests {
                         ),
                         ("pnpm-workspace.yaml", "ts", "packages:\n - project\n"),
                     ] {
-                        let root = tempfile::tempdir().unwrap();
+                        let root = canonical_tempdir();
                         let project = root.path().join("project");
                         std::fs::create_dir_all(project.join("src")).unwrap();
                         std::fs::write(
@@ -6693,7 +6699,7 @@ pub(crate) mod tests {
     #[test]
     fn asynchronous_cargo_discovery_includes_transitive_workspace_path_dependencies() {
         block_on(async {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[\"app\"]\n[workspace.dependencies]\nhelper={path=\"libs/helper\"}\n").unwrap();
             for (path, manifest) in [
                 (
@@ -6754,7 +6760,7 @@ pub(crate) mod tests {
     #[test]
     fn asynchronous_package_workspace_link_resolves_a_member_beside_its_workspace_root() {
         block_on(async {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let workspace = root.path().join("workspace");
             let member = root.path().join("member");
             std::fs::create_dir_all(&workspace).unwrap();
@@ -6889,7 +6895,7 @@ pub(crate) mod tests {
                 ),
             ] {
                 for island_first in [false, true] {
-                    let root = tempfile::tempdir().unwrap();
+                    let root = canonical_tempdir();
                     for package in ["a", "b", "island"] {
                         let directory = root.path().join("packages").join(package);
                         std::fs::create_dir_all(directory.join("src")).unwrap();
@@ -6957,7 +6963,7 @@ pub(crate) mod tests {
     #[test]
     fn asynchronous_membership_budget_exhaustion_keeps_nearest_project() {
         block_on(async {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let project = root.path().join("project");
             std::fs::create_dir_all(project.join("src")).unwrap();
             std::fs::write(project.join("Cargo.toml"), "[package]\nname=\"project\"\n").unwrap();
@@ -7067,7 +7073,7 @@ pub(crate) mod tests {
                 ),
             ];
             for (label, contents) in cases {
-                let root = tempfile::tempdir().unwrap();
+                let root = canonical_tempdir();
                 let project = root.path().join("project");
                 std::fs::create_dir_all(project.join("src")).unwrap();
                 std::fs::write(project.join("package.json"), "{}").unwrap();
@@ -7106,7 +7112,7 @@ pub(crate) mod tests {
 
     #[test]
     fn workspace_discovery_prefers_topmost_cargo_workspace() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let nested = root.path().join("crates/nested");
         std::fs::create_dir_all(nested.join("src")).unwrap();
         std::fs::write(
@@ -7139,7 +7145,7 @@ pub(crate) mod tests {
             ("pnpm-workspace.yaml", "packages:\n - packages/*\n"),
             ("tsconfig.json", r#"{"references":[{"path":"packages/a"}]}"#),
         ] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let package = root.path().join("packages/a/src");
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(root.path().join(manifest), content).unwrap();
@@ -8108,7 +8114,7 @@ pub(crate) mod tests {
 
     #[test]
     fn root_discovery_stops_at_the_nearest_marker_and_never_leaves_the_worktree() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path();
         let inner = worktree.join("crates/inner");
         std::fs::create_dir_all(inner.join("src")).expect("dirs");
@@ -10920,7 +10926,7 @@ pub(crate) mod tests {
     #[test]
     fn two_files_in_one_root_share_one_session_and_debounce_independently() {
         block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = canonical_tempdir();
             let worktree = root.path().to_path_buf();
             std::fs::write(worktree.join("Cargo.toml"), "").expect("marker");
             let first = worktree.join("first.rs");
@@ -10988,8 +10994,8 @@ pub(crate) mod tests {
     #[test]
     fn diagnostics_reach_only_the_documents_of_the_emitting_session() {
         block_on(async {
-            let first_root = tempfile::tempdir().expect("tempdir");
-            let second_root = tempfile::tempdir().expect("tempdir");
+            let first_root = canonical_tempdir();
+            let second_root = canonical_tempdir();
             let first = first_root.path().join("one.rs");
             let second = second_root.path().join("two.rs");
             std::fs::write(&first, "a\n").expect("write");
@@ -11074,8 +11080,8 @@ pub(crate) mod tests {
     #[test]
     fn progress_reaches_only_the_documents_of_the_emitting_session() {
         block_on(async {
-            let first_root = tempfile::tempdir().expect("tempdir");
-            let second_root = tempfile::tempdir().expect("tempdir");
+            let first_root = canonical_tempdir();
+            let second_root = canonical_tempdir();
             let first = first_root.path().join("one.rs");
             let second = second_root.path().join("two.rs");
             std::fs::write(&first, "a\n").expect("write");
@@ -11232,7 +11238,7 @@ pub(crate) mod tests {
     #[test]
     fn a_dead_session_is_replaced_and_every_open_document_is_reopened() {
         block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
+            let root = canonical_tempdir();
             let worktree = root.path().to_path_buf();
             std::fs::write(worktree.join("Cargo.toml"), "").expect("marker");
             let first = worktree.join("first.rs");
@@ -11539,7 +11545,7 @@ pub(crate) mod tests {
     /// A worktree, a sibling directory outside it that also carries a root
     /// marker, and a symlink inside the worktree pointing at that sibling.
     fn escaping_symlink() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = canonical_tempdir();
         let worktree = root.path().join("worktree");
         let outside = root.path().join("outside");
         std::fs::create_dir_all(worktree.join("src")).expect("worktree");
