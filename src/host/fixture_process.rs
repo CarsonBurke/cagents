@@ -80,22 +80,90 @@ fn packet_socket() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
-fn connect(path: &Path) -> io::Result<UnixStream> {
+fn remaining_io(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "fixture custody handoff deadline expired",
+        ));
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))
+}
+
+fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "fixture custody connection deadline expired",
+        ));
+    }
     let descriptor = packet_socket()?;
     let (address, length) = address(path)?;
+    let stream = UnixStream::from(descriptor);
+    stream.set_nonblocking(true)?;
     if unsafe {
         libc::connect(
-            descriptor.as_raw_fd(),
+            stream.as_raw_fd(),
             (&address as *const libc::sockaddr_un).cast(),
             length,
         )
     } != 0
     {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // AF_UNIX EAGAIN can mean a full backlog without a pending connect.
+        // Refuse it; only EINPROGRESS permits observing this one attempt.
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error);
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture custody connection deadline expired",
+                ));
+            }
+            let mut readiness = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let timeout = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32;
+            let result = unsafe { libc::poll(&mut readiness, 1, timeout) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue; // Readiness only; never repeat connect or reset the deadline.
+                }
+                return Err(error);
+            }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture custody connection deadline expired",
+                ));
+            }
+            if readiness.revents & libc::POLLNVAL != 0 {
+                return Err(refused(
+                    "fixture custody connection descriptor became invalid",
+                ));
+            }
+            break;
+        }
     }
-    let stream = UnixStream::from(descriptor);
-    stream.set_read_timeout(Some(IO_BOUND))?;
-    stream.set_write_timeout(Some(IO_BOUND))?;
+    // Writable/error readiness alone does not prove connection success.
+    // take_error reads SO_ERROR; peer_addr also refuses an unconnected socket.
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    stream.peer_addr()?;
+    stream.set_nonblocking(false)?;
+    remaining_io(&stream, deadline)?;
     Ok(stream)
 }
 
@@ -387,14 +455,23 @@ fn register(pins: &Pins, owners: [Process; 2]) -> io::Result<()> {
     if parent <= 0 || unsafe { libc::getppid() } != parent {
         return Err(refused("fixture original parent changed"));
     }
-    let mut stream = connect(Path::new(&path))?;
+    let deadline = Instant::now() + IO_BOUND;
+    let stream = connect(Path::new(&path), deadline)?;
     let credentials = peer(&stream)?;
     if credentials.pid != parent || credentials.uid != unsafe { libc::getuid() } {
         return Err(refused("fixture endpoint is not its original parent"));
     }
     let bytes = serde_json::to_vec(&Registration { case, owners }).map_err(io::Error::other)?;
+    remaining_io(&stream, deadline)?;
     send_registration(&stream, &bytes, &pins.descriptors)?;
+    remaining_io(&stream, deadline)?;
     let (ack, unexpected) = receive_packet(&stream)?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "fixture custody acknowledgment arrived after the handoff deadline",
+        ));
+    }
     if !unexpected.is_empty() || ack.as_slice() != case.as_bytes() {
         return Err(refused(
             "fixture custody acknowledgment is missing or different",
@@ -492,10 +569,35 @@ struct OriginalChild {
     descriptor: OwnedFd,
     status_path: Option<PathBuf>,
 }
+
+fn validate_wait_policy(action: &libc::sigaction) -> io::Result<()> {
+    if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(refused(
+            "fixture requires default SIGCHLD without SA_NOCLDWAIT; caller policy is preserved",
+        ));
+    }
+    Ok(())
+}
+
+fn require_waitable_children() -> io::Result<()> {
+    // Observe only. Auto-reaping can release an immediately exited child's PID
+    // before pidfd capture, and a custom handler may compete for its wait.
+    let mut action: libc::sigaction = unsafe { mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    validate_wait_policy(&action)
+}
+
 impl OriginalChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        require_waitable_children()?;
+        Self::new(command.spawn()?)
+    }
+
     fn new(mut child: Child) -> io::Result<Self> {
-        // No waiter has been given this original Child. Even an immediate exit
-        // remains unreaped until this sole owner collects the original status.
+        // spawn refused auto-reaping or competing inherited signal policy
+        // before creating this Child. No other waiter receives its handle.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
         if descriptor < 0 {
             let error = io::Error::last_os_error();
@@ -619,7 +721,7 @@ pub(super) fn run_fixture(
         .env(PARENT, std::process::id().to_string())
         .stdout(Stdio::from(output_file("fixture.stdout")?))
         .stderr(Stdio::from(output_file("fixture.stderr")?));
-    let mut child = OriginalChild::new(command.spawn()?)?;
+    let mut child = OriginalChild::spawn(command)?;
     child.status_path = Some(root.join("fixture-child-status.json"));
     let mut parent = Parent {
         original: child,
@@ -706,16 +808,38 @@ mod tests {
     use super::*;
 
     fn child(script: &str) -> OriginalChild {
-        OriginalChild::new(
+        OriginalChild::spawn(
             Command::new("/bin/sh")
                 .args(["-c", script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
+                .stderr(Stdio::null()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inherited_auto_reap_or_custom_handler_is_refused_without_resetting_policy() {
+        let mut action: libc::sigaction = unsafe { mem::zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        assert!(validate_wait_policy(&action).is_ok());
+        action.sa_sigaction = libc::SIG_IGN;
+        assert!(validate_wait_policy(&action).is_err());
+        assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+        action.sa_sigaction = libc::SIG_DFL;
+        action.sa_flags = libc::SA_NOCLDWAIT;
+        assert!(validate_wait_policy(&action).is_err());
+        assert_eq!(action.sa_flags, libc::SA_NOCLDWAIT);
+        action.sa_flags = 0;
+        action.sa_sigaction = 123;
+        assert!(validate_wait_policy(&action).is_err());
+        assert_eq!(action.sa_sigaction, 123);
+    }
+
+    #[test]
+    fn expired_connection_deadline_refuses_before_contacting_an_endpoint() {
+        let error = connect(Path::new("/unused-fixture-endpoint"), Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -753,7 +877,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("custody.sock");
         let listener = listener(&path).unwrap();
-        let sender = connect(&path).unwrap();
+        let sender = connect(&path, Instant::now() + IO_BOUND).unwrap();
         let (receiver, _) = listener.accept().unwrap();
         let descriptors = vec![
             owner.descriptor.try_clone().unwrap(),

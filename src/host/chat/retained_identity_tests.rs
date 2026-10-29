@@ -89,13 +89,13 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
     // This is the real HOST entry, including its first protocol::create call.
     start_execution(&host, 0, source, context).unwrap();
     let handle = host.lock().unwrap().chats[&id].handle.clone();
-    let identity = handle
-        .actor_identity()
-        .expect("actual retained helper required");
     // Captures only the returned, live authenticated actor. The startup Close
     // guard remains armed until the parent holds both original descriptors.
     let _cleanup = crate::host::fixture_process::ActorGuard::created(handle.clone(), proof.clone())
         .expect("original actor custody must be acknowledged before fixture input");
+    let identity = handle
+        .actor_identity()
+        .expect("actual retained helper required");
     wait(
         || handle.attachment_snapshot().ready,
         "provider did not initialize",
