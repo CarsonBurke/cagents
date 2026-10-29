@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 import pyatspi
 from gi.repository import GLib
@@ -680,13 +681,32 @@ try:
             capture(window, label + '-launch-wide', (1280, 800))
             if mode == 'peer-removal':
                 ready = 'Verified conversation ready for peer removal.'
-                wait(lambda: any(node.name == ready and visible(node) for node in live_tree(pid)))
-                wait(lambda: any(visible(node) and node.name.startswith('Chat pane Healthy saved pane,')
-                                 for node in live_tree(pid)))
                 def peer_inside_viewport(node):
                     bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
                     return (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
                             and bounds.x + bounds.width <= viewport[0] and bounds.y + bounds.height <= viewport[1])
+                # Display titles follow the manual channel title and change
+                # again when the peer edit arrives. Bind the sole Chat to its
+                # private source directory instead of freezing presentation.
+                (out / (label + '-bootstrap-accessibility.json')).write_text(json.dumps(
+                    accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()}
+                        for node in live_tree(pid) if visible(node)]), indent=2) + '\n')
+                ready_labels = wait(lambda: accessibility_snapshot(lambda: [node.name
+                    for node in live_tree(pid) if ready in node.name and visible(node)]))
+                event({'event': 'peer-ready-sentinel-visible', 'labels': ready_labels})
+                def peer_chat_tab():
+                    def read():
+                        tabs = [node for node in live_tree(pid)
+                                if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                                and node.name.startswith('Chat pane ')]
+                        assert len(tabs) <= 1, 'Peer fixture must have exactly one Chat pane'
+                        if not tabs or not peer_inside_viewport(tabs[0]):
+                            return None
+                        name = tabs[0].name
+                        assert ', ' + str(root / 'project') + ', ' in name, 'Unexpected Chat source directory'
+                        return name
+                    return accessibility_snapshot(read)
+                event({'event': 'peer-chat-tab-identified', 'label': wait(peer_chat_tab)})
                 def empty_peer_composer():
                     fields = [node for node in live_tree(pid) if node.name == 'Message' and visible(node)
                               and node.getState().contains(pyatspi.STATE_EDITABLE)]
@@ -730,8 +750,9 @@ try:
                 def peer_removed():
                     nodes = live_tree(pid)
                     field = peer_field()
-                    return (not any(visible(node) and (node.name == ready or node.name == 'Message'
-                                    or node.name.startswith('Chat pane Healthy saved pane,')) for node in nodes)
+                    return (not any(visible(node) and (ready in node.name or node.name == 'Message'
+                                    or (node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                                        and node.name.startswith('Chat pane '))) for node in nodes)
                             and any(visible(node) and node.name == settings_focused for node in nodes)
                             and field is not None and field.getState().contains(pyatspi.STATE_FOCUSED)
                             and field.queryText().getText(0, -1) == 'peer scope preserved')
@@ -1160,6 +1181,12 @@ try:
 finally:
     native_failure = sys.exc_info()[1]
     diagnostic_errors = []
+    if native_failure is not None:
+        try:
+            (out / 'native-failure-traceback.txt').write_text(''.join(traceback.format_exception(
+                type(native_failure), native_failure, native_failure.__traceback__)))
+        except BaseException as error:
+            diagnostic_errors.append({'kind': 'traceback', 'error': repr(error)})
     if native_failure is not None and active_arm and window is not None and pid is not None:
         try:
             assert (Path('/proc') / str(pid) / 'exe').resolve() == (target / 'dev-runtime/cagents-ui').resolve()
