@@ -5724,6 +5724,13 @@ impl Cagents {
             if !card.existence.is_open() {
                 continue;
             }
+            if self.shared_views.quarantined.contains(&card.id)
+                || self.durable.quarantined_panes.contains_key(&card.id)
+            {
+                self.shared_views.quarantined.insert(card.id);
+                self.present_quarantined_pane(card.id);
+                continue;
+            }
             let terminal_residency =
                 restored_terminal_residency(&card.kind, card.exposure, &card.residency);
             #[cfg(feature = "integrated-browser")]

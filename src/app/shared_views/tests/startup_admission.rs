@@ -1216,6 +1216,319 @@ fn a_wrong_proof_alias_is_preserved_instead_of_retired_by_uuid_equality() {
     assert!(app.card_state(canonical.id).unwrap().existence.is_open());
 }
 
+#[test]
+fn retained_chat_tombstone_still_records_its_exact_closed_source() {
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let CardKind::Chat(source) = &pane.kind else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut app.durable)
+        .local_only_cards
+        .insert(pane.id);
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    app.shared_views
+        .observed_chats
+        .insert(pane.id, source.clone());
+    app.chat_ui =
+        chat_ui::State::with_drafts(HashMap::from([(pane.id, "Retained closed draft".into())]));
+    app.cards.insert(
+        pane.id,
+        CardRuntime::Failed("Fixture detached saved reader".into()),
+    );
+    let mut retired = View::empty(hidden);
+    retired.retired.push(pane.id);
+    app.workspace_model = model(identity, active, hidden, retired);
+    drop(app.reconcile_shared_views());
+    assert_eq!(app.shared_views.closed_chats.get(&pane.id), Some(source));
+    assert!(
+        app.chat_closed_elsewhere(pane.id),
+        "retained visibility cannot suppress authoritative chat retirement bookkeeping"
+    );
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+    assert_eq!(
+        app.persistent_workspace().chat_drafts[&pane.id],
+        "Retained closed draft"
+    );
+    assert!(!app.chat_start_pending(pane.id));
+}
+
+#[test]
+fn rejected_identity_cannot_borrow_another_issuers_exact_source_but_accepts_a_canonical_upgrade() {
+    let (mut app, active, hidden, mut rejected, identity) = cached_chat();
+    current_owner(&mut rejected);
+    app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+    Arc::make_mut(&mut app.durable)
+        .quarantined_panes
+        .insert(rejected.id, rejected.kind.clone());
+    let healthy = sibling_chat(&rejected, "Another issuer's valid source");
+    let mut view = View::empty(hidden);
+    view.panes.push(healthy.clone());
+    let mut incoming = model(identity, active, hidden, view);
+    incoming.agents.push(managed_owner(&healthy, hidden));
+    // Simulate a same-ID local descriptor replacement. Its capability really
+    // belongs to B, while the complete model admits no descriptor for A.
+    app.card_state_mut(rejected.id).unwrap().kind = healthy.kind.clone();
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    app.workspace_model = incoming.clone();
+    drop(app.reconcile_shared_views());
+    assert!(app.shared_views.quarantined.contains(&rejected.id));
+    assert_eq!(
+        app.durable.quarantined_panes.get(&rejected.id),
+        Some(&rejected.kind)
+    );
+    assert!(matches!(
+        app.cards.get(&rejected.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(
+        !app.chat_start_pending(rejected.id),
+        "A cannot attach or resume by borrowing B's otherwise valid proof"
+    );
+
+    let mut upgraded = rejected.clone();
+    let CardKind::Chat(session) = &mut upgraded.kind else {
+        unreachable!()
+    };
+    session.proof.as_mut().unwrap().host_incarnation = "verified-canonical-upgrade".into();
+    incoming.sequence += 1;
+    incoming.views[1].panes.push(upgraded.clone());
+    incoming.agents.push(managed_owner(&upgraded, hidden));
+    app.refresh_managed_pane_quarantine(&incoming);
+    assert!(
+        !app.shared_views.quarantined.contains(&rejected.id),
+        "the unique exact canonical update can re-enter ordinary source admission"
+    );
+    assert!(!app.durable.quarantined_panes.contains_key(&rejected.id));
+    assert_eq!(
+        app.card_state(rejected.id).unwrap().kind,
+        healthy.kind,
+        "classification leaves source replacement and draft preservation to ordinary admission"
+    );
+}
+
+#[test]
+fn persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    current_owner(&mut pane);
+    let CardKind::Chat(session) = &mut pane.kind else {
+        unreachable!()
+    };
+    session.launch.provider = crate::agent::Provider::Codex;
+    session.launch.recipe.program = "codex".into();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+        pane.id,
+        "Keep rejected Codex draft".into(),
+    )]));
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let mut rejected = model(identity, active, hidden, view.clone());
+    let mut issuer = managed_owner(&pane, hidden);
+    issuer.closed = true;
+    rejected.agents.push(issuer);
+    app.workspace_model = rejected;
+    drop(app.reconcile_shared_views());
+    let saved = app.persistent_workspace();
+    assert_eq!(saved.quarantined_panes.get(&pane.id), Some(&pane.kind));
+    assert!(!saved.local_only_cards.contains(&pane.id));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("open-quarantine.sqlite3");
+    let store =
+        crate::persistence::StateStore::open(&path, crate::model::BootId::new("before-reload"))
+            .unwrap();
+    store
+        .save_workspace(
+            &saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    drop(store);
+    let store =
+        crate::persistence::StateStore::open(&path, crate::model::BootId::new("after-reload"))
+            .unwrap();
+    let restored = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert_eq!(restored.quarantined_panes.get(&pane.id), Some(&pane.kind));
+    app.durable = Arc::new(restored);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_draft_attachments(
+        app.durable.chat_drafts.clone(),
+        app.durable.chat_draft_attachments.clone(),
+    );
+    app.workspace_model = Default::default();
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.initialize_runtimes());
+    assert!(
+        matches!(app.cards.get(&pane.id), Some(CardRuntime::Failed(_))),
+        "persisted markers must paint an inert failure during initialization"
+    );
+    assert!(!app.chat_start_pending(pane.id));
+    let replacement = model(uuid::Uuid::new_v4(), active, hidden, view);
+    drop(app.apply_workspace_model_update(ModelUpdate::Connected(replacement.clone())));
+    for channel in [active, hidden] {
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(channel),
+            operation: None,
+            model: replacement.clone(),
+        }));
+    }
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(
+        !app.chat_start_pending(pane.id),
+        "issuer absence cannot authorize a resumable provider start after SeedView admission"
+    );
+    assert_eq!(
+        app.persistent_workspace().chat_drafts[&pane.id],
+        "Keep rejected Codex draft"
+    );
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+        ModelEdit::SeedView { panes, closed, .. } if panes.iter().any(|source| source.id == pane.id) || closed.contains(&pane.id))));
+
+    // Changing the same-ID local source is also not proof that the original
+    // rejection has gone away. Even the local-only startup exception must wait.
+    let original = pane.kind.clone();
+    let CardKind::Chat(changed) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+        unreachable!()
+    };
+    changed.id = TerminalId::new();
+    Arc::make_mut(&mut app.durable)
+        .local_only_cards
+        .insert(pane.id);
+    app.shared_views = State::for_workspace(&app.durable);
+    drop(app.initialize_runtimes());
+    drop(app.reconcile_shared_views());
+    assert!(app.shared_views.quarantined.contains(&pane.id));
+    assert!(matches!(
+        app.cards.get(&pane.id),
+        Some(CardRuntime::Failed(_))
+    ));
+    assert!(!app.chat_start_pending(pane.id));
+    assert_eq!(
+        app.durable.quarantined_panes.get(&pane.id),
+        Some(&original),
+        "source mismatch preserves the original rejected evidence"
+    );
+
+    Arc::make_mut(&mut app.durable)
+        .local_only_cards
+        .remove(&pane.id);
+    app.card_state_mut(pane.id).unwrap().kind = original;
+    let mut verified = replacement;
+    verified.sequence += 1;
+    verified.agents.push(managed_owner(&pane, hidden));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(verified)));
+    assert!(!app.shared_views.quarantined.contains(&pane.id));
+    assert!(
+        !app.durable.quarantined_panes.contains_key(&pane.id),
+        "only exact authoritative revalidation clears the durable rejection"
+    );
+}
+
+#[test]
+fn quarantined_retained_cards_do_not_duplicate_or_replace_a_retained_editor() {
+    let (mut app, active, hidden, mut rejected, identity) = cached_chat();
+    current_owner(&mut rejected);
+    app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+    let mut healthy = sibling_chat(&rejected, "Healthy descriptor");
+    install_held_pane(&mut app, hidden, &healthy);
+    let editor = CardId::new();
+    let project = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == hidden)
+        .unwrap()
+        .project_id;
+    let editor_kind = CardKind::Repository(crate::model::RepositoryView {
+        project,
+        repository: "/repo".into(),
+        worktree: "/repo".into(),
+        selected_file: Some("keep-editor.rs".into()),
+    });
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards.push(CardState {
+        id: editor,
+        generation: durable.generation,
+        title: "Retained editor".into(),
+        width_fraction: 0.62,
+        kind: editor_kind.clone(),
+        existence: Existence::Open,
+        exposure: Exposure::Offscreen,
+        residency: Residency::Cold,
+    });
+    durable.local_only_cards.extend([rejected.id, editor]);
+    durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == hidden)
+        .unwrap()
+        .cards = vec![rejected.id, editor, healthy.id];
+    durable.active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    app.shared_views
+        .initialized
+        .extend([Scope::Channel(active), Scope::Channel(hidden)]);
+    // A browser sibling is sufficient to exercise projection without dispatching
+    // any native-provider work from this pure ordering regression.
+    let (_, _, _, browser) = fixture();
+    healthy.kind = browser.kind;
+    app.card_state_mut(healthy.id).unwrap().kind = healthy.kind.clone();
+    let mut view = View::empty(hidden);
+    view.panes = vec![rejected.clone(), healthy.clone()];
+    let mut full = model(identity, active, hidden, view);
+    let mut owner = managed_owner(&rejected, hidden);
+    owner.closed = true;
+    full.agents.push(owner);
+    app.workspace_model = full;
+    drop(app.reconcile_shared_views());
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == hidden)
+        .unwrap();
+    assert_eq!(
+        channel.cards.iter().copied().collect::<HashSet<_>>(),
+        HashSet::from([rejected.id, editor, healthy.id])
+    );
+    assert_eq!(channel.cards.len(), 3);
+    assert_eq!(
+        app.workspace.order().collect::<HashSet<_>>(),
+        HashSet::from([rejected.id, editor, healthy.id])
+    );
+    assert_eq!(app.workspace.order().count(), 3);
+    assert_eq!(app.card_state(editor).unwrap().kind, editor_kind);
+    assert!(app.card_state(editor).unwrap().existence.is_open());
+    assert_eq!(app.card_state(editor).unwrap().title, "Retained editor");
+    assert_eq!(app.card_state(healthy.id).unwrap().kind, healthy.kind);
+    assert_eq!(
+        app.durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .collect::<HashSet<_>>()
+            .len(),
+        app.durable.cards.len(),
+        "visible ordering cannot overwrite a distinct durable descriptor"
+    );
+}
+
 /// Drive the real initial-model and SeedView acknowledgement reducer routes.
 /// A Connected metadata snapshot alone does not yet admit the cached pane.
 fn admit(

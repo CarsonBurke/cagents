@@ -643,7 +643,7 @@ impl Cagents {
         Task::batch(ready.into_iter().map(|project| {
             if self.project_has_quarantined_panes(project) {
                 self.project_ui.close_failed.insert(project);
-                self.status = Some(TransientNotice::warning("Remove this project's unverified saved panes before closing it. Their history and drafts will be retained."));
+                self.status = Some(TransientNotice::warning("Remove this project's unverified saved panes before closing it. Their saved sessions and drafts will remain stored."));
                 return Task::none();
             }
             let Some(row) = self.sidebar_model.project(project) else {
@@ -1380,7 +1380,7 @@ impl Cagents {
                 }
                 if self.project_has_quarantined_panes(removal.project) {
                     self.status = Some(TransientNotice::warning(
-                        "Remove this project's unverified saved panes before removing the project. Their history and drafts will be retained.",
+                        "Remove this project's unverified saved panes before removing the project. Their saved sessions and drafts will remain stored.",
                     ));
                     return self.project_dialog_closed();
                 }
@@ -1660,7 +1660,7 @@ impl Cagents {
     fn start_worktree_deletion(&mut self, target: Target) -> Task<Message> {
         if self.worktree_has_quarantined_panes(&target.path) {
             self.status = Some(TransientNotice::warning(
-                "Remove this worktree's unverified saved panes before deleting it. Their history and drafts will be retained.",
+                "Remove this worktree's unverified saved panes before deleting it. Their saved sessions and drafts will remain stored.",
             ));
             return Task::none();
         }

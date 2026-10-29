@@ -646,7 +646,7 @@ impl Cagents {
             .any(|card| self.shared_views.quarantined.contains(card))
         {
             self.status = Some(TransientNotice::warning(
-                "Remove the unverified saved panes from this channel before deleting it. Their history and drafts will be retained.",
+                "Remove the unverified saved panes from this channel before deleting it. Their saved sessions and drafts will remain stored.",
             ));
             return Task::none();
         }

@@ -32,11 +32,10 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
-// Format 12 introduces retained Claude descriptors that older readers cannot
-// decode safely. Admission must reject them before partial workspace loading
-// can omit a card and a later snapshot can tombstone it. This supplements the
-// normal local IPC startup gate; it also fences permitted old-set/remote opens.
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+// Format 14 fences readers which do not honor durable pane quarantine. An older
+// reader must not restore a rejected source merely because it can decode the
+// descriptor. This supplements the local IPC gate for old-set/remote opens.
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -274,6 +273,7 @@ pub struct WorkspaceManifest {
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
+    pub quarantined_panes: HashMap<CardId, CardKind>,
     pub pending_chat_admissions: HashMap<CardId, crate::chat::Session>,
     pub pending_terminal_creations: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
@@ -2071,6 +2071,7 @@ impl StateStore {
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
+            quarantined_panes: manifest.quarantined_panes,
             pending_chat_admissions: manifest.pending_chat_admissions,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
@@ -2764,8 +2765,14 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     ))?;
     let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
-    let mut retained =
-        HashMap::<WorkspaceId, (HashSet<CardId>, HashMap<CardId, crate::chat::Session>)>::new();
+    let mut retained = HashMap::<
+        WorkspaceId,
+        (
+            HashSet<CardId>,
+            HashMap<CardId, crate::chat::Session>,
+            HashMap<CardId, CardKind>,
+        ),
+    >::new();
     while let Some(row) = rows.next()? {
         budget.check_deadline()?;
         let existence: String = row.get(3)?;
@@ -2783,23 +2790,30 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
+        let workspace: String = row.get(6)?;
+        let workspace = parse_id("migration workspace", &workspace)?;
+        let (local, pending, quarantined) = match retained.entry(workspace) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let local = retained_metadata(&transaction, workspace, "local_only_cards", budget)?;
+                let pending =
+                    retained_metadata(&transaction, workspace, "pending_chat_admissions", budget)?;
+                let quarantined =
+                    retained_metadata(&transaction, workspace, "quarantined_panes", budget)?;
+                entry.insert((local, pending, quarantined))
+            }
+        };
+        if let Some(rejected) = quarantined.get(&card) {
+            if rejected != &session {
+                return Err(StoreError::InvalidState(
+                    "A quarantined saved pane no longer matches its rejected source".into(),
+                ));
+            }
+            // This is saved rejection evidence, not an actor to resolve or
+            // resume. Actual live daemon inventory is qualified independently.
+            continue;
+        }
         if let CardKind::Chat(source) = &session {
-            let workspace: String = row.get(6)?;
-            let workspace = parse_id("migration workspace", &workspace)?;
-            let (local, pending) = match retained.entry(workspace) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let local =
-                        retained_metadata(&transaction, workspace, "local_only_cards", budget)?;
-                    let pending = retained_metadata(
-                        &transaction,
-                        workspace,
-                        "pending_chat_admissions",
-                        budget,
-                    )?;
-                    entry.insert((local, pending))
-                }
-            };
             // A shared cache awaiting authority may still name a hosted actor.
             // Only a deliberately retained local copy with an exact source
             // marker is inert text rather than required hosted migration.
@@ -3457,6 +3471,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
             )?;
         }
+        // Version 14 changes reader admission only. Quarantine is stored in
+        // existing metadata rows; the v13 layout/data needs no rewrite.
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -3991,6 +4007,11 @@ fn save_workspace_transaction(
         transaction,
         &format!("workspace:{workspace_id}:navigation:local_only_cards"),
         &to_json(&state.local_only_cards)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:quarantined_panes"),
+        &to_json(&state.quarantined_panes)?,
     )?;
     set_metadata(
         transaction,
@@ -5344,6 +5365,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("local-only pane identities", &value))
         .transpose()?
         .unwrap_or_default(),
+        quarantined_panes: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:quarantined_panes"),
+        )?
+        .map(|value| from_json("quarantined saved pane sources", &value))
+        .transpose()?
+        .unwrap_or_default(),
         pending_chat_admissions: metadata(
             connection,
             &format!("workspace:{id}:navigation:pending_chat_admissions"),
@@ -6004,6 +6032,7 @@ mod tests {
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            quarantined_panes: Default::default(),
             pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
@@ -6239,6 +6268,43 @@ mod tests {
             result.insert(table, rows);
         }
         result
+    }
+
+    #[test]
+    fn v13_quarantine_reader_admission_migration_preserves_rows_and_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v13-admission.sqlite3");
+        let mut workspace = workspace_with_terminal(&boot("v13-admission"));
+        workspace
+            .quarantined_panes
+            .insert(workspace.cards[0].id, workspace.cards[0].kind.clone());
+        let store = StateStore::open(&path, boot("v13-admission")).unwrap();
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        connection.pragma_update(None, "user_version", 13).unwrap();
+        let before = logical_ui_rows(&connection);
+        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(logical_ui_rows(&connection), before);
+        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
+        drop(connection);
+        let reopened = StateStore::open(&path, boot("v14-admission")).unwrap();
+        assert_eq!(
+            reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .quarantined_panes,
+            workspace.quarantined_panes
+        );
     }
 
     #[test]
@@ -7802,6 +7868,96 @@ mod tests {
     }
 
     #[test]
+    fn migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers()
+     {
+        for surface in ["chat", "terminal"] {
+            for marker in ["exact", "mismatch", "malformed", "oversized", "absent"] {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("quarantine-migration.sqlite3");
+                let store = StateStore::open(&path, boot("quarantine-migration")).unwrap();
+                let mut workspace = workspace_with_terminal(&boot("quarantine-migration"));
+                if surface == "chat" {
+                    let (chat_workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+                    workspace = chat_workspace;
+                    workspace.cards[0].kind = CardKind::Chat(source);
+                }
+                let rejected = workspace.cards[0].id;
+                let source = workspace.cards[0].kind.clone();
+                let mut healthy = workspace.cards[0].clone();
+                healthy.id = CardId::new();
+                match &mut healthy.kind {
+                    CardKind::Terminal(session) => session.id = TerminalId::new(),
+                    CardKind::Chat(session) => session.id = TerminalId::new(),
+                    _ => unreachable!(),
+                }
+                workspace.cards.push(healthy.clone());
+                let mut evidence = source.clone();
+                if marker == "mismatch" {
+                    match &mut evidence {
+                        CardKind::Terminal(session) => session
+                            .launch
+                            .arguments
+                            .push("--different-rejected-source".into()),
+                        CardKind::Chat(session) => session
+                            .launch
+                            .recipe
+                            .arguments
+                            .push("--different-rejected-source".into()),
+                        _ => unreachable!(),
+                    }
+                }
+                if marker != "absent" {
+                    workspace.quarantined_panes.insert(rejected, evidence);
+                }
+                SaveLane::default().save(&store, &workspace).unwrap();
+                if matches!(marker, "malformed" | "oversized") {
+                    let inner = store.lock_inner().unwrap();
+                    let value = if marker == "malformed" {
+                        "{broken".to_owned()
+                    } else {
+                        " ".repeat(4 * 1024 * 1024 + 1)
+                    };
+                    inner
+                        .connection
+                        .execute(
+                            "UPDATE metadata SET value=?2 WHERE key=?1",
+                            params![
+                                format!("workspace:{}:navigation:quarantined_panes", workspace.id),
+                                value
+                            ],
+                        )
+                        .unwrap();
+                }
+                drop(store);
+                let before = fs::read(&path).unwrap();
+                let sessions = read_open_migration_sessions(&path);
+                if matches!(marker, "mismatch" | "malformed" | "oversized") {
+                    assert!(
+                        sessions.is_err(),
+                        "{surface}/{marker} cannot silently become runnable migration work"
+                    );
+                } else {
+                    let sessions = sessions.unwrap();
+                    assert!(
+                        sessions.contains(&(healthy.id, healthy.kind.clone())),
+                        "healthy sources remain independently qualified"
+                    );
+                    assert_eq!(
+                        sessions.contains(&(rejected, source)),
+                        marker == "absent",
+                        "{surface}/{marker}"
+                    );
+                }
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    before,
+                    "inspection never rewrites {surface}/{marker} evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn migration_inspection_omits_only_exact_retained_local_chat_sources() {
         for mode in [
             "retained",
@@ -8335,6 +8491,62 @@ mod tests {
             store.stored_generations(workspace.id).unwrap().workspace,
             before
         );
+    }
+
+    #[test]
+    fn quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("quarantine-metadata.sqlite3");
+        let boot_id = boot("quarantine-metadata");
+        let mut state = workspace_with_terminal(&boot_id);
+        let card = state.cards[0].id;
+        let source = state.cards[0].kind.clone();
+        state.quarantined_panes.insert(card, source.clone());
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        store
+            .save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &Default::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .quarantined_panes
+                .get(&card),
+            Some(&source)
+        );
+        let key = format!("workspace:{}:navigation:quarantined_panes", state.id);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute("DELETE FROM metadata WHERE key = ?1", [&key])
+            .unwrap();
+        assert!(
+            store
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .quarantined_panes
+                .is_empty(),
+            "legacy workspaces without this metadata remain readable"
+        );
+        for malformed in [
+            "{broken",
+            "{\"not-a-card-id\":{}}",
+            "{\"00000000-0000-4000-8000-000000000001\":\"not-a-pane-source\"}",
+        ] {
+            writer.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![&key, malformed]).unwrap();
+            assert!(
+                store.load_workspace_manifest(state.id).is_err(),
+                "known malformed rejection evidence cannot become an empty allow-list"
+            );
+            assert!(store.load_workspace(state.id, None).is_err());
+        }
     }
 
     #[test]
