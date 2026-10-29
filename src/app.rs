@@ -4481,7 +4481,7 @@ pub enum Message {
     OpenLink(CardId, Url, LinkOpenGesture),
     OpenDocumentLink(CardId, String),
     PreviewLocalFile(CardId),
-    OpenTerminalOutput(CardId),
+    OpenTerminalOutput(terminal_end_ui::OutputIntent),
     ExternalLinkOpened(Result<(), String>),
     FileRevealed(Result<file_manager::RevealOutcome, String>),
     NewBrowser,
@@ -16627,15 +16627,7 @@ impl Application for Cagents {
             }
             Message::OpenDocumentLink(card, uri) => self.open_document_link(Some(card), &uri),
             Message::PreviewLocalFile(card) => self.preview_local_file(card),
-            Message::OpenTerminalOutput(card) => {
-                let url = ended_terminal(self.card_state(card))
-                    .and_then(|session| session.transcript_path.as_ref())
-                    .and_then(|path| Url::from_file_path(path).ok());
-                match url {
-                    Some(url) => self.open_link_in(url, LinkOpenDestination::SystemDefault),
-                    None => Task::none(),
-                }
-            }
+            Message::OpenTerminalOutput(intent) => self.open_terminal_output(intent),
             Message::ExternalLinkOpened(result) => {
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
