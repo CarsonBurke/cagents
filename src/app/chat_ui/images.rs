@@ -2943,11 +2943,24 @@ mod tests {
             let mut snapshot = (*runtime.snapshot).clone();
             snapshot.items = vec![item.clone()];
             runtime.snapshot = Arc::new(snapshot);
-            let mut cached =
-                CachedItem::new(&item.content, crate::settings::EditorSyntaxTheme::Auto);
-            cached.image = bytes_handle(backend_bytes);
-            runtime.cache.insert(item.id.clone(), cached);
-            let gallery = Gallery::new(runtime, &item.id).unwrap();
+            Runtime::prepare_items(
+                &mut runtime.cache,
+                &runtime.snapshot.items,
+                false,
+                &HashSet::new(),
+                runtime.syntax_theme,
+                Provider::Codex,
+            );
+            let attempt = runtime.cache[&item.id].image_attempt;
+            complete(
+                runtime,
+                &item,
+                attempt,
+                Loaded::Ready(bytes_handle(backend_bytes).unwrap()),
+            );
+            let preview =
+                PreviewTarget::capture(runtime.target, &item, &runtime.cache[&item.id]).unwrap();
+            let gallery = Gallery::from_preview(runtime, &preview).unwrap();
             assert!(gallery.entries[0].managed);
             assert!(
                 gallery.url().is_none(),
@@ -2972,10 +2985,24 @@ mod tests {
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.items = vec![item.clone()];
         runtime.snapshot = Arc::new(snapshot);
-        let mut cached = CachedItem::new(&item.content, crate::settings::EditorSyntaxTheme::Auto);
-        cached.image = bytes_handle(png());
-        runtime.cache.insert(item.id.clone(), cached);
-        let gallery = Gallery::new(runtime, &item.id).unwrap();
+        Runtime::prepare_items(
+            &mut runtime.cache,
+            &runtime.snapshot.items,
+            false,
+            &HashSet::new(),
+            runtime.syntax_theme,
+            Provider::Codex,
+        );
+        let attempt = runtime.cache[&item.id].image_attempt;
+        complete(
+            runtime,
+            &item,
+            attempt,
+            Loaded::Ready(bytes_handle(png()).unwrap()),
+        );
+        let preview =
+            PreviewTarget::capture(runtime.target, &item, &runtime.cache[&item.id]).unwrap();
+        let gallery = Gallery::from_preview(runtime, &preview).unwrap();
         assert_eq!(gallery.entries[0].path, path);
         assert!(
             gallery.url().is_none(),

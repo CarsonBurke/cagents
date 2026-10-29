@@ -10954,7 +10954,10 @@ mod tests {
                 images::bounded_handle(bytes.clone(), &budget),
             );
         }
-        let gallery = images::Gallery::new(runtime, &items[0].id).unwrap();
+        let preview =
+            images::PreviewTarget::capture(runtime.target, &items[0], &runtime.cache[&items[0].id])
+                .unwrap();
+        let gallery = images::Gallery::from_preview(runtime, &preview).unwrap();
         let renderer = crate::app::tests::headless_renderer();
         let mut trees = Vec::new();
         for item in &items[..2] {
