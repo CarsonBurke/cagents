@@ -512,6 +512,17 @@ impl ClientHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn fixture_with_wake(
+        session: Session,
+        snapshot: Snapshot,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Self {
+        let mut handle = Self::fixture(session, snapshot);
+        Arc::get_mut(&mut handle.inner).unwrap().wake = Arc::new(wake);
+        handle
+    }
+
+    #[cfg(test)]
     pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
@@ -1368,6 +1379,13 @@ impl ClientHandle {
             chat_id: self.inner.id,
             command,
         })
+    }
+    /// Present a kept-current cache when its actual pane is revealed. This
+    /// local wake neither changes transport visibility nor requests provider IO.
+    pub(crate) fn wake_visible_snapshot(&self) {
+        if self.inner.alive.load(Ordering::Acquire) && self.inner.visible.load(Ordering::Acquire) {
+            (self.inner.wake)(Wake::Changed);
+        }
     }
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {

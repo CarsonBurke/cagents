@@ -446,6 +446,173 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expanded_saved_output_reloads_on_pane_return_with_or_without_a_held_followup() {
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+
+        for held_followup in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(
+                Provider::Codex,
+                Some(PathBuf::from("/workspace/chat-fixture")),
+            ));
+            let card = app.workspace.focused().unwrap();
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                panic!("draft chat");
+            };
+            let target = runtime.target;
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.ready = true;
+            snapshot.busy = true;
+            snapshot.capabilities.queue = false;
+            let wakes = Arc::new(Mutex::new(Vec::new()));
+            let observed = wakes.clone();
+            let handle = Arc::new(ClientHandle::fixture_with_wake(
+                runtime.session.clone(),
+                snapshot,
+                move |wake| observed.lock().unwrap().push(wake),
+            ));
+            runtime.connection = Connection::Live(handle.clone());
+            runtime.snapshot = handle.snapshot();
+            if held_followup {
+                runtime.replace_draft(text_editor::Content::with_text("keep this follow-up"));
+                drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+            }
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().followups.len(),
+                usize::from(held_followup)
+            );
+
+            let mut exited = (*handle.snapshot()).clone();
+            exited.generation += 1;
+            exited.busy = false;
+            exited.exited = true;
+            exited.turn_generation = 7;
+            exited.provider_exit = Some(chat::ProviderExitDiagnostic {
+                summary: "Provider exited with status 7".into(),
+                output: "recent tail only".into(),
+                log: Some(chat::ProviderExitLog {
+                    id: "saved-output-before-hide".into(),
+                    bytes: 32,
+                    omitted: 2,
+                }),
+            });
+            handle.replace_snapshot_for_test(exited);
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            let before_hide = handle.snapshot();
+            assert!(wakes.lock().unwrap().is_empty());
+            let _first_load = app.handle_chat_ui(Action::ToggleProviderExit(target));
+            let request = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit_output
+                .request
+                .as_ref()
+                .unwrap()
+                .request
+                .clone();
+            let saved = Arc::new("first saved line\nlast saved line".to_owned());
+            let released = Arc::downgrade(&saved);
+            drop(app.handle_chat_ui(Action::ProviderExitLoaded(
+                target,
+                request,
+                Ok(chat::client::ProviderExitOutput {
+                    text: saved,
+                    omitted: 2,
+                }),
+            )));
+            assert!(released.upgrade().is_some());
+
+            // Exercise the ordinary workspace hide/reveal path. A held local
+            // follow-up keeps the transport visible after provider exit.
+            app.set_workspace_surfaces_visible(false);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(!runtime.visible.load(Ordering::Relaxed));
+            assert!(runtime.provider_exit_expanded);
+            assert!(runtime.provider_exit_output.ready.is_none());
+            assert!(runtime.provider_exit_output.request.is_none());
+            assert!(released.upgrade().is_none());
+            assert_eq!(handle.is_visible_for_test(), held_followup);
+            assert!(wakes.lock().unwrap().is_empty());
+
+            app.set_workspace_surfaces_visible(true);
+            assert!(handle.is_visible_for_test());
+            let mut observed = std::mem::take(&mut *wakes.lock().unwrap());
+            assert_eq!(observed.len(), 1, "one local reveal wake, no wire update");
+            let wake = observed.pop().unwrap();
+            assert!(matches!(wake, Wake::Changed));
+            let _reload = app.handle_chat_ui(Action::Wake(target, wake));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(Arc::ptr_eq(&runtime.snapshot, &before_hide));
+            assert_eq!(runtime.snapshot.generation, before_hide.generation);
+            assert_eq!(runtime.followups.len(), usize::from(held_followup));
+            assert!(runtime.pending.is_none());
+            let request = runtime
+                .provider_exit_output
+                .request
+                .as_ref()
+                .unwrap()
+                .request
+                .clone();
+            assert!(request.key.matches(&before_hide));
+            assert!(!request.cancelled.load(Ordering::Acquire));
+            assert!(runtime.provider_exit_output.ready.is_none());
+            drop(app.handle_chat_ui(Action::ProviderExitLoaded(
+                target,
+                request,
+                Ok(chat::client::ProviderExitOutput {
+                    text: Arc::new("first saved line\nlast saved line".into()),
+                    omitted: 2,
+                }),
+            )));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(
+                runtime
+                    .provider_exit_output
+                    .ready
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_str(),
+                "first saved line\nlast saved line"
+            );
+            assert_ne!(
+                runtime
+                    .provider_exit_output
+                    .ready
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_str(),
+                runtime.snapshot.provider_exit.as_ref().unwrap().output
+            );
+            assert!(runtime.provider_exit_output.request.is_none());
+            assert!(runtime.provider_exit_output.error.is_none());
+
+            // An already visible pane must not repeatedly request the same
+            // saved output, and copying must still use the complete buffer.
+            app.set_workspace_surfaces_visible(true);
+            assert!(wakes.lock().unwrap().is_empty());
+            let copied = app.handle_chat_ui(Action::CopyProviderExit(target));
+            let mut stream = cosmic::iced::runtime::task::into_stream(copied).unwrap();
+            let effect = stream.next().now_or_never().unwrap().unwrap();
+            let cosmic::iced::runtime::Action::Clipboard(
+                cosmic::iced::runtime::clipboard::Action::Write {
+                    target: iced::advanced::clipboard::Kind::Standard,
+                    contents,
+                },
+            ) = effect
+            else {
+                panic!("copy after reveal must write the standard clipboard");
+            };
+            assert_eq!(
+                contents,
+                "Provider exited with status 7\n\nfirst saved line\nlast saved line\n\n[2 raw output bytes were not retained]"
+            );
+            assert!(stream.next().now_or_never().unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn provider_output_reconnect_retires_old_copy_and_admits_fresh_copy_for_the_same_log() {
         use cosmic::iced::futures::{FutureExt, StreamExt};
 

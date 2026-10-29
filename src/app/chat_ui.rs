@@ -2620,11 +2620,21 @@ impl Runtime {
             });
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
-        self.visible.store(visible, Ordering::Relaxed);
+        let was_visible = self.visible.swap(visible, Ordering::Relaxed);
+        let revealed = visible && !was_visible;
         if !visible {
             self.provider_exit_output.hide();
         }
         images::sync(self);
+        if revealed
+            && self.provider_exit_expanded
+            && let Some(handle) = self.handle()
+        {
+            // Held follow-ups can keep the connection visible while the pane
+            // is hidden. Reload its released output even if the daemon has no
+            // new snapshot and present() will not change transport visibility.
+            handle.wake_visible_snapshot();
+        }
         self.present()
     }
     /// Tells the connection whether to keep the card's snapshot current.
