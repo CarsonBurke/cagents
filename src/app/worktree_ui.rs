@@ -819,7 +819,7 @@ impl Cagents {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
-        self.set_workspace_surfaces_visible(false);
+        let hidden = self.set_workspace_surfaces_visible(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID
@@ -867,7 +867,7 @@ impl Cagents {
         // seen longest ago when the budget is full.
         let residency = self.lifecycle_sweep();
         let source_control = self.rebind_source_control();
-        Task::batch([viewport, residency, source_control])
+        Task::batch([hidden, viewport, residency, source_control])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {

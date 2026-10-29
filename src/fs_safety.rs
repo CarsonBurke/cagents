@@ -156,6 +156,12 @@ impl Root {
         metadata_of_descriptor(&self.directory)
     }
 
+    /// Enumerates this already-open directory, even if its old name is moved
+    /// or replaced. Child names must still be resolved beneath the root.
+    pub fn read_dir(&self) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
     /// Address this retained directory from a synchronous child without
     /// inheriting a descriptor. The caller must keep this root alive until
     /// that child exits; `/proc/self` would name the child's different FD table.
@@ -271,7 +277,7 @@ impl ResolveError {
         }
     }
 
-    fn io(path: &Path, error: &io::Error) -> Self {
+    pub(crate) fn io(path: &Path, error: &io::Error) -> Self {
         // `EACCES`, `EPERM` and `EROFS` are the three ways the kernel says "not
         // by you": the permission bits refuse it, a file attribute or a missing
         // capability refuses it, or the whole filesystem is mounted read-only.
@@ -427,6 +433,35 @@ pub fn open_parent_beneath(root: &Root, relative: &Path) -> Result<(Root, OsStri
     Ok((directory, name))
 }
 
+/// Creates missing parent directories without following a symlink at any
+/// component, then returns the held parent and final leaf name.
+pub fn create_parent_beneath(
+    root: &Root,
+    relative: &Path,
+) -> Result<(Root, OsString), ResolveError> {
+    let reported = root.path.join(relative);
+    let parts = components(relative).ok_or_else(|| ResolveError::escaped(&reported))?;
+    let (name, parents) = parts
+        .split_last()
+        .ok_or_else(|| ResolveError::escaped(&reported))?;
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| ResolveError::io(&reported, &error))?;
+    for component in parents {
+        let name = c_component(component, &directory.path)?;
+        // SAFETY: the held directory and NUL-terminated leaf outlive mkdirat.
+        let result = unsafe { libc::mkdirat(directory.descriptor(), name.as_ptr(), 0o755) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(ResolveError::io(&reported, &error));
+            }
+        }
+        directory = resolve_directory(&directory, Path::new(component))?;
+    }
+    Ok((directory, (*name).to_owned()))
+}
+
 /// Opens one directory beneath the held root without following symlinks.
 pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, ResolveError> {
     resolve_directory(root, relative)
@@ -452,6 +487,43 @@ pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> 
         format!("/proc/self/fd/{}", directory.descriptor()),
         std::fs::Permissions::from_mode(mode),
     )
+}
+
+/// Removes an empty directory beneath the held root. Nonempty directories are
+/// preserved, and an empty relative path can never name the root itself.
+pub fn remove_empty_directory_beneath(root: &Root, relative: &Path) -> Result<bool, ResolveError> {
+    let (parent, name) = open_parent_beneath(root, relative)?;
+    let leaf = c_component(&name, &parent.path)?;
+    // SAFETY: both the held parent and leaf remain live through unlinkat.
+    let result = unsafe { libc::unlinkat(parent.descriptor(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+    ) {
+        return Ok(false);
+    }
+    Err(ResolveError::io(&parent.path.join(name), &error))
+}
+
+/// Creates a symbolic link as an entry in a held directory. The target is
+/// preserved literally; only the new leaf is resolved by this operation.
+pub fn symlink_within(directory: &Root, target: &Path, name: &OsStr) -> Result<(), ResolveError> {
+    let leaf = c_component(name, &directory.path)?;
+    let target = c_path(target).map_err(|error| ResolveError::io(&directory.path, &error))?;
+    // SAFETY: both C strings and the held directory outlive symlinkat.
+    let result = unsafe { libc::symlinkat(target.as_ptr(), directory.descriptor(), leaf.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ))
+    }
 }
 
 /// Removes only an empty direct child through its retained parent.

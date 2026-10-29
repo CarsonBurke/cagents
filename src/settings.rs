@@ -301,8 +301,8 @@ impl Default for KeyboardShortcuts {
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
             review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
-            review_next_change: vec!["Alt+J".to_owned()],
-            review_previous_change: vec!["Alt+K".to_owned()],
+            review_next_change: vec!["Alt+J".to_owned(), "F7".to_owned()],
+            review_previous_change: vec!["Alt+K".to_owned(), "Shift+F7".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
             new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
             chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
@@ -691,6 +691,10 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
+const fn default_git_status_limit() -> usize {
+    10_000
+}
+
 const fn default_show_worktree_changes_icons() -> bool {
     true
 }
@@ -866,6 +870,9 @@ pub struct AppSettings {
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
+    /// Maximum changed paths mounted in a source-control snapshot. Safety reads remain complete.
+    #[serde(default = "default_git_status_limit")]
+    pub git_status_limit: usize,
     #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
@@ -884,6 +891,8 @@ pub struct AppSettings {
     pub editor_wrap_lines: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
+    #[serde(default)]
+    pub diff_ignore_whitespace: bool,
     #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
@@ -998,6 +1007,7 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
+            git_status_limit: default_git_status_limit(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -1007,6 +1017,7 @@ impl Default for AppSettings {
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
             diff_hide_unchanged: default_diff_hide_unchanged(),
+            diff_ignore_whitespace: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
@@ -1206,7 +1217,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 7;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1230,6 +1241,7 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
+/// Revision 7 adds F7 aliases to hunk navigation without replacing custom chords.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1285,6 +1297,16 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "search_projects",
         retired_in: 5,
         chords: &["Ctrl+F"],
+    },
+    RetiredShortcutDefault {
+        action: "review_next_change",
+        retired_in: 7,
+        chords: &["Alt+J"],
+    },
+    RetiredShortcutDefault {
+        action: "review_previous_change",
+        retired_in: 7,
+        chords: &["Alt+K"],
     },
 ];
 
@@ -1657,6 +1679,7 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        self.git_status_limit = self.git_status_limit.clamp(1, 100_000);
         let mut seen = std::collections::HashSet::new();
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
@@ -2982,6 +3005,17 @@ mod tests {
     }
 
     #[test]
+    fn git_status_limit_defaults_and_clamps_to_bounded_range() {
+        assert_eq!(AppSettings::default().git_status_limit, 10_000);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = 0;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 1);
+        let mut settings = AppSettings::default();
+        settings.git_status_limit = usize::MAX;
+        assert_eq!(settings.validate().unwrap().git_status_limit, 100_000);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -4228,8 +4262,40 @@ new_thread = "Alt+Shift+G"
         shortcuts.insert("new_terminal".into(), vec!["Alt+J"].into());
         shortcuts.insert("search_projects".into(), vec!["Alt+Shift+Down"].into());
         let migrated: AppSettings = value.try_into().unwrap();
-        assert!(migrated.keyboard_shortcuts.review_next_change.is_empty());
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["F7"]);
         assert!(migrated.keyboard_shortcuts.review_next_unviewed.is_empty());
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        migrated.validate().unwrap();
+    }
+
+    #[test]
+    fn diff_hunk_alias_migration_preserves_custom_bindings_and_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let migrate = |settings: &AppSettings| {
+            fs::write(&path, toml::to_string(settings).unwrap()).unwrap();
+            load(&path).unwrap()
+        };
+        let mut previous = AppSettings::default();
+        previous.shortcut_defaults_revision = 6;
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+J".into()];
+        previous.keyboard_shortcuts.review_previous_change = vec!["Alt+K".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_next_change,
+            ["Alt+J", "F7"]
+        );
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+L".into()];
+        previous.keyboard_shortcuts.new_terminal = vec!["Shift+F7".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["Alt+L"]);
         assert_eq!(
             migrated.keyboard_shortcuts.review_previous_change,
             ["Alt+K"]

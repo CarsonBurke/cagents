@@ -1,6 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
 mod poll;
+mod record_capture;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -77,6 +78,8 @@ pub struct CommandSpec {
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
+    /// Opt-in NUL record capture; excess output is drained and flagged.
+    pub stdout_record_limit: Option<usize>,
     pub stderr_limit: usize,
     // Borrowed only during execute; the journal service holds the owning file.
     pub(crate) inherited_lease: Option<i32>,
@@ -94,6 +97,7 @@ impl CommandSpec {
             stdin: None,
             timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             stdout_limit: DEFAULT_STDOUT_LIMIT,
+            stdout_record_limit: None,
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
             inherited_files: Vec::new(),
@@ -139,9 +143,20 @@ impl CommandSpec {
         self
     }
 
+    /// Let user-driven operations run until completion or explicit cancellation.
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout = None;
+        self
+    }
+
     pub fn output_limits(mut self, stdout_limit: usize, stderr_limit: usize) -> Self {
         self.stdout_limit = stdout_limit;
         self.stderr_limit = stderr_limit;
+        self
+    }
+
+    pub fn stdout_record_limit(mut self, records: usize) -> Self {
+        self.stdout_record_limit = Some(records);
         self
     }
 
@@ -239,7 +254,13 @@ pub struct ProcessFailure {
 
 impl fmt::Display for ProcessFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.program.display(), self.message)
+        write!(formatter, "{}: {}", self.program.display(), self.message)?;
+        if self.kind == ProcessFailureKind::Exit
+            && let Some(detail) = self.output_excerpt()
+        {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -290,12 +311,53 @@ impl ProcessFailure {
         })
     }
 
+    /// Preserve hook diagnostics written to either stream. Status/progress lines
+    /// are retained in the full output; the inline excerpt stays compact.
+    pub fn output_excerpt(&self) -> Option<String> {
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        let stream = if stderr.trim().is_empty() {
+            &stdout
+        } else {
+            &stderr
+        };
+        let lines = stream
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.chars().take(600).collect())
+        }
+    }
+
+    /// All captured output for a disclosure, without losing multiline hooks.
+    pub fn full_output(&self) -> String {
+        let mut output = String::new();
+        if !self.stdout.is_empty() {
+            output.push_str("stdout:\n");
+            output.push_str(&String::from_utf8_lossy(&self.stdout));
+        }
+        if !self.stderr.is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("stderr:\n");
+            output.push_str(&String::from_utf8_lossy(&self.stderr));
+        }
+        output
+    }
+
     /// What to report about this failure, in whichever words actually describe
     /// it.
     ///
     /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
-    /// nothing: `Display` renders it as `{program}: process exited with status
-    /// Some(4)`, a number standing in for the two sentences `gh` wrote about
+    /// nothing beyond an exit code, a number standing in for the two
+    /// sentences `gh` wrote about
     /// how to log in, or for `fatal: not a git repository`. So it is the one
     /// kind whose stderr is preferred, and only when there is some.
     ///
@@ -327,6 +389,8 @@ pub struct ProcessOutput {
     pub signal: Option<i32>,
     pub success: bool,
     pub stdout: Vec<u8>,
+    #[serde(default)]
+    pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
 }
 
@@ -336,6 +400,7 @@ impl ProcessOutput {
             exit_code: status.code(),
             signal: exit_signal(&status),
             success: status.success(),
+            stdout_truncated: false,
             stdout,
             stderr,
         }
@@ -352,7 +417,11 @@ impl ProcessOutput {
                 signal: self.signal,
                 stdout: self.stdout,
                 stderr: self.stderr,
-                message: format!("process exited with status {:?}", self.exit_code),
+                message: match (self.exit_code, self.signal) {
+                    (Some(code), _) => format!("exit {code}"),
+                    (_, Some(signal)) => format!("terminated by signal {signal}"),
+                    _ => "process exited without an exit code".into(),
+                },
                 started: true,
             })
         }
@@ -389,7 +458,7 @@ struct CancellationState {
 /// Bounded signals coalesce repeated notifications and never block cancellation.
 #[derive(Debug)]
 enum CancellationNotifier {
-    #[cfg(all(test, feature = "ui"))]
+    #[cfg(test)]
     Process(mpsc::Sender<WaitEvent>),
     Signal(mpsc::SyncSender<()>),
     Descriptor(Arc<OwnedFd>),
@@ -398,7 +467,7 @@ enum CancellationNotifier {
 impl CancellationNotifier {
     fn notify(&self) {
         match self {
-            #[cfg(all(test, feature = "ui"))]
+            #[cfg(test)]
             Self::Process(sender) => {
                 let _ = sender.send(WaitEvent::Cancelled);
             }
@@ -450,7 +519,7 @@ impl CancellationToken {
 
     /// Registers a waker for the duration of one blocking wait. The returned
     /// guard deregisters it, so a long-lived token does not accumulate senders.
-    #[cfg(all(test, feature = "ui"))]
+    #[cfg(test)]
     pub(crate) fn register(&self, waker: mpsc::Sender<WaitEvent>) -> CancellationWaker<'_> {
         self.register_notifier(CancellationNotifier::Process(waker))
     }
@@ -1233,6 +1302,31 @@ sys.exit(7)
     }
 
     #[test]
+    fn failure_display_preserves_actionable_lines_and_formats_exit_codes() {
+        let output = ProcessOutput {
+            stdout_truncated: false,
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            stdout: b"hook stdout\n".to_vec(),
+            stderr: b"\n lint: unused variable\npre-commit: aborting\n".to_vec(),
+        };
+        let failure = output.require_success(Path::new("git")).unwrap_err();
+        let display = failure.to_string();
+        assert!(display.contains("exit 1"));
+        assert!(display.contains("lint: unused variable\npre-commit: aborting"));
+        assert!(!display.contains("Some("));
+        assert!(!display.contains("None"));
+        assert!(failure.full_output().contains("hook stdout"));
+        let mut stdout_only = failure.clone();
+        stdout_only.stderr.clear();
+        assert!(stdout_only.to_string().contains("hook stdout"));
+        stdout_only.exit_code = None;
+        stdout_only.message = "terminated by signal 9".into();
+        assert!(!stdout_only.to_string().contains("None"));
+    }
+
+    #[test]
     fn command_specs_have_finite_resource_defaults() {
         let command = CommandSpec::new("git");
         assert_eq!(command.timeout, Some(DEFAULT_COMMAND_TIMEOUT));
@@ -1255,6 +1349,72 @@ sys.exit(7)
         assert!(output.success);
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_listing_cap_drains_oversized_stdout_without_killing_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("listing-finished");
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf finished > \"$MARKER\"",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(10_000)
+            .timeout(Duration::from_secs(10));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout, vec![0; 10_000]);
+        assert_eq!(std::fs::read(marker).unwrap(), b"finished");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_listing_still_obeys_cancellation_and_stderr_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("drained");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let observed = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if observed.exists() {
+                    cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("listing did not finish draining before cancellation");
+        });
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(100)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert_eq!(failure.stdout.len(), 100);
+
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
+            .stdout_record_limit(100)
+            .output_limits(1024, 32);
+        let failure = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
+        assert!(failure.message.contains("stderr exceeded"));
     }
 
     #[cfg(unix)]
@@ -1445,8 +1605,9 @@ sys.exit(7)
                 OsString::from("printf ready > \"$READY\"; while :; do sleep 1; done"),
             ])
             .env("READY", ready.as_os_str())
-            // Long enough that a timeout cannot be what ends this test.
-            .timeout(Duration::from_secs(30));
+            // The mutation lane has no implicit deadline; only cancellation
+            // can release this blocked child and its descendants.
+            .without_timeout();
 
         let cancellation = CancellationToken::new();
         let canceller = cancellation.clone();

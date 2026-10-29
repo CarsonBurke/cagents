@@ -24,6 +24,8 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+#[cfg(feature = "ui")]
+pub(crate) mod change_list;
 pub mod channel_work;
 pub mod channel_work_api;
 #[cfg(feature = "ui")]
@@ -41,6 +43,10 @@ pub mod design;
 pub mod device;
 pub mod device_service;
 pub mod diagnostics;
+#[cfg(feature = "ui")]
+pub mod diff_interaction;
+#[cfg(feature = "ui")]
+pub mod diff_patch;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]
@@ -65,6 +71,8 @@ pub mod file_manager;
 pub(crate) mod file_url;
 mod filesystem_recovery_context;
 pub mod fs_safety;
+#[cfg(feature = "ui")]
+pub mod git_patch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]

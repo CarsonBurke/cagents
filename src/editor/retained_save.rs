@@ -54,6 +54,13 @@ pub struct RetainedSaveOutcome {
     recovery: Option<RecoveryAuthority>,
 }
 impl RetainedSaveOutcome {
+    /// Wrap a logical outcome only when no live private receipt remains.
+    pub(super) fn without_recovery(outcome: SaveOutcome) -> Self {
+        Self {
+            outcome,
+            recovery: None,
+        }
+    }
     pub fn outcome(&self) -> &SaveOutcome {
         &self.outcome
     }
@@ -91,7 +98,8 @@ pub(crate) fn finish_context(
     match result {
         Ok(mut outcome) => {
             if !warning.is_empty()
-                && let SaveOutcome::Saved { durability, .. } = &mut outcome.outcome
+                && let SaveOutcome::Saved { durability, .. }
+                | SaveOutcome::Absent { durability, .. } = &mut outcome.outcome
             {
                 match durability {
                     super::SaveDurability::Durable => {
@@ -452,7 +460,7 @@ fn directory_error(error: fs_safety::RecoveryDirectoryError) -> FileIoError {
 
 /// Owns the actual published private directory and its bounded recovery slot.
 /// The receipt, rather than a diagnostic path, survives unresolved outcomes.
-struct Holding {
+pub(super) struct Holding {
     parent: Root,
     publication: fs_safety::DirectoryPublication,
     private_metadata: fs::Metadata,
@@ -468,7 +476,7 @@ struct Holding {
     directory_warnings: Vec<String>,
 }
 impl Holding {
-    fn create(
+    pub(super) fn create(
         parent: &Root,
         source: &File,
         context: &FilesystemRecoveryContext,
@@ -510,13 +518,72 @@ impl Holding {
             directory_warnings,
         })
     }
-    fn root(&self) -> &Root {
+    pub(super) fn root(&self) -> &Root {
         self.publication.directory()
     }
-    fn validate_payload(&self) -> io::Result<()> {
+    pub(super) fn validate_payload(&self) -> io::Result<()> {
         fs_safety::verify_recovery_directory_private(self.root(), &self.private_metadata)?;
         self.context.validate_payload_root(self.root())?;
         fs_safety::verify_recovery_directory_private(self.root(), &self.private_metadata)
+    }
+    /// Presence shares the same pre-effect source pins, factory, reservation
+    /// and exact directory receipt as ordinary retained Save. Leaf restoration
+    /// and publication finish before this terminal cleanup/carrier boundary.
+    pub(super) fn finish_presence(
+        mut self,
+        parent: &Root,
+        result: Result<SaveOutcome, RetainedSaveError>,
+    ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+        let cleanup = self.remove_empty(parent);
+        let mut warnings = std::mem::take(&mut self.directory_warnings);
+        if let Err(error) = cleanup {
+            warnings.push(format!(
+                "Private presence holding cleanup is unresolved: {error}"
+            ));
+        }
+        let authority = if self.publication.is_removed() {
+            None
+        } else {
+            Some(self.retain())
+        };
+        match result {
+            Ok(mut outcome) => {
+                if !warnings.is_empty()
+                    && let SaveOutcome::Saved { durability, .. }
+                    | SaveOutcome::Absent { durability, .. } = &mut outcome
+                {
+                    let warning = warnings.join("; ");
+                    match durability {
+                        super::SaveDurability::Durable => {
+                            *durability = super::SaveDurability::Unconfirmed { error: warning };
+                        }
+                        super::SaveDurability::Unconfirmed { error } => {
+                            error.push_str("; ");
+                            error.push_str(&warning);
+                        }
+                    }
+                }
+                Ok(RetainedSaveOutcome {
+                    outcome,
+                    recovery: authority,
+                })
+            }
+            Err(error) => {
+                let authority = match (authority, error.recovery_authority().cloned()) {
+                    (Some(current), Some(previous)) => Some(current.combine(previous)),
+                    (current, previous) => current.or(previous),
+                };
+                let message = if warnings.is_empty() {
+                    error.to_string()
+                } else {
+                    format!("{error}; {}", warnings.join("; "))
+                };
+                match authority {
+                    Some(authority) => Err(RetainedSaveError::Recovery { message, authority }),
+                    None => Err(RetainedSaveError::Io(message)),
+                }
+            }
+        }
     }
     fn keep_file(&mut self, file: File) -> Result<File, FileIoError> {
         match file.try_clone() {

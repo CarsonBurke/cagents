@@ -42,11 +42,26 @@ impl Drop for State {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedComparison {
+    base_oid: Oid,
+    model: Arc<BranchChangesModel>,
+}
+
+impl PreparedComparison {
+    fn new(comparison: BranchComparison) -> Self {
+        Self {
+            base_oid: comparison.base_oid.clone(),
+            model: Arc::new(BranchChangesModel::new(comparison)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Action {
     Loaded {
         generation: u64,
         identity: Identity,
-        result: Result<BranchComparison, String>,
+        result: Result<PreparedComparison, String>,
     },
 }
 
@@ -174,9 +189,19 @@ impl Cagents {
             let worktree = identity.key.canonical_path.clone();
             let base_ref = identity.base_ref.clone();
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
+                let comparison = RepositoryService::system("git")
                     .branch_comparison(&worktree, &base_ref, &cancellation)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                if cancellation.is_cancelled() {
+                    return Err("branch comparison reader cancelled".to_owned());
+                }
+                // Sorting, labels and viewport indexes belong to this worker;
+                // the update thread publishes the already-built immutable model.
+                let prepared = PreparedComparison::new(comparison);
+                if cancellation.is_cancelled() {
+                    return Err("branch comparison reader cancelled".to_owned());
+                }
+                Ok(prepared)
             })
             .await
             .map_err(|error| format!("branch comparison reader join failed: {error}"))
@@ -211,15 +236,15 @@ impl Cagents {
             return Task::none();
         };
         match result {
-            Ok(comparison)
-                if comparison.head == identity.head
-                    && comparison.base_ref == identity.base_ref
+            Ok(prepared)
+                if prepared.model.head == identity.head
+                    && prepared.model.base_ref == identity.base_ref
                     && identity
                         .base_oid
                         .as_ref()
-                        .is_none_or(|base| *base == comparison.base_oid) =>
+                        .is_none_or(|base| *base == prepared.base_oid) =>
             {
-                let model = Arc::new(BranchChangesModel::new(comparison));
+                let model = prepared.model;
                 source.branch_changes = BranchChanges::Ready(Arc::clone(&model));
                 self.branch_ui.cached = Some((identity, model));
                 Task::none()
@@ -309,6 +334,12 @@ impl Cagents {
         if find(area).is_none() {
             return Task::none();
         }
+        if area == ChangeArea::Conflict {
+            return self.open_diff_card(key, move |card| RepositoryAction::OpenFileFromBrowser {
+                card,
+                path,
+            });
+        }
         let staged = find(ChangeArea::Staged);
         let unstaged = find(ChangeArea::Unstaged)
             .or_else(|| find(ChangeArea::Untracked))
@@ -385,6 +416,9 @@ mod tests {
 
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 head: HeadState::Detached {
                     oid: "ab".repeat(20),
@@ -438,5 +472,95 @@ mod tests {
         snapshot.remote_refs[0].oid = Oid::parse_object("12".repeat(20)).unwrap();
         let after = comparison_identity(key, &snapshot, Some("trunk")).unwrap();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn prepared_branch_publication_keeps_exact_model_and_rejects_stale_endpoints() {
+        for mismatch in [
+            "none",
+            "generation",
+            "head",
+            "base ref",
+            "base oid",
+            "binding",
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            let snapshot = snapshot();
+            let identity = comparison_identity(key.clone(), &snapshot, Some("trunk")).unwrap();
+            app.sidebar_model.source_control = Some(SourceControlModel::ready(key, &snapshot));
+            app.branch_ui.pending = Some(Pending {
+                generation: 1,
+                identity: identity.clone(),
+                cancellation: CancellationToken::default(),
+            });
+            let mut comparison = BranchComparison {
+                head: identity.head.clone(),
+                base_ref: identity.base_ref.clone(),
+                base_oid: identity.base_oid.clone().unwrap(),
+                merge_base: identity.base_oid.clone().unwrap(),
+                entries: vec![crate::repository::DiffEntry {
+                    path: RepoPath::parse("src/current.rs").unwrap(),
+                    old_path: None,
+                    kind: crate::repository::ChangeKind::Modified,
+                    added_lines: Some(1),
+                    removed_lines: Some(0),
+                }],
+            };
+            match mismatch {
+                "head" => comparison.head = Oid::parse_object("11".repeat(20)).unwrap(),
+                "base ref" => {
+                    comparison.base_ref = ValidatedRefName::parse("refs/heads/other").unwrap()
+                }
+                "base oid" => comparison.base_oid = Oid::parse_object("22".repeat(20)).unwrap(),
+                "binding" => {
+                    app.sidebar_model
+                        .source_control
+                        .as_mut()
+                        .unwrap()
+                        .key
+                        .worktree_id = crate::model::WorktreeId::new();
+                }
+                _ => {}
+            }
+            let prepared = PreparedComparison::new(comparison);
+            let built_model = Arc::clone(&prepared.model);
+            drop(app.update_branch_ui(Action::Loaded {
+                generation: if mismatch == "generation" { 2 } else { 1 },
+                identity,
+                result: Ok(prepared),
+            }));
+            if mismatch == "none" {
+                let BranchChanges::Ready(published) = &app
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .branch_changes
+                else {
+                    panic!("current prepared model must publish");
+                };
+                assert!(Arc::ptr_eq(published, &built_model));
+                assert!(Arc::ptr_eq(
+                    &app.branch_ui.cached.as_ref().unwrap().1,
+                    &built_model
+                ));
+            } else {
+                assert!(app.branch_ui.cached.is_none(), "{mismatch}");
+                assert!(
+                    !matches!(
+                        app.sidebar_model
+                            .source_control
+                            .as_ref()
+                            .unwrap()
+                            .branch_changes,
+                        BranchChanges::Ready(_)
+                    ),
+                    "{mismatch} cannot publish a stale prepared model"
+                );
+            }
+        }
     }
 }

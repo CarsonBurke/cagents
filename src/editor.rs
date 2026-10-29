@@ -10,6 +10,11 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+mod presence;
+pub use presence::FileRestoration;
+#[cfg(test)]
+pub(crate) use presence::save_document_file;
+pub(crate) use presence::{PresenceSave, save_document_file_at};
 pub mod retained_save;
 
 /// Rasterizing a page happens in a child process, so the reader's document
@@ -192,6 +197,10 @@ pub enum FileIoError {
 pub enum SaveOutcome {
     Saved {
         content_hash: blake3::Hash,
+        durability: SaveDurability,
+    },
+    Absent {
+        restoration: std::sync::Arc<FileRestoration>,
         durability: SaveDurability,
     },
     Conflict {

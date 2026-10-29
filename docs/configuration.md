@@ -96,7 +96,7 @@ show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 7
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -117,8 +117,8 @@ review_toggle_viewed = ["Alt+V"]
 review_next_file = ["Alt+Down"]
 review_previous_file = ["Alt+Up"]
 review_next_unviewed = ["Alt+Shift+Down"]
-review_next_change = ["Alt+J"]
-review_previous_change = ["Alt+K"]
+review_next_change = ["Alt+J", "F7"]
+review_previous_change = ["Alt+K", "Shift+F7"]
 
 [notifications]
 enabled = true
@@ -166,6 +166,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
 | `managed_worktree_directory` | string | `".worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root; an in-checkout destination is excluded clone-locally on creation |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
+| `git_status_limit` | integer | `10000` | Maximum changed paths shown in each source-control snapshot; normalized to `1`–`100000`. Oversized listings show a notice. Safety checks and bulk group actions read complete status independently. |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
 | `editor_find_options` | table | all options `false` | Persisted Find matching options; see the three fields below |
@@ -174,6 +175,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |
 | `editor_replace_preserve_case` | boolean | `false` | Preserve upper, lower and title case in plain-text replacements |
 | `editor_syntax_theme` | string | `"auto"` | Syntax colors for editors and diffs: `"auto"` (follows the app theme), `"solarized_dark"`, `"mocha"`, `"ocean"`, `"eighties"`, or `"inspired_github"` (`"inspired_git_hub"`, written by earlier versions, is also read) |
+| `diff_ignore_whitespace` | boolean | `false` | Ignores horizontal whitespace when comparing lines, while retaining exact original text for copying and patches. The diff toolbar changes this preference |
 | `confirm_terminal_close` | boolean | `true` | Asks before closing a terminal that has a foreground program or background jobs. An idle shell closes without asking |
 | `chat_enter_sends` | boolean | `true` | When on, Enter sends a chat message and Shift+Enter starts a new line. When off, Enter starts a new line and Ctrl+Enter sends |
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
@@ -183,7 +185,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `7` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -376,7 +378,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 7`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),

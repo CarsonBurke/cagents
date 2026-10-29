@@ -900,9 +900,9 @@ impl Cagents {
             } else {
                 Arc::make_mut(&mut self.durable).active_channel = None;
                 self.active_workspace = None;
-                self.set_workspace_surfaces_visible(false);
+                let hidden = self.set_workspace_surfaces_visible(false);
                 self.workspace = Self::rebuild_workspace(&WorkspaceState::default());
-                Task::none()
+                hidden
             }
         } else {
             Task::none()

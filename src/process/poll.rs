@@ -94,6 +94,7 @@ impl Drop for PolledChild {
 struct PipeCapture<R> {
     pipe: Option<R>,
     captured: PipeRead,
+    listing: Option<super::record_capture::NulPrefix>,
     error: Option<String>,
     limit: usize,
 }
@@ -107,6 +108,7 @@ impl<R: Read + AsFd> PipeCapture<R> {
                 limit_exceeded: false,
             },
             error: None,
+            listing: None,
             limit,
         }
     }
@@ -131,6 +133,10 @@ impl<R: Read + AsFd> PipeCapture<R> {
                 }
                 Ok(read) => {
                     drained += read;
+                    if let Some(listing) = &mut self.listing {
+                        listing.push(&buffer[..read]);
+                        continue;
+                    }
                     let remaining = self.limit.saturating_sub(self.captured.output.len());
                     self.captured
                         .output
@@ -259,6 +265,9 @@ pub(super) fn execute(
     let _registration =
         cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
     let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
+    stdout.listing = spec
+        .stdout_record_limit
+        .map(|records| super::record_capture::NulPrefix::new(records, spec.stdout_limit));
     let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
     let input = spec.stdin.as_deref().unwrap_or_default();
     let mut written = 0;
@@ -394,6 +403,13 @@ pub(super) fn execute(
         (None, Some(error)) => Some(format!("stderr: {error}")),
         (None, None) => None,
     };
+    let stdout_truncated = if let Some(listing) = stdout.listing.take() {
+        let (bytes, truncated) = listing.finish();
+        stdout.captured.output = bytes;
+        truncated
+    } else {
+        false
+    };
     let stdout_read = stdout.captured;
     let stderr_read = stderr.captured;
     if let Some(kind) = terminal_kind {
@@ -447,11 +463,9 @@ pub(super) fn execute(
             started: true,
         });
     }
-    Ok(ProcessOutput::from_parts(
-        status,
-        stdout_read.output,
-        stderr_read.output,
-    ))
+    let mut output = ProcessOutput::from_parts(status, stdout_read.output, stderr_read.output);
+    output.stdout_truncated = stdout_truncated;
+    Ok(output)
 }
 
 #[cfg(test)]

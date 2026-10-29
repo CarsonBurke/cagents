@@ -2020,6 +2020,7 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
             })
         } else {
             Ok(ProcessOutput {
+                stdout_truncated: false,
                 exit_code: Some(128),
                 signal: None,
                 success: false,

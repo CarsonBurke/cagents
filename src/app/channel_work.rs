@@ -154,6 +154,7 @@ impl Cagents {
         };
         let title = channel.title.clone();
         let was_main = self.channel_work_is_main();
+        let mut visibility = Task::none();
         let effect = self.channel_work.view.open(home, title);
         if matches!(&effect, Some(Effect::Read { home: accepted, .. }) if *accepted == home) {
             // An explicit accepted open selects its destination even when the
@@ -175,10 +176,13 @@ impl Cagents {
                 }) {
                     self.channel_work.title = current.title.clone();
                 }
-                self.set_workspace_surfaces_visible(false);
+                visibility = self.set_workspace_surfaces_visible(false);
             }
         }
-        effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
+        Task::batch([
+            visibility,
+            effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
+        ])
     }
 
     /// Only stable navigation is deferred through the Work draft guard. Pane
@@ -451,107 +455,110 @@ impl Cagents {
     fn finish_channel_conversations(&mut self) -> Task<Message> {
         self.channel_work.main = false;
         self.channel_work.generation = uuid::Uuid::new_v4();
-        self.set_workspace_surfaces_visible(self.workspace_surfaces_visible());
-        if let Some(deferred) = self.channel_work.deferred.take() {
-            let Deferred::Navigation {
-                registry,
-                repository: captured_repository,
-                message,
-            } = deferred
-            else {
-                return match deferred {
-                    Deferred::PullRequest { url, destination } => {
-                        self.open_link_in(url, destination)
-                    }
-                    Deferred::Pane(captured) => {
-                        if self
-                            .channel_pane_destination(captured.card)
-                            .is_some_and(|current| captured.matches(&current))
-                        {
-                            self.update(Message::Palette(palette_ui::Action::FocusPane(
-                                captured.card,
-                            )))
-                        } else {
-                            self.status = Some(TransientNotice::warning(
-                                "That pane changed scope. Choose it again from the current workspace.",
-                            ));
-                            Task::none()
+        let visibility = self.set_workspace_surfaces_visible(self.workspace_surfaces_visible());
+        let navigation = (|| {
+            if let Some(deferred) = self.channel_work.deferred.take() {
+                let Deferred::Navigation {
+                    registry,
+                    repository: captured_repository,
+                    message,
+                } = deferred
+                else {
+                    return match deferred {
+                        Deferred::PullRequest { url, destination } => {
+                            self.open_link_in(url, destination)
                         }
-                    }
-                    Deferred::Navigation { .. } => unreachable!(),
+                        Deferred::Pane(captured) => {
+                            if self
+                                .channel_pane_destination(captured.card)
+                                .is_some_and(|current| captured.matches(&current))
+                            {
+                                self.update(Message::Palette(palette_ui::Action::FocusPane(
+                                    captured.card,
+                                )))
+                            } else {
+                                self.status = Some(TransientNotice::warning(
+                                    "That pane changed scope. Choose it again from the current workspace.",
+                                ));
+                                Task::none()
+                            }
+                        }
+                        Deferred::Navigation { .. } => unreachable!(),
+                    };
                 };
-            };
-            let valid = registry == self.workspace_model.identity
-                && match message.as_ref() {
-                    Message::Sidebar(SidebarAction::OpenRepository {
-                        project_id,
-                        repository,
-                    }) => self
-                        .sidebar_model
-                        .project(*project_id)
-                        .is_some_and(|project| {
-                            project.repository == *repository
-                                && captured_repository.as_ref() == Some(&project.repository)
-                        }),
-                    Message::Sidebar(SidebarAction::OpenWorktree {
-                        project_id,
-                        worktree_id,
-                        path,
-                    }) => self
-                        .sidebar_model
-                        .project(*project_id)
-                        .is_some_and(|project| {
-                            captured_repository.as_ref() == Some(&project.repository)
-                                && project.worktrees.iter().any(|worktree| {
-                                    worktree.id == *worktree_id && worktree.path == *path
-                                })
-                        }),
-                    Message::FocusCard(card) => {
-                        self.workspace.order().any(|id| id == *card)
-                            && self
-                                .card_state(*card)
-                                .is_some_and(|card| card.existence.is_open())
-                    }
-                    Message::Sidebar(
-                        SidebarAction::OpenSettings
-                        | SidebarAction::OpenAutomations
-                        | SidebarAction::OpenWork,
-                    )
-                    | Message::AccountUi(account_ui::Action::OpenPane) => true,
-                    _ => false,
+                let valid = registry == self.workspace_model.identity
+                    && match message.as_ref() {
+                        Message::Sidebar(SidebarAction::OpenRepository {
+                            project_id,
+                            repository,
+                        }) => self
+                            .sidebar_model
+                            .project(*project_id)
+                            .is_some_and(|project| {
+                                project.repository == *repository
+                                    && captured_repository.as_ref() == Some(&project.repository)
+                            }),
+                        Message::Sidebar(SidebarAction::OpenWorktree {
+                            project_id,
+                            worktree_id,
+                            path,
+                        }) => self
+                            .sidebar_model
+                            .project(*project_id)
+                            .is_some_and(|project| {
+                                captured_repository.as_ref() == Some(&project.repository)
+                                    && project.worktrees.iter().any(|worktree| {
+                                        worktree.id == *worktree_id && worktree.path == *path
+                                    })
+                            }),
+                        Message::FocusCard(card) => {
+                            self.workspace.order().any(|id| id == *card)
+                                && self
+                                    .card_state(*card)
+                                    .is_some_and(|card| card.existence.is_open())
+                        }
+                        Message::Sidebar(
+                            SidebarAction::OpenSettings
+                            | SidebarAction::OpenAutomations
+                            | SidebarAction::OpenWork,
+                        )
+                        | Message::AccountUi(account_ui::Action::OpenPane) => true,
+                        _ => false,
+                    };
+                return if valid {
+                    self.update(*message)
+                } else {
+                    self.status = Some(TransientNotice::warning(
+                        "The navigation destination changed. Choose it again from the current workspace.",
+                    ));
+                    Task::none()
                 };
-            return if valid {
-                self.update(*message)
-            } else {
-                self.status = Some(TransientNotice::warning(
-                    "The navigation destination changed. Choose it again from the current workspace.",
-                ));
-                Task::none()
-            };
-        }
-        let focused = self
-            .channel_work
-            .restore_card
-            .take()
-            .filter(|card| {
-                self.workspace.order().any(|id| id == *card)
-                    && self
-                        .card_state(*card)
-                        .is_some_and(|card| card.existence.is_open())
-            })
-            .or_else(|| {
-                self.workspace.focused().filter(|card| {
-                    self.card_state(*card)
-                        .is_some_and(|card| card.existence.is_open())
+            }
+            let focused = self
+                .channel_work
+                .restore_card
+                .take()
+                .filter(|card| {
+                    self.workspace.order().any(|id| id == *card)
+                        && self
+                            .card_state(*card)
+                            .is_some_and(|card| card.existence.is_open())
                 })
-            });
-        focused.map_or_else(
-            || {
-                iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
-                    .map(cosmic::Action::App)
-            },
-            |card| self.focus_workspace_card(card),
-        )
+                .or_else(|| {
+                    self.workspace.focused().filter(|card| {
+                        self.card_state(*card)
+                            .is_some_and(|card| card.existence.is_open())
+                    })
+                });
+            focused.map_or_else(
+                || {
+                    iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                        .map(cosmic::Action::App)
+                },
+                |card| self.focus_workspace_card(card),
+            )
+        })();
+        Task::batch([visibility, navigation])
     }
 
     pub(super) fn channel_work_subscription(&self) -> Subscription<Message> {
@@ -2458,6 +2465,107 @@ mod tests {
             },
         );
         (app, home)
+    }
+
+    #[tokio::test]
+    async fn returning_to_conversations_finishes_an_interrupted_initial_diff() {
+        for stale_navigation in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let git = |args: &[&str]| {
+                let mut command = std::process::Command::new("git");
+                for (name, _) in std::env::vars_os() {
+                    if name.to_string_lossy().starts_with("GIT_") {
+                        command.env_remove(name);
+                    }
+                }
+                let output = command
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "--quiet", "-b", "main"]);
+            std::fs::write(directory.path().join("notes.txt"), "index\n").unwrap();
+            git(&["add", "--", "notes.txt"]);
+            std::fs::write(directory.path().join("notes.txt"), "working\n").unwrap();
+            let (mut app, _) = main_fixture();
+            app.context_inspector_open = false;
+            let mut state = super::super::tests::terminal_card_state();
+            let card = state.id;
+            let mut runtime = repository_widget::RepositoryRuntime::new(RepositoryView {
+                project: ProjectId::new(),
+                repository: directory.path().to_owned(),
+                worktree: directory.path().to_owned(),
+                selected_file: None,
+            });
+            // Start the actual sidebar diff path, then leave before its lazy
+            // first worker has been polled. Hiding must retire that request.
+            drop(runtime.update(RepositoryAction::OpenWorkingDiff {
+                card,
+                file: repository_widget::RepositoryFile {
+                    path: "notes.txt".into(),
+                    unstaged: true,
+                    status: Some(" M".into()),
+                    ..Default::default()
+                },
+                basis: crate::repository::DiffBasis::IndexToWorktree,
+            }));
+            assert_eq!(runtime.inspector_context().diff_state, Some("Loading"));
+            state.kind = CardKind::Repository(runtime.descriptor.clone());
+            app.durable = Arc::new(WorkspaceState {
+                cards: vec![state],
+                focused: Some(card),
+                ..Default::default()
+            });
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            drop(app.set_workspace_surfaces_visible(false));
+            app.channel_work.restore_card = Some(card);
+            if stale_navigation {
+                app.channel_work.deferred = Some(Deferred::Navigation {
+                    registry: uuid::Uuid::new_v4(),
+                    repository: None,
+                    message: Box::new(Message::FocusCard(card)),
+                });
+            }
+            let task = app.finish_channel_conversations();
+            assert!(!app.channel_work_is_main());
+            let mut effects = cosmic::iced::runtime::task::into_stream(task)
+                .expect("reveal schedules the initial diff worker");
+            // A focus operation can wait for a native frame. The independently
+            // batched diff must finish even while that focus effect is pending.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(effect) = effects.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::Repository(RepositoryAction::DiffLoaded { .. }),
+                    )) = effect
+                    {
+                        drop(app.update(message));
+                        return;
+                    }
+                }
+                panic!("return discarded the only diff completion task");
+            })
+            .await
+            .expect("the local initial diff must not remain Loading");
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                panic!("repository remains mounted");
+            };
+            let model = runtime
+                .current_diff_model_snapshot()
+                .expect("current diff ready");
+            assert_eq!(model.before.as_ref(), "index\n");
+            assert_eq!(model.after.as_ref(), "working\n");
+        }
     }
 
     fn two_channels(app: &mut Cagents, home: Home) -> (ChannelId, CardId, CardId) {
