@@ -2262,29 +2262,80 @@ where
         emit_success(cli.json, completions::execute(shell));
         return ExitCode::SUCCESS;
     }
+    if matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::ProtocolVersion
+        }
+    ) {
+        return match execute_daemon(DaemonCommand::ProtocolVersion) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // These operations govern the whole daemon, not a hosted session's own
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
-    if matches!(
-        &cli.command,
+    let user_only_message = match &cli.command {
         TopCommand::Daemon {
-            command: DaemonCommand::Start
+            command:
+                DaemonCommand::Bridge
+                | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
                 | DaemonCommand::StopForRebuild { .. },
+        } => Some(
+            "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+        ),
+        TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
+            Some("Installation and window restart commands require your own terminal")
         }
-    ) && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        TopCommand::Account {
+            command:
+                AccountCommand::Link { .. }
+                | AccountCommand::Default { .. }
+                | AccountCommand::Remove { .. },
+        } => Some("Account changes require your own terminal"),
+        _ => None,
+    };
+    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        && let Some(message) = user_only_message
+    {
+        emit_error(cli.json, &AppError::new("permission_denied", message));
+        return ExitCode::FAILURE;
+    }
+
+    // These implementations operate on this installation's files or pidfds.
+    // Refuse a remote target before selecting/preparing it or touching local
+    // recovery state; the selected remote must never imply local consent.
+    if (cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote())
+        && matches!(
+            &cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Bridge
+                    | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::AbandonUpgrade { .. }
+                    | DaemonCommand::StopForRebuild { .. },
+            } | TopCommand::CoordinateInstall { .. }
+                | TopCommand::RestartWindows { .. }
+        )
     {
         emit_error(
             cli.json,
             &AppError::new(
-                "permission_denied",
-                "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+                "daemon_local_only",
+                "This operation manages the local installation; omit --device or select local",
             ),
         );
         return ExitCode::FAILURE;
@@ -4433,9 +4484,15 @@ mod tests {
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Vec<_>>();
-                assert_eq!(errors.len(), if case == "user" { 0 } else { 14 });
+                assert_eq!(errors.len(), if case == "user" { 6 } else { 26 });
                 assert!(errors.iter().all(|error| {
-                    error["ok"] == false && error["error"]["kind"] == "permission_denied"
+                    error["ok"] == false
+                        && error["error"]["kind"]
+                            == if case == "user" {
+                                "daemon_local_only"
+                            } else {
+                                "permission_denied"
+                            }
                 }));
             }
             return;
@@ -4447,6 +4504,22 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let before = std::fs::symlink_metadata(&socket).unwrap();
         let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
+        for no_start in [false, true] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            if no_start {
+                argv.push("--no-start");
+            }
+            argv.extend(["daemon", "protocol-version"]);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local protocol query routed")),
+                ExitCode::SUCCESS
+            );
+        }
 
         fn accept(listener: &UnixListener) -> UnixStream {
             let mut event = libc::pollfd {
@@ -4488,21 +4561,68 @@ mod tests {
         }
 
         if case != "user" {
-            let commands: [&[&str]; 7] = [
-                &["start"],
-                &["stop", "--require-empty"],
-                &["preflight"],
-                &["prepare-upgrade", "--yes", "--no-relaunch-agents"],
-                &["upgrade", "--yes"],
-                &["abandon-upgrade", "--yes"],
-                &["stop-for-rebuild", "--including-subagents"],
+            let commands: [&[&str]; 13] = [
+                &["daemon", "start"],
+                &["daemon", "stop", "--require-empty"],
+                &["daemon", "preflight"],
+                &["daemon", "prepare-upgrade", "--yes", "--no-relaunch-agents"],
+                &["daemon", "upgrade", "--yes"],
+                &["daemon", "abandon-upgrade", "--yes"],
+                &["daemon", "stop-for-rebuild", "--including-subagents"],
+                &["daemon", "bridge"],
+                &[
+                    "coordinate-install",
+                    "--prefix",
+                    "/missing-prefix",
+                    "--installer",
+                    "/missing-installer",
+                ],
+                &["restart-windows", "--instance", "missing-instance"],
+                &["account", "default", "claude", "automatic"],
+                &["account", "link", "codex", "/missing-home"],
+                &["account", "remove", "claude/system", "--yes"],
             ];
             for device in ["local", "fixture-device-must-not-be-selected"] {
                 for command in commands {
-                    let mut argv = vec!["cagents", "--json", "--device", device, "daemon"];
+                    let mut argv = vec!["cagents", "--json", "--device", device];
                     argv.extend_from_slice(command);
-                    assert_eq!(run_from(argv), ExitCode::FAILURE);
+                    assert_eq!(
+                        run_from_with_staged_lookup(argv, |_, _| panic!(
+                            "scoped initiator reached staged routing"
+                        )),
+                        ExitCode::FAILURE
+                    );
                 }
+            }
+            // Test the bridge's own admission as well as public CLI dispatch.
+            // The private EOF peer keeps a missing guard a bounded failure;
+            // no-start prevents even a broken entry from spawning a daemon.
+            {
+                let _policy =
+                    StartPolicy(NO_START.swap(true, std::sync::atomic::Ordering::Relaxed));
+                let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = stopped.clone();
+                let observed = listener.try_clone().unwrap();
+                let peer = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match observed.accept() {
+                            Ok((stream, _)) => {
+                                drop(stream);
+                                return true;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                            Err(error) => panic!("private bridge peer: {error}"),
+                        }
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    false
+                });
+                let result = crate::device::serve_stdio();
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert!(!peer.join().unwrap(), "scoped bridge connected");
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             }
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
@@ -4636,6 +4756,32 @@ mod tests {
             assert_eq!(run_from(argv), ExitCode::SUCCESS);
         }
         server.join().unwrap();
+        for command in [
+            vec!["daemon", "upgrade", "--yes"],
+            vec!["daemon", "abandon-upgrade", "--yes"],
+            vec!["daemon", "stop-for-rebuild", "--including-subagents"],
+            vec!["daemon", "bridge"],
+            vec![
+                "coordinate-install",
+                "--prefix",
+                "/missing-prefix",
+                "--installer",
+                "/missing-installer",
+            ],
+            vec!["restart-windows", "--instance", "missing-instance"],
+        ] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            argv.extend(command);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local-only operation routed")),
+                ExitCode::FAILURE
+            );
+        }
     }
 
     #[test]
