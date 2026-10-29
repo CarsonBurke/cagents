@@ -159,8 +159,28 @@ jobs:
           evidence = pathlib.Path(os.environ["MOD1_EVIDENCE_ROOT"])
           manifest = json.loads((evidence / "manifest.json").read_text())
           results = []
+          products = []
+          class ProductFailure(RuntimeError):
+              def __init__(self, label, message):
+                  self.label = label
+                  super().__init__(message)
           def put(path, value):
               path.write_text(json.dumps(value, indent=2) + "\n")
+          def result(global_error=None):
+              if global_error is not None:
+                  for product in products:
+                      if product["status"] == "running":
+                          product.update(status="stopped_globally", unrun_selector_invocations=None)
+              passed = len(products) == len(manifest["products"]) and all(product["status"] == "passed" for product in products)
+              value = {"narrow_qualification": "passed" if passed and global_error is None else "failed",
+                       "stopped_globally": global_error is not None, "error": global_error,
+                       "completed_phases": len(results), "products": products,
+                       "unattempted_products": [product["pr"] for product in manifest["products"] if product["pr"] not in {item["pr"] for item in products}],
+                       "qualified_parent_count": sum(len(product["qualified_parents"]) for product in products),
+                       "requested_parent_count": sum(len(product["selectors"]) for product in manifest["products"]),
+                       "limits": manifest["limits"]}
+              put(evidence / "result.json", value)
+              return value
           def git(root, *args):
               return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
           def verify(root, product):
@@ -173,7 +193,7 @@ jobs:
               output = evidence / (str(product["pr"]) + "-" + label)
               output.mkdir()
               bounded = ["timeout", "--signal=TERM", "--kill-after=30s", "2700s", *command]
-              record = {"source": product, "cwd": str(root), "command": command,
+              record = {"source": product, "label": label, "selector": selector, "cwd": str(root), "command": command,
                         "bounded_command": bounded, "command_bound_seconds": 2700,
                         "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "status": "running", "fixture_root": env["TMPDIR"],
@@ -197,13 +217,16 @@ jobs:
               put(evidence / "phases.json", results)
               print("RETURN", product["pr"], label, "exit", status, flush=True)
               verify(root, product)
-              assert status == 0, f"PR {product['pr']} {label} failed; preserve the original logs, no retry"
+              if record["timeout_or_wrapper_failure"]:
+                  raise RuntimeError(f"PR {product['pr']} {label}: uncertain timeout/signal/wrapper outcome; stop globally")
+              if status != 0:
+                  raise ProductFailure(label, f"PR {product['pr']} {label} failed with exit {status}; preserve original logs, no retry")
               if selector:
                   text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
                   names = re.findall(r"^test (\S+) \.\.\. ok$", text, re.M)
                   summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
-                  assert names == [selector], {"selector": selector, "actual": names}
-                  assert summaries == [("ok", "1", "0", "0")], summaries
+                  if names != [selector] or summaries != [("ok", "1", "0", "0")]:
+                      raise ProductFailure(label, f"Exact-parent oracle failed: selector={selector}, names={names}, summaries={summaries}")
                   put(output / "exact-parent.json", {"selector": selector, "passed": 1, "failed": 0, "ignored": 0})
           try:
               assert not any(name.startswith("CAGENTS_") for name in os.environ)
@@ -222,18 +245,34 @@ jobs:
                       env[key] = str(directory)
                   env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("mod1-target-" + product["feature"]))
                   env["CARGO_BUILD_JOBS"] = "2"
-                  phase(product, "check", ["cargo", "check", "--locked", "--no-default-features",
-                        "--features", product["feature"], "--bin", product["binary"]], env)
-                  for index, selector in enumerate(product["selectors"], 1):
-                      phase(product, f"parent-{index}", ["cargo", "test", "--locked", "--no-default-features",
-                            "--features", product["feature"], "--lib", selector, "--",
-                            "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
-              put(evidence / "result.json", {"narrow_qualification": "passed", "parents": 6,
-                  "limits": manifest["limits"]})
+                  outcome = {"pr": product["pr"], "head": product["head"], "status": "running",
+                             "check": "unrun", "qualified_parents": [],
+                             "unrun_selector_invocations": list(product["selectors"])}
+                  products.append(outcome)
+                  result()
+                  try:
+                      outcome["check"] = "running"
+                      phase(product, "check", ["cargo", "check", "--locked", "--no-default-features",
+                            "--features", product["feature"], "--bin", product["binary"]], env)
+                      outcome["check"] = "passed"
+                      for index, selector in enumerate(product["selectors"], 1):
+                          outcome["unrun_selector_invocations"].remove(selector)
+                          phase(product, f"parent-{index}", ["cargo", "test", "--locked", "--no-default-features",
+                                "--features", product["feature"], "--lib", selector, "--",
+                                "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
+                          outcome["qualified_parents"].append(selector)
+                      outcome["status"] = "passed"
+                  except ProductFailure as error:
+                      outcome.update(status="failed", failed_phase=error.label, error=str(error))
+                      if error.label == "check":
+                          outcome["check"] = "failed"
+                      print("PRODUCT FAILED", product["pr"], str(error), flush=True)
+                  result()
           except BaseException as error:
-              put(evidence / "result.json", {"narrow_qualification": "failed",
-                  "error": str(error), "completed_phases": len(results), "limits": manifest["limits"]})
+              result(global_error=str(error))
               raise
+          if result()["narrow_qualification"] != "passed":
+              raise SystemExit(1)
           PY
 
       - name: Retain final source state even after a failed phase

@@ -72,6 +72,8 @@
     "Formatting is UNRUN and not established by this workflow, including historical heads without scripts/check-format. Separate exact-head formatter evidence and full PR formatting gates are not waived.",
     "No whole feature suite, native interaction, screenshots, performance, integrated-browser, provider or merge acceptance.",
     "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
+    "An ordinary product command or exact-parent oracle failure stops only that product and preserves aggregate failure while later independent products run serially. Context, source, configuration and uncertain timeout/signal/wrapper failures stop globally.",
+    "Qualified parent counts require the original successful command and exact one-pass oracle. Unrun selector invocations were never reached; a failed invocation may fail compilation before its parent executes, so its raw test outcome remains separate.",
     "Natural hosted User context is required; inherited CAGENTS_ names are refused, never removed.",
     "GNU timeout bounds each command; its wrapper return and direct completion are recorded. No detached-process census or whole-family closure is claimed.",
     "No local build, test, provider, daemon or native execution is authorized by this research file."
