@@ -168,21 +168,45 @@ impl ExecutionBinding {
     }
 
     fn require_state(&self, state: &HostState) -> Result<(), String> {
-        let snapshot = self.context.ownership_snapshot();
         if state
             .execution_startups
             .get(&self.agent)
-            .is_none_or(|(intent, context)| {
-                intent != &crate::agent_execution::HostedSession::Chat(self.source.clone())
-                    || !Arc::ptr_eq(context, &self.context)
-            })
-            || snapshot.token != Some(self.token)
-            || snapshot.kind
-                != (LaunchOwnerKind::RemoteActor {
-                    identity: self.identity.clone(),
-                })
+            .is_none_or(|(intent, context)| !self.matches(self.agent, intent, context))
         {
             return Err("The captured execution launch, context or semantic actor changed".into());
+        }
+        Ok(())
+    }
+
+    fn matches(
+        &self,
+        agent: crate::model::AgentId,
+        intent: &crate::agent_execution::HostedSession,
+        context: &Arc<chat::protocol::ExecutionContext>,
+    ) -> bool {
+        let snapshot = self.context.ownership_snapshot();
+        agent == self.agent
+            && intent == &crate::agent_execution::HostedSession::Chat(self.source.clone())
+            && Arc::ptr_eq(context, &self.context)
+            && snapshot.token == Some(self.token)
+            && snapshot.kind
+                == (LaunchOwnerKind::RemoteActor {
+                    identity: self.identity.clone(),
+                })
+    }
+
+    fn require_inspection(
+        &self,
+        identity: &chat::runtime::ActorIdentity,
+        issued: &Session,
+        aliases: &[Session],
+    ) -> Result<(), String> {
+        if identity != &self.identity || (issued != &self.source && !aliases.contains(&self.source))
+        {
+            return Err(
+                "The authenticated helper does not recognize a captured execution intent source"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -204,6 +228,46 @@ impl ExecutionBinding {
     }
 }
 
+fn context_actor(
+    context: &Arc<chat::protocol::ExecutionContext>,
+    identity: &chat::runtime::ActorIdentity,
+) -> bool {
+    matches!(context.ownership_snapshot().kind, LaunchOwnerKind::RemoteActor { identity: current } if &current == identity)
+}
+
+/// All same-actor obligations are frozen together before hosted-first job
+/// coalescing can discard the other entry points. Same TerminalId alone never
+/// joins owners, and a terminal intent never gains native cleanup authority.
+fn collect_actor_bindings(
+    state: &HostState,
+    identity: &chat::runtime::ActorIdentity,
+) -> Result<(Vec<StartupBinding>, Vec<ExecutionBinding>), String> {
+    let mut startups = Vec::new();
+    for (id, pending) in &state.native_actor_startups {
+        if context_actor(&pending.context, identity) {
+            if *id != pending.source.id {
+                return Err("The native startup map key differs from its exact source".into());
+            }
+            let binding = StartupBinding::capture(pending)?;
+            binding.require_state(state)?;
+            startups.push(binding);
+        }
+    }
+    let mut executions = Vec::new();
+    for (agent, (intent, context)) in &state.execution_startups {
+        if context_actor(context, identity) {
+            let crate::agent_execution::HostedSession::Chat(source) = intent else {
+                return Err(
+                    "A retained semantic actor has an incompatible terminal execution intent"
+                        .into(),
+                );
+            };
+            executions.push(ExecutionBinding::capture(state, *agent, source, context)?);
+        }
+    }
+    Ok((startups, executions))
+}
+
 /// This value is deliberately private to HOST and has no wire representation.
 /// Only an ordinary-exit transaction can mint it; every publication checks the
 /// same original proof and current exact attachment or startup owner again.
@@ -213,8 +277,8 @@ pub(in crate::host) struct Capture {
     source: Session,
     requested: Session,
     identity: chat::runtime::ActorIdentity,
-    startup: Option<StartupBinding>,
-    execution: Option<ExecutionBinding>,
+    startups: Vec<StartupBinding>,
+    executions: Vec<ExecutionBinding>,
     target: Option<super::super::CloseTarget>,
     /// A normal close can retire its HOST record before the original child
     /// wait completes. Preserve that exact failed attachment, but permit only
@@ -228,6 +292,7 @@ pub(in crate::host) fn capture_startup(
 ) -> Result<Capture, String> {
     let startup = StartupBinding::capture(pending)?;
     startup.require_state(state)?;
+    let (startups, executions) = collect_actor_bindings(state, &startup.identity)?;
     let target = match state.chats.get(&pending.source.id) {
         Some(record) => {
             if record.handle.actor_identity().as_ref() != Some(&startup.identity)
@@ -245,15 +310,19 @@ pub(in crate::host) fn capture_startup(
     };
     let retired_target = target
         .is_none()
-        .then(|| startup.failed_close.clone())
+        .then(|| {
+            startups
+                .iter()
+                .find_map(|startup| startup.failed_close.clone())
+        })
         .flatten();
     let capture = Capture {
         proof: state.proof().clone(),
         source: pending.source.clone(),
         requested: pending.requested.clone(),
         identity: startup.identity.clone(),
-        startup: Some(startup),
-        execution: None,
+        startups,
+        executions,
         target,
         retired_target,
     };
@@ -293,6 +362,7 @@ pub(in crate::host) fn capture_hosted(
     }) {
         return Err("The hosted attachment does not match its captured startup actor".into());
     }
+    let (startups, executions) = collect_actor_bindings(state, &identity)?;
     let capture = Capture {
         proof: state.proof().clone(),
         source: source.clone(),
@@ -300,8 +370,8 @@ pub(in crate::host) fn capture_hosted(
             .as_ref()
             .map_or_else(|| source.clone(), |startup| startup.requested.clone()),
         identity,
-        startup,
-        execution: None,
+        startups,
+        executions,
         target: Some(super::super::CloseTarget::from_record(record)),
         retired_target: None,
     };
@@ -319,17 +389,28 @@ pub(in crate::host) fn capture_execution(
         return Err("A terminal launch has no retained semantic actor".into());
     };
     let execution = ExecutionBinding::capture(state, agent, source, context)?;
-    let startup = execution.native_binding(state)?;
+    let (startups, executions) = collect_actor_bindings(state, &execution.identity)?;
+    if state
+        .native_actor_startups
+        .get(&source.id)
+        .is_some_and(|pending| !context_actor(&pending.context, &execution.identity))
+    {
+        return Err("A different actor's native startup owns this execution descriptor".into());
+    }
+    let startup = startups.iter().find(|startup| {
+        Arc::ptr_eq(&startup.context, context)
+            && (startup.source == *source || startup.requested == *source)
+    });
     let target = state
         .chats
         .get(&source.id)
         .map(|record| -> Result<super::super::CloseTarget, String> {
             if record.handle.actor_identity().as_ref() != Some(&execution.identity)
                 || record.execution_instance != execution.identity.instance
-                || startup
-                    .as_ref()
-                    .and_then(|startup| startup.failed_close.as_ref())
-                    .is_some_and(|failed| !failed.matches(record))
+                || startups
+                    .iter()
+                    .filter_map(|startup| startup.failed_close.as_ref())
+                    .any(|failed| !failed.matches(record))
             {
                 return Err("The execution startup's semantic attachment changed".into());
             }
@@ -339,9 +420,9 @@ pub(in crate::host) fn capture_execution(
     let retired_target = target
         .is_none()
         .then(|| {
-            startup
-                .as_ref()
-                .and_then(|startup| startup.failed_close.clone())
+            startups
+                .iter()
+                .find_map(|startup| startup.failed_close.clone())
         })
         .flatten();
     let capture = Capture {
@@ -351,8 +432,8 @@ pub(in crate::host) fn capture_execution(
             .map_or_else(|| source.clone(), |startup| startup.source.clone()),
         requested: source.clone(),
         identity: execution.identity.clone(),
-        startup,
-        execution: Some(execution),
+        startups,
+        executions,
         target,
         retired_target,
     };
@@ -374,9 +455,7 @@ impl Capture {
     }
 
     pub(in crate::host) fn matches_startup(&self, pending: &Startup) -> bool {
-        self.startup
-            .as_ref()
-            .is_some_and(|startup| startup.matches(pending))
+        self.startups.iter().any(|startup| startup.matches(pending))
     }
 
     fn require_ordinary_intent(&self, state: &HostState) -> Result<(), String> {
@@ -390,23 +469,139 @@ impl Capture {
         Ok(())
     }
 
-    pub(in crate::host::chat) fn require_state(&self, state: &HostState) -> Result<(), String> {
-        self.require_ordinary_intent(state)?;
-        if let Some(startup) = &self.startup {
+    fn require_frozen_bindings(
+        &self,
+        state: &HostState,
+        context: Option<&Arc<chat::protocol::ExecutionContext>>,
+    ) -> Result<usize, String> {
+        let mut matched = 0;
+        for startup in self
+            .startups
+            .iter()
+            .filter(|startup| context.is_none_or(|context| Arc::ptr_eq(context, &startup.context)))
+        {
             startup.require_state(state)?;
             if !startup.context.ownership_snapshot().ordinary_requested {
                 return Err("The original startup cancellation has not been requested".into());
             }
+            matched += 1;
         }
-        if let Some(execution) = &self.execution {
+        for execution in self.executions.iter().filter(|execution| {
+            context.is_none_or(|context| Arc::ptr_eq(context, &execution.context))
+        }) {
             execution.require_state(state)?;
             if !execution.context.ownership_snapshot().ordinary_requested {
                 return Err("The original execution cancellation has not been requested".into());
             }
-            if self.startup.is_none() && state.native_actor_startups.contains_key(&self.source.id) {
-                return Err("A different native startup appeared after execution capture".into());
+            matched += 1;
+        }
+        Ok(matched)
+    }
+
+    fn contains_context(&self, context: &Arc<chat::protocol::ExecutionContext>) -> bool {
+        self.startups
+            .iter()
+            .any(|binding| Arc::ptr_eq(&binding.context, context))
+            || self
+                .executions
+                .iter()
+                .any(|binding| Arc::ptr_eq(&binding.context, context))
+    }
+
+    /// Compare the current map census with the originally frozen set. A new
+    /// AgentId using an old Arc is a new obligation even if actor/token match.
+    /// The per-context proof gate ignores other contexts already settled by
+    /// the coordinator, while the semantic operation validates the whole actor.
+    fn require_current_census(
+        &self,
+        state: &HostState,
+        context: Option<&Arc<chat::protocol::ExecutionContext>>,
+    ) -> Result<(), String> {
+        for (id, pending) in &state.native_actor_startups {
+            let relevant = match context {
+                Some(context) => {
+                    Arc::ptr_eq(context, &pending.context)
+                        || self.startups.iter().any(|binding| {
+                            binding.source.id == *id && Arc::ptr_eq(context, &binding.context)
+                        })
+                        || self.executions.iter().any(|binding| {
+                            binding.source.id == *id && Arc::ptr_eq(context, &binding.context)
+                        })
+                }
+                None => {
+                    context_actor(&pending.context, &self.identity)
+                        || self.contains_context(&pending.context)
+                        || *id == self.source.id
+                        || self.startups.iter().any(|binding| binding.source.id == *id)
+                        || self
+                            .executions
+                            .iter()
+                            .any(|binding| binding.source.id == *id)
+                }
+            };
+            if relevant
+                && !self
+                    .startups
+                    .iter()
+                    .any(|binding| binding.source.id == *id && binding.matches(pending))
+            {
+                return Err(
+                    "A native startup obligation appeared or changed after actor capture".into(),
+                );
             }
         }
+        for (agent, (intent, owner)) in &state.execution_startups {
+            let relevant = match context {
+                Some(context) => {
+                    Arc::ptr_eq(context, owner)
+                        || self.executions.iter().any(|binding| {
+                            binding.agent == *agent && Arc::ptr_eq(context, &binding.context)
+                        })
+                }
+                None => {
+                    context_actor(owner, &self.identity)
+                        || self.contains_context(owner)
+                        || self
+                            .executions
+                            .iter()
+                            .any(|binding| binding.agent == *agent)
+                }
+            };
+            if relevant
+                && !self
+                    .executions
+                    .iter()
+                    .any(|binding| binding.matches(*agent, intent, owner))
+            {
+                return Err(
+                    "An execution intent obligation appeared or changed after actor capture".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Proof application follows semantic removal of the resident chat. Keep
+    /// every original per-context map, descriptor, AgentId, Arc and typed owner
+    /// fence, without requiring the already retired attachment to remain live.
+    pub(in crate::host) fn require_context_state(
+        &self,
+        state: &HostState,
+        context: &Arc<chat::protocol::ExecutionContext>,
+    ) -> Result<(), String> {
+        self.require_ordinary_intent(state)?;
+        if self.require_frozen_bindings(state, Some(context))? == 0 {
+            return Err(
+                "This context has no original obligation in the actor cleanup capture".into(),
+            );
+        }
+        self.require_current_census(state, Some(context))
+    }
+
+    pub(in crate::host::chat) fn require_state(&self, state: &HostState) -> Result<(), String> {
+        self.require_ordinary_intent(state)?;
+        self.require_frozen_bindings(state, None)?;
+        self.require_current_census(state, None)?;
         if self.target.as_ref().is_some_and(|target| {
             state
                 .chats
@@ -464,18 +659,18 @@ impl Capture {
     }
 
     pub(super) fn inherit_original_helper(&self, handle: &Handle) -> Result<(), String> {
-        for previous in [
-            self.startup
-                .as_ref()
-                .and_then(|startup| startup._remote.as_ref()),
-            self.execution
-                .as_ref()
-                .and_then(|execution| execution._remote.as_ref()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            handle.inherit_original_helper_from(previous)?;
+        for startup in &self.startups {
+            if let Some(previous) = &startup._remote {
+                handle.inherit_original_helper_from(previous)?;
+            }
+            if let Some(failed) = &startup.failed_close {
+                handle.inherit_original_helper_from(&failed.handle)?;
+            }
+        }
+        for execution in &self.executions {
+            if let Some(previous) = &execution._remote {
+                handle.inherit_original_helper_from(previous)?;
+            }
         }
         Ok(())
     }
@@ -491,10 +686,24 @@ impl Capture {
                 "The authenticated semantic actor differs from its shutdown capture".into(),
             );
         }
-        if let Some(startup) = &self.startup {
-            startup.require_inspection(identity, issued, aliases)?;
-        } else if issued != &self.source && !aliases.contains(&self.source) {
+        if issued != &self.source && !aliases.contains(&self.source) {
             return Err("The authenticated actor does not recognize its captured source".into());
+        }
+        for startup in &self.startups {
+            startup.require_inspection(identity, issued, aliases)?;
+            if startup
+                .failed_close
+                .as_ref()
+                .is_some_and(|failed| issued != &failed.source && !aliases.contains(&failed.source))
+            {
+                return Err(
+                    "The authenticated actor does not recognize a captured failed target source"
+                        .into(),
+                );
+            }
+        }
+        for execution in &self.executions {
+            execution.require_inspection(identity, issued, aliases)?;
         }
         if self
             .retired_target
@@ -520,7 +729,7 @@ impl Capture {
         self.require_host(host)?;
         self.require_live_adoption()?;
         self.require_inspection(identity, issued, aliases)?;
-        if self.startup.is_none() && self.execution.is_none() {
+        if self.startups.is_empty() && self.executions.is_empty() {
             // Ordinary hosted cleanup never gains a missing ownership row.
             return verify_close_ownership(host, identity, issued, aliases, scope).map(|_| ());
         }

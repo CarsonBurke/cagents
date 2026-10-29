@@ -68,7 +68,8 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
         .execution_startups
         .insert(accepted.agent.id, (intent.clone(), context.clone()));
     let host = Arc::new(HostLock::new(state));
-    finish_ordinary_startups(&host).unwrap();
+    let receipts = capture_ordinary_startups(&host.lock().unwrap());
+    finish_ordinary_startups(&host, &receipts).unwrap();
     assert!(
         host.lock()
             .unwrap()
@@ -79,7 +80,7 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
     let fault = rusqlite::Connection::open(&database).unwrap();
     fault.execute_batch("CREATE TRIGGER refuse_owned_launch_clear BEFORE DELETE ON agent_launches BEGIN SELECT RAISE(ABORT, 'owned launch clear fault'); END;").unwrap();
     assert!(
-        finish_ordinary_startups(&host)
+        finish_ordinary_startups(&host, &receipts)
             .unwrap_err()
             .contains("owned launch clear fault")
     );
@@ -101,6 +102,21 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
     fault
         .execute_batch("DROP TRIGGER refuse_owned_launch_clear;")
         .unwrap();
+    fault.execute_batch("CREATE TRIGGER ignore_owned_launch_clear BEFORE DELETE ON agent_launches BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(
+        finish_ordinary_startups(&host, &receipts)
+            .unwrap_err()
+            .contains("remains pending after cleanup")
+    );
+    assert!(
+        host.lock()
+            .unwrap()
+            .execution_startups
+            .contains_key(&accepted.agent.id)
+    );
+    fault
+        .execute_batch("DROP TRIGGER ignore_owned_launch_clear;")
+        .unwrap();
     // A successful no-op DELETE is not a receipt for a different durable
     // source. Inject only the row replacement; keep the original memory owner
     // and its no-provider evidence unchanged.
@@ -119,7 +135,7 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
         )
         .unwrap();
     assert!(
-        finish_ordinary_startups(&host)
+        finish_ordinary_startups(&host, &receipts)
             .unwrap_err()
             .contains("successor was preserved")
     );
@@ -136,8 +152,35 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
             .unwrap()
             .pending_agent_launch(accepted.agent.id)
             .unwrap(),
+        Some(successor.clone())
+    );
+    // Replacing BOTH the memory intent and its durable row while keeping the
+    // same proved context must not rebind the original frozen receipt. The
+    // strict SQL source check alone would accept this successor's own row.
+    host.lock()
+        .unwrap()
+        .execution_startups
+        .insert(accepted.agent.id, (successor.clone(), context.clone()));
+    finish_ordinary_startups(&host, &receipts).unwrap();
+    {
+        let state = host.lock().unwrap();
+        let (retained, owner) = &state.execution_startups[&accepted.agent.id];
+        assert_eq!(retained, &successor);
+        assert!(Arc::ptr_eq(owner, &context));
+    }
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap(),
         Some(successor)
     );
+    host.lock()
+        .unwrap()
+        .execution_startups
+        .insert(accepted.agent.id, (intent.clone(), context.clone()));
     fault
         .execute(
             "UPDATE agent_launches SET source = ?2 WHERE agent = ?1",
@@ -147,7 +190,7 @@ fn ordinary_intent_clear_failure_retains_exact_context_and_retries_in_same_host(
             ],
         )
         .unwrap();
-    finish_ordinary_startups(&host).unwrap();
+    finish_ordinary_startups(&host, &receipts).unwrap();
     assert!(host.lock().unwrap().execution_startups.is_empty());
     assert_eq!(
         registry(&host)

@@ -291,6 +291,8 @@ fn run(
             Err(std::sync::TryLockError::WouldBlock) => thread::sleep(RETRY),
         }
     }
+    let execution_receipts =
+        agent_execution::capture_ordinary_startups(&host.lock().unwrap_or_else(|p| p.into_inner()));
     let mut actors: Vec<ActorWork> = Vec::new();
     let mut locals: Vec<LocalWork> = Vec::new();
     let mut generics: Vec<GenericWork> = Vec::new();
@@ -598,7 +600,12 @@ fn run(
                     {
                         for (original, captured) in &work.bindings {
                             if Arc::ptr_eq(original, context) && captured.kind == snapshot.kind {
-                                if let Some(token) = captured.token {
+                                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(error) =
+                                    work.capture.require_context_state(&state, context)
+                                {
+                                    diagnostic = Some(error);
+                                } else if let Some(token) = captured.token {
                                     context.complete_semantic_cleanup(token, identity);
                                 }
                             }
@@ -620,7 +627,7 @@ fn run(
                 }
             }
         }
-        if let Err(error) = agent_execution::finish_ordinary_startups(host) {
+        if let Err(error) = agent_execution::finish_ordinary_startups(host, &execution_receipts) {
             diagnostic = Some(error);
         }
         {

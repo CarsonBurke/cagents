@@ -237,6 +237,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_owner(Arc::new(Pending))
+    }
+
+    fn with_owner(owner: Arc<dyn LaunchCleanup>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let (attachment, successor) = Handle::fixture_remote_attachment_pair();
         let identity = attachment.actor_identity().unwrap();
@@ -264,7 +268,7 @@ impl Fixture {
             native_continuity: chat::NativeContinuity::ReconnectOnly,
         };
         let context = Arc::new(chat::protocol::ExecutionContext::default());
-        let token = context.claim_startup_owner(Arc::new(Pending));
+        let token = context.claim_startup_owner(owner);
         assert!(context.transfer_startup_owner(token, Arc::new(Pending), identity.clone()));
         let pending = Startup {
             source: source.clone(),
@@ -321,6 +325,427 @@ impl Fixture {
             .insert(self.pending.source.id, self.record(self.attachment.clone()));
         Arc::new(HostLock::new(state))
     }
+}
+
+/// Synthetic protocol input for the HOST descriptor/CAS tests below only.
+/// This does not model a helper, authenticate retirement or qualify Child.wait.
+/// Genuine original-wait progress is exercised by the separate real fixtures.
+struct UnitCompletedWaitInput;
+
+impl LaunchCleanup for UnitCompletedWaitInput {
+    fn cleanup(&self) -> Result<LaunchOutcome, String> {
+        Ok(LaunchOutcome::Uncertain)
+    }
+
+    fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
+        chat::protocol::HelperWaitProof::TeardownProved
+    }
+}
+
+struct ActorObligations {
+    fixture: Fixture,
+    shared_agent: crate::model::AgentId,
+    separate_agent: crate::model::AgentId,
+    separate_source: Session,
+    separate_context: Arc<chat::protocol::ExecutionContext>,
+}
+
+impl ActorObligations {
+    fn new() -> Self {
+        let fixture = Fixture::with_owner(Arc::new(UnitCompletedWaitInput));
+        let shared_agent = crate::model::AgentId::new();
+        let separate_agent = crate::model::AgentId::new();
+        let mut separate_source = fixture.pending.source.clone();
+        separate_source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let separate_context = Self::context(&fixture.identity, 2);
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.chats.insert(
+                fixture.pending.source.id,
+                fixture.record(fixture.attachment.clone()),
+            );
+            state.execution_startups.insert(
+                shared_agent,
+                (
+                    crate::agent_execution::HostedSession::Chat(fixture.pending.source.clone()),
+                    fixture.pending.context.clone(),
+                ),
+            );
+            state.execution_startups.insert(
+                separate_agent,
+                (
+                    crate::agent_execution::HostedSession::Chat(separate_source.clone()),
+                    separate_context.clone(),
+                ),
+            );
+        }
+        Self {
+            fixture,
+            shared_agent,
+            separate_agent,
+            separate_source,
+            separate_context,
+        }
+    }
+
+    fn context(
+        identity: &chat::runtime::ActorIdentity,
+        generation: usize,
+    ) -> Arc<chat::protocol::ExecutionContext> {
+        let context = Arc::new(chat::protocol::ExecutionContext::default());
+        let mut token = None;
+        for _ in 0..generation {
+            token = Some(context.claim_startup_owner(Arc::new(UnitCompletedWaitInput)));
+        }
+        assert!(context.transfer_startup_owner(
+            token.unwrap(),
+            Arc::new(Pending),
+            identity.clone(),
+        ));
+        context.request_ordinary_cleanup();
+        context
+    }
+
+    fn captures(&self) -> [Capture; 3] {
+        let state = self.fixture.host.lock().unwrap();
+        [
+            capture_hosted(
+                &state,
+                &self.fixture.pending.source,
+                &self.fixture.attachment,
+            )
+            .unwrap(),
+            capture_startup(&state, &self.fixture.pending).unwrap(),
+            capture_execution(
+                &state,
+                self.separate_agent,
+                &crate::agent_execution::HostedSession::Chat(self.separate_source.clone()),
+                &self.separate_context,
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn apply(
+        &self,
+        capture: &Capture,
+        state: &HostState,
+        context: &Arc<chat::protocol::ExecutionContext>,
+    ) -> Result<bool, String> {
+        // This is the coordinator's real proof-application order. The unit
+        // double supplies protocol progress only; no helper outcome is forged.
+        capture.require_context_state(state, context)?;
+        Ok(context.complete_semantic_cleanup(
+            context.ownership_snapshot().token.unwrap(),
+            &self.fixture.identity,
+        ))
+    }
+}
+
+#[test]
+fn every_capture_entry_point_freezes_all_actor_obligations_before_proof_application() {
+    let obligations = ActorObligations::new();
+    let fixture = &obligations.fixture;
+    let mut other_actor = fixture.identity.clone();
+    other_actor.instance = uuid::Uuid::new_v4();
+    let other_context = ActorObligations::context(&other_actor, 2);
+    fixture.host.lock().unwrap().execution_startups.insert(
+        crate::model::AgentId::new(),
+        (
+            crate::agent_execution::HostedSession::Chat(fixture.pending.source.clone()),
+            other_context.clone(),
+        ),
+    );
+    let captures = obligations.captures();
+    let native_token = fixture.pending.context.ownership_snapshot().token;
+    let separate_token = obligations.separate_context.ownership_snapshot().token;
+    assert!(!Arc::ptr_eq(
+        &fixture.pending.context,
+        &obligations.separate_context
+    ));
+    assert_ne!(native_token, separate_token);
+    let mut state = fixture.host.lock().unwrap();
+    for capture in &captures {
+        assert_eq!(capture.startups.len(), 1);
+        assert_eq!(capture.executions.len(), 2);
+        assert!(capture.executions.iter().any(|binding| {
+            binding.agent == obligations.shared_agent
+                && Arc::ptr_eq(&binding.context, &fixture.pending.context)
+        }));
+        capture.require_state(&state).unwrap();
+        // Even hosted-first capture must authenticate the execution-only
+        // descriptor on the other original context before semantic close.
+        assert!(
+            capture
+                .require_inspection(&fixture.identity, &fixture.pending.source, &[])
+                .is_err()
+        );
+        capture
+            .require_inspection(
+                &fixture.identity,
+                &fixture.pending.source,
+                &[obligations.separate_source.clone()],
+            )
+            .unwrap();
+    }
+    // Remote classification is monotonic, so a late claim cannot rotate its
+    // token in place. Supply a different legitimately minted token as stale
+    // capture input to isolate both owner-generation comparisons.
+    let mut stale_native = captures[0].clone();
+    stale_native.startups[0].token = separate_token.unwrap();
+    assert!(
+        obligations
+            .apply(&stale_native, &state, &fixture.pending.context)
+            .is_err()
+    );
+    let mut stale_execution = captures[0].clone();
+    stale_execution
+        .executions
+        .iter_mut()
+        .find(|binding| binding.agent == obligations.separate_agent)
+        .unwrap()
+        .token = native_token.unwrap();
+    assert!(
+        obligations
+            .apply(&stale_execution, &state, &obligations.separate_context)
+            .is_err()
+    );
+    assert_eq!(fixture.pending.context.outcome(), LaunchOutcome::Uncertain);
+    assert_eq!(
+        obligations.separate_context.outcome(),
+        LaunchOutcome::Uncertain
+    );
+    // Semantic cleanup removes the current chat before proof application.
+    // The full semantic gate retains its attachment CAS; context application
+    // instead checks the original native/execution obligations and owner.
+    state.chats.remove(&fixture.pending.source.id);
+    for capture in &captures {
+        assert!(capture.require_state(&state).is_err());
+        assert!(
+            obligations
+                .apply(capture, &state, &fixture.pending.context)
+                .unwrap()
+        );
+        assert!(
+            obligations
+                .apply(capture, &state, &obligations.separate_context)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        fixture.pending.context.outcome(),
+        LaunchOutcome::TeardownProved
+    );
+    assert_eq!(
+        obligations.separate_context.outcome(),
+        LaunchOutcome::TeardownProved
+    );
+    // The same TerminalId does not coalesce another exact actor generation.
+    assert_eq!(other_context.outcome(), LaunchOutcome::Uncertain);
+}
+
+#[test]
+fn coalesced_context_proof_refuses_successor_intent_agent_arc_and_owner_token() {
+    for mutation in 0..6 {
+        let obligations = ActorObligations::new();
+        let fixture = &obligations.fixture;
+        let captures = obligations.captures();
+        let mut state = fixture.host.lock().unwrap();
+        let (agent, context) = if mutation == 5 {
+            (obligations.shared_agent, &fixture.pending.context)
+        } else {
+            (obligations.separate_agent, &obligations.separate_context)
+        };
+        let original = state.execution_startups[&agent].clone();
+        let replacement_agent = crate::model::AgentId::new();
+        match mutation {
+            0 => {
+                let mut source = obligations.separate_source.clone();
+                source
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("successor-intent".into());
+                state.execution_startups.insert(
+                    obligations.separate_agent,
+                    (
+                        crate::agent_execution::HostedSession::Chat(source),
+                        obligations.separate_context.clone(),
+                    ),
+                );
+            }
+            1 => {
+                state.execution_startups.remove(&obligations.separate_agent);
+                state
+                    .execution_startups
+                    .insert(replacement_agent, original.clone());
+            }
+            2 => {
+                state.execution_startups.insert(
+                    obligations.separate_agent,
+                    (
+                        original.0.clone(),
+                        ActorObligations::context(&fixture.identity, 3),
+                    ),
+                );
+            }
+            3 => {
+                state
+                    .execution_startups
+                    .insert(replacement_agent, original.clone());
+            }
+            4 => {
+                let mut foreign = fixture.identity.clone();
+                foreign.instance = uuid::Uuid::new_v4();
+                let context = ActorObligations::context(&foreign, 2);
+                state
+                    .execution_startups
+                    .insert(obligations.separate_agent, (original.0.clone(), context));
+            }
+            5 => {
+                let mut source = fixture.pending.source.clone();
+                source
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("same-arc-successor".into());
+                state.execution_startups.insert(
+                    agent,
+                    (
+                        crate::agent_execution::HostedSession::Chat(source),
+                        context.clone(),
+                    ),
+                );
+            }
+            _ => unreachable!(),
+        }
+        for capture in &captures {
+            assert!(
+                capture.require_state(&state).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        state.chats.remove(&fixture.pending.source.id);
+        for capture in &captures {
+            assert!(
+                obligations.apply(capture, &state, context).is_err(),
+                "mutation {mutation}"
+            );
+            assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        }
+        state.execution_startups.remove(&replacement_agent);
+        state.execution_startups.insert(agent, original);
+        for capture in &captures {
+            assert!(
+                obligations.apply(capture, &state, context).unwrap(),
+                "restored mutation {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coalesced_context_proof_retains_every_native_descriptor_and_failed_target_fence() {
+    for mutation in 0..5 {
+        let obligations = ActorObligations::new();
+        let fixture = &obligations.fixture;
+        let captures = obligations.captures();
+        let mut state = fixture.host.lock().unwrap();
+        let mut changed = fixture.pending.clone();
+        match mutation {
+            0 => changed
+                .source
+                .launch
+                .recipe
+                .arguments
+                .push("changed-source".into()),
+            1 => changed
+                .requested
+                .launch
+                .recipe
+                .arguments
+                .push("changed-requested".into()),
+            2 => changed.context = ActorObligations::context(&fixture.identity, 3),
+            3 => {
+                changed.failed_close = Some(super::super::super::CloseTarget::from_record(
+                    &fixture.record(fixture.attachment.clone()),
+                ));
+            }
+            4 => changed.source.id = crate::model::TerminalId::new(),
+            _ => unreachable!(),
+        }
+        state
+            .native_actor_startups
+            .insert(fixture.pending.source.id, changed);
+        for capture in &captures {
+            assert!(
+                capture.require_state(&state).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        state.chats.remove(&fixture.pending.source.id);
+        for capture in &captures {
+            assert!(
+                obligations
+                    .apply(capture, &state, &fixture.pending.context)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            assert_eq!(fixture.pending.context.outcome(), LaunchOutcome::Uncertain);
+        }
+        state
+            .native_actor_startups
+            .insert(fixture.pending.source.id, fixture.pending.clone());
+        for capture in &captures {
+            assert!(
+                obligations
+                    .apply(capture, &state, &fixture.pending.context)
+                    .unwrap(),
+                "restored mutation {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coalesced_capture_refuses_new_same_actor_context_and_unfrozen_native_obligation() {
+    let obligations = ActorObligations::new();
+    let fixture = &obligations.fixture;
+    let mut state = fixture.host.lock().unwrap();
+    // Capture a hosted actor with execution obligations but no native row.
+    // A later native claim on even an original context is a new obligation.
+    state.native_actor_startups.clear();
+    let capture = capture_hosted(&state, &fixture.pending.source, &fixture.attachment).unwrap();
+    state
+        .native_actor_startups
+        .insert(fixture.pending.source.id, fixture.pending.clone());
+    assert!(capture.require_state(&state).is_err());
+    assert!(
+        obligations
+            .apply(&capture, &state, &fixture.pending.context)
+            .is_err()
+    );
+    assert_eq!(fixture.pending.context.outcome(), LaunchOutcome::Uncertain);
+    state.native_actor_startups.clear();
+    let fresh_agent = crate::model::AgentId::new();
+    let fresh_context = ActorObligations::context(&fixture.identity, 3);
+    state.execution_startups.insert(
+        fresh_agent,
+        (
+            crate::agent_execution::HostedSession::Chat(fixture.pending.source.clone()),
+            fresh_context.clone(),
+        ),
+    );
+    assert!(capture.require_state(&state).is_err());
+    assert!(obligations.apply(&capture, &state, &fresh_context).is_err());
+    assert_eq!(fresh_context.outcome(), LaunchOutcome::Uncertain);
+    state.execution_startups.remove(&fresh_agent);
+    state.chats.remove(&fixture.pending.source.id);
+    assert!(
+        obligations
+            .apply(&capture, &state, &fixture.pending.context)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -990,7 +1415,12 @@ fn ordinary_semantic_persistence_failure_retries_in_the_same_host() {
         cleanup(&host, &capture).unwrap();
         let token = context.ownership_snapshot().token.unwrap();
         wait(
-            || context.complete_semantic_cleanup(token, &identity),
+            || {
+                capture
+                    .require_context_state(&host.lock().unwrap(), &context)
+                    .unwrap();
+                context.complete_semantic_cleanup(token, &identity)
+            },
             "semantic settlement did not receive the original helper's actual wait proof",
         );
         assert_eq!(
@@ -1202,7 +1632,13 @@ fn receipt_only_startup(absent_failed_target: bool) {
         if let Some(capture) = &ordinary {
             cleanup(&host, capture).unwrap();
             let token = context.ownership_snapshot().token.unwrap();
-            while !context.complete_semantic_cleanup(token, &identity) {
+            loop {
+                capture
+                    .require_context_state(&host.lock().unwrap(), &context)
+                    .unwrap();
+                if context.complete_semantic_cleanup(token, &identity) {
+                    break;
+                }
                 assert!(
                     Instant::now() < deadline,
                     "original helper actual wait never completed"

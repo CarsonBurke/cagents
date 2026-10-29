@@ -750,17 +750,44 @@ fn retain_startup(
     Ok(())
 }
 
-/// The coordinator has already obtained genuine cleanup evidence. Serialize
-/// with the real dispatch and persist before removing its in-memory owner.
-pub(super) fn finish_ordinary_startups(host: &SharedHost) -> Result<(), String> {
-    use chat::protocol::LaunchOutcome;
-    let pending = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+/// An original execution descriptor retained across ordinary cleanup.
+#[derive(Clone)]
+pub(super) struct OrdinaryStartupReceipt {
+    id: AgentId,
+    intent: HostedSession,
+    context: Arc<chat::protocol::ExecutionContext>,
+}
+
+/// Freeze descriptors after the admission barrier. Later proof must never be
+/// rebound to a fresh intent merely because it reuses the original context.
+pub(super) fn capture_ordinary_startups(
+    state: &super::state::HostState,
+) -> Vec<OrdinaryStartupReceipt> {
+    state
         .execution_startups
-        .clone();
-    for (id, (intent, context)) in pending {
-        let gate = agent_gate(host, id);
+        .iter()
+        .map(|(id, (intent, context))| OrdinaryStartupReceipt {
+            id: *id,
+            intent: intent.clone(),
+            context: context.clone(),
+        })
+        .collect()
+}
+
+/// After genuine cleanup evidence, serialize with the real dispatch and
+/// persist only the original descriptor before removing its in-memory owner.
+pub(super) fn finish_ordinary_startups(
+    host: &SharedHost,
+    captured: &[OrdinaryStartupReceipt],
+) -> Result<(), String> {
+    use chat::protocol::LaunchOutcome;
+    for receipt in captured {
+        let OrdinaryStartupReceipt {
+            id,
+            intent,
+            context,
+        } = receipt;
+        let gate = agent_gate(host, *id);
         let _dispatch = match gate.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -778,8 +805,8 @@ pub(super) fn finish_ordinary_startups(host: &SharedHost) -> Result<(), String> 
         let matches = |state: &super::state::HostState| {
             state
                 .execution_startups
-                .get(&id)
-                .is_some_and(|(current, owner)| current == &intent && Arc::ptr_eq(owner, &context))
+                .get(id)
+                .is_some_and(|(current, owner)| current == intent && Arc::ptr_eq(owner, context))
         };
         if !matches(&host.lock().unwrap_or_else(|p| p.into_inner())) {
             continue;
@@ -787,7 +814,7 @@ pub(super) fn finish_ordinary_startups(host: &SharedHost) -> Result<(), String> 
         registry(host)?
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clear_quiescent_agent_launch(id, &intent)?;
+            .clear_quiescent_agent_launch(*id, intent)?;
         // No SQLite or helper operation occurs in this final HOST transaction.
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let current = context.ownership_snapshot();
@@ -799,7 +826,7 @@ pub(super) fn finish_ordinary_startups(host: &SharedHost) -> Result<(), String> 
                 LaunchOutcome::NoProvider | LaunchOutcome::TeardownProved
             )
         {
-            state.execution_startups.remove(&id);
+            state.execution_startups.remove(id);
             state.inventory_generation += 1;
             crate::daemon::wake();
         }

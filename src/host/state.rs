@@ -6430,6 +6430,156 @@ for line in sys.stdin:
             .unwrap();
     }
 
+    fn nonspawning_ordinary_context(
+        state: &mut HostState,
+        directory: &std::path::Path,
+    ) -> Arc<crate::chat::protocol::ExecutionContext> {
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: None,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/usr/bin/false".into(),
+                    arguments: Vec::new(),
+                    working_directory: directory.into(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+        };
+        let context = Arc::new(crate::chat::protocol::ExecutionContext::default());
+        state.native_actor_startups.insert(
+            source.id,
+            super::super::chat::retained_actor::Startup {
+                source: source.clone(),
+                requested: source,
+                context: context.clone(),
+                failed_close: None,
+            },
+        );
+        context
+    }
+
+    #[test]
+    fn ordinary_coordinator_preserves_a_committed_upgrade_without_cancelling_contexts() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(HostLock::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        assert_eq!(
+            prepare_upgrade_with(&host, capability, || Ok(store)).unwrap(),
+            (0, 0)
+        );
+        // A nonspawning census entry makes accidental cancellation observable.
+        // No constructor, helper or provider is invoked by this decision test.
+        let context = nonspawning_ordinary_context(&mut host.lock().unwrap(), directory.path());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let producer = stopped.clone();
+        let coordinator = super::super::ordinary_exit::Coordinator::start(&host, move || {
+            producer.store(true, Ordering::Release);
+        })
+        .unwrap();
+        assert!(coordinator.is_none());
+        assert!(!context.ownership_snapshot().ordinary_requested);
+        assert!(!stopped.load(Ordering::Acquire));
+        let mut state = host.lock().unwrap();
+        assert!(state.has_committed_upgrade());
+        assert!(!state.ordinary_exit_cleanup_pending());
+        state.native_actor_startups.clear();
+        drop(state);
+        finish_upgrade(&host).unwrap();
+    }
+
+    #[test]
+    fn ordinary_coordinator_intent_refuses_an_upgrade_paused_before_final_commit() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(HostLock::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        let (entered, discovery) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        struct UpgradeJob {
+            release: Option<std::sync::mpsc::SyncSender<()>>,
+            worker: Option<thread::JoinHandle<Result<(u64, u64), ProtocolError>>>,
+        }
+        impl Drop for UpgradeJob {
+            fn drop(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.try_send(());
+                }
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        let mut upgrade = UpgradeJob {
+            release: Some(release),
+            worker: None,
+        };
+        let upgrade_host = host.clone();
+        upgrade.worker = Some(thread::spawn(move || {
+            prepare_upgrade_with(&upgrade_host, capability, || {
+                entered.send(()).map_err(|error| error.to_string())?;
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(store)
+            })
+        }));
+        discovery.recv_timeout(Duration::from_secs(5)).unwrap();
+        let context = nonspawning_ordinary_context(&mut host.lock().unwrap(), directory.path());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let producer = stopped.clone();
+        let mut coordinator = super::super::ordinary_exit::Coordinator::start(&host, move || {
+            producer.store(true, Ordering::Release);
+        })
+        .unwrap()
+        .expect("ordinary intent won before upgrade's final validation");
+        upgrade.release.take().unwrap().send(()).unwrap();
+        let prepared = upgrade.worker.take().unwrap().join().unwrap();
+        assert_eq!(
+            prepared.unwrap_err().message,
+            "Daemon is already shutting down"
+        );
+        assert!(context.ownership_snapshot().ordinary_requested);
+        {
+            let state = host.lock().unwrap();
+            assert!(state.ordinary_exit_cleanup_pending());
+            assert!(!state.has_committed_upgrade());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !coordinator.completed() {
+            assert!(
+                Instant::now() < deadline,
+                "nonspawning coordinator did not join"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+    }
+
     #[test]
     fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
         if !upgrade_fixture_in_fresh_process() {
