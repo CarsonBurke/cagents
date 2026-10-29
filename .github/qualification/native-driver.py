@@ -188,12 +188,14 @@ def capture(window, name, size):
 
 
 def click(pid, name, keyboard=False):
+    names = (name,) if isinstance(name, str) else name
     def find():
         nodes = [node for node in tree(pid) if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
-                 and node.name == name and visible(node)
+                 and node.name in names and visible(node)
                  and node.getState().contains(pyatspi.STATE_ENABLED)]
         return nodes[0] if len(nodes) == 1 else None
     node = wait(find)
+    selected_name = node.name
     if keyboard:
         def input_focus():
             return int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
@@ -203,7 +205,7 @@ def click(pid, name, keyboard=False):
                     'enabled': states.contains(pyatspi.STATE_ENABLED), 'showing': visible(target),
                     'native_input_focus': input_focus(), 'owned_window': int(window)}
         before_focus = focus_state(node)
-        event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'keyboard',
+        event({'event': 'control-gesture', 'pid': pid, 'name': selected_name, 'input': 'keyboard',
                'before_focus': before_focus})
         assert node.queryComponent().grabFocus(), 'Recovery control refused keyboard focus'
         last_focus = {}
@@ -227,10 +229,21 @@ def click(pid, name, keyboard=False):
     assert bounds.width > 0 and bounds.height > 0
     assert 0 <= bounds.x + bounds.width // 2 < viewport[0]
     assert 0 <= bounds.y + bounds.height // 2 < viewport[1]
-    event({'event': 'control-gesture', 'pid': pid, 'name': name, 'input': 'pointer',
+    event({'event': 'control-gesture', 'pid': pid, 'name': selected_name, 'input': 'pointer',
            'bounds': [bounds.x, bounds.y, bounds.width, bounds.height]})
     run(['xdotool', 'mousemove', '--sync', str(bounds.x + bounds.width // 2),
          str(bounds.y + bounds.height // 2), 'click', '1'])
+    return selected_name
+
+
+def capture_notice(pid, window, name, message):
+    control_name = click(pid, ('Application notices: success', 'Application notices', 'Application errors'))
+    wait(lambda: any(node.name == 'Close application notices' and visible(node) for node in live_tree(pid)))
+    wait(lambda: any(node.name == message and visible(node) for node in live_tree(pid)))
+    event({'event': 'application-notice-readback', 'pid': pid, 'control': control_name, 'message': message})
+    capture(window, name, (1280, 800))
+    click(pid, 'Close application notices')
+    wait(lambda: not any(node.name == 'Close application notices' and visible(node) for node in live_tree(pid)))
 
 
 def copy_exact(pid, name, expected, keyboard=False):
@@ -731,22 +744,20 @@ try:
                 finally:
                     event({'event': 'pending-recheck-state', 'pid': pid, 'state': pending_state})
                 assert not pending_state['enabled'] and not pending_state['sensitive']
-                run(['import', '-window', window, str(out / (label + '-pending.png'))])
-                with Image.open(out / (label + '-pending.png')) as picture:
-                    picture.save(out / (label + '-pending.webp'), lossless=True)
+                capture(window, label + '-pending', (1280, 800))
                 x, y, width, height = pending_state['bounds']
                 run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1', 'click', '1'])
                 assert receipt.read_text().count('explicit-read-started') == starts + 1
                 (root / 'hold-check').unlink()
                 wait(lambda: receipt.read_text().count('explicit-read-replied') > reads)
-                wait(lambda: any('This saved pane is still unverified.' in node.name for node in live_tree(pid)))
                 assert 'repaired-held-attach-requested' not in receipt.read_text()
-                capture(window, label + '-failed-check', (1280, 800))
+                capture_notice(pid, window, label + '-failed-check',
+                               'This saved pane is still unverified. Its session and drafts are retained.')
                 (root / 'error-check').touch()
                 click(pid, 'Check session again')
                 wait(lambda: 'scripted-read-disconnect' in receipt.read_text())
-                wait(lambda: any('Could not check this saved session.' in node.name for node in live_tree(pid)))
-                capture(window, label + '-transport-error', (1280, 800))
+                capture_notice(pid, window, label + '-transport-error',
+                               'Could not check this saved session. Its pane and drafts are retained.')
                 (root / 'error-check').unlink()
                 (root / 'repair-evidence').touch()
                 click(pid, 'Check session again')
@@ -783,6 +794,8 @@ try:
                 wait(lambda: any(node.name == 'Message' and node.getState().contains(pyatspi.STATE_FOCUSED)
                                  for node in live_tree(pid)))
                 capture(window, label + '-removed', (1280, 800))
+                capture_notice(pid, window, label + '-removed-notice',
+                               'Saved pane removed from this window. Its saved session and drafts remain stored.')
             names = accessibility_snapshot(lambda: [{'name': node.name, 'role': node.getRoleName()} for node in live_tree(pid)])
             (out / (label + '-accessibility.json')).write_text(json.dumps(names, indent=2))
             database = Path((root / 'database-path').read_text())
