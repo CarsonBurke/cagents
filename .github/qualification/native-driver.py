@@ -335,6 +335,28 @@ def open_ordinary_history(pid):
                      for node in live_tree(pid)))
 
 
+
+def history_row_has_status(pid, title, status):
+    def read():
+        rows = [node for node in live_tree(pid) if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                and node.name == 'Resume ' + title and visible(node)]
+        assert len(rows) <= 1, 'History row must be unique'
+        if not rows:
+            return False
+        pending, seen = [rows[0]], 0
+        while pending:
+            node = pending.pop()
+            if node is None:
+                raise IncompleteAccessibilityTree('History row changed during traversal')
+            seen += 1
+            assert seen < 100 and node.childCount < 100
+            if visible(node) and node.name.endswith(' · ' + status):
+                return True
+            pending.extend(node.getChildAtIndex(index) for index in range(node.childCount))
+        return False
+    return accessibility_snapshot(read)
+
+
 def processes():
     result = {}
     for path in Path('/proc').glob('[0-9]*/stat'):
@@ -868,7 +890,10 @@ try:
                 assert 'ordinary-exact-history-start-accepted' not in receipt.read_text(), (
                     'Ordinary saved work started before an explicit Resume')
                 open_ordinary_history(pid)
-                capture(window, label + '-ordinary-history', (1280, 800))
+                wait(lambda: history_row_has_status(pid, 'Healthy saved pane', 'Open'))
+                wait(lambda: history_row_has_status(pid, 'Unavailable saved pane',
+                     'Unavailable' if variant == 'after' else 'Open'))
+                capture(window, label + '-ordinary-history', (1280, 800), neutral_pointer=True)
                 if variant == 'after':
                     run(['xdotool', 'key', 'Escape'])
                     wait(lambda: not any(node.name == 'Resume conversation' and visible(node) for node in live_tree(pid)))
@@ -876,6 +901,7 @@ try:
                     click(pid, 'Remove saved pane')
                     wait(lambda: not any(node.name == 'Saved pane unavailable' for node in live_tree(pid)))
                     open_ordinary_history(pid)
+                    wait(lambda: history_row_has_status(pid, 'Unavailable saved pane', 'Unavailable'))
                     before_denied = receipt.read_text().count('effect-request-')
                     click(pid, 'Resume Unavailable saved pane')
                     wait(lambda: any('This saved pane could not be verified and cannot be reopened here.' in node.name
