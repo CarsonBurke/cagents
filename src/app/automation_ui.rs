@@ -85,8 +85,8 @@ impl Cagents {
                 | Action::Select(_)
                 | Action::New
                 | Action::Edit
-                | Action::Enable
-                | Action::RunNow
+                | Action::Enable { .. }
+                | Action::RunNow { .. }
         ) {
             self.refresh_automation_choices();
         }

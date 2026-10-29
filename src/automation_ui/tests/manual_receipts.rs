@@ -50,7 +50,14 @@ fn selected_empty() -> (State, Automation) {
 }
 
 fn confirmed_run(state: &mut State, selected: &Automation) -> (u64, Request, Uuid) {
-    assert!(state.update(Action::RunNow).is_none());
+    assert!(
+        state
+            .update(Action::RunNow {
+                id: selected.id,
+                revision: selected.revision,
+            })
+            .is_none()
+    );
     let confirmation = state.confirmation.as_ref().expect("public confirmation");
     assert_eq!(confirmation.automation, *selected);
     let generation = confirmation.generation;

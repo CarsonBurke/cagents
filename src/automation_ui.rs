@@ -111,13 +111,22 @@ pub enum Action {
     PromptCursor(text_editor::Cursor),
     Shell(text_editor::Action),
     ShellCursor(text_editor::Cursor),
-    Enable,
+    Enable {
+        id: Uuid,
+        revision: u64,
+    },
     Pause {
         id: Uuid,
         revision: u64,
     },
-    RunNow,
-    Remove,
+    RunNow {
+        id: Uuid,
+        revision: u64,
+    },
+    Remove {
+        id: Uuid,
+        revision: u64,
+    },
     Confirm(u64),
     CancelConfirmation,
     History,
@@ -1149,6 +1158,27 @@ impl State {
     pub fn update(&mut self, action: Action) -> Option<Effect> {
         // Captured controls may arrive after another definition or run was read.
         // Reject them before consuming a current read or confirmation.
+        if let Action::Enable { id, revision }
+        | Action::RunNow { id, revision }
+        | Action::Remove { id, revision } = &action
+        {
+            let available = self.draft.is_none()
+                && self.run.is_none()
+                && !self.all_history
+                && self.confirmation.is_none()
+                && self.selected.as_ref().is_some_and(|selected| {
+                    selected.id == *id
+                        && selected.revision == *revision
+                        && selected.blocked.is_none()
+                        && match &action {
+                            Action::Enable { .. } => !selected.enabled,
+                            _ => selected.active_firing.is_none(),
+                        }
+                });
+            if !available {
+                return None;
+            }
+        }
         if let Action::Pause { id, revision } = &action
             && !self.selected.as_ref().is_some_and(|selected| {
                 selected.id == *id && selected.revision == *revision && selected.enabled
@@ -1802,11 +1832,11 @@ impl State {
                     draft.shell.perform(action);
                 }
             }
-            Action::Enable | Action::RunNow | Action::Remove => {
+            Action::Enable { .. } | Action::RunNow { .. } | Action::Remove { .. } => {
                 if let Some(automation) = &self.selected {
                     self.sequence = self.sequence.wrapping_add(1);
                     let (request, title) = match action {
-                        Action::Enable => (
+                        Action::Enable { .. } => (
                             Request::SetEnabled {
                                 id: automation.id,
                                 revision: automation.revision,
@@ -1815,7 +1845,7 @@ impl State {
                             },
                             "Enable scheduled execution?",
                         ),
-                        Action::RunNow => (
+                        Action::RunNow { .. } => (
                             Request::RunNow {
                                 id: automation.id,
                                 execution_revision: automation.execution_revision,
@@ -2459,7 +2489,10 @@ impl State {
                                 } else {
                                     button(
                                         "Enable…",
-                                        Action::Enable,
+                                        Action::Enable {
+                                            id: selected.id,
+                                            revision: selected.revision,
+                                        },
                                         !busy && selected.blocked.is_none(),
                                     )
                                 },
@@ -2471,14 +2504,20 @@ impl State {
                                     } else {
                                         "Run now…"
                                     },
-                                    Action::RunNow,
+                                    Action::RunNow {
+                                        id: selected.id,
+                                        revision: selected.revision,
+                                    },
                                     !busy
                                         && selected.active_firing.is_none()
                                         && selected.blocked.is_none(),
                                 ),
                                 button(
                                     "Remove…",
-                                    Action::Remove,
+                                    Action::Remove {
+                                        id: selected.id,
+                                        revision: selected.revision,
+                                    },
                                     !busy
                                         && selected.active_firing.is_none()
                                         && selected.blocked.is_none(),
@@ -3427,9 +3466,31 @@ fn optional(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod action_admission;
     mod manual_receipts;
 
     use super::*;
+
+    fn enable(owner: &Automation) -> Action {
+        Action::Enable {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
+
+    fn run_now(owner: &Automation) -> Action {
+        Action::RunNow {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
+
+    fn remove(owner: &Automation) -> Action {
+        Action::Remove {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
 
     fn automation() -> Automation {
         Automation {
@@ -3602,7 +3663,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         assert!(!state.can_open_run());
         assert!(state.update(Action::InspectRun(run)).is_none());
         assert!(state.confirmation.is_some());
@@ -3651,7 +3712,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         let old = state.confirmation.as_ref().unwrap().generation;
         state.update(Action::Edit);
         state.update(Action::Field(Field::Name, "New launch".into()));
@@ -4394,12 +4455,13 @@ mod tests {
     #[test]
     fn confirmation_and_draft_actions_remain_accessible_when_wrapped() {
         for width in [280.0, 900.0] {
+            let selected = automation();
             for (action, command) in [
-                (Action::Enable, "Confirm"),
-                (Action::Remove, "Remove automation"),
+                (enable(&selected), "Confirm"),
+                (remove(&selected), "Remove automation"),
             ] {
                 let mut state = State {
-                    selected: Some(automation()),
+                    selected: Some(selected.clone()),
                     ..Default::default()
                 };
                 assert!(state.update(action).is_none());
@@ -5197,7 +5259,7 @@ mod tests {
             selected: Some(selected.clone()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         let confirmation = state.confirmation.as_ref().unwrap();
         let generation = confirmation.generation;
         assert_eq!(confirmation.automation, selected);
@@ -5225,7 +5287,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -5238,7 +5300,7 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Err("Connection lost after send".into())),
         });
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request { request: retry, .. }) =
             state.update(Action::Confirm(generation))
@@ -6886,7 +6948,7 @@ mod tests {
             selected: Some(a.clone()),
             ..Default::default()
         };
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -6947,7 +7009,7 @@ mod tests {
 
         // Refused navigation cannot consume the prior confirmation or an
         // accepted/uncertain request's original UUID.
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -6993,7 +7055,7 @@ mod tests {
 
         // A removal already returned to the list has no selected subject to
         // leave: refreshing that list should retain its useful confirmation.
-        state.update(Action::Remove);
+        state.update(remove(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -7185,9 +7247,9 @@ mod tests {
         for action in [
             Action::Tick,
             Action::Refresh,
-            Action::Enable,
-            Action::RunNow,
-            Action::Remove,
+            Action::Enable { id, revision: 4 },
+            Action::RunNow { id, revision: 4 },
+            Action::Remove { id, revision: 4 },
             Action::OpenSession {
                 automation: id,
                 firing: Uuid::new_v4(),
@@ -7445,8 +7507,8 @@ mod tests {
             assert!(state.update(action).is_none());
             assert!(state.pending.is_none());
         }
-        state.selected = Some(other_owner.clone());
-        assert!(state.update(Action::Enable).is_none());
+        select_control_definition(&mut state, &other_owner);
+        assert!(state.update(enable(&other_owner)).is_none());
         let consent = state.confirmation.as_ref().unwrap().generation;
         assert!(
             state
@@ -7908,7 +7970,11 @@ mod tests {
         assert!(matches!(state.pending,
             Some((pending, Pending::RefreshAutomation)) if pending == sequence));
         finish_control_definition_read(&mut state, sequence, &b);
-        assert!(state.update(Action::RunNow).is_none());
+        assert!(
+            state
+                .update(run_now(state.selected.as_ref().unwrap()))
+                .is_none()
+        );
         let confirmation = state.confirmation.as_ref().unwrap().generation;
         assert!(state.update(old).is_none());
         assert_eq!(
