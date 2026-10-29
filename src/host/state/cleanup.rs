@@ -6,6 +6,8 @@ use crate::{
     device_service::{CleanupRefusal, CleanupRefusalKind as Reason},
 };
 use std::{io, path::Path};
+mod process_census;
+use process_census::{Census, Identity, Procfs};
 
 pub(in crate::host) struct CleanupScope {
     directories: Vec<PathBuf>,
@@ -22,7 +24,7 @@ impl HostState {
     /// The returned snapshot is not permission to remove: its `check` must
     /// finish successfully before acquiring the candidate's directory lease.
     pub(in crate::host) fn automatic_worktree_cleanup_scope(
-        &self,
+        &mut self,
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<CleanupScope, CleanupRefusal> {
@@ -40,7 +42,9 @@ impl HostState {
         self.worktree_removal_scope()
     }
 
-    pub(in crate::host) fn worktree_removal_scope(&self) -> Result<CleanupScope, CleanupRefusal> {
+    pub(in crate::host) fn worktree_removal_scope(
+        &mut self,
+    ) -> Result<CleanupScope, CleanupRefusal> {
         if self.shutting_down || self.upgrade.is_some() {
             return Err(CleanupRefusal::new(
                 Reason::ShutdownOrUpgrade,
@@ -49,10 +53,15 @@ impl HostState {
         }
         // These reservations predate a launch recipe. Guessing their cwd would
         // turn an unavailable attribution into permission to delete.
-        if !self.spawning.is_empty() || !self.browser_logins_spawning.is_empty() {
-            return Err(uncertain(
-                "A terminal launch has not established its working directory",
-            ));
+        if self.inventory_count() != 0
+            || !self.browser_logins_spawning.is_empty()
+            || !self.execution_startups.is_empty()
+            || !self.chat_bindings.is_empty()
+            || !self.chat_handoffs.is_empty()
+            || !self.native_closing.is_empty()
+            || !self.native_adoption_failures.is_empty()
+        {
+            return Err(uncertain("Hosted process ownership has not settled"));
         }
         let mut scope = CleanupScope {
             directories: Vec::new(),
@@ -195,13 +204,28 @@ impl CleanupScope {
             uncertain(format!("Cannot establish the worktree directory: {error}"))
         })?;
         self.check_bindings(&candidate)?;
-        // Direct stdio providers and in-flight helper children have no holder.
-        // Inspect their real cwd, as well as immutable session bindings above.
-        check_process_family(
-            &Process::read(std::process::id() as i32)
+        let boot = crate::daemon::read_boot_id().map_err(|error| uncertain(error.to_string()))?;
+        let mut census = Census::default();
+        census.retain(Identity::new(
+            boot.clone(),
+            Process::read(std::process::id() as i32)
                 .map_err(|error| uncertain(error.to_string()))?,
-            &candidate,
-        )?;
+        ))?;
+        // A record's original root may have left its holder's ancestry. Seed
+        // both identities, even if discovery no longer finds their record.
+        for record in self
+            .terminal_holders
+            .values()
+            .chain(self.native_holders.values())
+        {
+            if record.boot != boot {
+                return Err(uncertain(
+                    "Hosted process boot identity changed during cleanup",
+                ));
+            }
+            census.retain(Identity::new(record.boot.clone(), record.holder.clone()))?;
+            census.retain(Identity::new(record.boot.clone(), record.root.clone()))?;
+        }
         for kind in [Kind::Terminal, Kind::Native] {
             let directory = holders::directory(kind).map_err(uncertain)?;
             let entries = match fs::read_dir(&directory) {
@@ -228,10 +252,11 @@ impl CleanupScope {
                     })?
                     .ok_or_else(|| uncertain("Holder ownership changed during cleanup"))?;
                 self.check_holder_binding(&record)?;
-                check_process_family(&record.holder, &candidate)?;
             }
         }
-        Ok(())
+        // This frozen ownership model has no complete original-family proof.
+        // Observation can explain a refusal, but can never authorize removal.
+        census.check(&mut Procfs, &candidate)
     }
 }
 
@@ -283,22 +308,26 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_session_is_allowed_but_candidate_session_is_kept() {
+    fn empty_bindings_allow_but_unresolved_sessions_refuse_even_outside_candidate() {
         let (mut host, _directory, candidate, other) = fixture();
-        let session = pending_chat(other);
-        host.chat_spawning.insert(session.id, session);
         host.worktree_removal_scope()
             .unwrap()
             .check_bindings(&candidate)
             .unwrap();
-        let session = pending_chat(candidate.clone());
-        host.chat_spawning.insert(session.id, session);
-        let refusal = host
-            .worktree_removal_scope()
-            .unwrap()
-            .check_bindings(&candidate)
-            .unwrap_err();
-        assert_eq!(refusal.kind, Reason::BusySession);
+        for directory in [other, candidate] {
+            let session = pending_chat(directory);
+            let id = session.id;
+            host.chat_spawning.insert(id, session);
+            assert!(matches!(
+                host.worktree_removal_scope(),
+                Err(CleanupRefusal {
+                    kind: Reason::OwnershipUncertain,
+                    ..
+                })
+            ));
+            assert!(host.chat_spawning.contains_key(&id));
+            host.chat_spawning.remove(&id);
+        }
     }
 
     #[test]
@@ -345,7 +374,7 @@ mod tests {
 
     #[test]
     fn holder_attribution_requires_the_exact_process_record() {
-        let (host, _directory, _candidate, _other) = fixture();
+        let (mut host, _directory, _candidate, _other) = fixture();
         let mut scope = host.worktree_removal_scope().unwrap();
         let process = Process::read(std::process::id() as i32).unwrap();
         let mut record = Record {
@@ -415,7 +444,10 @@ mod tests {
         );
         let unrelated = directory.path().join("unrelated");
         fs::create_dir(&unrelated).unwrap();
-        check_process_family(&root, &unrelated).unwrap();
+        assert_eq!(
+            check_process_family(&root, &unrelated).unwrap_err().kind,
+            Reason::OwnershipUncertain
+        );
     }
 }
 
@@ -439,90 +471,12 @@ fn check_directory(directory: &Path, candidate: &Path) -> Result<(), CleanupRefu
     Ok(())
 }
 
-/// Check all descendants, including background children that changed cwd while
-/// their parent shell remained elsewhere. Two identical bounded censuses are
-/// required so a changing/reparenting process tree does not look quiescent.
+// Historical live-process fixture adapter. Full production checks retain all
+// authenticated roots together in the same per-attempt census above.
+#[cfg(test)]
 fn check_process_family(root: &Process, candidate: &Path) -> Result<(), CleanupRefusal> {
-    let mut previous = None;
-    for _ in 0..3 {
-        let family = process_family(root).map_err(|error| {
-            uncertain(format!(
-                "Cannot establish hosted process ownership: {error}"
-            ))
-        })?;
-        for process in family.values() {
-            let path = format!("/proc/{}/cwd", process.pid);
-            let cwd = fs::read_link(path).map_err(|error| {
-                uncertain(format!(
-                    "Cannot establish a hosted process working directory: {error}"
-                ))
-            })?;
-            if !process.is_current() {
-                return Err(uncertain("Hosted process ownership changed during cleanup"));
-            }
-            check_directory(&cwd, candidate)?;
-        }
-        if previous.as_ref() == Some(&family) {
-            return Ok(());
-        }
-        previous = Some(family);
-    }
-    Err(uncertain(
-        "Hosted descendants changed during cleanup; retry after they settle",
-    ))
-}
-
-fn process_family(root: &Process) -> io::Result<BTreeMap<i32, Process>> {
-    let mut family = BTreeMap::new();
-    let mut pending = vec![root.clone()];
-    while let Some(parent) = pending.pop() {
-        if !parent.is_current() {
-            return Err(io::Error::other("process identity changed"));
-        }
-        for task in fs::read_dir(format!("/proc/{}/task", parent.pid))? {
-            let path = task?.path().join("children");
-            let children = match fs::read_to_string(path) {
-                Ok(children) => children,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            for pid in children.split_whitespace() {
-                let pid = pid.parse::<i32>().map_err(io::Error::other)?;
-                if family.contains_key(&pid) {
-                    continue;
-                }
-                let stat = match fs::read(format!("/proc/{pid}/stat")) {
-                    Ok(stat) => stat,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
-                let (_, start) = crate::model::agent_recovery::process_identity(&stat)
-                    .ok_or_else(|| io::Error::other("invalid child identity"))?;
-                let fields = stat
-                    .rsplit(|byte| *byte == b')')
-                    .next()
-                    .ok_or_else(|| io::Error::other("invalid child state"))?;
-                // Zombies retain a PID but no working directory or live work.
-                if fields
-                    .split(|byte| byte.is_ascii_whitespace())
-                    .find(|field| !field.is_empty())
-                    == Some(b"Z")
-                {
-                    continue;
-                }
-                let process = Process { pid, start };
-                pending.push(process.clone());
-                family.insert(pid, process);
-                if family.len() > 4096 {
-                    return Err(io::Error::other(
-                        "hosted process census exceeded its safety bound",
-                    ));
-                }
-            }
-        }
-        if !parent.is_current() {
-            return Err(io::Error::other("process identity changed"));
-        }
-    }
-    Ok(family)
+    let boot = crate::daemon::read_boot_id().map_err(|error| uncertain(error.to_string()))?;
+    let mut census = Census::default();
+    census.retain(Identity::new(boot, root.clone()))?;
+    census.check(&mut Procfs, candidate)
 }
