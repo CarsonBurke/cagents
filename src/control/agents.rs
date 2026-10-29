@@ -694,33 +694,30 @@ fn resolve(summaries: &[Summary], handle: &str) -> Result<Option<Handle>, AppErr
 /// The caller's authority and, once a command first needs the daemon, a
 /// connection to it and the caller's agents.
 struct Session {
-    authority: Authority,
-    connection: Option<(ControlClient, PathBuf)>,
+    context: ServiceRequestContext,
+    connection: Option<ControlClient>,
     summaries: Option<Vec<Summary>>,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(context: &ServiceRequestContext) -> Self {
         Self {
-            authority: Authority::from_environment(),
+            context: context.clone(),
             connection: None,
             summaries: None,
         }
     }
 
-    /// Connects on first use, starting the daemon if it is not running.
+    /// Selects an endpoint on first use under the original caller's policy.
     fn client(&mut self) -> Result<&mut ControlClient, AppError> {
         if self.connection.is_none() {
-            let socket = control_daemon_socket()?;
-            let client = ControlClient::connect(&socket)
-                .map_err(|e| AppError::new("daemon_connection", e))?;
-            self.connection = Some((client, socket));
+            self.connection = Some(self.context.connect()?);
         }
-        Ok(&mut self.connection.as_mut().expect("connected above").0)
+        Ok(self.connection.as_mut().expect("connected above"))
     }
 
     fn call(&mut self, operation: Operation) -> Result<Reply, AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         self.client()?
             .agent(authority, operation)
             .map_err(protocol_error)
@@ -729,7 +726,7 @@ impl Session {
     /// Waits for `runs`; an agent's wait also ends when a message arrives
     /// for it. The user's shell has `cagents inbox` and is never busy.
     fn wait(&mut self, runs: &[RunId], any: bool, timeout: f64) -> Result<Waited, AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         let messages = authority.token().is_some();
         self.client()?
             .wait_agents(
@@ -796,7 +793,7 @@ impl Session {
     /// was lost: the key makes the retry return the first acceptance rather
     /// than start the work twice. Says whether it retried.
     fn submit(&mut self, request: Submit) -> Result<(Reply, bool), AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         match self
             .client()?
             .agent(authority, Operation::Submit(request.clone()))
@@ -840,7 +837,19 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
     if let AgentCommand::Console { agent_id } = command {
         return run_console(agent_id);
     }
-    let mut session = Session::new();
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: AgentCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    // The hidden console has its own existing-only opaque-capability route.
+    if let AgentCommand::Console { agent_id } = command {
+        return run_console(agent_id);
+    }
+    context.admit_remote()?;
+    let mut session = Session::new(context);
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
         AgentCommand::Spawn {
