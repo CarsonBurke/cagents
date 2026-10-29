@@ -379,7 +379,7 @@ fn dispatch(
         session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
         session.proof = Some(proof);
         #[cfg(all(test, target_os = "linux"))]
-        dispatch_fixture::prepare(accepted.agent.id, &mut session, &context);
+        dispatch_fixture::prepare(accepted.agent.id, &mut session, &context).map_err(before)?;
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1521,5 +1521,7 @@ fn console(
     }
 }
 
+#[cfg(test)]
+mod ordinary_startup_tests;
 #[cfg(test)]
 pub(super) mod tests;

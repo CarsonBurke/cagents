@@ -3239,7 +3239,7 @@ impl CloseTarget {
         shutdown: Option<&retained_actor::startup_shutdown::Capture>,
     ) -> Result<(), ProtocolError> {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if shutdown.is_some_and(|capture| capture.require_state(&state).is_err())
+        if shutdown.is_some_and(|capture| capture.require_reserved_state(&state).is_err())
             || (state.shutting_down && shutdown.is_none())
             || state.chat_handoffs.contains_key(&self.source.id)
             || !state

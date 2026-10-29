@@ -118,7 +118,17 @@ impl StartupFence {
                 outcome,
                 LaunchOutcome::NoProvider | LaunchOutcome::TeardownProved
             ) {
-                return Err("original cleanup did not prove teardown".into());
+                if outcome != LaunchOutcome::Uncertain
+                    || !self.context.ownership_snapshot().ordinary_requested
+                {
+                    return Err("original cleanup did not prove teardown".into());
+                }
+                // Ordinary coordination wakes existing waiters without
+                // manufacturing proof. The actual sole Child.wait73 and HOST
+                // settlement checks below remain mandatory before any rethrow.
+                eprintln!(
+                    "Original cleanup wait deferred to ordinary coordinator; actual Child.wait proof still required"
+                );
             }
         }
         Ok(())
@@ -343,8 +353,19 @@ fn ordinary_host_exit_cancels_an_admitted_native_startup_before_waiting_for_cont
     pre_discovery_shutdown(true);
 }
 
+#[test]
+fn ordinary_host_exit_wakes_real_dispatch_cleanup_with_a_queued_writer_before_helper_proof() {
+    shutdown_case(true, true);
+}
+
 fn pre_discovery_shutdown(admitted_reader: bool) {
-    let name = if admitted_reader {
+    shutdown_case(admitted_reader, false);
+}
+
+fn shutdown_case(admitted_reader: bool, real_dispatch: bool) {
+    let name = if real_dispatch {
+        "host::exit_drain_tests::native_startup_shutdown_tests::ordinary_host_exit_wakes_real_dispatch_cleanup_with_a_queued_writer_before_helper_proof"
+    } else if admitted_reader {
         "host::exit_drain_tests::native_startup_shutdown_tests::ordinary_host_exit_cancels_an_admitted_native_startup_before_waiting_for_control_writer"
     } else {
         "host::exit_drain_tests::native_startup_shutdown_tests::ordinary_host_exit_cancels_and_retains_the_exact_pre_discovery_native_startup_until_reaped"
@@ -378,45 +399,125 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
         0
     );
 
-    let mut source = provider_chat::fresh_session(
-        Provider::Claude,
-        TerminalId::new(),
-        root.join("project"),
-        &crate::account::Account::system(Provider::Claude),
-    )
-    .unwrap();
-    // Existing inert ELF is only executable-validation input. The helper must
-    // observe cancellation after preflight and never reach provider creation.
-    // No provider protocol script or substituted helper implements the oracle.
-    source.launch.recipe.program = "/usr/bin/false".into();
-    source.proof = Some(user.proof.clone());
-    let context = Arc::new(ExecutionContext::capture(&root.join("project")).unwrap());
-    let observation = Observation::install(source.clone(), context.clone());
-    let (result, results) = mpsc::channel();
     let worker_finished = Arc::new(AtomicBool::new(false));
+    let (result, results) = mpsc::channel();
+    let control_gate = host.lock().unwrap().control_gate.clone();
+    let (source, context, observation, dispatch_worker, resume) = if real_dispatch {
+        use crate::agent_execution::{Destination, Origin, Spec, Submit, Surface, Target};
+        let request = Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider: Provider::Claude,
+                account: Some(crate::account::Account::system(Provider::Claude).id()),
+                target: Target {
+                    repository: root.join("project"),
+                    directory: root.join("project"),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            }),
+            prompt: "This prompt must never reach a provider".into(),
+            idempotency_key: "owned-dispatch-cleanup-before-signal".into(),
+        };
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: root.join("project"),
+                name: "Owned shutdown fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let accepted = registry
+            .lock()
+            .unwrap()
+            .submit_agent(&Origin::User, &request, 1)
+            .unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .claim_agent_dispatch(&accepted, 1)
+                .unwrap()
+        );
+        let observed = super::super::agent_execution::dispatch_fixture::install(accepted.agent.id);
+        let worker_host = host.clone();
+        let finished = worker_finished.clone();
+        let send = result.clone();
+        let worker = thread::spawn(move || {
+            let started =
+                super::super::agent_execution::dispatch_fixture::run(&worker_host, &accepted)
+                    .map(|()| ServerResponse::ShutdownAccepted)
+                    .map_err(|(_, message)| {
+                        ProtocolError::new(
+                            crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                            message,
+                            false,
+                        )
+                    });
+            finished.store(true, Ordering::Release);
+            let _ = send.send(started);
+        });
+        let observed = observed.recv_timeout(Duration::from_secs(8)).unwrap();
+        (
+            observed.source,
+            observed.context,
+            observed.observation,
+            Some(worker),
+            Some(observed.resume),
+        )
+    } else {
+        let mut source = provider_chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            root.join("project"),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        // Existing inert ELF is only executable-validation input. It must never execute.
+        source.launch.recipe.program = "/usr/bin/false".into();
+        source.proof = Some(user.proof.clone());
+        let context = Arc::new(ExecutionContext::capture(&root.join("project")).unwrap());
+        let observation = Observation::install(source.clone(), context.clone());
+        (source, context, observation, None, None)
+    };
     let mut startup = StartupFence {
         gate: Some(gate),
         context: context.clone(),
         host: host.clone(),
         results,
         result: None,
-        worker: None,
+        worker: dispatch_worker,
         worker_finished: worker_finished.clone(),
         cleanup: None,
     };
-    let starter_host = host.clone();
-    let starter_source = source.clone();
-    let starter_context = context.clone();
-    let control_gate = host.lock().unwrap().control_gate.clone();
-    startup.worker = Some(thread::spawn(move || {
-        // Equivalent to the execution service's admitted-start reader. This
-        // variant covers its lock mechanics, not a public ChatStart RPC.
-        let _admitted = admitted_reader.then(|| control_gate.read().unwrap());
-        let started =
-            super::super::chat::start_execution(&starter_host, 0, starter_source, starter_context);
-        worker_finished.store(true, Ordering::Release);
-        let _ = result.send(started);
-    }));
+    if let Some(resume) = resume {
+        // The actual dispatch cannot create a helper until its ORIGINAL cleanup
+        // fence exists. This acknowledgment carries no production proof.
+        resume.send(()).unwrap();
+    } else {
+        let starter_host = host.clone();
+        let starter_source = source.clone();
+        let starter_context = context.clone();
+        let reader = control_gate.clone();
+        startup.worker = Some(thread::spawn(move || {
+            // Equivalent reader mechanics are kept separate from real dispatch.
+            let _admitted = admitted_reader.then(|| reader.read().unwrap());
+            let started = super::super::chat::start_execution(
+                &starter_host,
+                0,
+                starter_source,
+                starter_context,
+            );
+            worker_finished.store(true, Ordering::Release);
+            let _ = result.send(started);
+        }));
+    }
+    let mut queued_writer = None;
 
     let mut host_result = None;
     let mut actual_helper = None;
@@ -452,6 +553,30 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
         startup.observe_caller();
         assert!(startup.result.is_none(), "startup must still be blocked");
         assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        if real_dispatch {
+            // Cause an owned startup refusal BEFORE ordinary intent, then
+            // prove the actual dispatch is already in its original cleanup
+            // wait while still holding its production reader.
+            startup.begin_failure_cleanup().unwrap();
+            wait_for(|| context.cleanup_waiters_for_test() >= 2);
+            let writer_gate = control_gate.clone();
+            let (entered, entering) = mpsc::channel();
+            let writer = thread::spawn(move || {
+                let _ = entered.send(());
+                let _exclusive = writer_gate.write().unwrap();
+            });
+            queued_writer = Some(writer);
+            entering.recv_timeout(Duration::from_secs(1)).unwrap();
+            wait_for(|| {
+                matches!(
+                    control_gate.try_read(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                )
+            });
+            eprintln!(
+                "Actual dispatch already waiting for exact cleanup; exclusive writer queued before ordinary intent"
+            );
+        }
         if admitted_reader {
             // Signal-style ordinary shutdown: the public Shutdown RPC itself
             // is an exclusive request and would wait behind this reader.
@@ -574,11 +699,21 @@ fn pre_discovery_shutdown(admitted_reader: bool) {
             );
         }
         startup.begin_failure_cleanup().unwrap();
+        if real_dispatch && !shutdown_stimulated {
+            host.lock().unwrap().request_shutdown();
+            crate::daemon::wake();
+            eprintln!(
+                "Failure-only fixture shutdown wakes actual dispatch before releasing its original helper gate"
+            );
+        }
     }
     // Even a failing baseline MUST cancel and observe the ORIGINAL caller's
     // Err while the helper is still blocked, before allowing it past preflight.
     startup.release_after_cancellation().unwrap();
     startup.finish_failure_cleanup().unwrap();
+    if let Some(writer) = queued_writer {
+        writer.join().unwrap();
+    }
     let waited = if actual_helper.is_none() && context.outcome() == LaunchOutcome::NoProvider {
         None
     } else {

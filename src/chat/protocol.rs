@@ -273,19 +273,22 @@ impl ExecutionContext {
             if matches!(&state.kind, Some(LaunchOwnerKind::RemoteActor { .. })) {
                 // A transferred context never returns to raw startup cleanup,
                 // even after installed() has dropped its strong attachment.
-                return state.token.expect("transferred launch owner token");
+                // Refuse the incoming owner outside this lock too: otherwise
+                // a late StartupOwner could still spawn without custody.
+                (state.token.expect("transferred launch owner token"), true)
+            } else {
+                state.generation = state
+                    .generation
+                    .checked_add(1)
+                    .expect("launch owner generation");
+                let token = LaunchOwnerToken(state.generation);
+                state.token = Some(token);
+                state.kind = Some(kind);
+                state.outcome = LaunchOutcome::Uncertain;
+                state.original_helper = None;
+                state.owner = Some(owner.clone());
+                (token, state.ordinary_requested)
             }
-            state.generation = state
-                .generation
-                .checked_add(1)
-                .expect("launch owner generation");
-            let token = LaunchOwnerToken(state.generation);
-            state.token = Some(token);
-            state.kind = Some(kind);
-            state.outcome = LaunchOutcome::Uncertain;
-            state.original_helper = None;
-            state.owner = Some(owner.clone());
-            (token, state.ordinary_requested)
         };
         // A request before the first claim also fences a late spawn. Never
         // invoke an owner's callback while holding the context mutex.
@@ -306,6 +309,7 @@ impl ExecutionContext {
         let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
         if state.token != Some(token)
             || state.kind != Some(LaunchOwnerKind::Startup)
+            || state.owner.is_none()
             || state.ordinary_requested
         {
             return false;
@@ -420,6 +424,23 @@ impl ExecutionContext {
         }
         state.outcome = LaunchOutcome::TeardownProved;
         state.owner = None;
+        drop(state);
+        crate::daemon::wake();
+        true
+    }
+    /// HOST must first verify this context's exact durable intent/source and
+    /// the current local attachment's close receipt. Retained roles cannot use
+    /// this compatibility path or downgrade their stronger cleanup contract.
+    pub(crate) fn complete_hosted_cleanup(&self, captured: &LaunchOwnershipSnapshot) -> bool {
+        let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        if captured.kind != LaunchOwnerKind::Generic
+            || state.kind != Some(LaunchOwnerKind::Generic)
+            || state.token != captured.token
+            || state.owner.is_some()
+        {
+            return false;
+        }
+        state.outcome = LaunchOutcome::TeardownProved;
         drop(state);
         crate::daemon::wake();
         true
@@ -711,6 +732,28 @@ mod launch_tests {
             LaunchOutcome::TeardownProved
         );
         assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    #[test]
+    fn hosted_cleanup_requires_installed_generic_role_and_exact_captured_generation() {
+        let context = ExecutionContext::default();
+        context.claim_owner(Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain))));
+        let first = context.ownership_snapshot();
+        assert!(!context.complete_hosted_cleanup(&first));
+        context.installed();
+        context.claim_owner(Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain))));
+        let current = context.ownership_snapshot();
+        context.installed();
+        assert!(!context.complete_hosted_cleanup(&first));
+        assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        assert!(context.complete_hosted_cleanup(&current));
+        assert_eq!(context.outcome(), LaunchOutcome::TeardownProved);
+
+        let startup = ExecutionContext::default();
+        startup.claim_startup_owner(Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain))));
+        let captured = startup.ownership_snapshot();
+        startup.installed();
+        assert!(!startup.complete_hosted_cleanup(&captured));
     }
 
     #[test]

@@ -142,7 +142,7 @@ struct ActorWork {
     )>,
     semantic_done: bool,
     attempted: bool,
-    worker: Option<(mpsc::Receiver<Result<(), String>>, JoinHandle<()>)>,
+    worker: Option<CleanupJob>,
 }
 
 fn bindings(
@@ -162,15 +162,40 @@ fn bindings(
 struct LocalWork {
     source: crate::chat::Session,
     handle: Handle,
+    bindings: Vec<(
+        Arc<ExecutionContext>,
+        crate::chat::protocol::LaunchOwnershipSnapshot,
+    )>,
     done: bool,
     attempted: bool,
-    worker: Option<(mpsc::Receiver<Result<(), String>>, JoinHandle<()>)>,
+    worker: Option<CleanupJob>,
+}
+
+struct GenericWork {
+    context: Arc<ExecutionContext>,
+    attempted: bool,
+    worker: Option<CleanupJob>,
+}
+
+struct CleanupJob {
+    result: mpsc::Receiver<Result<(), String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for CleanupJob {
+    fn drop(&mut self) {
+        // This guard lives only in the coordinator. Even an unwind retains
+        // and joins every owned job before dropping its captured evidence.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn spawn_job(
     name: &str,
     work: impl FnOnce() -> Result<(), String> + Send + 'static,
-) -> Result<(mpsc::Receiver<Result<(), String>>, JoinHandle<()>), String> {
+) -> Result<CleanupJob, String> {
     let (complete, completion) = mpsc::channel();
     let worker = thread::Builder::new()
         .name(name.into())
@@ -181,18 +206,20 @@ fn spawn_job(
             daemon::wake();
         })
         .map_err(|error| error.to_string())?;
-    Ok((completion, worker))
+    Ok(CleanupJob {
+        result: completion,
+        worker: Some(worker),
+    })
 }
 
-fn collect_job(
-    job: &mut Option<(mpsc::Receiver<Result<(), String>>, JoinHandle<()>)>,
-) -> Option<Result<(), String>> {
-    let result = match job.as_ref()?.0.try_recv() {
+fn collect_job(job: &mut Option<CleanupJob>) -> Option<Result<(), String>> {
+    let result = match job.as_ref()?.result.try_recv() {
         Ok(result) => result,
         Err(mpsc::TryRecvError::Empty) => return None,
         Err(mpsc::TryRecvError::Disconnected) => Err("Cleanup worker lost its receipt".into()),
     };
-    let (_, worker) = job.take().unwrap();
+    let mut owned = job.take().unwrap();
+    let worker = owned.worker.take().unwrap();
     Some(
         worker
             .join()
@@ -237,6 +264,7 @@ fn run(
     }
     let mut actors: Vec<ActorWork> = Vec::new();
     let mut locals: Vec<LocalWork> = Vec::new();
+    let mut generics: Vec<GenericWork> = Vec::new();
     let mut terminals = None;
     let mut terminals_done = false;
     loop {
@@ -245,6 +273,21 @@ fn run(
             contexts(&state)
         };
         request_all(&pending);
+        for context in &pending {
+            let snapshot = context.ownership_snapshot();
+            if snapshot.kind == LaunchOwnerKind::Generic
+                && snapshot.outcome == LaunchOutcome::Uncertain
+                && !generics
+                    .iter()
+                    .any(|work| Arc::ptr_eq(&work.context, context))
+            {
+                generics.push(GenericWork {
+                    context: context.clone(),
+                    attempted: false,
+                    worker: None,
+                });
+            }
+        }
         let mut diagnostic = None;
         {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -280,6 +323,23 @@ fn run(
                         locals.push(LocalWork {
                             source: record.session.clone(),
                             handle: record.handle.clone(),
+                            bindings: state
+                                .execution_startups
+                                .values()
+                                .filter_map(|(intent, context)| {
+                                    let crate::agent_execution::HostedSession::Chat(source) =
+                                        intent
+                                    else {
+                                        return None;
+                                    };
+                                    let snapshot = context.ownership_snapshot();
+                                    (crate::agent_execution::same_chat_process(
+                                        source,
+                                        &record.session,
+                                    ) && snapshot.kind == LaunchOwnerKind::Generic)
+                                        .then(|| (context.clone(), snapshot))
+                                })
+                                .collect(),
                             done: false,
                             attempted: false,
                             worker: None,
@@ -358,6 +418,11 @@ fn run(
                 }
             }
         }
+        for work in &mut generics {
+            if let Some(Err(error)) = collect_job(&mut work.worker) {
+                diagnostic = Some(error);
+            }
+        }
         if let Some(result) = collect_job(&mut terminals) {
             match result {
                 Ok(()) => terminals_done = true,
@@ -368,7 +433,8 @@ fn run(
         // All newly encountered owners get their first attempt before retries.
         let mut slots = MAX_JOBS.saturating_sub(
             actors.iter().filter(|w| w.worker.is_some()).count()
-                + locals.iter().filter(|w| w.worker.is_some()).count(),
+                + locals.iter().filter(|w| w.worker.is_some()).count()
+                + generics.iter().filter(|w| w.worker.is_some()).count(),
         );
         for retry in [false, true] {
             for work in &mut actors {
@@ -402,9 +468,62 @@ fn run(
                 let source = work.source.clone();
                 let handle = work.handle.clone();
                 match spawn_job("cagents-chat-close", move || {
+                    let require_current = || {
+                        let state = worker_host.lock().unwrap_or_else(|p| p.into_inner());
+                        if state.chats.get(&source.id).is_some_and(|record| {
+                            record.handle.same_attachment(&handle)
+                                && crate::agent_execution::same_chat_process(
+                                    &record.session,
+                                    &source,
+                                )
+                        }) {
+                            Ok(())
+                        } else {
+                            Err("The captured local cleanup attachment changed".to_owned())
+                        }
+                    };
+                    require_current()?;
                     handle.close()?;
                     chat::retained_actor::finish_close(&worker_host, &handle, &source)?;
-                    agent_execution::retired(&worker_host, &source)
+                    require_current()?;
+                    agent_execution::retired(&worker_host, &source)?;
+                    require_current()
+                }) {
+                    Ok(job) => {
+                        work.worker = Some(job);
+                        work.attempted = true;
+                        slots -= 1;
+                    }
+                    Err(error) => diagnostic = Some(error),
+                }
+            }
+            for work in &mut generics {
+                if slots == 0 {
+                    break;
+                }
+                let snapshot = work.context.ownership_snapshot();
+                if snapshot.outcome != LaunchOutcome::Uncertain
+                    || snapshot.kind != LaunchOwnerKind::Generic
+                    || work.worker.is_some()
+                    || work.attempted != retry
+                    || locals.iter().any(|local| {
+                        !local.done
+                            && local
+                                .bindings
+                                .iter()
+                                .any(|(owner, _)| Arc::ptr_eq(owner, &work.context))
+                    })
+                {
+                    continue;
+                }
+                let context = work.context.clone();
+                match spawn_job("cagents-launch-cleanup", move || {
+                    match context.reconcile_cleanup()? {
+                        LaunchOutcome::NoProvider | LaunchOutcome::TeardownProved => Ok(()),
+                        LaunchOutcome::Uncertain => {
+                            Err("Exact launch cleanup remains unconfirmed".into())
+                        }
+                    }
                 }) {
                     Ok(job) => {
                         work.worker = Some(job);
@@ -444,6 +563,9 @@ fn run(
         // context/token comparisons fence late dispatch error publication.
         for context in &pending {
             let snapshot = context.ownership_snapshot();
+            if let Some(error) = &snapshot.diagnostic {
+                diagnostic = Some(error.clone());
+            }
             match &snapshot.kind {
                 LaunchOwnerKind::RemoteActor { identity } => {
                     for work in actors
@@ -458,6 +580,16 @@ fn run(
                             }
                         }
                     }
+                }
+                LaunchOwnerKind::Generic => {
+                    for local in locals.iter().filter(|local| local.done) {
+                        for (owner, captured) in &local.bindings {
+                            if Arc::ptr_eq(owner, context) {
+                                context.complete_hosted_cleanup(captured);
+                            }
+                        }
+                    }
+                    context.poll_cleanup(&snapshot);
                 }
                 _ => {
                     context.poll_cleanup(&snapshot);
@@ -535,6 +667,9 @@ fn run(
                 && actors_done
                 && inventory_done
                 && locals.iter().all(|work| work.done && work.worker.is_none())
+                && generics.iter().all(|work| {
+                    work.worker.is_none() && work.context.outcome() != LaunchOutcome::Uncertain
+                })
                 && state.native_actor_startups.is_empty()
                 && state.execution_startups.is_empty()
                 && !state.ordinary_exit_cleanup_blocked()

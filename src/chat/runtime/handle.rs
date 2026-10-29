@@ -33,6 +33,23 @@ impl Handle {
             Owner::Local(_) => chat::protocol::HelperWaitProof::NoParentChild,
         }
     }
+    pub(crate) fn inherit_original_helper_from(&self, previous: &Handle) -> Result<(), String> {
+        match (&self.0, &previous.0) {
+            (Owner::Remote(current), Owner::Remote(previous)) => {
+                current.inherit_original_helper_from(previous)
+            }
+            _ => Err(
+                "Original retained-helper custody requires exact retained actor attachments".into(),
+            ),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn rollback_uninstalled_for_test(&self) -> Result<(), String> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.rollback_uninstalled_for_test(),
+            Owner::Local(_) => Err("Fixture rollback requires an exact retained actor".into()),
+        }
+    }
     /// A real remote proxy with no external provider or helper. The returned
     /// responder waits for actual production admission before settling it.
     #[cfg(test)]
@@ -735,6 +752,12 @@ impl chat::protocol::LaunchCleanup for Handle {
     }
     fn retained_handle(&self) -> Option<Handle> {
         matches!(&self.0, Owner::Remote(_)).then(|| self.clone())
+    }
+    fn cleanup_diagnostic(&self) -> Option<String> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.cleanup_diagnostic(),
+            Owner::Local(_) => None,
+        }
     }
 }
 #[cfg(test)]

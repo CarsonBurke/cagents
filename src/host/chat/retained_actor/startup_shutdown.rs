@@ -98,6 +98,23 @@ impl StartupBinding {
         }
         Ok(())
     }
+
+    fn forget_proved(&self, host: &SharedHost) -> Result<(), String> {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        self.require_state(&state)?;
+        if state.shutting_down
+            || self.context.outcome() != chat::protocol::LaunchOutcome::TeardownProved
+        {
+            return Err(
+                "The exact startup remains retained until its complete cleanup proof".into(),
+            );
+        }
+        state.native_actor_startups.remove(&self.source.id);
+        state.inventory_generation += 1;
+        drop(state);
+        crate::daemon::wake();
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -339,7 +356,11 @@ impl Capture {
     }
 
     fn require_ordinary_intent(&self, state: &HostState) -> Result<(), String> {
-        if !state.shutting_down || state.has_committed_upgrade() || state.proof() != &self.proof {
+        if !state.shutting_down
+            || !state.ordinary_exit_cleanup_pending()
+            || state.has_committed_upgrade()
+            || state.proof() != &self.proof
+        {
             return Err("The original ordinary-shutdown ownership changed".into());
         }
         Ok(())
@@ -379,8 +400,47 @@ impl Capture {
         Ok(())
     }
 
+    fn cleanup_source(&self) -> &Session {
+        self.target
+            .as_ref()
+            .map_or(&self.source, |target| &target.source)
+    }
+
+    pub(in crate::host::chat) fn require_reserved_state(
+        &self,
+        state: &HostState,
+    ) -> Result<(), String> {
+        self.require_state(state)?;
+        let source = self.cleanup_source();
+        if state.chat_spawning.get(&source.id) != Some(source) {
+            return Err("The exact coordinator-owned cleanup reservation changed".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_reserved_host(&self, host: &SharedHost) -> Result<(), String> {
+        self.require_reserved_state(&host.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     pub(super) fn require_host(&self, host: &SharedHost) -> Result<(), String> {
         self.require_state(&host.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(super) fn inherit_original_helper(&self, handle: &Handle) -> Result<(), String> {
+        for previous in [
+            self.startup
+                .as_ref()
+                .and_then(|startup| startup._remote.as_ref()),
+            self.execution
+                .as_ref()
+                .and_then(|execution| execution._remote.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.inherit_original_helper_from(previous)?;
+        }
+        Ok(())
     }
 
     pub(super) fn require_inspection(
@@ -426,10 +486,7 @@ impl Capture {
 /// the original helper's separate Child.wait may still need to be polled.
 pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(), String> {
     capture.require_host(host)?;
-    let requested = capture
-        .target
-        .as_ref()
-        .map_or(&capture.source, |target| &target.source);
+    let requested = capture.cleanup_source();
     close_with_target(
         host,
         requested,
@@ -437,6 +494,7 @@ pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(
         capture.target.as_ref(),
         None,
         Some(capture),
+        true,
     )
 }
 
@@ -445,7 +503,19 @@ pub(in crate::host) fn cleanup(host: &SharedHost, capture: &Capture) -> Result<(
 /// usable after live discovery disappears; no disappearance is itself proof.
 pub(super) fn cleanup_normal_startup(host: &SharedHost, pending: &Startup) -> Result<(), String> {
     let binding = StartupBinding::capture(pending)?;
-    cleanup_normal_bound(host, &binding, |state| binding.require_state(state))
+    cleanup_normal_bound(host, &binding, |state| {
+        binding.require_state(state)?;
+        if binding.failed_close.as_ref().is_some_and(|failed| {
+            state
+                .chats
+                .get(&binding.source.id)
+                .is_some_and(|record| !failed.matches(record))
+        }) {
+            return Err("The failed startup's exact semantic attachment changed".into());
+        }
+        Ok(())
+    })?;
+    binding.forget_proved(host)
 }
 
 /// An execution intent can outlive normal forget_startup after its durable
@@ -481,7 +551,11 @@ pub(in crate::host) fn cleanup_execution_startup(
             }
             None => Ok(()),
         }
-    })
+    })?;
+    if let Some(native) = native {
+        native.forget_proved(host)?;
+    }
+    Ok(())
 }
 
 fn cleanup_normal_bound(
@@ -540,6 +614,7 @@ fn cleanup_normal_bound(
         None,
         None,
         None,
+        true,
     )?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     require_owner(&state)?;

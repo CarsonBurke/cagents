@@ -16,6 +16,78 @@ fn owner() -> Arc<StartupOwner> {
     })
 }
 
+/// Installed before spawn so every assertion/unwind retains the actual Child.
+/// Only this guard calls its original owner's sole wait; there is no PID path.
+struct DirectChildGuard {
+    owner: Arc<StartupOwner>,
+    control: Option<UnixStream>,
+    child: Option<std::process::Child>,
+}
+
+impl DirectChildGuard {
+    fn new(owner: Arc<StartupOwner>, control: Option<UnixStream>) -> Self {
+        Self {
+            owner,
+            control,
+            child: None,
+        }
+    }
+
+    fn spawn(&mut self, command: &mut ChildCommand) -> Result<(), String> {
+        self.child = Some(self.owner.spawn_child(command)?);
+        Ok(())
+    }
+
+    fn control(&self) -> &UnixStream {
+        self.control.as_ref().expect("live fixture control")
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(control) = self.control.take() {
+            let _ = control.shutdown(std::net::Shutdown::Both);
+        }
+        self.owner.cancel_control();
+    }
+
+    fn take_child(&mut self) -> std::process::Child {
+        self.child.take().expect("fixture owns its original Child")
+    }
+
+    fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.disconnect();
+        let child = self
+            .child
+            .take()
+            .or_else(|| {
+                self.owner
+                    .unwatched_child
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+            })
+            .ok_or("The fixture no longer owns an unwaited original Child")?;
+        self.owner.wait_for_child(child)
+    }
+}
+
+impl Drop for DirectChildGuard {
+    fn drop(&mut self) {
+        self.disconnect();
+        let child = self.child.take().or_else(|| {
+            self.owner
+                .unwatched_child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        });
+        if let Some(child) = child {
+            let pid = child.id();
+            let waited = self.owner.wait_for_child(child);
+            eprintln!("direct startup fixture original Child {pid} settled: {waited:?}");
+        }
+    }
+}
+
 #[test]
 fn ordinary_latch_refuses_first_and_replacement_late_claims_before_spawn() {
     let context = ExecutionContext::default();
@@ -128,6 +200,16 @@ fn cancellation_rejects_remote_transfer_and_remote_role_survives_installed() {
     let token = context.claim_startup_owner(startup);
     let before = context.ownership_snapshot();
     assert!(context.transfer_startup_owner(token, Arc::new(remote.clone()), remote.identity()));
+    let rejected = owner();
+    assert_eq!(context.claim_startup_owner(rejected.clone()), token);
+    assert!(rejected.begin_spawn().is_err());
+    assert!(!context.ownership_snapshot().ordinary_requested);
+    assert_eq!(
+        context.ownership_snapshot().kind,
+        LaunchOwnerKind::RemoteActor {
+            identity: remote.identity()
+        }
+    );
     let transferred = context.request_ordinary_cleanup();
     assert!(transferred.remote.is_some());
     assert_eq!(
@@ -151,6 +233,11 @@ fn cancellation_rejects_remote_transfer_and_remote_role_survives_installed() {
     );
     assert_eq!(installed.original_helper, HelperWaitProof::Pending);
     assert!(installed.remote.is_none());
+    assert!(!context.complete_hosted_cleanup(&installed));
+    let mut forged_generic = installed.clone();
+    forged_generic.kind = LaunchOwnerKind::Generic;
+    assert!(!context.complete_hosted_cleanup(&forged_generic));
+    assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
     // A late generic claim must not downgrade the permanent remote role.
     context.claim_owner(owner());
     assert_eq!(context.ownership_snapshot().kind, installed.kind);
@@ -258,16 +345,17 @@ fn actual_helper_preframe_eof_and_refused_authority_prove_original_wait73() {
     for authority in ["eof", "missing", "invalid"] {
         let owner = owner();
         let (control, peer) = UnixStream::pair().unwrap();
+        let mut child = DirectChildGuard::new(owner.clone(), Some(control));
         let mut command = helper_command(&peer, false);
-        let child = owner.spawn_child(&mut command).unwrap();
+        child.spawn(&mut command).unwrap();
         drop(peer);
         if authority != "eof" {
             let mut source = fixture_source();
             if authority == "missing" {
                 source.proof = None;
             }
-            send(&control, &refused_request(source), TIMEOUT).unwrap();
-            let response: Result<Attached, String> = receive(&control, TIMEOUT).unwrap();
+            send(child.control(), &refused_request(source), TIMEOUT).unwrap();
+            let response: Result<Attached, String> = receive(child.control(), TIMEOUT).unwrap();
             let Err(error) = response else {
                 panic!("helper accepted refused authority")
             };
@@ -275,8 +363,7 @@ fn actual_helper_preframe_eof_and_refused_authority_prove_original_wait73() {
                 assert!(error.contains("lacks proof"));
             }
         }
-        drop(control);
-        assert_eq!(owner.wait_for_child(child).unwrap().code(), Some(73));
+        assert_eq!(child.wait().unwrap().code(), Some(73));
         assert_eq!(
             owner.original_helper_wait_proof(),
             HelperWaitProof::TeardownProved
@@ -287,10 +374,11 @@ fn actual_helper_preframe_eof_and_refused_authority_prove_original_wait73() {
 #[test]
 fn an_actual_status_one_never_proves_startup_teardown() {
     let owner = owner();
-    let child = owner
-        .spawn_child(ChildCommand::new("/bin/sh").args(["-c", "exit 1"]))
+    let mut child = DirectChildGuard::new(owner.clone(), None);
+    child
+        .spawn(ChildCommand::new("/bin/sh").args(["-c", "exit 1"]))
         .unwrap();
-    assert_eq!(owner.wait_for_child(child).unwrap().code(), Some(1));
+    assert_eq!(child.wait().unwrap().code(), Some(1));
     owner.request_ordinary_cleanup();
     assert_eq!(owner.poll_cleanup(), LaunchOutcome::Uncertain);
     assert_eq!(owner.original_helper_wait_proof(), HelperWaitProof::Pending);
@@ -304,13 +392,12 @@ fn failed_watcher_admission_retains_the_original_child_and_uncertain_owner() {
     context.claim_startup_owner(owner.clone());
     let (publish, incoming) = std::sync::mpsc::sync_channel(1);
     drop(incoming);
-    let child = owner
-        .spawn_child(&mut ChildCommand::new("/bin/true"))
-        .unwrap();
-    let child_id = child.id();
+    let mut child = DirectChildGuard::new(owner.clone(), None);
+    child.spawn(&mut ChildCommand::new("/bin/true")).unwrap();
+    let child_id = child.child.as_ref().unwrap().id();
     assert!(
         owner
-            .publish_child(&publish, child)
+            .publish_child(&publish, child.take_child())
             .unwrap_err()
             .contains("custody is retained")
     );
@@ -331,8 +418,16 @@ fn failed_watcher_admission_retains_the_original_child_and_uncertain_owner() {
     let retained = retained
         .upgrade()
         .expect("context must retain exact child owner");
-    let mut child = retained.unwatched_child.lock().unwrap().take().unwrap();
-    assert_eq!(child.id(), child_id);
+    assert_eq!(
+        retained
+            .unwatched_child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id(),
+        child_id
+    );
     // Sole test cleanup consumes the retained Child itself. No replacement
     // waiter or synthetic production status is installed on the owner.
     assert!(child.wait().unwrap().success());
@@ -346,12 +441,17 @@ fn failed_watcher_admission_retains_the_original_child_and_uncertain_owner() {
 fn semantic_completion_retains_spawned_origin_until_its_original_wait() {
     let owner = owner();
     let (control, peer) = UnixStream::pair().unwrap();
+    let mut child = DirectChildGuard::new(owner.clone(), Some(control));
     let mut command = helper_command(&peer, false);
-    let child = owner.spawn_child(&mut command).unwrap();
+    child.spawn(&mut command).unwrap();
     drop(peer);
-    drop(control);
+    child.disconnect();
     let mut remote = RemoteActor::fixture();
-    Arc::get_mut(&mut remote.0).unwrap().origin = SpawnOrigin::SpawnedHere(owner.clone());
+    *Arc::get_mut(&mut remote.0)
+        .unwrap()
+        .origin
+        .get_mut()
+        .unwrap() = SpawnOrigin::SpawnedHere(owner.clone());
     let context = ExecutionContext::default();
     let token = context.claim_startup_owner(owner.clone());
     assert!(context.transfer_startup_owner(token, Arc::new(remote.clone()), remote.identity()));
@@ -361,7 +461,7 @@ fn semantic_completion_retains_spawned_origin_until_its_original_wait() {
         HelperWaitProof::Pending
     );
     assert!(!context.complete_semantic_cleanup(token, &remote.identity()));
-    assert_eq!(owner.wait_for_child(child).unwrap().code(), Some(73));
+    assert_eq!(child.wait().unwrap().code(), Some(73));
     assert_eq!(
         remote.original_helper_wait_proof(),
         HelperWaitProof::TeardownProved
@@ -383,6 +483,50 @@ fn semantic_completion_retains_spawned_origin_until_its_original_wait() {
     assert_eq!(
         RemoteActor::fixture().original_helper_wait_proof(),
         HelperWaitProof::NoParentChild
+    );
+}
+
+#[test]
+fn same_actor_attachment_inherits_strong_origin_and_refuses_conflicting_origins() {
+    let owner = owner();
+    let (control, peer) = UnixStream::pair().unwrap();
+    let mut child = DirectChildGuard::new(owner.clone(), Some(control));
+    child.spawn(&mut helper_command(&peer, false)).unwrap();
+    drop(peer);
+    child.disconnect();
+    let mut previous = RemoteActor::fixture();
+    *Arc::get_mut(&mut previous.0)
+        .unwrap()
+        .origin
+        .get_mut()
+        .unwrap() = SpawnOrigin::SpawnedHere(owner.clone());
+    let adopted = previous.distinct_attachment_fixture();
+    assert_eq!(
+        adopted.original_helper_wait_proof(),
+        HelperWaitProof::NoParentChild
+    );
+    adopted.inherit_original_helper_from(&previous).unwrap();
+    adopted.inherit_original_helper_from(&adopted).unwrap();
+    assert_eq!(
+        adopted.original_helper_wait_proof(),
+        HelperWaitProof::Pending
+    );
+    let mismatched = RemoteActor::fixture();
+    assert!(mismatched.inherit_original_helper_from(&previous).is_err());
+    let conflicting = previous.distinct_attachment_fixture();
+    *conflicting.0.origin.lock().unwrap() = SpawnOrigin::SpawnedHere(self::owner());
+    assert!(adopted.inherit_original_helper_from(&conflicting).is_err());
+    let retained = Arc::downgrade(&owner);
+    drop(previous);
+    drop(owner);
+    assert!(
+        retained.strong_count() >= 2,
+        "replacement attachment must retain progress in addition to the cleanup guard"
+    );
+    assert_eq!(child.wait().unwrap().code(), Some(73));
+    assert_eq!(
+        adopted.original_helper_wait_proof(),
+        HelperWaitProof::TeardownProved
     );
 }
 
@@ -420,19 +564,20 @@ fn actual_helper_subreaper_refusal_is_before_provider_and_still_reaps73() {
     let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
     let owner = owner();
     let (control, peer) = UnixStream::pair().unwrap();
+    let mut child = DirectChildGuard::new(owner.clone(), Some(control));
     // Confirm this exact caller would authorize before introducing the kernel
     // refusal; the helper still performs its own real authentication.
-    authorize(&control, source.proof.as_ref().unwrap()).unwrap();
+    authorize(child.control(), source.proof.as_ref().unwrap()).unwrap();
     let mut command = helper_command(&peer, true);
-    let child = owner.spawn_child(&mut command).unwrap();
+    child.spawn(&mut command).unwrap();
     drop(peer);
-    send(&control, &refused_request(source), TIMEOUT).unwrap();
-    let response: Result<Attached, String> = receive(&control, TIMEOUT).unwrap();
+    send(child.control(), &refused_request(source), TIMEOUT).unwrap();
+    let response: Result<Attached, String> = receive(child.control(), TIMEOUT).unwrap();
     let Err(error) = response else {
         panic!("helper accepted refused subreaper setup")
     };
     assert!(error.contains("Operation not permitted"));
-    assert_eq!(owner.wait_for_child(child).unwrap().code(), Some(73));
+    assert_eq!(child.wait().unwrap().code(), Some(73));
     assert!(
         !marker.exists(),
         "refused helper must not execute its provider"

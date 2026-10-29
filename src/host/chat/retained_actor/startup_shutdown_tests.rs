@@ -1,8 +1,223 @@
-//! Exact admission unit regressions plus one real helper semantic retry. The
+//! Exact admission unit regressions plus real helper semantic retries. The
 //! in-memory proxy fixtures below never exercise helper authentication; the
-//! final isolated test uses the production constructor and close protocol.
+//! isolated tests use the production constructor and close protocol.
 use super::*;
 use crate::chat::protocol::{LaunchCleanup, LaunchOutcome};
+#[cfg(target_os = "linux")]
+use crate::chat::runtime::startup_observation::{Event, Observation, Spawned};
+
+/// Installed before the actual constructor. This owns observation of only its
+/// exact source/context and never signals a PID, provider or descendant.
+#[cfg(target_os = "linux")]
+struct UninstalledFixture {
+    source: Session,
+    context: Arc<chat::protocol::ExecutionContext>,
+    observation: Observation,
+    spawned: Option<Spawned>,
+    spawn_error: Option<String>,
+    waited: Option<std::process::ExitStatus>,
+    repairs: Vec<(std::path::PathBuf, &'static str)>,
+    attempted: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl UninstalledFixture {
+    fn new(source: Session, context: Arc<chat::protocol::ExecutionContext>) -> Self {
+        Self {
+            observation: Observation::install(source.clone(), context.clone()),
+            source,
+            context,
+            spawned: None,
+            spawn_error: None,
+            waited: None,
+            repairs: Vec::new(),
+            attempted: false,
+        }
+    }
+
+    fn repair_on_failure(&mut self, path: std::path::PathBuf, sql: &'static str) {
+        self.repairs.push((path, sql));
+    }
+
+    fn observe(&mut self, event: Event) -> Result<(), String> {
+        match event {
+            Event::Spawned(result) => {
+                if self.spawned.is_some() || self.spawn_error.is_some() {
+                    return Err("duplicate original helper spawn observation".into());
+                }
+                match result {
+                    Ok(spawned) => self.spawned = Some(spawned),
+                    Err(error) => self.spawn_error = Some(error),
+                }
+            }
+            Event::Reaped(result) => {
+                if self.waited.is_some() {
+                    return Err("duplicate original sole Child.wait observation".into());
+                }
+                self.waited = Some(result?);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, failure_only: bool) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        self.attempted = true;
+        while let Ok(event) = self.observation.events.try_recv() {
+            self.observe(event)?;
+        }
+        if failure_only {
+            for (path, sql) in &self.repairs {
+                if let Err(error) = rusqlite::Connection::open(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|db| db.execute_batch(sql).map_err(|error| error.to_string()))
+                {
+                    eprintln!("Targeted fixture fault repair failed: {error}");
+                }
+            }
+            // This is failure-only rollback, never the semantic oracle. The
+            // fixture source never calls commit_native_installation. The
+            // narrow test seam authenticates installed=false again and closes
+            // only the shared ORIGINAL startup stream; all Handle clones see
+            // that release. No cleanup outcome is written here.
+            let owner = self.context.request_ordinary_cleanup();
+            if self.waited.is_none()
+                && let Some(original) = owner.remote
+            {
+                let identity = original
+                    .actor_identity()
+                    .ok_or("original startup attachment lost its exact actor")?;
+                if identity.record.terminal != self.source.id
+                    || self
+                        .spawned
+                        .as_ref()
+                        .is_some_and(|spawned| identity.record.holder != spawned.process)
+                {
+                    return Err(
+                        "original startup attachment differs from the observed helper".into(),
+                    );
+                }
+                if let Ok(inspection) = Handle::inspect_remote(
+                    &identity.record,
+                    self.source
+                        .proof
+                        .clone()
+                        .ok_or("fixture source lost its original proof")?,
+                ) {
+                    if inspection.identity != identity
+                        || inspection.state.installed
+                        || (inspection.source != self.source
+                            && !inspection.previous_sources.contains(&self.source))
+                    {
+                        return Err(
+                            "uninstalled rollback lost its exact authenticated source".into()
+                        );
+                    }
+                }
+                if let Err(error) = original.rollback_uninstalled_for_test() {
+                    // An already retired helper can finish its original wait
+                    // before inspection. Only the actual receipt below can
+                    // settle that race; this refusal is never proof.
+                    eprintln!("Failure-only original startup rollback request: {error}");
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.waited.is_none() {
+            let captured = self.context.ownership_snapshot();
+            let current = self.context.poll_cleanup(&captured);
+            if self.spawned.is_none()
+                && self.spawn_error.is_none()
+                && current.ordinary_requested
+                && current.outcome == LaunchOutcome::NoProvider
+            {
+                eprintln!("Failure-only fixture cleanup settled without any helper spawn");
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("original helper sole Child.wait remains unconfirmed; fixture evidence retained".into());
+            }
+            let event = self
+                .observation
+                .events
+                .recv_timeout(remaining)
+                .map_err(|error| {
+                    format!("original helper sole Child.wait did not settle: {error}")
+                })?;
+            self.observe(event)?;
+        }
+        if self
+            .waited
+            .as_ref()
+            .and_then(std::process::ExitStatus::code)
+            != Some(73)
+        {
+            return Err(
+                "the actual original sole Child.wait did not return teardown status73".into(),
+            );
+        }
+        let helper = self.spawned.as_ref().ok_or_else(|| {
+            format!(
+                "original helper spawn identity/pidfd was not captured: {:?}",
+                self.spawn_error
+            )
+        })?;
+        let mut poll = libc::pollfd {
+            fd: helper.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 || poll.revents & libc::POLLIN == 0 {
+            return Err(
+                "the original helper pidfd did not confirm exit after its actual wait".into(),
+            );
+        }
+        match crate::daemon::holder_registry::Process::read(helper.process.pid) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(current) if current != helper.process => {}
+            _ => return Err("the original helper remains unreaped after its actual wait".into()),
+        }
+        eprintln!(
+            "Original helper fixture settled: failure_only_cleanup={failure_only}, sole_Child_wait_exit=73, pidfd_exited=true, original_reaped=true"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for UninstalledFixture {
+    fn drop(&mut self) {
+        if !self.attempted
+            && let Err(error) = self.finish(true)
+        {
+            eprintln!(
+                "Exact uninstalled fixture cleanup is unconfirmed; evidence retained: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_fixture(
+    guard: &mut UninstalledFixture,
+    checked: std::thread::Result<()>,
+    root: &std::path::Path,
+) {
+    guard.finish(checked.is_err()).unwrap_or_else(|error| {
+        panic!("Original fixture cleanup remains unconfirmed; evidence retained: {error}")
+    });
+    if let Err(panic) = checked {
+        // Manual rollback cannot turn the original semantic assertion into a
+        // pass. Rethrow only after the original sole waiter and kernel agree.
+        std::panic::resume_unwind(panic);
+    }
+    std::fs::write(
+        root.join("original-helper-settled"),
+        "actual original Child.wait73\n",
+    )
+    .unwrap();
+}
 
 struct Pending;
 impl LaunchCleanup for Pending {
@@ -64,7 +279,7 @@ impl Fixture {
         state
             .native_actor_startups
             .insert(pending.source.id, pending.clone());
-        state.shutting_down = true;
+        state.begin_ordinary_exit_cleanup();
         let host = Arc::new(HostLock::new(state));
         pending.context.request_ordinary_cleanup();
         Self {
@@ -157,6 +372,25 @@ fn captured_startup_refuses_changed_descriptors_context_and_failed_target() {
 }
 
 #[test]
+fn transient_stop_quiescence_does_not_mint_ordinary_cleanup_authority() {
+    let fixture = Fixture::new();
+    let mut transient = HostState::new(fixture.host.lock().unwrap().proof().clone());
+    // Accepted Stop can quiesce admission before ordinary cleanup has been
+    // atomically established. That transient state is not a cleanup permit.
+    transient.shutting_down = true;
+    transient
+        .native_actor_startups
+        .insert(fixture.pending.source.id, fixture.pending.clone());
+    transient.chats.insert(
+        fixture.pending.source.id,
+        fixture.record(fixture.attachment.clone()),
+    );
+    assert!(capture_startup(&transient, &fixture.pending).is_err());
+    assert!(capture_hosted(&transient, &fixture.pending.source, &fixture.attachment).is_err());
+    assert!(fixture.capture().require_state(&transient).is_err());
+}
+
+#[test]
 fn execution_capture_without_native_row_refuses_replaced_intent_and_context() {
     let fixture = Fixture::new();
     let agent = crate::model::AgentId::new();
@@ -219,6 +453,17 @@ fn captured_attachment_refuses_same_actor_replacement_and_keeps_public_close_fen
     let target =
         super::super::super::CloseTarget::from_record(&fixture.record(fixture.attachment.clone()));
     assert!(target.require_current(&fixture.host).is_err());
+    assert!(
+        target
+            .require_current_with_shutdown(&fixture.host, Some(&capture))
+            .is_err()
+    );
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .chat_spawning
+        .insert(fixture.pending.source.id, fixture.pending.source.clone());
     assert!(
         target
             .require_current_with_shutdown(&fixture.host, Some(&capture))
@@ -333,54 +578,12 @@ fn startup_capture_never_enrolls_an_installed_unknown_or_changed_actor() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ordinary_semantic_persistence_failure_retries_in_the_same_host() {
-    const CHILD: &str = "CAGENTS_ORDINARY_SEMANTIC_RETRY_TEST";
-    if std::env::var_os(CHILD).is_none() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = directory.path();
-        for path in [
-            "home/.claude",
-            "run",
-            "data",
-            "config",
-            "cache",
-            "bin",
-            "project",
-        ] {
-            std::fs::create_dir_all(root.join(path)).unwrap();
-        }
-        let exact = thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &exact, "--nocapture"])
-            .env_clear()
-            .env(CHILD, "1")
-            .env(
-                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
-                crate::host::chat::retained_actor_tests::retained_helper_executable(),
-            )
-            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_HOLDER_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let Some(root) = isolated_child("CAGENTS_ORDINARY_SEMANTIC_RETRY_TEST") else {
         return;
-    }
+    };
     fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !predicate() {
@@ -388,7 +591,6 @@ fn ordinary_semantic_persistence_failure_retries_in_the_same_host() {
             thread::sleep(Duration::from_millis(20));
         }
     }
-    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
     install_boot_permission_provider(&root.join("bin/claude"));
     let proof = HostSessionProof {
         host_session_id: "ordinary-semantic-retry".into(),
@@ -422,134 +624,359 @@ fn ordinary_semantic_persistence_failure_retries_in_the_same_host() {
         .unwrap();
     let context =
         Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
-    let (mut spec, adapter) = chat::protocol::create(&source.launch).unwrap();
-    spec.execution = Some(context.clone());
-    let prepared = adapter.prepared_launch_identity().unwrap();
-    let environment = spec.environment.clone();
-    let original =
-        Handle::start_remote_owned(spec, source.clone(), prepared, environment, |_| {}).unwrap();
-    let identity = original.actor_identity().unwrap();
-    struct Cleanup(crate::daemon::holder_registry::Record);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            // Failed fixture teardown only. Process existence is never used
-            // as a semantic or original-Child.wait cleanup receipt.
-            for process in [&self.0.root, &self.0.holder] {
-                if process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
-            }
+    let mut guard = UninstalledFixture::new(source.clone(), context.clone());
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (mut spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        spec.execution = Some(context.clone());
+        let prepared = adapter.prepared_launch_identity().unwrap();
+        let environment = spec.environment.clone();
+        let original =
+            Handle::start_remote_owned(spec, source.clone(), prepared, environment, |_| {})
+                .unwrap();
+        let identity = original.actor_identity().unwrap();
+        wait(
+            || original.attachment_snapshot().ready,
+            "actual helper did not initialize its provider",
+        );
+        std::fs::write(root.join("emit-boot-permission"), "emit").unwrap();
+        wait(
+            || {
+                Handle::inspect_remote(&identity.record, proof.clone()).is_ok_and(|inspection| {
+                    inspection.state.outbox_latest > inspection.state.outbox_ack
+                })
+            },
+            "provider emitted no semantic outbox evidence",
+        );
+        let pending = Startup {
+            source: source.clone(),
+            requested: source.clone(),
+            context: context.clone(),
+            failed_close: None,
+        };
+        {
+            let mut state = host.lock().unwrap();
+            state
+                .native_actor_startups
+                .insert(source.id, pending.clone());
+            state.begin_ordinary_exit_cleanup();
         }
-    }
-    let _cleanup = Cleanup(identity.record.clone());
-    wait(
-        || original.attachment_snapshot().ready,
-        "actual helper did not initialize its provider",
-    );
-    std::fs::write(root.join("emit-boot-permission"), "emit").unwrap();
-    wait(
-        || {
-            Handle::inspect_remote(&identity.record, proof.clone()).is_ok_and(|inspection| {
-                inspection.state.outbox_latest > inspection.state.outbox_ack
-            })
-        },
-        "provider emitted no semantic outbox evidence",
-    );
-    let pending = Startup {
-        source: source.clone(),
-        requested: source.clone(),
-        context: context.clone(),
-        failed_close: None,
-    };
-    {
-        let mut state = host.lock().unwrap();
-        state
-            .native_actor_startups
-            .insert(source.id, pending.clone());
-        state.shutting_down = true;
-    }
-    context.request_ordinary_cleanup();
-    let capture = capture_startup(&host.lock().unwrap(), &pending).unwrap();
-    let attention = crate::instance::project_dirs()
-        .unwrap()
-        .data_dir()
-        .join("agent-attention.sqlite3");
-    wait(
-        || {
-            rusqlite::Connection::open(&attention).is_ok_and(|db| {
-                db.query_row(
+        context.request_ordinary_cleanup();
+        let capture = capture_startup(&host.lock().unwrap(), &pending).unwrap();
+        let attention = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("agent-attention.sqlite3");
+        wait(
+            || {
+                rusqlite::Connection::open(&attention).is_ok_and(|db| {
+                    db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='seen')",
                     [],
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap_or(false)
-            })
-        },
-        "notification journal did not initialize",
-    );
-    let fault = rusqlite::Connection::open(attention).unwrap();
-    fault.execute_batch("CREATE TRIGGER reject_ordinary_attention BEFORE INSERT ON seen BEGIN SELECT RAISE(ABORT, 'fixture ordinary semantic commit failure'); END;").unwrap();
-    let refusal = cleanup(&host, &capture).unwrap_err();
-    assert!(
-        refusal.contains("fixture ordinary semantic commit failure"),
-        "{refusal}"
-    );
-    let held = Handle::inspect_remote(&identity.record, proof.clone()).unwrap();
-    assert!(held.state.outbox_latest > held.state.outbox_ack);
-    assert!(
-        host.lock().unwrap().chats[&source.id]
-            .handle
-            .is_close_only()
-    );
-    assert!(capture.matches_startup(&host.lock().unwrap().native_actor_startups[&source.id]));
-    assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
-    assert!(
-        registry
-            .lock()
-            .unwrap()
-            .native_actor_cursor_for_test(identity.instance)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        registry
-            .lock()
-            .unwrap()
-            .native_actor_retirement(identity.instance)
-            .unwrap()
-            .is_none()
-    );
-    fault
-        .execute_batch("DROP TRIGGER reject_ordinary_attention;")
-        .unwrap();
-    cleanup(&host, &capture).unwrap();
-    let token = context.ownership_snapshot().token.unwrap();
-    wait(
-        || context.complete_semantic_cleanup(token, &identity),
-        "semantic settlement did not receive the original helper's actual wait proof",
-    );
-    assert_eq!(
-        context.ownership_snapshot().original_helper,
-        chat::protocol::HelperWaitProof::TeardownProved
-    );
-    assert!(
-        registry
-            .lock()
-            .unwrap()
-            .native_actor_retirement(identity.instance)
-            .unwrap()
-            .is_some()
-    );
-    assert!(!host.lock().unwrap().chats.contains_key(&source.id));
-    assert!(capture.matches_startup(&host.lock().unwrap().native_actor_startups[&source.id]));
-    assert!(
-        !root.join("prompts").exists(),
-        "cleanup must never send provider input"
-    );
+                })
+            },
+            "notification journal did not initialize",
+        );
+        guard.repair_on_failure(
+            attention.clone(),
+            "DROP TRIGGER IF EXISTS reject_ordinary_attention;",
+        );
+        let fault = rusqlite::Connection::open(attention).unwrap();
+        fault.execute_batch("CREATE TRIGGER reject_ordinary_attention BEFORE INSERT ON seen BEGIN SELECT RAISE(ABORT, 'fixture ordinary semantic commit failure'); END;").unwrap();
+        let refusal = cleanup(&host, &capture).unwrap_err();
+        assert!(
+            refusal.contains("fixture ordinary semantic commit failure"),
+            "{refusal}"
+        );
+        let held = Handle::inspect_remote(&identity.record, proof.clone()).unwrap();
+        assert!(held.state.outbox_latest > held.state.outbox_ack);
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .handle
+                .is_close_only()
+        );
+        assert!(capture.matches_startup(&host.lock().unwrap().native_actor_startups[&source.id]));
+        assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_cursor_for_test(identity.instance)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(identity.instance)
+                .unwrap()
+                .is_none()
+        );
+        fault
+            .execute_batch("DROP TRIGGER reject_ordinary_attention;")
+            .unwrap();
+        cleanup(&host, &capture).unwrap();
+        let token = context.ownership_snapshot().token.unwrap();
+        wait(
+            || context.complete_semantic_cleanup(token, &identity),
+            "semantic settlement did not receive the original helper's actual wait proof",
+        );
+        assert_eq!(
+            context.ownership_snapshot().original_helper,
+            chat::protocol::HelperWaitProof::TeardownProved
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(identity.instance)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        assert!(capture.matches_startup(&host.lock().unwrap().native_actor_startups[&source.id]));
+        assert!(
+            !root.join("prompts").exists(),
+            "cleanup must never send provider input"
+        );
+    }));
+    finish_fixture(&mut guard, checked, &root);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn execution_startup_without_native_row_retries_from_verified_retirement() {
+    let Some(root) = isolated_child("CAGENTS_EXECUTION_RETIRED_STARTUP_TEST") else {
+        return;
+    };
+    crate::host::chat::retained_actor_tests::install_provider(&root.join("bin/claude"));
+    let proof = HostSessionProof {
+        host_session_id: "execution-startup-retirement-retry".into(),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: "same-daemon".into(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let registry_path = root.join("registry.sqlite3");
+    let mut state = HostState::new(proof.clone());
+    state.install_model(crate::host::model::Registry::at(&registry_path).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let mut source = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    source.proof = Some(proof.clone());
+    let registry = crate::host::agent_execution::registry(&host).unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
+        .unwrap();
+    let context =
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
+    let mut guard = UninstalledFixture::new(source.clone(), context.clone());
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (mut spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        spec.execution = Some(context.clone());
+        let prepared = adapter.prepared_launch_identity().unwrap();
+        let environment = spec.environment.clone();
+        let original =
+            Handle::start_remote_owned(spec, source.clone(), prepared, environment, |_| {})
+                .unwrap();
+        let identity = original.actor_identity().unwrap();
+        let inspection = Handle::inspect_remote(&identity.record, proof.clone()).unwrap();
+        assert!(!inspection.state.installed);
+        assert_eq!(inspection.state.outbox_latest, inspection.state.outbox_ack);
+        enroll_pending(
+            &host,
+            &inspection.identity,
+            &inspection.source,
+            &inspection.previous_sources,
+            inspection
+                .launch_account_scope
+                .as_ref()
+                .map_err(String::as_str),
+            false,
+        )
+        .unwrap();
+        let agent = crate::model::AgentId::new();
+        let intent = crate::agent_execution::HostedSession::Chat(source.clone());
+        host.lock()
+            .unwrap()
+            .execution_startups
+            .insert(agent, (intent.clone(), context.clone()));
+        // There are no semantic events in this fixture. The genuine helper close
+        // and retirement create its authenticated capsule before any HOST chat is
+        // published; no process disappearance is accepted as a close receipt.
+        original.close().unwrap();
+        original.finish_retained_close().unwrap();
+        assert!(matches!(
+            Handle::inspect_retained_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::Verified(_)
+        ));
+        assert!(
+            !crate::host::chat::has_native_owner(&source).unwrap(),
+            "the live discovery record must be naturally absent"
+        );
+        guard.repair_on_failure(
+            registry_path.clone(),
+            "DROP TRIGGER IF EXISTS reject_execution_retirement;",
+        );
+        let fault = rusqlite::Connection::open(registry_path).unwrap();
+        fault.execute_batch("CREATE TRIGGER reject_execution_retirement BEFORE INSERT ON native_actor_retirements BEGIN SELECT RAISE(ABORT, 'fixture execution retirement commit failure'); END;").unwrap();
+        let refusal = cleanup_execution_startup(&host, agent, &source, &context).unwrap_err();
+        assert!(
+            refusal.contains("fixture execution retirement commit failure"),
+            "{refusal}"
+        );
+        assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert_eq!(host.lock().unwrap().execution_startups[&agent].0, intent);
+        assert!(Arc::ptr_eq(
+            &host.lock().unwrap().execution_startups[&agent].1,
+            &context
+        ));
+        fault
+            .execute_batch("DROP TRIGGER reject_execution_retirement;")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match cleanup_execution_startup(&host, agent, &source, &context) {
+                Ok(()) => break,
+                Err(error) => {
+                    assert!(
+                        error.contains("original helper wait remains pending"),
+                        "{error}"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "original helper actual wait never completed"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        assert_eq!(context.outcome(), LaunchOutcome::TeardownProved);
+        assert_eq!(
+            context.ownership_snapshot().original_helper,
+            chat::protocol::HelperWaitProof::TeardownProved
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(identity.instance)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            host.lock().unwrap().execution_startups[&agent].0,
+            intent,
+            "semantic cleanup leaves exact durable-intent settlement to its caller"
+        );
+        assert!(!root.join("prompts").exists());
+    }));
+    finish_fixture(&mut guard, checked, &root);
+}
+
+#[cfg(target_os = "linux")]
+fn isolated_child(marker: &str) -> Option<std::path::PathBuf> {
+    const PRESENCE: &str = "CAGENTS_SEMANTIC_FIXTURE_AUTHORITY_PRESENCE";
+    let _helper = crate::host::chat::retained_actor_tests::retained_helper_executable();
+    if std::env::var_os(marker).is_some() {
+        let expected = match std::env::var(PRESENCE).as_deref() {
+            Ok("present") => true,
+            Ok("absent") => false,
+            _ => panic!("missing original opaque authority presence"),
+        };
+        assert_eq!(
+            crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default(),
+            expected
+        );
+        return Some(std::path::PathBuf::from(
+            std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap(),
+        ));
+    }
+    // Keep the entire private evidence directory on every failure, including
+    // setup or cleanup failure. Delete it only after the child reports success
+    // and its exact original helper's actual wait has been verified.
+    let root = tempfile::tempdir_in("/var/tmp").unwrap().keep();
+    for path in [
+        "home/.claude",
+        "run",
+        "data",
+        "config",
+        "cache",
+        "bin",
+        "project",
+    ] {
+        std::fs::create_dir_all(root.join(path)).unwrap();
+    }
+    let exact = thread::current().name().unwrap().to_owned();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Preserve these inherited values opaquely. Never read/copy/reset the
+    // authority value or replace the caller's validated helper executable.
+    for (key, _) in std::env::vars_os() {
+        if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+        .env(marker, "1")
+        .env(
+            PRESENCE,
+            if crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default()
+            {
+                "present"
+            } else {
+                "absent"
+            },
+        )
+        .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+        .env("CAGENTS_HOLDER_ROOT", &root)
+        .env("HOME", root.join("home"))
+        .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    std::fs::write(root.join("fixture.stdout"), &output.stdout).unwrap();
+    std::fs::write(root.join("fixture.stderr"), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "private semantic fixture failed; evidence retained at {}: stdout={} stderr={}",
+        root.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.join("original-helper-settled").is_file(),
+        "original helper settlement missing; evidence retained at {}",
+        root.display()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn install_boot_permission_provider(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, r#"#!/usr/bin/python3

@@ -230,8 +230,9 @@ struct Remote {
     preserved: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
-    origin: SpawnOrigin,
+    origin: Mutex<SpawnOrigin>,
 }
+#[derive(Clone)]
 enum SpawnOrigin {
     SpawnedHere(Arc<StartupOwner>),
     NoParentChild,
@@ -557,7 +558,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
-            origin: SpawnOrigin::NoParentChild,
+            origin: Mutex::new(SpawnOrigin::NoParentChild),
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -695,12 +696,65 @@ impl RemoteActor {
         Arc::ptr_eq(&self.0, &other.0)
     }
     pub fn original_helper_wait_proof(&self) -> chat::protocol::HelperWaitProof {
-        match &self.0.origin {
+        let origin = self
+            .0
+            .origin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match origin {
             SpawnOrigin::SpawnedHere(owner) => {
                 chat::protocol::LaunchCleanup::original_helper_wait_proof(owner.as_ref())
             }
             SpawnOrigin::NoParentChild => chat::protocol::HelperWaitProof::NoParentChild,
         }
+    }
+    pub fn inherit_original_helper_from(&self, previous: &Self) -> Result<(), String> {
+        if self.0.identity != previous.0.identity {
+            return Err("Original helper custody belongs to a different exact actor".into());
+        }
+        // Never nest attachment mutexes, including when inheriting from self.
+        let previous = previous
+            .0
+            .origin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut current = self.0.origin.lock().unwrap_or_else(|p| p.into_inner());
+        match (&*current, previous) {
+            (SpawnOrigin::NoParentChild, SpawnOrigin::SpawnedHere(owner)) => {
+                *current = SpawnOrigin::SpawnedHere(owner);
+            }
+            (SpawnOrigin::SpawnedHere(current), SpawnOrigin::SpawnedHere(previous))
+                if !Arc::ptr_eq(current, &previous) =>
+            {
+                return Err("The same actor has conflicting original helper custody".into());
+            }
+            _ => {}
+        }
+        drop(current);
+        crate::daemon::wake();
+        Ok(())
+    }
+    /// Failed-fixture rollback only. This requests the helper's existing
+    /// uninstalled EOF cleanup and never supplies semantic or wait evidence.
+    #[cfg(test)]
+    pub fn rollback_uninstalled_for_test(&self) -> Result<(), String> {
+        let mut startup = self.0.startup.lock().unwrap_or_else(|p| p.into_inner());
+        if startup.is_none() {
+            return Err("This attachment has no original uninstalled startup control".into());
+        }
+        let inspection = Self::inspect(&self.0.identity.record, self.0.proof.clone())?;
+        if inspection.identity != self.0.identity
+            || inspection.state.installed
+            || self.0.installed.load(Ordering::Acquire)
+        {
+            return Err("Fixture rollback refuses an installed or changed retained actor".into());
+        }
+        let control = startup.take().expect("original startup control checked");
+        control
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(|error| error.to_string())
     }
     /// Unlike snapshots, resolution always authenticates this live epoch.
     pub fn resolve_source(&self, source: &chat::Session) -> Result<chat::Session, String> {
@@ -1251,7 +1305,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
-            origin,
+            origin: Mutex::new(origin),
         }));
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
@@ -1951,6 +2005,20 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
     }
     fn retained_handle(&self) -> Option<super::super::Handle> {
         Some(super::super::Handle::from_remote(self.clone()))
+    }
+    fn cleanup_diagnostic(&self) -> Option<String> {
+        let origin = self
+            .0
+            .origin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match origin {
+            SpawnOrigin::SpawnedHere(owner) => {
+                chat::protocol::LaunchCleanup::cleanup_diagnostic(owner.as_ref())
+            }
+            SpawnOrigin::NoParentChild => None,
+        }
     }
 }
 impl Drop for Remote {
