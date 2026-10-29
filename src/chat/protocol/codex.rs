@@ -6711,7 +6711,7 @@ mod tests {
         let hello = parent.initialize().unwrap();
         let home = parent.expected_home.to_str().unwrap().to_owned();
         let initialized = parent
-            .receive(json!({"id":hello.writes[0]["id"],"result":{"codexHome":home}}))
+            .receive(json!({"id":hello.writes[0]["id"],"result":{"codexHome":home,"userAgent":"codex-child-name-fixture"}}))
             .unwrap();
         let attach = initialized
             .writes
