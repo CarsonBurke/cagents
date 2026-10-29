@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{fs::MetadataExt, net::{UnixListener, UnixStream}},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -821,11 +821,52 @@ fn client(
         }
     }
 }
+fn inspection_database(root: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if std::env::args().nth(5).as_deref() != Some("--inspection-database")
+        || std::env::args().nth(7).is_some() {
+        return Err("Typed inspection requires its explicit private snapshot".into());
+    }
+    let database = PathBuf::from(std::env::args().nth(6).ok_or("Inspection snapshot missing")?);
+    if ![root.join("inspection/typed.sqlite3"), root.join("inspection/refusal.sqlite3")].contains(&database)
+        || fs::canonicalize(root)? != root || fs::canonicalize(&database)? != database {
+        return Err("Refusing an inspection path outside the exact private snapshots".into());
+    }
+    let root_metadata = fs::symlink_metadata(root)?;
+    let directory = fs::symlink_metadata(root.join("inspection"))?;
+    let snapshot = fs::symlink_metadata(&database)?;
+    let original_path = SessionRuntime::default_database_path()?;
+    if PathBuf::from(fs::read_to_string(root.join("database-path"))?) != original_path
+        || !original_path.starts_with(root) || fs::canonicalize(&original_path)? != original_path {
+        return Err("Original fixture database binding changed".into());
+    }
+    let original = fs::symlink_metadata(&original_path)?;
+    if !root_metadata.is_dir() || root_metadata.mode() & 0o7777 != 0o700
+        || !directory.is_dir() || directory.file_type().is_symlink()
+        || directory.mode() & 0o7777 != 0o700 || directory.uid() != root_metadata.uid()
+        || !snapshot.is_file() || snapshot.file_type().is_symlink()
+        || snapshot.mode() & 0o7777 != 0o600 || snapshot.uid() != root_metadata.uid() || snapshot.nlink() != 1
+        || !original.is_file() || original.file_type().is_symlink()
+        || original.mode() & 0o7777 != 0o600 || original.uid() != root_metadata.uid() || original.nlink() != 1
+        || database == original_path || (snapshot.dev(), snapshot.ino()) == (original.dev(), original.ino()) {
+        return Err("Inspection requires distinct private snapshot and original files".into());
+    }
+    println!("inspection-snapshot-path-verified snapshot={} original={}", database.display(), original_path.display());
+    Ok(database)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if Authority::from_environment() != Authority::default() {
         return Err(
             "Genuine User launch required; inherited caller authority must remain unchanged".into(),
         );
+    }
+    let invocation = std::env::args().skip(1).collect::<Vec<_>>();
+    let serving = invocation.len() == 2;
+    let inspecting = invocation.len() == 6 && invocation[2] == "--inspect"
+        && matches!(invocation[3].as_str(), "open" | "closed")
+        && invocation[4] == "--inspection-database";
+    if !serving && !inspecting {
+        return Err("Use root/mode or root/mode/--inspect/open|closed/--inspection-database/path".into());
     }
     let root = PathBuf::from(
         std::env::args()
@@ -972,7 +1013,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     attachment.reference.as_ref().unwrap().validate()?;
     if std::env::args().nth(3).as_deref() == Some("--inspect") {
-        let database = SessionRuntime::default_database_path()?;
+        let database = inspection_database(&root)?;
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;

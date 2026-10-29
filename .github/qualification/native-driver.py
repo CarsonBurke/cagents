@@ -1,6 +1,7 @@
 """Temporary hosted-X11 actual native evidence; never production-provider evidence."""
 import ast
 import ctypes
+import difflib
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,6 +130,174 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def private_inspection_file(root, path):
+    assert root.is_absolute() and root.resolve() == root
+    assert path.is_absolute() and path != root and path.is_relative_to(root)
+    current = root
+    for part in (None, *path.relative_to(root).parts):
+        if part is not None:
+            assert part not in ('', '.', '..')
+            current = current / part
+        info = current.lstat()
+        assert info.st_uid == os.getuid() and not stat.S_ISLNK(info.st_mode)
+        if current == path:
+            assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600
+            assert info.st_nlink == 1
+        else:
+            assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+    return {'path': str(path), 'device': info.st_dev, 'inode': info.st_ino,
+            'uid': info.st_uid, 'mode': stat.S_IMODE(info.st_mode), 'links': info.st_nlink,
+            'bytes': info.st_size, 'sha256': digest(path)}
+
+
+def inspection_database_snapshot(root, path, artifact):
+    identity = private_inspection_file(root, path)
+    with sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True, timeout=.2) as db:
+        db.execute('BEGIN')
+        sql = list(db.iterdump())
+        schema = list(db.execute('SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name'))
+        pragmas = {name: db.execute('PRAGMA ' + name).fetchone()[0]
+                   for name in ('user_version', 'schema_version', 'application_id', 'journal_mode')}
+        metadata = dict(db.execute('SELECT key, value FROM metadata'))
+        tables = {}
+        for name, in db.execute("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name"):
+            identifier = '"' + name.replace('"', '""') + '"'
+            tables[name] = [[{'blob_hex': value.hex()} if isinstance(value, bytes) else value
+                             for value in row] for row in db.execute('SELECT * FROM ' + identifier)]
+    assert private_inspection_file(root, path) == identity, 'Database identity changed during inspection snapshot'
+    artifact.write_text('\n'.join(sql) + '\n')
+    return {'identity': identity, 'sql': sql, 'schema': schema, 'pragmas': pragmas,
+            'metadata': metadata, 'tables': tables, 'dump': str(artifact), 'dump_sha256': digest(artifact)}
+
+
+def create_inspection_clone(root, original, clone):
+    original_identity = private_inspection_file(root, original)
+    directory = root / 'inspection'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    assert clone in (directory / 'typed.sqlite3', directory / 'refusal.sqlite3')
+    directory_info = directory.lstat()
+    assert stat.S_ISDIR(directory_info.st_mode) and stat.S_IMODE(directory_info.st_mode) == 0o700
+    assert directory_info.st_uid == os.getuid()
+    fd = os.open(clone, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+    clone_identity = private_inspection_file(root, clone)
+    assert (clone_identity['device'], clone_identity['inode']) != (original_identity['device'], original_identity['inode'])
+    deadline = time.monotonic() + 20
+    def progress(status, remaining, total):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Private SQLite inspection backup exceeded its deadline')
+    with sqlite3.connect('file:' + str(original) + '?mode=ro', uri=True, timeout=.2) as source_db:
+        with sqlite3.connect(clone, timeout=.2) as clone_db:
+            source_db.backup(clone_db, pages=128, progress=progress, sleep=.05)
+            # StateStore configures WAL before checking the schema. Prepare
+            # only the clone now, so a refused reader has no profile to change.
+            assert source_db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+            assert clone_db.execute('PRAGMA journal_mode=WAL').fetchone()[0] == 'wal'
+    assert private_inspection_file(root, original) == original_identity
+
+
+def invoke_snapshot_inspector(helper, root, mode, existence, env, clone, log, refusal):
+    args = [str(helper), str(root), mode, '--inspect', existence,
+            '--inspection-database', str(clone)]
+    if refusal:
+        result = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        log.write_bytes(result.stdout)
+        return result
+    with log.open('w') as stream:
+        return run(args, env=env, stdout=stream, stderr=subprocess.STDOUT)
+
+
+def inspect_saved_snapshot(helper, root, mode, existence, env, label, *, refusal=False):
+    if 'CAGENTS_AGENT_AUTHORITY' in os.environ or 'CAGENTS_AGENT_AUTHORITY' in env:
+        raise RuntimeError('Inherited caller authority is present; inspection refused')
+    original = Path((root / 'database-path').read_text())
+    kind = 'refusal' if refusal else 'typed'
+    clone = root / 'inspection' / (kind + '.sqlite3')
+    prefix = label + '-' + kind + '-inspection'
+    log = out / (label + ('-v13-reader-refusal.log' if refusal else '-typed-persistence.log'))
+    snapshots, audit_errors = {}, []
+    audit = {'kind': kind, 'helper': str(helper), 'helper_sha256': digest(helper),
+             'original': str(original), 'clone': str(clone), 'environment_changed': False,
+             'argv': [str(helper), str(root), mode, '--inspect', existence, '--inspection-database', str(clone)],
+             'snapshot_transport': 'SQLite mode=ro source backup; clone-only WAL profile preparation before clone-before receipt. Source must already use WAL; user_version is never changed.',
+             'root_argument': str(root), 'scope': 'Original SQLite reads and backup are read-only. Typed decoding opens a fresh writable clone; its exact startup writes are audited.'}
+    result = None
+    try:
+        snapshots['original-before'] = inspection_database_snapshot(root, original, out / (prefix + '-original-before.sql'))
+        create_inspection_clone(root, original, clone)
+        snapshots['clone-before'] = inspection_database_snapshot(root, clone, out / (prefix + '-clone-before.sql'))
+        before, copied = snapshots['original-before'], snapshots['clone-before']
+        assert copied['sql'] == before['sql'] and copied['schema'] == before['schema']
+        assert all(copied['pragmas'][name] == before['pragmas'][name]
+                   for name in ('user_version', 'application_id', 'journal_mode'))
+        assert copied['identity']['path'] != before['identity']['path']
+        assert (copied['identity']['device'], copied['identity']['inode']) != (before['identity']['device'], before['identity']['inode'])
+        if refusal:
+            assert copied['pragmas']['user_version'] == 14
+        audit['invocation_started_unix_ms'] = time.time_ns() // 1_000_000
+        result = invoke_snapshot_inspector(helper, root, mode, existence, env, clone, log, refusal)
+        audit['invocation_finished_unix_ms'] = time.time_ns() // 1_000_000
+        audit['exit_code'] = result.returncode
+        if refusal:
+            assert result.returncode != 0 and b'UnsupportedSchema' in result.stdout
+            assert re.search(rb'(?m)^Error: UnsupportedSchema \{ found: 14, supported: 13 \}\r?$', result.stdout)
+        else:
+            assert result.returncode == 0
+    finally:
+        operation_error = sys.exc_info()[1]
+        audit.setdefault('invocation_finished_unix_ms', time.time_ns() // 1_000_000)
+        if operation_error is not None:
+            audit['operation_error'] = {'type': type(operation_error).__name__, 'message': str(operation_error)}
+            if isinstance(operation_error, subprocess.CalledProcessError):
+                audit['exit_code'] = operation_error.returncode
+        for name, path in [('clone-after', clone), ('original-after', original)]:
+            try:
+                snapshots[name] = inspection_database_snapshot(root, path, out / (prefix + '-' + name + '.sql'))
+            except BaseException as error:
+                audit_errors.append(name + ': ' + repr(error))
+        try:
+            before, after = snapshots['original-before'], snapshots['original-after']
+            (out / (prefix + '-original-delta.diff')).write_text(''.join(difflib.unified_diff(
+                [line + '\n' for line in before['sql']], [line + '\n' for line in after['sql']],
+                fromfile='original-before.sql', tofile='original-after.sql')))
+            assert before['sql'] == after['sql'], 'Original SQL changed'
+            assert before['identity'] == after['identity'], 'Original file/hash/inode changed'
+            assert before['schema'] == after['schema'] and before['pragmas'] == after['pragmas'], 'Original schema/header changed'
+        except BaseException as error:
+            audit_errors.append('original immutability: ' + repr(error))
+        if 'clone-before' in snapshots and 'clone-after' in snapshots:
+            before, after = snapshots['clone-before'], snapshots['clone-after']
+            (out / (prefix + '-clone-delta.diff')).write_text(''.join(difflib.unified_diff(
+                [line + '\n' for line in before['sql']], [line + '\n' for line in after['sql']],
+                fromfile='clone-before.sql', tofile='clone-after.sql')))
+            try:
+                assert before['schema'] == after['schema'] and before['pragmas'] == after['pragmas'], 'Clone schema/header changed'
+                assert all(before['identity'][key] == after['identity'][key]
+                           for key in ('path', 'device', 'inode', 'uid', 'mode', 'links')), 'Clone identity changed'
+                if refusal:
+                    assert before['sql'] == after['sql'] and before['identity'] == after['identity'], 'Refusal clone changed'
+                else:
+                    expected = before['metadata'].copy()
+                    assert expected['last_boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'Inspection boot changed'
+                    startup = after['metadata']['last_startup_unix_ms']
+                    assert isinstance(startup, str) and startup.isascii() and startup.isdecimal()
+                    assert audit['invocation_started_unix_ms'] <= int(startup) <= audit['invocation_finished_unix_ms']
+                    assert expected['clean_shutdown'] in ('0', '1')
+                    expected.update(clean_shutdown='0', last_startup_unix_ms=startup)
+                    assert after['metadata'] == expected, 'Unexpected clone metadata normalization'
+                    assert {key: rows for key, rows in before['tables'].items() if key != 'metadata'} == {
+                        key: rows for key, rows in after['tables'].items() if key != 'metadata'}, 'Clone payload/card normalization'
+            except BaseException as error:
+                audit_errors.append('clone audit: ' + repr(error))
+        audit['snapshots'] = {name: {key: value for key, value in snapshot.items() if key not in ('sql', 'tables')}
+                              for name, snapshot in snapshots.items()}
+        audit['errors'] = audit_errors
+        audit['outcome'] = 'failed' if operation_error is not None or audit_errors else 'complete'
+        (out / (prefix + '.json')).write_text(json.dumps(audit, indent=2) + '\n')
+        if audit_errors:
+            raise RuntimeError('Private inspection snapshot audit failed: ' + '; '.join(audit_errors)) from operation_error
 
 
 def tree(pid):
@@ -958,12 +1128,7 @@ try:
                 stop(ui)
                 stop(fixture)
                 assert icon_config.read_text() == '\"Adwaita\"\n'
-                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
-                    before_rows = list(db.iterdump())
-                with (out / (label + '-typed-persistence.log')).open('w') as log:
-                    run([str(helper), str(root), mode, '--inspect', 'open'], env=env, stdout=log, stderr=subprocess.STDOUT)
-                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
-                    assert list(db.iterdump()) == before_rows
+                inspect_saved_snapshot(helper, root, mode, 'open', env, label)
                 events = receipt.read_text()
                 assert 'UNEXPECTED-' not in events
                 assert events.splitlines().count('composition-ranked-response-delivered') == 1
@@ -1006,16 +1171,8 @@ try:
                 stop(ui)
                 stop(fixture)
                 assert icon_config.read_text() == '"Adwaita"\n'
-                with (out / (label + '-typed-persistence.log')).open('w') as log:
-                    run([str(helper), str(root), mode, '--inspect', 'open'], env=env, stdout=log, stderr=subprocess.STDOUT)
-                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
-                    before_rows = list(db.iterdump())
-                old_reader = subprocess.run([str(base / 'before-fixture'), str(root), mode, '--inspect', 'open'],
-                                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
-                (out / (label + '-v13-reader-refusal.log')).write_bytes(old_reader.stdout)
-                assert old_reader.returncode != 0 and b'UnsupportedSchema' in old_reader.stdout
-                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
-                    assert list(db.iterdump()) == before_rows
+                inspect_saved_snapshot(helper, root, mode, 'open', env, label)
+                inspect_saved_snapshot(base / 'before-fixture', root, mode, 'open', env, label, refusal=True)
                 events = receipt.read_text()
                 assert 'UNEXPECTED-' not in events
                 assert events.splitlines().count('composition-ranked-response-delivered') == 1
@@ -1140,8 +1297,7 @@ try:
                 stop(ui)
                 stop(fixture)
                 assert icon_config.read_text() == '"Adwaita"\n'
-                with (out / (label + '-typed-persistence.log')).open('w') as log:
-                    run([str(helper), str(root), mode, '--inspect', 'closed'], env=env, stdout=log, stderr=subprocess.STDOUT)
+                inspect_saved_snapshot(helper, root, mode, 'closed', env, label)
                 events = receipt.read_text()
                 assert 'UNEXPECTED-' not in events
                 assert events.splitlines().count('healthy-attach-requested') == 1
@@ -1503,8 +1659,7 @@ try:
             stop(fixture)
             assert icon_config.read_text() == '"Adwaita"\n', 'Private icon setting changed during native interaction'
             expected_existence = 'closed' if variant == 'after' and (mode == 'closed' or ordinary) else 'open'
-            with (out / (label + '-typed-persistence.log')).open('w') as log:
-                run([str(helper), str(root), mode, '--inspect', expected_existence], env=env, stdout=log, stderr=subprocess.STDOUT)
+            inspect_saved_snapshot(helper, root, mode, expected_existence, env, label)
             database = Path((root / 'database-path').read_text())
             assert database.is_relative_to(root)
             if variant == 'after':
@@ -1513,13 +1668,7 @@ try:
                     marker = json.loads(db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()[0])
                     bad_id = '00000000-0000-4000-8000-000000004922'
                     assert (bad_id in marker) == (hidden or ordinary or mode != 'stale' or payload != 'short')
-                    before_rows = list(db.iterdump())
-                old_reader = subprocess.run([str(base / 'before-fixture'), str(root), mode, '--inspect', expected_existence],
-                                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
-                (out / (label + '-v13-reader-refusal.log')).write_bytes(old_reader.stdout)
-                assert old_reader.returncode != 0 and b'UnsupportedSchema' in old_reader.stdout
-                with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as db:
-                    assert list(db.iterdump()) == before_rows
+                inspect_saved_snapshot(base / 'before-fixture', root, mode, expected_existence, env, label, refusal=True)
             events = receipt.read_text()
             (out / (label + '-receipts.txt')).write_text(events)
             assert 'UNEXPECTED-' not in events, '\n'.join(
