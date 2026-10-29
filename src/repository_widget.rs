@@ -1217,12 +1217,8 @@ impl EditorDocument {
         Some(self.lsp_version)
     }
 
-    /// Installs a whole new buffer text and brings the derived editor state
-    /// with it.
-    ///
-    /// Used where the result is computed as text rather than as editor
-    /// actions — applying a completion — which the widget's `Content` has no
-    /// other way to express.
+    /// Replaces a test fixture's buffer without preserving its edit history.
+    #[cfg(test)]
     fn replace_text(&mut self, text: &str) {
         self.content = text_editor::Content::with_text(text);
         // The positions the history recorded address the buffer that was
@@ -4678,6 +4674,8 @@ impl RepositoryRuntime {
         // as one transition per edit it happened to decompose into.
         let version = document.bump_lsp_version();
         let before = document.content.cursor();
+        let original = document.content.text_snapshot();
+        let scroll = document.content.scroll_position();
         let changes = document.splice(
             &text,
             edits
@@ -4685,9 +4683,31 @@ impl RepositoryRuntime {
                 .rev()
                 .map(|(span, new_text, _)| (span.clone(), *new_text)),
         );
-        if changes.is_none() {
-            document.replace_text(&updated);
-        }
+        let rebuilt = changes.is_none();
+        let changes = changes.unwrap_or_else(|| {
+            let content = text_editor::Content::with_text(&updated);
+            // The failed splice may already have changed later ranges. Its
+            // undo operand must be the original native topology, including
+            // adjacent endings that reparsing the same bytes would regroup.
+            let breaks = |snapshot: &text_editor::TextSnapshot| {
+                (1..snapshot.line_count())
+                    .map(|line| {
+                        snapshot
+                            .byte_offset(text_editor::Position { line, column: 0 })
+                            .expect("snapshot line has a byte offset")
+                    })
+                    .collect()
+            };
+            let change = TextChange {
+                start: text_editor::Position { line: 0, column: 0 },
+                removed: text,
+                inserted: updated.clone(),
+                removed_breaks: breaks(&original),
+                inserted_breaks: breaks(&content.text_snapshot()),
+            };
+            document.content = content;
+            vec![change]
+        });
         debug_assert_eq!(document.content.text(), updated);
         // Resolved against the edited buffer, so the caret lands where the
         // editor now believes that offset to be.
@@ -4696,16 +4716,14 @@ impl RepositoryRuntime {
             position,
             selection: None,
         });
-        if let Some(changes) = changes {
-            // One step, like the one choice the user made.
-            document.history.record_group(
-                changes,
-                before,
-                document.content.cursor(),
-                Instant::now(),
-            );
-            document.text_changed();
+        if rebuilt {
+            document.content.restore_scroll_position(scroll);
         }
+        // One step, like the one choice the user made, including a rebuild.
+        document
+            .history
+            .record_group(changes, before, document.content.cursor(), Instant::now());
+        document.text_changed();
         if let Some(version) = version {
             self.lsp_edits_exact &= incremental;
             // Recorded highest-range-first, the order they were applied in:
@@ -19151,6 +19169,11 @@ mod tests {
             let card = CardId::new();
             let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\n\rb");
             drop(runtime.take_lsp_intents());
+            assert!(runtime.move_cursor_to(LspPosition::new(2, 1)));
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!();
+            };
+            let before = document.content.cursor();
             let replacement = completion_edit(
                 LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 1)),
                 "B",
@@ -19177,6 +19200,7 @@ mod tests {
             let DocumentState::Editable(document) = &runtime.document else {
                 unreachable!();
             };
+            let after = document.content.cursor();
             assert_eq!(
                 document
                     .content
@@ -19193,6 +19217,189 @@ mod tests {
                 }],
                 "one accepted completion publishes the actual edited source"
             );
+            drop(runtime.take_lsp_edits());
+            for (redo, version, source, cursor, dirty) in [
+                (false, 3, "a\n\rb", before, false),
+                (true, 4, expected, after, true),
+            ] {
+                drop(runtime.update(if redo {
+                    RepositoryAction::Redo { card }
+                } else {
+                    RepositoryAction::Undo { card }
+                }));
+                assert_eq!(buffer_text(&runtime), source);
+                assert_eq!(lsp_version(&runtime), version);
+                assert_eq!(runtime.is_dirty(), dirty);
+                let DocumentState::Editable(document) = &runtime.document else {
+                    unreachable!();
+                };
+                assert_eq!(document.content.cursor(), cursor);
+                assert_eq!(
+                    runtime.take_lsp_intents(),
+                    vec![LspIntent::Change {
+                        version,
+                        text: source.into(),
+                    }]
+                );
+                assert!(runtime.take_lsp_edits().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_completion_fallback_preserves_prior_history_and_native_line_topology() {
+        fn native_lines(
+            source: &text_editor::TextSnapshot,
+        ) -> Vec<(String, text_editor::LineEnding)> {
+            (0..source.line_count())
+                .map(|index| {
+                    let line = source.line(index).unwrap();
+                    (line.text.into_owned(), line.ending)
+                })
+                .collect()
+        }
+
+        for empty_line_primary in [false, true] {
+            for noncanonical in [false, true] {
+                let card = CardId::new();
+                let (initial, original, expected) = if noncanonical {
+                    ("a\n\rb\nc\rX\nd", "a\n\rb\nc\r\nd", "a\nX\rB\nc\r\nd")
+                } else {
+                    ("a\n\rb", "pa\n\rb", "pa\nX\rB")
+                };
+                let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, initial);
+                drop(runtime.take_lsp_intents());
+                assert!(runtime.move_cursor_to(if noncanonical {
+                    LspPosition::new(4, 0)
+                } else {
+                    LspPosition::new(0, 0)
+                }));
+                let DocumentState::Editable(document) = &runtime.document else {
+                    unreachable!();
+                };
+                let initial_cursor = document.content.cursor();
+                let initial_lines = native_lines(&document.content.text_snapshot());
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(if noncanonical {
+                        text_editor::Edit::Delete
+                    } else {
+                        text_editor::Edit::Insert('p')
+                    }),
+                }));
+                assert_eq!(buffer_text(&runtime), original);
+                assert_eq!(lsp_version(&runtime), 2);
+                assert_eq!(
+                    runtime.take_lsp_intents(),
+                    vec![LspIntent::Change {
+                        version: 2,
+                        text: original.into(),
+                    }]
+                );
+                drop(runtime.take_lsp_edits());
+                let DocumentState::Editable(document) = &mut runtime.document else {
+                    unreachable!();
+                };
+                let before = document.content.cursor();
+                let original_lines = native_lines(&document.content.text_snapshot());
+                if noncanonical {
+                    assert_eq!(original_lines[2], ("c".into(), text_editor::LineEnding::Cr));
+                    assert_eq!(
+                        original_lines[3],
+                        (String::new(), text_editor::LineEnding::Lf)
+                    );
+                }
+                let scroll = text_editor::ScrollPosition {
+                    line: 1,
+                    vertical: 2.0,
+                    horizontal: 7.0,
+                };
+                document.content.restore_scroll_position(scroll);
+                let replacement = completion_edit(
+                    LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 1)),
+                    "B",
+                );
+                let insertion = completion_edit(
+                    LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                    "X",
+                );
+                let (primary, additional) = if empty_line_primary {
+                    (insertion, replacement)
+                } else {
+                    (replacement, insertion)
+                };
+                runtime.set_editor_completions(vec![completion_item(primary, vec![additional])]);
+                let target = runtime.editor_completion_targets(card).remove(0);
+                assert!(runtime.apply_completion_target(card, &target));
+                assert_eq!(buffer_text(&runtime), expected);
+                assert_eq!(lsp_version(&runtime), 3);
+                assert_eq!(document_revision(&runtime), 2);
+                assert_eq!(
+                    runtime.take_lsp_intents(),
+                    vec![LspIntent::Change {
+                        version: 3,
+                        text: expected.into(),
+                    }]
+                );
+                drop(runtime.take_lsp_edits());
+                let DocumentState::Editable(document) = &runtime.document else {
+                    unreachable!();
+                };
+                let after = document.content.cursor();
+                let final_lines = native_lines(&document.content.text_snapshot());
+                assert_eq!(document.content.scroll_position(), scroll);
+                let caret = if empty_line_primary {
+                    LspPosition::new(1, 1)
+                } else {
+                    LspPosition::new(2, 1)
+                };
+                assert_eq!(runtime.cursor_position(), Some(caret));
+                let caret_offset =
+                    usize::from(!noncanonical) + if empty_line_primary { 3 } else { 5 };
+                assert_eq!(
+                    document.content.text_snapshot().byte_offset(after.position),
+                    Some(caret_offset)
+                );
+
+                for (redo, version, source, cursor, lines, dirty) in [
+                    (false, 4, original, before, &original_lines, true),
+                    (false, 5, initial, initial_cursor, &initial_lines, false),
+                    (true, 6, original, before, &original_lines, true),
+                    (true, 7, expected, after, &final_lines, true),
+                ] {
+                    drop(runtime.update(if redo {
+                        RepositoryAction::Redo { card }
+                    } else {
+                        RepositoryAction::Undo { card }
+                    }));
+                    assert_eq!(buffer_text(&runtime), source);
+                    assert_eq!(lsp_version(&runtime), version);
+                    assert_eq!(
+                        document_revision(&runtime),
+                        u64::try_from(version - 1).unwrap()
+                    );
+                    assert_eq!(runtime.is_dirty(), dirty);
+                    let DocumentState::Editable(document) = &runtime.document else {
+                        unreachable!();
+                    };
+                    assert_eq!(document.content.cursor(), cursor);
+                    assert_eq!(native_lines(&document.content.text_snapshot()), *lines);
+                    let intents = runtime.take_lsp_intents();
+                    let [
+                        LspIntent::Change {
+                            version: published,
+                            text: LspChangeText::Snapshot(snapshot),
+                        },
+                    ] = intents.as_slice()
+                    else {
+                        panic!("replay publishes the actual native source");
+                    };
+                    assert_eq!(*published, version);
+                    assert_eq!(snapshot.text().as_ref(), source);
+                    assert_eq!(native_lines(snapshot), *lines);
+                    drop(runtime.take_lsp_edits());
+                }
+            }
         }
     }
 
