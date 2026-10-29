@@ -1,0 +1,308 @@
+name: Research exact close and save corrections
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/qualify-close-save-corrections.yml
+      - research/close-save-corrections/manifest.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-close-save-corrections-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.93.0
+
+jobs:
+  qualify:
+    if: >-
+      github.event.pull_request.head.ref == 'research/close-save-corrections-qualification-b9' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Sequential exact UI and HOST corrections
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require natural hosted User context and initialize evidence
+        run: |
+          set -euo pipefail
+          evidence_root="$RUNNER_TEMP/close-save-corrections-evidence"
+          install -d -m 700 "$evidence_root"
+          printf '%s\n' "CLOSE_SAVE_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "close-save-corrections-evidence"
+          present = sorted(name for name in os.environ if name.startswith("CAGENTS_"))
+          (root / "context.json").write_text(json.dumps({
+              "hosted": os.environ.get("GITHUB_ACTIONS") == "true",
+              "inherited_cagents_names": present,
+              "policy": "Presence only; no values inspected, removed or replaced."
+          }, indent=2) + "\n")
+          if os.environ.get("GITHUB_ACTIONS") != "true" or present:
+              print("Natural hosted User context required; present names: " + ", ".join(present), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Check out the exact research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out the pinned main setup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: b855d789f2609cf16870951b5e92914f66843fc4
+          path: setup-main
+          persist-credentials: false
+
+      - name: Check out corrected PR 1627
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 6eadcfb540183c48f06f3dfc891c194e74c6f48a
+          path: product-1627
+          persist-credentials: false
+
+      - name: Check out corrected PR 1726
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 59f6a9c84f02891a8cc6e6642701074cad92763a
+          path: product-1726
+          persist-credentials: false
+
+      - name: Check out corrected PR 1912
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 8717b0e3f3187a958e1c480fed93fed16d0673fd
+          path: product-1912
+          persist-credentials: false
+
+      - name: Verify every literal source and setup before compilation
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["CLOSE_SAVE_EVIDENCE_ROOT"])
+          manifest_path = workspace / "research/research/close-save-corrections/manifest.json"
+          manifest = json.loads(manifest_path.read_text())
+          shutil.copyfile(manifest_path, evidence / "manifest.json")
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def source(root, head, tree):
+              result = {"head": git(root, "rev-parse", "HEAD"), "tree": git(root, "rev-parse", "HEAD^{tree}"),
+                        "status": git(root, "status", "--porcelain=v1", "--untracked-files=all")}
+              assert result == {"head": head, "tree": tree, "status": ""}, result
+              assert not any(line.startswith("160000 ") for line in git(root, "ls-files", "--stage").splitlines()), "unexpected submodule"
+              return result
+          control = workspace / "research"
+          assert git(control, "rev-parse", "HEAD") == os.environ["EXPECTED_CONTROL_SHA"]
+          assert git(control, "status", "--porcelain=v1", "--untracked-files=all") == ""
+          records = {"control_head": git(control, "rev-parse", "HEAD"),
+                     "control_tree": git(control, "rev-parse", "HEAD^{tree}"),
+                     "workflow_sha256": hashlib.sha256((control / ".github/workflows/qualify-close-save-corrections.yml").read_bytes()).hexdigest(),
+                     "setup": source(workspace / "setup-main", manifest["setup_head"], manifest["setup_tree"]),
+                     "products": {}}
+          action = workspace / "setup-main/.github/actions/setup-linux-build/action.yml"
+          assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
+          assert manifest["never_merge"] is True
+          assert [p["pr"] for p in manifest["products"]] == [1627, 1726, 1912]
+          assert sum(len(p["selectors"]) for p in manifest["products"]) == 15
+          assert len({selector for p in manifest["products"] for selector in p["selectors"]}) == 15
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = source(root, product["head"], product["tree"])
+              paths = ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/modules.rs", *product["source_paths"]]
+              record["source_sha256"] = {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
+              records["products"][str(product["pr"])] = record
+          (evidence / "sources-before.json").write_text(json.dumps(records, indent=2) + "\n")
+          PY
+
+      - name: Install the pinned main Linux Rust and Zig setup
+        uses: ./setup-main/.github/actions/setup-linux-build
+
+      - name: Retain the pinned build tools
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            clang --version
+            git --version
+            timeout --version
+          } > "$CLOSE_SAVE_EVIDENCE_ROOT/tools.txt"
+
+      - name: Sequentially check and run only the exact owning parents
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, subprocess, tempfile, time
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["CLOSE_SAVE_EVIDENCE_ROOT"])
+          manifest = json.loads((evidence / "manifest.json").read_text())
+          results = []
+          products = []
+          class ProductFailure(RuntimeError):
+              def __init__(self, label, message):
+                  self.label = label
+                  super().__init__(message)
+          def put(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n")
+          def result(global_error=None):
+              if global_error is not None:
+                  for product in products:
+                      if product["status"] == "running":
+                          product.update(status="stopped_globally", unrun_selector_invocations=None)
+              passed = len(products) == len(manifest["products"]) and all(product["status"] == "passed" for product in products)
+              value = {"narrow_qualification": "passed" if passed and global_error is None else "failed",
+                       "stopped_globally": global_error is not None, "error": global_error,
+                       "completed_phases": len(results), "products": products,
+                       "unattempted_products": [product["pr"] for product in manifest["products"] if product["pr"] not in {item["pr"] for item in products}],
+                       "qualified_parent_count": sum(len(product["qualified_parents"]) for product in products),
+                       "requested_parent_count": sum(len(product["selectors"]) for product in manifest["products"]),
+                       "limits": manifest["limits"]}
+              put(evidence / "result.json", value)
+              return value
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def verify(root, product):
+              assert git(root, "rev-parse", "HEAD") == product["head"]
+              assert git(root, "rev-parse", "HEAD^{tree}") == product["tree"]
+              assert git(root, "status", "--porcelain=v1", "--untracked-files=all") == ""
+          def phase(product, label, command, env, selector=None):
+              root = workspace / ("product-" + str(product["pr"]))
+              verify(root, product)
+              output = evidence / (str(product["pr"]) + "-" + label)
+              output.mkdir()
+              bounded = ["timeout", "--signal=TERM", "--kill-after=30s", "2700s", *command]
+              record = {"source": product, "label": label, "selector": selector, "cwd": str(root), "command": command,
+                        "bounded_command": bounded, "command_bound_seconds": 2700,
+                        "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "status": "running", "fixture_root": env["TMPDIR"],
+                        "target_dir": env["CARGO_TARGET_DIR"],
+                        "completion_scope": "GNU timeout wrapper/direct wait only; no detached-family closure claim."}
+              put(output / "command.json", record)
+              print("START", product["pr"], label, flush=True)
+              start = time.monotonic()
+              with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
+                  completed = subprocess.run(bounded, cwd=root, env=env, stdout=stdout, stderr=stderr)
+              status = completed.returncode
+              record.update(status="returned", wrapper_exit=status, direct_wait_complete=True,
+                            wall_seconds=time.monotonic() - start)
+              record["command_exit"] = status if 0 <= status < 124 else None
+              record["timeout_or_wrapper_failure"] = status >= 124 or status < 0
+              record["stdout_sha256"] = hashlib.sha256((output / "stdout.log").read_bytes()).hexdigest()
+              record["stderr_sha256"] = hashlib.sha256((output / "stderr.log").read_bytes()).hexdigest()
+              put(output / "command.json", record)
+              (output / "exit.txt").write_text(str(status) + "\n")
+              results.append(record)
+              put(evidence / "phases.json", results)
+              print("RETURN", product["pr"], label, "exit", status, flush=True)
+              verify(root, product)
+              if record["timeout_or_wrapper_failure"]:
+                  raise RuntimeError(f"PR {product['pr']} {label}: uncertain timeout/signal/wrapper outcome; stop globally")
+              if status != 0:
+                  raise ProductFailure(label, f"PR {product['pr']} {label} failed with exit {status}; preserve original logs, no retry")
+              if selector:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^test (\S+) \.\.\. ok$", text, re.M)
+                  summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
+                  if names != [selector] or summaries != [("ok", "1", "0", "0")]:
+                      raise ProductFailure(label, f"Exact-parent oracle failed: selector={selector}, names={names}, summaries={summaries}")
+                  put(output / "exact-parent.json", {"selector": selector, "passed": 1, "failed": 0, "ignored": 0})
+          try:
+              assert not any(name.startswith("CAGENTS_") for name in os.environ)
+              for product in manifest["products"]:
+                  assert product["feature"] in ("ui", "host")
+                  assert product["binary"] == ("cagents-ui" if product["feature"] == "ui" else "cagentsd")
+                  fixture = pathlib.Path(tempfile.mkdtemp(prefix="cs", dir="/tmp"))
+                  fixture.chmod(0o700)
+                  env = os.environ.copy()
+                  env["TMPDIR"] = str(fixture)
+                  for key, leaf in [("XDG_RUNTIME_DIR", "run"), ("XDG_DATA_HOME", "data"),
+                                    ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"),
+                                    ("XDG_STATE_HOME", "state")]:
+                      directory = fixture / leaf
+                      directory.mkdir(mode=0o700)
+                      env[key] = str(directory)
+                  env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("close-save-target-" + product["feature"]))
+                  env["CARGO_BUILD_JOBS"] = "2"
+                  outcome = {"pr": product["pr"], "head": product["head"], "status": "running",
+                             "check": "unrun", "qualified_parents": [],
+                             "unrun_selector_invocations": list(product["selectors"])}
+                  products.append(outcome)
+                  result()
+                  try:
+                      outcome["check"] = "running"
+                      phase(product, "check", ["cargo", "check", "--locked", "--no-default-features",
+                            "--features", product["feature"], "--bin", product["binary"]], env)
+                      outcome["check"] = "passed"
+                      for index, selector in enumerate(product["selectors"], 1):
+                          outcome["unrun_selector_invocations"].remove(selector)
+                          phase(product, f"parent-{index}", ["cargo", "test", "--locked", "--no-default-features",
+                                "--features", product["feature"], "--lib", selector, "--",
+                                "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
+                          outcome["qualified_parents"].append(selector)
+                      outcome["status"] = "passed"
+                  except ProductFailure as error:
+                      outcome.update(status="failed", failed_phase=error.label, error=str(error))
+                      if error.label == "check":
+                          outcome["check"] = "failed"
+                      print("PRODUCT FAILED", product["pr"], str(error), flush=True)
+                  result()
+          except BaseException as error:
+              result(global_error=str(error))
+              raise
+          if result()["narrow_qualification"] != "passed":
+              raise SystemExit(1)
+          PY
+
+      - name: Retain final source state even after a failed phase
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "close-save-corrections-evidence"
+          evidence.mkdir(mode=0o700, exist_ok=True)
+          expected = evidence / "manifest.json"
+          if not expected.exists():
+              (evidence / "sources-after.json").write_text(json.dumps({"audit": "unavailable before source preflight"}) + "\n")
+              raise SystemExit(0)
+          manifest = json.loads(expected.read_text())
+          records, failures = {}, []
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = {}
+              for label, args in [("head", ["rev-parse", "HEAD"]), ("tree", ["rev-parse", "HEAD^{tree}"]),
+                                  ("status", ["status", "--porcelain=v1", "--untracked-files=all"])]:
+                  result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), *args], capture_output=True, text=True)
+                  record[label] = {"exit": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr}
+              records[str(product["pr"])] = record
+              if any(item["exit"] != 0 for item in record.values()) or record["head"]["stdout"] != product["head"] or record["tree"]["stdout"] != product["tree"] or record["status"]["stdout"]:
+                  failures.append(product["pr"])
+          (evidence / "sources-after.json").write_text(json.dumps({"products": records, "failures": failures}, indent=2) + "\n")
+          assert not failures, failures
+          PY
+
+      - name: Retain original raw qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: close-save-corrections-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/close-save-corrections-evidence/
+          if-no-files-found: error
+          retention-days: 14

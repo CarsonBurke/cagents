@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "never_merge": true,
+  "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+  "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "products": [
+    {
+      "pr": 1627,
+      "head": "6eadcfb540183c48f06f3dfc891c194e74c6f48a",
+      "tree": "f6ef3b56065f695d479cf7aa6016bc8fc9f465da",
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "host::chat::native_recovery::paired_projection_tests::failed_reattachment_keeps_original_provider_exit_diagnostic"
+      ],
+      "source_paths": [
+        "src/host/mod.rs",
+        "src/host/chat.rs",
+        "src/host/chat/native_recovery.rs",
+        "src/host/chat/native_recovery/paired_projection_tests.rs",
+        "src/chat/runtime.rs",
+        "src/chat/native_holder/transport.rs",
+        "src/daemon/holder_registry.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "The selected parent self-execs the same test ELF in a private /var/tmp fixture with its existing 90-second outer bound. An offline same-ELF Codex protocol peer intentionally exits 7; native/terminal holder and /bin/cat pair lifecycle roles remain internal fixture processes. No separate cagentsd helper is consumed. Child results and injected provider exit are not additional selected parents. No commercial provider is launched."
+    },
+    {
+      "pr": 1726,
+      "head": "59f6a9c84f02891a8cc6e6642701074cad92763a",
+      "tree": "26d7c4a16d1065f5e7d440adb40b4a3d35c39d19",
+      "feature": "ui",
+      "binary": "cagents-ui",
+      "selectors": [
+        "app::tests::older_settings_success_preserves_final_close_error_and_same_value_retry",
+        "app::tests::cancelled_window_close_settles_only_original_settings_owner",
+        "app::tests::window_close_updater_commit_waits_for_current_final_save",
+        "app::shared_views::tests::a_reported_title_awaiting_its_save_survives_shared_view_edits",
+        "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save"
+      ],
+      "source_paths": [
+        "src/app.rs",
+        "src/app/shared_views.rs",
+        "src/settings.rs",
+        "src/persistence.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "Direct headless app reducers and temporary Settings/SQLite stores; synthetic pane descriptors and dropped engine futures do not launch a native window, terminal, provider or executable helper. The source is an independently reviewed deliberate composition with one resolved shared_views.rs conflict, preserving reported titles and no-op durable allocation identity; it is not an ordinary conflict-free merge."
+    },
+    {
+      "pr": 1912,
+      "head": "8717b0e3f3187a958e1c480fed93fed16d0673fd",
+      "tree": "04ddf4dce1ff50f2eeb801718b801c2ea0292057",
+      "feature": "host",
+      "binary": "cagentsd",
+      "selectors": [
+        "chat::runtime::tests::codex_child_hydration_backfills_only_reported_nonblank_nicknames",
+        "chat::runtime::tests::codex_child_live_nickname_wins_over_delayed_hydration_and_sparse_refresh",
+        "chat::runtime::tests::codex_child_hydration_failure_or_foreign_thread_cannot_publish_a_nickname",
+        "chat::protocol::codex::tests::child_identity_uses_only_reported_nonblank_nickname_without_guessing_roles",
+        "chat::runtime::tests::codex_child_nickname_survives_sparse_refresh_and_accepts_new_reported_names",
+        "chat::runtime::tests::codex_unnamed_children_preserve_metadata_without_role_or_task_as_identity",
+        "chat::protocol::codex::tests::child_discovery_cannot_replay_active_metadata_over_idle_hydration",
+        "chat::protocol::codex::tests::proven_child_start_discovers_early_streams_and_hydration_failure_keeps_them",
+        "chat::protocol::codex::tests::paging_historical_collaboration_cannot_restart_a_finished_child"
+      ],
+      "source_paths": [
+        "src/chat.rs",
+        "src/chat/protocol.rs",
+        "src/chat/protocol/codex.rs",
+        "src/chat/runtime.rs",
+        ".cargo/config.toml"
+      ],
+      "fixture_contract": "Direct parser receive/page calls and Snapshot reduction. The runtime adapter creates an owned-listener specification without opening its unused socket or starting a process. No self-exec, executable helper, provider or socket launch is required by any selected root."
+    }
+  ],
+  "limits": [
+    "Temporary hosted research only; close without merging after retaining immutable evidence.",
+    "Three exact owning executable checks and fifteen distinct exact headless library parents only; planned counts are not execution results.",
+    "Formatting is UNRUN and not established by this workflow. Separate exact-head formatter evidence and full PR formatting gates are not waived.",
+    "No whole feature suite, native interaction, screenshots, performance, integrated-browser, commercial provider or merge acceptance. The #1627 offline self-exec lifecycle fixture is narrower than native/product acceptance.",
+    "All commands and sources run sequentially; UI and HOST remain separate invocations and target directories.",
+    "An ordinary product command or exact-parent oracle failure stops only that product and preserves aggregate failure while later independent products run serially. Context, source, configuration and uncertain timeout/signal/wrapper failures stop globally.",
+    "Qualified parent counts require the original successful command and exact one-pass oracle. Unrun selector invocations were never reached; a failed invocation may fail compilation before its parent executes, so its raw test outcome remains separate.",
+    "Natural hosted User context is required; inherited CAGENTS_ names are refused, never removed.",
+    "GNU timeout bounds each command; its wrapper return and direct completion are recorded. No detached-process census or whole-family closure is claimed.",
+    "No local build, test, provider, daemon or native execution is authorized by this research file."
+  ]
+}
