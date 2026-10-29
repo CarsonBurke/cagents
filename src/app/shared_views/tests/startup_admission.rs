@@ -2823,7 +2823,33 @@ fn ordinary_retained_repository_close_keeps_custody_without_denial_and_allows_sa
     let (mut app, active, hidden, mut pane) = fixture();
     let runtime = RepositoryRuntime::dirty_fixture(pane.id);
     pane.kind = CardKind::Repository(runtime.descriptor.clone());
-    Arc::make_mut(&mut app.durable).active_channel = Some(active);
+    let descriptor = &runtime.descriptor;
+    app.sidebar_model.projects.push(SidebarProject::new(
+        descriptor.project,
+        RepositoryId::new(),
+        "retained editor".into(),
+        descriptor.repository.clone(),
+        vec![crate::sidebar::SidebarWorktree::new(
+            crate::model::WorktreeId::new(),
+            descriptor.worktree.clone(),
+            Some("main".into()),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )],
+        vec![],
+    ));
+    for channel in &mut Arc::make_mut(&mut app.durable).channels {
+        channel.project_id = descriptor.project;
+    }
+    // Native channel entry establishes the directory and active_workspace
+    // that scope snapshots need. Merely assigning active_channel would leave
+    // an impossible active channel with no selected project directory.
+    drop(app.select_channel(active));
+    assert_eq!(app.durable.active_channel, Some(active));
+    assert_eq!(app.active_workspace, Some(descriptor.worktree.clone()));
     let mut view = View::empty(active);
     view.panes.push(pane.clone());
     drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
@@ -2838,6 +2864,16 @@ fn ordinary_retained_repository_close_keeps_custody_without_denial_and_allows_sa
     assert!(!app.pane_is_quarantined(pane.id));
     assert!(
         matches!(app.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty())
+    );
+    assert_eq!(app.workspace.focused(), Some(pane.id));
+    assert_eq!(
+        app.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == active)
+            .unwrap()
+            .focused,
+        Some(pane.id)
     );
     drop(app.update(Message::CloseCard(pane.id)));
     assert!(app.dirty_repository_close.is_some());
@@ -2854,6 +2890,15 @@ fn ordinary_retained_repository_close_keeps_custody_without_denial_and_allows_sa
     drop(app.update(Message::CommitClose(pane.id)));
     assert!(!app.card_state(pane.id).unwrap().existence.is_open());
     assert!(app.durable.local_only_cards.contains(&pane.id));
+    assert_eq!(app.workspace.focused(), None);
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|channel| channel.id == active)
+        .unwrap();
+    assert!(!channel.cards.contains(&pane.id));
+    assert_eq!(channel.focused, None);
     let full = model(
         app.workspace_model.identity,
         active,
