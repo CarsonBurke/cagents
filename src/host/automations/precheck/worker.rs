@@ -834,6 +834,8 @@ mod tests {
     #[test]
     fn unlocked_worker_without_receipt_is_never_inferred_successful() {
         let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
         let firing = Uuid::new_v4();
         let directory = root.path().join(firing.to_string());
         crate::secure_file::prepare_private_directory(&directory).unwrap();
@@ -892,6 +894,8 @@ mod tests {
 
     fn retirement_fixture() -> (tempfile::TempDir, Worker, Retirement) {
         let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
         let firing = Uuid::new_v4();
         let directory = root.path().join(firing.to_string());
         crate::secure_file::prepare_private_directory(&directory).unwrap();
@@ -1022,6 +1026,8 @@ mod tests {
     #[test]
     fn retirement_refuses_missing_legacy_and_replaced_directories() {
         let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
         let firing = Uuid::new_v4();
         let mut missing = Worker::recover(root.path(), firing, 1);
         assert!(missing.retire().is_err());
