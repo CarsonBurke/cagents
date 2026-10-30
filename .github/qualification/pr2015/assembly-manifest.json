@@ -1,0 +1,120 @@
+{
+  "schema": "issue2015-hosted-attempt1-reviewed-data-assembly/v1",
+  "kind": "DATA_ASSEMBLY_AND_HASH_CONSERVATION_NOT_INDEPENDENT_REVIEW_OR_RUNTIME_AUTHORITY",
+  "source_commit": "143555931ca118d023b6ddeb8b7071f8bde5d98c",
+  "source_tree": "730a4787d4f3d9c18dffd602212dd7b87d8cce7b",
+  "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "source_freeze": {
+    "path": "/tmp/issue2015-hosted-attempt1-source-freeze-v2.json",
+    "sha256": "2bd0c301526fd9b9190518f1f4c1a3afc800bcffc25c87e7739ba4809928109a"
+  },
+  "all42_frozen_source_sha256_unchanged": {
+    ".github/qualification/pr2015/README.md": "8b5a733fe46462fa31488f1cf731d688a3e23cd345c1306e1b03da8ed6a5986d",
+    ".github/qualification/pr2015/SHA256SUMS": "ef94e620e4cdc9100f4fdd54209e510d65775dc59ab8edc7bf0c3307938074e1",
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+    ".github/qualification/pr2015/case-select.py": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
+    ".github/qualification/pr2015/case.json": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+    ".github/qualification/pr2015/lineage/local-e3/README.md": "25934c0e4cd79ea1a96f7603c0e372164838f1fe92ea795b68d7c04d7ad6077e",
+    ".github/qualification/pr2015/lineage/local-e3/SHA256SUMS": "dca4b1a412382d09103606d274132d5ea1d15054687d2df1c37e3a65b68ab417",
+    ".github/qualification/pr2015/lineage/local-e3/command-data-6dc.json": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/cause-guard-correction-freeze.json": "9b3bb550982922098cb15695a60a30251374eadbf52ec22c421c70901f59ab33",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/command-data-independent-review.md": "b8298607a7932d0da9f2175e6a4feeb4b4f867ac65cddb8dd3cedaf1f961f928",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-controller-source-review.json": "276aa51159c327c96fb5f978211e18f3186eeb3a639638d432d115201f2d32dc",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-plan.json": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/donor-run-packet.py": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/git-policy-source.py": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-command-data-5a4.json": "feb23120adabb815ba07c657d0eade56499a78fa38fcd5f264b6c5fdb80e80db",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/historical-git-guard-HOLD.json": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-install.sh": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-install_guard.rs": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-installer_guard_contract.rs": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-installer_lifecycle_contract.rs": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-update.rs": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+    ".github/qualification/pr2015/lineage/local-e3/dependencies/product-user_fixture.rs": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+    ".github/qualification/pr2015/lineage/local-e3/donor-diff.patch": "46b5fd9a132edba3684959574175dc7679d00498e0b0373c69ad1bbe9b78cb50",
+    ".github/qualification/pr2015/lineage/local-e3/plan.json": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314",
+    ".github/qualification/pr2015/lineage/local-e3/run-packet.py": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+    ".github/qualification/pr2015/lineage/local-e3/source-conservation.json": "f3c876c9e9121366739893822fceaeb65918b9412382fccb48f3e1079c7ba924",
+    ".github/qualification/pr2015/lineage/local-e3/source-ready.json": "b4995b513f58997714c9d8fd215861241a32d43a6cb01359fa718568a04ec881",
+    ".github/qualification/pr2015/lineage/local-e3/source-review-binding.json": "2fb1b8529ee45233741c49939564ebf6259eacb29e422eb4f1c0d3a01c6e380e",
+    ".github/qualification/pr2015/lineage/local-e3-source-freeze.json": "4b1e22554562a4e12e83199541bd84dc09430ca16f85aebabb9164a982937905",
+    ".github/qualification/pr2015/lineage/main15/cache-restore-gate.py": "3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281",
+    ".github/qualification/pr2015/lineage/main15/qualify-held-scope.yml": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+    ".github/qualification/pr2015/lineage/main15/source-plan-v12r2.json": "a047be44fa464120b50b642fc68ba35e3103685c59c7a12b7c93eff7f61b3d28",
+    ".github/qualification/pr2015/lineage/published-workflow-7dc.yml": "91b11334d5c40b0b5f7c7707873f525ac8b741c4aee7f965022fc615db70800d",
+    ".github/qualification/pr2015/manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+    ".github/qualification/pr2015/plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+    ".github/qualification/pr2015/review-plan.md": "cc6720a999013a60a87014982ab6efa87cfaa9034c5cc8f2ff07fcec131d3ac3",
+    ".github/qualification/pr2015/run-packet.py": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+    ".github/qualification/pr2015/source-conservation.json": "09c3922c05ef9f6a5bb9cf7e6e3b81ccf50743297893a31044ceb64968a20ff4",
+    ".github/qualification/pr2015/source-ready.json": "769d6f79a563f0c604183b2defde37e9d6c75dd9ed6b12b89b287bac0274c690",
+    ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+    ".github/qualification/pr2015/test-original-attempt-context.py": "0906fb636fae6e0b5b7cf3795b7174e0f5540c19dcf37b24cd0cf9b1ff467cac",
+    ".github/workflows/research-pr1853-bd88.yml": "97bef99d9c141bbed508a3d9ea4b5b04904f6a92346994279ff16f4da338a181"
+  },
+  "copied_payloads_and_assembly_document": [
+    {
+      "path": ".github/qualification/pr2015/independent-review.json",
+      "sha256": "eb6fe78ace86e9e760544bb6a37d587ef33805c39ddd97f0b1c7efb66a356e2e",
+      "bytes": 8238,
+      "copied_verbatim_from": "/tmp/issue2015-hosted-attempt1-runner-independent-source-review-v2.json",
+      "label": "GENUINE_RUNNER_SCOPED_INDEPENDENT_SOURCE_REVIEW"
+    },
+    {
+      "path": ".github/qualification/pr2015/reviews/workflow-cache-attempt1-source-review.json",
+      "sha256": "bca2054a85b241763e071074b2354714f3b85e1de8a193f85b11c5edb889c178",
+      "bytes": 10208,
+      "copied_verbatim_from": "/tmp/fw16-issue2015-hosted-attempt1-14355593-scoped-source-CLEAR.json",
+      "label": "GENUINE_DISJOINT_WORKFLOW_CACHE_ADMISSION_AND_SYNTHETIC_FIXTURE_SOURCE_REVIEW"
+    },
+    {
+      "path": ".github/qualification/pr2015/evidence/synthetic-context-unit-actual/receipt.json",
+      "sha256": "4de5ae35fe9c47449e310a355e030ff286cc1d498fa5a88309acd8c0e8a11e2c",
+      "bytes": 2381,
+      "copied_verbatim_from": "/tmp/fw16-issue2015-attempt1-pure-unit-actual-ew1z_qhd/receipt.json",
+      "label": "ORIGINAL_SYNTHETIC_UNIT_EXECUTION_RECEIPT_NOT_HOSTED_OR_PRODUCT_EVIDENCE"
+    },
+    {
+      "path": ".github/qualification/pr2015/evidence/synthetic-context-unit-actual/stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "copied_verbatim_from": "/tmp/fw16-issue2015-attempt1-pure-unit-actual-ew1z_qhd/stdout.log",
+      "label": "ORIGINAL_SYNTHETIC_UNIT_STDOUT"
+    },
+    {
+      "path": ".github/qualification/pr2015/evidence/synthetic-context-unit-actual/stderr.log",
+      "sha256": "a817992c43993ea0c3ed95ebb44f3f33a4f63f9e0a7020aed73e1dab03c5cea7",
+      "bytes": 734,
+      "copied_verbatim_from": "/tmp/fw16-issue2015-attempt1-pure-unit-actual-ew1z_qhd/stderr.log",
+      "label": "ORIGINAL_SYNTHETIC_UNIT_STDERR"
+    },
+    {
+      "path": ".github/qualification/pr2015/assembly.md",
+      "sha256": "d3cc89f68266bb08d9521fd4235e8afe559d14baf727e462ae00d8219a5032b0",
+      "bytes": 2961,
+      "label": "AUTHOR_DATA_ASSEMBLY_DOCUMENT_NOT_ROOT_OR_INDEPENDENT_REVIEW"
+    }
+  ],
+  "manifest_self_hash": "Recorded externally and in new ASSEMBLY-SHA256SUMS; no self-reference",
+  "prior_v1_frozen_files_unchanged": 41,
+  "genuine_peer_reviews": "Distinct scoped original records; fields unchanged. No assembled Root review or grant asserted.",
+  "synthetic_unit_actual": {
+    "original_tool_chunk_as_supplied_by_Root": "de0e12",
+    "original_exit": 0,
+    "passing_unittest_parent_methods": 4,
+    "context_subcases_nonadditive": 17,
+    "stdout_bytes": 0,
+    "stderr_bytes": 734,
+    "scope": "Only synthetic in-memory context oracle; not owning CLI integration parents, hosted User or product execution",
+    "rerun_for_assembly": false
+  },
+  "runtime_unknown_or_unrun": [
+    "Authenticated original GitHub-hosted User/event/job/workflow/log/artifact provenance",
+    "PR1921 trusted cache visibility and existing CLI feature-empty payload",
+    "Product Cargo check, integration compilation, complete actual inventories and five owning parents",
+    "Native, provider, installed product and whole-PR behavior",
+    "External original-run C scheduling, full-job terminal/RAW/return/acceptance"
+  ],
+  "assembly_effects": "Only new data files and normal local data commit; no frozen source or existing checksum edit, controller/test/build execution, probe, publication, dispatch or external write."
+}
