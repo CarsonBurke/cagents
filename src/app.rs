@@ -38,6 +38,8 @@ mod review_request_ui;
 mod safety_tests;
 mod saved_terminal;
 mod session_recovery;
+#[cfg(test)]
+mod settings_save_feedback_order_tests;
 mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
@@ -16191,12 +16193,17 @@ impl Application for Cagents {
             Message::SettingsSaved { generation, result } => {
                 match result {
                     Ok(saved) => {
-                        if saved.generation >= self.settings_ack_generation {
+                        if saved.generation >= self.settings_ack_generation
+                            && saved.generation >= self.settings_save_generation
+                        {
                             self.settings_save_error = None;
                         }
                         self.acknowledge_settings_save(saved);
                     }
-                    Err(error) if generation >= self.settings_ack_generation => {
+                    Err(error)
+                        if generation >= self.settings_ack_generation
+                            && generation >= self.settings_save_generation =>
+                    {
                         self.status = Some(TransientNotice::warning(format!(
                             "Could not save settings: {error}"
                         )));
