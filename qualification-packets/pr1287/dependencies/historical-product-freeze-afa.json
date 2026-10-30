@@ -1,0 +1,12 @@
+{
+  "head": "afa06ba70d94e6ab4cffcd62baa747fa2047f6eb",
+  "tree": "9a247d9c2a7995fd1070ffa7664c9734916a3663",
+  "parent": "6327aacc848ebff380c466696346a4809412be54",
+  "leaves": {
+    "src/automations/archive.rs": "9c61511f486805b62413844ed38fca76837ca0fd19d993c8f75676fd3e40d6e6",
+    "src/persistence.rs": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5"
+  },
+  "correction": "real second recipe row preserves canonical transcript FK; positive after restoration",
+  "negative_preserved": "6327 source oracle FK defect, not executed runtime failure",
+  "validation": "Rust1.93 leaf/diff only; compile/tests UNRUN"
+}

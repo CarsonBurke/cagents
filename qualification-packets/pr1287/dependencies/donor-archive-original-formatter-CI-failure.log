@@ -1,0 +1,172 @@
+Script contracts	Check all formatter contracts	﻿2026-10-30T12:46:19.0097231Z ##[group]Run python3 tests/check_format.py -v
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0097619Z [36;1mpython3 tests/check_format.py -v[0m
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0118752Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0119094Z env:
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0119303Z   RUSTUP_TOOLCHAIN: 1.93.0
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0119549Z   RUSTUP_AUTO_INSTALL: 0
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0119795Z   PYTHONDONTWRITEBYTECODE: 1
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0120050Z   CARGO_NET_OFFLINE: true
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0120350Z   EXPECTED_SOURCE_SHA: 012574b856c340ac83e53795c628a70128eff399
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0120710Z   CHECK_FORMAT_CARGO_FIXTURE: 1
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.0120957Z ##[endgroup]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.2015563Z test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout (__main__.FormatCheck.test_absolute_cargo_target_keeps_formatter_cache_out_of_checkout) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:19.3001465Z test_actual_cargo_root_omission_and_explicit_include_checks (__main__.FormatCheck.test_actual_cargo_root_omission_and_explicit_include_checks) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:20.7661445Z test_cache_hit_rechecks_the_current_metadata_guard (__main__.FormatCheck.test_cache_hit_rechecks_the_current_metadata_guard) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:20.8748526Z test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) ... 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:20.8750393Z   test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=0, rustfmt=0) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:20.9825743Z   test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=0, rustfmt=1) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:21.0413687Z   test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=7, rustfmt=0) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:21.1001017Z   test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=7, rustfmt=2) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:27.4226517Z test_commented_external_paths_are_checked_after_external_file_changes (__main__.FormatCheck.test_commented_external_paths_are_checked_after_external_file_changes) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:29.1694487Z test_edit_and_restore_during_check_does_not_cache_success (__main__.FormatCheck.test_edit_and_restore_during_check_does_not_cache_success) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:29.2824205Z test_empty_cargo_target_retains_default_formatter_cache (__main__.FormatCheck.test_empty_cargo_target_retains_default_formatter_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:31.0236629Z test_external_license_templates_and_missing_toml_parser_disable_cache (__main__.FormatCheck.test_external_license_templates_and_missing_toml_parser_disable_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:32.1824925Z test_external_module_path_and_symlink_disable_cache (__main__.FormatCheck.test_external_module_path_and_symlink_disable_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:34.5058985Z test_failure_and_mid_check_source_change_never_cache_success (__main__.FormatCheck.test_failure_and_mid_check_source_change_never_cache_success) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:34.5231179Z test_formatter_library_contents_and_unverified_graphs (__main__.FormatCheck.test_formatter_library_contents_and_unverified_graphs) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:35.1162149Z test_linked_configuration_parents_disable_cache (__main__.FormatCheck.test_linked_configuration_parents_disable_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:35.1322750Z test_missing_byte_environment_preserves_ordinary_formatter_status (__main__.FormatCheck.test_missing_byte_environment_preserves_ordinary_formatter_status) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:35.7220712Z test_nested_source_config_cannot_hide_an_external_license_template (__main__.FormatCheck.test_nested_source_config_cannot_hide_an_external_license_template) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:36.3100677Z test_non_rust_module_targets_cannot_hide_an_external_path_chain (__main__.FormatCheck.test_non_rust_module_targets_cannot_hide_an_external_path_chain) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:37.4779933Z test_past_edit_restore_and_directory_churn_reuse_known_good_content (__main__.FormatCheck.test_past_edit_restore_and_directory_churn_reuse_known_good_content) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:42.8718266Z test_real_rustfmt_rechecks_commented_external_module (__main__.FormatCheck.test_real_rustfmt_rechecks_commented_external_module) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:42.9429932Z test_real_rustfmt_traversal_and_nested_fragments_without_rewrites (__main__.FormatCheck.test_real_rustfmt_traversal_and_nested_fragments_without_rewrites) ... FAIL
+Script contracts	Check all formatter contracts	2026-10-30T12:46:43.0544700Z test_relative_cargo_target_uses_checker_checkout_directory (__main__.FormatCheck.test_relative_cargo_target_uses_checker_checkout_directory) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:43.0754262Z test_rustup_proxy_key_tracks_selected_binary_contents (__main__.FormatCheck.test_rustup_proxy_key_tracks_selected_binary_contents) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:47.1227465Z test_success_cache_reuses_only_identical_sources_and_environment (__main__.FormatCheck.test_success_cache_reuses_only_identical_sources_and_environment) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:48.2927426Z test_transient_source_and_config_files_do_not_cache_success (__main__.FormatCheck.test_transient_source_and_config_files_do_not_cache_success) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:48.4013587Z test_unusable_cargo_target_preserves_formatter_failure_without_local_cache (__main__.FormatCheck.test_unusable_cargo_target_preserves_formatter_failure_without_local_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:48.4186019Z test_unverified_hardlinked_formatter_disables_cache (__main__.FormatCheck.test_unverified_hardlinked_formatter_disables_cache) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7429167Z test_xdg_config_contents_invalidate_without_environment_change (__main__.FormatCheck.test_xdg_config_contents_invalidate_without_environment_change) ... ok
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7430178Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7430362Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7431439Z FAIL: test_actual_cargo_root_omission_and_explicit_include_checks (__main__.FormatCheck.test_actual_cargo_root_omission_and_explicit_include_checks)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7432495Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7433012Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7434108Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 506, in test_actual_cargo_root_omission_and_explicit_include_checks
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7435049Z     self.exercise_included_sources(os.environ)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7435774Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 528, in exercise_included_sources
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7436637Z     self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7437451Z AssertionError: 1 != 0 : Error: file `src/app/repository_clone_lsp_ownership_tests.rs` does not exist
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7438037Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7438044Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7438229Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7439331Z FAIL: test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=0, rustfmt=0)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7440466Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7440938Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7441771Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 116, in test_checks_both_routes_and_preserves_failures_and_diagnostics
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7442599Z     self.assertEqual(
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7443732Z AssertionError: Lists differ: [['/t[163 chars]'src/app/repository_clone_lsp_ownership_tests.[199 chars]rs']] != [['/t[163 chars]'src/control/handshake_deadline_tests.rs', 'sr[148 chars]rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7444693Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7444838Z First differing element 1:
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7445333Z ['/tm[95 chars]'src/app/repository_clone_lsp_ownership_tests.[198 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7446427Z ['/tm[95 chars]'src/control/handshake_deadline_tests.rs', 'sr[147 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7446817Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7447082Z   [['/tmp/cagents-format-check-dbhtezft', 'cargo', 'fmt', '--check'],
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7447622Z    ['/tmp/cagents-format-check-dbhtezft',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7448000Z     'rustfmt',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7448261Z     '--edition',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7448533Z     '2024',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7448781Z     '--check',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7449062Z     'src/modules.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7449415Z -   'src/app/repository_clone_lsp_ownership_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7449912Z     'src/control/handshake_deadline_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7450353Z     'src/terminal/worker/bounded_input_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7451003Z     'src/host/model/views/placement_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7451401Z     'tests/support/iced_tree.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7451762Z     'tests/support/repository_scale.rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7452031Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7452199Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7453402Z FAIL: test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=0, rustfmt=1)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7454463Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7454922Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7455726Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 116, in test_checks_both_routes_and_preserves_failures_and_diagnostics
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7456576Z     self.assertEqual(
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7457514Z AssertionError: Lists differ: [['/t[163 chars]'src/app/repository_clone_lsp_ownership_tests.[199 chars]rs']] != [['/t[163 chars]'src/control/handshake_deadline_tests.rs', 'sr[148 chars]rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7458395Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7458545Z First differing element 1:
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7459022Z ['/tm[95 chars]'src/app/repository_clone_lsp_ownership_tests.[198 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7459659Z ['/tm[95 chars]'src/control/handshake_deadline_tests.rs', 'sr[147 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7460033Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7460301Z   [['/tmp/cagents-format-check-dbhtezft', 'cargo', 'fmt', '--check'],
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7460828Z    ['/tmp/cagents-format-check-dbhtezft',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7461202Z     'rustfmt',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7461465Z     '--edition',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7461726Z     '2024',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7461964Z     '--check',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7462237Z     'src/modules.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7462584Z -   'src/app/repository_clone_lsp_ownership_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7463033Z     'src/control/handshake_deadline_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7463689Z     'src/terminal/worker/bounded_input_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7464194Z     'src/host/model/views/placement_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7464648Z     'tests/support/iced_tree.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7465078Z     'tests/support/repository_scale.rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7465377Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7465549Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7466721Z FAIL: test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=7, rustfmt=0)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7467919Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7468439Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7469340Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 116, in test_checks_both_routes_and_preserves_failures_and_diagnostics
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7470212Z     self.assertEqual(
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7471267Z AssertionError: Lists differ: [['/t[163 chars]'src/app/repository_clone_lsp_ownership_tests.[199 chars]rs']] != [['/t[163 chars]'src/control/handshake_deadline_tests.rs', 'sr[148 chars]rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7472526Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7472689Z First differing element 1:
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7473399Z ['/tm[95 chars]'src/app/repository_clone_lsp_ownership_tests.[198 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7474194Z ['/tm[95 chars]'src/control/handshake_deadline_tests.rs', 'sr[147 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7474736Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7475012Z   [['/tmp/cagents-format-check-dbhtezft', 'cargo', 'fmt', '--check'],
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7475575Z    ['/tmp/cagents-format-check-dbhtezft',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7475970Z     'rustfmt',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7476250Z     '--edition',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7476518Z     '2024',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7476786Z     '--check',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7477078Z     'src/modules.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7477481Z -   'src/app/repository_clone_lsp_ownership_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7477979Z     'src/control/handshake_deadline_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7478817Z     'src/terminal/worker/bounded_input_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7479309Z     'src/host/model/views/placement_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7479734Z     'tests/support/iced_tree.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7480090Z     'tests/support/repository_scale.rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7480338Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7480491Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7481617Z FAIL: test_checks_both_routes_and_preserves_failures_and_diagnostics (__main__.FormatCheck.test_checks_both_routes_and_preserves_failures_and_diagnostics) (cargo=7, rustfmt=2)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7482833Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7510029Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7511104Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 116, in test_checks_both_routes_and_preserves_failures_and_diagnostics
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7512005Z     self.assertEqual(
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7513073Z AssertionError: Lists differ: [['/t[163 chars]'src/app/repository_clone_lsp_ownership_tests.[199 chars]rs']] != [['/t[163 chars]'src/control/handshake_deadline_tests.rs', 'sr[148 chars]rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7514230Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7514381Z First differing element 1:
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7514888Z ['/tm[95 chars]'src/app/repository_clone_lsp_ownership_tests.[198 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7515531Z ['/tm[95 chars]'src/control/handshake_deadline_tests.rs', 'sr[147 chars].rs']
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7515899Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7516149Z   [['/tmp/cagents-format-check-dbhtezft', 'cargo', 'fmt', '--check'],
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7516670Z    ['/tmp/cagents-format-check-dbhtezft',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7517098Z     'rustfmt',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7517433Z     '--edition',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7517715Z     '2024',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7517988Z     '--check',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7518300Z     'src/modules.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7518715Z -   'src/app/repository_clone_lsp_ownership_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7519266Z     'src/control/handshake_deadline_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7519776Z     'src/terminal/worker/bounded_input_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7520250Z     'src/host/model/views/placement_tests.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7520645Z     'tests/support/iced_tree.rs',
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7521059Z     'tests/support/repository_scale.rs']]
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7521346Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7521529Z ======================================================================
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7522633Z FAIL: test_real_rustfmt_traversal_and_nested_fragments_without_rewrites (__main__.FormatCheck.test_real_rustfmt_traversal_and_nested_fragments_without_rewrites)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7523926Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7524446Z Traceback (most recent call last):
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7525364Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 498, in test_real_rustfmt_traversal_and_nested_fragments_without_rewrites
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7526324Z     self.exercise_included_sources(env)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7527061Z   File "/home/runner/work/cagents/cagents/tests/check_format.py", line 528, in exercise_included_sources
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7528228Z     self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7529072Z AssertionError: 1 != 0 : Error: file `src/app/repository_clone_lsp_ownership_tests.rs` does not exist
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7529622Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7529630Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7529850Z ----------------------------------------------------------------------
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7530319Z Ran 25 tests in 31.651s
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7530532Z 
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7530662Z FAILED (failures=6)
+Script contracts	Check all formatter contracts	2026-10-30T12:46:50.7626667Z ##[error]Process completed with exit code 1.

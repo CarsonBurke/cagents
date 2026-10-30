@@ -1,0 +1,619 @@
+{
+  "prepared_only": true,
+  "status": "SOURCE_ONLY_GIT_METADATA_GUARD_CORRECTION_REVIEW_PENDING_UNGRANTED_UNRUN",
+  "product_pr": 1287,
+  "product_head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "product_tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/source-review-binding.json",
+  "source_review_sha256": "4efe030529d467eea1664bd1ee9dfc3882dfa4f273530d414d2f8b6c9f3ea4d6",
+  "source_manifest": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/source-manifest-r2.json",
+    "sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+    "original_path": "/tmp/fw16-pr1287-4fa33705-source-qualification-manifest-r2.json"
+  },
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "docs/development.md": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11",
+    "scripts/check-format": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7",
+    "src/account.rs": "2e19aa0f020724a784352664552eb809068ce3b9997378927f70b3474aae1a5f",
+    "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+    "src/automations.rs": "4150f5b7708f4f8323caf5b4bb0cb0952f311fd0eb3c2ae425522089a24417b0",
+    "src/automations/archive.rs": "9c61511f486805b62413844ed38fca76837ca0fd19d993c8f75676fd3e40d6e6",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/chat.rs": "9d6f8077828ae76282d43e6c4c8906ff9a25b232abdeb0c72b1dfbf06d25c0c8",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/model.rs": "cc4455180a27d116ff43f18ccb91e55fdf4dcc6aee43efc077df31948f270ba0",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/persistence.rs": "28cd95af1037c6a07d9481a073ae752f692bd3c358f7244f8c76c2e5fd6979fd",
+    "src/persistence/review_cache.rs": "0334113709fcb593bf1f3f722803d18fed83514a7fd069fb0d599cc65a1a6543",
+    "src/upgrade.rs": "0adfb3906287b5acabfc6c9b273766573aecfa73c10cde7ffae755da7b90757b"
+  },
+  "binary_checks": [
+    {
+      "label": "host-binary-check",
+      "artifact_group": "host-lib",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "ui-binary-check",
+      "artifact_group": "ui-lib",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "selectors": [
+        {
+          "name": "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+        "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+        "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+        "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+        "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+        "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+        "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+        "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+        "persistence::tests::migration_terminal_inventory_counts_canonical_paths_across_windows_before_decode",
+        "persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+        "persistence::tests::migration_session_inspection_refuses_future_window_schema_without_writing",
+        "persistence::tests::migration_inspection_reads_schema4_without_migrating_and_open_migrates_it",
+        "persistence::tests::migration_session_sql_bounds_all_normalized_fields_before_decoding",
+        "persistence::tests::migration_session_inspection_is_read_only_and_reconstructs_exact_terminal_and_chat_rows",
+        "persistence::tests::migration_inspection_omits_only_exact_retained_local_chat_sources",
+        "persistence::tests::migration_inspection_retained_metadata_is_bounded_and_fail_closed"
+      ],
+      "source_predicted_absent_names": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_seconds": 1200,
+      "inventory_seconds": 30,
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ]
+    },
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "selectors": [
+        {
+          "name": "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_terminal_inventory_counts_canonical_paths_across_windows_before_decode",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_session_inspection_refuses_future_window_schema_without_writing",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_inspection_reads_schema4_without_migrating_and_open_migrates_it",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_session_sql_bounds_all_normalized_fields_before_decoding",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_session_inspection_is_read_only_and_reconstructs_exact_terminal_and_chat_rows",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_inspection_omits_only_exact_retained_local_chat_sources",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "persistence::tests::migration_inspection_retained_metadata_is_bounded_and_fail_closed",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+        "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+        "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+        "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+        "persistence::tests::migration_terminal_inventory_counts_canonical_paths_across_windows_before_decode",
+        "persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode",
+        "persistence::tests::migration_session_inspection_refuses_future_window_schema_without_writing",
+        "persistence::tests::migration_inspection_reads_schema4_without_migrating_and_open_migrates_it",
+        "persistence::tests::migration_session_sql_bounds_all_normalized_fields_before_decoding",
+        "persistence::tests::migration_session_inspection_is_read_only_and_reconstructs_exact_terminal_and_chat_rows",
+        "persistence::tests::migration_inspection_omits_only_exact_retained_local_chat_sources",
+        "persistence::tests::migration_inspection_retained_metadata_is_bounded_and_fail_closed"
+      ],
+      "source_predicted_absent_names": [
+        "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+        "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+        "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+        "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_seconds": 1200,
+      "inventory_seconds": 30,
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ]
+    }
+  ],
+  "planned_phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3",
+    "parent-host-lib-4",
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12"
+  ],
+  "planned_phase_count": 22,
+  "counts": {
+    "checks": 2,
+    "lib_compilations": 2,
+    "ELF_inventories": 2,
+    "qualifying_outer_parents": 16,
+    "unique_source_parents": 16,
+    "host_assigned_outer_parents": 4,
+    "ui_assigned_outer_parents": 12,
+    "cli_assigned_outer_parents": 0,
+    "source_predicted_compiled_selected_host": 16,
+    "source_predicted_compiled_selected_ui": 12,
+    "expected_nonadditive_child_reexecutions": 0,
+    "total_phases": 22
+  },
+  "packet_deadline_seconds": 2400,
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "rust": "1.93.0",
+    "new_cache": false
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "archive_bindings": [
+    {
+      "name": "source-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/source-review-binding.json",
+      "sha256": "4efe030529d467eea1664bd1ee9dfc3882dfa4f273530d414d2f8b6c9f3ea4d6"
+    },
+    {
+      "name": "source-manifest-r2.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/source-manifest-r2.json",
+      "sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+      "original_path": "/tmp/fw16-pr1287-4fa33705-source-qualification-manifest-r2.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "script-status-companion.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/script-status-companion.json",
+      "sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-source-plan-script-status-companion.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "product-source-freeze-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/product-source-freeze-v1.json",
+      "sha256": "0a11677566724b58721a42e5d6a96636bc0d346876d21daa93667be2c7bf6f58",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-main-whole-byte-source-freeze-v1.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-source-manifest-r1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-source-manifest-r1.json",
+      "sha256": "a2a2d8dc9e1ffcaf8c0f235ef2191f33ca23cc2f75c0a7ba2e0537ac7afce2ff",
+      "original_path": "/tmp/fw16-pr1287-afa06ba7-source-qualification-manifest-r1.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "script-success-readback.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/script-success-readback.json",
+      "sha256": "1160a864c9f94eb65d549eddb1e01da97f02301661b928037a1528bc4e66f8b8",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-script-success-readback.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "donor-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-run-packet.py",
+      "sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/run-packet.py",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-plan.json",
+      "sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-README.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-README.md",
+      "sha256": "5c204c319ead757a67cd747d845df9bee7bd477e4eba333694c5adc7c1a569d1",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/README.md",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-source-conservation.json",
+      "sha256": "d4877d96b648cf2b9d38eae498d6ef211aa0d7ea46384e48ecf699ab67189adf",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-conservation.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "historical-product-freeze-afa.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-product-freeze-afa.json",
+      "sha256": "90ac7fc0043917337e7129bc036231a205a89a153ba1259cdd0c36eed8d6f8d8",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-canonical-transcript-source-freeze-v2.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-source-oracle-015e.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-source-oracle-015e.txt",
+      "sha256": "3e2e525bbea8bd12c7d60bb028cb21d40e3a1879d9232516deaa8004ef5a8dbc",
+      "original_path": "/tmp/pr1287-015e222de6a8852eeddbd221e3822f0e6fad963b-test-oracle-source-review.txt",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-production-review-60e.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-production-review-60e.json",
+      "sha256": "33b7c25d56429dac100e1c2e5f80d43fe40a84c9b4d910006a30886aab1c4189",
+      "original_path": "/tmp/pr1287-60e8147-production-source-review.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-canonical-review-6327.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-canonical-review-6327.json",
+      "sha256": "e9bcfbd9085e190be493d0b1a6f6879f23b033846d5773e5de9fa3492adcf859",
+      "original_path": "/tmp/pr1287-6327aacc-canonical-transcript-independent-source-review.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "donor-archive-source-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-source-review.json",
+      "sha256": "5fa91185d0ac13e3b188358dee8c5f48cbebff16297cccb082fb50b6eb3297d5",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-review-binding.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-source-inventory.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-source-inventory.json",
+      "sha256": "123e70a9e2ec22cc24c677b8874d15eed169ca76e2b6ae4657c3ddf160762bda",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-inventory.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-donor-reviewed-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-donor-reviewed-run-packet.py",
+      "sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-run-packet.py",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-donor-reviewed-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-donor-reviewed-plan.json",
+      "sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-plan.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-donor-controller-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-donor-controller-review.json",
+      "sha256": "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48",
+      "original_path": "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-donor-source-ready-handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-donor-source-ready-handoff.json",
+      "sha256": "7ebcc68e512376563a9a98353bad8706de59d06356116d7b34a3e0cadc7a1602",
+      "original_path": "/tmp/coord-b9-1650-e297-source-ready-handoff.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-product-correction-independent-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-product-correction-independent-review.json",
+      "sha256": "3bcecf19559dc90d2992ce3c9f852cc2dd8d33e132d28566840d0a6e8602dc45",
+      "original_path": "/tmp/coord-b9-1828-lsp-navigation-independent-source-review.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-product-normal-main-composition.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-product-normal-main-composition.json",
+      "sha256": "29b59e7fa5484043d1e4aeacb578630b8805d4e5013cd1b47fbf24626939e4bd",
+      "original_path": "/tmp/coord-b9-1828-current-main-source-freeze.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-product-formatter-fixture-independent-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-product-formatter-fixture-independent-review.json",
+      "sha256": "331f48dc9931e22aa030ff3622f569eeeebe740e1806a7d0dcc66ceeda45f84a",
+      "original_path": "/tmp/coord-b9-1828-fixture-alignment-source-review.json",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-original-preflight-CI-failure.log",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-original-preflight-CI-failure.log",
+      "sha256": "10562df56e9d8f9c041b62bee61833483939140683f55f5b83597a460b126dc1",
+      "original_path": "/tmp/coord-b9-1828-ci-41057463335-preflight-failure.log",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "donor-archive-original-formatter-CI-failure.log",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-original-formatter-CI-failure.log",
+      "sha256": "9e1cd5892348f91bd2aef25f88f9470de7b6f353f1777ad2a8085958fb58961b",
+      "original_path": "/tmp/coord-b9-1828-ci-41057813223-formatter-failure.log",
+      "interpretation": "Historical source-only donor provenance; no product/runtime/grant transfer. Original external references are archival, not dereferenced by this runner."
+    },
+    {
+      "name": "historical-nested-recipe-freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-nested-recipe-freeze.json",
+      "sha256": "0bcd1391dd4d384bf7c9b01ff8d82e835ded3db524f83dc20594bdf4fbefb452",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-nested-recipe-source-freeze-v1.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-canonical-freeze-6327.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-canonical-freeze-6327.json",
+      "sha256": "5d7e3c1104dad0ba1db2d28de9406e3b4cdf4abec6340aca226e4c62b4cd9ad3",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-canonical-transcript-source-freeze-v1.json",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "historical-recipe-design.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/historical-recipe-design.md",
+      "sha256": "dc0e771bcf4efa9a9b8a898a1672ac15460c210ff64d5ddd63b0af9e7e20abb0",
+      "original_path": "/tmp/pr1287-terminal-continuity-fix-design-88dbd658.md",
+      "interpretation": "Exact source/report input; historical records confer zero current-head execution passes."
+    },
+    {
+      "name": "predecessor-controller-HOLD.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/predecessor-controller-HOLD.json",
+      "sha256": "72b0db3ab2695e81d3acba9d14b216403a4971d482ab91013b8ed98c4863a83d"
+    },
+    {
+      "name": "git-policy-source.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/git-policy-source.py",
+      "sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74"
+    }
+  ],
+  "grant": "NONE. Fresh actual cagents coordinator grant required later. Packet preparation and a syntactically accepted UUID are not authority, a lease, queue admission or once-only authorization. Root owns independent exact controller review and any actual fair admission.",
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "environment": "Inherited opaque authority/config/context preserved except exact reviewed compiler-only overrides. No provider/User/native authority substitution or environment stripping.",
+  "fixture_contract": {
+    "outer_graph_executions": 16,
+    "unique_source_parents": 16,
+    "host_assigned": 4,
+    "ui_assigned": 12,
+    "cli_assigned": 0,
+    "source_predicted_compiled_selected": {
+      "host": 16,
+      "ui": 12
+    },
+    "expected_child_reexecutions": 0,
+    "source_derived_events": [
+      "run1",
+      "named-ok",
+      "summary"
+    ],
+    "scope": "Exactly assigned HOST4 then UI12; HOST may compile all16 selected source names and UI12, not extra executions or passes. Real temporary SQLite/read-only descriptor fixtures; no source self-reexec, external subprocess/provider/native service requirement among selected parents. Nested source cases nonadditive."
+  },
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+      "tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+      "runner_sha256": "<actual reviewed frozen runner SHA256>",
+      "plan_sha256": "<actual reviewed frozen plan SHA256>"
+    },
+    "runtime_arguments": [
+      "--controller-review",
+      "<actual independent controller receipt path>",
+      "--controller-review-sha256",
+      "<actual receipt SHA256>"
+    ],
+    "note": "Fresh exact independent review of this adaptation required. Actual coordinator/cagents grant is separately required; no old review/grant transfer. Receipt bytes archived before lock. UUID is receipt correlation only; no freshness or once-only authorization is implemented."
+  },
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "budget": "Original donor2400s absolute cap starts once after existing C acquisition and never resets. Serial HOST check600s\u2192lib compile1200s\u2192inventory30s\u21924 exact parents30s each, then UI check600s\u2192lib compile1200s\u2192inventory30s\u219212 exact parents30s each. Every phase/source check shares remaining original cap. These ceilings are nonadditive; no extension, automatic retry, cold fallback, target/cache creation or combined HOST+UI graph.",
+  "limits": "Only22 planned phases and16 distinct assigned outer parents. CLI0. Stop first negative/timeout/unknown/missing evidence. Full fresh --list total N and predicted selected-name presence are recorded; source counts16/12 are not full ELF totals or passes. Original donor parser keeps strict1P0F0I and exact event shape; its filtered-out integer is preserved raw and must be independently checked against fresh N-1. No broad all-targets, integrated/native/development-runner/provider/daemon/desktop/helper/registry or WHOLE/SeedView/installed/release/merge qualification. Predecessor controller HOLD72b0db3a retained. Unsupported Git-routing names refuse before the first Git child; values remain opaque and unmodified. Guarded metadata Git disables hooks/fsmonitor/untracked cache/submodule recursion and refuses conditional/promisor configuration, sparse/hidden/unresolved/submodule index state, staged source changes and effective working/cached filter attributes before status. Dormant filter definitions remain allowed. Configuration/index/attribute checks are discrete cooperative observations, not atomic exclusion against outside mutations. No live unsafe configuration or historical unsafe execution is asserted. New guard runtime/negative fixtures remain UNRUN. Read-only Git metadata checks retain donor supervision and phase deadline policy; original C workload cap/custody/close code is unchanged.",
+  "lineage": {
+    "direct_donor_runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-run-packet.py",
+      "sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/run-packet.py"
+    },
+    "direct_donor_plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-plan.json",
+      "sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json"
+    },
+    "direct_donor_conservation": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-source-conservation.json",
+      "sha256": "d4877d96b648cf2b9d38eae498d6ef211aa0d7ea46384e48ecf699ab67189adf",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-conservation.json"
+    },
+    "underlying_controller_head": "e2975301303ef34d002b6546c5a3eb585a432402",
+    "underlying_controller_tree": "f97e0d767c33d8e0f54849289fc243230b3dd771",
+    "underlying_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/donor-archive-donor-controller-review.json",
+      "sha256": "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48",
+      "original_path": "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json"
+    },
+    "scope": "Direct9cee PR1828 controller source donor only. Adapt task/source/report pins and16/22 cardinalities; interleave each group's check before compile/inventory/parents, bind full predicted compiled selected-name presence separately from assigned execution. All low-level custody/spawn/original wait/parser/signal/retention/final-double-observation/Cfd-close functions conserved."
+  },
+  "historical_negative_preservation": {
+    "6327": {
+      "defect": "Canonical transcript metadata was inserted after inspected recipe key became alias, leaving no canonical terminal_recipes FK parent; the API oracle could fail in setup before intended descriptor-limit assertion.",
+      "evidence": "Root steering and current immutable freeze v2 negative_preserved field. Separate6327 persistence review explicitly excluded archive public-API test approval.",
+      "final_correction": "afa creates a second real Card/recipe before saving, moves its recipe ID to canonical after original row becomes alias, inserts canonical transcript with a real FK parent, then deletes transcript and second recipe before restoring original ID. Added exact receipt/read-only positive after restoration.",
+      "head": "6327aacc848ebff380c466696346a4809412be54",
+      "qualification_limit": "Test-only correction independently read in immutable diff; Rust/SQLite execution remains UNRUN. It is not a retroactive pass at6327.",
+      "status": "source oracle FK defect; not executed runtime failure",
+      "tree": "c1c5ae2214084721a5577bf5815eb6ec2004b485"
+    },
+    "CI41078804359": {
+      "disposition": "Preserve as infrastructure negative. Separate CI composition requires its own exact source/cfg/Cargo/build repin and review; no dispatch grant.",
+      "head_context": "old015e",
+      "meaningful_tests_ran": false,
+      "passes_donated": 0,
+      "reported_cause": "Script stage lacked historical script dependencies",
+      "run": "41078804359",
+      "source": "Root steering; not independently queried in this task"
+    },
+    "afa_manifest": "Old exact-source plan is stale after Main/Cargo/loader composition even though archive leaf remains exact. No old full-head qualification donated."
+  },
+  "script_status": {
+    "manifest_original": "RUNNING report retained in original r2; not silently rewritten",
+    "companion_success": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/script-status-companion.json",
+      "sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-source-plan-script-status-companion.json"
+    },
+    "raw_success_receipt": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/dependencies/script-success-readback.json",
+      "sha256": "1160a864c9f94eb65d549eddb1e01da97f02301661b928037a1528bc4e66f8b8",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-script-success-readback.json"
+    },
+    "rust_checks_tests_native": "UNRUN; Script success confers zero Cargo/test passes."
+  },
+  "negative_path_ELF_hash_limit": "Conserved donor limitation: ELF digest is checked before inventory/each owning parent and after invoke returns successfully. If invoke raises on nonzero/timeout/custody/source/evidence error, control never reaches that phase's post-use digest. No post-failed-use ELF hash or full ELF bytes are guaranteed archived; do not claim unchanged ELF after a failed phase. All raw negative outcomes stay nonqualifying; strict original wait/custody still governs any release.",
+  "grant_binding_limit": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present.",
+  "request": "Source-only finite qualification packet for Root independent review, not execution, allocation, resource availability inquiry, capacity probe, queue admission or a retry. Inherited original authority/environment remains; no model/account changes."
+}

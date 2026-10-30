@@ -1,0 +1,7 @@
+{
+  "head": "60e8147968ab77a561fcfb33f99804ac59792d00",
+  "tree": "3a4dd4453448edb424d570546fdd3badb2fc74fa",
+  "parent": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+  "leaf_sha256": "e78894eb4a45ebac7590c73cc617a83a089def6d1649c00ba8a1d31271c61236",
+  "validation": "physical Rust1.93 leaf format and git diff check only; compile/tests/native UNRUN"
+}

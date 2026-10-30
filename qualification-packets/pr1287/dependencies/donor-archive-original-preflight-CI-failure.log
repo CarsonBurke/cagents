@@ -1,0 +1,41 @@
+Script contracts	Verify source and required tools	﻿2026-10-30T12:43:29.4341250Z ##[group]Run test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4341766Z [36;1mtest "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4342132Z [36;1mgit rev-parse HEAD 'HEAD^{tree}'[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4342525Z [36;1msha256sum scripts/run-development tests/run-development-zig.py \[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4343122Z [36;1m  scripts/check-format scripts/check-format-cache.py tests/check_format.py mise.toml[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4343689Z [36;1mfor format_tool in git cargo rustc rustfmt rustup sh python3; do[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4344066Z [36;1m  command -v "$format_tool"[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4344318Z [36;1mdone[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4344518Z [36;1mpython3 - <<'PY'[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4344741Z [36;1mimport sys[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4344958Z [36;1mimport tomllib[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4345348Z [36;1massert sys.version_info >= (3, 11), "Python 3.11+ is required for TOML contract coverage"[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4345784Z [36;1mprint(sys.version)[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4346043Z [36;1mPY[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4346244Z [36;1mcase "$(cargo --version)" in[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4346678Z [36;1m  "cargo 1.93.0 "*) ;;[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4347052Z [36;1m  *) printf '%s\n' 'Cargo must use the pinned Rust 1.93.0 toolchain' >&2; exit 1 ;;[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4347444Z [36;1mesac[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4347692Z [36;1mcase "$(rustc --version)" in[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4347945Z [36;1m  "rustc 1.93.0 "*) ;;[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4348281Z [36;1m  *) printf '%s\n' 'Rust must use the pinned 1.93.0 toolchain' >&2; exit 1 ;;[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4348652Z [36;1mesac[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4348839Z [36;1mcargo --version[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4349067Z [36;1mrustfmt --version[0m
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4372296Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4372642Z env:
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4372848Z   RUSTUP_TOOLCHAIN: 1.93.0
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4373085Z   RUSTUP_AUTO_INSTALL: 0
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4373323Z   PYTHONDONTWRITEBYTECODE: 1
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4373573Z   CARGO_NET_OFFLINE: true
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4373889Z   EXPECTED_SOURCE_SHA: a475a604b9e950ba3883dab910dc3db2e9b6c2d3
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4374230Z ##[endgroup]
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4446923Z a475a604b9e950ba3883dab910dc3db2e9b6c2d3
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4447410Z ed901bf172bca2426dfb536a6e58deca61ce3687
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4470905Z sha256sum: tests/run-development-zig.py: No such file or directory
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4471883Z bd4b3929c7c877635893f90399c202b9492f65a06483b3681f84a92fc53721b3  scripts/run-development
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4473552Z sha256sum: scripts/check-format-cache.py: No such file or directory
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4474387Z f7cb4ce6f3ad1163d26534eea4bdde343a2b4e475d3956c8b24edb00ebec2ecd  scripts/check-format
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4475754Z d7ff4937f9f1afc8f4028e5f51d4103edf9bf90c93d5250a6e50d1205918b799  tests/check_format.py
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4477045Z 8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe  mise.toml
+Script contracts	Verify source and required tools	2026-10-30T12:43:29.4487931Z ##[error]Process completed with exit code 1.

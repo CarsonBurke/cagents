@@ -1,0 +1,36 @@
+{
+  "status": "ONE_LINE_FIXTURE_CORRECTION_SOURCE_CLEAR_EXECUTION_PENDING",
+  "head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+  "tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+  "base": "012574b856c340ac83e53795c628a70128eff399",
+  "changed_paths": [
+    "tests/check_format.py"
+  ],
+  "delta": "INCLUDED gains exact required app/repository_clone_lsp_ownership_tests.rs leaf in formatter argv order; no assertion, parser, helper or production source changed.",
+  "independent_review": {
+    "descriptor": "/root/ci_delivery",
+    "scope": "Root-authored fixture constant only; reviewer authored product and does not claim independent product approval.",
+    "verdict": "SOURCE_CLEAR",
+    "evidence": "cache_fixture creates every INCLUDED path and derives argv; actual formatter fixture creates INCLUDED[1:] and tests malformed refusal/nonrewrite/recovery for each. Existing status/diagnostic and other assertions unchanged.",
+    "execution": "UNRUN"
+  },
+  "prior_negative": {
+    "run": 41057813223,
+    "head": "012574b856c340ac83e53795c628a70128eff399",
+    "conclusion": "FAILURE",
+    "original_exit": 1,
+    "tests_ran": 25,
+    "reported_failure_count": 6,
+    "source_tools_zig_custody": "PASS",
+    "later_shell_repository_format_integrity": "SKIPPED",
+    "raw_log": "/tmp/coord-b9-1828-ci-41057813223-formatter-failure.log",
+    "sha256": "9e1cd5892348f91bd2aef25f88f9470de7b6f353f1777ad2a8085958fb58961b",
+    "waiver_or_rerun": false
+  },
+  "whitespace": {
+    "exit": 0,
+    "exec_chunk": "e2fd78"
+  },
+  "native_and_UI_tests": "UNRUN",
+  "new_ci": "PENDING_NORMAL_PUSH"
+}

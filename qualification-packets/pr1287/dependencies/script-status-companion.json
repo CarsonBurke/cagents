@@ -1,0 +1,17 @@
+{
+  "recorded_utc": "2026-10-30T15:56:10.692447+00:00",
+  "manifest": "/tmp/fw16-pr1287-4fa33705-source-qualification-manifest-r2.json",
+  "manifest_sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+  "same_head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "script_status_update": {
+    "run": 41084001631,
+    "job": 124160232059,
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "completed_utc": "2026-10-30T15:49:02Z",
+    "source_receipt": "/tmp/fw16-backend-ec204421/pr1287-4fa-script-success-readback.json",
+    "sha256": "1160a864c9f94eb65d549eddb1e01da97f02301661b928037a1528bc4e66f8b8"
+  },
+  "source_plan": "16distinct=8affected+8retainedcontrol; HOST4/UI12/CLI0 assigned, not executed",
+  "remaining": "Rustcheck/test discovery/execution/nativeUNRUN; noexecutiongrant/controller/newqueue"
+}

@@ -1,0 +1,244 @@
+{
+  "kind": "AUTHOR_PREPARED_PR1287_SOURCE_ONLY_QUALIFICATION_PACKET_READY_FOR_INDEPENDENT_REVIEW_NOT_EXECUTION",
+  "status": "SOURCE_ONLY_PREPARED_UNREVIEWED_UNGRANTED_UNRUN",
+  "packet_directory": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll",
+  "mode": "0700; dependencies0700; sealed files0444",
+  "product": {
+    "head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+    "tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+    "sole_locator": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection"
+  },
+  "bindings": {
+    "runner": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/run-packet.py",
+      "sha256": "4288fcae65f7afa46ce54979a9aa69a9ae0e9231235adf675423959fcbe579e4"
+    },
+    "plan": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/plan.json",
+      "sha256": "0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f"
+    },
+    "source_binding": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/source-review-binding.json",
+      "sha256": "6b508f2825f105052b979203ba92ac6c575d80474229a7e1e32ae9e135574304"
+    },
+    "donor_diff": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/donor-diff.patch",
+      "sha256": "a61921fa677bce59546a501777433171898f452e1e2f0b7249f52b06ea01bddf"
+    },
+    "source_conservation": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/source-conservation.json",
+      "sha256": "cda412311f9a8d2c74b44cef9302f3c5c33da1cd9ec475fdd2e60b697bb96b9e"
+    },
+    "readme": {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/README.md",
+      "sha256": "0fe6d1d4e389c33eb97649cbe8bc8391dc4e0c600b03e94119a131e482fce0a2"
+    }
+  },
+  "source_manifest_r2": {
+    "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/source-manifest-r2.json",
+    "sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb"
+  },
+  "script_status_companion": {
+    "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/script-status-companion.json",
+    "sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626"
+  },
+  "dependencies": [
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/source-manifest-r2.json",
+      "sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+      "original_path": "/tmp/fw16-pr1287-4fa33705-source-qualification-manifest-r2.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/script-status-companion.json",
+      "sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-source-plan-script-status-companion.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/product-source-freeze-v1.json",
+      "sha256": "0a11677566724b58721a42e5d6a96636bc0d346876d21daa93667be2c7bf6f58",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-main-whole-byte-source-freeze-v1.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-source-manifest-r1.json",
+      "sha256": "a2a2d8dc9e1ffcaf8c0f235ef2191f33ca23cc2f75c0a7ba2e0537ac7afce2ff",
+      "original_path": "/tmp/fw16-pr1287-afa06ba7-source-qualification-manifest-r1.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/script-success-readback.json",
+      "sha256": "1160a864c9f94eb65d549eddb1e01da97f02301661b928037a1528bc4e66f8b8",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-script-success-readback.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-run-packet.py",
+      "sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/run-packet.py"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-plan.json",
+      "sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-README.md",
+      "sha256": "5c204c319ead757a67cd747d845df9bee7bd477e4eba333694c5adc7c1a569d1",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/README.md"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-source-conservation.json",
+      "sha256": "d4877d96b648cf2b9d38eae498d6ef211aa0d7ea46384e48ecf699ab67189adf",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-conservation.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-product-freeze-afa.json",
+      "sha256": "90ac7fc0043917337e7129bc036231a205a89a153ba1259cdd0c36eed8d6f8d8",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-canonical-transcript-source-freeze-v2.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-source-oracle-015e.txt",
+      "sha256": "3e2e525bbea8bd12c7d60bb028cb21d40e3a1879d9232516deaa8004ef5a8dbc",
+      "original_path": "/tmp/pr1287-015e222de6a8852eeddbd221e3822f0e6fad963b-test-oracle-source-review.txt"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-production-review-60e.json",
+      "sha256": "33b7c25d56429dac100e1c2e5f80d43fe40a84c9b4d910006a30886aab1c4189",
+      "original_path": "/tmp/pr1287-60e8147-production-source-review.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-canonical-review-6327.json",
+      "sha256": "e9bcfbd9085e190be493d0b1a6f6879f23b033846d5773e5de9fa3492adcf859",
+      "original_path": "/tmp/pr1287-6327aacc-canonical-transcript-independent-source-review.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-source-review.json",
+      "sha256": "5fa91185d0ac13e3b188358dee8c5f48cbebff16297cccb082fb50b6eb3297d5",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-review-binding.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-source-inventory.json",
+      "sha256": "123e70a9e2ec22cc24c677b8874d15eed169ca76e2b6ae4657c3ddf160762bda",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-inventory.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-donor-reviewed-run-packet.py",
+      "sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-run-packet.py"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-donor-reviewed-plan.json",
+      "sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-plan.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-donor-controller-review.json",
+      "sha256": "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48",
+      "original_path": "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-donor-source-ready-handoff.json",
+      "sha256": "7ebcc68e512376563a9a98353bad8706de59d06356116d7b34a3e0cadc7a1602",
+      "original_path": "/tmp/coord-b9-1650-e297-source-ready-handoff.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-product-correction-independent-review.json",
+      "sha256": "3bcecf19559dc90d2992ce3c9f852cc2dd8d33e132d28566840d0a6e8602dc45",
+      "original_path": "/tmp/coord-b9-1828-lsp-navigation-independent-source-review.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-product-normal-main-composition.json",
+      "sha256": "29b59e7fa5484043d1e4aeacb578630b8805d4e5013cd1b47fbf24626939e4bd",
+      "original_path": "/tmp/coord-b9-1828-current-main-source-freeze.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-product-formatter-fixture-independent-review.json",
+      "sha256": "331f48dc9931e22aa030ff3622f569eeeebe740e1806a7d0dcc66ceeda45f84a",
+      "original_path": "/tmp/coord-b9-1828-fixture-alignment-source-review.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-original-preflight-CI-failure.log",
+      "sha256": "10562df56e9d8f9c041b62bee61833483939140683f55f5b83597a460b126dc1",
+      "original_path": "/tmp/coord-b9-1828-ci-41057463335-preflight-failure.log"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/donor-archive-original-formatter-CI-failure.log",
+      "sha256": "9e1cd5892348f91bd2aef25f88f9470de7b6f353f1777ad2a8085958fb58961b",
+      "original_path": "/tmp/coord-b9-1828-ci-41057813223-formatter-failure.log"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-nested-recipe-freeze.json",
+      "sha256": "0bcd1391dd4d384bf7c9b01ff8d82e835ded3db524f83dc20594bdf4fbefb452",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-nested-recipe-source-freeze-v1.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-canonical-freeze-6327.json",
+      "sha256": "5d7e3c1104dad0ba1db2d28de9406e3b4cdf4abec6340aca226e4c62b4cd9ad3",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1287-canonical-transcript-source-freeze-v1.json"
+    },
+    {
+      "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/historical-recipe-design.md",
+      "sha256": "dc0e771bcf4efa9a9b8a898a1672ac15460c210ff64d5ddd63b0af9e7e20abb0",
+      "original_path": "/tmp/pr1287-terminal-continuity-fix-design-88dbd658.md"
+    }
+  ],
+  "assignment": {
+    "checks": 2,
+    "lib_compilations": 2,
+    "ELF_inventories": 2,
+    "qualifying_outer_parents": 16,
+    "unique_source_parents": 16,
+    "host_assigned_outer_parents": 4,
+    "ui_assigned_outer_parents": 12,
+    "cli_assigned_outer_parents": 0,
+    "source_predicted_compiled_selected_host": 16,
+    "source_predicted_compiled_selected_ui": 12,
+    "expected_nonadditive_child_reexecutions": 0,
+    "total_phases": 22
+  },
+  "phases": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3",
+    "parent-host-lib-4",
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12"
+  ],
+  "conservation": {
+    "whole_runner_exact_after_enumerated_inverse": true,
+    "unchanged_top_level_helpers": 20,
+    "changed_top_level_functions": [
+      "execute_contracts",
+      "parent_accounting",
+      "main"
+    ],
+    "nested_source_context_run_and_C_handoff_sections_byte_exact": true,
+    "original2400_second_cap": true,
+    "physical_tool_pins_and_existing_C_target_lock_conserved_not_queried": true
+  },
+  "limitations": {
+    "negative_path_postfailed_ELF_hash": "Conserved donor limitation: ELF digest is checked before inventory/each owning parent and after invoke returns successfully. If invoke raises on nonzero/timeout/custody/source/evidence error, control never reaches that phase's post-use digest. No post-failed-use ELF hash or full ELF bytes are guaranteed archived; do not claim unchanged ELF after a failed phase. All raw negative outcomes stay nonqualifying; strict original wait/custody still governs any release.",
+    "grant_UUID_binding_not_once_only_authorization": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present.",
+    "filtered_N_minus_1": "Original donor parser unchanged; independent raw-evidence check against fresh full inventory N is required.",
+    "source_ready_is_not_source_clear": "Root independent exact controller review still required; no new product review or readiness certificate."
+  },
+  "verification": "Source hashes, JSON data cardinalities, exact donor inverse and lexical function/inner-section byte comparison only. No Python AST/import/eval/py_compile, script/controller/oracle, Cargo/rustc/check/test/format/native/provider/helper, process/capacity/target/lock/cache/registry/inbox/meter action.",
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "qualified": false,
+  "next_owner": "Root independent review before any queue admission; separately fresh actual cagents grant later, not this task."
+}

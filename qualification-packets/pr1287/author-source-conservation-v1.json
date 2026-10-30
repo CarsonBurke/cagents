@@ -1,0 +1,195 @@
+{
+  "kind": "AUTHOR_SOURCE_CONSERVATION_AND_PLAN_PREPARATION_NOT_INDEPENDENT_REVIEW_OR_EXECUTION",
+  "product_head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "product_tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+  "direct_donor_runner_sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+  "direct_donor_plan_sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+  "runner_sha256": "4288fcae65f7afa46ce54979a9aa69a9ae0e9231235adf675423959fcbe579e4",
+  "plan_sha256": "0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f",
+  "source_binding_sha256": "6b508f2825f105052b979203ba92ac6c575d80474229a7e1e32ae9e135574304",
+  "method": "V8 plain string substitutions, JSON data and byte/hash comparisons only. No Python AST/parse/import/eval/py_compile, donor/function/runner invocation, Cargo/rustc/test/format execution, target/lock/cache/registry/provider/desktop/process probe.",
+  "whole_runner_exact_after_enumerated_inverse": true,
+  "replacements": [
+    {
+      "label": "task docstring",
+      "old": "\"\"\"Prepared PR1828 exact-head owning UI C packet. No execution without fresh grant and independent controller review.\"\"\"",
+      "new": "\"\"\"Prepared PR1287 exact-head serial HOST4/UI12 C packet. No execution without fresh cagents grant and independent controller review.\"\"\""
+    },
+    {
+      "label": "sole product locator",
+      "old": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-current-main')",
+      "new": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection')"
+    },
+    {
+      "label": "private plan locator",
+      "old": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json')",
+      "new": "PLAN = Path('/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/plan.json')"
+    },
+    {
+      "label": "exact plan hash",
+      "old": "PLAN_SHA = 'a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774'",
+      "new": "PLAN_SHA = '0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f'"
+    },
+    {
+      "label": "per-group check before same-group library sequence",
+      "old": "    for check in plan['binary_checks']:\n        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])\n    artifacts = {}\n    for group in plan['artifact_groups']:\n        gid = group['id']\n",
+      "new": "    artifacts = {}\n    for group in plan['artifact_groups']:\n        gid = group['id']\n        check = next(check for check in plan['binary_checks'] if check['artifact_group'] == gid)\n        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])\n"
+    },
+    {
+      "label": "fresh compiled selected-name bindings separate from assigned executions",
+      "old": "        selected = [contract['name'] for contract in group['selectors']]\n        actual = inventory_names((inventory / 'stdout.log').read_text() + '\\n' + (inventory / 'stderr.log').read_text(), selected)\n        save('inventory-' + gid + '/inventory.json', {'selected_exact_names': selected, 'full_names': actual,\n             'selected_count': len(selected), 'not_passes': True})\n",
+      "new": "        selected = [contract['name'] for contract in group['selectors']]\n        compiled_selected = group['source_predicted_compiled_names']\n        absent = group['source_predicted_absent_names']\n        actual = inventory_names((inventory / 'stdout.log').read_text() + '\\n' + (inventory / 'stderr.log').read_text(), compiled_selected)\n        assert set(selected).issubset(compiled_selected), 'Assigned execution is absent from source-pinned compilation contract'\n        assert not set(absent).intersection(actual), 'Source-pinned excluded feature selectors unexpectedly compiled'\n        save('inventory-' + gid + '/inventory.json', {'assigned_execution_names': selected,\n             'source_predicted_compiled_selected_names': compiled_selected, 'source_predicted_absent_names': absent,\n             'full_names': actual, 'actual_test_N': len(actual), 'assigned_execution_count': len(selected),\n             'compiled_selected_count': len(compiled_selected), 'not_passes': True})\n"
+    },
+    {
+      "label": "parent accounting upper bound",
+      "old": "0 <= len(parents) <= count <= 12",
+      "new": "0 <= len(parents) <= count <= 16"
+    },
+    {
+      "label": "phase accounting cardinality",
+      "old": "'unrun_phase_count': 15 - len(phase_attempts)",
+      "new": "'unrun_phase_count': 22 - len(phase_attempts)"
+    },
+    {
+      "label": "requested parent cardinality",
+      "old": "'requested_parent_count': 12",
+      "new": "'requested_parent_count': 16"
+    },
+    {
+      "label": "unrun parent cardinality",
+      "old": "'unrun_parent_count': 12 - count",
+      "new": "'unrun_parent_count': 16 - count"
+    },
+    {
+      "label": "PR1287 source manifest/freeze/status admission binding only",
+      "old": "    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_1828_CORRECTION_COMPOSITION_AND_FIXTURE_NOT_A_NEW_REVIEW'\n    assert review['verdict'] == 'BOUND_EXISTING_INDEPENDENT_SOURCE_REVIEWS_AND_EXACT_COMPOSITION_ONLY'\n    assert review['owning_parent_count'] == 12\n    # This authored binding is not a new independent product review. Verify\n    # the actual correction report, exact automatic main composition and the\n    # separately scoped one-line fixture review before controller admission.\n    product_review = review['product_review']\n    assert digest(product_review['path']) == product_review['sha256']\n    original_review = json.loads(Path(product_review['path']).read_bytes())\n    assert original_review['head'] == product_review['head']\n    assert original_review['tree'] == product_review['tree']\n    assert original_review['status'] == 'INDEPENDENT_SOURCE_CLEAR_CORRECTION_ONLY_EXECUTION_UNRUN'\n    assert original_review['root_independent_source_review']['reviewer_is_author'] is False\n    composition = review['composition_receipt']\n    assert digest(composition['path']) == composition['sha256']\n    composed = json.loads(Path(composition['path']).read_bytes())\n    assert composed['head'] == composition['head'] and composed['tree'] == composition['tree']\n    assert composed['feature_parent'] == product_review['head']\n    assert composed['prior_source_review_sha256'] == product_review['sha256'] and composed['clean'] is True\n    assert composed['merge'] == 'Automatic merge had no conflicts; no manual source resolution or changes after clean merge. Main supplies required script prerequisite files.'\n    delta_review = review['fixture_delta_review']\n    assert digest(delta_review['path']) == delta_review['sha256']\n    fixture = json.loads(Path(delta_review['path']).read_bytes())\n    assert fixture['head'] == plan['product_head'] and fixture['tree'] == plan['product_tree']\n    assert fixture['base'] == composition['head']\n    assert fixture['status'] == 'ONE_LINE_FIXTURE_CORRECTION_SOURCE_CLEAR_EXECUTION_PENDING'\n    assert fixture['changed_paths'] == ['tests/check_format.py']\n    assert fixture['independent_review']['verdict'] == 'SOURCE_CLEAR'\n",
+      "new": "    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_PR1287_MANIFEST_STATUS_BINDING_NOT_A_NEW_REVIEW'\n    assert review['verdict'] == 'BOUND_SOURCE_PLAN_AND_REPORTED_SCRIPT_STATUS_ONLY'\n    assert review['owning_parent_count'] == 16\n    # Authored source-plan/status binding, not an independent product review or grant.\n    # The exact independent controller receipt below still owns admission review.\n    manifest_ref = review['source_manifest']\n    assert digest(manifest_ref['path']) == manifest_ref['sha256']\n    manifest = json.loads(Path(manifest_ref['path']).read_bytes())\n    assert manifest['head'] == plan['product_head'] and manifest['tree'] == plan['product_tree']\n    assert manifest['queue_assignments'] == {'cli': 0, 'host': 4, 'ui': 12}\n    assert manifest['source_predicted_compiled_selected_counts'] == {'cli': 0, 'host': 16, 'ui': 12}\n    assert plan['source_paths_sha256'] == {path: value['sha256'] for path, value in manifest['current_leaf_pins'].items()}\n    assert [group['id'] for group in plan['artifact_groups']] == ['host-lib', 'ui-lib']\n    assert [group['features'] for group in plan['artifact_groups']] == [['host'], ['ui']]\n    assert [check['artifact_group'] for check in plan['binary_checks']] == ['host-lib', 'ui-lib']\n    for lane, group in zip(('host', 'ui'), plan['artifact_groups']):\n        assert [contract['name'] for contract in group['selectors']] == manifest['lanes'][lane]['assigned_selectors']\n        assert all(contract['expected_child_reexecutions'] == 0 for contract in group['selectors'])\n        assert group['source_predicted_compiled_names'] == manifest['lanes'][lane]['source_predicted_compiled_selected_names']\n        assert group['source_predicted_absent_names'] == manifest['lanes'][lane]['source_predicted_selected_names_absent']\n    freeze_ref = review['composition_freeze']\n    assert digest(freeze_ref['path']) == freeze_ref['sha256'] == manifest['freeze']['sha256']\n    freeze = json.loads(Path(freeze_ref['path']).read_bytes())\n    assert freeze['head'] == plan['product_head'] and freeze['tree'] == plan['product_tree']\n    assert all(plan['source_paths_sha256'][path] == sha for path, sha in freeze['leaves'].items())\n    status_ref = review['script_status_companion']\n    assert digest(status_ref['path']) == status_ref['sha256']\n    companion = json.loads(Path(status_ref['path']).read_bytes())\n    assert companion['same_head'] == plan['product_head'] and companion['manifest_sha256'] == manifest_ref['sha256']\n    assert companion['script_status_update']['status'] == 'COMPLETED'\n    assert companion['script_status_update']['conclusion'] == 'SUCCESS'\n    script_ref = review['script_success_readback']\n    assert digest(script_ref['path']) == script_ref['sha256'] == companion['script_status_update']['sha256']\n    script_receipt = json.loads(Path(script_ref['path']).read_bytes())\n    assert script_receipt['headRefOid'] == plan['product_head']\n    assert any(check.get('name') == 'Script contracts' and check.get('status') == 'COMPLETED'\n               and check.get('conclusion') == 'SUCCESS' for check in script_receipt['statusCheckRollup'])\n"
+    },
+    {
+      "label": "phase admission count",
+      "old": "plan['planned_phase_count'] == 15",
+      "new": "plan['planned_phase_count'] == 22"
+    },
+    {
+      "label": "parent admission count",
+      "old": "plan['counts']['qualifying_outer_parents'] == 12",
+      "new": "plan['counts']['qualifying_outer_parents'] == 16"
+    },
+    {
+      "label": "evidence namespace",
+      "old": "/tmp/coord-b9-1828-c4bdce2a-owning-ui-validation-",
+      "new": "/tmp/fw16-pr1287-4fa33705-host4-ui12-validation-"
+    },
+    {
+      "label": "qualification cardinality",
+      "old": "len(tests) == 12",
+      "new": "len(tests) == 16"
+    }
+  ],
+  "top_level_functions_byte_exact": [
+    "digest",
+    "now",
+    "observed_wait",
+    "supervision_failure",
+    "bounded_capture",
+    "git",
+    "signal_pidfd",
+    "children",
+    "settle_children",
+    "cargo_test_artifact",
+    "inventory_names",
+    "parent_pass",
+    "validate_controller_review",
+    "evidence_copy",
+    "custody_clean",
+    "safe_lane_handoff",
+    "final_observations",
+    "note_lane_cancellation",
+    "require_workload_allowed",
+    "retain_uncertain_lane"
+  ],
+  "changed_top_level_functions": [
+    "execute_contracts",
+    "parent_accounting",
+    "main"
+  ],
+  "inner_sections_byte_exact": [
+    {
+      "label": "source-and-context-inner-bodies",
+      "byte_exact": true,
+      "characters": 2809
+    },
+    {
+      "label": "run-inner-body",
+      "byte_exact": true,
+      "characters": 5188
+    },
+    {
+      "label": "C-acquisition-through-handback",
+      "byte_exact": true,
+      "characters": 3790
+    }
+  ],
+  "permitted_delta": "Paths/source binding/pins,16-parent22-phase counts, exact source manifest/status admission metadata, and serial each-group-check orchestration plus fresh source-predicted compiled selector presence recording separate from assigned execution. No low-level launch/wait/pidfd/signal/custody/parser/negative/retention/lock-close body changed.",
+  "preserved_plan_fields": [
+    "packet_deadline_seconds",
+    "lane",
+    "physical_tool_bin",
+    "tool_sha256",
+    "environment",
+    "bounded_failure_cleanup"
+  ],
+  "finite_plan": {
+    "phase_count": 22,
+    "assigned_outer_parents": 16,
+    "host_assigned": 4,
+    "ui_assigned": 12,
+    "cli_assigned": 0,
+    "host_source_predicted_compiled_selected": 16,
+    "ui_source_predicted_compiled_selected": 12,
+    "children": 0,
+    "phase_order": [
+      "host-binary-check",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-1",
+      "parent-host-lib-2",
+      "parent-host-lib-3",
+      "parent-host-lib-4",
+      "ui-binary-check",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-1",
+      "parent-ui-lib-2",
+      "parent-ui-lib-3",
+      "parent-ui-lib-4",
+      "parent-ui-lib-5",
+      "parent-ui-lib-6",
+      "parent-ui-lib-7",
+      "parent-ui-lib-8",
+      "parent-ui-lib-9",
+      "parent-ui-lib-10",
+      "parent-ui-lib-11",
+      "parent-ui-lib-12"
+    ]
+  },
+  "negative_path_ELF_hash_limit": "Conserved donor limitation: ELF digest is checked before inventory/each owning parent and after invoke returns successfully. If invoke raises on nonzero/timeout/custody/source/evidence error, control never reaches that phase's post-use digest. No post-failed-use ELF hash or full ELF bytes are guaranteed archived; do not claim unchanged ELF after a failed phase. All raw negative outcomes stay nonqualifying; strict original wait/custody still governs any release.",
+  "strict_parser_limit": "Exact unchanged parent_pass requires running1, exact named success,1P0F0I summary and ordinary event sequence. Filtered integer is accepted syntactically by donor; independent evidence reviewer must compare original raw summary against fresh inventory N-1. No parser broadening or child-count exception used for any selected parent.",
+  "grant_limit": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present.",
+  "historical_record_scope": "All direct runtime source/report dependencies are local immutable copies. Historical donor reports retain their original external reference strings solely as archived provenance; this runner never dereferences those nested historical strings or transfers old product/capacity/runtime results. Every direct archive binding has its own copied bytes/hash.",
+  "current_source_manifest_r2": {
+    "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/source-manifest-r2.json",
+    "sha256": "8cfbf1962340a5bc6bee485c45145e5e9586b7ab47c25cfaa7b7c2e22829c0bb",
+    "original_path": "/tmp/fw16-pr1287-4fa33705-source-qualification-manifest-r2.json"
+  },
+  "status_companion": {
+    "path": "/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/dependencies/script-status-companion.json",
+    "sha256": "c1b8bea2923ea15ea49142ed3fb6747235d26bf5c4a2435861e4186fbf0a4626",
+    "original_path": "/tmp/fw16-backend-ec204421/pr1287-4fa-source-plan-script-status-companion.json"
+  },
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "qualified": false,
+  "status": "SOURCE_ONLY_PREPARED_UNREVIEWED_UNGRANTED_UNRUN"
+}

@@ -1,0 +1,187 @@
+--- donor-pr1828-9cee2286-run-packet.py
++++ prepared-pr1287-run-packet.py
+@@ -1,4 +1,4 @@
+-"""Prepared PR1828 exact-head owning UI C packet. No execution without fresh grant and independent controller review."""
++"""Prepared PR1287 exact-head serial HOST4/UI12 C packet. No execution without fresh cagents grant and independent controller review."""
+ import argparse
+ import ctypes
+ import errno
+@@ -16,16 +16,16 @@
+ import time
+ from datetime import datetime, timezone
+ 
+-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-current-main')
++WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection')
+ TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
+ LOCK = TARGET.parent / 'lane-c.lock'
+ TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
+-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json')
++PLAN = Path('/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/plan.json')
+ PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
+ PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
+ SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
+ CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
+-PLAN_SHA = 'a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774'
++PLAN_SHA = '0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f'
+ 
+ 
+ def digest(path):
+@@ -282,11 +282,11 @@
+ 
+ 
+ def execute_contracts(plan, invoke, save, parents):
+-    for check in plan['binary_checks']:
+-        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])
+     artifacts = {}
+     for group in plan['artifact_groups']:
+         gid = group['id']
++        check = next(check for check in plan['binary_checks'] if check['artifact_group'] == gid)
++        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])
+         compiled = invoke('compile-' + gid, [str(TOOL / 'cargo'), *group['compile_argv'][1:]], group['compile_seconds'])
+         artifact = cargo_test_artifact((compiled / 'stdout.log').read_text(), WT / group['manifest'], group['features'])
+         exe = Path(artifact['executable'])
+@@ -302,9 +302,15 @@
+         inventory = invoke('inventory-' + gid, [str(exe), '--list', '--color=never'], group['inventory_seconds'])
+         assert digest(exe) == elf['sha256'], 'ELF changed during inventory'
+         selected = [contract['name'] for contract in group['selectors']]
+-        actual = inventory_names((inventory / 'stdout.log').read_text() + '\n' + (inventory / 'stderr.log').read_text(), selected)
+-        save('inventory-' + gid + '/inventory.json', {'selected_exact_names': selected, 'full_names': actual,
+-             'selected_count': len(selected), 'not_passes': True})
++        compiled_selected = group['source_predicted_compiled_names']
++        absent = group['source_predicted_absent_names']
++        actual = inventory_names((inventory / 'stdout.log').read_text() + '\n' + (inventory / 'stderr.log').read_text(), compiled_selected)
++        assert set(selected).issubset(compiled_selected), 'Assigned execution is absent from source-pinned compilation contract'
++        assert not set(absent).intersection(actual), 'Source-pinned excluded feature selectors unexpectedly compiled'
++        save('inventory-' + gid + '/inventory.json', {'assigned_execution_names': selected,
++             'source_predicted_compiled_selected_names': compiled_selected, 'source_predicted_absent_names': absent,
++             'full_names': actual, 'actual_test_N': len(actual), 'assigned_execution_count': len(selected),
++             'compiled_selected_count': len(compiled_selected), 'not_passes': True})
+         for index, contract in enumerate(group['selectors'], 1):
+             assert digest(exe) == elf['sha256']
+             d = invoke('parent-' + gid + '-' + str(index),
+@@ -363,7 +369,7 @@
+             errors.append(row['output_read_error'])
+         raw.append(row)
+     count = len(attempted)
+-    assert 0 <= len(parents) <= count <= 12
++    assert 0 <= len(parents) <= count <= 16
+     settled = sum(row['original_wait_complete'] for row in raw)
+     phase_attempts = [attempt for attempt in attempts if attempt[0] == 'phase']
+     phase_states = [state for state in states if state['stage'] == 'phase']
+@@ -377,17 +383,17 @@
+              'attempted_phase_count': len(phase_attempts), 'recorded_phase_count': len(phases),
+              'original_wait_settled_phase_count': settled_phases,
+              'unknown_phase_count': len(phase_attempts) - settled_phases,
+-             'unrun_phase_count': 15 - len(phase_attempts),
++             'unrun_phase_count': 22 - len(phase_attempts),
+              'attempted_source_check_count': len(source_attempts),
+              'original_wait_settled_source_check_count': settled_sources,
+              'unknown_source_check_count': len(source_attempts) - settled_sources,
+              'all_original_waits_complete': len(attempts) == len(states) and all(state['original_wait_complete'] for state in states),
+-             'requested_parent_count': 12, 'passed_parent_count': len(parents),
++             'requested_parent_count': 16, 'passed_parent_count': len(parents),
+              'attempted_parent_count': count, 'executed_parent_count': count,
+              'original_wait_settled_parent_count': settled, 'unknown_parent_count': count - settled,
+              'recorded_parent_count': sum(row['phase_recorded'] for row in raw),
+              'incomplete_parent_record_count': sum(not row['evidence_complete'] for row in raw),
+-             'nonqualifying_parent_count': count - len(parents), 'unrun_parent_count': 12 - count}, raw, errors)
++             'nonqualifying_parent_count': count - len(parents), 'unrun_parent_count': 16 - count}, raw, errors)
+ 
+ 
+ def final_observations(source, context, before, before_context, save):
+@@ -471,38 +477,47 @@
+     review_bytes = Path(plan['source_review']).read_bytes()
+     review = json.loads(review_bytes)
+     assert review['head'] == plan['product_head'] and review['tree'] == plan['product_tree']
+-    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_1828_CORRECTION_COMPOSITION_AND_FIXTURE_NOT_A_NEW_REVIEW'
+-    assert review['verdict'] == 'BOUND_EXISTING_INDEPENDENT_SOURCE_REVIEWS_AND_EXACT_COMPOSITION_ONLY'
+-    assert review['owning_parent_count'] == 12
+-    # This authored binding is not a new independent product review. Verify
+-    # the actual correction report, exact automatic main composition and the
+-    # separately scoped one-line fixture review before controller admission.
+-    product_review = review['product_review']
+-    assert digest(product_review['path']) == product_review['sha256']
+-    original_review = json.loads(Path(product_review['path']).read_bytes())
+-    assert original_review['head'] == product_review['head']
+-    assert original_review['tree'] == product_review['tree']
+-    assert original_review['status'] == 'INDEPENDENT_SOURCE_CLEAR_CORRECTION_ONLY_EXECUTION_UNRUN'
+-    assert original_review['root_independent_source_review']['reviewer_is_author'] is False
+-    composition = review['composition_receipt']
+-    assert digest(composition['path']) == composition['sha256']
+-    composed = json.loads(Path(composition['path']).read_bytes())
+-    assert composed['head'] == composition['head'] and composed['tree'] == composition['tree']
+-    assert composed['feature_parent'] == product_review['head']
+-    assert composed['prior_source_review_sha256'] == product_review['sha256'] and composed['clean'] is True
+-    assert composed['merge'] == 'Automatic merge had no conflicts; no manual source resolution or changes after clean merge. Main supplies required script prerequisite files.'
+-    delta_review = review['fixture_delta_review']
+-    assert digest(delta_review['path']) == delta_review['sha256']
+-    fixture = json.loads(Path(delta_review['path']).read_bytes())
+-    assert fixture['head'] == plan['product_head'] and fixture['tree'] == plan['product_tree']
+-    assert fixture['base'] == composition['head']
+-    assert fixture['status'] == 'ONE_LINE_FIXTURE_CORRECTION_SOURCE_CLEAR_EXECUTION_PENDING'
+-    assert fixture['changed_paths'] == ['tests/check_format.py']
+-    assert fixture['independent_review']['verdict'] == 'SOURCE_CLEAR'
++    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_PR1287_MANIFEST_STATUS_BINDING_NOT_A_NEW_REVIEW'
++    assert review['verdict'] == 'BOUND_SOURCE_PLAN_AND_REPORTED_SCRIPT_STATUS_ONLY'
++    assert review['owning_parent_count'] == 16
++    # Authored source-plan/status binding, not an independent product review or grant.
++    # The exact independent controller receipt below still owns admission review.
++    manifest_ref = review['source_manifest']
++    assert digest(manifest_ref['path']) == manifest_ref['sha256']
++    manifest = json.loads(Path(manifest_ref['path']).read_bytes())
++    assert manifest['head'] == plan['product_head'] and manifest['tree'] == plan['product_tree']
++    assert manifest['queue_assignments'] == {'cli': 0, 'host': 4, 'ui': 12}
++    assert manifest['source_predicted_compiled_selected_counts'] == {'cli': 0, 'host': 16, 'ui': 12}
++    assert plan['source_paths_sha256'] == {path: value['sha256'] for path, value in manifest['current_leaf_pins'].items()}
++    assert [group['id'] for group in plan['artifact_groups']] == ['host-lib', 'ui-lib']
++    assert [group['features'] for group in plan['artifact_groups']] == [['host'], ['ui']]
++    assert [check['artifact_group'] for check in plan['binary_checks']] == ['host-lib', 'ui-lib']
++    for lane, group in zip(('host', 'ui'), plan['artifact_groups']):
++        assert [contract['name'] for contract in group['selectors']] == manifest['lanes'][lane]['assigned_selectors']
++        assert all(contract['expected_child_reexecutions'] == 0 for contract in group['selectors'])
++        assert group['source_predicted_compiled_names'] == manifest['lanes'][lane]['source_predicted_compiled_selected_names']
++        assert group['source_predicted_absent_names'] == manifest['lanes'][lane]['source_predicted_selected_names_absent']
++    freeze_ref = review['composition_freeze']
++    assert digest(freeze_ref['path']) == freeze_ref['sha256'] == manifest['freeze']['sha256']
++    freeze = json.loads(Path(freeze_ref['path']).read_bytes())
++    assert freeze['head'] == plan['product_head'] and freeze['tree'] == plan['product_tree']
++    assert all(plan['source_paths_sha256'][path] == sha for path, sha in freeze['leaves'].items())
++    status_ref = review['script_status_companion']
++    assert digest(status_ref['path']) == status_ref['sha256']
++    companion = json.loads(Path(status_ref['path']).read_bytes())
++    assert companion['same_head'] == plan['product_head'] and companion['manifest_sha256'] == manifest_ref['sha256']
++    assert companion['script_status_update']['status'] == 'COMPLETED'
++    assert companion['script_status_update']['conclusion'] == 'SUCCESS'
++    script_ref = review['script_success_readback']
++    assert digest(script_ref['path']) == script_ref['sha256'] == companion['script_status_update']['sha256']
++    script_receipt = json.loads(Path(script_ref['path']).read_bytes())
++    assert script_receipt['headRefOid'] == plan['product_head']
++    assert any(check.get('name') == 'Script contracts' and check.get('status') == 'COMPLETED'
++               and check.get('conclusion') == 'SUCCESS' for check in script_receipt['statusCheckRollup'])
+     assert plan['lane']['target'] == str(TARGET) and plan['lane']['lock'] == str(LOCK)
+     assert plan['lane']['jobs'] == 2 and plan['lane']['new_cache'] is False
+-    assert plan['packet_deadline_seconds'] == 2400 and plan['planned_phase_count'] == 15
+-    assert plan['counts']['qualifying_outer_parents'] == 12
++    assert plan['packet_deadline_seconds'] == 2400 and plan['planned_phase_count'] == 22
++    assert plan['counts']['qualifying_outer_parents'] == 16
+     controller_path = Path(args.controller_review)
+     assert controller_path.is_absolute() and not controller_path.is_symlink() and controller_path.resolve(strict=True) == controller_path
+     controller_bytes = controller_path.read_bytes()
+@@ -518,7 +533,7 @@
+     for name, expected_sha in plan['tool_sha256'].items():
+         path = TOOL / name
+         assert path.is_file() and not path.is_symlink() and digest(path) == expected_sha
+-    out = Path('/tmp/coord-b9-1828-c4bdce2a-owning-ui-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
++    out = Path('/tmp/fw16-pr1287-4fa33705-host4-ui12-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
+     out.mkdir(mode=0o700)
+     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
+     # Custody and original bytes are archived before touching the lane lock.
+@@ -760,7 +775,7 @@
+              'lock_closed': lock_closed, 'lock_unlocked': lock_unlocked, 'lock_close_error': lock_close_error,
+              'actual_release': actual_release,
+              'release_policy': 'Original Cfd closes only after complete original waits/evidence and clean unforced phase plus both final custody observations. No LOCK_UN is issued. Unknown assessment/handoff or close retains no safe-return claim; ambiguous close is never retried.',
+-             'qualified': error is None and not CANCELLATION_SIGNALS and len(tests) == 12 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
++             'qualified': error is None and not CANCELLATION_SIGNALS and len(tests) == 16 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
+              'nonadditive_child_result_count': sum(len(parent['nonadditive_child_results']) for parent in tests),
+              'finished': now(), 'limits': plan['limits']}
+         save('summary.json', summary)

@@ -1,0 +1,93 @@
+{
+  "status": "INERT_SOURCE_DERIVED_FUTURE_ORACLES_ALL_UNRUN",
+  "cases": [
+    {
+      "name": "ordinary_metadata",
+      "routing_names": [],
+      "config_keys": [
+        "core.repositoryformatversion"
+      ],
+      "index_tags": [
+        "H"
+      ],
+      "effective_attributes": [],
+      "expected": "admit_metadata_only"
+    },
+    {
+      "name": "empty_routing_value_still_present",
+      "routing_names": [
+        "GIT_DIR"
+      ],
+      "expected": "refuse_before_first_Git_child"
+    },
+    {
+      "name": "injected_config_name",
+      "routing_names": [
+        "GIT_CONFIG_COUNT"
+      ],
+      "expected": "refuse_before_first_Git_child"
+    },
+    {
+      "name": "conditional_include",
+      "routing_names": [],
+      "config_keys": [
+        "includeif.gitdir:/fixture.path"
+      ],
+      "expected": "refuse_before_index_or_status"
+    },
+    {
+      "name": "promisor_even_false",
+      "config_keys": [
+        "remote.origin.promisor"
+      ],
+      "expected": "refuse_before_object_or_status"
+    },
+    {
+      "name": "dormant_filter",
+      "config_keys": [
+        "filter.example.clean"
+      ],
+      "effective_attributes": [],
+      "expected": "allow_definition_without_effective_filter"
+    },
+    {
+      "name": "effective_filter_unset_text",
+      "effective_attributes": [
+        [
+          "src/example.rs",
+          "filter",
+          "unset"
+        ]
+      ],
+      "expected": "refuse_before_status"
+    },
+    {
+      "name": "hidden_index",
+      "index_tags": [
+        "h"
+      ],
+      "expected": "refuse_before_status"
+    },
+    {
+      "name": "index_gitlink",
+      "index_modes": [
+        "160000"
+      ],
+      "expected": "refuse_before_status"
+    },
+    {
+      "name": "staged_different_object",
+      "index_equals_head": false,
+      "expected": "refuse_before_status"
+    },
+    {
+      "name": "fsmonitor_disabled",
+      "config_keys": [
+        "core.fsmonitor"
+      ],
+      "required_argv_overlay": "core.fsmonitor=false",
+      "expected": "no_monitor_execution_requires_future_real_private_Git_fixture"
+    }
+  ],
+  "limits": "No production/controller/parser/helper executed; no source-derived expected outcome is a runtime pass."
+}

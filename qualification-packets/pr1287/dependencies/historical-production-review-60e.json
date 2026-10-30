@@ -1,0 +1,53 @@
+{
+  "kind": "INDEPENDENT_FINITE_PRODUCTION_SOURCE_REVIEW",
+  "sealed_utc": "2026-10-30T15:27:19Z",
+  "verdict": "BOUNDED_PRODUCTION_SOURCE_CLEAR_NO_INTRODUCED_ISSUE_FOUND_IN_REVIEWED_SCOPE",
+  "source_pin": {
+    "head": "60e8147968ab77a561fcfb33f99804ac59792d00",
+    "tree": "3a4dd4453448edb424d570546fdd3badb2fc74fa",
+    "parent": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+    "archive_blob": "d9cd590d8e05a7b46e4f42233afe902d623228d4",
+    "archive_sha256": "e78894eb4a45ebac7590c73cc617a83a089def6d1649c00ba8a1d31271c61236",
+    "model_blob": "130d453fab00ca30c284bb91fa2d3138fe1aa59a",
+    "freeze_path": "/tmp/fw16-backend-ec204421/pr1287-nested-recipe-source-freeze-v1.json",
+    "freeze_sha256": "0bcd1391dd4d384bf7c9b01ff8d82e835ded3db524f83dc20594bdf4fbefb452",
+    "changed_path": "src/automations/archive.rs",
+    "whole_leaf_numstat": "202 insertions, 10 deletions"
+  },
+  "review_scope": "Exact immutable Git object: the production closed_pane_matches guard against a changed nested relaunch recipe, compatibility with the prior accepted terminal states, and static fixture type/ownership sanity. Owning test assertions and coverage belong to metadata_lock. No mutable persistence.rs worktree source was reviewed.",
+  "design_comparison": {
+    "design_path": "/tmp/pr1287-terminal-continuity-fix-design-88dbd658.md",
+    "design_sha256": "dc0e771bcf4efa9a9b8a898a1672ac15460c210ff64d5ddd63b0af9e7e20abb0",
+    "prior_design_review_sha256": "6904c6e3a759c3687dfed071acf90b8b7b32c81bb9145df2f9e8eb6474871022",
+    "result": "The actual six-line production guard implements the approved borrowed full-recipe inequality check at the approved location."
+  },
+  "source_findings": [
+    {
+      "source": "src/automations/archive.rs:181-208",
+      "conclusion": "Closed Automation origin, original console/native terminal ID equality, and complete matching native proof remain prerequisites. The new guard examines &current.continuity and refuses a RelaunchAvailable recipe unequal to &original.launch only after those ownership checks. It does not substitute the native provider recipe or grant replacement authority."
+    },
+    {
+      "source": "src/automations/archive.rs:203-220; src/model.rs:234-243",
+      "conclusion": "The guard precedes the original clone and ended-continuity assignment, so that assignment can no longer erase a nested recipe mismatch. LaunchRecipe derives full PartialEq/Eq over program, argument vector, working directory, environment map and unset environment set. The pattern binds &LaunchRecipe and compares borrowed values; it adds no move, mutation, allocation or IO."
+    },
+    {
+      "source": "src/automations/archive.rs:209-220; src/model.rs:402-445,891-910",
+      "conclusion": "Exact original Live/Detached descriptors, Exited descriptors, and matching-recipe RelaunchAvailable(Some exit) retain their prior behavior. Exit metadata normalization remains unchanged. RelaunchAvailable(None) was already refused because the original must have a live proof and None does not enter the normalization whitelist. The final full TerminalSession equality still checks outer launch, IDs, listener, provenance, transcript and resume hint. The Chat branch and receipt construction are unchanged by this guard."
+    },
+    {
+      "source": "src/automations/archive.rs:544-643,1016-1142; src/model.rs:15-21,76,234-243,375-383,402-445",
+      "conclusion": "Static fixture sanity found no type or ownership mismatch: terminal IDs are Copy; proof fields are moved from a cloned proof; TerminalExit.signal is Option<String>; recipe maps/sets and PathBuf mutations match their declared types; owned continuity variants are cloned before reuse; and the normalized-row fixture borrows continuity for serialization before moving the descriptor. This is source inspection, not compiler or test qualification. Assertion sufficiency is separately owned by metadata_lock."
+    }
+  ],
+  "introduced_defects_found": [],
+  "bounded_verdict": "The actual production guard closes the reviewed nested-recipe normalization gap without a source-visible compatibility regression. This review approves only that immutable production delta and static fixture sanity.",
+  "limits_and_separate_ownership": [
+    "Compilation, all tests including the added pure and host/SQLite fixtures, native execution and provider behavior are UNRUN by this reviewer. No runtime success or measured performance is claimed.",
+    "Test oracle coverage and execution qualification are not inferred from source or from this verdict; metadata_lock owns the independent assertion review.",
+    "The inherited UUID-alias/persistence issue is not corrected or cleared by this archive-only commit; Root's separate persistence work is excluded from this review.",
+    "The previously reviewed bounded-text correction was not re-audited. Archive callers, schema/migration admission and Main15 WHOLE-before-SeedView qualification remain separately owned; this is not whole-PR release approval.",
+    "Only read-only Git/source/artifact inspection was performed. No fetch, source/Git/GitHub write, build, test, formatter, native/provider/helper/DB execution, inbox, meter or child action occurred."
+  ],
+  "only_write": "This requested sealed /tmp source-review receipt",
+  "stop": "Finite independent source review complete."
+}

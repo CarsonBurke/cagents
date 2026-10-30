@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "kind": "SOURCE_READY_HANDOFF_AND_FAIR_VALIDATION_REQUEST_NOT_A_GRANT",
+  "product_head": "5e66818946fc2c6c37d4895ad9f7949e648be35e",
+  "product_tree": "2ca3bff9e19e1286624b02fe2b59edbbb6ae0d1a",
+  "controller_head": "e2975301303ef34d002b6546c5a3eb585a432402",
+  "controller_tree": "f97e0d767c33d8e0f54849289fc243230b3dd771",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/run-packet.py",
+  "runner_sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+  "plan_sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646",
+  "controller_review": "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json",
+  "controller_review_sha256": "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48",
+  "frozen_current_receipt": "/tmp/coord-b9-1650-fixture-ui29-metadata-successor-frozen.json",
+  "frozen_current_receipt_sha256": "e47ff99562fb35103804104db1e4acec381551b6e087e9f088cf6941cee7b67d",
+  "source_readback": {
+    "controller_clean": true,
+    "product_clean": true,
+    "controller_files": 8,
+    "product_pins": 18,
+    "archive_bindings": 15,
+    "native_target_lock_or_tool_probe": "NONE"
+  },
+  "requested_scope": "One fair fresh bounded C attempt after existing1775 and RootCLI2012: same29phases/26exactUIparents, jobs2/Rust1.93/existingwarmtarget+lock/2400s, stopfirstnegative. Originalc54failure staysnegative.",
+  "actual_grant": null,
+  "execution": "UNRUN_NO_NEW_PROCESS_CARGO_NATIVE",
+  "original_c54_return": "ECaccepted4a750089; no oldallocation or retries transferred",
+  "runtime_argv_template_only": [
+    "python3",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/run-packet.py",
+    "--grant",
+    "ACTUAL_GRANT_REQUIRED",
+    "--runner-sha256",
+    "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+    "--controller-review",
+    "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json",
+    "--controller-review-sha256",
+    "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48"
+  ],
+  "source_worker_boundary": {
+    "path": "/tmp/coord-b9-2004-private-file-worker-boundary.md",
+    "sha256": "e5bf50849c681c5765e16b4a36e7643e9189f646bdd760d043b06de829dd4ecb",
+    "new_worker_started": false
+  },
+  "at_utc": "2026-10-30T10:58:55.422578+00:00"
+}

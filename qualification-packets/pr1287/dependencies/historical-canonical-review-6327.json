@@ -1,0 +1,88 @@
+{
+  "kind": "INDEPENDENT_EXACT_PR1287_CANONICAL_TRANSCRIPT_IMPLEMENTATION_SOURCE_REVIEW",
+  "reviewer": "/root/1931_upgrade_snapshot_test_design/snapshot_retry_review; nonauthor",
+  "verdict": "SOURCE_CLEAR_FOR_EXACT_6327AACC_SCOPED_HELPER_AND_TWO_DIRECT_SQLITE_PARENTS",
+  "findings": [],
+  "freeze": {
+    "head": "6327aacc848ebff380c466696346a4809412be54",
+    "tree": "c1c5ae2214084721a5577bf5815eb6ec2004b485",
+    "parent": "60e8147968ab77a561fcfb33f99804ac59792d00",
+    "freeze_sha256": "5d7e3c1104dad0ba1db2d28de9406e3b4cdf4abec6340aca226e4c62b4cd9ad3",
+    "source_leaves": {
+      "src/persistence.rs": {
+        "sha256": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5",
+        "freeze_matches": true,
+        "live_equals_frozen_commit": true
+      },
+      "src/automations/archive.rs": {
+        "sha256": "7e0543ec40463d174539fb51754d2f90cc81a088a23cba565c86aeeb81f04a2e",
+        "freeze_matches": true,
+        "live_equals_frozen_commit": true
+      }
+    },
+    "general_loader_byte_identical": true,
+    "general_loader_sha256": "f7ab7c6f8af4b3d57f55211a18b4753fee0fb178449f972a47e7c1825989bdbe",
+    "new_direct_parents": [
+      {
+        "line": 5349,
+        "definition": "fn migration_terminal_inspection_budgets_the_canonical_transcript_lookup() {"
+      },
+      {
+        "line": 5467,
+        "definition": "fn migration_terminal_inspection_bounds_raw_ids_before_string_conversion() {"
+      }
+    ]
+  },
+  "scope": {
+    "reviewed": "204-line persistence delta: read_migration_session_at terminal arm and two direct owning SQLite parents, including relevant Rust/rusqlite types and unchanged general loader comparison.",
+    "excluded": "Public API test addition in automations/archive.rs is assigned to separate oracle reviewer; its leaf hash is bound here but its case is not approved here. No WHOLE/SeedView/general-loader/schema redesign or broader archive admission review.",
+    "exact_parent": "60e8147968ab77a561fcfb33f99804ac59792d00"
+  },
+  "production_assessment": [
+    "Boolean-first query returns rusqlite::Result<Option<String>> in its closure; outer OptionalExtension yields exactly Option<Option<String>>. String column1 is requested only after integer Boolean column0 is true. Missing row and explicit oversize sentinel use the same fixed CorruptRow refusal without source text.",
+    "The bounded raw String is parsed by existing parse_id into TerminalId outside the callback and explicitly dropped before the aggregate and normal loader. This avoids an invalid StoreError-to-rusqlite error conversion and retains UUID alias semantics; no canonical-only restriction or new identity is persisted.",
+    "Second query retains all seven raw recipe/provenance byte terms: terminal_id,recipe_json,continuity_json,resume_hint,recovery_origin,owned_codex_listener,predecessor. It budgets only the canonical transcript path selected by terminal.to_string(), exactly matching unchanged load_terminal_record.",
+    "Required NULL terms still make the aggregate Boolean NULL and fail strict conversion; nullable provenance/path lengths retain coalesce-to-zero. Existing NULL/invalid-JSON transcript path, if present, is still rejected by the unchanged loader. Bounded non-TEXT/invalid UTF8 retains rusqlite errors; bounded malformed UUID retains InvalidUuid. OptionalExtension only suppresses QueryReturnedNoRows.",
+    "4MiB u64 binding is within SQLite signed range. Heterogeneous params! arguments are borrowed ToSql values, so reused canonical/recipe/path Strings in tests are not moved. The scalar length sum at SQLite's value-size ceiling does not approach signed64 overflow.",
+    "All queries use the supplied connection. Correctness requires the documented existing read-transaction precondition; the production inspector's sole call passes its existing &tx. No new source connection or nested transaction was added.",
+    "General loader is byte-identical to parent, function SHA256 f7ab7c6f8af4b3d57f55211a18b4753fee0fb178449f972a47e7c1825989bdbe. Ordinary restore/continuity/listener/schema semantics are not changed by this helper correction."
+  ],
+  "direct_parent_assessment": {
+    "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup": {
+      "source_line": 5349,
+      "scope": "Genuine temporary file-backed SQLite normalized minimal decoder fixture and separate read-only transaction, with source bytes compared before/after inspection; explicitly no whole-source schema admission claim.",
+      "meaningful_cases": [
+        "Canonical, uppercase and simple UUID spellings produce the same terminal with its canonical transcript path.",
+        "Uppercase recipe ID, valid canonical oversized path JSON and small raw-key decoy must refuse. By unchanged loader and fixture values, predecessor raw join would budget the decoy and return a valid oversized canonical path, so this detects the actual mismatch rather than shared malformed JSON failure.",
+        "Reverse decoy case accepts: canonical path small, raw-alias path oversized. This prevents over-rejection by budgeting paths the loader does not read.",
+        "Exact4MiB aggregate passes, then one additional byte refuses. The trailing multibyte character counts actual UTF8 bytes, and other provenance is explicitly NULL in this fixture."
+      ],
+      "type_notes": "Fixture TerminalSession has no listener/recovery/predecessor evidence and valid serialized launch/continuity. Raw aliases remain distinct TEXT keys; no new schema/FK behavior is asserted."
+    },
+    "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion": {
+      "source_line": 5467,
+      "scope": "Real in-memory SQLite with intentionally unconstrained raw-key type to exercise decoder refusal behavior that a strict admitted schema may prevent storing.",
+      "meaningful_cases": [
+        "Oversized raw TEXT returns CorruptRow before malformed UUID parsing.",
+        "Oversized invalid UTF8 TEXT returns exactly the same fixed error text as ordinary oversized TEXT, detecting accidental String conversion or source-value diagnostic leakage.",
+        "Bounded malformed UUID returns InvalidUuid.",
+        "Bounded invalid UTF8 TEXT,BLOB and NULL remain errors; deleted recipe row returns fixed CorruptRow."
+      ],
+      "limitation": "These are source-reviewed assertions, not executed results or an allocation/RSS measurement."
+    }
+  },
+  "type_sources": {
+    "rusqlite": "Locked0.37.0 local primary source: Row::get invokes FromSql on requested value only; String requires TEXT/as_str before owning allocation; bool requires integer; OptionalExtension catches only QueryReturnedNoRows; params! borrows each expression as &dynToSql.",
+    "uuid": "Locked1.25.0 local primary source and TerminalId macro: parse_str accepts supported aliases and Display emits canonical UUID. Production continues to use those same functions.",
+    "no_compile_claim": true
+  },
+  "evidence_limits": [
+    "Implementation and parent/type compatibility were reviewed statically only. No Cargo/rustc/test/helper/native/provider execution occurred; compiled exact test discovery and all results remain UNRUN.",
+    "The4MiB limit bounds uncontrolled Rust descriptor/key copying, not SQLite internal page/value allocations or process RSS.",
+    "Multiple corruptions may report a different first error because bounded UUID parsing now precedes aggregate refusal. No error-priority equivalence is promised.",
+    "The temporary minimal tables establish raw decoder behavior, not compatibility/schema admission of arbitrary source databases. No malformed table schema is promoted into a supported production schema.",
+    "Future owning execution needs separate affected HOST/UI artifacts and nonzero exact direct-parent selection; CLI-only execution cannot qualify persistence. Public API oracle approval remains separate.",
+    "Source-clear is scoped to exact frozen objects and does not authorize publication/execution/merge or donate earlier results."
+  ],
+  "actions": "Read exact freeze, immutable local commit source/diff, unchanged loader bytes and locked dependency primary source. No source/Git/GitHub mutation, fetch,Cargo,rustc,tests,native/provider/helper/process/inbox/meter or child agents. Only this requested /tmp report is written. Review complete."
+}

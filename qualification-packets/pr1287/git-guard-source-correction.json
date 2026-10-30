@@ -1,0 +1,41 @@
+{
+  "status": "SOURCE_CORRECTION_PENDING_SAME_NONAUTHOR_REVIEW",
+  "predecessor_runner_sha256": "4288fcae65f7afa46ce54979a9aa69a9ae0e9231235adf675423959fcbe579e4",
+  "runner_sha256": "ce724709493e94e5514fec52c4c02f596fad40be2846d96172f2502b48a703a8",
+  "plan_sha256": "18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c",
+  "changed_existing_functions": [
+    "git",
+    "main"
+  ],
+  "unchanged_top_level_functions": [
+    "digest",
+    "now",
+    "observed_wait",
+    "supervision_failure",
+    "bounded_capture",
+    "signal_pidfd",
+    "children",
+    "settle_children",
+    "cargo_test_artifact",
+    "inventory_names",
+    "parent_pass",
+    "validate_controller_review",
+    "evidence_copy",
+    "execute_contracts",
+    "custody_clean",
+    "safe_lane_handoff",
+    "parent_accounting",
+    "final_observations",
+    "note_lane_cancellation",
+    "require_workload_allowed",
+    "retain_uncertain_lane"
+  ],
+  "new_functions": [
+    "refuse_git_routing",
+    "git_nul_fields",
+    "guard_git_metadata"
+  ],
+  "syntax": "Python ast.parse only; candidate never imported, compiled, evaluated or executed",
+  "runtime": "ALL_UNRUN; no grant",
+  "source_scope": "New ignored controller worktree only; product WT/source and original negative packet unchanged"
+}

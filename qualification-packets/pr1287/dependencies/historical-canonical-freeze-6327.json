@@ -1,0 +1,10 @@
+{
+  "head": "6327aacc848ebff380c466696346a4809412be54",
+  "tree": "c1c5ae2214084721a5577bf5815eb6ec2004b485",
+  "parent": "60e8147968ab77a561fcfb33f99804ac59792d00",
+  "leaves": {
+    "src/persistence.rs": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5",
+    "src/automations/archive.rs": "7e0543ec40463d174539fb51754d2f90cc81a088a23cba565c86aeeb81f04a2e"
+  },
+  "validation": "physical Rust1.93 leaf format and git diff check only; compile/tests/native UNRUN"
+}

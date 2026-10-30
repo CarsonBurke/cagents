@@ -1,0 +1,124 @@
+{
+  "kind": "AUTHOR_SOURCE_CONSERVATION_NOT_INDEPENDENT_REVIEW_OR_EXECUTION",
+  "donor_controller_head": "e2975301303ef34d002b6546c5a3eb585a432402",
+  "donor_controller_tree": "f97e0d767c33d8e0f54849289fc243230b3dd771",
+  "donor_runner_sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+  "runner_sha256": "9cee2286ec27df79c065d0534757404e4cf0aa53eb21b6f8a28d3acb9b9d961e",
+  "donor_plan_sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646",
+  "plan_sha256": "a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774",
+  "whole_runner_inverse_exact": true,
+  "replacements": [
+    {
+      "label": "task docstring",
+      "old": "\"\"\"Prepared PR1650 exact-head owning-contract C packet. No execution without fresh grant and independent controller review.\"\"\"",
+      "new": "\"\"\"Prepared PR1828 exact-head owning UI C packet. No execution without fresh grant and independent controller review.\"\"\""
+    },
+    {
+      "label": "product worktree",
+      "old": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-panel-fixture-correction')",
+      "new": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-current-main')"
+    },
+    {
+      "label": "plan path",
+      "old": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/plan.json')",
+      "new": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/plan.json')"
+    },
+    {
+      "label": "plan sha",
+      "old": "PLAN_SHA = '0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646'",
+      "new": "PLAN_SHA = 'a6fe776656595c01b9f75777532226fd8f30bbf1cfc2511abb126ee131418774'"
+    },
+    {
+      "label": "1828 source-review admission binding only",
+      "old": "    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_TWO_NONAUTHOR_SOURCE_REVIEWS_NOT_A_NEW_REVIEW'\n    assert review['verdict'] == 'BOUND_EXISTING_INDEPENDENT_SOURCE_REVIEWS_ONLY'\n    assert review['owning_parent_count'] == 26\n    # The binding is authored data, not a new independent review. Preserve and\n    # verify both actual nonauthor reports; controller review assesses their\n    # bounded composition and this admission block before any new grant.\n    product_review = review['product_review']\n    assert digest(product_review['path']) == product_review['sha256']\n    original_review = json.loads(Path(product_review['path']).read_bytes())\n    assert original_review['head'] == review['parent'] == product_review['head']\n    assert original_review['tree'] == product_review['tree']\n    assert original_review['verdict'] == 'SOURCE_CLEAR_WITHIN_NEW_CORRECTION; UX_CONTRACT_COHERENT; NO_NATIVE_OR_WHOLE_FEATURE_APPROVAL'\n    assert original_review['independent_conservation']['old_23_parents_and_all_helpers_byte_exact_after_only_additions_removed'] is True\n    assert original_review['owning_oracles']['total_leaf_outer_parents'] == 26\n    delta_review = review['fixture_delta_review']\n    assert digest(delta_review['path']) == delta_review['sha256']\n    assert delta_review['sha256'] == 'b949e57690f49a524a66e73c097871815f1d2aa20212118b9ded1ca1b59bbdaa'\n    fixture_receipt = review['fixture_source_receipt']\n    assert digest(fixture_receipt['path']) == fixture_receipt['sha256']\n",
+      "new": "    assert review['kind'] == 'AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_1828_CORRECTION_COMPOSITION_AND_FIXTURE_NOT_A_NEW_REVIEW'\n    assert review['verdict'] == 'BOUND_EXISTING_INDEPENDENT_SOURCE_REVIEWS_AND_EXACT_COMPOSITION_ONLY'\n    assert review['owning_parent_count'] == 12\n    # This authored binding is not a new independent product review. Verify\n    # the actual correction report, exact automatic main composition and the\n    # separately scoped one-line fixture review before controller admission.\n    product_review = review['product_review']\n    assert digest(product_review['path']) == product_review['sha256']\n    original_review = json.loads(Path(product_review['path']).read_bytes())\n    assert original_review['head'] == product_review['head']\n    assert original_review['tree'] == product_review['tree']\n    assert original_review['status'] == 'INDEPENDENT_SOURCE_CLEAR_CORRECTION_ONLY_EXECUTION_UNRUN'\n    assert original_review['root_independent_source_review']['reviewer_is_author'] is False\n    composition = review['composition_receipt']\n    assert digest(composition['path']) == composition['sha256']\n    composed = json.loads(Path(composition['path']).read_bytes())\n    assert composed['head'] == composition['head'] and composed['tree'] == composition['tree']\n    assert composed['feature_parent'] == product_review['head']\n    assert composed['prior_source_review_sha256'] == product_review['sha256'] and composed['clean'] is True\n    assert composed['merge'] == 'Automatic merge had no conflicts; no manual source resolution or changes after clean merge. Main supplies required script prerequisite files.'\n    delta_review = review['fixture_delta_review']\n    assert digest(delta_review['path']) == delta_review['sha256']\n    fixture = json.loads(Path(delta_review['path']).read_bytes())\n    assert fixture['head'] == plan['product_head'] and fixture['tree'] == plan['product_tree']\n    assert fixture['base'] == composition['head']\n    assert fixture['status'] == 'ONE_LINE_FIXTURE_CORRECTION_SOURCE_CLEAR_EXECUTION_PENDING'\n    assert fixture['changed_paths'] == ['tests/check_format.py']\n    assert fixture['independent_review']['verdict'] == 'SOURCE_CLEAR'\n"
+    },
+    {
+      "label": "parent accounting upper bound",
+      "old": "0 <= len(parents) <= count <= 26",
+      "new": "0 <= len(parents) <= count <= 12"
+    },
+    {
+      "label": "phase accounting cardinality",
+      "old": "'unrun_phase_count': 29 - len(phase_attempts)",
+      "new": "'unrun_phase_count': 15 - len(phase_attempts)"
+    },
+    {
+      "label": "requested parent cardinality",
+      "old": "'requested_parent_count': 26",
+      "new": "'requested_parent_count': 12"
+    },
+    {
+      "label": "unrun parent cardinality",
+      "old": "'unrun_parent_count': 26 - count",
+      "new": "'unrun_parent_count': 12 - count"
+    },
+    {
+      "label": "phase admission cardinality",
+      "old": "plan['planned_phase_count'] == 29",
+      "new": "plan['planned_phase_count'] == 15"
+    },
+    {
+      "label": "parent admission cardinality",
+      "old": "plan['counts']['qualifying_outer_parents'] == 26",
+      "new": "plan['counts']['qualifying_outer_parents'] == 12"
+    },
+    {
+      "label": "qualification cardinality",
+      "old": "len(tests) == 26",
+      "new": "len(tests) == 12"
+    },
+    {
+      "label": "evidence namespace",
+      "old": "/tmp/coord-b9-1650-5e668189-owning-ui-validation-",
+      "new": "/tmp/coord-b9-1828-c4bdce2a-owning-ui-validation-"
+    }
+  ],
+  "top_level_functions_byte_exact": [
+    "digest",
+    "now",
+    "observed_wait",
+    "supervision_failure",
+    "bounded_capture",
+    "git",
+    "signal_pidfd",
+    "children",
+    "settle_children",
+    "cargo_test_artifact",
+    "inventory_names",
+    "parent_pass",
+    "validate_controller_review",
+    "evidence_copy",
+    "execute_contracts",
+    "custody_clean",
+    "safe_lane_handoff",
+    "final_observations",
+    "note_lane_cancellation",
+    "require_workload_allowed",
+    "retain_uncertain_lane"
+  ],
+  "changed_top_level_functions": [
+    "parent_accounting",
+    "main"
+  ],
+  "allowed_semantics": "parent_accounting changes only12/15 finite cardinalities; main changes only actual1828 source-review metadata admission,12/15 admission/final-success counts and evidence namespace. All source/context/run inner bodies, positive family/original wait/custody/Cfd close/signal/error/negative paths exact donor.",
+  "preserved_plan_fields": [
+    "binary_checks",
+    "artifact_groups[0].compile_argv/features/manifest/target_name/target_kind/compile_seconds/inventory_seconds",
+    "packet_deadline_seconds",
+    "lane",
+    "physical_tool_bin",
+    "tool_sha256",
+    "environment",
+    "bounded_failure_cleanup"
+  ],
+  "packet_cardinality": {
+    "outer_parents": 12,
+    "phases": 15,
+    "nonadditive_child_reexecutions": 0
+  },
+  "runtime": "NONE: source reading/hashing/text comparison; ASTparse only planned. No import of runner/main/oracle and no physical Rust tool/target/cache/lock/native/process probe.",
+  "actual_grant": null,
+  "qualified": false,
+  "limits": "Unchanged donor cooperative cancellation, bounded cleanup, positive-family handback and ambiguous-close retention semantics and limits are conserved, not reimplemented or newly qualified."
+}

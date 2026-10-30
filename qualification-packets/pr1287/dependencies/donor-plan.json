@@ -1,0 +1,316 @@
+{
+  "prepared_only": true,
+  "status": "SOURCE_ONLY_PREPARED_UNREVIEWED_UNGRANTED_UNRUN",
+  "product_pr": 1828,
+  "product_head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+  "product_tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-current-main",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-review-binding.json",
+  "source_review_sha256": "5fa91185d0ac13e3b188358dee8c5f48cbebff16297cccb082fb50b6eb3297d5",
+  "source_paths_sha256": {
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/app.rs": "05d161cb2f8c29c6cf14d390a3c5bd95e8723ec10984b36704f8c86bd1315581",
+    "src/app/repository_clone_lsp_ownership_tests.rs": "6d3972660b47d3ba29157402816c57724dc7c7d730c752539b2b91589ec822f7",
+    "src/repository_widget.rs": "d1d440a154502c29905b852eacadc22858b812b044d0a3937ff2862bc9d106b2",
+    "src/editor_widget.rs": "3aa811545a800afe57cc629bfbe0c282979bd98ffd0b7770ecf7ca8802d10376",
+    "src/editor_widget/snapshot.rs": "dd621277a7f3aa9cc9b369fe9d963bebd368a6404645d6b05a1cb8921aa9fc3f",
+    "src/lsp.rs": "4bdc429ccb1b23f165c3a3d01e50e3bf2711b2e7a142c265a90cdbfcd15703b6",
+    "scripts/check-format": "4503728a40bc7892e688e5fe082df0a6596614c8688834c3329743f57a6aa4b6",
+    "tests/check_format.py": "725d051b6fdd196635cfe9818bb4fb19734fb1dfc741f36204bb2cc547d60ddd"
+  },
+  "binary_checks": [
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "selectors": [
+        {
+          "name": "app::tests::repository_clone_lsp_ownership::cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::repository_clone_lsp_ownership::loaded_jump_coordinates_reject_surrogate_splits_and_invalid_lines",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::repository_clone_lsp_ownership::dirty_repository_clone_cannot_replace_original_language_source_on_load_edit_or_retry",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::repository_clone_lsp_ownership::clean_clones_diverge_without_sharing_language_edits_and_retry_after_owner_release",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::repository_clone_navigation::browser_clone_loads_live_file_and_independent_navigation",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::repository_clone_navigation::clone_keeps_empty_and_fixed_file_recipes_and_reopen_separate",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_jump_into_another_file_parks_until_it_is_open",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_jump_gives_the_editor_the_keyboard",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_jump_that_opens_a_file_gives_the_editor_the_keyboard_too",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_parked_jump_does_not_survive_a_different_file_opening",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_file_with_no_server_reports_disabled_and_clears_a_parked_jump",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::tests::a_jump_into_a_file_the_card_cannot_open_says_so",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        }
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_seconds": 1200,
+      "inventory_seconds": 30,
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ]
+    }
+  ],
+  "planned_phase_order": [
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12"
+  ],
+  "planned_phase_count": 15,
+  "counts": {
+    "checks": 1,
+    "lib_compilations": 1,
+    "ELF_inventories": 1,
+    "qualifying_outer_parents": 12,
+    "unique_source_parents": 12,
+    "expected_nonadditive_child_reexecutions": 0,
+    "total_phases": 15
+  },
+  "packet_deadline_seconds": 2400,
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "rust": "1.93.0",
+    "new_cache": false
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "archive_bindings": [
+    {
+      "name": "source-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-review-binding.json",
+      "sha256": "5fa91185d0ac13e3b188358dee8c5f48cbebff16297cccb082fb50b6eb3297d5"
+    },
+    {
+      "name": "source-inventory.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/source-inventory.json",
+      "sha256": "123e70a9e2ec22cc24c677b8874d15eed169ca76e2b6ae4657c3ddf160762bda"
+    },
+    {
+      "name": "donor-reviewed-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-run-packet.py",
+      "sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc"
+    },
+    {
+      "name": "donor-reviewed-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-plan.json",
+      "sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646"
+    },
+    {
+      "name": "donor-controller-review.json",
+      "path": "/tmp/coord-b9-1650-fixture-ui29-independent-controller-review-e2975301.json",
+      "sha256": "dbb29b872f90e615f0c8f8d7d4914cd771e5ad9ac72e9cf702ab7dbd0cd14b48"
+    },
+    {
+      "name": "donor-source-ready-handoff.json",
+      "path": "/tmp/coord-b9-1650-e297-source-ready-handoff.json",
+      "sha256": "7ebcc68e512376563a9a98353bad8706de59d06356116d7b34a3e0cadc7a1602"
+    },
+    {
+      "name": "product-correction-independent-review.json",
+      "path": "/tmp/coord-b9-1828-lsp-navigation-independent-source-review.json",
+      "sha256": "3bcecf19559dc90d2992ce3c9f852cc2dd8d33e132d28566840d0a6e8602dc45"
+    },
+    {
+      "name": "product-normal-main-composition.json",
+      "path": "/tmp/coord-b9-1828-current-main-source-freeze.json",
+      "sha256": "29b59e7fa5484043d1e4aeacb578630b8805d4e5013cd1b47fbf24626939e4bd"
+    },
+    {
+      "name": "product-formatter-fixture-independent-review.json",
+      "path": "/tmp/coord-b9-1828-fixture-alignment-source-review.json",
+      "sha256": "331f48dc9931e22aa030ff3622f569eeeebe740e1806a7d0dcc66ceeda45f84a"
+    },
+    {
+      "name": "original-preflight-CI-failure.log",
+      "path": "/tmp/coord-b9-1828-ci-41057463335-preflight-failure.log",
+      "sha256": "10562df56e9d8f9c041b62bee61833483939140683f55f5b83597a460b126dc1"
+    },
+    {
+      "name": "original-formatter-CI-failure.log",
+      "path": "/tmp/coord-b9-1828-ci-41057813223-formatter-failure.log",
+      "sha256": "9e1cd5892348f91bd2aef25f88f9470de7b6f353f1777ad2a8085958fb58961b"
+    }
+  ],
+  "grant": "NONE. ACTUAL_GRANT_REQUIRED; preparation is not an admission or queue. #1650 stays ahead. Root/EC grant and fresh exact independent controller review required.",
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "environment": "Inherited opaque authority/config/context preserved except exact reviewed compiler-only overrides. No provider/User/native authority substitution or environment stripping.",
+  "fixture_contract": {
+    "outer_graph_executions": 12,
+    "unique_source_parents": 12,
+    "expected_child_reexecutions": 0,
+    "source_derived_events": [
+      "run1",
+      "named-ok",
+      "summary"
+    ],
+    "scope": "Four real App/LSP ownership parents, two clone-navigation parents and six focused navigation controls. One outer1P0F0I result per invocation, no libtest child-count exception. Source Git/fixture subprocesses are custody obligations, not added passes. No actual native/provider evidence."
+  },
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+      "tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+      "runner_sha256": "<actual reviewed frozen runner SHA256>",
+      "plan_sha256": "<actual reviewed frozen plan SHA256>"
+    },
+    "runtime_arguments": [
+      "--controller-review",
+      "<actual independent controller receipt path>",
+      "--controller-review-sha256",
+      "<actual receipt SHA256>"
+    ],
+    "note": "Receipt bytes archived before lock together with exact runner/plan/source review bytes. A preparation file or placeholder is not review or lease authority."
+  },
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "budget": "Same donor2400s absolute cap starts once after C acquisition and never resets. UI binary check600s; samehead UI lib CargoJSONcompile1200s; actual ELF inventory30s;12 exact parents30s each. Source/context preparation consumes remaining phase/global budgets; no retry/extension, feature union or new target/cache.",
+  "limits": "Only1isolated UIbincheck,1samehead UIlib compilation,1actualELFinventory and12exact ordinary parents/15phases. No CLI/HOST/integrated graph, live provider, native development-runner interaction, external language-server acceptance, screenshots, narrow/wide native UX, responsiveness, installed/release or whole-PR/merge qualification. Static names are not discovery; all current execution remains UNRUN.",
+  "lineage": {
+    "controller_head": "e2975301303ef34d002b6546c5a3eb585a432402",
+    "controller_tree": "f97e0d767c33d8e0f54849289fc243230b3dd771",
+    "template_runner_sha256": "a0c64f76b21e1e377817c3250120ecf973789be085afaaefc1875e7564512ddc",
+    "template_plan_sha256": "0e8c8bdeede451f6efff8dbe5a9f07ee65d6c2c5ee3e2471bf4cbba34c7e8646",
+    "template_source_copy": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-ui15/qualification-packets/pr1828/donor-run-packet.py",
+    "scope": "Exact reviewed1650 controller adaptation. Only task paths/pins,12/15 cardinality metadata and actual1828 source-review admission binding change. No donor product/runtime pass or grant transfer."
+  },
+  "historical_negative_preservation": [
+    {
+      "head": "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+      "run": 41057463335,
+      "conclusion": "FAILURE",
+      "original_exit": 1,
+      "stage": "Verify source and required tools",
+      "missing": [
+        "tests/run-development-zig.py",
+        "scripts/check-format-cache.py"
+      ],
+      "raw_log": "/tmp/coord-b9-1828-ci-41057463335-preflight-failure.log",
+      "sha256": "10562df56e9d8f9c041b62bee61833483939140683f55f5b83597a460b126dc1",
+      "later_steps": "SKIPPED",
+      "waiver_or_retry": false
+    },
+    {
+      "head": "012574b856c340ac83e53795c628a70128eff399",
+      "run": 41057813223,
+      "conclusion": "FAILURE",
+      "original_exit": 1,
+      "tests_ran": 25,
+      "reported_failure_count": 6,
+      "raw_log": "/tmp/coord-b9-1828-ci-41057813223-formatter-failure.log",
+      "sha256": "9e1cd5892348f91bd2aef25f88f9470de7b6f353f1777ad2a8085958fb58961b",
+      "later_shell_repository_format_integrity": "SKIPPED",
+      "waiver_or_retry": false
+    }
+  ],
+  "request": "Source preparation only. No running job, resource probe, lock/cache adoption or execution request generated. Root owns independent controller review and any eventual fair admission; #1650 remains first."
+}

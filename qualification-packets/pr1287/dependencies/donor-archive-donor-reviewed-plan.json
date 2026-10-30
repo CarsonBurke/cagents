@@ -1,0 +1,417 @@
+{
+  "prepared_only": true,
+  "status": "SOURCE_ONLY_FIXTURE_SUCCESSOR_UNREVIEWED_UNGRANTED_UNRUN",
+  "product_pr": 1650,
+  "product_head": "5e66818946fc2c6c37d4895ad9f7949e648be35e",
+  "product_tree": "2ca3bff9e19e1286624b02fe2b59edbbb6ae0d1a",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-panel-fixture-correction",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/source-review-binding.json",
+  "source_review_sha256": "8c2fa20e4a91b1b6f8d63ba373bca6b656154bf7a615a24a01091090aa5ff4c4",
+  "source_paths_sha256": {
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/bin/cagents-ui.rs": "025b4d6fbbf168bdcb5055c0684b914f0e3cb3a1ba669ea275005cd336518efd",
+    "src/app.rs": "3addafc0aa88d6c42495a6f9003f36a9ad62a1ae6fc2f1d01c1314a80e365311",
+    "src/app/chat_ui/goal_dispatch.rs": "7f7fd5ab9047151bfa8bc806bfe14b761184065ecfe46ee11081cc878b31571b",
+    "src/app/chat_ui.rs": "c5a109d7529661ecf153f0066e222453fd847a114fd9088e88163f1667e81f7e",
+    "src/app/chat_ui/goal.rs": "013237ce1e1ad158cb0f281baf136a6a4f788354cefb6924afe032a884f0aeec",
+    "src/chat.rs": "c1dd89cad364b64bb487558843d6ca59d59523a88e3d80ff87b6323e7c35b315",
+    "src/chat/client.rs": "10f2a3ad5cebb48d62965c506d5353a5bfb26a0240dcef0209d91078fedfcca5",
+    "src/chat/goal.rs": "977e48728352fb5c988f9605db6caec372d2322fa87b28a747bce3d90a0482e6",
+    "src/chat/protocol/codex.rs": "357fad2d3d43d9394923d035030fb3a3ea27278a5a0d271168a312f6d88d1ea5",
+    "src/chat/runtime.rs": "b67876b0d5c16c23dd9880df576efc45bbb11f90d57a93f4d49943abb9178c4b"
+  },
+  "binary_checks": [
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "selectors": [
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::panel_goal_admission_retains_revision_across_publication_before_ui_wake",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::panel_goal_lost_observation_retires_before_pending_or_readiness_wait",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::stale_panel_goal_retires_without_releasing_an_unrelated_physical_command",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::explicit_model_or_effort_replacement_retires_only_an_admitted_unsent_goal",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::missing_goal_model_catalog_expires_from_its_actual_timer_without_a_provider_wake",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::armed_model_timer_expires_waiting_work_behind_readiness_or_another_command_only",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::external_selection_drift_during_probe_refuses_unsent_goal_and_preserves_input",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::model_staging_publication_supplies_the_new_goal_revision_for_set_and_resume",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::selection_and_goal_revision_share_a_publication_and_never_upgrade_at_handoff",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::delayed_model_confirmation_dispatches_once_and_timer_cannot_release_native_or_rebound_work",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::local_model_replacement_preserves_waiting_read_pause_and_clear_intents",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::busy_goal_input_has_a_real_send_button_and_composer_chord",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::an_old_panel_close_preserves_a_newer_waiting_goal_and_all_composer_state",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::goal_keyboard_ring_focuses_real_enabled_card_controls_and_wraps_without_mutating_input",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::goal_submit_preserves_disabled_conversation_draft_without_dispatch",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::goal_submit_precedes_automatic_account_routing_and_never_creates_a_prompt_queue",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::goal_input_refusals_preserve_draft_paste_attachments_and_unrelated_followups",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::native_confirmation_not_transport_acceptance_consumes_only_unchanged_goal_input",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::uncertain_unsupported_wrong_revision_and_rejected_dispatch_never_consume_or_replay_input",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::stale_goal_control_preserves_a_newer_model_picker_and_its_field_focus",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::retained_goal_control_cannot_dismiss_a_same_revision_model_picker",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::retained_goal_control_cannot_reopen_a_publicly_closed_panel",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::goal_callbacks_cannot_retarget_actor_thread_observation_or_selected_child",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::typed_draft_goal_waits_for_original_start_model_and_probe_without_a_literal_prompt",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::failed_start_and_replaced_source_retire_goal_intent_without_retry_or_draft_loss",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        },
+        {
+          "name": "app::chat_ui::goal_dispatch::tests::native_goal_activity_blocks_automatic_account_handoff_between_turns_without_faking_turn_busy",
+          "expected_child_reexecutions": 0,
+          "seconds": 30
+        }
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_seconds": 1200,
+      "inventory_seconds": 30,
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ]
+    }
+  ],
+  "planned_phase_order": [
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12",
+    "parent-ui-lib-13",
+    "parent-ui-lib-14",
+    "parent-ui-lib-15",
+    "parent-ui-lib-16",
+    "parent-ui-lib-17",
+    "parent-ui-lib-18",
+    "parent-ui-lib-19",
+    "parent-ui-lib-20",
+    "parent-ui-lib-21",
+    "parent-ui-lib-22",
+    "parent-ui-lib-23",
+    "parent-ui-lib-24",
+    "parent-ui-lib-25",
+    "parent-ui-lib-26"
+  ],
+  "planned_phase_count": 29,
+  "counts": {
+    "checks": 1,
+    "lib_compilations": 1,
+    "ELF_inventories": 1,
+    "qualifying_outer_parents": 26,
+    "unique_source_parents": 26,
+    "expected_nonadditive_child_reexecutions": 0,
+    "total_phases": 29
+  },
+  "packet_deadline_seconds": 2400,
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "rust": "1.93.0",
+    "new_cache": false
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "archive_bindings": [
+    {
+      "name": "prior-f20-source-review.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/source-review.json",
+      "sha256": "7ad787338ed5d9ffac15b360770bfe78fe2311236db72e8424e65c9b89f9021e"
+    },
+    {
+      "name": "prior-f20-owning-ui-source-plan.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/owning-ui-source-plan.json",
+      "sha256": "12a4c7aaaf9cede37b02ed96bd5eb6fd95ac53a1fd08c0e0806a38cd46dd8ce5"
+    },
+    {
+      "name": "prior-f20-source-inventory.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/source-inventory.json",
+      "sha256": "be1face800b4a610a969f8083ff1f9623b085dbbaf79dcb8043a9eb1306e1e65"
+    },
+    {
+      "name": "prior-f20-product-source-conservation.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/product-source-conservation.json",
+      "sha256": "ad5acd803d8240821d49d33aaa2c780a4e8d85a1fea74641ad52580f1b58108e"
+    },
+    {
+      "name": "prior-f20-donor-run-packet.py",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/donor-run-packet.py",
+      "sha256": "00c20713bd33f127f9682414bea513f93d7fb28e1076944cb1c87617b34eee58"
+    },
+    {
+      "name": "prior-f20-donor-plan.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-prepared/donor-plan.json",
+      "sha256": "c20a2cefd736ee5f7792aae16791b562ce9a78201d0382ce745f8a933e9a4231"
+    },
+    {
+      "name": "source-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/source-review-binding.json",
+      "sha256": "8c2fa20e4a91b1b6f8d63ba373bca6b656154bf7a615a24a01091090aa5ff4c4"
+    },
+    {
+      "name": "fixture-delta-review.md",
+      "path": "/tmp/coord-b9-1650-panel-fixture-correction-independent-source-review.md",
+      "sha256": "b949e57690f49a524a66e73c097871815f1d2aa20212118b9ded1ca1b59bbdaa"
+    },
+    {
+      "name": "fixture-source-receipt.json",
+      "path": "/tmp/coord-b9-1650-panel-fixture-correction-evidence/source-receipt.json",
+      "sha256": "6454fbc3c95b06db4dd3795d658d4b60354a94682d708c04a9b46ecd693e156e"
+    },
+    {
+      "name": "executed-f20-donor-runner.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/donor-run-packet.py",
+      "sha256": "94b22a0befeedeb1e3e15caf99153cb25bf6884bf11fd05902574bd6e47756e1"
+    },
+    {
+      "name": "executed-f20-donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/donor-plan.json",
+      "sha256": "c6641bb5355d008900de6ac9206892ce038533f4944153f569ab719861195834"
+    },
+    {
+      "name": "original-c54-negative-summary.json",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-validation-20261030T102518251526Z-2/summary.json",
+      "sha256": "0058ef57023733c79df570f0bca0108ea4e798bbc21ef6974fdc662ebd2c096d"
+    },
+    {
+      "name": "original-c54-negative-SHA256SUMS",
+      "path": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-validation-20261030T102518251526Z-2/SHA256SUMS",
+      "sha256": "4cd10c37c66732c2cda5c953707671ea44fb016b15b5e9735abefc8c6159792c"
+    },
+    {
+      "name": "original-c54-sole-raw.json",
+      "path": "/tmp/fw16-pr1650-c54-sole-original-raw-audit.json",
+      "sha256": "01a2c035fd226b4a5146f9f577643a4281aa63f25e8a0d8dd908861c25fb9c48"
+    },
+    {
+      "name": "source-inventory.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/source-inventory.json",
+      "sha256": "b4a2b1714196e2f72d70dde9efd46cc47478c5bc5ff4e2284e1028452f1fb0b2"
+    }
+  ],
+  "grant": "NONE. Corrected-source preparation only; originalc54 returned/ECacceptance separate.1775 fairqueue next. Fresh exact controller review and new fair EC grant required; no retry/queue jump.",
+  "environment": "Inherited opaque authority/config/context preserved except exact reviewed compiler-only overrides. No provider/User/native authority substitution or environment stripping.",
+  "fixture_contract": {
+    "outer_graph_executions": 26,
+    "unique_source_parents": 26,
+    "expected_child_reexecutions": 0,
+    "source_derived_events": [
+      "run1",
+      "named-ok",
+      "summary"
+    ],
+    "scope": "All26 exact goal_dispatch UI outer parents; three new first and23 retained. Ordinary one-parent output only; source subcases/model timers/physical command slots do not add parent counts. No provider/actual native evidence or authenticated authority."
+  },
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "5e66818946fc2c6c37d4895ad9f7949e648be35e",
+      "tree": "2ca3bff9e19e1286624b02fe2b59edbbb6ae0d1a",
+      "runner_sha256": "<actual reviewed frozen runner SHA256>",
+      "plan_sha256": "<actual reviewed frozen plan SHA256>"
+    },
+    "runtime_arguments": [
+      "--controller-review",
+      "<actual independent controller receipt path>",
+      "--controller-review-sha256",
+      "<actual receipt SHA256>"
+    ],
+    "note": "Receipt bytes archived before lock together with exact runner/plan/source review bytes. A preparation file or placeholder is not review or lease authority."
+  },
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "budget": "Original2400s global cap starts once after C acquisition and never resets. One isolated UI check600s, one UI library compile1200s, actual Cargo-reported ELF inventory30s and26 exact ordinary parents30s each. Every phase shares remaining original budget including source/context preparation. No retry/extension, feature union or new cache.",
+  "limits": "Only exact29phase correction contract:1isolated UI binary check,1actual root UI library CargoJSONELF compile,1strict ELF inventory and26 exact owning parents. Allnew3 and retained23 are selected; scenarios/subcases are nonadditive. No CLI/HOST/integrated graph, provider/native gesture, actual protocol peer, installed/live582 recovery, mounted UX/screenshots/responsiveness, current-main integration, whole84commit feature or merge qualification. This is source preparation; compilation/tests/native remain UNRUN.",
+  "lineage": {
+    "template_runner_sha256": "94b22a0befeedeb1e3e15caf99153cb25bf6884bf11fd05902574bd6e47756e1",
+    "template_plan_sha256": "c6641bb5355d008900de6ac9206892ce038533f4944153f569ab719861195834",
+    "template_source_copy": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1650-fixture-ui29/qualification-packets/pr1650/donor-run-packet.py",
+    "scope": "Source-only exact adaptation of actual c54 runner; same execution/count/context/custody/release functions. Only source-review admission block and literal source/output paths/pins change. No runtime result transfer."
+  },
+  "historical_negative_preservation": [
+    {
+      "head": "f20cf0b0f2d9678ee921aafd95dc372276c000be",
+      "grant": "c54c5984-8ed1-48c7-896c-3e687b87657a",
+      "evidence": "/tmp/coord-b9-1650-f20cf0b0-owning-ui-validation-20261030T102518251526Z-2",
+      "result": "Originalwrapper1; firstparent0P1F101;25UNRUN; UIcheck/compile/inventory0. No pass replacement or retry.",
+      "sole_raw": "/tmp/fw16-pr1650-c54-sole-original-raw-audit.json",
+      "sha256": "01a2c035fd226b4a5146f9f577643a4281aa63f25e8a0d8dd908861c25fb9c48",
+      "ELF_limit": "No post-failure ELF digest archived in original; no stronger claim."
+    }
+  ],
+  "product_source_scope": "Original bounded f20 production correction7ad + independent5e668 fixture-only delta b949; all26 exact test bodies/assertions preserved. No wholePR/current-main/native/installed approval.",
+  "release_correction": {
+    "donor_runner_sha256": "e4a7cb37831836e760ef3064082ec06b29f9f68837b8b079864ff6963a338f89",
+    "scope": "Only finalization handoff/physical Cclose barrier; original product26 parents and29 phases unchanged.",
+    "no_release": "Existing complete safe_lane_handoff must be true before the original Cfd is closed. Unknown assessment or handoff retains the original process without further workload or close.",
+    "close_error": "One original close attempt only; uncertainty is retained without retry or a physical-lock-held claim.",
+    "cleanup": "Existing bounded cleanup and original custody algorithms unchanged; no new executor or maintained framework.",
+    "runtime": "UNRUN; fresh independent exact controller review and actual EC grant required.",
+    "cooperative_cancellation": "SIGINT/TERM recorded by handlers installed before source children/C acquire. Fresh guards before each Popen and C acquire forbid new workloads. Existing cleanup remains permitted; unknown handback retains original process with no further controls."
+  },
+  "source_review_binding_kind": "AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_TWO_NONAUTHOR_SOURCE_REVIEWS_NOT_A_NEW_REVIEW",
+  "fixture_correction": {
+    "head": "5e66818946fc2c6c37d4895ad9f7949e648be35e",
+    "source_review_sha256": "b949e57690f49a524a66e73c097871815f1d2aa20212118b9ded1ca1b59bbdaa",
+    "owning_source_sha256": "7f7fd5ab9047151bfa8bc806bfe14b761184065ecfe46ee11081cc878b31571b",
+    "scope": "Seed authoritative Text+managed Image in existing fixture; no regression assertion/production changes."
+  },
+  "historical_f20_source_inventory_sha256": "be1face800b4a610a969f8083ff1f9623b085dbbaf79dcb8043a9eb1306e1e65",
+  "source_inventory_sha256": "b4a2b1714196e2f72d70dde9efd46cc47478c5bc5ff4e2284e1028452f1fb0b2"
+}

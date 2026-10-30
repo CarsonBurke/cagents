@@ -1,0 +1,39 @@
+{
+  "status": "INDEPENDENT_SOURCE_CLEAR_CORRECTION_ONLY_EXECUTION_UNRUN",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-lsp-navigation",
+  "branch": "fix/pr1828-lsp-navigation-b9",
+  "base": "c57dc4afa8e8c3531b4f4c5ba7455981aa5d9057",
+  "head": "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+  "tree": "ed901bf172bca2426dfb536a6e58deca61ce3687",
+  "files": {
+    "src/app.rs": "8aaa7559cbc59dc345aaa9b570658fdbc3704d86d79a8fb1866f2c8093c14bb5",
+    "src/app/repository_clone_lsp_ownership_tests.rs": "6d3972660b47d3ba29157402816c57724dc7c7d730c752539b2b91589ec822f7"
+  },
+  "clean": true,
+  "author_receipt": "/tmp/coord-b9-1828-lsp-navigation-author/source-receipt.json",
+  "author_receipt_sha256": "7b9b0380d335cd913f60269ba229766cc503d822ca1809499ebf99fa5ff76d21",
+  "root_independent_source_review": {
+    "reviewer_is_author": false,
+    "finding": "Published exact-c57 P2 both current reviews read, public head freshly unchanged. No prior test result transferred.",
+    "correctness": "Disabled/duplicate-owner Open now settles matching parked navigation from immutable text supplied by that actual admitted FileLoaded Open intent. Manager owner/version maps are not acquired or changed for refusal; later stale file-worker generation is rejected before Open. UTF16 conversion matches manager surrogate/line semantics and normal native snapshots read only the requested line. Different-file Open still consumes the obsolete pending position.",
+    "owning_oracles": "Real App+two repository panes+real manager/in-process transport; different owner dirty astral prefix, nonzero own disk coordinate, focus, unchanged foreign doc/version/source; actual obsolete FileLoaded callback, plain open and Text/native snapshot CRLF/surrogate bounds. Authored not executed.",
+    "neighbor_review": "Existing admitted manager path remains; no-server unrelated-open clearing retained. No reachable current-head blocker found in assigned correction. Actual native UX review remains required."
+  },
+  "checks": {
+    "official_physical_rust193_scripts_check_format": {
+      "exit": 0,
+      "exec_chunk": "af63d9",
+      "elapsed_seconds": 7.579971552
+    },
+    "whitespace": {
+      "exit": 0,
+      "exec_chunk": "eea9db"
+    },
+    "UI_check": "UNRUN",
+    "all_new_and_neighbor_tests": "UNRUN",
+    "native_two_pane_flow": "UNRUN",
+    "before_after_WebP": "MISSING",
+    "independent_native_UX": "UNRUN"
+  },
+  "publication": "Normal fast-forward to existing Draft permitted after this source review; no approval/merge readiness or historical qualification transfer."
+}

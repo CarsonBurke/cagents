@@ -1,0 +1,31 @@
+{
+  "kind": "SOURCE_ONLY_1828_EXACT12_UI_OUTER_PARENTS_NOT_COMPILED_INVENTORY",
+  "head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+  "tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+  "count": 12,
+  "names_in_execution_order": [
+    "app::tests::repository_clone_lsp_ownership::cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner",
+    "app::tests::repository_clone_lsp_ownership::loaded_jump_coordinates_reject_surrogate_splits_and_invalid_lines",
+    "app::tests::repository_clone_lsp_ownership::dirty_repository_clone_cannot_replace_original_language_source_on_load_edit_or_retry",
+    "app::tests::repository_clone_lsp_ownership::clean_clones_diverge_without_sharing_language_edits_and_retry_after_owner_release",
+    "app::tests::repository_clone_navigation::browser_clone_loads_live_file_and_independent_navigation",
+    "app::tests::repository_clone_navigation::clone_keeps_empty_and_fixed_file_recipes_and_reopen_separate",
+    "app::tests::a_jump_into_another_file_parks_until_it_is_open",
+    "app::tests::a_jump_gives_the_editor_the_keyboard",
+    "app::tests::a_jump_that_opens_a_file_gives_the_editor_the_keyboard_too",
+    "app::tests::a_parked_jump_does_not_survive_a_different_file_opening",
+    "app::tests::a_file_with_no_server_reports_disabled_and_clears_a_parked_jump",
+    "app::tests::a_jump_into_a_file_the_card_cannot_open_says_so"
+  ],
+  "source_files_sha256": {
+    "src/app.rs": "05d161cb2f8c29c6cf14d390a3c5bd95e8723ec10984b36704f8c86bd1315581",
+    "src/app/repository_clone_lsp_ownership_tests.rs": "6d3972660b47d3ba29157402816c57724dc7c7d730c752539b2b91589ec822f7"
+  },
+  "module_chain": "src/modules.rs UI app -> src/app.rs cfg(test) tests -> repository_clone_lsp_ownership include!(app/repository_clone_lsp_ownership_tests.rs), repository_clone_navigation nested module, or direct tests members.",
+  "selection_reason": "All four LSP ownership parents, both original clone-navigation parents, and six parked-jump/caret/no-server/openability controls. No unrelated settings suite.",
+  "expected_child_reexecutions": 0,
+  "fixture_limits": "Private Git subprocesses and in-process LSP manager/transport fixture are process-custody obligations, not extra libtest parents or native/provider passes. No selected parent invokes current_exe as another libtest parent. Existing private-Git env_clear is fixture isolation, not proof or alteration of parent User/authority provenance.",
+  "proof": "Only source declarations and module ancestry verified. Future actual Cargo-reported ELF --list must independently prove each exact selected nonignored name once; static names are not discovery or passes.",
+  "actual_grant": null,
+  "execution": "UNRUN"
+}

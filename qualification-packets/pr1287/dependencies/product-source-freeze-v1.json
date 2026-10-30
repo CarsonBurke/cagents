@@ -1,0 +1,13 @@
+{
+  "head": "4fa3370532d78d8e19099639f2bc40c711dc725a",
+  "tree": "ea6671347bb1c2aa84f240f9b4727c00346403bc",
+  "parent": "7c98122f5ad89d7e6c7e118814d794318f0880b6",
+  "leaves": {
+    "src/persistence.rs": "28cd95af1037c6a07d9481a073ae752f692bd3c358f7244f8c76c2e5fd6979fd",
+    "src/automations/archive.rs": "9c61511f486805b62413844ed38fca76837ca0fd19d993c8f75676fd3e40d6e6",
+    "src/automations.rs": "4150f5b7708f4f8323caf5b4bb0cb0952f311fd0eb3c2ae425522089a24417b0"
+  },
+  "ownership": "Main15 explicit8f95744a-fd7e-4d9a-b249-e93c5f777e73",
+  "scope": "shared canonical byte inspection, bounded remaining raw-key preflight, aggregate reserve before loader, one multiple-window SQLite parent",
+  "validation": "Rust1.93 leaf/diff pass; compile/tests/native UNRUN"
+}

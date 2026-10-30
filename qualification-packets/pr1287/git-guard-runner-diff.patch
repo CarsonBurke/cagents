@@ -1,0 +1,118 @@
+--- prepared-negative-4288fcae
++++ git-guard-corrected-runner
+@@ -20,12 +20,12 @@
+ TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
+ LOCK = TARGET.parent / 'lane-c.lock'
+ TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
+-PLAN = Path('/tmp/fw16-pr1287-4fa33705-qualification-packet-8iT5g7ll/plan.json')
++PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-qualification-control/qualification-packets/pr1287/plan.json')
+ PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
+ PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
+ SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
+ CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
+-PLAN_SHA = '0bf9f587e3f9f020d68603cac147c5de1765a1ef99e1d04796c5f9b3a2df4c7f'
++PLAN_SHA = '18c66b50a740e4c71999d03bec40954cba04d91b079cfd1a3b78230f32183e7c'
+ 
+ 
+ def digest(path):
+@@ -112,8 +112,91 @@
+         raise
+ 
+ 
++GIT_ROUTING = (
++    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
++    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
++    'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_ATTR_SOURCE',
++)
++
++
++def refuse_git_routing():
++    # Match the maintained checkout helper. Never log, remove or replace values.
++    assert not any(name in os.environ for name in GIT_ROUTING), 'Unsupported Git-routing variable names are present'
++
++
+ def git(*args, absolute_deadline=None):
+-    return bounded_capture(['git', '--no-optional-locks', '-C', str(WT), *args], absolute_deadline)
++    refuse_git_routing()
++    return bounded_capture([
++        'git', '--no-replace-objects', '--no-optional-locks',
++        '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
++        '-c', 'core.untrackedCache=false', '-c', 'submodule.recurse=false',
++        '-C', str(WT), *args,
++    ], absolute_deadline)
++
++
++def git_nul_fields(value):
++    assert not value or value.endswith('\0'), 'Unterminated Git metadata'
++    return value[:-1].split('\0') if value else []
++
++
++def guard_git_metadata(absolute_deadline=None):
++    """Refuse executable metadata contexts before the first status invocation.
++
++    These read-only guards mirror prepare-validation-checkout's configuration,
++    index and effective-attribute policy. The original supervised Git capture
++    remains responsible for every spawned process and its original wait.
++    """
++    refuse_git_routing()
++    keys = git_nul_fields(git('config', '--null', '--name-only', '--list', absolute_deadline=absolute_deadline))
++    assert all(key for key in keys), 'Empty Git configuration key'
++    assert not any(re.match(r'^(includeif\.|remote\..*\.promisor$|extensions\.partialclone$)', key.lower())
++                   for key in keys), 'Conditional Git configuration and partial/promisor clones are unsupported'
++    for setting in ('core.sparsecheckout', 'index.sparse'):
++        if setting in {key.lower() for key in keys}:
++            assert git('config', '--bool', '--get', setting, absolute_deadline=absolute_deadline) == 'false', 'Sparse Git source is unsupported'
++    indexed = git_nul_fields(git('ls-files', '-v', '-z', absolute_deadline=absolute_deadline))
++    assert indexed and all(entry.startswith('H ') and entry[2:] for entry in indexed), 'Index flags or unresolved entries conceal source'
++    paths = [entry[2:] for entry in indexed]
++    assert len(paths) == len(set(paths)), 'Duplicate index paths'
++    staged = {}
++    for entry in git_nul_fields(git('ls-files', '--stage', '-z', absolute_deadline=absolute_deadline)):
++        header, separator, path = entry.partition('\t')
++        fields = header.split(' ')
++        assert (separator and path and len(fields) == 3 and fields[0] in ('100644', '100755', '120000')
++                and re.fullmatch(r'[0-9a-f]{40}', fields[1]) and fields[2] == '0' and path not in staged), 'Invalid or submodule index entry'
++        staged[path] = (fields[0], fields[1])
++    assert set(staged) == set(paths), 'Index path inventories disagree'
++    committed = {}
++    for entry in git_nul_fields(git('ls-tree', '-r', '-z', 'HEAD', absolute_deadline=absolute_deadline)):
++        header, separator, path = entry.partition('\t')
++        fields = header.split(' ')
++        assert (separator and path and len(fields) == 3 and fields[0] in ('100644', '100755', '120000')
++                and fields[1] == 'blob' and re.fullmatch(r'[0-9a-f]{40}', fields[2]) and path not in committed), 'Invalid or submodule committed entry'
++        committed[path] = (fields[0], fields[2])
++    assert staged == committed, 'Staged source differs from the committed tree'
++    # Bounded argv batches avoid stdin pipes and preserve original wait/custody.
++    batches, batch, size = [], [], 0
++    for path in paths:
++        cost = len(os.fsencode(path)) + 1
++        assert cost <= 32768, 'Tracked path exceeds the metadata argument bound'
++        if batch and size + cost > 32768:
++            batches.append(batch)
++            batch, size = [], 0
++        batch.append(path)
++        size += cost
++    if batch:
++        batches.append(batch)
++    for batch in batches:
++        for source in ((), ('--cached',)):
++            values = git_nul_fields(git('check-attr', '-z', '--all', *source, '--', *batch,
++                                        absolute_deadline=absolute_deadline))
++            assert len(values) % 3 == 0, 'Incomplete effective Git attribute metadata'
++            seen = set()
++            for offset in range(0, len(values), 3):
++                path, attribute, _value = values[offset:offset + 3]
++                assert path in batch and attribute and (path, attribute) not in seen, 'Invalid or duplicate effective Git attribute'
++                seen.add((path, attribute))
++                assert attribute != 'filter', 'Effective Git filter attributes are unsupported'
+ 
+ 
+ def signal_pidfd(fd, number):
+@@ -567,6 +650,7 @@
+     def source(absolute_deadline=None):
+         if deadline is not None:
+             absolute_deadline = deadline if absolute_deadline is None else min(deadline, absolute_deadline)
++        guard_git_metadata(absolute_deadline)
+         value = {'head': git('rev-parse', 'HEAD', absolute_deadline=absolute_deadline),
+                  'tree': git('rev-parse', 'HEAD^{tree}', absolute_deadline=absolute_deadline),
+                  'status': git('status', '--porcelain=v1', '--untracked-files=all', absolute_deadline=absolute_deadline),

@@ -1,0 +1,31 @@
+{
+  "kind": "AUTHOR_ASSEMBLED_IMMUTABLE_BINDING_OF_1828_CORRECTION_COMPOSITION_AND_FIXTURE_NOT_A_NEW_REVIEW",
+  "verdict": "BOUND_EXISTING_INDEPENDENT_SOURCE_REVIEWS_AND_EXACT_COMPOSITION_ONLY",
+  "head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+  "tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+  "owning_parent_count": 12,
+  "product_review": {
+    "path": "/tmp/coord-b9-1828-lsp-navigation-independent-source-review.json",
+    "sha256": "3bcecf19559dc90d2992ce3c9f852cc2dd8d33e132d28566840d0a6e8602dc45",
+    "head": "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+    "tree": "ed901bf172bca2426dfb536a6e58deca61ce3687",
+    "scope": "Independent bounded correction source/UX contract assessment, authored by root who did not author correction. Execution/native unrun."
+  },
+  "composition_receipt": {
+    "path": "/tmp/coord-b9-1828-current-main-source-freeze.json",
+    "sha256": "29b59e7fa5484043d1e4aeacb578630b8805d4e5013cd1b47fbf24626939e4bd",
+    "head": "012574b856c340ac83e53795c628a70128eff399",
+    "tree": "85436022005d0ad05d088c5951d55810e2466aa4",
+    "scope": "Author normal conflict-free merge with captured main; exact bindings, not a newly invented independent production review."
+  },
+  "fixture_delta_review": {
+    "path": "/tmp/coord-b9-1828-fixture-alignment-source-review.json",
+    "sha256": "331f48dc9931e22aa030ff3622f569eeeebe740e1806a7d0dcc66ceeda45f84a",
+    "head": "c4bdce2a4c1417cc16fb3dc0eed5ada8a17481bd",
+    "tree": "8f34e45bb08f0fc669bd5948a77cf2514737282d",
+    "scope": "One-line formatter-fixture list alignment. Its independent reviewer authored product, so clearance applies only to root-authored fixture delta; no independent product approval transferred."
+  },
+  "interpretation": "This file is an author assembly of actual immutable records, not SOURCE_CLEAR, readiness or execution authority. Fresh independent controller review must assess current pins/composition and admission before any grant.",
+  "runtime": "CURRENT_HEAD_COMPILATION_DISCOVERY_ALL12_TESTS_NATIVE_UNRUN",
+  "actual_grant": null
+}

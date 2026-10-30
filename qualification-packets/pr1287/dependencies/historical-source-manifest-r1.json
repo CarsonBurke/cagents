@@ -1,0 +1,980 @@
+{
+  "affected_seven_assignments": {
+    "cli": 0,
+    "host": 4,
+    "ui": 3
+  },
+  "affected_seven_selectors": [
+    "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+    "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+    "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+    "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+    "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+    "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+    "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion"
+  ],
+  "baseline": "88dbd65859be8b09e5664d2d10cbec5059fddd0b",
+  "broad_boundary_gates": {
+    "combined_host_ui": false,
+    "commands": [
+      [
+        "<PINNED_CARGO>",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--all-targets"
+      ],
+      [
+        "<PINNED_CARGO>",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--all-targets"
+      ]
+    ],
+    "native_proof": "NONE; actual flow remains separate",
+    "status": "UNRUN, separately required beyond this exact selected queue"
+  },
+  "cli_boundary": {
+    "automations_archive_compiled": false,
+    "owning_selected_tests": 0,
+    "persistence_compiled": false,
+    "reason": "Both changed modules are excluded from CLI by exact source cfg. Bare/default cargo test cannot qualify these fixes. CLI check is not an owning qualification substitute."
+  },
+  "compiled_selected_counts_including_control": {
+    "cli": 0,
+    "host": 8,
+    "ui": 4
+  },
+  "current_leaf_pins": {
+    ".cargo/config.toml": {
+      "bytes": 340,
+      "git_blob": "26c381c4d46ced77ee6a3f219e29a3193b205a9d",
+      "sha256": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96"
+    },
+    "Cargo.lock": {
+      "bytes": 341297,
+      "git_blob": "a671a166c5339ec26723c3c6598bc1ffeed6d882",
+      "sha256": "e36b7c5632f026ab2e5a1f41523a8bc0d77519a2ab416b613c8bd90897b2ff31"
+    },
+    "Cargo.toml": {
+      "bytes": 10751,
+      "git_blob": "8e662163e2dba4bdc2c286e9da37483b8a45dee7",
+      "sha256": "780a5836160d6332b848c91503b9f2d4a028b9a1bdcc4c0b0ed1b3b21f973270"
+    },
+    "build.rs": {
+      "bytes": 4374,
+      "git_blob": "935672a3504690936d8802a95859c012b4709b04",
+      "sha256": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f"
+    },
+    "src/account.rs": {
+      "bytes": 66182,
+      "git_blob": "8ef46c6e66ebcd0dcf6b6af7fd3856c28946a586",
+      "sha256": "d69eaf5f371f1de1ffd96af8d7b71ac450f5045e7c794bb185cfb0162f32dac6"
+    },
+    "src/agent_execution.rs": {
+      "bytes": 23679,
+      "git_blob": "509a5df65ad01f2e727a191c3ab27aeeb1a0910f",
+      "sha256": "b0ffa134a9aa7dd4233471ea72820d73139b446f526add774e310593ed68b9c9"
+    },
+    "src/automations.rs": {
+      "bytes": 16304,
+      "git_blob": "e9cc8d9d5c3c44d1350c389a35fcaf08e626d2cd",
+      "sha256": "e566f2635ab443785fef53b21f426eb21b919469f4d6501476c87d0a5e54248c"
+    },
+    "src/automations/archive.rs": {
+      "bytes": 52990,
+      "git_blob": "5a2b0187d170df0338ead50ca8d85c012faf34ea",
+      "sha256": "9c61511f486805b62413844ed38fca76837ca0fd19d993c8f75676fd3e40d6e6"
+    },
+    "src/bin/cagents-ui.rs": {
+      "bytes": 21776,
+      "git_blob": "d1ce23d50586bcce136d35886117e3be7fee9fff",
+      "sha256": "1b7da484e1914aaebad2decc1f575c8c80c91e366ee7f3ddd4f1844599094f77"
+    },
+    "src/bin/cagentsd.rs": {
+      "bytes": 4159,
+      "git_blob": "49e8d478169e59cd12388d1784e84ee162c42d8c",
+      "sha256": "e21ef607260d9f2036a12e467ecfa73ab5708ae3c1862dc07bf6195cb22f24bf"
+    },
+    "src/chat.rs": {
+      "bytes": 102127,
+      "git_blob": "6750d30791db6397f98b305a4069353aaca0cbfc",
+      "sha256": "12aa44b6bb0d5b64eb2608c818641da2bd7fadd520d4c3a413d6d1298c682d53"
+    },
+    "src/lib.rs": {
+      "bytes": 211,
+      "git_blob": "02575b9f47687c692079fd9959cf8be4e5a291fb",
+      "sha256": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326"
+    },
+    "src/main.rs": {
+      "bytes": 656,
+      "git_blob": "429db35e164a3306f4e91c2576f4fc352606ebce",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+    },
+    "src/model.rs": {
+      "bytes": 53989,
+      "git_blob": "130d453fab00ca30c284bb91fa2d3138fe1aa59a",
+      "sha256": "63c3cfe7ef79fe8bbceb5d38d213ac9cd41238857100ef07d71ab6faba08ba7e"
+    },
+    "src/modules.rs": {
+      "bytes": 3402,
+      "git_blob": "1a9c87ab2f048a094b481e931c789ae8d30c1284",
+      "sha256": "40732694378d8c99d3d8d5b21010e0335f1e036b9e2f1872e586d9210587d963"
+    },
+    "src/persistence.rs": {
+      "bytes": 371103,
+      "git_blob": "aeaa61f89bc81aa7c3a640abb92e1d54d3c49281",
+      "sha256": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5"
+    },
+    "src/persistence/review_cache.rs": {
+      "bytes": 15432,
+      "git_blob": "00e8b202e4b2af7f4b581dff0df42dd58478c027",
+      "sha256": "0334113709fcb593bf1f3f722803d18fed83514a7fd069fb0d599cc65a1a6543"
+    }
+  },
+  "diff_derivation": {
+    "additional_unchanged_inherited_control": 1,
+    "affected_distinct_parents": 7,
+    "baseline_to_final_numstat": [
+      "506\t12\tsrc/automations/archive.rs",
+      "201\t3\tsrc/persistence.rs"
+    ],
+    "baseline_to_final_test_changes": {
+      "src/automations/archive.rs": {
+        "added": [
+          "terminal_archive_requires_the_original_nested_relaunch_recipe",
+          "source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+          "source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+          "source_inspectors_keep_text_type_and_utf8_conversion_errors"
+        ],
+        "changed_existing": [
+          "source_archive_inspection_is_read_only_and_needs_no_service"
+        ],
+        "removed": []
+      },
+      "src/persistence.rs": {
+        "added": [
+          "migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+          "migration_terminal_inspection_bounds_raw_ids_before_string_conversion"
+        ],
+        "changed_existing": [],
+        "removed": []
+      }
+    },
+    "extended_existing_parents": 1,
+    "final_parent_delta": {
+      "deletions": 0,
+      "insertions": 44,
+      "new_test_parents": 0,
+      "path": "src/automations/archive.rs",
+      "persistence_byte_identical": true,
+      "production_delta": false
+    },
+    "future_queue_distinct_with_control": 8,
+    "new_test_parents": 6
+  },
+  "evidence_status": {
+    "CI_dispatch": false,
+    "Cargo": "UNRUN",
+    "DB_fixture_execution": "UNRUN",
+    "Git_or_GitHub_writes": false,
+    "actual_tool_pins": "NOT QUERIED",
+    "allocation": "NONE",
+    "children": 0,
+    "execution_grant": false,
+    "native": "UNRUN",
+    "provider": "UNRUN",
+    "runner_authored_or_dispatched": false,
+    "rustc": "UNRUN",
+    "test_discovery": "UNRUN",
+    "tests": "UNRUN"
+  },
+  "feature_derivation": [
+    {
+      "fact": "Library includes modules.rs; compiled names below are source-derived, not observed libtest discovery.",
+      "source": "src/lib.rs"
+    },
+    {
+      "fact": "automations root is ungated, archive child is any(host,ui). archive cfg(test) module contains two shared pure tests; three bounded-text tests plus existing inspector carry an additional feature=host gate.",
+      "source": "src/modules.rs / src/automations.rs"
+    },
+    {
+      "fact": "persistence exists only in any(host,ui), with cfg(test) module and two new ungated-within-module tests. Both HOST/UI compile them; CLI/full identity graph does not.",
+      "source": "src/modules.rs / src/persistence.rs"
+    },
+    {
+      "fact": "default full is production identity only; host and ui select isolated implementation graphs. cagents/cagents-ui/cagentsd binaries have test=false, so owning unit selectors require --lib. Separate HOST/UI binary checks are required; never combine host+ui to shorten command.",
+      "source": "Cargo.toml"
+    }
+  ],
+  "fix_lineage": [
+    {
+      "changed_leaf_bindings": {
+        "src/automations/archive.rs": {
+          "git_blob": "9c38c36a8144b6cc5af7fa00cc28d26d72e66c4f",
+          "sha256": "da83916d91681f22b110b410c95910b3a68eecd7dcffaa392ad0aaed6b0a30ef"
+        },
+        "src/persistence.rs": {
+          "git_blob": "9936a182e94267257ffd3c2bfa69cf8fae446374",
+          "sha256": "4c828bbcbec5e86e3332a03c3488de2efa6765ecbddc8a4607ca33ef30d23db7"
+        }
+      },
+      "head": "88dbd65859be8b09e5664d2d10cbec5059fddd0b",
+      "parents": [
+        "6764147a34e3fd7e3d13828911067a216e985ef7"
+      ],
+      "tree": "386694df215f9456654c618c653dcd67f78ac8a6"
+    },
+    {
+      "changed_leaf_bindings": {
+        "src/automations/archive.rs": {
+          "git_blob": "1ef031e705090bd7c932ceba71b2342e522e47cd",
+          "sha256": "f420e2c88a37dcac288d2c145c74fe6a6249c9d713a50776729e5988a03778bd"
+        },
+        "src/persistence.rs": {
+          "git_blob": "9936a182e94267257ffd3c2bfa69cf8fae446374",
+          "sha256": "4c828bbcbec5e86e3332a03c3488de2efa6765ecbddc8a4607ca33ef30d23db7"
+        }
+      },
+      "head": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+      "parents": [
+        "88dbd65859be8b09e5664d2d10cbec5059fddd0b"
+      ],
+      "tree": "7c07e65850f0b0c2efd473fe42f172e6d1fe39a5"
+    },
+    {
+      "changed_leaf_bindings": {
+        "src/automations/archive.rs": {
+          "git_blob": "d9cd590d8e05a7b46e4f42233afe902d623228d4",
+          "sha256": "e78894eb4a45ebac7590c73cc617a83a089def6d1649c00ba8a1d31271c61236"
+        },
+        "src/persistence.rs": {
+          "git_blob": "9936a182e94267257ffd3c2bfa69cf8fae446374",
+          "sha256": "4c828bbcbec5e86e3332a03c3488de2efa6765ecbddc8a4607ca33ef30d23db7"
+        }
+      },
+      "head": "60e8147968ab77a561fcfb33f99804ac59792d00",
+      "parents": [
+        "015e222de6a8852eeddbd221e3822f0e6fad963b"
+      ],
+      "tree": "3a4dd4453448edb424d570546fdd3badb2fc74fa"
+    },
+    {
+      "changed_leaf_bindings": {
+        "src/automations/archive.rs": {
+          "git_blob": "39e4d847470aedf4996ccc43c0308e4cc025b1c4",
+          "sha256": "7e0543ec40463d174539fb51754d2f90cc81a088a23cba565c86aeeb81f04a2e"
+        },
+        "src/persistence.rs": {
+          "git_blob": "aeaa61f89bc81aa7c3a640abb92e1d54d3c49281",
+          "sha256": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5"
+        }
+      },
+      "head": "6327aacc848ebff380c466696346a4809412be54",
+      "parents": [
+        "60e8147968ab77a561fcfb33f99804ac59792d00"
+      ],
+      "tree": "c1c5ae2214084721a5577bf5815eb6ec2004b485"
+    },
+    {
+      "changed_leaf_bindings": {
+        "src/automations/archive.rs": {
+          "git_blob": "5a2b0187d170df0338ead50ca8d85c012faf34ea",
+          "sha256": "9c61511f486805b62413844ed38fca76837ca0fd19d993c8f75676fd3e40d6e6"
+        },
+        "src/persistence.rs": {
+          "git_blob": "aeaa61f89bc81aa7c3a640abb92e1d54d3c49281",
+          "sha256": "f6612f44ba957d0f4d17be4dbbc72c6a3d3739c2397ff218cc61e8aeab6bbde5"
+        }
+      },
+      "head": "afa06ba70d94e6ab4cffcd62baa747fa2047f6eb",
+      "parents": [
+        "6327aacc848ebff380c466696346a4809412be54"
+      ],
+      "tree": "9a247d9c2a7995fd1070ffa7664c9734916a3663"
+    }
+  ],
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/pr1287-canonical-transcript-source-freeze-v2.json",
+    "sha256": "90ac7fc0043917337e7129bc036231a205a89a153ba1259cdd0c36eed8d6f8d8"
+  },
+  "function_pins": {
+    "src/automations/archive.rs::closed_pane_matches": {
+      "end_line_inclusive": 225,
+      "function_line": 177,
+      "function_sha256": "bd1ae45c99ae901b89be0d99fdd08862c3d1defc6209a802b3a969607d26fd9b"
+    },
+    "src/automations/archive.rs::inspect_archived_pane": null,
+    "src/automations/archive.rs::inspect_completed_automation_pane": null,
+    "src/automations/archive.rs::read_inspection_text": {
+      "end_line_inclusive": 25,
+      "function_line": 9,
+      "function_sha256": "8ef6f6963caf6a83a8a773cf868d69f3aad476913d3fb936c37b7539ba547d6a"
+    },
+    "src/persistence.rs::load_terminal_record": {
+      "end_line_inclusive": 4916,
+      "function_line": 4843,
+      "function_sha256": "96c8b8fad491ea4982d32e4b6467d7d0d02824f83e2b13bcd17d50782fd57f5f"
+    },
+    "src/persistence.rs::read_migration_session_at": null
+  },
+  "future_evidence_contract": [
+    "Future execution needs a separately authorized consumer, resource budget and isolated sequential HOST/UI lanes; this manifest requests no allocation.",
+    "Bind physical Cargo/rustc and source/profile/feature pins separately. Cargo source rust-version1.93 is not an observed tool identity.",
+    "Fresh lane-specific Cargo JSON must identify current root library test executable; bind its bytes/identity and complete original unfiltered --list with actual total N. No stale target glob, historical inventory, guessed test count or zero-match success.",
+    "Each assigned selector must produce original exit0, exactly one running1 block, one exact success row and summary1 passed/0 failed/0 ignored/0 measured/N-1 filtered. Nested scenarios are nonadditive.",
+    "Keep original raw failure/timeout; no retry, selector replacement or baseline pass donation. Independent original evidence review remains required.",
+    "Owning checks plus selected tests do not satisfy broad affected-boundary requirements: HOST and UI --all-targets remain separate future gates.",
+    "Actual migration/archive product flow, schema admission, native UI evidence and provider lifecycle remain unqualified; fixture/source evidence is limited to the described contracts.",
+    "Any successor, merged CI script composition, helper, feature or Cargo change requires repin before future execution. Never reuse6327 fixture qualification as finalafa qualification."
+  ],
+  "head": "afa06ba70d94e6ab4cffcd62baa747fa2047f6eb",
+  "inherited_controls": [
+    {
+      "selector": "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+      "status": "unchanged whole function from88db; explicitly retained as eighth queue parent"
+    },
+    {
+      "selector": "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+      "status": "one extended parent: original successful raw-chat/no-claim/missing/symlink/read-only and normalized Live/Exited positives retained; added matching relaunch, nested mismatch bypass, alias/limit and post-restore success controls"
+    },
+    {
+      "selector": "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+      "status": "new parent brackets negative canonical oversize with accepted aliases, reverse decoy and exact aggregate boundary; functional regression and compatibility controls in same nonadditive parent"
+    }
+  ],
+  "kind": "PR1287 final successor exact SOURCE qualification manifest; future queue DATA only",
+  "lanes": {
+    "host": {
+      "actual_ELF": null,
+      "actual_ELF_test_N": null,
+      "actual_compiled_inventory": null,
+      "assigned_distinct_count": 4,
+      "assigned_selectors": [
+        "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+        "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+        "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+        "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service"
+      ],
+      "bin_check_artifact": "cagentsd",
+      "commands_data_only": [
+        {
+          "argv": [
+            "<PINNED_CARGO>",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "host",
+            "--bin",
+            "cagentsd"
+          ],
+          "kind": "check",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<PINNED_CARGO>",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "host",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "kind": "compile_lib",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "--list",
+            "--color=never"
+          ],
+          "kind": "fresh_complete_inventory",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        }
+      ],
+      "execution_authorized": false,
+      "implementation_feature": "host",
+      "source_predicted_compiled_selected_count": 8,
+      "source_predicted_compiled_selected_names": [
+        "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+        "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+        "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+        "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+        "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+        "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+        "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+        "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history"
+      ],
+      "source_predicted_selected_names_absent": [],
+      "unit_artifact": "current root cagents library libtest ELF (not production binary)"
+    },
+    "ui": {
+      "actual_ELF": null,
+      "actual_ELF_test_N": null,
+      "actual_compiled_inventory": null,
+      "assigned_distinct_count": 4,
+      "assigned_selectors": [
+        "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+        "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+        "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+        "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history"
+      ],
+      "bin_check_artifact": "cagents-ui",
+      "commands_data_only": [
+        {
+          "argv": [
+            "<PINNED_CARGO>",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--bin",
+            "cagents-ui"
+          ],
+          "kind": "check",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<PINNED_CARGO>",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "kind": "compile_lib",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "--list",
+            "--color=never"
+          ],
+          "kind": "fresh_complete_inventory",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        },
+        {
+          "argv": [
+            "<FRESH_CURRENT_LANE_LIBTEST_ELF>",
+            "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never"
+          ],
+          "kind": "exact_parent",
+          "state": "UNRUN"
+        }
+      ],
+      "execution_authorized": false,
+      "implementation_feature": "ui",
+      "source_predicted_compiled_selected_count": 4,
+      "source_predicted_compiled_selected_names": [
+        "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+        "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+        "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+        "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history"
+      ],
+      "source_predicted_selected_names_absent": [
+        "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+        "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+        "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+        "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service"
+      ],
+      "unit_artifact": "current root cagents library libtest ELF (not production binary)"
+    }
+  },
+  "only_new_output": "/tmp/fw16-pr1287-afa06ba7-source-qualification-manifest-r1.json",
+  "parent": "6327aacc848ebff380c466696346a4809412be54",
+  "predecessor_failures_not_claimed": {
+    "limitations": [
+      "Bounded normal/raw-key and UTF8/type controls should pass baseline too.",
+      "Raw-ID refusal parent can pass older aggregate budgeting; it does not alone prove new standalone ordering.",
+      "Functional cap errors cannot prove allocation happened after borrowed length check; production source ordering is independently necessary.",
+      "No allocator/RSS/SQLite internal allocation or native migration-flow proof."
+    ],
+    "status": "No predecessor transplant, compilation, executable inventory or execution. All distinguishing statements are source-derived counterfactuals, not observed failures."
+  },
+  "preserved_6327_source_negative": {
+    "defect": "Canonical transcript metadata was inserted after inspected recipe key became alias, leaving no canonical terminal_recipes FK parent; the API oracle could fail in setup before intended descriptor-limit assertion.",
+    "evidence": "Root steering and current immutable freeze v2 negative_preserved field. Separate6327 persistence review explicitly excluded archive public-API test approval.",
+    "final_correction": "afa creates a second real Card/recipe before saving, moves its recipe ID to canonical after original row becomes alias, inserts canonical transcript with a real FK parent, then deletes transcript and second recipe before restoring original ID. Added exact receipt/read-only positive after restoration.",
+    "head": "6327aacc848ebff380c466696346a4809412be54",
+    "qualification_limit": "Test-only correction independently read in immutable diff; Rust/SQLite execution remains UNRUN. It is not a retroactive pass at6327.",
+    "status": "source oracle FK defect; not executed runtime failure",
+    "tree": "c1c5ae2214084721a5577bf5815eb6ec2004b485"
+  },
+  "previous_source_reports": [
+    {
+      "path": "/tmp/pr1287-015e222de6a8852eeddbd221e3822f0e6fad963b-test-oracle-source-review.txt",
+      "sha256": "3e2e525bbea8bd12c7d60bb028cb21d40e3a1879d9232516deaa8004ef5a8dbc",
+      "status": "existing scoped source evidence only; preserved, no runtime pass donation"
+    },
+    {
+      "path": "/tmp/pr1287-60e8147-production-source-review.json",
+      "sha256": "33b7c25d56429dac100e1c2e5f80d43fe40a84c9b4d910006a30886aab1c4189",
+      "status": "existing scoped source evidence only; preserved, no runtime pass donation"
+    },
+    {
+      "path": "/tmp/pr1287-6327aacc-canonical-transcript-independent-source-review.json",
+      "sha256": "e9bcfbd9085e190be493d0b1a6f6879f23b033846d5773e5de9fa3492adcf859",
+      "status": "existing scoped source evidence only; preserved, no runtime pass donation"
+    }
+  ],
+  "queue_with_inherited_control_assignments": {
+    "cli": 0,
+    "host": 4,
+    "ui": 4
+  },
+  "reported_CI_infrastructure_failure": {
+    "disposition": "Preserve as infrastructure negative. Separate CI composition requires its own exact source/cfg/Cargo/build repin and review; no dispatch grant.",
+    "head_context": "old015e",
+    "meaningful_tests_ran": false,
+    "passes_donated": 0,
+    "reported_cause": "Script stage lacked historical script dependencies",
+    "run": "41078804359",
+    "source": "Root steering; not independently queried in this task"
+  },
+  "selectors": [
+    {
+      "assigned_execution_lane": "host",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_015e",
+      "compiles_in_isolated_lanes": [
+        "host"
+      ],
+      "effective_cfg": "all(test,feature=host)",
+      "end_line_inclusive": 747,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Compatibility/raw-key-exactness control: valid cases should also pass baseline88db; not a fail-predecessor test for the new cap.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 699,
+      "function_sha256": "fac0848943f552b032c70eaca7453858486fa30e1cca440fa6794293cb52e53c",
+      "introduced_function_line": 591,
+      "introduced_or_existing_at": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+      "meaningful_source_assertions": "Both production inspector APIs accept no-claim empty, ordinary, Unicode/punctuation and exact4MiB raw workspace keys; poison at each exact full metadata key makes both APIs error. DB main bytes remain unchanged and missing registry remains absent.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Loose raw legacy-shaped tables intentionally avoid whole-StateStore schema admission. Main-file byte equality is not exhaustive sidecar/directory or SQLite-internal-memory proof.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "host",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_015e",
+      "compiles_in_isolated_lanes": [
+        "host"
+      ],
+      "effective_cfg": "all(test,feature=host)",
+      "end_line_inclusive": 776,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Source-derived distinguishing assertion versus88db: old workspace rows reach no-claim None; old tag reaches None or later descriptor error. Exact new early errors differ. No predecessor/current execution occurred.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 751,
+      "function_sha256": "c9eaf93ef9d64e7d7c34456fe2eda1dfb48194d792ee0a4e8d1d59308dd6e8aa",
+      "introduced_function_line": 643,
+      "introduced_or_existing_at": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+      "meaningful_source_assertions": "Both production inspector APIs reject ASCII workspace B+1, UTF8 workspace B+1 bytes with scalar count<=B, and B+1 kind_tag, using precise source-row unreadable errors. Joined source keys are changed together; source bytes unchanged and registry remains absent.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Functional early refusal cannot prove check-before-owned-String allocation: a check-after-copy implementation could satisfy this test. Borrowed-byte ordering remains a separate source assertion; no RSS/allocator measurement.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::source_inspectors_refuse_oversized_text_before_no_claim_fallback ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "host",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_015e",
+      "compiles_in_isolated_lanes": [
+        "host"
+      ],
+      "effective_cfg": "all(test,feature=host)",
+      "end_line_inclusive": 806,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Inherited conversion-error compatibility control expected to pass88db too; does not independently establish the new size check.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 780,
+      "function_sha256": "0de0642fd4b71520f938f4f51d7cad705a4477a4c2422723f39da5eb10c77481",
+      "introduced_function_line": 672,
+      "introduced_or_existing_at": "015e222de6a8852eeddbd221e3822f0e6fad963b",
+      "meaningful_source_assertions": "Both production APIs retain exact row-read errors for joined workspace BLOB/invalidUTF8 and kind-tag BLOB/invalidUTF8; actual joined corrupt cells cannot be mistaken for a missing-row None. Source main bytes unchanged and no registry creation.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Raw loose table fixture allows storage classes a strict admitted schema could reject. No claim of broader database-schema admission.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::source_inspectors_keep_text_type_and_utf8_conversion_errors ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "ui",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_60e",
+      "compiles_in_isolated_lanes": [
+        "host",
+        "ui"
+      ],
+      "effective_cfg": "all(test,any(feature=host,feature=ui))",
+      "end_line_inclusive": 643,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Source-derived distinguishing assertion versus015e/88db: predecessor overwrites cloned original continuity with current ended continuity before equality, accepting otherwise-identical changed nested recipes. No actual predecessor failure was run.",
+      "filesystem_requirement": "none; pure synthetic descriptors",
+      "function_line": 544,
+      "function_sha256": "117ca6bc80081b944cce593d1a677d363e011bd4fef54fa2d0570ae9100f61a3",
+      "introduced_function_line": 544,
+      "introduced_or_existing_at": "60e8147968ab77a561fcfb33f99804ac59792d00",
+      "meaningful_source_assertions": "Receipt accepts original Live, Exited and matching-recipe RelaunchAvailable(Some exit) for successful/failed/signalled exits. It rejects program,args,cwd,environment,unset-environment changes and substitution of distinct native provider recipe; RelaunchAvailable(None) remains refused and original console is unchanged.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Pure synthetic descriptor/proof fixture; no terminal/provider process, native app, scheduler or authenticated service behavior. Nine accepted continuity/exit combinations and eighteen changed-recipe cases are one parent.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::terminal_archive_requires_the_original_nested_relaunch_recipe ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "host",
+      "baseline_function_sha256": "485e9cda8d6c71562f687e7ba7af04da4f604b4d9ab9a40960e4edce823a209d",
+      "changed_from_baseline": true,
+      "classification": "extended_existing_60e_6327_afa",
+      "compiles_in_isolated_lanes": [
+        "host"
+      ],
+      "effective_cfg": "all(test,feature=host)",
+      "end_line_inclusive": 1286,
+      "exists_in_baseline": true,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Changed nested-recipe negatives distinguish60e from015e by bypassing saved/current equality; canonical alias+oversized-path error distinguishes6327 production from60e. Finalafa test-only FK correction repairs setup. All are source-derived counterfactuals, no observed predecessor execution.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 810,
+      "function_sha256": "acb487af3b14f14a5e4bfcd0ca0a5ea12d981d426ecb0dd10ff8e5e6f3e55ac3",
+      "introduced_function_line": 520,
+      "introduced_or_existing_at": "88dbd65859be8b09e5664d2d10cbec5059fddd0b",
+      "meaningful_source_assertions": "Original raw chat controls require claim for archive, reject missing/symlink registry, accept exact closed receipt, and preserve source bytes. Actual StateStore normalized terminal rows have NULL cards.content_json; matching Live/Exited/relaunch states qualify. Both raw normalized continuity and caller descriptor mutate together for five nested-recipe negatives, then restoration qualifies. Raw UUID alias qualifies; oversized canonical transcript path gives exact descriptor-limit error; after FK-safe setup is restored, exact receipt qualifies again and bytes remain unchanged. Explicit outer-recipe replacement remains refused.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "First raw-source section is a loose schema. The normalized terminal branch uses real StateStore-created source and real second Card/recipe to parent canonical transcript FK. It is an inspector contract, not whole-source/schema/migration admission or a service/native run. Before/after main-file snapshots do not measure allocation/RSS.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::source_archive_inspection_is_read_only_and_needs_no_service ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "ui",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_6327",
+      "compiles_in_isolated_lanes": [
+        "host",
+        "ui"
+      ],
+      "effective_cfg": "all(test,any(feature=host,feature=ui))",
+      "end_line_inclusive": 5464,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Meaningful source-derived fail-predecessor case: old raw-key join budgets small decoy, while unchanged loader parses UUID then reads and owns oversized canonical path; expected CorruptRow would fail. Reverse-decoy/exact-limit assertions also prevent generic refusal. No actual predecessor/current run.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 5349,
+      "function_sha256": "8c7ce222a2273a71b80d217000e445f46d67401b4cda429b57fb53894549cb03",
+      "introduced_function_line": 5349,
+      "introduced_or_existing_at": "6327aacc848ebff380c466696346a4809412be54",
+      "meaningful_source_assertions": "Read-only transaction on private file-backed normalized minimal tables accepts canonical/uppercase/simple UUID aliases and exact aggregate4MiB UTF8 boundary. Oversized canonical valid JSON path with small raw-alias decoy rejects; converse small canonical path with oversized unused raw decoy accepts; B+1 aggregate rejects. Main bytes unchanged.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/persistence.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Minimal decoder tables deliberately omit full production schema/FK. This does not qualify StateStore source admission. Cap bounds uncontrolled Rust descriptor copying, not SQLite internal allocations or process RSS.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test persistence::tests::migration_terminal_inspection_budgets_the_canonical_transcript_lookup ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "ui",
+      "baseline_function_sha256": null,
+      "changed_from_baseline": false,
+      "classification": "new_6327",
+      "compiles_in_isolated_lanes": [
+        "host",
+        "ui"
+      ],
+      "effective_cfg": "all(test,any(feature=host,feature=ui))",
+      "end_line_inclusive": 5519,
+      "exists_in_baseline": false,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Compatibility/guard oracle, not a demonstrated fail-predecessor regression: old aggregate budget already refused oversized ID and could satisfy these broad error assertions. Ordering of the new standalone raw-ID guard requires source inspection; no String-allocation instrumentation.",
+      "filesystem_requirement": "private temporary SQLite/files only",
+      "function_line": 5467,
+      "function_sha256": "b59540f11dd7b6e51010f2fa6498c8f955b519d42c20ee4f7f1a9dd155225282",
+      "introduced_function_line": 5467,
+      "introduced_or_existing_at": "6327aacc848ebff380c466696346a4809412be54",
+      "meaningful_source_assertions": "Oversized raw ID returns fixed CorruptRow; oversized invalidUTF8 yields same fixed error; bounded malformed UUID retains InvalidUuid; bounded invalidUTF8/BLOB/NULL remain errors; missing recipe returns CorruptRow.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/persistence.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "In-memory intentionally unconstrained raw-key table, not admitted production schema. Assertions on several malformed cases require any error; error-priority equivalence across multiple corruptions is not claimed.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test persistence::tests::migration_terminal_inspection_bounds_raw_ids_before_string_conversion ... ok"
+        ]
+      }
+    },
+    {
+      "assigned_execution_lane": "ui",
+      "baseline_function_sha256": "5b1ac6be06d0ba14b775087e119cc1c003ef2778f9d75e2722854221ee1a5548",
+      "changed_from_baseline": false,
+      "classification": "inherited_positive_control",
+      "compiles_in_isolated_lanes": [
+        "host",
+        "ui"
+      ],
+      "effective_cfg": "all(test,any(feature=host,feature=ui))",
+      "end_line_inclusive": 542,
+      "exists_in_baseline": true,
+      "expected_outer_parent_count": 1,
+      "external_subprocess_required": false,
+      "fail_predecessor_oracle_limit": "Unchanged inherited positive/negative compatibility control. It should pass baseline88db; not a fail-predecessor test for these successor fixes.",
+      "filesystem_requirement": "none; pure synthetic descriptors",
+      "function_line": 478,
+      "function_sha256": "5b1ac6be06d0ba14b775087e119cc1c003ef2778f9d75e2722854221ee1a5548",
+      "introduced_function_line": 453,
+      "introduced_or_existing_at": "88dbd65859be8b09e5664d2d10cbec5059fddd0b",
+      "meaningful_source_assertions": "Exact closed/read-only archive qualifies and receipt matches exact session; changed ID, unissued proof, wrong confirmed thread, invented listener/native continuity/paired terminal, open owner, ready/busy/no-readonly or oversized presentation rejects; permitted stale None learns only canonical confirmed thread.",
+      "native_window_required": false,
+      "nested_cases_nonadditive": true,
+      "owning_source": "src/automations/archive.rs",
+      "provider_required": false,
+      "runtime_status": "UNRUN",
+      "selector": "automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history",
+      "self_reexec": false,
+      "span_convention": "UTF8 fn declaration through same-indentation closing brace inclusive, excluding following newline; whole leaf pins are authoritative.",
+      "specific_limits": "Synthetic archive/host proof descriptor only. No service, migration, native UI or provider execution.",
+      "strict_rows": {
+        "running": [
+          "running 1 test"
+        ],
+        "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; <fresh lane N minus1> filtered out; finished in <duration>s",
+        "terminal": [
+          "test automations::archive::tests::archive_receipt_requires_exact_closed_read_only_history ... ok"
+        ]
+      }
+    }
+  ],
+  "self_reexec_exclusions": [
+    {
+      "end_line_inclusive": 5289,
+      "function_line": 5254,
+      "function_sha256": "4ef46bf730f79ed7f3ddba72414d9600d59c495b837aed60663198891453b4d7",
+      "reason": "Neighbor WAL-lock self-reexec parent and its environment-dependent child; unrelated to exact decoder/archive contract and not invoked by selected parents.",
+      "selected": false,
+      "selector": "persistence::tests::an_open_store_keeps_its_wal_from_other_processes",
+      "source": "src/persistence.rs"
+    },
+    {
+      "end_line_inclusive": 5246,
+      "function_line": 5235,
+      "function_sha256": "89885445a57abe190a43734e7c1c6437283129c17d16e5ee11511fea9dc1b244",
+      "reason": "Neighbor WAL-lock self-reexec parent and its environment-dependent child; unrelated to exact decoder/archive contract and not invoked by selected parents.",
+      "selected": false,
+      "selector": "persistence::tests::another_process_visits_the_store",
+      "source": "src/persistence.rs"
+    }
+  ],
+  "source_method": "Immutable local Git objects only; no moving worktree contents, fetch or test discovery.",
+  "stop": "Finite source-only manifest complete; no execution or readiness grant.",
+  "tree": "9a247d9c2a7995fd1070ffa7664c9734916a3663",
+  "worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1287-bounded-inspection"
+}

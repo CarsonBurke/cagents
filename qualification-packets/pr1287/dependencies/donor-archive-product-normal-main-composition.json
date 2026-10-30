@@ -1,0 +1,51 @@
+{
+  "status": "CURRENT_MAIN_MERGED_SOURCE_ONLY_CI_AND_NATIVE_PENDING",
+  "head": "012574b856c340ac83e53795c628a70128eff399",
+  "tree": "85436022005d0ad05d088c5951d55810e2466aa4",
+  "parents": [
+    "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+    "e8842819519dff74c0726d1fdd94f435b495a153"
+  ],
+  "main_parent": "e8842819519dff74c0726d1fdd94f435b495a153",
+  "feature_parent": "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1828-current-main",
+  "clean": true,
+  "merge": "Automatic merge had no conflicts; no manual source resolution or changes after clean merge. Main supplies required script prerequisite files.",
+  "remaining_product_paths_against_main": [
+    "scripts/check-format",
+    "src/app.rs",
+    "src/app/repository_clone_lsp_ownership_tests.rs"
+  ],
+  "all_other_main_entries": "unchanged by feature merge",
+  "prior_source_review": "/tmp/coord-b9-1828-lsp-navigation-independent-source-review.json",
+  "prior_source_review_sha256": "3bcecf19559dc90d2992ce3c9f852cc2dd8d33e132d28566840d0a6e8602dc45",
+  "prior_negative": {
+    "run": 41057463335,
+    "head": "a475a604b9e950ba3883dab910dc3db2e9b6c2d3",
+    "conclusion": "FAILURE",
+    "original_step_exit": 1,
+    "stage": "Verify source and required tools",
+    "exact_failures": [
+      "sha256sum: tests/run-development-zig.py: No such file or directory",
+      "sha256sum: scripts/check-format-cache.py: No such file or directory"
+    ],
+    "later_contract_steps": "SKIPPED",
+    "raw_log": "/tmp/coord-b9-1828-ci-41057463335-preflight-failure.log",
+    "raw_log_sha256": "10562df56e9d8f9c041b62bee61833483939140683f55f5b83597a460b126dc1",
+    "retry_or_waiver": false
+  },
+  "checks": {
+    "official_physical_rust193_scripts_check_format": {
+      "exit": 0,
+      "exec_chunk": "c99102",
+      "elapsed_seconds": 7.998047415
+    },
+    "git_diff_check": 0,
+    "git_cached_diff_check": 0,
+    "UI_check": "UNRUN",
+    "owning_tests": "UNRUN",
+    "native_UX": "UNRUN",
+    "screenshots": "MISSING"
+  },
+  "publication": "Existing Draft normal fast-forward only. No test/native source result transfer to composed head and no merge-readiness claim."
+}
