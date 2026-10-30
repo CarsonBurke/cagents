@@ -5434,11 +5434,17 @@ mod tests {
             provisional: false,
         }))));
         assert!(!app.account_ui.registry_ready);
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message.contains("registry unreadable"))
-        );
+        let notices: Vec<_> = app
+            .notices
+            .recent()
+            .filter(|entry| {
+                entry.notice.message == "Your added accounts could not be read: registry unreadable"
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].notice.severity, NoticeSeverity::Error);
+        assert_eq!(notices[0].repeats, 1);
+        assert!(app.status.is_none(), "the reducer drains the write channel");
         drop(app.accounts_focus_changed(true, true));
         drop(app.update(Message::AccountUi(Action::Tick)));
         drop(app.update(Message::AccountUi(Action::Popover(Some(id.clone())))));
