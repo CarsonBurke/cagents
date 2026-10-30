@@ -33,6 +33,10 @@ fn execute_with_client(
             .validate()
             .map_err(|e| AppError::new("account_reset_request", e))?;
         let session = request.session;
+        let expected_redemption = match &request.action {
+            Action::Inspect => None,
+            Action::Redeem { expected, .. } => Some(expected.clone()),
+        };
         let reply = client
             .device_operation(crate::device_service::Operation::AccountAllowance { request })
             .map_err(protocol_error)?;
@@ -50,6 +54,27 @@ fn execute_with_client(
                 "account_allowance",
                 "Allowance reply names a different session",
             ));
+        }
+        match expected_redemption {
+            None if report.outcome.is_some() || report.reconciled => {
+                return Err(AppError::new(
+                    "account_allowance",
+                    "Allowance inspection reply unexpectedly describes redemption",
+                ));
+            }
+            Some(expected) if report.allowance.account.as_ref() != Some(&expected) => {
+                return Err(AppError::new(
+                    "account_allowance",
+                    "Reset reply does not match the requested provider account and backend origin; redemption outcome is unconfirmed",
+                ));
+            }
+            Some(_) if report.outcome.is_none() => {
+                return Err(AppError::new(
+                    "account_allowance",
+                    "Reset reply did not include a reset outcome; redemption outcome is unconfirmed",
+                ));
+            }
+            _ => {}
         }
         Ok(report)
     };
@@ -371,8 +396,12 @@ mod tests {
                                 } else {
                                     assert_eq!(request.action, Action::Inspect);
                                 }
+                                let mut report = reading(session);
+                                if command_kind == 1 {
+                                    report.outcome = Some(reset::Outcome::Reset);
+                                }
                                 ServerResponse::DeviceOperation {
-                                    reply: Reply::AccountAllowance(reading(session)),
+                                    reply: Reply::AccountAllowance(report),
                                 }
                             }
                             _ => panic!("unexpected request, role fallback or replacement target"),
@@ -446,6 +475,184 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn framed_allowance_report(
+        session: TerminalId,
+        redeem: bool,
+        report: Report,
+    ) -> Result<CommandOutput, AppError> {
+        use crate::{
+            device_service::{Operation, Reply},
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+            terminal_ipc::{
+                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+                ServerResponse, read_frame, write_frame,
+            },
+        };
+        use std::os::unix::net::UnixStream;
+
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("private-reset-report-peer"),
+                boot_id: BootId::new("private-boot"),
+                host_incarnation: HostIncarnation::new("private-incarnation"),
+            };
+            for step in 0..3 {
+                let envelope: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                if step > 0 {
+                    assert_eq!(envelope.proof.as_ref(), Some(&proof));
+                }
+                let response = match (step, envelope.request) {
+                    (0, ClientRequest::Connect { .. }) => ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                    (1, ClientRequest::Authenticate { authority }) => {
+                        assert_eq!(authority, Authority::default());
+                        ServerResponse::Accepted
+                    }
+                    (
+                        2,
+                        ClientRequest::DeviceOperation {
+                            operation: Operation::AccountAllowance { request },
+                        },
+                    ) => {
+                        assert_eq!(request.session, session);
+                        assert_eq!(
+                            request.action,
+                            if redeem {
+                                Action::Redeem {
+                                    expected: ProviderAccount {
+                                        account_id: "actual-account".into(),
+                                        backend_origin: "https://chatgpt.com".into(),
+                                    },
+                                    credit_id: "actual-credit".into(),
+                                    authorized: true,
+                                    condition: None,
+                                }
+                            } else {
+                                Action::Inspect
+                            }
+                        );
+                        ServerResponse::DeviceOperation {
+                            reply: Reply::AccountAllowance(report.clone()),
+                        }
+                    }
+                    _ => panic!("unexpected report fixture request"),
+                };
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(envelope.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "an unconfirmed report must not trigger another operation"
+            );
+        });
+        let command = if redeem {
+            AccountCommand::Redeem {
+                session,
+                provider_account: "actual-account".into(),
+                backend_origin: "https://chatgpt.com".into(),
+                credit: "actual-credit".into(),
+                authorize: true,
+            }
+        } else {
+            AccountCommand::Allowance { session }
+        };
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let result = execute_with_client(&mut client, command, Authority::default());
+        drop(client);
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn reset_reports_must_match_the_requested_action_and_provider_account() {
+        let session = TerminalId::new();
+        for (case, message) in [
+            (0, "did not include a reset outcome"),
+            (1, "does not match the requested provider account"),
+            (2, "does not match the requested provider account"),
+            (3, "does not match the requested provider account"),
+            (4, "names a different session"),
+        ] {
+            let mut report = reading(session);
+            report.outcome = Some(reset::Outcome::Reset);
+            match case {
+                0 => report.outcome = None,
+                1 => report.allowance.account = None,
+                2 => report.allowance.account.as_mut().unwrap().account_id = "other-account".into(),
+                3 => {
+                    report.allowance.account.as_mut().unwrap().backend_origin =
+                        "https://other.example".into()
+                }
+                _ => report.session = TerminalId::new(),
+            }
+            let error = framed_allowance_report(session, true, report)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, "account_allowance");
+            assert!(error.message.contains(message), "{}", error.message);
+        }
+        for outcome in [
+            reset::Outcome::Reset,
+            reset::Outcome::AlreadyRedeemed,
+            reset::Outcome::NothingToReset,
+            reset::Outcome::NoCredit,
+        ] {
+            for reconciled in [false, true] {
+                let mut report = reading(session);
+                report.outcome = Some(outcome);
+                report.reconciled = reconciled;
+                let output = framed_allowance_report(session, true, report).unwrap();
+                assert_eq!(output.command, "account.redeem");
+                assert_eq!(
+                    output.data["outcome"],
+                    serde_json::to_value(outcome).unwrap()
+                );
+                assert_eq!(output.data["reconciled"], reconciled);
+            }
+        }
+        for unknown in [false, true] {
+            let mut report = reading(session);
+            if unknown {
+                report.allowance.account = None;
+                report.allowance.reset_credits = None;
+                report.allowance.windows.clear();
+            }
+            assert_eq!(
+                framed_allowance_report(session, false, report)
+                    .unwrap()
+                    .command,
+                "account.allowance"
+            );
+        }
+        for reconciled_only in [false, true] {
+            let mut report = reading(session);
+            if reconciled_only {
+                report.reconciled = true;
+            } else {
+                report.outcome = Some(reset::Outcome::Reset);
+            }
+            let error = framed_allowance_report(session, false, report)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, "account_allowance");
+            assert!(error.message.contains("inspection reply unexpectedly"));
         }
     }
 
