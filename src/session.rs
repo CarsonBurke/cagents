@@ -2411,7 +2411,7 @@ impl PendingWrites {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
-                            self.quarantine.snapshot_landed(&snapshot);
+                            self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                             self.acknowledge_retained_copy_closures(&snapshot);
                             committed.store(true, std::sync::atomic::Ordering::Release);
                             let _ = reply.send(Ok(()));
