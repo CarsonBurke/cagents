@@ -526,12 +526,24 @@ pub(crate) fn lease_owner(
     Ok(metadata.pid)
 }
 
-/// Sends SIGTERM to the daemon identified by the current instance's lock.
+/// Stops the daemon identified by the current instance's lock and waits for
+/// that exact process, lease and listener to finish normal shutdown.
 ///
-/// The pidfd is opened before `/proc` validation, so PID reuse cannot redirect
-/// the signal after the lock owner has been authenticated.
+/// No protocol response is needed, so this remains usable across versions. The
+/// original pidfd alone authorizes the one signal; replacement or uncertain
+/// ownership is an error, never permission to signal another process.
 pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
-    let paths = RuntimePaths::discover()?;
+    terminate_daemon_at(
+        &RuntimePaths::discover()?,
+        std::time::Duration::from_secs(5),
+    )
+}
+
+fn terminate_daemon_at(
+    paths: &RuntimePaths,
+    timeout: std::time::Duration,
+) -> Result<bool, PlatformError> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut lock = match OpenOptions::new()
         .read(true)
         .custom_flags(LOCK_OPEN_FLAGS)
@@ -544,11 +556,48 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
         }
         Err(error) => return Err(error.into()),
     };
-    let Some(pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+    validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+    // Preserve the existing stopped/stale case without parsing an unheld file.
+    // SAFETY: this exclusively owned descriptor and scalar flags are valid.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let recovered = recover_unheld_stop_socket(&lock, paths);
+        // SAFETY: this descriptor owns the lock acquired above.
+        let released = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        recovered?;
+        if released != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
         return Ok(false);
-    };
-    // SAFETY: pidfd is a live pidfd for the validated lock owner, SIGTERM is a
-    // valid signal, and a null siginfo pointer with flags zero is supported.
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::WouldBlock {
+        return Err(error.into());
+    }
+    let metadata = lock.metadata()?;
+    let identity = (metadata.dev(), metadata.ino());
+    let original = stop_lock_contents(&mut lock)?;
+    let stored: StoredLockMetadata = serde_json::from_slice(&original)?;
+    let pidfd = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
+    verify_stop_lock(&mut lock, paths, identity, &original)?;
+    // Acquiring this lock would mean the observed owner stopped owning it
+    // before authorization completed. Do not send even the original signal.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        return Err(io::Error::other("daemon ownership changed before stop").into());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::WouldBlock {
+        return Err(error.into());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon stop authorization timed out",
+        )
+        .into());
+    }
+    // SAFETY: the original pidfd was opened before ownership validation. This
+    // is the only signal and never retargets a PID or a replacement lock owner.
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -564,7 +613,126 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
             return Err(error.into());
         }
     }
-    Ok(true)
+    if !wait_process(
+        &pidfd,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the original daemon is still stopping",
+        )
+        .into());
+    }
+    // Process exit does not authorize recovering another listener or reporting
+    // a replacement daemon stopped. Keep the exact original lock throughout.
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon shutdown observation timed out",
+            )
+            .into());
+        }
+        verify_stop_lock(&mut lock, paths, identity, &original)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let completed = (|| {
+                verify_stop_lock(&mut lock, paths, identity, &original)?;
+                match fs::symlink_metadata(&paths.socket) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(PlatformError::Io(error)),
+                    Ok(_) => Err(io::Error::other(
+                        "the original daemon exited but a listener path remains",
+                    )
+                    .into()),
+                }
+            })();
+            // Explicit unlock also covers a copy inherited by concurrent fork.
+            let released = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+            completed?;
+            if released != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon shutdown observation timed out",
+                )
+                .into());
+            }
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the original daemon's lease is still held",
+            )
+            .into());
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+    }
+}
+
+// Called only while this descriptor owns the exclusive lease. An unheld corrupt
+// file remains recoverable, but a replacement pathname never inherits that lease.
+fn recover_unheld_stop_socket(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError> {
+    let held = lock.metadata()?;
+    verify_stop_lock_path(lock, paths, (held.dev(), held.ino()))?;
+    recover_stale_socket(&paths.socket)
+}
+
+fn verify_stop_lock_path(
+    lock: &File,
+    paths: &RuntimePaths,
+    identity: (u64, u64),
+) -> Result<(), PlatformError> {
+    let held = lock.metadata()?;
+    let named = fs::symlink_metadata(&paths.lock)?;
+    validate_lock_file(&paths.lock, &held, current_uid())?;
+    validate_lock_file(&paths.lock, &named, current_uid())?;
+    if (held.dev(), held.ino()) != identity || (named.dev(), named.ino()) != identity {
+        return Err(io::Error::other(
+            "daemon ownership changed while stopping; no replacement was stopped",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn stop_lock_contents(lock: &mut File) -> Result<Vec<u8>, PlatformError> {
+    lock.seek(SeekFrom::Start(0))?;
+    let mut contents = Vec::new();
+    // Lock metadata is a small PID/proof record. Bound the observation before
+    // granting process authority, including malformed or concurrently grown data.
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut *lock, 65_537), &mut contents)?;
+    if contents.len() > 65_536 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon lock metadata exceeds 64 KiB",
+        )
+        .into());
+    }
+    Ok(contents)
+}
+
+fn verify_stop_lock(
+    lock: &mut File,
+    paths: &RuntimePaths,
+    identity: (u64, u64),
+    original: &[u8],
+) -> Result<(), PlatformError> {
+    verify_stop_lock_path(lock, paths, identity)?;
+    if stop_lock_contents(lock)? != original {
+        return Err(io::Error::other(
+            "daemon ownership changed while stopping; no replacement was stopped",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// A confirmation pins the process before it is displayed. A successor cannot
@@ -662,7 +830,6 @@ fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "ui")]
 fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -1466,6 +1633,292 @@ mod tests {
         ));
         assert_eq!(fs::read(&not_directory).unwrap(), b"untouched");
         assert_eq!(fs::read(&lock).unwrap(), b"untouched");
+    }
+
+    /// A private kernel lease/listener fixture, not a provider or a substitute
+    /// daemon protocol. All children remain direct children of this test.
+    struct StopFixture {
+        child: std::process::Child,
+        input: Option<std::process::ChildStdin>,
+        output: Option<std::process::ChildStdout>,
+    }
+
+    impl StopFixture {
+        fn start(paths: &RuntimePaths, mode: &str) -> Self {
+            use std::process::{Command, Stdio};
+            let script = r#"import fcntl,json,os,signal,socket,sys
+mode=sys.argv[3]
+signals=0
+f=open(sys.argv[1], 'a+')
+os.chmod(sys.argv[1], 0o600)
+fcntl.flock(f, fcntl.LOCK_EX)
+f.seek(0);f.truncate()
+json.dump({'pid':os.getpid(), 'proof':json.loads(sys.argv[4])}, f);f.flush()
+listener=socket.socket(socket.AF_UNIX)
+listener.bind(sys.argv[2]);listener.listen(4)
+def release():
+    listener.close()
+    if mode!='leftover':
+        os.unlink(sys.argv[2])
+    f.close()
+def stopping(signum, frame):
+    global signals
+    signals+=1
+    print('stopping', flush=True)
+    if mode in ('normal','leftover'):
+        release()
+        sys.exit(0)
+signal.signal(signal.SIGTERM, stopping)
+print('ready', flush=True)
+for line in sys.stdin:
+    if line.strip()=='release':
+        release()
+        if mode=='transfer':
+            print('released', flush=True)
+        else:
+            sys.exit(0)
+    elif line.strip()=='park':
+        listener.close();os.unlink(sys.argv[2])
+        print('parked', flush=True)
+    elif line.strip()=='signals':
+        print('signals:'+str(signals), flush=True)
+    elif line.strip()=='exit':
+        sys.exit(0)
+"#;
+            let child = Command::new("/usr/bin/python3")
+                .args(["-I", "-B", "-c", script])
+                .arg(&paths.lock)
+                .arg(&paths.socket)
+                .arg(mode)
+                .arg(serde_json::to_string(&proof()).unwrap())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Establish cleanup before any fallible pipe/identity observation.
+            let mut fixture = Self {
+                child,
+                input: None,
+                output: None,
+            };
+            fixture.input = fixture.child.stdin.take();
+            fixture.output = fixture.child.stdout.take();
+            assert_eq!(fixture.line(), "ready");
+            fixture
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::Read;
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let output = self.output.as_mut().unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "private stop fixture did not publish its event"
+                );
+                let mut event = libc::pollfd {
+                    fd: output.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one live pipe descriptor and writable event structure.
+                let result = unsafe {
+                    libc::poll(
+                        &mut event,
+                        1,
+                        remaining.as_millis().min(i32::MAX as u128) as i32,
+                    )
+                };
+                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                assert!(result > 0, "private stop fixture event timed out");
+                let mut byte = [0];
+                assert_eq!(
+                    output.read(&mut byte).unwrap(),
+                    1,
+                    "private stop fixture exited before its event"
+                );
+                if byte[0] == b'\n' {
+                    return String::from_utf8(bytes).unwrap();
+                }
+                bytes.push(byte[0]);
+                assert!(bytes.len() <= 4096);
+            }
+        }
+
+        fn send(&mut self, command: &[u8]) {
+            use std::io::Write;
+            self.input.as_mut().unwrap().write_all(command).unwrap();
+        }
+    }
+
+    impl Drop for StopFixture {
+        fn drop(&mut self) {
+            // These are exclusively owned, unreaped direct fixture children;
+            // no provider, descendant, numeric-PID discovery or production state.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn rebuild_stop_waits_for_original_exit_and_preserves_live_timeout() {
+        use std::time::Duration;
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().to_path_buf());
+        let mut normal = StopFixture::start(&paths, "normal");
+        let pin = open_validated_pidfd(
+            &File::open(&paths.lock).unwrap(),
+            normal.child.id(),
+            Path::new("/proc"),
+        )
+        .unwrap();
+        assert!(terminate_daemon_at(&paths, Duration::from_secs(2)).unwrap());
+        assert!(
+            wait_process(&pin, Duration::ZERO).unwrap(),
+            "success requires the ORIGINAL process exit, not just SIGTERM delivery"
+        );
+        assert!(normal.child.wait().unwrap().success());
+        assert!(!HostLease::is_held(&paths).unwrap());
+        assert!(!paths.socket.exists());
+
+        let mut retained = StopFixture::start(&paths, "hold");
+        let original_contents = fs::read(&paths.lock).unwrap();
+        let socket = fs::symlink_metadata(&paths.socket).unwrap();
+        let selected = paths.clone();
+        let stopping =
+            std::thread::spawn(move || terminate_daemon_at(&selected, Duration::from_secs(5)));
+        // Observe actual signal delivery before awaiting the bounded refusal.
+        // The child cannot exit until this test explicitly releases its gate.
+        assert_eq!(retained.line(), "stopping");
+        let error = stopping.join().unwrap().unwrap_err();
+        assert!(
+            matches!(error, PlatformError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(retained.child.try_wait().unwrap().is_none());
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert_eq!(fs::read(&paths.lock).unwrap(), original_contents);
+        let after = fs::symlink_metadata(&paths.socket).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (socket.dev(), socket.ino()),
+            "timeout must not remove the original live endpoint"
+        );
+        retained.send(b"release\n");
+        assert!(retained.child.wait().unwrap().success());
+        assert!(!HostLease::is_held(&paths).unwrap());
+        assert!(!paths.socket.exists());
+
+        let mut leftover = StopFixture::start(&paths, "leftover");
+        let socket = fs::symlink_metadata(&paths.socket).unwrap();
+        let error = terminate_daemon_at(&paths, Duration::from_secs(2)).unwrap_err();
+        assert!(
+            error.to_string().contains("listener path remains"),
+            "{error}"
+        );
+        assert!(leftover.child.wait().unwrap().success());
+        assert!(!HostLease::is_held(&paths).unwrap());
+        let after = fs::symlink_metadata(&paths.socket).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (socket.dev(), socket.ino()),
+            "original process exit does not permit deleting an unproven remaining socket"
+        );
+        fs::remove_file(&paths.socket).unwrap(); // Only this test's leftover node.
+    }
+
+    #[test]
+    fn rebuild_stop_recovers_unheld_corrupt_metadata_but_refuses_a_replaced_lock() {
+        use std::time::Duration;
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().to_path_buf());
+        fs::write(&paths.lock, b"truncated").unwrap();
+        leave_stale_socket(&paths.socket);
+        assert!(!terminate_daemon_at(&paths, Duration::from_secs(5)).unwrap());
+        assert_eq!(fs::read(&paths.lock).unwrap(), b"truncated");
+        assert!(!paths.socket.exists());
+
+        // Pause at the actual recovery boundary with its acquired original
+        // lease, then substitute the named file before recovery can inspect a
+        // different owner's socket. The old descriptor remains locked.
+        let original = File::open(&paths.lock).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        fs::rename(&paths.lock, root.path().join("original.lock")).unwrap();
+        let mut replacement = StopFixture::start(&paths, "hold");
+        let contents = fs::read(&paths.lock).unwrap();
+        let endpoint = fs::symlink_metadata(&paths.socket).unwrap();
+        assert!(recover_unheld_stop_socket(&original, &paths).is_err());
+        replacement.send(b"signals\n");
+        assert_eq!(replacement.line(), "signals:0");
+        assert!(replacement.child.try_wait().unwrap().is_none());
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert_eq!(fs::read(&paths.lock).unwrap(), contents);
+        let after = fs::symlink_metadata(&paths.socket).unwrap();
+        assert_eq!((after.dev(), after.ino()), (endpoint.dev(), endpoint.ino()));
+        assert!(UnixStream::connect(&paths.socket).is_ok());
+        replacement.send(b"release\n");
+        assert!(replacement.child.wait().unwrap().success());
+        assert_eq!(
+            unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+    }
+
+    #[test]
+    fn rebuild_stop_refuses_a_replacement_without_signalling_or_unlinking_it() {
+        use std::time::Duration;
+        for different_inode in [false, true] {
+            let root = tempdir().unwrap();
+            let paths = paths(root.path().to_path_buf());
+            let mut original = StopFixture::start(&paths, "transfer");
+            let selected = paths.clone();
+            let stopping =
+                std::thread::spawn(move || terminate_daemon_at(&selected, Duration::from_secs(5)));
+            assert_eq!(original.line(), "stopping");
+            if different_inode {
+                // The original keeps its kernel lease while a distinct inode
+                // and listener become current at the same named paths.
+                fs::rename(&paths.lock, root.path().join("original.lock")).unwrap();
+                original.send(b"park\n");
+                assert_eq!(original.line(), "parked");
+                assert!(HostLease::is_lock_held(&root.path().join("original.lock")).unwrap());
+            } else {
+                // Real HostLease::drop ordering permits a successor after the
+                // socket/lease release but before original process exit.
+                original.send(b"release\n");
+                assert_eq!(original.line(), "released");
+            }
+            let mut replacement = StopFixture::start(&paths, "hold");
+            let replacement_contents = fs::read(&paths.lock).unwrap();
+            let replacement_socket = fs::symlink_metadata(&paths.socket).unwrap();
+            original.send(b"exit\n");
+            assert!(original.child.wait().unwrap().success());
+            let error = stopping.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("ownership changed"), "{error}");
+            replacement.send(b"signals\n");
+            assert_eq!(replacement.line(), "signals:0");
+            assert!(replacement.child.try_wait().unwrap().is_none());
+            assert!(HostLease::is_held(&paths).unwrap());
+            assert_eq!(fs::read(&paths.lock).unwrap(), replacement_contents);
+            let socket = fs::symlink_metadata(&paths.socket).unwrap();
+            assert_eq!(
+                (socket.dev(), socket.ino()),
+                (replacement_socket.dev(), replacement_socket.ino())
+            );
+            assert!(
+                UnixStream::connect(&paths.socket).is_ok(),
+                "replacement listener must remain usable"
+            );
+            replacement.send(b"release\n");
+            assert!(replacement.child.wait().unwrap().success());
+        }
     }
 
     #[cfg(feature = "ui")]
