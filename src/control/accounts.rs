@@ -19,7 +19,7 @@ pub enum AccountCommand {
         #[arg(value_enum, ignore_case = true)]
         provider: crate::agent::Provider,
     },
-    /// Archive a managed account or unregister a linked account using app safety rules.
+    /// Remove an account registration; managed account files may be deleted.
     Remove {
         /// Stable provider/account ID to remove.
         account: crate::account::AccountId,
@@ -40,7 +40,11 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (provider, account, refresh) = match command {
-        AccountCommand::Info { provider, account, refresh } => (provider, account, refresh),
+        AccountCommand::Info {
+            provider,
+            account,
+            refresh,
+        } => (provider, account, refresh),
         command => return management(command),
     };
     let socket = control_daemon_socket()?;
@@ -68,10 +72,24 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
         }
     };
     let installed = snapshot(&mut client)?;
-    report.accounts.retain(|account| !account.id.as_str().ends_with("/system") || installed["installed"].as_object()
-        .is_some_and(|providers| providers.iter().any(|(provider, value)| provider.eq_ignore_ascii_case(account.id.as_str().split('/').next().unwrap_or_default()) && value == true)));
-    if installed["installed"].as_object().is_none_or(|providers| !providers.iter().any(|(provider, value)| provider.eq_ignore_ascii_case("omp") && value == true)) {
-        report.diagnostics.retain(|line| !line.starts_with("OMP has no recorded"));
+    report.accounts.retain(|account| {
+        !account.id.as_str().ends_with("/system")
+            || installed["installed"].as_object().is_some_and(|providers| {
+                providers.iter().any(|(provider, value)| {
+                    provider.eq_ignore_ascii_case(
+                        account.id.as_str().split('/').next().unwrap_or_default(),
+                    ) && value == true
+                })
+            })
+    });
+    if installed["installed"].as_object().is_none_or(|providers| {
+        !providers
+            .iter()
+            .any(|(provider, value)| provider.eq_ignore_ascii_case("omp") && value == true)
+    }) {
+        report
+            .diagnostics
+            .retain(|line| !line.starts_with("OMP has no recorded"));
     }
     Ok(CommandOutput {
         command: "account.info",
@@ -81,23 +99,43 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
 }
 
 fn snapshot(client: &mut ControlClient) -> Result<Value, AppError> {
-    match client.device_operation(crate::device_service::Operation::AccountsRead).map_err(protocol_error)? {
+    match client
+        .device_operation(crate::device_service::Operation::AccountsRead)
+        .map_err(protocol_error)?
+    {
         crate::device_service::Reply::Accounts(value) => Ok(value),
-        _ => Err(AppError::new("account", "Unexpected account registry response")),
+        _ => Err(AppError::new(
+            "account",
+            "Unexpected account registry response",
+        )),
     }
 }
 
-fn lifecycle(client: &mut ControlClient, operation: crate::account::remote::Operation) -> Result<Value, AppError> {
-    match client.device_operation(crate::device_service::Operation::AccountLifecycle { operation }).map_err(protocol_error)? {
+fn lifecycle(
+    client: &mut ControlClient,
+    operation: crate::account::remote::Operation,
+) -> Result<Value, AppError> {
+    match client
+        .device_operation(crate::device_service::Operation::AccountLifecycle { operation })
+        .map_err(protocol_error)?
+    {
         crate::device_service::Reply::AccountLifecycle(value) => Ok(value),
-        _ => Err(AppError::new("account", "Unexpected account lifecycle response")),
+        _ => Err(AppError::new(
+            "account",
+            "Unexpected account lifecycle response",
+        )),
     }
 }
 
 fn management(command: AccountCommand) -> Result<CommandOutput, AppError> {
     use crate::{account::remote::Operation, agent::Provider};
-    if matches!(command, AccountCommand::Remove { .. }) && Authority::from_environment().token().is_some() {
-        return Err(AppError::new("account_authority", "Account removal is refused under an agent capability; run it from your own shell"));
+    if matches!(command, AccountCommand::Remove { .. })
+        && Authority::from_environment().token().is_some()
+    {
+        return Err(AppError::new(
+            "account_authority",
+            "Account removal is refused under an agent capability; run it from your own shell",
+        ));
     }
     let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
@@ -105,72 +143,228 @@ fn management(command: AccountCommand) -> Result<CommandOutput, AppError> {
         AccountCommand::List => {
             let snapshot = snapshot(&mut client)?;
             let accounts = account_rows(&snapshot);
-            let human = format::table(&["ID", "LABEL", "DEFAULT", "STATUS"], accounts.iter().map(|account| vec![
-                account["id"].as_str().unwrap_or_default().into(), account["label"].as_str().unwrap_or_default().into(),
-                if account["default"] == true { "selected".into() } else { String::new() },
-                if account["archived"] == true { "archived" } else if account["installed"] == false { "provider not installed" } else { "available" }.into(),
-            ]).collect(), "No configured accounts");
-            Ok(CommandOutput { command: "account.list", data: json!({"accounts": accounts, "revision": snapshot["registry"]["revision"]}), human })
+            let human = format::table(
+                &["ID", "LABEL", "DEFAULT", "STATUS"],
+                accounts
+                    .iter()
+                    .map(|account| {
+                        vec![
+                            account["id"].as_str().unwrap_or_default().into(),
+                            account["label"].as_str().unwrap_or_default().into(),
+                            if account["default"] == true {
+                                "selected".into()
+                            } else {
+                                String::new()
+                            },
+                            if account["archived"] == true {
+                                "archived"
+                            } else if account["installed"] == false {
+                                "provider not installed"
+                            } else {
+                                "available"
+                            }
+                            .into(),
+                        ]
+                    })
+                    .collect(),
+                "No configured accounts",
+            );
+            Ok(CommandOutput {
+                command: "account.list",
+                data: json!({"accounts": accounts, "revision": snapshot["registry"]["revision"]}),
+                human,
+            })
         }
         AccountCommand::Default { provider, account } => {
-            if provider == Provider::Omp { return Err(AppError::new("account", "OMP manages its own account selection")); }
+            if provider == Provider::Omp {
+                return Err(AppError::new(
+                    "account",
+                    "OMP manages its own account selection",
+                ));
+            }
             let snapshot = snapshot(&mut client)?;
             let mut registry = snapshot["registry"].clone();
             let automatic = account.eq_ignore_ascii_case("automatic");
-            let selected = if automatic { None } else {
-                let id = if account.contains('/') { account } else { format!("{}/{account}", provider.executable()) };
-                let _: crate::account::AccountId = id.parse().map_err(|e| AppError::new("account", e))?;
-                if !id.starts_with(&format!("{}/", provider.executable())) || !account_rows(&snapshot).iter().any(|row| row["id"] == id && row["archived"] != true) {
-                    return Err(AppError::new("account", "Choose an available account of this provider from account list"));
+            let selected = if automatic {
+                None
+            } else {
+                let id = if account.contains('/') {
+                    account
+                } else {
+                    format!("{}/{account}", provider.executable())
+                };
+                let _: crate::account::AccountId =
+                    id.parse().map_err(|e| AppError::new("account", e))?;
+                if !id.starts_with(&format!("{}/", provider.executable()))
+                    || !account_rows(&snapshot)
+                        .iter()
+                        .any(|row| row["id"] == id && row["archived"] != true)
+                {
+                    return Err(AppError::new(
+                        "account",
+                        "Choose an available account of this provider from account list",
+                    ));
                 }
                 Some(id)
             };
-            let object = registry.as_object_mut().ok_or_else(|| AppError::new("account", "Invalid account registry"))?;
-            let defaults = object.entry("defaults").or_insert_with(|| json!({})).as_object_mut().ok_or_else(|| AppError::new("account", "Invalid account defaults"))?;
-            if let Some(id) = &selected { defaults.insert(provider.executable().into(), json!(id.split_once('/').unwrap().1)); }
-            else { defaults.remove(provider.executable()); }
-            let expected_revision = snapshot["registry"]["revision"].as_u64().unwrap_or_default();
-            let revision = match client.device_operation(crate::device_service::Operation::AccountsUpdate { expected_revision, registry }).map_err(protocol_error)? {
-                crate::device_service::Reply::AccountRegistry(registry) => registry["revision"].clone(),
-                _ => return Err(AppError::new("account", "Unexpected account preference response")),
+            let object = registry
+                .as_object_mut()
+                .ok_or_else(|| AppError::new("account", "Invalid account registry"))?;
+            let defaults = object
+                .entry("defaults")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| AppError::new("account", "Invalid account defaults"))?;
+            if let Some(id) = &selected {
+                defaults.insert(
+                    provider.executable().into(),
+                    json!(id.split_once('/').unwrap().1),
+                );
+            } else {
+                defaults.remove(provider.executable());
+            }
+            let expected_revision = snapshot["registry"]["revision"]
+                .as_u64()
+                .unwrap_or_default();
+            let revision = match client
+                .device_operation(crate::device_service::Operation::AccountsUpdate {
+                    expected_revision,
+                    registry,
+                })
+                .map_err(protocol_error)?
+            {
+                crate::device_service::Reply::AccountRegistry(registry) => {
+                    registry["revision"].clone()
+                }
+                _ => {
+                    return Err(AppError::new(
+                        "account",
+                        "Unexpected account preference response",
+                    ));
+                }
             };
-            Ok(CommandOutput { command: "account.default", data: json!({"provider": provider.executable(), "account": selected, "automatic": automatic, "revision": revision}),
-                human: format!("{} default: {}", provider.executable(), selected.as_deref().unwrap_or("automatic")) })
+            Ok(CommandOutput {
+                command: "account.default",
+                data: json!({"provider": provider.executable(), "account": selected, "automatic": automatic, "revision": revision}),
+                human: format!(
+                    "{} default: {}",
+                    provider.executable(),
+                    selected.as_deref().unwrap_or("automatic")
+                ),
+            })
         }
         AccountCommand::Remove { account } => {
-            lifecycle(&mut client, Operation::Remove { id: account.clone() })?;
-            Ok(CommandOutput { command: "account.remove", data: json!({"account": account, "state": "removed", "transcript_files_retained": true}),
-                human: format!("Removed {account}; managed transcript files are retained") })
+            let result = lifecycle(
+                &mut client,
+                Operation::Remove {
+                    id: account.clone(),
+                },
+            )?;
+            removal_output(&account, result)
         }
         AccountCommand::SignIn { provider } => {
-            let created = lifecycle(&mut client, Operation::Create { provider, copy_codex_config: false })?;
-            let key: uuid::Uuid = serde_json::from_value(created["key"].clone()).map_err(|e| AppError::new("account", e))?;
-            let recipe: LaunchRecipe = serde_json::from_value(created["recipe"].clone()).map_err(|e| AppError::new("account", e))?;
+            let created = lifecycle(
+                &mut client,
+                Operation::Create {
+                    provider,
+                    copy_codex_config: false,
+                },
+            )?;
+            let key: uuid::Uuid = serde_json::from_value(created["key"].clone())
+                .map_err(|e| AppError::new("account", e))?;
+            let recipe: LaunchRecipe = serde_json::from_value(created["recipe"].clone())
+                .map_err(|e| AppError::new("account", e))?;
             let result = run_login(&recipe);
             if !result.as_ref().is_ok_and(|status| status.success()) {
                 let _ = lifecycle(&mut client, Operation::Abandon { provider, key });
-                return Err(AppError::new("account_sign_in", match result { Ok(status) => format!("Provider sign-in exited {status}"), Err(error) => error.to_string() }));
+                return Err(AppError::new(
+                    "account_sign_in",
+                    match result {
+                        Ok(status) => format!("Provider sign-in exited {status}"),
+                        Err(error) => error.to_string(),
+                    },
+                ));
             }
             let settled = lifecycle(&mut client, Operation::Register { provider, key })?;
             if let Some(duplicate) = settled.get("Duplicate") {
-                return Ok(CommandOutput { command: "account.sign_in", data: json!({"account": duplicate["existing"], "state": "already_registered"}), human: "This login already has a registered account".into() });
+                return Ok(CommandOutput {
+                    command: "account.sign_in",
+                    data: json!({"account": duplicate["existing"], "state": "already_registered"}),
+                    human: "This login already has a registered account".into(),
+                });
             }
             if settled.get("Abandoned").is_some() {
-                return Err(AppError::new("account_sign_in", "The provider did not confirm a login; the unused sign-in home was removed"));
+                return Err(AppError::new(
+                    "account_sign_in",
+                    "The provider did not confirm a login; the unused sign-in home was removed",
+                ));
             }
             if settled.get("Registered").is_none() {
-                return Err(AppError::new("account_sign_in", "Unexpected sign-in verification response"));
+                return Err(AppError::new(
+                    "account_sign_in",
+                    "Unexpected sign-in verification response",
+                ));
             }
             let account = format!("{}/{key}", provider.executable());
-            Ok(CommandOutput { command: "account.sign_in", data: json!({"account": account, "state": "signed_in"}), human: format!("Signed in as {account}") })
+            Ok(CommandOutput {
+                command: "account.sign_in",
+                data: json!({"account": account, "state": "signed_in"}),
+                human: format!("Signed in as {account}"),
+            })
         }
         AccountCommand::Info { .. } => unreachable!(),
     }
 }
 
+/// Interpret the post-mutation reply without claiming anything about retained
+/// files. The registry implementation belongs to HOST/UI, so the CLI decodes
+/// only the reply metadata it needs rather than importing that feature graph.
+fn removal_output(
+    account: &crate::account::AccountId,
+    result: Value,
+) -> Result<CommandOutput, AppError> {
+    #[derive(serde::Deserialize)]
+    struct RemovedRegistry {
+        #[serde(rename = "revision")]
+        _revision: u64,
+    }
+
+    let (_, cleanup_error): (RemovedRegistry, Option<String>) =
+        serde_json::from_value(result).map_err(|_| AppError {
+            kind: "account_remove_result_unconfirmed",
+            message: format!("The removal result for {account} could not be confirmed. Check the account list before retrying."),
+            details: Some(json!({"account": account, "state": "unconfirmed", "removed": null})),
+        })?;
+    let data = json!({"account": account, "state": "removed", "removed": true, "cleanup_error": cleanup_error});
+    if let Some(error) = cleanup_error {
+        return Err(AppError {
+            kind: "account_remove_incomplete",
+            message: format!(
+                "Removed {account} from the account registry, but account-home cleanup reported an error: {error}"
+            ),
+            details: Some(data),
+        });
+    }
+    Ok(CommandOutput {
+        command: "account.remove",
+        data,
+        human: format!("Removed {account} from the account registry."),
+    })
+}
+
 fn account_rows(snapshot: &Value) -> Vec<Value> {
     let registry = &snapshot["registry"];
-    let installed = |provider: &str| snapshot["installed"].as_object().and_then(|entries| entries.iter().find(|(name, _)| name.eq_ignore_ascii_case(provider))).and_then(|(_, installed)| installed.as_bool()).unwrap_or(false);
+    let installed = |provider: &str| {
+        snapshot["installed"]
+            .as_object()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(provider))
+            })
+            .and_then(|(_, installed)| installed.as_bool())
+            .unwrap_or(false)
+    };
     let mut rows = Vec::new();
     for provider in ["claude", "codex"] {
         if installed(provider) {
@@ -179,9 +373,14 @@ fn account_rows(snapshot: &Value) -> Vec<Value> {
         }
     }
     for account in registry["account"].as_array().into_iter().flatten() {
-        let provider = account["provider"].as_str().unwrap_or_default().to_ascii_lowercase();
+        let provider = account["provider"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let key = account["key"].as_str().unwrap_or_default();
-        let archived = registry["archived"].as_array().is_some_and(|keys| keys.iter().any(|value| value == key));
+        let archived = registry["archived"]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|value| value == key));
         rows.push(json!({"id": format!("{provider}/{key}"), "provider": provider, "label": account["label"].as_str().or_else(|| account["email"].as_str()).unwrap_or("Unnamed account"),
             "default": registry["defaults"][&provider] == key, "installed": installed(&provider), "archived": archived}));
     }
@@ -193,20 +392,45 @@ fn run_login(recipe: &LaunchRecipe) -> io::Result<std::process::ExitStatus> {
     let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
     let mut command = if let Some(device) = crate::device::selected() {
         let mut command = Command::new("ssh");
-        if io::stdin().is_terminal() { command.arg("-t"); }
+        if io::stdin().is_terminal() {
+            command.arg("-t");
+        }
         let mut invocation = vec!["env".into()];
-        for key in &recipe.unset_environment { invocation.push("-u".into()); invocation.push(quote(key)); }
-        for (key, value) in &recipe.environment { invocation.push(quote(&format!("{key}={value}"))); }
-        invocation.push(quote(&recipe.program)); invocation.extend(recipe.arguments.iter().map(|value| quote(value)));
-        command.args(["--", &device.host, &format!("cd -- {} && exec {}", quote(&recipe.working_directory.to_string_lossy()), invocation.join(" "))]);
+        for key in &recipe.unset_environment {
+            invocation.push("-u".into());
+            invocation.push(quote(key));
+        }
+        for (key, value) in &recipe.environment {
+            invocation.push(quote(&format!("{key}={value}")));
+        }
+        invocation.push(quote(&recipe.program));
+        invocation.extend(recipe.arguments.iter().map(|value| quote(value)));
+        command.args([
+            "--",
+            &device.host,
+            &format!(
+                "cd -- {} && exec {}",
+                quote(&recipe.working_directory.to_string_lossy()),
+                invocation.join(" ")
+            ),
+        ]);
         command
     } else {
         let mut command = Command::new(&recipe.program);
-        command.args(&recipe.arguments).current_dir(&recipe.working_directory).envs(&recipe.environment);
-        for key in &recipe.unset_environment { command.env_remove(key); }
+        command
+            .args(&recipe.arguments)
+            .current_dir(&recipe.working_directory)
+            .envs(&recipe.environment);
+        for key in &recipe.unset_environment {
+            command.env_remove(key);
+        }
         command
     };
-    command.stdin(Stdio::inherit()).stdout(Stdio::from(io::stderr().as_fd().try_clone_to_owned()?)).stderr(Stdio::inherit()).status()
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::from(io::stderr().as_fd().try_clone_to_owned()?))
+        .stderr(Stdio::inherit())
+        .status()
 }
 
 fn human(report: &Report) -> String {
@@ -378,13 +602,90 @@ mod tests {
 mod management_tests {
     use super::*;
     #[test]
+    fn removal_result_reports_registry_removal_without_claiming_file_retention() {
+        let account = "claude/11111111-1111-4111-8111-111111111111"
+            .parse()
+            .unwrap();
+        let output =
+            removal_output(&account, json!([{"version": 3, "revision": 9}, null])).unwrap();
+        assert_eq!(output.command, "account.remove");
+        assert_eq!(output.data["account"], account.to_string());
+        assert_eq!(output.data["state"], "removed");
+        assert_eq!(output.data["removed"], true);
+        assert!(output.data["cleanup_error"].is_null());
+        assert!(output.data.get("transcript_files_retained").is_none());
+        assert!(!output.human.contains("retained"));
+        assert!(!output.human.contains("archiv"));
+    }
+
+    #[test]
+    fn cleanup_errors_keep_the_committed_removal_and_the_original_diagnostic() {
+        let account = "claude/11111111-1111-4111-8111-111111111111"
+            .parse()
+            .unwrap();
+        for diagnostic in ["fixture: original home could not be parked", ""] {
+            let error = match removal_output(
+                &account,
+                json!([{"version": 3, "revision": 9}, diagnostic]),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("a reported cleanup error is not clean success"),
+            };
+            assert_eq!(error.kind, "account_remove_incomplete");
+            assert!(error.message.starts_with("Removed "));
+            assert!(error.message.contains(diagnostic));
+            let details = error.details.unwrap();
+            assert_eq!(details["account"], account.to_string());
+            assert_eq!(details["state"], "removed");
+            assert_eq!(details["removed"], true);
+            assert_eq!(details["cleanup_error"], diagnostic);
+            assert!(details.get("transcript_files_retained").is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_removal_replies_keep_an_unknown_mutation_disposition() {
+        let account = "claude/11111111-1111-4111-8111-111111111111"
+            .parse()
+            .unwrap();
+        for malformed in [
+            json!({"revision": 9}),
+            json!([{"revision": 9}]),
+            json!([null, null]),
+            json!([{}, null]),
+            json!([{"revision": "private-registry-sentinel"}, null]),
+            json!([{"revision": 9}, false]),
+            json!([{"revision": 9}, null, null]),
+        ] {
+            let error = match removal_output(&account, malformed) {
+                Err(error) => error,
+                Ok(_) => panic!("an unrecognized reply cannot establish removal"),
+            };
+            assert_eq!(error.kind, "account_remove_result_unconfirmed");
+            assert!(!error.message.contains("private-registry-sentinel"));
+            let details = error.details.unwrap();
+            assert_eq!(details["state"], "unconfirmed");
+            assert!(details["removed"].is_null());
+            assert!(!details.to_string().contains("private-registry-sentinel"));
+        }
+    }
+
+    #[test]
     fn account_management_arguments_and_snapshot_shape() {
-        for args in [vec!["cagents", "account", "list"], vec!["cagents", "account", "default", "Claude", "automatic"],
-            vec!["cagents", "account", "sign-in", "codex"], vec!["cagents", "account", "remove", "codex/system"]] {
+        for args in [
+            vec!["cagents", "account", "list"],
+            vec!["cagents", "account", "default", "Claude", "automatic"],
+            vec!["cagents", "account", "sign-in", "codex"],
+            vec!["cagents", "account", "remove", "codex/system"],
+        ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
-        let rows = account_rows(&json!({"installed":{"Claude":true,"Codex":false},"registry":{"defaults":{"claude":"system"},"account":[{"provider":"codex","key":"00000000-0000-4000-8000-000000000000","label":"Fixture"}]}}));
-        assert_eq!(rows.len(), 2); assert_eq!(rows[0]["id"], "claude/system");
-        assert_eq!(rows[0]["default"], true); assert_eq!(rows[1]["installed"], false);
+        let rows = account_rows(
+            &json!({"installed":{"Claude":true,"Codex":false},"registry":{"defaults":{"claude":"system"},"account":[{"provider":"codex","key":"00000000-0000-4000-8000-000000000000","label":"Fixture"}]}}),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "claude/system");
+        assert_eq!(rows[0]["default"], true);
+        assert_eq!(rows[1]["installed"], false);
     }
 }
