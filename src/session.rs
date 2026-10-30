@@ -5695,10 +5695,12 @@ mod tests {
         runtime.flush(timeout).unwrap();
 
         // Bringing a closed card back is refused by construction. Storage
-        // keeps its tombstone, and the rest of the window saves around it.
+        // keeps its tombstone, and the rest of the window saves around it,
+        // without focusing a closed card.
         let resurrected = card.id;
         state.cards.push(card);
         state.focused = Some(resurrected);
+        state.chat_drafts.insert(resurrected, "first draft".into());
         runtime.snapshot(Arc::new(state.clone()));
         let refusal = runtime
             .flush(timeout)
@@ -5724,7 +5726,11 @@ mod tests {
             .load_workspace(state.id, None)
             .unwrap()
             .unwrap();
-        assert_eq!(saved.focused, Some(resurrected));
+        assert_eq!(saved.focused, None);
+        assert_eq!(
+            saved.chat_drafts.get(&resurrected).map(String::as_str),
+            Some("first draft")
+        );
         assert!(matches!(
             saved
                 .cards

@@ -4060,6 +4060,21 @@ fn save_workspace_transaction(
         .map_err(|error| error.in_card(card.id))?;
         card_generations.insert(card.id, generation);
     }
+    // A refused card keeps what storage holds for it, which may be its
+    // tombstone, and the window cannot be stored focusing a closed card.
+    if let Some(focused) = state.focused
+        && refused
+            .iter()
+            .any(|error| matches!(error, StoreError::Card { card, .. } if *card == focused))
+        && existing
+            .get(&focused)
+            .is_some_and(|stored| !stored.existence.is_open())
+    {
+        transaction.execute(
+            "UPDATE workspaces SET focused_card_id = NULL WHERE workspace_id = ?1",
+            [&workspace_id],
+        )?;
+    }
 
     for (card_id, stored) in &existing {
         if incoming_ids.contains(card_id) {
@@ -4096,7 +4111,9 @@ fn save_workspace_transaction(
 ///
 /// Only content is isolated this way. A stale base still fails the snapshot,
 /// which the writer rebases, and a card storage has never held has nothing to
-/// keep, so its refusal still refuses the window.
+/// keep, so its refusal still refuses the window. A card kept this way also
+/// keeps the terminal or browser it holds, so a later card in the same
+/// snapshot that takes that identity over is refused in turn.
 #[allow(clippy::too_many_arguments)]
 fn save_open_card(
     transaction: &Transaction<'_>,
@@ -9774,6 +9791,27 @@ mod tests {
         assert_eq!(saved.cards[1].title, "sibling renamed");
         assert_eq!(saved.focused, Some(sibling));
         assert_eq!(saved.chat_drafts[&card], "unsent text");
+
+        // A terminal re-pointed without its relaunch is refused only after
+        // its row is written, and the row comes back exactly as stored.
+        let kept = store.load_card(sibling, None).unwrap().unwrap();
+        let mut repointed = workspace.clone();
+        let CardKind::Terminal(terminal) = &mut repointed.cards[1].kind else {
+            unreachable!()
+        };
+        terminal.id = TerminalId::new();
+        repointed.cards[1].title = "relaunch renamed".into();
+        repointed.chat_drafts.insert(card, "later text".into());
+        let commit = lane.save(&store, &repointed).unwrap();
+        assert!(matches!(
+            commit.refused.as_slice(),
+            [StoreError::Card { card, .. }, StoreError::Card { card: other, .. }]
+                if (*card, *other) == (workspace.cards[0].id, sibling)
+        ));
+        assert_eq!(commit.card_generations[&sibling], kept.generation);
+        assert_eq!(store.load_card(sibling, None).unwrap().unwrap(), kept);
+        let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(saved.chat_drafts[&card], "later text");
 
         // A card storage never held has nothing to keep, so refusing it still
         // refuses the window.

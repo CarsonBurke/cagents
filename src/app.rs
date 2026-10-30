@@ -855,8 +855,10 @@ fn quarantined_write_line<'a>(
             |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
         WriteSubject::Pane { card } => card_title(*card).map_or_else(
-            || "Latest changes to a pane".to_owned(),
-            |title| format!("Latest changes to pane “{title}”"),
+            || "Latest changes to a pane (storage keeps its last saved state)".to_owned(),
+            |title| {
+                format!("Latest changes to pane “{title}” (storage keeps its last saved state)")
+            },
         ),
         WriteSubject::CardIdentity {
             card,
@@ -7563,9 +7565,7 @@ impl Cagents {
         self.focus_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
-        self.snapshot_workspace_scope();
-        self.publish_view_changes();
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
@@ -7576,12 +7576,20 @@ impl Cagents {
             }
         }
     }
+    /// The window to save, after publishing this window's own edits to the
+    /// shared views it shows. An edit saved but not published is undone by
+    /// the next shared projection, and storage refuses the snapshot that
+    /// projection saves when it reverts what storage already holds.
+    fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
+        self.snapshot_workspace_scope();
+        self.publish_view_changes();
+        self.persistent_workspace()
+    }
+
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
-                self.snapshot_workspace_scope();
-                self.publish_view_changes();
-                let saved = self.persistent_workspace();
+                let saved = self.shared_window_snapshot();
                 if let Some(writer) = &self.session {
                     writer.snapshot_conversion(saved);
                 }
@@ -7650,12 +7658,8 @@ impl Cagents {
     /// Storage refuses a snapshot that re-points a chat card at another
     /// conversation, so the replacement is recorded explicitly, together with
     /// the snapshot that shows it, the way a terminal relaunch records its new
-    /// identity.
-    ///
-    /// The new conversation is published to the card's shared view as well,
-    /// like any other edit to it. Otherwise the next projection of that view
-    /// would put the earlier conversation back, and every later snapshot
-    /// would be refused for differing from the replacement storage holds.
+    /// identity. Like any other edit, the new conversation is published to
+    /// the card's shared view.
     fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
         let expected = match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(current)) if current != &session => current.id,
@@ -7664,9 +7668,7 @@ impl Cagents {
         if self.install_chat_session(card, session.clone()).is_none() {
             return;
         }
-        self.snapshot_workspace_scope();
-        self.publish_view_changes();
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.replace_chat_identity(card, expected, session, saved);
         }
@@ -7696,7 +7698,7 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(saved);
         }
@@ -20216,12 +20218,14 @@ mod tests {
         let pane = write(WriteSubject::Pane { card });
         let line = quarantined_write_line(&pane, &titled);
         assert!(
-            line.starts_with("Latest changes to pane “build” —"),
+            line.starts_with(
+                "Latest changes to pane “build” (storage keeps its last saved state) —"
+            ),
             "{line}"
         );
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&pane, &untitled);
-        assert!(line.starts_with("Latest changes to a pane —"), "{line}");
+        assert!(line.starts_with("Latest changes to a pane ("), "{line}");
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,
