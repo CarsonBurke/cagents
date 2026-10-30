@@ -1047,6 +1047,45 @@ mod tests {
         let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
         observed.selected_model = Some("chosen-model".into());
         observed.reasoning = Some("low".into());
+        let history_image = Attachment {
+            path: "kept-history.png".into(),
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 1,
+                device: uuid::Uuid::new_v4(),
+                name: "kept-history.png".into(),
+                sha256: "1".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        // A real wake rebuilds recall history from the reader publication.
+        // Seed that source, not disposable runtime-only history vectors. The
+        // valid image reference is intentionally unavailable on this device;
+        // recalling its immutable metadata does not require decoding a file.
+        observed.items = vec![
+            Arc::new(chat::Item {
+                started_at: None,
+                id: "panel-history/input/0".into(),
+                role: chat::Role::User,
+                content: ItemContent::Text {
+                    text: "An earlier ordinary prompt".into(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+            }),
+            Arc::new(chat::Item {
+                started_at: None,
+                id: "panel-history/input/1".into(),
+                role: chat::Role::User,
+                content: ItemContent::Image {
+                    path: history_image.path.to_str().unwrap().into(),
+                    description: history_image.label(),
+                    reference: history_image.reference.clone(),
+                },
+                at: None,
+            }),
+        ];
         observed.goal.as_mut().unwrap().read = ReadState::Known(Some(chat::goal::Goal {
             thread_id: THREAD.into(),
             objective: "Original panel goal".into(),
@@ -1073,9 +1112,9 @@ mod tests {
         ));
         rt.attachments
             .push(Attachment::file("kept-panel-draft.txt"));
-        rt.history.push("An earlier ordinary prompt".into());
-        rt.history_images
-            .push(vec![Attachment::file("kept-history.txt")]);
+        assert_eq!(rt.history, ["An earlier ordinary prompt"]);
+        assert_eq!(rt.history_images, [vec![history_image]]);
+        assert!(rt.history_cursor.is_none());
         drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
         let rt = runtime(&app, card);
         assert!(rt.snapshot.ready && !rt.disconnected);
