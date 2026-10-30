@@ -2104,16 +2104,13 @@ impl State {
         let (comments, unresolved) = self.discussion_counts(&row.path.display());
         if comments > 0 {
             trailing.push(
-                widget::tooltip(
+                crate::interaction::tooltip_above(
                     design::caption(if unresolved > 0 {
                         format!("{comments} · {unresolved} open")
                     } else {
                         format!("{comments}")
                     }),
-                    design::caption(format!(
-                        "{comments} comments, {unresolved} unresolved threads"
-                    )),
-                    widget::tooltip::Position::Top,
+                    format!("{comments} comments, {unresolved} unresolved threads"),
                 )
                 .into(),
             );
