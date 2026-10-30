@@ -335,11 +335,16 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
 
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+fn same_file(
+    a: impl Into<fs_safety::EntryMetadata>,
+    b: impl Into<fs_safety::EntryMetadata>,
+) -> bool {
+    let (a, b) = (a.into(), b.into());
     a.is_file() && b.is_file() && a.dev() == b.dev() && a.ino() == b.ino()
 }
 
-fn stable_version(m: &fs::Metadata) -> (u64, u32, u32, u32, i64, i64) {
+fn stable_version(m: impl Into<fs_safety::EntryMetadata>) -> (u64, u32, u32, u32, i64, i64) {
+    let m = m.into();
     (
         m.len(),
         m.mode(),
@@ -349,8 +354,11 @@ fn stable_version(m: &fs::Metadata) -> (u64, u32, u32, u32, i64, i64) {
         m.mtime_nsec(),
     )
 }
-fn full_version(m: &fs::Metadata) -> ((u64, u32, u32, u32, i64, i64), i64, i64) {
-    (stable_version(m), m.ctime(), m.ctime_nsec())
+fn full_version(
+    m: impl Into<fs_safety::EntryMetadata>,
+) -> ((u64, u32, u32, u32, i64, i64), i64, i64) {
+    let m = m.into();
+    (stable_version(&m), m.ctime(), m.ctime_nsec())
 }
 
 struct SaveBaseline {

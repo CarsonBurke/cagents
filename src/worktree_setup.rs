@@ -67,7 +67,8 @@ struct SourceFingerprint {
     changed: (i64, i64),
 }
 
-fn source_fingerprint(metadata: &fs::Metadata) -> SourceFingerprint {
+fn source_fingerprint(metadata: impl Into<fs_safety::EntryMetadata>) -> SourceFingerprint {
+    let metadata = metadata.into();
     SourceFingerprint {
         device: metadata.dev(),
         inode: metadata.ino(),

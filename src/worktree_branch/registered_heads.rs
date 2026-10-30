@@ -79,7 +79,7 @@ fn read_regular(root: &Root, name: &OsStr) -> Result<Vec<u8>, String> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(anchor(root).join(name))
         .map_err(io)?;
-    let before = file.metadata().map_err(io)?;
+    let before = fs_safety::EntryMetadata::from(&file.metadata().map_err(io)?);
     if !before.is_file() || before.len() > LIMIT {
         return Err("Registration metadata is not a bounded regular file".into());
     }
@@ -89,9 +89,9 @@ fn read_regular(root: &Root, name: &OsStr) -> Result<Vec<u8>, String> {
         .take(LIMIT + 1)
         .read_to_end(&mut bytes)
         .map_err(io)?;
-    let after = file.metadata().map_err(io)?;
+    let after = fs_safety::EntryMetadata::from(&file.metadata().map_err(io)?);
     let named = fs_safety::metadata_beneath(root, Path::new(name)).map_err(io)?;
-    let version = |m: &fs::Metadata| {
+    let version = |m: &fs_safety::EntryMetadata| {
         (
             m.dev(),
             m.ino(),

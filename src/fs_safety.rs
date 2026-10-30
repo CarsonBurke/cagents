@@ -7,9 +7,10 @@
 //!    object.** `symlink_metadata(path)` followed by `fs::read(path)` resolves
 //!    the name twice, so anything that changes the name in between — a build,
 //!    a `git checkout`, a hostile local process — makes the second call read
-//!    something the first never classified. Every function here works from an
-//!    already-open descriptor, so the object cannot be swapped underneath a
-//!    decision that was made about it.
+//!    something the first never classified. Content operations here work from
+//!    already-open descriptors. Named metadata is a point observation through
+//!    a retained parent; callers must still classify or verify the actual file
+//!    descriptor before reading, writing or acting on ownership evidence.
 //! 2. **A repository must never redirect a read or a write outside the
 //!    worktree.** `O_NOFOLLOW` rejects only a symlinked *final* component; a
 //!    symlinked *parent* directory is still traversed, so replacing `src` with
@@ -192,6 +193,137 @@ impl Root {
     }
 }
 
+/// A point observation of an entry, without a handle to its contents.
+///
+/// This value grants no authority to read, modify or remove the entry. A later
+/// name lookup can find a different object; retained-file users must compare
+/// their actual descriptor's identity and version as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryMetadata {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl From<&Metadata> for EntryMetadata {
+    fn from(metadata: &Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+impl From<&EntryMetadata> for EntryMetadata {
+    fn from(metadata: &EntryMetadata) -> Self {
+        *metadata
+    }
+}
+
+impl EntryMetadata {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.file_type().is_file()
+    }
+
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.file_type().is_dir()
+    }
+
+    #[must_use]
+    pub fn file_type(&self) -> EntryFileType {
+        EntryFileType(self.mode & u32::from(libc::S_IFMT))
+    }
+
+    #[must_use]
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    #[must_use]
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    #[must_use]
+    pub fn mtime(&self) -> i64 {
+        self.mtime
+    }
+
+    #[must_use]
+    pub fn mtime_nsec(&self) -> i64 {
+        self.mtime_nsec
+    }
+
+    #[must_use]
+    pub fn ctime(&self) -> i64 {
+        self.ctime
+    }
+
+    #[must_use]
+    pub fn ctime_nsec(&self) -> i64 {
+        self.ctime_nsec
+    }
+}
+
+/// The complete native type bits, including special and unknown entry types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryFileType(u32);
+
+impl EntryFileType {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.0 == u32::from(libc::S_IFREG)
+    }
+
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.0 == u32::from(libc::S_IFDIR)
+    }
+
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.0 == u32::from(libc::S_IFLNK)
+    }
+}
+
 /// Internal worker-side ancestor observation through a retained directory.
 /// This intentional literal parent lookup is separate from confined public
 /// component resolution: `open_at` MUST continue rejecting user-supplied `..`.
@@ -365,22 +497,92 @@ pub fn open_beneath_writable(root: &Root, relative: &Path) -> Result<Option<File
 /// The metadata of `relative` beneath `root`, describing a final symlink as the
 /// link itself rather than its target.
 ///
-/// This is `symlink_metadata` without its hazard: the final component is opened
-/// without opening its contents (`O_PATH` on Linux, event-only plus
-/// `O_SYMLINK` on Darwin). Every parent component still refuses symlinks.
+/// Linux observes the final component through an `O_PATH` descriptor. Darwin
+/// uses `fstatat(AT_SYMLINK_NOFOLLOW)` without opening the leaf, including FIFO
+/// and socket entries. Every parent component still refuses symlinks.
+///
+/// This describes the name at one instant, not a retained object or a promise
+/// about a later open. Reading or modifying contents requires the actual
+/// descriptor's own type, identity and version checks.
 ///
 /// # Errors
 ///
 /// Returns [`ResolveError::Escaped`] when a component above the final one is a
 /// symlink or would leave `root`, and [`ResolveError::Io`] for every other
 /// failure.
-pub fn metadata_beneath(root: &Root, relative: &Path) -> Result<Metadata, ResolveError> {
+pub fn metadata_beneath(root: &Root, relative: &Path) -> Result<EntryMetadata, ResolveError> {
+    #[cfg(target_os = "macos")]
+    {
+        metadata_beneath_after_stat(root, relative, || {})
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let reported = root.path.join(relative);
+        let (directory, name) = open_parent_beneath(root, relative)?;
+        let flags = platform::METADATA_OPEN | libc::O_CLOEXEC;
+        let entry = open_at(directory.descriptor(), &name, flags)
+            .map_err(|error| classify(&reported, &error))?;
+        metadata_of_descriptor(&entry)
+            .map(|metadata| EntryMetadata::from(&metadata))
+            .map_err(|error| ResolveError::io(&reported, &error))
+    }
+}
+
+// The checkpoint lets native tests replace the leaf after the stat observation
+// and detect any later open used to manufacture std::fs::Metadata.
+#[cfg(target_os = "macos")]
+fn metadata_beneath_after_stat(
+    root: &Root,
+    relative: &Path,
+    after_stat: impl FnOnce(),
+) -> Result<EntryMetadata, ResolveError> {
     let reported = root.path.join(relative);
     let (directory, name) = open_parent_beneath(root, relative)?;
-    let flags = platform::METADATA_OPEN | libc::O_CLOEXEC;
-    let entry = open_at(directory.descriptor(), &name, flags)
-        .map_err(|error| classify(&reported, &error))?;
-    metadata_of_descriptor(&entry).map_err(|error| ResolveError::io(&reported, &error))
+    let metadata = stat_entry_at(directory.descriptor(), &name)
+        .map_err(|error| ResolveError::io(&reported, &error))?;
+    after_stat();
+    Ok(entry_metadata_from_stat(&metadata))
+}
+
+#[cfg(target_os = "macos")]
+fn stat_entry_at(directory: RawFd, name: &OsStr) -> io::Result<libc::stat> {
+    let name = c_name(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the retained directory and single C component outlive the call.
+    // fstatat initializes the target libc stat on success. NOFOLLOW describes
+    // the leaf itself, without opening any FIFO, socket or symlink target.
+    let status = unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful fstatat initialized the stat fields above.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn entry_metadata_from_stat(metadata: &libc::stat) -> EntryMetadata {
+    // These are target libc fields, never the opaque std Metadata layout.
+    // Casts preserve the Unix MetadataExt numeric representation, including
+    // signed dev_t/off_t conversion; native field-parity tests cover it.
+    EntryMetadata {
+        dev: metadata.st_dev as u64,
+        ino: metadata.st_ino,
+        len: metadata.st_size as u64,
+        mode: u32::from(metadata.st_mode),
+        uid: metadata.st_uid,
+        gid: metadata.st_gid,
+        mtime: metadata.st_mtime,
+        mtime_nsec: metadata.st_mtime_nsec,
+        ctime: metadata.st_ctime,
+        ctime_nsec: metadata.st_ctime_nsec,
+    }
 }
 
 /// Reads the target of the symbolic link `relative` beneath `root`.
@@ -1365,10 +1567,11 @@ fn resolve(
 fn resolve_directory(root: &Root, relative: &Path) -> Result<Root, ResolveError> {
     let reported = root.path.join(relative);
     let flags = platform::IDENTITY_OPEN | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = flags | libc::O_DIRECTORY;
     let descriptor = resolve(root, relative, flags, resolver())?;
-    // The walk opens the final component `O_NOFOLLOW`, which for `O_PATH`
-    // yields the symlink itself rather than an error, so the kind is checked
-    // here for both resolvers rather than trusted to `O_DIRECTORY`.
+    // Linux O_PATH|O_NOFOLLOW can yield the symlink itself. Darwin constrains
+    // directory type before open; both still verify the retained descriptor.
     let metadata =
         metadata_of_descriptor(&descriptor).map_err(|error| ResolveError::io(&reported, &error))?;
     let kind = metadata.file_type();
@@ -1398,10 +1601,14 @@ fn walk(
         .directory
         .try_clone()
         .map_err(|error| ResolveError::io(reported, &error))?;
+    #[cfg(not(target_os = "macos"))]
     let intermediate = platform::IDENTITY_OPEN | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     for part in leading {
+        #[cfg(not(target_os = "macos"))]
         let child = open_at(directory.as_raw_fd(), part, intermediate)
             .map_err(|error| classify(reported, &error))?;
+        #[cfg(target_os = "macos")]
+        let child = open_directory_at(directory.as_raw_fd(), part, reported)?;
         let metadata =
             metadata_of_descriptor(&child).map_err(|error| ResolveError::io(reported, &error))?;
         let kind = metadata.file_type();
@@ -1413,8 +1620,53 @@ fn walk(
         }
         directory = child;
     }
+    #[cfg(target_os = "macos")]
+    if flags & libc::O_DIRECTORY != 0 {
+        return open_directory_at(directory.as_raw_fd(), name, reported);
+    }
     open_at(directory.as_raw_fd(), name, flags | libc::O_NOFOLLOW)
         .map_err(|error| classify(reported, &error))
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_at(
+    directory: RawFd,
+    name: &OsStr,
+    reported: &Path,
+) -> Result<OwnedFd, ResolveError> {
+    open_directory_at_after_open(directory, name, reported, |_| {})
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_at_after_open(
+    directory: RawFd,
+    name: &OsStr,
+    reported: &Path,
+    after_open: impl FnOnce(&OwnedFd),
+) -> Result<OwnedFd, ResolveError> {
+    // Constrain the type before open reaches filesystem FIFO/socket behavior;
+    // fstat after an unconstrained event-only open would already be too late.
+    let flags = platform::IDENTITY_OPEN | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let descriptor = open_at(directory, name, flags).map_err(|error| {
+        // Darwin may reject a symlink with ENOTDIR before checking NOFOLLOW.
+        // Refine only a type failure, using the same retained parent. A raced
+        // or unavailable observation still refuses: never retry the open.
+        if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) {
+            if let Ok(metadata) = stat_entry_at(directory, name) {
+                let kind = entry_metadata_from_stat(&metadata).file_type();
+                if kind.is_symlink() {
+                    return ResolveError::escaped(reported);
+                }
+                if !kind.is_dir() {
+                    return ResolveError::message(reported, "not a directory");
+                }
+            }
+        }
+        classify(reported, &error)
+    })?;
+    // Native tests inspect peer state while a successful open is still held.
+    after_open(&descriptor);
+    Ok(descriptor)
 }
 
 /// One `openat2` call restricted to `root`.
@@ -2050,6 +2302,260 @@ pub(crate) mod tests {
         let error = metadata_beneath(&root, Path::new("missing.txt")).expect_err("missing");
 
         assert!(error.is_not_found(), "{error:?}");
+    }
+
+    #[test]
+    fn metadata_observation_matches_native_fields_for_all_entry_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let regular = File::create(directory.path().join("regular")).unwrap();
+        regular.set_len(37).unwrap();
+        regular
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::new(1_234_567_890, 123_456_789),
+            ))
+            .unwrap();
+        fs::set_permissions(
+            directory.path().join("regular"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        assert_eq!(regular.metadata().unwrap().mtime_nsec(), 123_456_789);
+        fs::create_dir(directory.path().join("directory")).unwrap();
+        fs::write(directory.path().join("unreadable"), b"private").unwrap();
+        fs::set_permissions(
+            directory.path().join("unreadable"),
+            fs::Permissions::from_mode(0),
+        )
+        .unwrap();
+        fs::write(outside.path().join("target"), b"outside").unwrap();
+        for (name, target) in [
+            ("link", PathBuf::from("regular")),
+            ("dangling", PathBuf::from("missing")),
+            ("outside", outside.path().join("target")),
+        ] {
+            std::os::unix::fs::symlink(target, directory.path().join(name)).unwrap();
+        }
+        fifo(&directory.path().join("fifo"));
+        let _socket =
+            std::os::unix::net::UnixListener::bind(directory.path().join("socket")).unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        for name in [
+            "regular",
+            "directory",
+            "unreadable",
+            "link",
+            "dangling",
+            "outside",
+            "fifo",
+            "socket",
+        ] {
+            // A stable fixture permits an independent path-based stat oracle;
+            // production lookup must remain anchored to its retained parent.
+            let native = fs::symlink_metadata(directory.path().join(name)).unwrap();
+            let observed = metadata_beneath(&root, Path::new(name)).unwrap();
+            assert_eq!(observed, EntryMetadata::from(&native), "{name}");
+            assert_eq!(observed.is_file(), native.is_file(), "{name}");
+            assert_eq!(observed.is_dir(), native.is_dir(), "{name}");
+            assert_eq!(
+                observed.file_type().is_symlink(),
+                native.file_type().is_symlink(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            metadata_beneath(&root, Path::new("regular")).unwrap(),
+            EntryMetadata::from(&regular.metadata().unwrap())
+        );
+        assert_ne!(
+            metadata_beneath(&root, Path::new("fifo"))
+                .unwrap()
+                .file_type(),
+            metadata_beneath(&root, Path::new("socket"))
+                .unwrap()
+                .file_type()
+        );
+        assert_eq!(fs::read(outside.path().join("target")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn metadata_observation_stays_with_retained_root_and_clone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("root");
+        fs::create_dir_all(original.join("parent")).unwrap();
+        fs::write(original.join("parent/entry"), b"retained contents").unwrap();
+        let expected = EntryMetadata::from(&fs::metadata(original.join("parent/entry")).unwrap());
+        let root = Root::open(&original).unwrap();
+        let clone = root.try_clone().unwrap();
+        fs::rename(&original, fixture.path().join("retained")).unwrap();
+        fs::create_dir_all(original.join("parent")).unwrap();
+        fs::write(original.join("parent/entry"), b"decoy").unwrap();
+        for retained in [&root, &clone] {
+            let observed = metadata_beneath(retained, Path::new("parent/entry")).unwrap();
+            assert_eq!(observed, expected);
+            assert_ne!((observed.dev(), observed.ino()), {
+                let decoy = fs::metadata(original.join("parent/entry")).unwrap();
+                (decoy.dev(), decoy.ino())
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_fifo_has_no_reader(path: &Path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let error = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .expect_err("metadata must not provide a FIFO reader");
+        assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_observation_never_joins_a_fifo_as_reader() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fifo");
+        fifo(&path);
+        let root = Root::open(directory.path()).unwrap();
+        assert_fifo_has_no_reader(&path);
+        let reached = std::cell::Cell::new(false);
+        let observed = metadata_beneath_after_stat(&root, Path::new("fifo"), || {
+            reached.set(true);
+            assert_fifo_has_no_reader(&path);
+        })
+        .unwrap();
+        assert!(reached.get());
+        assert_eq!(
+            observed.mode() & u32::from(libc::S_IFMT),
+            u32::from(libc::S_IFIFO)
+        );
+        assert_fifo_has_no_reader(&path);
+
+        // Prove the peer-state oracle detects a real reader rather than
+        // passing merely because the writer fixture cannot open this FIFO.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .expect("positive control has a reader");
+        drop(writer);
+        drop(reader);
+        assert_fifo_has_no_reader(&path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metadata_observation_does_not_reopen_a_replaced_leaf() {
+        for replacement in ["fifo", "socket", "symlink"] {
+            let directory = tempfile::tempdir().unwrap();
+            let entry = directory.path().join("entry");
+            fs::write(&entry, b"original").unwrap();
+            let expected = EntryMetadata::from(&fs::metadata(&entry).unwrap());
+            let root = Root::open(directory.path()).unwrap();
+            let mut socket = None;
+            let observed = metadata_beneath_after_stat(&root, Path::new("entry"), || {
+                fs::rename(&entry, directory.path().join("held-original")).unwrap();
+                match replacement {
+                    "fifo" => fifo(&entry),
+                    "socket" => {
+                        socket = Some(std::os::unix::net::UnixListener::bind(&entry).unwrap());
+                    }
+                    "symlink" => std::os::unix::fs::symlink("missing", &entry).unwrap(),
+                    _ => unreachable!(),
+                }
+            })
+            .unwrap();
+            assert_eq!(observed, expected, "{replacement}");
+            let current = metadata_beneath(&root, Path::new("entry")).unwrap();
+            assert_ne!(
+                (observed.dev(), observed.ino()),
+                (current.dev(), current.ino())
+            );
+            if replacement == "fifo" {
+                assert_fifo_has_no_reader(&entry);
+            }
+            drop(socket);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_walk_rejects_substituted_special_entries_before_open() {
+        for replacement in ["fifo", "socket", "file", "symlink"] {
+            let directory = tempfile::tempdir().unwrap();
+            let entry = directory.path().join("parent");
+            fs::create_dir_all(entry.join("deep")).unwrap();
+            fs::write(entry.join("deep/item"), b"original").unwrap();
+            let root = Root::open(directory.path()).unwrap();
+            fs::rename(&entry, directory.path().join("retained-parent")).unwrap();
+            let socket = match replacement {
+                "fifo" => {
+                    fifo(&entry);
+                    None
+                }
+                "socket" => Some(std::os::unix::net::UnixListener::bind(&entry).unwrap()),
+                "file" => {
+                    fs::write(&entry, b"replacement").unwrap();
+                    None
+                }
+                "symlink" => {
+                    std::os::unix::fs::symlink("retained-parent", &entry).unwrap();
+                    None
+                }
+                _ => unreachable!(),
+            };
+            let opened = std::cell::Cell::new(false);
+            let error = open_directory_at_after_open(
+                root.descriptor(),
+                OsStr::new("parent"),
+                &entry,
+                |_| {
+                    opened.set(true);
+                    if replacement == "fifo" {
+                        assert_fifo_has_no_reader(&entry);
+                    }
+                },
+            )
+            .expect_err("a directory type constraint must reject before open");
+            assert!(
+                !opened.get(),
+                "{replacement}: successful non-directory open"
+            );
+            assert!(!error.is_not_found());
+            if replacement == "symlink" {
+                assert!(matches!(error, ResolveError::Escaped { .. }));
+            }
+            for relative in ["parent/item", "parent/deep/item"] {
+                let error = metadata_beneath(&root, Path::new(relative)).unwrap_err();
+                assert!(!error.is_not_found(), "{replacement}: {error:?}");
+                if replacement == "symlink" {
+                    assert!(matches!(error, ResolveError::Escaped { .. }));
+                }
+            }
+            assert!(open_directory_beneath(&root, Path::new("parent")).is_err());
+            let opened = std::cell::Cell::new(false);
+            let retained = open_directory_at_after_open(
+                root.descriptor(),
+                OsStr::new("retained-parent"),
+                &directory.path().join("retained-parent"),
+                |_| opened.set(true),
+            )
+            .expect("positive control remains a directory");
+            assert!(opened.get());
+            assert!(metadata_of_descriptor(&retained).unwrap().is_dir());
+            if replacement == "fifo" {
+                assert_fifo_has_no_reader(&entry);
+            }
+            drop(socket);
+        }
     }
 
     #[test]
