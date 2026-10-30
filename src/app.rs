@@ -854,6 +854,12 @@ fn quarantined_write_line<'a>(
             || "Window layout and panes (one pane was refused)".to_owned(),
             |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
+        WriteSubject::Pane { card } => card_title(*card).map_or_else(
+            || "Latest changes to a pane (storage keeps its last saved state)".to_owned(),
+            |title| {
+                format!("Latest changes to pane “{title}” (storage keeps its last saved state)")
+            },
+        ),
         WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -883,7 +889,9 @@ fn quarantined_write_line<'a>(
     // itself, so name the remedy the generic guidance only implies.
     if matches!(
         write.subject,
-        WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
+        WriteSubject::CardIdentity { .. }
+            | WriteSubject::Workspace { card: Some(_) }
+            | WriteSubject::Pane { .. }
     ) {
         line.push_str(" · closing the pane clears it");
     }
@@ -2573,6 +2581,24 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
         window::Event::Opened { size, .. } | window::Event::Resized(size) => {
             Some(Message::WindowResized(size.width, size.height))
         }
+        _ => None,
+    }
+}
+
+/// Whether a Wayland compositor fills the screen with a window or tiles its
+/// right edge, either of which removes the shell's resize border along it.
+fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
+    use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+    use iced::event::{PlatformSpecific, wayland};
+
+    match event {
+        iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+            wayland::WindowEvent::WindowState(state),
+        ))) => Some(Message::WindowEdgeState {
+            window,
+            filled: state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN),
+            right_edge_tiled: state.contains(WindowState::TILED_RIGHT),
+        }),
         _ => None,
     }
 }
@@ -4464,6 +4490,12 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowEdgeState {
+        window: window::Id,
+        filled: bool,
+        right_edge_tiled: bool,
+    },
+    WindowFilled(window::Id, bool),
     ActivateUi {
         token: Option<String>,
     },
@@ -5239,6 +5271,17 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// Whether the main window is maximized or fullscreen, so the shell offers
+    /// no resize border. Tracked here rather than read from `core`, which only
+    /// learns it from Wayland window states.
+    window_filled: bool,
+    /// Whether a Wayland window state has arrived for the main window. Those
+    /// events then report maximized and fullscreen, so only a backend without
+    /// them, such as X11, needs `query_window_filled` on every resize.
+    window_state_observed: bool,
+    /// Whether the compositor reports the main window's right edge as tiled,
+    /// so the shell offers no resize border there.
+    right_edge_tiled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -6126,6 +6169,56 @@ impl Cagents {
         }
     }
 
+    /// The trailing inset that keeps the interface out of the window's resize
+    /// border.
+    ///
+    /// While the right window edge is free, the shell starts a resize from any
+    /// press within [`design::WINDOW_RESIZE_BORDER`] of it, before the press
+    /// reaches a widget. Panes put their scrollbars at their right edge, so the
+    /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
+    /// fullscreen and right-tiled windows have no border there and stay flush.
+    fn window_edge_inset(&self) -> f32 {
+        if self.window_filled || self.right_edge_tiled {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
+        }
+    }
+
+    /// The window width left to the interface beside the resize border.
+    fn content_width(&self) -> f32 {
+        (self.window_width - self.window_edge_inset()).max(0.0)
+    }
+
+    /// Re-derives what depends on [`Self::content_width`], such as whether the
+    /// inspector docks or overlays, after the window or its inset changes.
+    fn content_width_changed(&mut self) -> Task<Message> {
+        if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
+            self.context_inspector_open = false;
+            self.context_inspector_transition = None;
+        }
+        self.sync_context_overlay_state()
+    }
+
+    /// Reads whether the main window is maximized or fullscreen from the
+    /// windowing backend, which is what the shell's resize border consults.
+    /// Wayland reports this through window states, which make the query
+    /// redundant; X11 has no such event, so there every resize asks again.
+    fn query_window_filled(&self) -> Task<Message> {
+        if self.window_state_observed {
+            return Task::none();
+        }
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        iced::window::is_maximized(window)
+            .then(move |maximized| {
+                iced::window::mode(window)
+                    .map(move |mode| maximized || mode == iced::window::Mode::Fullscreen)
+            })
+            .map(move |filled| cosmic::Action::App(Message::WindowFilled(window, filled)))
+    }
+
     fn new_pane_fraction(&self, configured: f32) -> f32 {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
@@ -6139,12 +6232,12 @@ impl Cagents {
                 self.settings
                     .inspector_width
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                    .min(self.window_width.max(0.0))
+                    .min(self.content_width())
                     * self.context_inspector_progress()
             } else {
                 0.0
             };
-            (self.window_width - sidebar - inspector).max(0.0)
+            (self.content_width() - sidebar - inspector).max(0.0)
         } else {
             self.workspace.viewport_width()
         };
@@ -7472,9 +7565,7 @@ impl Cagents {
         self.focus_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
-        self.snapshot_workspace_scope();
-        self.publish_view_changes();
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
@@ -7485,12 +7576,20 @@ impl Cagents {
             }
         }
     }
+    /// The window to save, after publishing this window's own edits to the
+    /// shared views it shows. An edit saved but not published is undone by
+    /// the next shared projection, and storage refuses the snapshot that
+    /// projection saves when it reverts what storage already holds.
+    fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
+        self.snapshot_workspace_scope();
+        self.publish_view_changes();
+        self.persistent_workspace()
+    }
+
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
-                self.snapshot_workspace_scope();
-                self.publish_view_changes();
-                let saved = self.persistent_workspace();
+                let saved = self.shared_window_snapshot();
                 if let Some(writer) = &self.session {
                     writer.snapshot_conversion(saved);
                 }
@@ -7559,7 +7658,8 @@ impl Cagents {
     /// Storage refuses a snapshot that re-points a chat card at another
     /// conversation, so the replacement is recorded explicitly, together with
     /// the snapshot that shows it, the way a terminal relaunch records its new
-    /// identity.
+    /// identity. Like any other edit, the new conversation is published to
+    /// the card's shared view.
     fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
         let expected = match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(current)) if current != &session => current.id,
@@ -7568,8 +7668,7 @@ impl Cagents {
         if self.install_chat_session(card, session.clone()).is_none() {
             return;
         }
-        self.snapshot_workspace_scope();
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.replace_chat_identity(card, expected, session, saved);
         }
@@ -7599,7 +7698,7 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(saved);
         }
@@ -12459,7 +12558,7 @@ impl Cagents {
             .inspector_width
             .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
         Some(
-            if self.window_width - navigation - inspector
+            if self.content_width() - navigation - inspector
                 >= crate::workspace::WidthLimits::default().minimum
             {
                 InspectorLayout::Docked
@@ -12618,6 +12717,7 @@ impl Cagents {
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             // A request's answer is rendered by this very panel, so dismissing
@@ -14107,6 +14207,9 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -14266,7 +14369,7 @@ impl Application for Cagents {
             };
         let _ = app
             .workspace
-            .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
+            .resize_viewport((app.content_width() - sidebar_width - inspector_width).max(0.0));
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app
@@ -16577,6 +16680,36 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowEdgeState {
+                window,
+                filled,
+                right_edge_tiled,
+            } => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_state_observed = true;
+                self.window_filled = filled;
+                self.right_edge_tiled = right_edge_tiled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
+            Message::WindowFilled(window, filled) => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_filled = filled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -16584,11 +16717,7 @@ impl Application for Cagents {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
-                    self.context_inspector_open = false;
-                    self.context_inspector_transition = None;
-                }
-                self.sync_context_overlay_state()
+                Task::batch([self.content_width_changed(), self.query_window_filled()])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -17041,7 +17170,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
+                // A held chord copies once, so its repeats must not cancel the
+                // copy its first press started.
+                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
                     chat_ui::invalidate_copy_intent();
@@ -17062,12 +17193,38 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                if let Some(gallery) = &self.chat_ui.image_viewer {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
                         match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                            // Layout-independent, like the other Ctrl chords.
+                            keyboard::Key::Character(_)
+                                if modifiers.command()
+                                    && !modifiers.shift()
+                                    && !modifiers.alt()
+                                    && !modifiers.logo()
+                                    && key
+                                        .to_latin(*physical_key)
+                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                            {
+                                // A held chord copies once.
+                                if *repeat {
+                                    return Task::none();
+                                }
+                                let image = gallery.selected_image();
+                                return self.handle_chat_ui(chat_ui::Action::Image(
+                                    image,
+                                    chat_ui::images::ImageCommand::Copy,
+                                ));
                             }
+                            // Escape is the viewer's own (`Gallery::view`), so that
+                            // one an open context menu claims closes only the menu.
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                                 self.chat_ui.image_viewer.as_mut().unwrap().next(false);
                             }
@@ -18028,6 +18185,9 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(event_window, false),
                 )),
                 iced::Event::Window(event) => window_geometry_message(&event),
+                event @ iced::Event::PlatformSpecific(_) => {
+                    window_edge_message(&event, event_window)
+                }
                 _ => None,
             }),
         ];
@@ -18449,7 +18609,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let window_width = self.window_width;
+        let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
             &self.sidebar_model,
@@ -18703,7 +18863,7 @@ impl Application for Cagents {
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                .min(window_width.max(0.0));
+                .min(content_width);
             let progress = self.context_inspector_progress();
             let visible_width = width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
@@ -18821,6 +18981,11 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        // Only the inset changes with the window state, so the tree, and
+        // every scroll offset and focus in it, survives a maximize.
+        let surface: Element<'_, Message> = widget::container(surface)
+            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -20050,6 +20215,18 @@ mod tests {
         let line = quarantined_write_line(&snapshot, &untitled);
         assert!(line.contains("(one pane was refused)"), "{line}");
 
+        let pane = write(WriteSubject::Pane { card });
+        let line = quarantined_write_line(&pane, &titled);
+        assert!(
+            line.starts_with(
+                "Latest changes to pane “build” (storage keeps its last saved state) —"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("closing the pane clears it"), "{line}");
+        let line = quarantined_write_line(&pane, &untitled);
+        assert!(line.starts_with("Latest changes to a pane ("), "{line}");
+
         let relaunch = write(WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -20075,10 +20252,12 @@ mod tests {
 
     #[test]
     fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
+        // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
+        // content, so the third case sits exactly at the narrow threshold.
         for (window, seed, with_project, inspector_open, expected, measured) in [
             (1280.0, 1340.0, false, false, 1.0, 1020.0),
             (1600.0, 600.0, false, false, 0.5, 1340.0),
-            (1360.0, 1340.0, false, false, 0.5, 1100.0),
+            (1368.0, 1340.0, false, false, 0.5, 1100.0),
             (1600.0, 1340.0, true, true, 1.0, 960.0),
             (2000.0, 600.0, true, true, 0.5, 1360.0),
             (900.0, 1340.0, true, true, 1.0, 640.0),
@@ -21506,7 +21685,163 @@ mod tests {
 
     #[test]
     fn resetting_settings_restores_autosave_for_an_already_open_editor() {
-        async fn settle_repository_tasks(app: &mut Cagents, task: Task<Message>) {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::resetting_settings_restores_autosave_for_an_already_open_editor",
+        ) {
+            return;
+        }
+
+        #[derive(Debug, Default)]
+        struct SaveDiagnostics {
+            auto_save_due_delivered: usize,
+            events: Vec<String>,
+        }
+
+        fn editor_state(app: &Cagents, card: CardId) -> String {
+            let editor = match app.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => {
+                    let context = runtime.inspector_context();
+                    format!(
+                        "document={:?}, document_error={:?}, text={:?}, dirty={}, saving={}, save_error={:?}, editor_recovery={}, blocks_navigation={}",
+                        context.document,
+                        context.document_error,
+                        runtime.editor_text(),
+                        runtime.is_dirty(),
+                        runtime.is_saving(),
+                        runtime.save_error(),
+                        runtime.has_editor_recovery(),
+                        runtime.blocks_navigation(),
+                    )
+                }
+                Some(_) => "non-repository runtime".into(),
+                None => "runtime missing".into(),
+            };
+            format!(
+                "{editor}, window_custody_pending={}",
+                app.operation_recovery_pending(),
+            )
+        }
+
+        impl SaveDiagnostics {
+            fn before_message(
+                &mut self,
+                app: &Cagents,
+                card: CardId,
+                phase: &str,
+                message: &Message,
+            ) {
+                let detail = match message {
+                    Message::Repository(RepositoryAction::FileLoadedAt { identity, result }) => {
+                        let disposition = match result {
+                            Err(error) => format!("Err({error:?})"),
+                            Ok(read) => {
+                                let same_worktree = read.worktree() == identity.worktree;
+                                // Inspect a clone of this fixture's actual read
+                                // result; leave the original message/root intact.
+                                // Cloning performs no new file read or admission.
+                                let (_, loaded) = read.clone().into_parts();
+                                let content = match loaded {
+                                    Err(error) => format!("inner Err({error:?})"),
+                                    Ok(loaded) => match loaded.content {
+                                        crate::editor::FileContent::Editable { text, .. } => {
+                                            format!("Editable {{ bytes: {} }}", text.len())
+                                        }
+                                        crate::editor::FileContent::Image {
+                                            width, height, ..
+                                        } => {
+                                            format!("Image {{ width: {width}, height: {height} }}")
+                                        }
+                                        crate::editor::FileContent::Pdf { pages, .. } => {
+                                            format!("Pdf {{ pages: {pages} }}")
+                                        }
+                                        crate::editor::FileContent::ReadOnly(reason) => {
+                                            format!("ReadOnly({reason:?})")
+                                        }
+                                    },
+                                };
+                                format!(
+                                    "Ok(FileRead {{ same_worktree: {same_worktree}, content: {content} }})"
+                                )
+                            }
+                        };
+                        Some(format!(
+                            "FileLoadedAt card_matches={}, generation={}, disposition={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::AutoSaveDue {
+                        identity,
+                        revision,
+                        ticket,
+                    }) => {
+                        self.auto_save_due_delivered += 1;
+                        Some(format!(
+                            "AutoSaveDue delivered={} card_matches={}, generation={}, revision={revision}, ticket={ticket}",
+                            self.auto_save_due_delivered,
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::RetainedSaveFinished {
+                        identity,
+                        ticket,
+                        revision,
+                        saved_text,
+                        result,
+                    }) => {
+                        // Match before the runtime flattens retained errors.
+                        // Never Debug-print a live recovery authority/owner.
+                        let disposition = match result {
+                            Ok(outcome) => format!(
+                                "Ok({:?}), recovery_present={}",
+                                outcome.outcome(),
+                                outcome.recovery_authority().is_some(),
+                            ),
+                            Err(crate::editor::retained_save::RetainedSaveError::Io(error)) => {
+                                format!("Err(Io({error:?})), recovery_present=false")
+                            }
+                            Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                                message,
+                                ..
+                            }) => {
+                                format!("Err(Recovery({message:?})), recovery_present=true")
+                            }
+                        };
+                        Some(format!(
+                            "RetainedSaveFinished card_matches={}, generation={}, ticket={ticket}, revision={revision}, saved_text={saved_text:?}, result={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::SettingsSaved { result, .. } => Some(format!(
+                        "SettingsSaved success={}, error={:?}",
+                        result.is_ok(),
+                        result.as_ref().err(),
+                    )),
+                    _ => None,
+                };
+                if let Some(detail) = detail {
+                    self.events.push(format!(
+                        "{phase}: before consumption: {detail}; {}",
+                        editor_state(app, card),
+                    ));
+                }
+            }
+
+            fn checkpoint(&mut self, app: &Cagents, card: CardId, phase: &str) {
+                self.events
+                    .push(format!("{phase}: {}", editor_state(app, card)));
+            }
+        }
+
+        async fn settle_repository_tasks(
+            app: &mut Cagents,
+            task: Task<Message>,
+            diagnostics: &mut SaveDiagnostics,
+            card: CardId,
+            phase: &str,
+        ) {
             let mut pending = VecDeque::from([task]);
             while let Some(task) = pending.pop_front() {
                 let Some(mut stream) = iced::runtime::task::into_stream(task) else {
@@ -21517,10 +21852,13 @@ mod tests {
                         message @ (Message::Repository(_) | Message::SettingsSaved { .. }),
                     )) = action
                     {
+                        diagnostics.before_message(app, card, phase, &message);
                         pending.push_back(app.update(message));
+                        diagnostics.checkpoint(app, card, "after message consumption");
                     }
                 }
             }
+            diagnostics.checkpoint(app, card, phase);
         }
 
         tokio::runtime::Builder::new_current_thread()
@@ -21535,6 +21873,7 @@ mod tests {
                 app.settings_path = Some(directory.path().join("settings.toml"));
                 app.settings_write_blocked = false;
                 let card = CardId::new();
+                let mut diagnostics = SaveDiagnostics::default();
                 app.cards.insert(
                     card,
                     CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
@@ -21551,27 +21890,45 @@ mod tests {
                     card,
                     path: PathBuf::from("notes.txt"),
                 }));
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after open").await;
 
                 let task = app.apply_setting_input(SettingsField::EditorAutoSave, "false".into());
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(
+                    &mut app,
+                    task,
+                    &mut diagnostics,
+                    card,
+                    "after disabling autosave",
+                )
+                .await;
                 let task = app.update(Message::Repository(RepositoryAction::EditorAction {
                     card,
                     action: cosmic::widget::text_editor::Action::Edit(
                         cosmic::widget::text_editor::Edit::Insert('a'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing a")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "",
+                    "save diagnostics: {diagnostics:#?}",
+                );
 
                 // Reset schedules the dirty buffer without requiring another edit.
                 let task = app.reset_settings();
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "a");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after reset")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "a",
+                    "save diagnostics: {diagnostics:#?}",
+                );
                 assert!(
                     settings::load(app.settings_path.as_ref().unwrap())
                         .unwrap()
-                        .editor_auto_save
+                        .editor_auto_save,
+                    "save diagnostics: {diagnostics:#?}",
                 );
 
                 // The same open editor must keep saving subsequent changes.
@@ -21581,8 +21938,13 @@ mod tests {
                         cosmic::widget::text_editor::Edit::Insert('b'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing b")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "ab",
+                    "save diagnostics: {diagnostics:#?}",
+                );
             });
     }
 
@@ -23231,6 +23593,111 @@ mod tests {
             let _ = app.update(Message::CancelDialog);
             assert!(app.pull_request_dialog.is_none());
         }
+    }
+
+    #[test]
+    fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let state = |state| {
+            iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+                wayland::WindowEvent::WindowState(state),
+            )))
+        };
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        // The border is in compositor pixels; the interface scale enlarges
+        // every interface pixel.
+        app.settings.ui_scale = 1.25;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER / 1.25);
+        app.settings.ui_scale = 1.0;
+
+        // Another window's state does not move the main window's content.
+        let other = window_edge_message(&state(WindowState::TILED), window::Id::unique())
+            .expect("window state event");
+        let _ = app.update(other);
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+
+        // A tiled right edge has no border, so content returns to the edge.
+        // Other tiled edges leave the right border in place.
+        for (flags, inset) in [
+            (
+                WindowState::TILED_LEFT | WindowState::TILED_TOP,
+                design::WINDOW_RESIZE_BORDER,
+            ),
+            (WindowState::TILED_RIGHT | WindowState::ACTIVATED, 0.0),
+            (WindowState::ACTIVATED, design::WINDOW_RESIZE_BORDER),
+        ] {
+            let message = window_edge_message(&state(flags), main).expect("window state event");
+            let _ = app.update(message);
+            assert_eq!(app.window_edge_inset(), inset, "{flags:?}");
+        }
+
+        // A maximized or fullscreen window has no border at all, whether the
+        // Wayland state or the backend query reports it.
+        let maximized =
+            window_edge_message(&state(WindowState::MAXIMIZED), main).expect("window state event");
+        let _ = app.update(maximized);
+        assert_eq!(app.window_edge_inset(), 0.0);
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(window::Id::unique(), true));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert_eq!(app.window_edge_inset(), 0.0);
+        assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
+    }
+
+    #[test]
+    fn resizes_query_the_window_state_only_until_wayland_reports_it() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let mut app = context_inspector_test_app(false);
+        let resize = |app: &mut Cagents| app.update(Message::WindowResized(1600.0, 900.0)).units();
+        let without_query = resize(&mut app);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        // X11 sends no window states, so every resize asks the backend.
+        assert!(resize(&mut app) > without_query);
+        assert!(resize(&mut app) > without_query);
+
+        let state = iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
+            wayland::Event::Window(wayland::WindowEvent::WindowState(WindowState::ACTIVATED)),
+        ));
+        let _ = app.update(window_edge_message(&state, main).expect("window state event"));
+        assert_eq!(resize(&mut app), without_query);
+    }
+
+    #[test]
+    fn a_resize_border_change_alone_redocks_the_inspector() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        let _ = app.update(Message::WindowFilled(main, true));
+        // The narrowest window that still docks the inspector without a
+        // border, so the border's width alone decides between the layouts.
+        let docked = (600..3000)
+            .map(|width| width as f32)
+            .find(|&width| {
+                app.window_width = width;
+                !app.context_inspector_is_overlay()
+            })
+            .expect("a width that docks the inspector");
+        let _ = app.update(Message::WindowResized(docked, 900.0));
+        assert!(!app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert!(!app.context_inspector_overlay_active);
     }
 
     #[test]
@@ -28805,6 +29272,9 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
