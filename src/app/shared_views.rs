@@ -300,7 +300,9 @@ impl Cagents {
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
-        Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        if !self.durable.local_only_cards.contains(&id) {
+            Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        }
     }
 
     pub(super) fn reserve_terminal_creation(&mut self, id: CardId) {
@@ -1556,8 +1558,15 @@ impl Cagents {
             if let Scope::Worktree { path, .. } = &view.scope {
                 projected.scope = Some(path.clone());
                 self.worktree_owners.insert(projected.id, path.clone());
-                for channel in &mut Arc::make_mut(&mut self.durable).channels {
-                    channel.cards.retain(|id| *id != projected.id);
+                if self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&projected.id))
+                {
+                    for channel in &mut Arc::make_mut(&mut self.durable).channels {
+                        channel.cards.retain(|id| *id != projected.id);
+                    }
                 }
             }
 
@@ -1592,9 +1601,10 @@ impl Cagents {
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
-                let explicit = Arc::make_mut(&mut self.durable)
-                    .pending_terminal_creations
-                    .remove(&pane.id);
+                let explicit = self.durable.pending_terminal_creations.contains(&pane.id)
+                    && Arc::make_mut(&mut self.durable)
+                        .pending_terminal_creations
+                        .remove(&pane.id);
                 if automatic.is_some() || explicit {
                     if let CardKind::Terminal(session) = &pane.kind {
                         self.shared_views.attached.insert(pane.id);
@@ -1628,7 +1638,9 @@ impl Cagents {
             let existing = self.card_state(pane.id).cloned();
             // A restored shared terminal may have waited for the registry
             // while lifecycle hydration was admitted. Once its authoritative
-            // descriptor arrives, admit that exact identity again.
+            // descriptor arrives, admit that exact identity again. An
+            // optimistic reservation still waits; its equal echoes must not
+            // repeatedly restart lifecycle hydration.
             let no_start = !self
                 .terminal_starts
                 .lock()
@@ -1640,7 +1652,10 @@ impl Cagents {
                     .is_some_and(|card| matches!(card.residency, Residency::Hydrating { .. }));
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
-            if matches!(pane.kind, CardKind::Terminal(_)) && no_start && (waiting || failed_pending)
+            if accepted_default
+                && matches!(pane.kind, CardKind::Terminal(_))
+                && no_start
+                && (waiting || failed_pending)
             {
                 self.cards.insert(pane.id, CardRuntime::Loading);
                 let exposure = existing
@@ -1686,7 +1701,11 @@ impl Cagents {
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
                     let reported = self.reported_title_save.cards.contains(&pane.id);
-                    if let Some(current) = self.card_state_mut(pane.id) {
+                    if ((!reported && card.title != pane.title)
+                        || card.width_fraction != pane.width_fraction
+                        || card.kind != kind)
+                        && let Some(current) = self.card_state_mut(pane.id)
+                    {
                         if !reported {
                             current.title = pane.title.clone();
                         }
@@ -1724,13 +1743,15 @@ impl Cagents {
                     tasks.push(self.attach_shared_pane(pane));
                 }
             }
-            let durable = Arc::make_mut(&mut self.durable);
-            match &pane.scope {
-                Some(scope) => {
-                    durable.card_scopes.insert(pane.id, scope.clone());
-                }
-                None => {
-                    durable.card_scopes.remove(&pane.id);
+            if self.durable.card_scopes.get(&pane.id) != pane.scope.as_ref() {
+                let durable = Arc::make_mut(&mut self.durable);
+                match &pane.scope {
+                    Some(scope) => {
+                        durable.card_scopes.insert(pane.id, scope.clone());
+                    }
+                    None => {
+                        durable.card_scopes.remove(&pane.id);
+                    }
                 }
             }
         }
@@ -1751,28 +1772,45 @@ impl Cagents {
             .chain(retained)
             .collect::<Vec<_>>();
         if let Some(index) = index {
-            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
-            channel.cards = visible.clone();
-            if !channel
+            let channel = &self.durable.channels[index];
+            let focused = channel
                 .focused
-                .is_some_and(|id| channel.cards.contains(&id))
-            {
-                channel.focused = channel.cards.first().copied();
+                .filter(|id| visible.contains(id))
+                .or_else(|| visible.first().copied());
+            if channel.cards != visible || channel.focused != focused {
+                let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+                channel.cards = visible.clone();
+                channel.focused = focused;
             }
         }
         let members = visible.iter().copied().collect::<HashSet<_>>();
-        let states = self
+        let existing = self
+            .durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
+        let ordered = self
             .durable
             .cards
             .iter()
             .filter(|card| members.contains(&card.id))
-            .map(|card| (card.id, card.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
-        for card in &mut Arc::make_mut(&mut self.durable).cards {
-            if members.contains(&card.id) {
-                if let Some(next) = ordered.next() {
-                    *card = next;
+            .map(|card| card.id)
+            .eq(visible.iter().copied().filter(|id| existing.contains(id)));
+        if !ordered {
+            let states = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| members.contains(&card.id))
+                .map(|card| (card.id, card.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
+            for card in &mut Arc::make_mut(&mut self.durable).cards {
+                if members.contains(&card.id) {
+                    if let Some(next) = ordered.next() {
+                        *card = next;
+                    }
                 }
             }
         }
@@ -2138,6 +2176,93 @@ mod tests {
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         channel_move_fixture_with_kind(None)
+    }
+
+    #[test]
+    fn equal_shared_model_reads_do_not_veto_the_current_final_window_save() {
+        use super::super::workspace_model_sync::ModelUpdate;
+
+        for (retained_chat, scope) in [
+            (false, None),
+            (false, Some(PathBuf::from("/repo"))),
+            (true, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let scoped = scope.is_some();
+            let (mut app, _, _, pane) = if retained_chat {
+                retained_chat_move_fixture()
+            } else {
+                channel_move_fixture()
+            };
+            if retained_chat {
+                // A peer omitted this pane while its local unsent work is
+                // retained. Equal reads must preserve that usable draft too.
+                app.workspace_model.views[0].panes.clear();
+                app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
+                    pane.id,
+                    "Unsent locally retained draft".into(),
+                )]));
+            } else {
+                app.workspace_model.views[0].panes[0].scope = scope;
+            }
+            // Settle the actual shared projection before the close. The
+            // descriptors are synthetic; no engine or provider I/O is run.
+            let model = app.workspace_model.clone();
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    model.clone(),
+                ))),
+            );
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            super::super::tests::install_window_close_storage(&mut app, directory.path());
+            let task = app.update(Message::WindowCloseRequested(window));
+            assert!(app.pending_window_close.is_some());
+            let snapshot = app.persistent_workspace();
+            // Equal reads are normal background notifications. They must not
+            // manufacture a changed-model failure or a recurring close stall.
+            for _ in 0..3 {
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                        model.clone(),
+                    ))),
+                );
+                assert_eq!(app.persistent_workspace(), snapshot);
+                assert!(app.exit.is_none());
+                assert_eq!(app.core.main_window_id(), Some(window));
+            }
+            let completed = super::super::tests::window_close_test_message(&mut app, task);
+            let Message::WindowCloseFlushed { saved, result, .. } = &completed else {
+                unreachable!(
+                    "final save returned a different message for retained_chat={retained_chat}, scoped={scoped}"
+                );
+            };
+            assert!(
+                matches!(
+                    &completed,
+                    Message::WindowCloseFlushed { result: Ok(()), .. }
+                ),
+                "retained_chat={retained_chat}, scoped={scoped}: saved error={:?}; flush error={:?}",
+                saved.as_ref().err(),
+                result.as_ref().err()
+            );
+            let saved = app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_workspace(app.durable.id, None)
+                .unwrap()
+                .unwrap();
+            assert!(saved.cards.iter().any(|card| card.id == pane.id));
+            if retained_chat {
+                assert_eq!(saved.chat_drafts[&pane.id], "Unsent locally retained draft");
+            }
+            drop(app.update(completed));
+            assert!(app.exit.is_some());
+            assert!(app.pending_window_close.is_none());
+            assert_eq!(app.core.main_window_id(), None);
+        }
     }
 
     fn channel_move_fixture_with_kind(
@@ -4379,15 +4504,28 @@ mod tests {
 
         assert!(app.apply_reported_title(card, "build done".into()));
         drop(app.save_reported_titles_soon(card));
+        let held = Arc::clone(&app.durable);
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+            assert_eq!(app.card_state(card).unwrap().title, "build done");
+            assert!(
+                Arc::ptr_eq(&app.durable, &held),
+                "an older shared title alone cannot replace the final-save model witness"
+            );
+        }
         let mut wider = shared.clone();
         wider.width_fraction = 0.75;
         view.apply(&Change::Update {
             before: shared,
-            pane: wider,
+            pane: wider.clone(),
         })
         .unwrap();
-        app.workspace_model.views = vec![view];
+        app.workspace_model.views = vec![view.clone()];
         drop(app.reconcile_shared_views());
+        assert!(
+            !Arc::ptr_eq(&app.durable, &held),
+            "a real width change replaces the witness"
+        );
         let state = app.card_state(card).unwrap();
         assert_eq!(state.title, "build done");
         assert_eq!(
@@ -4398,6 +4536,28 @@ mod tests {
             app.workspace.card(card).unwrap().accessible_name,
             "build done",
             "the pane keeps its newer name"
+        );
+        let mut updated = wider.clone();
+        let CardKind::Terminal(session) = &mut updated.kind else {
+            panic!("reported terminal title")
+        };
+        session.transcript_path = Some(PathBuf::from("/repo/reported-title.log"));
+        let expected_kind = updated.kind.clone();
+        view.apply(&Change::Update {
+            before: wider,
+            pane: updated,
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        let before_kind_change = Arc::clone(&app.durable);
+        drop(app.reconcile_shared_views());
+        let state = app.card_state(card).unwrap();
+        assert_eq!(state.title, "build done");
+        assert_eq!(state.width_fraction, 0.75);
+        assert_eq!(state.kind, expected_kind);
+        assert!(
+            !Arc::ptr_eq(&app.durable, &before_kind_change),
+            "a real kind change replaces the witness"
         );
         assert!(
             !publishes_title(&app),
@@ -4958,6 +5118,195 @@ mod tests {
     }
 
     #[test]
+    fn pending_terminal_reservation_survives_equal_reads_and_final_save_ack() {
+        use super::super::workspace_model_sync::ModelUpdate;
+
+        // Observe without retaining another model/snapshot Arc or calling the
+        // mutating capture helpers: diagnostics must not change close custody.
+        let close_witness = |app: &Cagents| {
+            let Some(pending) = app.pending_window_close.as_ref() else {
+                return format!(
+                    "pending=None, window={:?}, exit={}, settings={}/{}, settings_error={:?}, transient={:?}",
+                    app.core.main_window_id(),
+                    app.exit.is_some(),
+                    app.settings_ack_generation,
+                    app.settings_save_generation,
+                    app.settings_save_error,
+                    app.window_close_transient_blocker(),
+                );
+            };
+            let writer = app.session.as_ref().map(SessionRuntime::operation_store);
+            let same_writer = matches!((&pending.writer, &writer),
+                (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+            let mut worktree_offsets = app.worktree_offsets.clone();
+            if app.durable.active_channel.is_none()
+                && let Some(path) = &app.active_workspace
+            {
+                worktree_offsets.insert(path.clone(), app.workspace.camera().offset());
+            }
+            // Read-only projection of capture_window_view before its title
+            // pruning. Report only changed field names, never draft/env bytes.
+            let view = serde_json::to_value(WindowView {
+                user_titles: app.chrome_ui.user_titles.clone(),
+                projects_sidebar_collapsed: app.chrome_ui.projects_collapsed,
+                sidebar_width: app.settings.sidebar_width,
+                inspector_width: app.settings.inspector_width,
+                context_inspector_open: app.context_inspector_open,
+                context_tab: app.context_tab,
+                sidebar: app.sidebar_state.saved_view(),
+                worktree_offsets,
+            })
+            .map_err(|error| error.to_string());
+            let view_differences = pending
+                .view
+                .as_ref()
+                .ok()
+                .and_then(serde_json::Value::as_object)
+                .zip(view.as_ref().ok().and_then(serde_json::Value::as_object))
+                .map(|(before, current)| {
+                    before
+                        .iter()
+                        .filter(|(key, value)| current.get(*key) != Some(*value))
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>()
+                });
+            format!(
+                "generation={}, window_same={}, writer_same={}, model_ptrs={:p}/{:p}, model_same={}, model_values_same={}, snapshot_same_durable={}, settings_generation_same={}, settings_values_same={}, settings={}/{}, settings_error={:?}, view_before_pruning_same={}, view_differences={view_differences:?}, transient={:?}",
+                pending.generation,
+                app.core.main_window_id() == Some(pending.window),
+                same_writer,
+                Arc::as_ptr(&pending.model),
+                Arc::as_ptr(&app.durable),
+                Arc::ptr_eq(&pending.model, &app.durable),
+                pending.model.as_ref() == app.durable.as_ref(),
+                pending.snapshot.as_ref() == app.durable.as_ref(),
+                pending.settings_generation == app.settings_save_generation,
+                pending.settings == app.settings,
+                app.settings_ack_generation,
+                app.settings_save_generation,
+                app.settings_save_error,
+                pending.view == view,
+                app.window_close_transient_blocker(),
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _, _, _) = channel_move_fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        let model = app.workspace_model.clone();
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(model))));
+        app.shared_views.pending.clear();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        // The ordinary insert publishes its optimistic reservation. The
+        // authority's unchanged view has not acknowledged it, so no terminal
+        // process may start while the window saves its durable intent.
+        drop(app.insert_terminal_card(session.clone(), Some((0, 0))));
+        let id = app.workspace.focused().unwrap();
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { operation, change: Change::Insert { pane, .. }, .. }
+                if operation == id.as_uuid() && pane.id == id && pane.pending_terminal_start))
+        );
+        let model = app.workspace_model.clone();
+        assert!(
+            model
+                .views
+                .iter()
+                .all(|view| view.panes.iter().all(|pane| pane.id != id))
+        );
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        super::super::tests::install_window_close_storage(&mut app, directory.path());
+        eprintln!(
+            "terminal final-close before request: {}",
+            close_witness(&app)
+        );
+        let task = app.update(Message::WindowCloseRequested(window));
+        eprintln!(
+            "terminal final-close after request: {}",
+            close_witness(&app)
+        );
+        assert!(app.pending_window_close.is_some());
+        let snapshot = app.persistent_workspace();
+        eprintln!(
+            "terminal final-close after snapshot: {}",
+            close_witness(&app)
+        );
+        for read in 0..3 {
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    model.clone(),
+                ))),
+            );
+            eprintln!(
+                "terminal final-close after equal read {read}: {}",
+                close_witness(&app)
+            );
+            assert_eq!(app.persistent_workspace(), snapshot);
+            assert!(app.durable.pending_terminal_creations.contains(&id));
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+            assert!(app.exit.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+        }
+        let completed = super::super::tests::window_close_test_message(&mut app, task);
+        if let Message::WindowCloseFlushed {
+            generation,
+            window: completed_window,
+            settings_owner,
+            saved,
+            result,
+        } = &completed
+        {
+            let writer = app.session.as_ref().map(SessionRuntime::operation_store);
+            let same_writer = matches!((&settings_owner.writer, &writer),
+                (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+            eprintln!(
+                "terminal final-close completion: generation={generation}, window_same={}, settings_owner_generation={}, settings_writer_same={same_writer}, saved_generation={:?}, saved_error={:?}, flush_error={:?}; {}",
+                app.core.main_window_id() == Some(*completed_window),
+                settings_owner.generation,
+                saved.as_ref().ok().map(|saved| saved.generation),
+                saved.as_ref().err(),
+                result.as_ref().err(),
+                close_witness(&app),
+            );
+        }
+        assert!(matches!(
+            &completed,
+            Message::WindowCloseFlushed { result: Ok(()), .. }
+        ));
+        let saved = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(saved.pending_terminal_creations.contains(&id));
+        assert!(saved.cards.iter().any(|card| card.id == id
+            && card.existence.is_open()
+            && matches!(&card.kind, CardKind::Terminal(current) if current == &session)));
+        eprintln!("terminal final-close before ACK: {}", close_witness(&app));
+        drop(app.update(completed));
+        let close_notices = app
+            .notices
+            .entries
+            .iter()
+            .filter(|entry| entry.notice.key == Some(NoticeKey::WindowClose(window)))
+            .map(|entry| (&entry.notice.message, &entry.notice.details))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "terminal final-close after ACK: {}; close_notices={close_notices:?}",
+            close_witness(&app),
+        );
+        assert!(app.exit.is_some());
+        assert!(app.pending_window_close.is_none());
+        assert_eq!(app.core.main_window_id(), None);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn explicit_terminal_creation_is_durable_and_waits_for_reservation() {
         let (mut app, a, _, first) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
@@ -5211,20 +5560,26 @@ mod tests {
         let CardKind::Terminal(terminal) = moving_terminal_kind() else {
             unreachable!()
         };
+        let proof = terminal.continuity.live_proof();
+        let mut recipe = terminal.launch;
+        recipe.program = crate::agent::Provider::Claude.executable().into();
+        recipe.arguments.clear();
         let session = chat::Session {
             id: TerminalId::new(),
-            proof: terminal.continuity.live_proof(),
+            proof,
             terminal: None,
             owned_codex_listener: None,
-            native_continuity: chat::NativeContinuity::Durable {
-                provider_version: "fixture".into(),
-            },
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             launch: chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                recipe: terminal.launch,
-                session_id: Some("retained-close-fixture".into()),
+                recipe,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
             },
         };
+        assert!(
+            session.has_valid_native_continuity(),
+            "the retained-chat fixture must satisfy the real storage admission guard"
+        );
         let kind = CardKind::Chat(session);
         pane.kind = kind.clone();
         app.card_state_mut(pane.id).unwrap().kind = kind.clone();
@@ -5235,13 +5590,99 @@ mod tests {
             .find(|candidate| candidate.id == pane.id)
             .unwrap()
             .kind = kind;
-        // This is the real recovery path: the saved owner remains while its
-        // unavailable surface waits for an exact native close receipt.
+        // Model the retained-owner recovery path with a schema-valid synthetic
+        // descriptor. No provider or authenticated native holder is exercised;
+        // the unavailable surface waits for its exact native close receipt.
         app.cards.insert(
             pane.id,
             CardRuntime::Failed("fixture detached native surface".into()),
         );
         (app, source, destination, pane)
+    }
+
+    #[test]
+    fn retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity() {
+        use crate::persistence::{SnapshotBase, StateStore, StoreError};
+
+        let (mut app, _, _, pane) = retained_chat_move_fixture();
+        let snapshot = app.persistent_workspace();
+        let CardKind::Chat(session) = &pane.kind else {
+            panic!("retained chat fixture");
+        };
+        assert!(session.has_valid_native_continuity());
+        assert_eq!(session.launch.provider, crate::agent::Provider::Claude);
+        assert_eq!(session.launch.recipe.program, "claude");
+        assert!(uuid::Uuid::parse_str(session.launch.session_id.as_ref().unwrap()).is_ok());
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("retained-fixture.sqlite3"),
+            crate::model::BootId::new("retained-fixture-storage"),
+        )
+        .unwrap();
+        let cards = std::collections::BTreeMap::new();
+        let committed = store
+            .save_workspace(
+                &snapshot,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &cards,
+                },
+            )
+            .unwrap();
+        let saved = store.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .kind,
+            pane.kind
+        );
+
+        // The old fixture's Codex-only continuity claim must remain invalid for
+        // Claude. Repairing the fixture must never weaken production admission.
+        let mut invalid = snapshot.as_ref().clone();
+        let CardKind::Chat(session) = &mut invalid
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane.id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        session.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        assert!(!session.has_valid_native_continuity());
+        let error = store
+            .save_workspace(
+                &invalid,
+                SnapshotBase {
+                    workspace: committed.generation,
+                    cards: &committed.card_generations,
+                },
+            )
+            .unwrap_err();
+        let StoreError::Card { card, error } = error else {
+            panic!("expected an invalid retained pane, got {error:?}");
+        };
+        assert_eq!(card, pane.id);
+        assert!(
+            matches!(*error, StoreError::InvalidState(ref reason) if reason == &format!("chat card {} has invalid native continuity evidence", pane.id))
+        );
+        let after = store.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(after.generation, committed.generation);
+        assert_eq!(
+            after
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .kind,
+            pane.kind
+        );
     }
 
     #[test]

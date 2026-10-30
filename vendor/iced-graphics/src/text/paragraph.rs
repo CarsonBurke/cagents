@@ -224,6 +224,7 @@ impl core::text::Paragraph for Paragraph {
             || paragraph.font != text.font
             || paragraph.shaping != text.shaping
             || paragraph.wrapping != text.wrapping
+            || paragraph.ellipsize != text.ellipsize
             || paragraph.align_x != text.align_x
             || paragraph.align_y != text.align_y
         {
@@ -496,6 +497,7 @@ impl PartialEq for Internal {
     fn eq(&self, other: &Self) -> bool {
         self.font == other.font
             && self.shaping == other.shaping
+            && self.ellipsize == other.ellipsize
             && self.align_x == other.align_x
             && self.align_y == other.align_y
             && self.bounds == other.bounds
