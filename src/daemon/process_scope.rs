@@ -645,5 +645,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .starts_with("cagents-session-")
         );
+        eprintln!(
+            "scope isolation qualified: manager namespace proved; strict holder/root separation asserted"
+        );
     }
 }
