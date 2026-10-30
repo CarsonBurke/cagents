@@ -4415,6 +4415,131 @@ fn successful_push_refuses_a_changed_source_oid_and_preserves_first_publish() {
 }
 
 #[test]
+fn sync_uses_configured_remote_branch_with_custom_tracking_aliases() {
+    use cagents::repository::GitOperation;
+    for remote in ["origin", "te/am"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.write("tracked.txt", b"base\n");
+        fixture.git_in_work(&["add", "."]);
+        fixture.commit("base");
+        fixture.git_in_work(&["remote", "add", remote, fixture.origin().to_str().unwrap()]);
+        fixture.git_in_work(&[
+            "config",
+            &format!("remote.{remote}.fetch"),
+            &format!("+refs/heads/*:refs/remotes/{remote}/review-*"),
+        ]);
+        fixture.git_in_work(&["push", "-u", remote, "main"]);
+        fixture.git_in_work(&["fetch", remote]);
+        assert_eq!(
+            fixture.text(&["rev-parse", "--symbolic-full-name", "@{upstream}"]),
+            format!("refs/remotes/{remote}/review-main")
+        );
+        fixture.run_failing(
+            &fixture.work(),
+            &["symbolic-ref", "-q", &format!("refs/remotes/{remote}/HEAD")],
+        );
+        fixture.write("tracked.txt", b"local work\n");
+        fixture.git_in_work(&["add", "."]);
+        let expected = fixture.commit("local work");
+        let outcome = fixture
+            .service()
+            .git_operation(
+                &fixture.work(),
+                &GitOperation::Sync { rebase: false },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, MutationOutcome::Applied { .. }),
+            "{remote}: {outcome:?}"
+        );
+        assert_eq!(remote_oid(&fixture, "refs/heads/main"), expected);
+        assert_eq!(
+            fixture.run(
+                &fixture.origin(),
+                &["for-each-ref", "--format=%(refname)", "refs/heads/"]
+            ),
+            b"refs/heads/main\n"
+        );
+    }
+}
+
+#[test]
+fn sync_does_not_push_a_branch_selected_after_the_pull() {
+    use cagents::repository::GitOperation;
+    struct SwitchAfterPull {
+        worktree: PathBuf,
+        pushes: std::sync::Mutex<usize>,
+    }
+    impl ProcessExecutor for SwitchAfterPull {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|argument| argument == "push") {
+                *self.pushes.lock().unwrap() += 1;
+            }
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if output.success && command.arguments.iter().any(|argument| argument == "pull") {
+                SystemProcessExecutor
+                    .execute(
+                        &isolate(
+                            CommandSpec::new("git")
+                                .cwd(&self.worktree)
+                                .args(["switch", "other"]),
+                        ),
+                        cancellation,
+                    )?
+                    .require_success(Path::new("git"))?;
+            }
+            Ok(output)
+        }
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("tracked.txt", b"base\n");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("base");
+    fixture.git_in_work(&[
+        "remote",
+        "add",
+        "origin",
+        fixture.origin().to_str().unwrap(),
+    ]);
+    fixture.git_in_work(&["push", "-u", "origin", "main"]);
+    fixture.git_in_work(&["switch", "-c", "other"]);
+    fixture.git_in_work(&["push", "-u", "origin", "other"]);
+    let remote_other = remote_oid(&fixture, "refs/heads/other");
+    fixture.write("tracked.txt", b"other local work\n");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("other local work");
+    fixture.git_in_work(&["switch", "main"]);
+    let executor = Arc::new(SwitchAfterPull {
+        worktree: fixture.work(),
+        pushes: std::sync::Mutex::new(0),
+    });
+    let service = RepositoryService::new("git", executor.clone());
+    let outcome = service
+        .git_operation(
+            &fixture.work(),
+            &GitOperation::Sync { rebase: false },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, MutationOutcome::PartiallyApplied { failures, .. } if failures.iter().any(|failure| failure.to_string().contains("Pull completed")) && failures.iter().any(|failure| failure.to_string().contains("changed during the pull"))),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.text(&["branch", "--show-current"]), "other");
+    assert_eq!(*executor.pushes.lock().unwrap(), 0);
+    assert_eq!(remote_oid(&fixture, "refs/heads/other"), remote_other);
+}
+
+#[test]
 fn git_operation_fetch_sync_and_stashes_round_trip() {
     use cagents::repository::GitOperation;
     let Some(fixture) = Fixture::new() else {

@@ -4,6 +4,11 @@
 use super::*;
 use std::{io::Write, os::unix::fs::PermissionsExt};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_AFTER_STASH_LOG_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug)]
 pub(super) enum StashDropFailure {
     Refused(String),
@@ -163,6 +168,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             log_lock
                 .publish(OsStr::new("stash"))
                 .map_err(StashDropFailure::Uncertain)?;
+        }
+        #[cfg(test)]
+        if FAIL_AFTER_STASH_LOG_PUBLICATION.replace(false) {
+            return Err(StashDropFailure::Uncertain(
+                "interrupted after publishing the stash log".into(),
+            ));
         }
         if next_head.is_some() {
             reference_lock

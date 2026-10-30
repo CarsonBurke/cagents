@@ -697,6 +697,7 @@ pub struct SnapshotCache {
     control_metadata: Option<ControlMetadata>,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
+    before_browse: Option<BTreeMap<RepoPath, Option<FileIdentity>>>,
     browse_root: Option<FileIdentity>,
     admin: BTreeMap<PathBuf, Option<FileIdentity>>,
 }
@@ -708,31 +709,66 @@ struct ControlMetadata {
     last_fetch_unix_ms: Option<u64>,
 }
 
-/// Resolve administrative metadata locally, including linked worktree gitfiles.
-fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
-    let path = worktree.join(".git");
-    if path.is_dir() {
-        return Some(path);
+/// A retained, nonblocking regular-file read. Unknown or changing metadata
+/// cannot establish a reusable local cache fingerprint.
+fn read_cache_marker(
+    root: &fs_safety::Root,
+    relative: &Path,
+    cancellation: &CancellationToken,
+) -> io::Result<Option<Vec<u8>>> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "metadata read cancelled",
+        ));
     }
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(4097)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > 4096 {
+    let mut file = match fs_safety::open_beneath(root, relative) {
+        Ok(file) => file,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => return Err(io::Error::other(error.to_string())),
+    };
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata is not a bounded regular file",
+        ));
+    }
+    let bytes = fs_safety::read_bounded(&mut file, 4096)?;
+    let after = file.metadata()?;
+    let named = fs_safety::metadata_beneath(root, relative)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if bytes.len() > 4096
+        || bytes.len() as u64 != after.len()
+        || cancellation.is_cancelled()
+        || file_identity(&before) != file_identity(&after)
+        || file_identity(&after) != file_identity(&named)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "metadata changed while reading",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Resolve administrative metadata locally, including linked worktree gitfiles.
+fn local_git_dir(worktree: &Path, cancellation: &CancellationToken) -> Option<PathBuf> {
+    if cancellation.is_cancelled() {
         return None;
     }
+    let root = fs_safety::Root::open(worktree).ok()?;
+    let metadata = fs_safety::metadata_beneath(&root, Path::new(".git")).ok()?;
+    if metadata.is_dir() {
+        return Some(worktree.join(".git"));
+    }
+    let bytes = read_cache_marker(&root, Path::new(".git"), cancellation).ok()??;
     let value = bytes.strip_prefix(b"gitdir: ")?;
-    let value = value.strip_suffix(b"\n").unwrap_or(value);
-    let value = value.strip_suffix(b"\r").unwrap_or(value);
-    use std::os::unix::ffi::OsStrExt;
-    let directory = Path::new(OsStr::from_bytes(value));
-    Some(if directory.is_absolute() {
-        directory.to_owned()
-    } else {
-        worktree.join(directory)
-    })
+    let value = trim_one_line_ending(value);
+    if value.is_empty() {
+        return None;
+    }
+    Some(worktree.join(bytes_to_path(value)))
 }
 
 type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
@@ -752,42 +788,63 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
 
 /// Filesystem-only metadata observations keep the missed-event fallback
 /// authoritative without extra Git commands on an unchanged snapshot.
-fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileIdentity>> {
-    let read_path = |path: &Path| -> Option<Vec<u8>> {
-        let mut bytes = Vec::new();
-        fs::File::open(path)
-            .ok()?
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        (bytes.len() <= 4096).then_some(bytes)
+fn snapshot_admin_fingerprint(
+    worktree: &Path,
+    cancellation: &CancellationToken,
+) -> Option<BTreeMap<PathBuf, Option<FileIdentity>>> {
+    snapshot_admin_fingerprint_with_budget(worktree, cancellation, 8192, 1024 * 1024, 64)
+}
+
+fn cache_path_identity(root: &fs_safety::Root, relative: &Path) -> Option<Option<FileIdentity>> {
+    match fs_safety::metadata_beneath(root, relative) {
+        Ok(metadata) => Some(Some(file_identity(&metadata))),
+        Err(error) if error.is_not_found() => Some(None),
+        Err(_) => None,
+    }
+}
+
+// Administrative symlinks or special files are usable by Git in some layouts,
+// but their own identity does not cover the target Git may read. Fall back to a
+// full refresh instead of treating that incomplete proof as an unchanged cache.
+fn cache_admin_identity(root: &fs_safety::Root, relative: &Path) -> Option<Option<FileIdentity>> {
+    match fs_safety::metadata_beneath(root, relative) {
+        Ok(metadata) if metadata.is_file() || metadata.is_dir() => {
+            Some(Some(file_identity(&metadata)))
+        }
+        Ok(_) => None,
+        Err(error) if error.is_not_found() => Some(None),
+        Err(_) => None,
+    }
+}
+
+fn snapshot_admin_fingerprint_with_budget(
+    worktree: &Path,
+    cancellation: &CancellationToken,
+    mut entries_left: usize,
+    mut path_bytes_left: usize,
+    max_depth: usize,
+) -> Option<BTreeMap<PathBuf, Option<FileIdentity>>> {
+    use std::os::unix::ffi::OsStrExt;
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let git_dir = fs::canonicalize(local_git_dir(worktree, cancellation)?).ok()?;
+    let git_root = fs_safety::Root::open(&git_dir).ok()?;
+    let common = match read_cache_marker(&git_root, Path::new("commondir"), cancellation).ok()? {
+        Some(bytes) => {
+            let value = trim_one_line_ending(&bytes);
+            if value.is_empty() {
+                return None;
+            }
+            fs::canonicalize(git_dir.join(bytes_to_path(value))).ok()?
+        }
+        None => git_dir.clone(),
     };
-    let marker = worktree.join(".git");
-    let git_dir = if marker.is_dir() {
-        marker.clone()
-    } else {
-        let Some(bytes) = read_path(&marker) else {
-            return BTreeMap::new();
-        };
-        let Some(relative) = bytes.strip_prefix(b"gitdir: ") else {
-            return BTreeMap::new();
-        };
-        worktree.join(bytes_to_path(trim_one_line_ending(relative)))
-    };
-    let git_dir = fs::canonicalize(&git_dir).unwrap_or(git_dir);
-    let common = read_path(&git_dir.join("commondir"))
-        .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
-        .and_then(|path| fs::canonicalize(path).ok())
-        .unwrap_or_else(|| git_dir.clone());
+    let common_root = fs_safety::Root::open(&common).ok()?;
     let mut paths = BTreeMap::new();
-    for root in [&git_dir, &common] {
-        // Lock creation/removal changes directory times without changing Git
-        // state. For the admin roots only their directory identity matters.
-        let identity = fs::metadata(root).ok().map(|metadata| {
-            let (device, inode, ..) = file_identity(&metadata);
-            (device, inode, 0, 0, 0, 0, 0)
-        });
-        paths.insert(root.clone(), identity);
+    for (path, root) in [(&git_dir, &git_root), (&common, &common_root)] {
+        let (device, inode, ..) = file_identity(&root.metadata().ok()?);
+        paths.insert(path.clone(), Some((device, inode, 0, 0, 0, 0, 0)));
     }
     for name in [
         "HEAD",
@@ -824,13 +881,11 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
         "rebase-apply/original-commit",
         "rebase-apply/abort-safety",
     ] {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let path = git_dir.join(name);
-        paths.insert(
-            path.clone(),
-            fs::metadata(path)
-                .ok()
-                .map(|metadata| file_identity(&metadata)),
-        );
+        paths.insert(path, cache_admin_identity(&git_root, Path::new(name))?);
     }
     for name in [
         "config",
@@ -839,50 +894,89 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
         "refs/stash",
         "logs/refs/stash",
     ] {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let path = common.join(name);
-        paths.insert(
-            path.clone(),
-            fs::metadata(path)
-                .ok()
-                .map(|metadata| file_identity(&metadata)),
-        );
+        paths.insert(path, cache_admin_identity(&common_root, Path::new(name))?);
     }
-    let mut pending = vec![common.join("refs"), git_dir.join("refs")];
-    while let Some(path) = pending.pop() {
+    let mut pending = vec![
+        (&common, &common_root, PathBuf::from("refs"), 0usize),
+        (&git_dir, &git_root, PathBuf::from("refs"), 0usize),
+    ];
+    while let Some((base, root, relative, depth)) = pending.pop() {
+        if cancellation.is_cancelled() || depth > max_depth {
+            return None;
+        }
+        let path = base.join(&relative);
         if paths.contains_key(&path) {
             continue;
         }
-        // Child identities below detect real ref additions/removals. Ignore
-        // directory times, which also change for unpublished *.lock files.
-        let identity = fs::metadata(&path).ok().map(|metadata| {
+        let metadata = match fs_safety::metadata_beneath(root, &relative) {
+            Ok(metadata) => metadata,
+            Err(error) if error.is_not_found() => {
+                paths.insert(path, None);
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if metadata.is_dir() {
             let (device, inode, ..) = file_identity(&metadata);
-            (device, inode, 0, 0, 0, 0, 0)
-        });
-        paths.insert(path.clone(), identity);
-        if let Ok(entries) = fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "lock")
-                {
+            paths.insert(path, Some((device, inode, 0, 0, 0, 0, 0)));
+            let directory = fs_safety::open_directory_beneath(root, &relative).ok()?;
+            for entry in directory.read_dir().ok()? {
+                if cancellation.is_cancelled() || entries_left == 0 {
+                    return None;
+                }
+                entries_left -= 1;
+                let name = entry.ok()?.file_name();
+                if name.as_bytes().ends_with(b".lock") {
                     continue;
                 }
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    pending.push(entry.path());
-                } else {
-                    let path = entry.path();
-                    paths.insert(
-                        path.clone(),
-                        fs::symlink_metadata(path)
-                            .ok()
-                            .map(|metadata| file_identity(&metadata)),
-                    );
-                }
+                let bytes = relative
+                    .as_os_str()
+                    .as_bytes()
+                    .len()
+                    .checked_add(name.as_bytes().len())?
+                    .checked_add(1)?;
+                path_bytes_left = path_bytes_left.checked_sub(bytes)?;
+                pending.push((base, root, relative.join(name), depth + 1));
             }
+        } else if metadata.is_file() {
+            paths.insert(path, Some(file_identity(&metadata)));
+        } else {
+            return None;
         }
     }
-    paths
+    (!cancellation.is_cancelled()).then_some(paths)
+}
+
+fn snapshot_file_observations(
+    worktree: &Path,
+    entries: &[ChangedPath],
+    cancellation: &CancellationToken,
+) -> Option<BTreeMap<RepoPath, Option<FileIdentity>>> {
+    snapshot_path_observations(
+        worktree,
+        entries.iter().map(|entry| &entry.path),
+        cancellation,
+    )
+}
+
+fn snapshot_path_observations<'a>(
+    worktree: &Path,
+    paths: impl IntoIterator<Item = &'a RepoPath>,
+    cancellation: &CancellationToken,
+) -> Option<BTreeMap<RepoPath, Option<FileIdentity>>> {
+    let root = fs_safety::Root::open(worktree).ok()?;
+    let mut observed = BTreeMap::new();
+    for path in paths {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        observed.insert(path.clone(), cache_path_identity(&root, path.as_path())?);
+    }
+    Some(observed)
 }
 
 impl SnapshotCache {
@@ -890,11 +984,18 @@ impl SnapshotCache {
     /// its directory membership too, so the slow fallback repairs missed events.
     pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
         let Ok(root) = fs_safety::Root::open(worktree) else {
+            self.dirty = true;
             return;
         };
-        self.browse_root = fs::symlink_metadata(worktree)
+        let before = self.before_browse.take().unwrap_or_default();
+        let current_root = fs::symlink_metadata(worktree)
             .ok()
             .map(|metadata| file_identity(&metadata));
+        if self.browse_root.is_some() && self.browse_root != current_root {
+            self.dirty = true;
+        } else {
+            self.browse_root = current_root;
+        }
         for path in files
             .paths
             .iter()
@@ -911,6 +1012,9 @@ impl SnapshotCache {
                 let metadata = fs_safety::metadata_beneath(&root, path.as_path())
                     .ok()
                     .map(|metadata| file_identity(&metadata));
+                if before.get(&path) != Some(&metadata) {
+                    self.dirty = true;
+                }
                 self.observed.insert(path, metadata);
             }
         }
@@ -3304,14 +3408,12 @@ fn measure_untracked_cached(
             cache
                 .get(&entry.path)
                 .filter(|(previous, _)| *previous == identity)
-                .map(|(_, lines)| *lines)
+                .copied()
         });
-        if let Some(lines) = cached.or_else(|| {
+        if let Some((identity, lines)) = cached.or_else(|| {
             untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
         }) {
-            if let Some(identity) = identity {
-                cache.insert(entry.path.clone(), (identity, lines));
-            }
+            cache.insert(entry.path.clone(), (identity, lines));
             entry.added_lines = Some(lines);
             entry.removed_lines = Some(0);
         }
@@ -3324,7 +3426,7 @@ fn untracked_line_count(
     cancellation: &CancellationToken,
     remaining: &mut u64,
     bytes: &mut Vec<u8>,
-) -> Option<u64> {
+) -> Option<(FileIdentity, u64)> {
     use std::os::unix::fs::MetadataExt;
 
     let relative = path.as_path();
@@ -3390,10 +3492,11 @@ fn untracked_line_count(
         return None;
     }
     std::str::from_utf8(bytes).ok()?;
-    Some(
+    Some((
+        file_identity(&after),
         bytes.iter().filter(|byte| **byte == b'\n').count() as u64
             + u64::from(!bytes.is_empty() && bytes.last() != Some(&b'\n')),
-    )
+    ))
 }
 
 fn increment(value: &mut u32) -> Result<(), GitParseError> {
@@ -4331,15 +4434,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         {
             cache.invalidate(true);
         }
-        let admin = snapshot_admin_fingerprint(worktree);
-        if !cache.admin.is_empty() && cache.admin != admin {
+        let admin = snapshot_admin_fingerprint(worktree, cancellation);
+        let admin_complete = admin.is_some();
+        if !admin_complete || (!cache.admin.is_empty() && Some(&cache.admin) != admin.as_ref()) {
             cache.invalidate(true);
         }
         if cache.options != Some(options) {
             cache.invalidate(true);
             cache.options = Some(options);
         }
-        let git_dir = local_git_dir(worktree);
+        cache.before_browse =
+            snapshot_path_observations(worktree, cache.observed.keys(), cancellation);
+        let git_dir = local_git_dir(worktree, cancellation);
         if !cache.fsmonitor_checked {
             let mut command = self.git_read(
                 worktree,
@@ -4367,15 +4473,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         )?;
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(&output.stdout).into();
-        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
-            let root = fs_safety::Root::open(worktree).ok();
-            let unchanged = cache.observed.iter().all(|(path, previous)| {
-                let current = root
-                    .as_ref()
-                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
-                    .map(|metadata| file_identity(&metadata));
-                current == *previous
-            });
+        if admin_complete
+            && !cache.dirty
+            && cache.digest == Some(digest)
+            && cache.metadata.is_some()
+        {
+            let unchanged = !cancellation.is_cancelled()
+                && cache.before_browse.as_ref() == Some(&cache.observed);
             let root_unchanged = !options.untracked_files
                 || fs::symlink_metadata(worktree)
                     .ok()
@@ -4387,6 +4491,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let mut status = invalid_output(parse_status(&output.stdout), output)?;
         status.untracked_omitted = !options.untracked_changes;
+        let mut observed = snapshot_file_observations(worktree, &status.entries, cancellation);
+        let browse_root = options
+            .untracked_files
+            .then(|| {
+                fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            })
+            .flatten();
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
             let output = self.run_checked(
                 &snapshot_fsmonitor(
@@ -4404,6 +4517,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
             &mut cache.lines,
         );
+        if let Some(observed) = &mut observed {
+            for entry in status
+                .entries
+                .iter()
+                .filter(|entry| entry.area == ChangeArea::Untracked && entry.added_lines.is_some())
+            {
+                if let Some((identity, _)) = cache.lines.get(&entry.path) {
+                    observed.insert(entry.path.clone(), Some(*identity));
+                }
+            }
+        }
         if options.untracked_files
             && let Some((files, ..)) = cache.metadata.as_mut()
         {
@@ -4442,19 +4566,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let control = cache.control_metadata.as_ref().unwrap();
         let (files, remotes, local_refs, remote_refs, remote_heads) =
             cache.metadata.as_ref().unwrap();
-        let root = fs_safety::Root::open(worktree).ok();
-        cache.observed = status
-            .entries
-            .iter()
-            .map(|entry| {
-                let identity = root
-                    .as_ref()
-                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
-                    .map(|metadata| file_identity(&metadata));
-                (entry.path.clone(), identity)
-            })
-            .collect();
-        cache.browse_root = options
+        let current = snapshot_file_observations(worktree, &status.entries, cancellation);
+        let observed_unchanged = observed.is_some() && observed == current;
+        cache.observed = observed.unwrap_or_default();
+        let current_root = options
             .untracked_files
             .then(|| {
                 fs::symlink_metadata(worktree)
@@ -4462,9 +4577,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     .map(|metadata| file_identity(&metadata))
             })
             .flatten();
-        cache.admin = admin;
+        cache.browse_root = browse_root;
+        cache.admin = admin.unwrap_or_default();
         cache.digest = Some(digest);
-        cache.dirty = false;
+        cache.dirty = !admin_complete || !observed_unchanged || browse_root != current_root;
         Ok(Some(RepositorySnapshot {
             operation: control.operation.clone(),
             stashes: control.stashes.clone(),
@@ -4621,6 +4737,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 command.arg("--").arg(remote)
             }
             GitOperation::Sync { rebase } => {
+                let before = self.status(worktree, cancellation)?;
+                let Some(branch) = before.branch() else {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: "Sync requires a checked-out branch".into(),
+                        },
+                    });
+                };
+                let branch = ValidatedBranchName::parse(branch)?;
+                let Some(target) = self.upstream_push_target(worktree, &branch, cancellation)?
+                else {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: "Sync requires an upstream".into(),
+                        },
+                    });
+                };
+                let Some(destinations) =
+                    self.push_destinations(worktree, target.remote(), cancellation)
+                else {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: "Sync could not verify its push destination".into(),
+                        },
+                    });
+                };
                 let pull = self
                     .git_mutation(
                         worktree,
@@ -4631,52 +4773,30 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     return Ok(outcome);
                 }
                 let after_pull = (|| -> Result<MutationOutcome, RepositoryError> {
-                    // Resolve the exact upstream destination through the same
-                    // checked push path; never depend on push.default.
-                    let snapshot = self.snapshot(worktree, cancellation)?;
-                    let Some(reference) =
-                        snapshot.local_refs.iter().find(|reference| reference.head)
-                    else {
+                    // Pull may run hooks or overlap another Git client. Keep
+                    // the original branch and configured remote-side upstream;
+                    // a tracking-ref alias is never a push destination.
+                    let after = self.status(worktree, cancellation)?;
+                    if after.branch() != Some(branch.as_str())
+                        || self
+                            .upstream_push_target(worktree, &branch, cancellation)?
+                            .as_ref()
+                            != Some(&target)
+                        || self
+                            .push_destinations(worktree, target.remote(), cancellation)
+                            .as_ref()
+                            != Some(&destinations)
+                    {
                         return Ok(MutationOutcome::NotApplied {
-                            failure: MutationFailure::Rejected {
-                                reason: "Sync requires a checked-out branch".into(),
-                            },
+                            failure: MutationFailure::Rejected { reason: "The branch or upstream changed during the pull; reload before pushing".into() },
                         });
-                    };
-                    let Some(upstream) = reference.upstream.as_ref() else {
-                        return Ok(MutationOutcome::NotApplied {
-                            failure: MutationFailure::Rejected {
-                                reason: "Sync requires an upstream".into(),
-                            },
-                        });
-                    };
-                    let Some(remote_ref) = snapshot
-                        .remote_refs
-                        .iter()
-                        .find(|candidate| candidate.name == *upstream)
-                    else {
-                        return Ok(MutationOutcome::NotApplied {
-                            failure: MutationFailure::Rejected {
-                                reason: "The upstream does not name a remote branch".into(),
-                            },
-                        });
-                    };
-                    let branch = ValidatedBranchName::parse(
-                        reference
-                            .name
-                            .as_str()
-                            .strip_prefix("refs/heads/")
-                            .unwrap_or(reference.name.as_str()),
-                    )?;
+                    }
                     Ok(
                         match self.push(
                             &PushRequest {
                                 worktree: worktree.to_owned(),
                                 branch,
-                                target: PushTarget::Upstream {
-                                    remote: remote_ref.remote.clone(),
-                                    remote_ref: remote_ref.name.clone(),
-                                },
+                                target,
                             },
                             cancellation,
                         )? {
@@ -4763,17 +4883,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     && let Err(failure) =
                         self.drop_stash_at(worktree, reference, expected_oid, cancellation)
                 {
-                    let reason = match failure {
-                        stash_mutations::StashDropFailure::Refused(reason) => format!(
-                            "The selected stash was applied, but its entry was preserved: {reason}"
-                        ),
-                        stash_mutations::StashDropFailure::Uncertain(reason) => format!(
-                            "The selected stash was applied, but deletion is unconfirmed; check the stash list before retrying: {reason}"
-                        ),
-                    };
-                    return Ok(MutationOutcome::PartiallyApplied {
-                        paths: Vec::new(),
-                        failures: vec![MutationFailure::Reconciliation { reason }],
+                    return Ok(match failure {
+                        stash_mutations::StashDropFailure::Refused(reason) => {
+                            MutationOutcome::PartiallyApplied {
+                                paths: Vec::new(),
+                                failures: vec![MutationFailure::Reconciliation {
+                                    reason: format!(
+                                        "The selected stash was applied, but its entry was preserved: {reason}"
+                                    ),
+                                }],
+                            }
+                        }
+                        stash_mutations::StashDropFailure::Uncertain(reason) => {
+                            MutationOutcome::OutcomeUnknown {
+                                failure: MutationFailure::Reconciliation {
+                                    reason: format!(
+                                        "The selected stash was applied, but deletion is unconfirmed; check the stash list before retrying: {reason}"
+                                    ),
+                                },
+                            }
+                        }
                     });
                 }
                 return Ok(MutationOutcome::Applied { paths: Vec::new() });
@@ -6599,9 +6728,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Ok(PushOutcome::OutcomeUnknown { failure });
         }
         // The push may have completed at the remote before the local process
-        // died, so the remote's own ref is consulted under a fresh token —
-        // reconciliation has to run even when the original token is cancelled.
-        let reconciliation = CancellationToken::new();
+        // died. Keep the caller's cancellation attached to the observation too:
+        // cancellation can arrive after the check above or during this lookup.
         let Some(destinations) = destinations else {
             return Ok(PushOutcome::OutcomeUnknown { failure });
         };
@@ -6611,7 +6739,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             &destinations,
             &destination,
             &local_oid,
-            &reconciliation,
+            cancellation,
         ) {
             Ok(pushed(local_oid))
         } else {
@@ -8172,6 +8300,12 @@ mod tests {
         status
     }
 
+    fn snapshot_cache_fixture_root() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join(".git")).unwrap();
+        directory
+    }
+
     fn cached_snapshot_outputs(
         entries: &[u8],
         files: &[u8],
@@ -8197,7 +8331,8 @@ mod tests {
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::default();
-        let root = Path::new("/snapshot-cache-test");
+        let directory = snapshot_cache_fixture_root();
+        let root = directory.path();
         assert!(
             git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
                 .unwrap()
@@ -8233,7 +8368,8 @@ mod tests {
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::default();
-        let root = Path::new("/snapshot-cache-test");
+        let directory = snapshot_cache_fixture_root();
+        let root = directory.path();
         git.snapshot_cached(
             root,
             SnapshotOptions {
@@ -8276,7 +8412,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_fallback_detects_content_changes_with_identical_status() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = snapshot_cache_fixture_root();
         let file = directory.path().join("new.txt");
         fs::write(&file, "abc\n").unwrap();
         let mut outputs = cached_snapshot_outputs(b"? new.txt\0", b"? new.txt\0");
@@ -8321,7 +8457,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = snapshot_cache_fixture_root();
         let mut outputs = cached_snapshot_outputs(b"", b"");
         outputs.extend([
             success(&snapshot_status(b"")),
@@ -8359,38 +8495,367 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_cache_does_not_bless_a_nested_listing_with_later_directory_identity() {
+        let directory = snapshot_cache_fixture_root();
+        let build = directory.path().join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("a"), "a\n").unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        for _ in 0..2 {
+            outputs.extend([
+                success(&snapshot_status(b"")),
+                success(b""),
+                success(b""),
+                success(b""),
+            ]);
+        }
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let service = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            untracked_changes: false,
+            untracked_files: true,
+        };
+        let cancellation = CancellationToken::new();
+        let mut cache = SnapshotCache::default();
+        let old_listing = WorkingFiles {
+            ignored: vec![path("build/a")],
+            ignored_directories: vec![path("build")],
+            ..WorkingFiles::default()
+        };
+        service
+            .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+            .unwrap()
+            .unwrap();
+        cache.observe_browse(directory.path(), &old_listing);
+        assert!(
+            cache.dirty,
+            "a newly discovered directory needs a prior baseline"
+        );
+        service
+            .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cache.dirty,
+            "the full refresh starts with a clean baseline"
+        );
+        let root_identity = file_identity(&fs::symlink_metadata(directory.path()).unwrap());
+        // The browse read returned a; b arrives after that read and before the
+        // cache observes the listing. Porcelain and the worktree root stay fixed.
+        fs::write(build.join("b"), "b\n").unwrap();
+        fs::File::open(&build)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            root_identity,
+            file_identity(&fs::symlink_metadata(directory.path()).unwrap())
+        );
+        cache.observe_browse(directory.path(), &old_listing);
+        assert!(
+            cache.dirty,
+            "a newer directory identity cannot certify the older listing"
+        );
+        assert!(
+            service
+                .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+                .unwrap()
+                .is_some(),
+            "identical porcelain must still request a fresh browse enumeration"
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 16);
+    }
+
+    #[test]
     fn snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise() {
+        if test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise"
+        )) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let gitdir = directory.path().join(".git");
         fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
         fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let first = snapshot_admin_fingerprint(directory.path());
+        let first = snapshot_admin_fingerprint(directory.path(), &CancellationToken::new());
+        assert!(first.is_some(), "complete metadata is eligible for caching");
         fs::write(gitdir.join("index.lock"), "temporary").unwrap();
         fs::remove_file(gitdir.join("index.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::new())
+        );
         fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::new())
+        );
         fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::new())
+        );
         fs::write(
             gitdir.join("config"),
             "[remote \"origin\"]\nurl = example\n",
         )
         .unwrap();
-        let configured = snapshot_admin_fingerprint(directory.path());
+        let configured = snapshot_admin_fingerprint(directory.path(), &CancellationToken::new());
         assert_ne!(first, configured);
         fs::write(gitdir.join("index"), "new-index").unwrap();
-        let indexed = snapshot_admin_fingerprint(directory.path());
+        let indexed = snapshot_admin_fingerprint(directory.path(), &CancellationToken::new());
         assert_ne!(configured, indexed);
         fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
         fs::File::open(gitdir.join("refs/heads/feature"))
             .unwrap()
             .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
             .unwrap();
-        let created = snapshot_admin_fingerprint(directory.path());
+        let created = snapshot_admin_fingerprint(directory.path(), &CancellationToken::new());
         assert_ne!(indexed, created);
         fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
-        assert_ne!(created, snapshot_admin_fingerprint(directory.path()));
+        assert_ne!(
+            created,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::new())
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(snapshot_admin_fingerprint(directory.path(), &cancelled).is_none());
+        for (entries, bytes, depth) in [(0, 1024, 64), (8192, 1, 64), (8192, 1024, 0)] {
+            assert!(
+                snapshot_admin_fingerprint_with_budget(
+                    directory.path(),
+                    &CancellationToken::new(),
+                    entries,
+                    bytes,
+                    depth
+                )
+                .is_none()
+            );
+        }
+        let git_root = fs_safety::Root::open(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), vec![b'x'; 4096]).unwrap();
+        assert_eq!(
+            read_cache_marker(&git_root, Path::new("commondir"), &CancellationToken::new())
+                .unwrap()
+                .unwrap()
+                .len(),
+            4096
+        );
+        fs::write(gitdir.join("commondir"), vec![b'x'; 4097]).unwrap();
+        assert!(
+            read_cache_marker(&git_root, Path::new("commondir"), &CancellationToken::new())
+                .is_err()
+        );
+        fs::remove_file(gitdir.join("commondir")).unwrap();
+        std::os::unix::fs::symlink("feature/new", gitdir.join("refs/heads/alias")).unwrap();
+        assert!(snapshot_admin_fingerprint(directory.path(), &CancellationToken::new()).is_none());
+        fs::remove_file(gitdir.join("refs/heads/alias")).unwrap();
+        assert!(snapshot_admin_fingerprint(directory.path(), &CancellationToken::new()).is_some());
+        let fifo = std::ffi::CString::new(gitdir.join("commondir").as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: the owned CString names an unused path in this temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(snapshot_admin_fingerprint(directory.path(), &CancellationToken::new()).is_none());
+        fs::remove_file(gitdir.join("commondir")).unwrap();
+        fs::remove_dir_all(&gitdir).unwrap();
+        let fifo = std::ffi::CString::new(gitdir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the owned CString names the now-unused temporary Git marker path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(local_git_dir(directory.path(), &CancellationToken::new()).is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_does_not_bless_counts_with_a_later_file_identity() {
+        struct ChangeAfterCounts {
+            inner: FakeExecutor,
+            file: PathBuf,
+            changed: std::sync::atomic::AtomicBool,
+        }
+        impl ProcessExecutor for ChangeAfterCounts {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let result = self.inner.execute(command, cancellation);
+                if command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "ls-files")
+                    && !self.changed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    fs::write(&self.file, "a\nb\n").unwrap();
+                    fs::File::open(&self.file)
+                        .unwrap()
+                        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+                        .unwrap();
+                }
+                result
+            }
+        }
+        for tracked in [false, true] {
+            let directory = snapshot_cache_fixture_root();
+            let file = directory.path().join("file.txt");
+            fs::write(&file, "abc\n").unwrap();
+            let entries: &[u8] = if tracked {
+                b"1 .M N... 100644 100644 100644 a b file.txt\0"
+            } else {
+                b"? file.txt\0"
+            };
+            let mut outputs = cached_snapshot_outputs(entries, b"H file.txt\0");
+            if tracked {
+                outputs[3] = success(b"1\t0\tfile.txt\0");
+            }
+            outputs.extend([
+                success(&snapshot_status(entries)),
+                success(b""),
+                success(if tracked { b"2\t0\tfile.txt\0" } else { b"" }),
+                success(&snapshot_status(entries)),
+            ]);
+            let executor = Arc::new(ChangeAfterCounts {
+                inner: FakeExecutor::with_outputs(outputs),
+                file,
+                changed: std::sync::atomic::AtomicBool::new(false),
+            });
+            let service = RepositoryService::new("git", executor.clone());
+            let options = SnapshotOptions {
+                untracked_changes: true,
+                untracked_files: false,
+            };
+            let cancellation = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let first = service
+                .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.status.entries[0].added_lines, Some(1));
+            assert!(cache.dirty, "counts precede the metadata callback's write");
+            let second = service
+                .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(second.status.entries[0].added_lines, Some(2));
+            assert!(
+                service
+                    .snapshot_cached(directory.path(), options, &cancellation, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(executor.inner.commands.lock().unwrap().len(), 12);
+        }
+    }
+
+    #[test]
+    fn incomplete_admin_metadata_never_establishes_an_unchanged_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.extend(cached_snapshot_outputs(b"", b""));
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let service = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        for _ in 0..2 {
+            assert!(
+                service
+                    .snapshot_cached(
+                        directory.path(),
+                        SnapshotOptions::default(),
+                        &CancellationToken::new(),
+                        &mut cache
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(cache.dirty && cache.admin.is_empty());
+        }
+        assert_eq!(executor.commands.lock().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn stash_pop_retains_the_applied_step_when_log_publication_becomes_uncertain() {
+        if test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::stash_pop_retains_the_applied_step_when_log_publication_becomes_uncertain"
+        )) {
+            return;
+        }
+        struct FixtureGit;
+        impl ProcessExecutor for FixtureGit {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                SystemProcessExecutor.execute(
+                    &command
+                        .clone()
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .env("GIT_AUTHOR_NAME", "Cagents Contract")
+                        .env("GIT_COMMITTER_NAME", "Cagents Contract")
+                        .env("GIT_AUTHOR_EMAIL", "contract@example.invalid")
+                        .env("GIT_COMMITTER_EMAIL", "contract@example.invalid"),
+                    cancellation,
+                )
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let service = RepositoryService::new("git", Arc::new(FixtureGit));
+        let cancellation = CancellationToken::new();
+        let run = |arguments: &[&str]| {
+            service
+                .executor
+                .execute(
+                    &CommandSpec::new("git")
+                        .cwd(directory.path())
+                        .args(arguments.iter().copied()),
+                    &cancellation,
+                )
+                .unwrap()
+                .require_success(Path::new("git"))
+                .unwrap()
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        fs::write(directory.path().join("file.txt"), b"base\n").unwrap();
+        run(&["add", "file.txt"]);
+        run(&["commit", "-m", "base"]);
+        fs::write(directory.path().join("file.txt"), b"stashed work\n").unwrap();
+        run(&["stash", "push", "-m", "selected"]);
+        let stash = service
+            .stashes(directory.path(), &cancellation)
+            .unwrap()
+            .remove(0);
+        stash_mutations::FAIL_AFTER_STASH_LOG_PUBLICATION.set(true);
+        let outcome = service
+            .git_operation(
+                directory.path(),
+                &GitOperation::StashApply {
+                    reference: stash.reference,
+                    expected_oid: stash.oid.clone(),
+                    pop: true,
+                },
+                &cancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(&outcome, MutationOutcome::OutcomeUnknown { failure } if failure.to_string().contains("was applied") && failure.to_string().contains("deletion is unconfirmed")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("file.txt")).unwrap(),
+            b"stashed work\n"
+        );
+        assert!(!directory.path().join(".git/logs/refs/stash").exists());
+        assert_eq!(
+            String::from_utf8(run(&["rev-parse", "refs/stash"]).stdout)
+                .unwrap()
+                .trim(),
+            stash.oid.as_str()
+        );
     }
 
     #[test]
@@ -11619,9 +12084,9 @@ mod tests {
             success(b"/origin\n"),
             success(format!("{}\trefs/heads/feature\n", oid(4)).as_bytes()),
         ]);
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        let outcome = service.push(&publish_request(), &cancelled).unwrap();
+        let outcome = service
+            .push(&publish_request(), &CancellationToken::new())
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -11661,6 +12126,107 @@ mod tests {
                 OsString::from("refs/heads/feature"),
             ]
         );
+    }
+
+    #[test]
+    fn cancelling_an_uncertain_push_does_not_start_remote_reconciliation() {
+        struct CancelAfterPush {
+            inner: Arc<FakeExecutor>,
+        }
+        impl ProcessExecutor for CancelAfterPush {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let output = self.inner.execute(command, cancellation);
+                if command.arguments.iter().any(|argument| argument == "push") {
+                    cancellation.cancel();
+                }
+                output
+            }
+        }
+        let original = fake_service(vec![
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
+            Err(launched_failure(b"To /origin\n")),
+        ]);
+        let commands = original.executor.clone();
+        let service = RepositoryService::new(
+            "git",
+            Arc::new(CancelAfterPush {
+                inner: commands.clone(),
+            }),
+        );
+        let cancellation = CancellationToken::new();
+        let outcome = service.push(&publish_request(), &cancellation).unwrap();
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(outcome, PushOutcome::OutcomeUnknown { .. }));
+        let commands = commands.commands.lock().unwrap();
+        assert_eq!(commands.len(), 6);
+        assert!(!commands.iter().any(|command| {
+            command
+                .arguments
+                .iter()
+                .any(|argument| argument == "ls-remote")
+        }));
+    }
+
+    #[test]
+    fn uncertain_push_reconciliation_keeps_the_callers_cancellation() {
+        struct CancelReconciliation {
+            inner: Arc<FakeExecutor>,
+            owner: CancellationToken,
+        }
+        impl ProcessExecutor for CancelReconciliation {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let result = self.inner.execute(command, cancellation);
+                if command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "ls-remote")
+                {
+                    self.owner.cancel();
+                    assert!(
+                        cancellation.is_cancelled(),
+                        "the reconciliation must not detach into a fresh token"
+                    );
+                    return Err(launched_failure(b"reconciliation cancelled"));
+                }
+                result
+            }
+        }
+        let original = fake_service(vec![
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
+            Err(launched_failure(b"To /origin\n")),
+            success(b"/origin\0"),
+            success(b""),
+            success(b"/origin\n"),
+            success(format!("{}\trefs/heads/feature\n", oid(4)).as_bytes()),
+        ]);
+        let cancellation = CancellationToken::new();
+        let service = RepositoryService::new(
+            "git",
+            Arc::new(CancelReconciliation {
+                inner: original.executor.clone(),
+                owner: cancellation.clone(),
+            }),
+        );
+        let outcome = service.push(&publish_request(), &cancellation).unwrap();
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(outcome, PushOutcome::OutcomeUnknown { .. }));
+        assert_eq!(original.executor.commands.lock().unwrap().len(), 10);
     }
 
     #[test]
@@ -12522,7 +13088,10 @@ mod tests {
                 &mut remaining,
                 &mut bytes
             ),
-            Some(2)
+            Some((
+                file_identity(&fs::metadata(worktree.path().join("text")).unwrap()),
+                2
+            ))
         );
         assert_eq!(remaining, 9);
         cancellation.cancel();
