@@ -1,5 +1,6 @@
 //! A hosted proposal never authorizes itself. The window presents the saved
 //! configuration and answers with its exact immutable request revision.
+use super::automation_ui::transport;
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
 
@@ -201,34 +202,24 @@ impl Cagents {
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
                 let generation = self.automation_approval.generation;
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        let Response::Proposals(proposals) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::PendingProposals {
-                                    repository,
-                                    after: None,
-                                    limit: 1,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?
+                        let mut client = context.connect()?;
+                        let Response::Proposals(proposals) =
+                            client.request(Request::PendingProposals {
+                                repository,
+                                after: None,
+                                limit: 1,
+                            })?
                         else {
                             return Err("Unexpected automation approval listing".into());
                         };
                         let Some(visible) = proposals.first() else {
                             return Ok(Vec::new());
                         };
-                        let Response::Proposal(proposal) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::Proposal { id: visible.id },
-                            )
-                            .map_err(|error| error.to_string())?
+                        let Response::Proposal(proposal) =
+                            client.request(Request::Proposal { id: visible.id })?
                         else {
                             return Err("Unexpected automation proposal".into());
                         };
@@ -324,23 +315,14 @@ impl Cagents {
                 state.deciding = true;
                 state.error = None;
                 let generation = state.generation;
+                let context = transport::Context::capture();
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        match client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::ResolveProposal {
-                                    id,
-                                    revision,
-                                    approved,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?
-                        {
+                        match context.request(Request::ResolveProposal {
+                            id,
+                            revision,
+                            approved,
+                        })? {
                             Response::Proposal(proposal) => Ok(*proposal),
                             _ => Err("Unexpected automation approval result".into()),
                         }
@@ -588,6 +570,8 @@ fn approval_focus(generation: u64, index: usize) -> Task<Message> {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use crate::{
         agent::Provider,
