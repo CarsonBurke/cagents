@@ -11,6 +11,7 @@ mod input_queue;
 mod joins;
 #[cfg(test)]
 mod pty_reader_tests;
+mod scrollback_compression;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -37,7 +38,9 @@ use libghostty_vt::{
     key::{self, Encoder as KeyEncoder},
     mouse::{self, Encoder as MouseEncoder},
     style::{PaletteIndex, RgbColor},
-    terminal::{ColorScheme, CompressionMode, CompressionResult, Mode, ScrollViewport},
+    terminal::{
+        ColorScheme, CompressionActivity, CompressionMode, CompressionResult, Mode, ScrollViewport,
+    },
 };
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 
@@ -2519,6 +2522,7 @@ struct Worker {
     /// When a capture was first withheld for the synchronized update still in
     /// progress. `None` while no update is holding the grid back.
     synchronized_since: Option<std::time::Instant>,
+    scrollback_compression: scrollback_compression::IdleCompression<CompressionActivity>,
     /// Size the widget last asked for; the size a resumed or upgraded terminal
     /// is rebuilt with.
     current_size: TerminalSize,
@@ -2959,6 +2963,7 @@ impl Worker {
             viewport_reads: Vec::new(),
             force_capture: false,
             synchronized_since: None,
+            scrollback_compression: scrollback_compression::IdleCompression::new(),
             current_size,
             applied_pty_size: current_size,
             applied_parser_size: current_size,
@@ -3219,6 +3224,10 @@ impl Worker {
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
                 self.observe_foreground();
             }
+            // Every visibility state keeps parsing output and may refill or
+            // decompress history. Reclaim it on its original owner thread,
+            // using bounded steps after Ghostty's activity token settles.
+            self.compress_idle_scrollback();
             let event = self
                 .retained_commands
                 .pop_front()
@@ -3237,6 +3246,7 @@ impl Worker {
                         self.synchronized_release_after()
                             .into_iter()
                             .chain(self.bell.release_after())
+                            .chain(self.scrollback_compression.after(std::time::Instant::now()))
                             .chain(
                                 (!self.pending_input.is_empty() || self.reply_pending())
                                     .then_some(PTY_WRITE_RETRY),
@@ -3865,6 +3875,8 @@ impl Worker {
                     Ok(None) => {}
                     Err(error) => self.error("search terminal", error.to_string()),
                 }
+                self.scrollback_compression
+                    .history_read(std::time::Instant::now());
             }
             Command::Hide => self.set_hidden(),
             Command::ClearScrollback => {
@@ -3876,6 +3888,8 @@ impl Worker {
                     Ok(text) => self.emit(TerminalEvent::ClipboardText { request, text }),
                     Err(error) => self.error("copy terminal selection", error),
                 }
+                self.scrollback_compression
+                    .history_read(std::time::Instant::now());
             }
             Command::HostVisibility(visibility) => match visibility {
                 Visibility::Visible => self.reveal(),
@@ -4111,17 +4125,55 @@ impl Worker {
         // changes only the storage representation, never the logical
         // contents - and its one synchronous scan is affordable exactly here,
         // where nothing is waiting on a frame.
-        match self.terminal.compress(CompressionMode::Full) {
-            Ok(CompressionResult::Unsupported) => tracing::debug!(
-                terminal_id = %self.terminal_id,
-                "scrollback reclamation is unavailable on this target"
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::debug!(
-                terminal_id = %self.terminal_id,
-                %error,
-                "hibernated terminal could not compress its scrollback"
-            ),
+        self.compress_scrollback(CompressionMode::Full);
+    }
+
+    fn compress_idle_scrollback(&mut self) {
+        if !self.scrollback_compression.enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.terminal.compression_activity() {
+            Ok(activity) => self.scrollback_compression.observe(activity, now),
+            Err(error) => {
+                // No trustworthy activity token means no safe idle schedule.
+                // Avoid turning a failed query into an idle polling loop.
+                self.scrollback_compression.disable();
+                tracing::debug!(terminal_id = %self.terminal_id, %error,
+                    "terminal scrollback compression activity is unavailable");
+                return;
+            }
+        }
+        if self.scrollback_compression.due(now) {
+            self.compress_scrollback(CompressionMode::Incremental);
+        }
+    }
+
+    fn compress_scrollback(&mut self, mode: CompressionMode) {
+        let started = std::time::Instant::now();
+        let result = self.terminal.compress(mode);
+        let now = std::time::Instant::now();
+        tracing::trace!(target: "cagents::terminal_pipeline", stage = "compression",
+            terminal_id = %self.terminal_id, ?mode, ?result,
+            elapsed_ns = started.elapsed().as_nanos() as u64);
+        // Full hibernation passes also settle the current activity token, so
+        // they do not cause an immediate redundant incremental scan.
+        if let Ok(activity) = self.terminal.compression_activity() {
+            self.scrollback_compression.observe(activity, now);
+        }
+        match result {
+            Ok(result) => {
+                self.scrollback_compression.finished(result, mode, now);
+                if result == CompressionResult::Unsupported {
+                    tracing::debug!(terminal_id = %self.terminal_id,
+                        "scrollback reclamation is unavailable on this target");
+                }
+            }
+            Err(error) => {
+                self.scrollback_compression.retry(now);
+                tracing::debug!(terminal_id = %self.terminal_id, %error,
+                    "terminal could not compress its scrollback");
+            }
         }
     }
 
@@ -4206,7 +4258,7 @@ impl Worker {
     }
 
     fn finish_viewport_reads(&mut self) {
-        if self.capture_dirty {
+        if self.capture_dirty || self.viewport_reads.is_empty() {
             return;
         }
         let base = self.published.snapshot.load_full();
@@ -4215,6 +4267,8 @@ impl Worker {
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
+        self.scrollback_compression
+            .history_read(std::time::Instant::now());
     }
 
     /// Whether the child is inside a synchronized update that may still
@@ -4391,8 +4445,12 @@ impl Worker {
             self.refresh_resume_hint(true);
             self.stop_reading()?;
             self.input_drained_for_handoff()?;
-            carry::screen(&mut self.terminal, holder::MAX_SCREEN)
-                .and_then(|screen| self.holder.detach(socket, &screen))?;
+            let screen = carry::screen(&mut self.terminal, holder::MAX_SCREEN);
+            // Formatting can restore cold history without changing its activity
+            // token. A refused detach keeps this worker and must reclaim it again.
+            self.scrollback_compression
+                .history_read(std::time::Instant::now());
+            screen.and_then(|screen| self.holder.detach(socket, &screen))?;
             self.carried = true;
             self.complete_input_handoff();
             Ok(Carried {
@@ -6890,6 +6948,82 @@ mod tests {
         handle.input(b"still here\n".to_vec()).unwrap();
         wait_for_text(&handle, "after:still here");
         handle.shutdown().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refused_carry_reclaims_formatted_history_without_new_output() {
+        if isolated_input_case("refused_carry_reclaims_formatted_history_without_new_output") {
+            return;
+        }
+        let (mut worker, handle, mut root) = input_handoff_worker(
+            r#"
+import os, time, tty
+tty.setraw(0)
+for row in range(2000):
+    os.write(1, f'\x1b[38;5;{row % 216 + 16}mfile-{row:04}.rs: reading café ✓\x1b[0m\r\n'.encode())
+os.write(1, b'CARRY_HISTORY_READY')
+while True: time.sleep(1)
+"#,
+        );
+        observe_worker_marker(&mut worker, b"CARRY_HISTORY_READY");
+        let formatted = |terminal: &Terminal<'_, '_>| {
+            use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
+            Formatter::new(
+                terminal,
+                FormatterOptions::new()
+                    .with_format(Format::Vt)
+                    .with_style(true),
+            )
+            .unwrap()
+            .format_alloc(None)
+            .unwrap()
+            .to_vec()
+        };
+        let before = formatted(&worker.terminal);
+        let rows = worker.terminal.scrollbar().unwrap().total;
+        assert!(rows >= 2_000);
+        worker.compress_scrollback(CompressionMode::Full);
+        assert!(worker.scrollback_compression.enabled());
+        assert_eq!(worker.scrollback_compression.after(Instant::now()), None);
+        let token = worker.terminal.compression_activity().unwrap();
+        let old_reader = worker.reader.as_ref().unwrap().thread().id();
+
+        // Reach the real carry formatter, then the holder's bind refusal. The
+        // child stays silent, so neither reader restart nor activity can rearm it.
+        let socket = std::env::current_dir()
+            .unwrap()
+            .join("missing")
+            .join("holder.sock");
+        let error = worker.carry(&socket).unwrap_err();
+        assert!(error.starts_with("listen on "), "{error}");
+        assert!(!worker.carried);
+        assert_ne!(worker.reader.as_ref().unwrap().thread().id(), old_reader);
+        assert!(!input_root_exited(&root.pidfd).unwrap());
+        assert_eq!(worker.terminal.compression_activity().unwrap(), token);
+        let delay = worker
+            .scrollback_compression
+            .after(Instant::now())
+            .expect("refused carry must rearm the completed compression pass");
+        assert!(delay <= Duration::from_secs(1));
+
+        // Use the worker's real idle path, without history reads between carry
+        // and recompression: those reads would hide the missing carry rearm.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut steps = 0;
+        while let Some(delay) = worker.scrollback_compression.after(Instant::now()) {
+            assert!(Instant::now() + delay < deadline, "recompression stalled");
+            thread::sleep(delay);
+            worker.compress_idle_scrollback();
+            steps += 1;
+        }
+        assert!(steps > 0);
+        assert!(worker.scrollback_compression.enabled());
+        assert_eq!(worker.terminal.compression_activity().unwrap(), token);
+        assert_eq!(formatted(&worker.terminal), before);
+        assert_eq!(worker.terminal.scrollbar().unwrap().total, rows);
+        worker.published.request_shutdown();
+        finish_captured_input_worker(worker, &handle, &mut root);
     }
 
     #[test]
