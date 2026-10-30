@@ -2439,7 +2439,9 @@ impl Adapter for Codex {
                         execution.early_bytes = 0;
                         if let Some(completed) = completed {
                             self.finish_execution(&completed, completion_authority, &mut step)?;
-                            if !self.busy || self.turn.as_deref() == Some(turn.as_str()) {
+                            if completion_authority
+                                && (!self.busy || self.turn.as_deref() == Some(turn.as_str()))
+                            {
                                 self.busy = false;
                                 self.turn = None;
                                 step.events.push(Event::Status {
@@ -5980,15 +5982,23 @@ mod tests {
             feed_frames(
                 &handle,
                 &frames,
-                vec![
-                    turn_frame("thread-exact", "new", "inProgress"),
-                    turn_frame("thread-exact", "new", "completed"),
-                ],
+                vec![turn_frame("thread-exact", "new", "inProgress")],
+            );
+            let started = handle.snapshot(None).unwrap();
+            assert!(started.busy);
+            assert_eq!(started.outcome, None);
+            assert!(started.turn_generation > after.turn_generation);
+            updates.try_iter().for_each(drop);
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "new", "completed")],
             );
             assert_eq!(
                 handle.snapshot(None).unwrap().outcome,
                 Some(crate::agent::ActivityOutcome::Succeeded)
             );
+            assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:new" && attention.kind == Kind::Succeeded)));
             handle.close().unwrap();
         }
     }
@@ -6014,6 +6024,11 @@ mod tests {
                 }
                 feed_frames(&handle, &frames, newer);
                 let before = handle.snapshot(None).unwrap();
+                assert_eq!(before.busy, !settled);
+                assert_eq!(
+                    before.outcome,
+                    settled.then_some(crate::agent::ActivityOutcome::Succeeded)
+                );
                 updates.try_iter().for_each(drop);
                 let mut completion = turn_frame("thread-exact", "old", "failed");
                 completion["params"]["turn"]["error"] = json!({"message":"old accepted failure"});
@@ -6025,6 +6040,7 @@ mod tests {
                 }
                 let after = handle.snapshot(None).unwrap();
                 assert_eq!(after.error, before.error);
+                assert_eq!(after.detail, before.detail);
                 assert_eq!(after.outcome, before.outcome);
                 assert_eq!(after.busy, before.busy);
                 assert_eq!(after.finished_at, before.finished_at);
