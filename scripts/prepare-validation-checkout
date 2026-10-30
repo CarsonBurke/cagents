@@ -64,9 +64,9 @@ def check_git_config(repository):
     # Refuse programs during checkout and implicit object fetching. Do not
     # inspect their configured values or modify the caller's environment.
     external = git(repository, "config", "--name-only", "--get-regexp",
-                   r"^(filter\.|remote\..*\.promisor$|extensions\.partialclone$)", allowed=(0, 1))
+                   r"^(filter\.|includeif\.|remote\..*\.promisor$|extensions\.partialclone$)", allowed=(0, 1))
     if external.stdout:
-        raise Refusal("invalid-input", "External Git filters and partial/promisor clones are unsupported.")
+        raise Refusal("invalid-input", "Conditional Git config, external filters and partial/promisor clones are unsupported.")
 
 
 def reject_gitlinks(repository, head):

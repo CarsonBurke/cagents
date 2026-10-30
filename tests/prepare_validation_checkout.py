@@ -95,6 +95,7 @@ class ValidationCheckout(unittest.TestCase):
         unsupported = [
             name for name in names
             if name.startswith("filter.")
+            or name.startswith("includeif.")
             or (name.startswith("remote.") and name.endswith(".promisor"))
             or name == "extensions.partialclone"
         ]
@@ -243,6 +244,26 @@ class ValidationCheckout(unittest.TestCase):
             self.assertEqual((self.checkout / ".git").read_bytes(), git_file)
         inventory = self.git(self.repository, "worktree", "list", "--porcelain").stdout
         self.assertEqual(inventory.count(f"worktree {self.checkout}\n"), 1)
+
+    def test_conditional_include_is_refused_before_checkout_creation(self):
+        included = self.root / "conditional-config"
+        included.write_text("[user]\n\tname = Inert conditional fixture\n")
+        # The source Git directory is not a linked-worktree admin directory.
+        # A future checkout could activate this include in a new context.
+        # Use only inert data, never a filter command or ambient config change.
+        self.git(
+            self.repository, "config", "--local",
+            f"includeIf.gitdir:{self.common}/worktrees/**.path", str(included),
+        )
+        source_before = snapshot(self.repository)
+        included_before = snapshot(included)
+        self.assertFalse(os.path.lexists(self.checkout))
+        self.assertFalse(os.path.lexists(self.record_path(self.checkout)))
+        self.refused("invalid-input", head=self.a, expected="absent")
+        self.assertEqual(snapshot(self.repository), source_before)
+        self.assertEqual(snapshot(included), included_before)
+        self.assertFalse(os.path.lexists(self.checkout))
+        self.assertFalse(os.path.lexists(self.record_path(self.checkout)))
 
     def test_blob_replacement_cannot_substitute_the_staged_source(self):
         expected_tree = self.tree(self.a)
