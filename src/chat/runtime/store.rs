@@ -303,6 +303,16 @@ impl Store {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        if item.id.starts_with("codex-turn-error:")
+            && let Some((_, metadata, _)) = &previous
+        {
+            let cached: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
+            if cached.id == item.id && super::is_codex_turn_error(&cached) {
+                // Completion/history may retain less detail than the original
+                // live failure. Its exact first body and ordinal are immutable.
+                return Ok(None);
+            }
+        }
         let recovered_placeholder = if older && let Some((_, metadata, input_bytes)) = &previous {
             let cached: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
             // A completed result can arrive before its call metadata is known.

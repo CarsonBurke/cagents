@@ -3095,6 +3095,20 @@ fn recover_history_error(
     }
 }
 
+/// Only the adapter's stable terminal-turn carrier keeps its first accepted
+/// diagnostic. Retry notices and other providers retain their update behavior.
+fn is_codex_turn_error(item: &Item) -> bool {
+    item.id
+        .strip_prefix("codex-turn-error:")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        && super::failure::provider_error_text(crate::agent::Provider::Codex, item).is_some()
+}
+
 #[cfg(test)]
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     apply_projected_event(state, indices, event, false);
@@ -3106,6 +3120,19 @@ fn apply_projected_event(
     event: Event,
     preview_observed: bool,
 ) {
+    if let Event::SubagentItem { id, item } = &event
+        && item.id.starts_with("codex-turn-error:")
+        && state
+            .subagents
+            .iter()
+            .find(|agent| agent.id == *id)
+            .and_then(|agent| agent.items.iter().find(|cached| cached.id == item.id))
+            .is_some_and(|cached| is_codex_turn_error(cached))
+    {
+        // Child history becomes SubagentItem too. Keep the original incident
+        // before copy-source preparation can invalidate its existing bytes.
+        return;
+    }
     // Frame events have already reached the resident preview before Store.
     // Do not consume a restored start boundary or append a delta twice.
     if !preview_observed {
@@ -3764,6 +3791,13 @@ mod tests {
     fn codex_incident_history(
         turns: Vec<Value>,
     ) -> (tempfile::TempDir, Box<dyn Adapter>, Vec<Event>) {
+        codex_incident_history_with_cursor(turns, None)
+    }
+
+    fn codex_incident_history_with_cursor(
+        turns: Vec<Value>,
+        cursor: Option<&str>,
+    ) -> (tempfile::TempDir, Box<dyn Adapter>, Vec<Event>) {
         let directory = tempfile::tempdir().unwrap();
         let launch = super::super::Launch {
             provider: crate::agent::Provider::Codex,
@@ -3802,7 +3836,7 @@ mod tests {
         let mut events = adapter
             .receive(json!({"id":request("thread/resume"),"result":{
                 "thread":{"id":"incident-thread","status":{"type":"idle"},"canAcceptDirectInput":true},
-                "initialTurnsPage":{"data":turns,"nextCursor":null}
+                "initialTurnsPage":{"data":turns,"nextCursor":cursor}
             }}))
             .unwrap()
             .events;
@@ -4015,6 +4049,522 @@ mod tests {
             live_ids.iter().collect::<Vec<_>>(),
             "history cannot append a second carrier or move the original"
         );
+    }
+
+    fn read_incident_copy(store: &Store, source: &super::super::TextCopySource) -> String {
+        let mut body = String::new();
+        loop {
+            let page = store.text_copy(source, body.len() as u64).unwrap();
+            body.push_str(&page.text);
+            if page.done {
+                return body;
+            }
+        }
+    }
+
+    #[test]
+    fn codex_terminal_incident_keeps_original_chunks_after_reduced_completion_and_history() {
+        for completion_first in [false, true] {
+            for final_message in ["", "Reduced final diagnostic"] {
+                let (_home, mut adapter, initial) =
+                    codex_incident_history_with_cursor(Vec::new(), Some("older"));
+                let mut store = Store::new().unwrap();
+                let mut state = Snapshot::default();
+                let mut indices = BTreeMap::new();
+                let mut history_error = None;
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    initial,
+                );
+                let run = crate::model::RunId::new();
+                let sent = adapter
+                    .command_for_run(
+                        run,
+                        Command::Prompt {
+                            text: "Original failing request".into(),
+                            attachments: Vec::new(),
+                            mode: super::super::PromptMode::Send,
+                        },
+                    )
+                    .unwrap();
+                let ack = json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"failed"}}});
+                if !completion_first {
+                    adapter.receive(ack.clone()).unwrap();
+                }
+                let raw = format!(
+                    "Original useful diagnostic\n{}",
+                    "λ original detail\n".repeat(20_000)
+                );
+                assert!(raw.len() > 2 * 128 * 1024);
+                let failed = adapter.receive(json!({"method":"error","params":{
+                    "threadId":"incident-thread","turnId":"failed","willRetry":false,"error":{"message":&raw}
+                }})).unwrap();
+                let original_carrier = failed
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) => Some(item.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                let carrier = original_carrier.id.clone();
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    failed.events,
+                );
+                let original_parts = state.items.clone();
+                assert!(
+                    original_parts.len() > 1,
+                    "terminal diagnostic uses real Store parts"
+                );
+                assert!(
+                    original_parts
+                        .iter()
+                        .skip(1)
+                        .all(|item| item.id.contains(":native-part:"))
+                );
+                let joined: String = original_parts
+                    .iter()
+                    .map(|item| {
+                        super::super::failure::provider_error_text(
+                            crate::agent::Provider::Codex,
+                            item,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                assert_eq!(joined, raw, "every original terminal byte is reconstructed");
+                store.publish_copy_sources(&mut state);
+                let source = state.text_copy_sources.conversation[0].clone().unwrap();
+                assert_eq!(read_incident_copy(&store, &source), raw);
+
+                for message in ["Reduced notification", ""] {
+                    let changed = adapter.receive(json!({"method":"error","params":{
+                        "threadId":"incident-thread","turnId":"failed","willRetry":false,"error":{"message":message}
+                    }})).unwrap();
+                    assert!(
+                        changed.events.iter().any(|event| matches!(event,
+                            Event::Error { message: actual, fatal: false } if actual == message
+                        )),
+                        "live control diagnostics retain the actual latest bytes"
+                    );
+                    apply_codex_incident_events(
+                        &mut store,
+                        &mut state,
+                        &mut indices,
+                        &mut history_error,
+                        changed.events,
+                    );
+                    assert_eq!(read_incident_copy(&store, &source), raw);
+                }
+                let failed_turn = json!({"id":"failed","status":"failed","items":[],"error":{"message":final_message}});
+                let completed = adapter
+                    .receive(json!({"method":"turn/completed","params":{
+                        "threadId":"incident-thread","turn":failed_turn.clone()
+                    }}))
+                    .unwrap();
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    completed.events,
+                );
+                if completion_first {
+                    // As in the retained managed-ACK control, newer unidentified
+                    // activity makes the ACK recover only its exact run content.
+                    adapter.receive(json!({"method":"thread/status/changed","params":{
+                        "threadId":"incident-thread","status":{"type":"active","activeFlags":["waitingOnApproval"]}
+                    }})).unwrap();
+                    let recovered = adapter.receive(ack).unwrap();
+                    assert!(recovered.events.iter().any(|event| matches!(event,
+                        Event::Item(item) if super::super::failure::provider_error_text(crate::agent::Provider::Codex, item) == Some(final_message)
+                    )), "the recovered completion attempts the reduced same-ID write");
+                    assert!(recovered.events.iter().any(|event| matches!(event,
+                        Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { .. } } if *actual == run
+                    )));
+                    apply_codex_incident_events(
+                        &mut store,
+                        &mut state,
+                        &mut indices,
+                        &mut history_error,
+                        recovered.events,
+                    );
+                }
+                assert_eq!(read_incident_copy(&store, &source), raw);
+                assert_eq!(
+                    state.items, original_parts,
+                    "no body, stamp, part ID or ordinal rewrites"
+                );
+
+                for earlier in [false, true] {
+                    let request = adapter
+                        .command(if earlier {
+                            Command::LoadEarlier
+                        } else {
+                            Command::Refresh
+                        })
+                        .unwrap();
+                    let id = request
+                        .writes
+                        .iter()
+                        .find(|frame| frame["method"] == "thread/turns/list")
+                        .unwrap()["id"]
+                        .clone();
+                    apply_codex_incident_events(
+                        &mut store,
+                        &mut state,
+                        &mut indices,
+                        &mut history_error,
+                        request.events,
+                    );
+                    let page = adapter.receive(json!({"id":id,"result":{"data":[failed_turn.clone()],"nextCursor":null}})).unwrap();
+                    assert!(page.events.iter().any(|event| if earlier {
+                        matches!(event, Event::History { .. })
+                    } else {
+                        matches!(event, Event::LatestHistory { .. })
+                    }));
+                    apply_codex_incident_events(
+                        &mut store,
+                        &mut state,
+                        &mut indices,
+                        &mut history_error,
+                        page.events,
+                    );
+                    assert_eq!(read_incident_copy(&store, &source), raw);
+                    assert_eq!(state.items, original_parts);
+                }
+                store
+                    .apply(Event::Item(Item {
+                        id: carrier.clone(),
+                        role: Role::Assistant,
+                        content: ItemContent::Text {
+                            text: "An unrelated replacement".into(),
+                            thinking: false,
+                            phase: Phase::Final,
+                        },
+                        started_at: None,
+                        at: None,
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    read_incident_copy(&store, &source),
+                    raw,
+                    "a nonerror replacement cannot erase the accepted carrier"
+                );
+                let later = adapter.receive(json!({"method":"turn/started","params":{
+                    "threadId":"incident-thread","turn":{"id":"later","status":"inProgress","items":[{"id":"prompt","type":"userMessage","content":[{"type":"text","text":"."}]}]}
+                }})).unwrap();
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    later.events,
+                );
+                assert_eq!(
+                    &state.items[..original_parts.len()],
+                    original_parts.as_slice()
+                );
+                assert!(
+                    matches!(&state.items.last().unwrap().content, ItemContent::Text { text, .. } if text == ".")
+                );
+
+                // A fresh provider page containing only B cannot reconstruct A.
+                let (_cold_home, _cold_adapter, history) =
+                    codex_incident_history(vec![failed_turn]);
+                let mut cold = Store::new().unwrap();
+                for event in history {
+                    cold.apply(event).unwrap();
+                }
+                let cold_items = cold.window().unwrap().items;
+                let old = cold_items.iter().find(|item| item.id == carrier).unwrap();
+                assert_eq!(
+                    super::super::failure::provider_error_text(crate::agent::Provider::Codex, old),
+                    Some(final_message)
+                );
+                cold.apply(Event::Item(original_carrier)).unwrap();
+                let first_accepted = cold.window().unwrap().items;
+                assert_eq!(
+                    super::super::failure::provider_error_text(
+                        crate::agent::Provider::Codex,
+                        first_accepted
+                            .iter()
+                            .find(|item| item.id == carrier)
+                            .unwrap(),
+                    ),
+                    Some(final_message),
+                    "first accepted is a cache rule, not inferred live provenance"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_child_incident_keeps_original_body_and_copy_source_through_history() {
+        let (_home, mut adapter, _) = codex_incident_history_with_cursor(Vec::new(), Some("older"));
+        let mut store = Store::new().unwrap();
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut history_error = None;
+        let raw = "Original child diagnostic\nall useful details";
+        let failed = adapter.receive(json!({"method":"error","params":{
+            "threadId":"incident-thread","turnId":"failed","willRetry":false,"error":{"message":raw}
+        }})).unwrap();
+        apply_codex_incident_events(
+            &mut store,
+            &mut state,
+            &mut indices,
+            &mut history_error,
+            super::super::child_events("child", failed.events),
+        );
+        let original = state.subagents[0].items[0].clone();
+        let source = state.text_copy_sources.children["child"][0]
+            .clone()
+            .unwrap();
+        assert_eq!(child_text_copy::read(&state, &source, 0).unwrap().text, raw);
+        let turn = json!({"id":"failed","status":"failed","items":[],"error":{"message":""}});
+        for frame in [
+            json!({"method":"error","params":{"threadId":"incident-thread","turnId":"failed","willRetry":false,"error":{"message":"Reduced child diagnostic"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"incident-thread","turn":turn.clone()}}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            apply_codex_incident_events(
+                &mut store,
+                &mut state,
+                &mut indices,
+                &mut history_error,
+                super::super::child_events("child", step.events),
+            );
+        }
+        for earlier in [false, true] {
+            let request = adapter
+                .command(if earlier {
+                    Command::LoadEarlier
+                } else {
+                    Command::Refresh
+                })
+                .unwrap();
+            let id = request
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/turns/list")
+                .unwrap()["id"]
+                .clone();
+            let page = adapter
+                .receive(json!({"id":id,"result":{"data":[turn.clone()],"nextCursor":null}}))
+                .unwrap();
+            assert!(page.events.iter().any(|event| if earlier {
+                matches!(event, Event::History { .. })
+            } else {
+                matches!(event, Event::LatestHistory { .. })
+            }));
+            let mapped = super::super::child_events("child", page.events);
+            assert!(mapped.iter().any(
+                |event| matches!(event, Event::SubagentItem { item, .. } if item.id == original.id)
+            ));
+            apply_codex_incident_events(
+                &mut store,
+                &mut state,
+                &mut indices,
+                &mut history_error,
+                mapped,
+            );
+            assert!(Arc::ptr_eq(&state.subagents[0].items[0], &original));
+            assert_eq!(child_text_copy::read(&state, &source, 0).unwrap().text, raw);
+            assert_eq!(
+                state.text_copy_sources.children["child"][0].as_ref(),
+                Some(&source)
+            );
+        }
+        let mut replacement = (*original).clone();
+        replacement.content = ItemContent::Text {
+            text: "not an error".into(),
+            thinking: false,
+            phase: Phase::Final,
+        };
+        apply_codex_incident_events(
+            &mut store,
+            &mut state,
+            &mut indices,
+            &mut history_error,
+            vec![Event::SubagentItem {
+                id: "child".into(),
+                item: replacement,
+            }],
+        );
+        assert!(Arc::ptr_eq(&state.subagents[0].items[0], &original));
+        assert_eq!(child_text_copy::read(&state, &source, 0).unwrap().text, raw);
+        for (method, text, output) in [
+            ("item/started", "Before", "begin"),
+            ("item/completed", "After", "final"),
+        ] {
+            for item in [
+                json!({"id":"answer","type":"agentMessage","text":text}),
+                json!({"id":"tool","type":"commandExecution","command":"printf next","cwd":"/fixture","status":if method == "item/started" {"inProgress"} else {"completed"},"aggregatedOutput":output,"exitCode":0}),
+            ] {
+                let step = adapter
+                    .receive(json!({"method":method,"params":{
+                        "threadId":"incident-thread","turnId":"later","item":item
+                    }}))
+                    .unwrap();
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    super::super::child_events("child", step.events),
+                );
+            }
+        }
+        assert!(
+            matches!(&state.subagents[0].items[1].content, ItemContent::Text { text, .. } if text == "After")
+        );
+        assert!(
+            matches!(&state.subagents[0].items[2].content, ItemContent::Command { output, .. } if output == "final")
+        );
+        assert_eq!(child_text_copy::read(&state, &source, 0).unwrap().text, raw);
+        assert!(
+            state.error.is_none(),
+            "child scalar errors never become the parent error"
+        );
+    }
+
+    #[test]
+    fn codex_terminal_preservation_leaves_other_markers_and_normal_updates_mutable() {
+        let (_home, mut adapter, _) = codex_incident_history(Vec::new());
+        let failed = adapter.receive(json!({"method":"error","params":{
+            "threadId":"incident-thread","turnId":"failed","willRetry":false,"error":{"message":"Original"}
+        }})).unwrap();
+        let template = failed
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Item(item) => Some(item.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let retry = adapter.receive(json!({"method":"error","params":{
+            "threadId":"incident-thread","turnId":"retrying","willRetry":true,"error":{"message":"Reconnecting"}
+        }})).unwrap();
+        let notice = retry
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Item(item) => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        let mut cases = vec![notice];
+        for id in [
+            "ordinary-text".into(),
+            format!("codex-turn-error:{}", "a".repeat(63)),
+            format!("codex-turn-error:{}", "A".repeat(64)),
+            format!("{}:native-part:1", template.id),
+        ] {
+            let mut item = template.clone();
+            item.id = id;
+            cases.push(item);
+        }
+        let mut unmarked = template.clone();
+        unmarked.content = ItemContent::Text {
+            text: "Original".into(),
+            thinking: false,
+            phase: Phase::Final,
+        };
+        cases.push(unmarked);
+        for field in ["role", "kind", "from", "sender", "summary", "provider"] {
+            let mut item = template.clone();
+            if field == "role" {
+                item.role = Role::Assistant;
+            }
+            if let ItemContent::Delivery {
+                kind,
+                from,
+                sender,
+                summary,
+                ..
+            } = &mut item.content
+            {
+                match field {
+                    "kind" => *kind = super::super::DeliveryKind::Message,
+                    "from" => *from = "teammate".into(),
+                    "sender" => *sender = "Teammate".into(),
+                    "summary" => *summary = "Quoted provider request failed".into(),
+                    "provider" => {
+                        *from = "provider-error:claude".into();
+                        *sender = "Claude".into();
+                    }
+                    _ => {}
+                }
+            }
+            cases.push(item);
+        }
+        let tool = Item {
+            id: "ordinary-tool".into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: "shell".into(),
+                input: "args".into(),
+                output: "begin".into(),
+                status: ToolStatus::Running,
+            },
+            started_at: None,
+            at: None,
+        };
+        cases.push(tool);
+        for original in cases {
+            let mut updated = original.clone();
+            match &mut updated.content {
+                ItemContent::Text { text, .. } => *text = "Updated".into(),
+                ItemContent::Delivery { body, .. } => *body = "Updated".into(),
+                ItemContent::Tool { output, status, .. } => {
+                    *output = "Updated".into();
+                    *status = ToolStatus::Succeeded;
+                }
+                _ => unreachable!(),
+            }
+            let mut store = Store::new().unwrap();
+            store.apply(Event::Item(original.clone())).unwrap();
+            store.apply(Event::Item(updated.clone())).unwrap();
+            let published = store.window().unwrap().items;
+            assert_eq!(published.len(), 1);
+            assert_eq!(
+                published[0].content, updated.content,
+                "normal Store update of {}",
+                updated.id
+            );
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::SubagentItem {
+                    id: "child".into(),
+                    item: original,
+                },
+            );
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::SubagentItem {
+                    id: "child".into(),
+                    item: updated.clone(),
+                },
+            );
+            assert_eq!(state.subagents[0].items.len(), 1);
+            assert_eq!(
+                state.subagents[0].items[0].content, updated.content,
+                "normal child update of {}",
+                updated.id
+            );
+        }
     }
 
     #[test]

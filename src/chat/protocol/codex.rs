@@ -3277,6 +3277,8 @@ fn error_message(error: &Value) -> String {
 /// must name that same incident without moving it behind later work. Hash the
 /// provider's original turn ID to keep the cache identity bounded; unlike
 /// provider item keys this namespace contains no slash. The text is not an ID.
+/// The transcript keeps the first accepted diagnostic for this exact carrier;
+/// later live control errors retain their own unmodified message.
 fn turn_error_item(turn: &str, message: String) -> Item {
     use sha2::{Digest, Sha256};
 
