@@ -4780,15 +4780,40 @@ pub(crate) fn read_migration_session_at(
     const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
     match kind {
         "terminal" => {
-            // Check lengths in SQLite before allocating any descriptor fields
+            // The loader parses this raw UUID before looking up a transcript
+            // by its canonical spelling. Bound the raw String first, then
+            // budget the same canonical transcript key in this read snapshot.
+            let raw: Option<Option<String>> = connection
+                .query_row(
+                    "SELECT length(CAST(terminal_id AS BLOB)) <= ?2, terminal_id
+                     FROM terminal_recipes WHERE card_id = ?1",
+                    params![card.to_string(), MAX_DESCRIPTOR_BYTES as u64],
+                    |row| {
+                        if row.get::<_, bool>(0)? {
+                            row.get::<_, String>(1).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .optional()?;
+            let Some(Some(raw)) = raw else {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            };
+            let terminal: TerminalId = parse_id("terminal", &raw)?;
+            drop(raw);
+            // Check lengths in SQLite before allocating the remaining fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
                 "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
                     + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
                     + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
-                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=?3 WHERE r.card_id=?1",
+                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64,terminal.to_string()],|row|row.get(0)).optional()?;
             if bounded != Some(true) {
                 return Err(StoreError::corrupt_row(
                     format!("migration terminal card {card}"),
@@ -5318,6 +5343,179 @@ mod tests {
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn migration_terminal_inspection_budgets_the_canonical_transcript_lookup() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("raw-terminal.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        // Exercise the raw normalized decoder, without claiming whole-source
+        // schema admission or opening/migrating this source as a StateStore.
+        connection
+            .execute_batch(
+                "CREATE TABLE terminal_recipes(card_id TEXT PRIMARY KEY, terminal_id TEXT UNIQUE,
+             recipe_json TEXT, continuity_json TEXT, resume_hint TEXT, recovery_origin TEXT,
+             owned_codex_listener TEXT, predecessor TEXT);
+             CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
+            )
+            .unwrap();
+        let state = workspace_with_terminal(&boot("migration-inspection"));
+        let card = state.cards[0].id;
+        let CardKind::Terminal(mut terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        terminal.id = parse_id("terminal", "abcdefab-cdef-4abc-8def-abcdefabcdef").unwrap();
+        terminal.resume_hint = None;
+        terminal.transcript_path = Some(PathBuf::from("/canonical"));
+        let canonical = terminal.id.to_string();
+        let recipe = serde_json::to_string(&terminal.launch).unwrap();
+        let continuity = serde_json::to_string(&terminal.continuity).unwrap();
+        let path = serde_json::to_string(&terminal.transcript_path.as_ref().unwrap()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO terminal_recipes VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL)",
+                params![card.to_string(), canonical, recipe, continuity],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transcript_metadata VALUES(?1,?2)",
+                params![canonical, path],
+            )
+            .unwrap();
+        let inspect = || {
+            let before = fs::read(&database).unwrap();
+            let mut reader =
+                Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let tx = reader.transaction().unwrap();
+            let result = read_migration_session_at(&tx, card, "terminal", None);
+            drop(tx);
+            drop(reader);
+            assert_eq!(
+                fs::read(&database).unwrap(),
+                before,
+                "inspection is read-only"
+            );
+            result
+        };
+        for raw in [
+            canonical.clone(),
+            canonical.to_uppercase(),
+            canonical.replace('-', ""),
+        ] {
+            connection
+                .execute("UPDATE terminal_recipes SET terminal_id=?1", [&raw])
+                .unwrap();
+            assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal.clone()));
+        }
+        let raw = canonical.to_uppercase();
+        connection
+            .execute("UPDATE terminal_recipes SET terminal_id=?1", [&raw])
+            .unwrap();
+        let oversized_path = serde_json::to_string(&PathBuf::from("p".repeat(LIMIT))).unwrap();
+        // The canonical lookup is valid JSON that the old loader would copy;
+        // a small raw-key decoy must not stand in for its byte budget.
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![oversized_path, canonical],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transcript_metadata VALUES(?1,?2)",
+                params![raw, path],
+            )
+            .unwrap();
+        assert!(matches!(inspect(), Err(StoreError::CorruptRow { .. })));
+
+        // Conversely, the loader never reads the raw alias's path.
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![path, canonical],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![oversized_path, raw],
+            )
+            .unwrap();
+        assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal.clone()));
+
+        let fixed_bytes = raw.len() + recipe.len() + continuity.len() + path.len();
+        let exact_hint = format!("{}窓", "h".repeat(LIMIT - fixed_bytes - "窓".len()));
+        assert_eq!(fixed_bytes + exact_hint.len(), LIMIT);
+        connection
+            .execute("UPDATE terminal_recipes SET resume_hint=?1", [&exact_hint])
+            .unwrap();
+        terminal.resume_hint = Some(exact_hint.clone());
+        assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal));
+        connection
+            .execute(
+                "UPDATE terminal_recipes SET resume_hint=?1",
+                [format!("{exact_hint}x")],
+            )
+            .unwrap();
+        assert!(matches!(inspect(), Err(StoreError::CorruptRow { .. })));
+    }
+
+    #[test]
+    fn migration_terminal_inspection_bounds_raw_ids_before_string_conversion() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE terminal_recipes(card_id TEXT PRIMARY KEY, terminal_id,
+             recipe_json TEXT, continuity_json TEXT, resume_hint TEXT, recovery_origin TEXT,
+             owned_codex_listener TEXT, predecessor TEXT);
+             CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
+            )
+            .unwrap();
+        let card = CardId::new();
+        connection
+            .execute(
+                "INSERT INTO terminal_recipes VALUES(?1,?2,'{}','{}',NULL,NULL,NULL,NULL)",
+                params![card.to_string(), "x".repeat(LIMIT + 1)],
+            )
+            .unwrap();
+        let oversized = read_migration_session_at(&connection, card, "terminal", None).unwrap_err();
+        assert!(matches!(oversized, StoreError::CorruptRow { .. }));
+        // Oversized invalid UTF-8 TEXT must hit the size sentinel before a
+        // String conversion. No diagnostic may include the raw source value.
+        connection
+            .execute(
+                "UPDATE terminal_recipes SET terminal_id=CAST(zeroblob(?1)||x'80' AS TEXT)",
+                [LIMIT as u64],
+            )
+            .unwrap();
+        let invalid = read_migration_session_at(&connection, card, "terminal", None).unwrap_err();
+        assert_eq!(invalid.to_string(), oversized.to_string());
+        connection
+            .execute("UPDATE terminal_recipes SET terminal_id='not-a-uuid'", [])
+            .unwrap();
+        assert!(matches!(
+            read_migration_session_at(&connection, card, "terminal", None),
+            Err(StoreError::InvalidUuid { .. })
+        ));
+        for edit in [
+            "UPDATE terminal_recipes SET terminal_id=CAST(x'80' AS TEXT)",
+            "UPDATE terminal_recipes SET terminal_id=x'616263'",
+            "UPDATE terminal_recipes SET terminal_id=NULL",
+        ] {
+            connection.execute(edit, []).unwrap();
+            assert!(read_migration_session_at(&connection, card, "terminal", None).is_err());
+        }
+        connection
+            .execute("DELETE FROM terminal_recipes", [])
+            .unwrap();
+        assert!(matches!(
+            read_migration_session_at(&connection, card, "terminal", None),
+            Err(StoreError::CorruptRow { .. })
+        ));
     }
 
     #[test]

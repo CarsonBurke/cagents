@@ -1140,6 +1140,82 @@ mod tests {
             .unwrap()
             .matches_terminal(id, &terminal)
         );
+        // UUID aliases are parsed by the unchanged normalized loader before
+        // its canonical transcript lookup. Budget that exact lookup even
+        // when the raw recipe key has no transcript metadata of its own.
+        let alias = terminal.id.to_string().replace('-', "");
+        let actual = Connection::open(&terminal_window).unwrap();
+        actual
+            .execute(
+                "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
+                params![alias, card.to_string()],
+            )
+            .unwrap();
+        drop(actual);
+        let before = (
+            std::fs::read(&terminal_window).unwrap(),
+            std::fs::read(&registry).unwrap(),
+        );
+        assert!(
+            inspect_completed_automation_pane(
+                &terminal_window,
+                &registry,
+                card,
+                &CardKind::Terminal(terminal.clone()),
+            )
+            .unwrap()
+            .unwrap()
+            .matches_terminal(id, &terminal)
+        );
+        assert_eq!(
+            before,
+            (
+                std::fs::read(&terminal_window).unwrap(),
+                std::fs::read(&registry).unwrap()
+            )
+        );
+        let path = std::path::PathBuf::from("p".repeat(MAX_SNAPSHOT_BYTES));
+        let actual = Connection::open(&terminal_window).unwrap();
+        actual.execute(
+            "INSERT INTO transcript_metadata(terminal_id,generation,path_json,byte_len,durable_offset,updated_at_unix_ms)
+             VALUES(?1,0,?2,0,0,1)",
+            params![terminal.id.to_string(), serde_json::to_string(&path).unwrap()],
+        ).unwrap();
+        drop(actual);
+        let mut with_path = terminal.clone();
+        with_path.transcript_path = Some(path);
+        let before = (
+            std::fs::read(&terminal_window).unwrap(),
+            std::fs::read(&registry).unwrap(),
+        );
+        assert_eq!(
+            inspect_completed_automation_pane(
+                &terminal_window,
+                &registry,
+                card,
+                &CardKind::Terminal(with_path),
+            )
+            .unwrap_err(),
+            "The source automation descriptor is invalid or exceeds its inspection limit"
+        );
+        assert_eq!(
+            before,
+            (
+                std::fs::read(&terminal_window).unwrap(),
+                std::fs::read(&registry).unwrap()
+            )
+        );
+        let actual = Connection::open(&terminal_window).unwrap();
+        actual
+            .execute("DELETE FROM transcript_metadata", [])
+            .unwrap();
+        actual
+            .execute(
+                "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
+                params![terminal.id.to_string(), card.to_string()],
+            )
+            .unwrap();
+        drop(actual);
         terminal.launch.working_directory = "/explicit-replacement".into();
         let actual = Connection::open(&terminal_window).unwrap();
         actual
