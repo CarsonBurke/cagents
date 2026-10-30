@@ -521,6 +521,99 @@ fn internal_request_is_bounded_to_window_context_and_rejects_unknown_capability_
 }
 
 #[test]
+fn new_window_retry_binds_one_explicit_target_without_changing_public_request_arguments() {
+    let request = Request::new(true, None, Some("window-2".into()), None, false).unwrap();
+    assert!(
+        request
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--new-window")
+    );
+    let first = request.bound_recovery_target().unwrap();
+    let retry = request.clone().bound_recovery_target().unwrap();
+    assert_eq!(
+        first.slot, retry.slot,
+        "all retries retain the first concrete destination"
+    );
+    assert_eq!(first.source, retry.source);
+    let prepared = request.for_recovery_target(&first);
+    let arguments = prepared.arguments();
+    assert!(!arguments.iter().any(|argument| argument == "--new-window"));
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--window", first.slot.as_str()])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--from-window", first.source.as_deref().unwrap()])
+    );
+    assert!(
+        request
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--new-window")
+    );
+}
+
+#[test]
+fn acquired_new_window_failure_serializes_actual_normalized_target_and_source() {
+    let mut request = Request::new(
+        true,
+        None,
+        Some("original-source".into()),
+        Some("build-host".into()),
+        false,
+    )
+    .unwrap();
+    request
+        .bind_acquired_window("device-0123456789abcdef", Some("device-fedcba9876543210"))
+        .unwrap();
+    let restored: Request =
+        serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+    assert_eq!(
+        restored.arguments(),
+        [
+            "--device",
+            "build-host",
+            "--device-window-scoped",
+            "--window",
+            "device-0123456789abcdef",
+            "--from-window",
+            "device-fedcba9876543210"
+        ]
+    );
+    let target = restored.bound_recovery_target().unwrap();
+    assert_eq!(target.slot, "device-0123456789abcdef");
+    assert_eq!(target.source.as_deref(), Some("device-fedcba9876543210"));
+}
+
+#[test]
+fn pending_incomplete_and_unknown_recovery_never_become_ready_or_admit_duplicate_open() {
+    assert_eq!(
+        finish_recovery_check(instance::startup_check::StartupDisposition::Pending),
+        Err(STARTUP_PENDING)
+    );
+    assert_eq!(
+        finish_recovery_check(instance::startup_check::StartupDisposition::RecoveryIncomplete),
+        Err(STARTUP_INCOMPLETE)
+    );
+    assert_eq!(
+        finish_recovery_check(instance::startup_check::StartupDisposition::Ready),
+        Ok(())
+    );
+    let request = Request::new(false, Some("window-2".into()), None, None, false).unwrap();
+    let target = request.bound_recovery_target().unwrap();
+    request.recovery.lock().unwrap().uncertain = true;
+    // An unknown launch keeps its original target even when a caller clones
+    // the request; clearing a spinner is never permission for a new target.
+    let again = request.clone().bound_recovery_target().unwrap();
+    assert_eq!(again.slot, target.slot);
+    assert!(request.recovery.lock().unwrap().uncertain);
+}
+
+#[test]
 fn lost_original_device_context_never_falls_back_to_a_local_open_or_activation() {
     let mut state = window(true);
     state.context_ready = false;

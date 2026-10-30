@@ -24,6 +24,8 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(feature = "ui")]
+pub(crate) mod startup_check;
 pub(crate) use daemon_admission::{
     DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
     inherit_daemon_fence,
@@ -1416,6 +1418,14 @@ pub struct UiActivation {
     pub token: Option<String>,
     pub session: Option<crate::model::TerminalId>,
     pub update: Option<UiUpdateRequest>,
+    pub startup: Option<UiStartupCheckRequest>,
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Clone)]
+pub struct UiStartupCheckRequest {
+    pub(crate) token: startup_check::StartupCheckToken,
+    pub(crate) response: std::sync::mpsc::SyncSender<String>,
 }
 
 #[cfg(feature = "ui")]
@@ -1959,6 +1969,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                         token,
                         session: None,
                         update: None,
+                        startup: None,
                     })
                     .is_err()
                 {
@@ -1973,6 +1984,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                         token,
                         session: Some(session),
                         update: None,
+                        startup: None,
                     })
                     .is_err()
                 {
@@ -1988,6 +2000,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                         token: None,
                         session: None,
                         update: Some(UiUpdateRequest { action, response }),
+                        startup: None,
                     })
                     .is_err()
                 {
@@ -1997,6 +2010,25 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .recv_timeout(Duration::from_secs(30))
                     .unwrap_or_else(|_| "error: window did not respond".into());
                 let _ = writeln!(&stream, "{response}");
+            }
+            Ok(ActivationRequest::Startup(token)) => {
+                let (response, receiver) = std::sync::mpsc::sync_channel(1);
+                if events
+                    .send_blocking(UiActivation {
+                        token: None,
+                        session: None,
+                        update: None,
+                        startup: Some(UiStartupCheckRequest { token, response }),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                // App replies immediately with a nonce-bound disposition;
+                // persistence and pane recovery run independently on its loop.
+                if let Ok(response) = receiver.recv_timeout(ACTIVATION_IO_TIMEOUT) {
+                    let _ = write!(&stream, "{response}");
+                }
             }
             Err(_) => {
                 let _ = writeln!(&stream, "error");
@@ -2011,6 +2043,7 @@ enum ActivationRequest {
     Session(crate::model::TerminalId, Option<String>),
     Shutdown,
     Update(UiUpdateAction),
+    Startup(startup_check::StartupCheckToken),
 }
 
 #[cfg(feature = "ui")]
@@ -2039,6 +2072,9 @@ fn read_capped_line(stream: &UnixStream) -> io::Result<String> {
 
 #[cfg(feature = "ui")]
 fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
+    if let Some(token) = startup_check::StartupCheckToken::parse_request(line)? {
+        return Ok(ActivationRequest::Startup(token));
+    }
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),

@@ -111,7 +111,7 @@ pub(crate) fn main_with_before_start(
 
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents::browser::ProcessShutdown;
-    let request = match cagents::update::startup::Request::new(
+    let mut request = match cagents::update::startup::Request::new(
         options.new_window,
         options.slot.map(str::to_owned),
         options.source.map(str::to_owned),
@@ -121,7 +121,7 @@ pub(crate) fn main_with_before_start(
         Ok(request) => request,
         Err(error) => return report(Err(error.into())),
     };
-    let result = run(options, failure_screen_owned);
+    let result = run(options, failure_screen_owned, &mut request);
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
@@ -320,7 +320,11 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
     Ok(Some(options))
 }
 
-fn run(options: Options<'_>, failure_screen_owned: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    options: Options<'_>,
+    failure_screen_owned: bool,
+    request: &mut cagents::update::startup::Request,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         new_window,
         slot,
@@ -365,6 +369,10 @@ fn run(options: Options<'_>, failure_screen_owned: bool) -> Result<(), Box<dyn s
         } else {
             cagents::device::window_slot(source)?
         };
+        // The lease has selected the original concrete new-window slot. Any
+        // later startup failure must carry this exact normalized destination
+        // and source into its detached Recovery Retry context.
+        request.bind_acquired_window(cagents::instance::window_slot(), device_source.as_deref())?;
         cagents::session::SessionRuntime::initialize_window(
             device_source
                 .as_deref()

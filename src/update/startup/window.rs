@@ -19,7 +19,56 @@ pub struct Request {
     source: Option<String>,
     device: Option<String>,
     scoped: bool,
+    /// In-process custody is never serialized into the public retry context.
+    #[serde(skip)]
+    recovery: std::sync::Arc<std::sync::Mutex<RecoveryState>>,
 }
+
+#[derive(Clone, Debug)]
+struct RecoveryTarget {
+    slot: String,
+    source: Option<String>,
+}
+
+#[derive(Clone)]
+struct RetainedRecovery {
+    monitor: crate::control::UiLaunchMonitor,
+    trusted: std::sync::Arc<instance::startup_check::TrustedUiExecutable>,
+}
+
+#[derive(Default)]
+struct RecoveryState {
+    target: Option<RecoveryTarget>,
+    retained: Option<RetainedRecovery>,
+    opening: bool,
+    uncertain: bool,
+}
+
+impl std::fmt::Debug for RecoveryState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryState")
+            .field("target", &self.target)
+            .field("retained", &self.retained.is_some())
+            .field("opening", &self.opening)
+            .finish()
+    }
+}
+
+struct RecoveryOpen(std::sync::Arc<std::sync::Mutex<RecoveryState>>);
+impl Drop for RecoveryOpen {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.opening = false;
+        }
+    }
+}
+
+const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_PENDING: &str =
+    "The requested window is still recovering. Keep its recovery controls open and check again.";
+const STARTUP_INCOMPLETE: &str = "The requested window has not completed recovery. Resolve its recovery notices, then retry this check.";
+const STARTUP_UNCONFIRMED: &str = "The original requested window could not be verified. It was not replaced; keep its recovery controls open and try again.";
 impl Request {
     pub fn new(
         new_window: bool,
@@ -34,6 +83,7 @@ impl Request {
             source,
             device,
             scoped,
+            recovery: Default::default(),
         };
         request.validate()?;
         Ok(request)
@@ -56,6 +106,66 @@ impl Request {
         self.validate()?;
         crate::device::select(self.device.as_deref())
             .map_err(|_| "The original device profile is no longer available.")
+    }
+    /// Once this launch has acquired a concrete slot, its detached failure
+    /// screen must retry that slot rather than allocate another new window.
+    pub fn bind_acquired_window(
+        &mut self,
+        slot: &str,
+        source: Option<&str>,
+    ) -> Result<(), &'static str> {
+        instance::validate_window_slot(slot).map_err(|_| "invalid acquired window")?;
+        if let Some(source) = source {
+            instance::validate_window_slot(source).map_err(|_| "invalid acquired window source")?;
+        }
+        self.new_window = false;
+        self.slot = Some(slot.to_owned());
+        self.source = source.map(str::to_owned);
+        // Both values were normalized by the actual acquiring entry point.
+        self.scoped = true;
+        self.recovery = Default::default();
+        Ok(())
+    }
+
+    fn recovery_target(&self) -> Result<RecoveryTarget, &'static str> {
+        let slot = if self.new_window {
+            // Allocate once in the parent, before any child can become a
+            // retained recovery window. The public --new-window contract is
+            // unchanged; only this retry's internal command is made explicit.
+            let name = format!("w-{}", uuid::Uuid::new_v4());
+            crate::device::window_slot(Some(&name))
+                .map_err(|_| "The requested window could not be identified.")?
+                .unwrap_or(name)
+        } else {
+            self.normalized_slot(self.slot.as_deref())?
+                .unwrap_or_else(|| instance::PRIMARY_WINDOW.into())
+        };
+        let source = self
+            .source
+            .as_deref()
+            .map(|source| self.normalized_slot(Some(source)))
+            .transpose()?
+            .flatten();
+        Ok(RecoveryTarget { slot, source })
+    }
+
+    fn for_recovery_target(&self, target: &RecoveryTarget) -> Self {
+        Self {
+            new_window: false,
+            slot: Some(target.slot.clone()),
+            source: target.source.clone(),
+            device: self.device.clone(),
+            scoped: true,
+            recovery: Default::default(),
+        }
+    }
+
+    fn bound_recovery_target(&self) -> Result<RecoveryTarget, &'static str> {
+        let mut state = self.recovery.lock().map_err(|_| STARTUP_UNCONFIRMED)?;
+        if state.target.is_none() {
+            state.target = Some(self.recovery_target()?);
+        }
+        Ok(state.target.clone().unwrap())
     }
     /// Retry the same public request through ordinary startup and readiness.
     /// Callers keep their recovery screen until this returns successfully.
@@ -399,13 +509,102 @@ fn reopen(request: &Request) -> Result<(), &'static str> {
     if let Some(reason) = super::observe().opening_refusal() {
         return Err(reason);
     }
-    if !request.new_window && request.focus()? {
-        return Ok(());
+    let target = request.bound_recovery_target()?;
+    let retained = {
+        let mut state = request.recovery.lock().map_err(|_| STARTUP_UNCONFIRMED)?;
+        if state.opening || state.uncertain {
+            return Err(STARTUP_UNCONFIRMED);
+        }
+        if state.retained.as_ref().is_some_and(|retained| {
+            retained.monitor.status() == crate::control::UiLaunchStatus::Exited
+        }) {
+            state.retained = None;
+        }
+        state.opening = true;
+        state.retained.clone()
+    };
+    let _opening = RecoveryOpen(request.recovery.clone());
+    if let Some(retained) = retained {
+        let disposition = retained
+            .monitor
+            .with_live_child(|child| {
+                if retained.monitor.status() == crate::control::UiLaunchStatus::Ready {
+                    return Ok(instance::startup_check::StartupDisposition::Ready);
+                }
+                instance::startup_check::ExactStartupTarget::connect(
+                    &target.slot,
+                    request.device.as_deref(),
+                    std::slice::from_ref(retained.trusted.as_ref()),
+                    STARTUP_CHECK_TIMEOUT,
+                )?
+                .require_original_child(child)?
+                .check(STARTUP_CHECK_TIMEOUT)
+            })
+            .map_err(|_| STARTUP_UNCONFIRMED)?;
+        return finish_recovery_check(disposition);
     }
     let executable = crate::update::superseding_ui()
         .or_else(|| std::env::current_exe().ok())
         .ok_or("The cagents executable could not be found.")?;
-    wait_for_reopen(&mut reopen_command(&executable, request))
+    let trusted = std::sync::Arc::new(
+        instance::startup_check::TrustedUiExecutable::open(&executable)
+            .map_err(|_| STARTUP_UNCONFIRMED)?,
+    );
+    let selected = request.for_recovery_target(&target);
+    if !request.new_window && selected.focus()? {
+        let disposition = instance::startup_check::ExactStartupTarget::connect(
+            &target.slot,
+            request.device.as_deref(),
+            std::slice::from_ref(trusted.as_ref()),
+            STARTUP_CHECK_TIMEOUT,
+        )
+        .and_then(|target| target.check(STARTUP_CHECK_TIMEOUT))
+        .map_err(|_| STARTUP_UNCONFIRMED)?;
+        return finish_recovery_check(disposition);
+    }
+    // If this task panics after starting a child, no subsequent Retry may
+    // assume that the child never existed and launch another one.
+    request
+        .recovery
+        .lock()
+        .map_err(|_| STARTUP_UNCONFIRMED)?
+        .uncertain = true;
+    let launched =
+        crate::control::spawn_ui_process_monitored(&mut reopen_command(&executable, &selected));
+    let mut state = request.recovery.lock().map_err(|_| STARTUP_UNCONFIRMED)?;
+    match launched {
+        Ok(crate::control::UiLaunchOutcome::Ready) => {
+            state.uncertain = false;
+            Ok(())
+        }
+        Ok(crate::control::UiLaunchOutcome::Retained(monitor)) => {
+            let pending = monitor.status() == crate::control::UiLaunchStatus::Pending;
+            state.retained = Some(RetainedRecovery { monitor, trusted });
+            state.uncertain = false;
+            Err(if pending {
+                STARTUP_PENDING
+            } else {
+                STARTUP_INCOMPLETE
+            })
+        }
+        Err(error) => {
+            state.uncertain =
+                error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string();
+            Err(
+                "cagents did not confirm startup. Check diagnostics or try again; your requested window is still selected.",
+            )
+        }
+    }
+}
+
+fn finish_recovery_check(
+    disposition: instance::startup_check::StartupDisposition,
+) -> Result<(), &'static str> {
+    match disposition {
+        instance::startup_check::StartupDisposition::Ready => Ok(()),
+        instance::startup_check::StartupDisposition::Pending => Err(STARTUP_PENDING),
+        instance::startup_check::StartupDisposition::RecoveryIncomplete => Err(STARTUP_INCOMPLETE),
+    }
 }
 fn wait_for_reopen(command: &mut Command) -> Result<(), &'static str> {
     crate::control::spawn_ui_process(command)
