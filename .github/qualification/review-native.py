@@ -200,8 +200,20 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
         raise RuntimeError('The actual review file row is unreachable by native Tab')
     assert int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5)) == int(window)
     before_keyboard = wait(selected_cache)
+    keyboard_target = wait(lambda: snapshot(owned_row))
+    keyboard_target['row'].clearCache()
+    assert keyboard_target['row'].getState().contains(atspi.STATE_FOCUSED)
+    keyboard_started = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    event({'event': 'native-review-keyboard-target', 'window': int(window), 'pid': pid,
+           'name': keyboard_target['row'].name, 'role': keyboard_target['row'].getRoleName(),
+           'focused': True, 'enabled': True, 'row_bounds': keyboard_target['row_bounds'],
+           'boottime_ns': keyboard_started, 'before_write_order': before_keyboard['write_order']})
     run(['xdotool', 'key', '--clearmodifiers', 'Return'])
-    keyboard_selection = wait(lambda: selected_cache(before_keyboard['write_order']))
+    # Cache writes capture CLOCK_BOOTTIME on the UI thread before dispatch.
+    # An older queued write cannot qualify this newly observed native Enter.
+    keyboard_selection = wait(lambda: selected_cache(max(before_keyboard['write_order'], keyboard_started)))
+    event({'event': 'native-review-keyboard-processed', 'keyboard_started_boottime_ns': keyboard_started,
+           'selection': keyboard_selection})
     capture(window, label + '-keyboard-selected-narrow', (900, 700), neutral_pointer=True)
     stop(ui)
     calls = [json.loads(line) for line in (root / 'gh-calls.jsonl').read_text().splitlines()]
@@ -230,7 +242,7 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
     assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
     result = {'launch': launch, 'frames': frames, 'delivered_cases': sorted(required),
               'pointer_selection': pointer_selection, 'before_keyboard': before_keyboard,
-              'keyboard_selection': keyboard_selection,
+              'keyboard_selection': keyboard_selection, 'keyboard_started_boottime_ns': keyboard_started,
               'scope': 'Actual native saved-card/list/review/conversation/count/hover/row interaction with synthetic unauthenticated data. Independent pixel UX review required; no real GitHub auth/tracking or mutations claimed.'}
     (out / (label + '-receipt.json')).write_text(json.dumps(result, indent=2) + '\n')
     event({'event': 'diagnostic-arm-completed', 'revision': revision})
