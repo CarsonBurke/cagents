@@ -1,4 +1,5 @@
 mod account_lifecycle;
+mod account_preparation;
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;

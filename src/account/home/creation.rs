@@ -16,6 +16,7 @@ pub(crate) struct NewHomeCreationReceipt {
     parent_path: PathBuf,
     parent: fs::File,
     directory: fs::File,
+    namespace: super::super::durability::Directories,
 }
 impl NewHomeCreationReceipt {
     pub(crate) fn provider(&self) -> Provider {
@@ -37,6 +38,13 @@ impl NewHomeCreationReceipt {
         crate::secure_file::reject_symlink_components(&self.path)?;
         same_directory(&self.parent, &self.parent_path)?;
         same_directory(&self.directory, &self.path)
+    }
+
+    pub(crate) fn sync_completed(&self) -> io::Result<()> {
+        self.revalidate()?;
+        self.directory.sync_all()?;
+        self.namespace.sync()?;
+        self.revalidate()
     }
 }
 fn same_directory(held: &fs::File, path: &Path) -> io::Result<()> {
@@ -71,6 +79,7 @@ pub(super) fn create(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&parent_path)?;
     same_directory(&parent, &parent_path)?;
+    let namespace = super::super::durability::Directories::capture(&parent_path)?;
     let name = key.hyphenated().to_string();
     let c_name = std::ffi::CString::new(name.as_bytes()).expect("UUID has no zero byte");
     // SAFETY: the retained parent and CString outlive mkdirat. No recursive
@@ -101,6 +110,7 @@ pub(super) fn create(
         parent_path,
         parent,
         directory,
+        namespace,
     };
     created.revalidate()?;
     Ok(created)
