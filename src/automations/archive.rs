@@ -200,6 +200,12 @@ fn closed_pane_matches(
                 {
                     return false;
                 }
+                if let crate::model::TerminalContinuity::RelaunchAvailable { recipe, .. } =
+                    &current.continuity
+                    && recipe != &original.launch
+                {
+                    return false;
+                }
                 let mut original = original.clone();
                 if matches!(
                     current.continuity,
@@ -534,6 +540,108 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn terminal_archive_requires_the_original_nested_relaunch_recipe() {
+        use crate::model::{
+            CardKind, LaunchRecipe, TerminalContinuity, TerminalExit, TerminalSession,
+        };
+        let (id, native, mut archive) = fixture();
+        let proof = native.proof.clone().unwrap();
+        let original = TerminalSession {
+            id: native.id,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: LaunchRecipe {
+                program: "cagents".into(),
+                arguments: vec!["agent".into(), "console".into(), id.to_string()],
+                working_directory: "/fixture".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            },
+        };
+        assert_ne!(original.launch, native.launch.recipe);
+        archive.agent.console = Some(original.clone());
+        for exit in [
+            TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+            TerminalExit {
+                code: Some(1),
+                signal: None,
+                occurred_at_unix_ms: 2,
+            },
+            TerminalExit {
+                code: None,
+                signal: Some("TERM".into()),
+                occurred_at_unix_ms: 3,
+            },
+        ] {
+            for continuity in [
+                original.continuity.clone(),
+                TerminalContinuity::Exited {
+                    last_exit: exit.clone(),
+                },
+                TerminalContinuity::RelaunchAvailable {
+                    recipe: original.launch.clone(),
+                    last_exit: Some(exit.clone()),
+                },
+            ] {
+                let mut current = original.clone();
+                current.continuity = continuity;
+                let receipt = ArchivedPaneReadiness::qualify_kind(
+                    id,
+                    &CardKind::Terminal(current.clone()),
+                    &archive,
+                )
+                .unwrap();
+                assert!(receipt.matches_terminal(id, &current));
+            }
+            for field in 0..6 {
+                let mut recipe = original.launch.clone();
+                match field {
+                    0 => recipe.program = "replacement".into(),
+                    1 => recipe.arguments.push("replacement".into()),
+                    2 => recipe.working_directory = "/replacement".into(),
+                    3 => {
+                        recipe.environment.insert("REPLACEMENT".into(), "1".into());
+                    }
+                    4 => {
+                        recipe.unset_environment.insert("REPLACEMENT".into());
+                    }
+                    _ => recipe = native.launch.recipe.clone(),
+                }
+                let mut current = original.clone();
+                current.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: Some(exit.clone()),
+                };
+                assert!(ArchivedPaneReadiness::qualify_kind(
+                    id, &CardKind::Terminal(current), &archive,
+                ).is_err(), "changed nested recipe field {field}");
+            }
+        }
+        let mut pending = original.clone();
+        pending.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: original.launch.clone(),
+            last_exit: None,
+        };
+        assert!(
+            ArchivedPaneReadiness::qualify_kind(id, &CardKind::Terminal(pending), &archive,)
+                .is_err()
+        );
+        assert_eq!(archive.agent.console.as_ref(), Some(&original));
+    }
+
     #[cfg(feature = "host")]
     fn inspection_text_source(
         workspace: &str,
@@ -905,16 +1013,22 @@ mod tests {
             .is_none(),
             "an ordinary baseline terminal with NULL content is not an archive"
         );
-        for ended in [false, true] {
-            if ended {
-                terminal.continuity = crate::model::TerminalContinuity::Exited {
-                    last_exit: crate::model::TerminalExit {
-                        code: Some(0),
-                        signal: None,
-                        occurred_at_unix_ms: 1,
-                    },
-                };
-            }
+        let exit = crate::model::TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 1,
+        };
+        for continuity in [
+            terminal.continuity.clone(),
+            crate::model::TerminalContinuity::Exited {
+                last_exit: exit.clone(),
+            },
+            crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: terminal.launch.clone(),
+                last_exit: Some(exit.clone()),
+            },
+        ] {
+            terminal.continuity = continuity;
             workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
             receipt = store
                 .save_workspace(
@@ -948,6 +1062,84 @@ mod tests {
                 )
             );
         }
+        // Mutate the raw normalized descriptor and the caller's descriptor
+        // together, so refusal must come from archive qualification rather
+        // than the preceding saved/current equality check.
+        let valid = terminal.clone();
+        for field in 0..5 {
+            let mut changed = valid.clone();
+            let crate::model::TerminalContinuity::RelaunchAvailable { recipe, .. } =
+                &mut changed.continuity
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => recipe.program = "replacement".into(),
+                1 => recipe.arguments.push("replacement".into()),
+                2 => recipe.working_directory = "/replacement".into(),
+                3 => {
+                    recipe.environment.insert("REPLACEMENT".into(), "1".into());
+                }
+                _ => {
+                    recipe.unset_environment.insert("REPLACEMENT".into());
+                }
+            }
+            let actual = Connection::open(&terminal_window).unwrap();
+            actual
+                .execute(
+                    "UPDATE terminal_recipes SET continuity_json=?1 WHERE card_id=?2",
+                    params![
+                        serde_json::to_string(&changed.continuity).unwrap(),
+                        card.to_string()
+                    ],
+                )
+                .unwrap();
+            drop(actual);
+            let before = (
+                std::fs::read(&terminal_window).unwrap(),
+                std::fs::read(&registry).unwrap(),
+            );
+            assert!(
+                inspect_completed_automation_pane(
+                    &terminal_window,
+                    &registry,
+                    card,
+                    &CardKind::Terminal(changed),
+                )
+                .unwrap()
+                .is_none(),
+                "changed nested recipe field {field} is not an archive"
+            );
+            assert_eq!(
+                before,
+                (
+                    std::fs::read(&terminal_window).unwrap(),
+                    std::fs::read(&registry).unwrap()
+                )
+            );
+        }
+        let actual = Connection::open(&terminal_window).unwrap();
+        actual
+            .execute(
+                "UPDATE terminal_recipes SET continuity_json=?1 WHERE card_id=?2",
+                params![
+                    serde_json::to_string(&valid.continuity).unwrap(),
+                    card.to_string()
+                ],
+            )
+            .unwrap();
+        drop(actual);
+        assert!(
+            inspect_completed_automation_pane(
+                &terminal_window,
+                &registry,
+                card,
+                &CardKind::Terminal(valid),
+            )
+            .unwrap()
+            .unwrap()
+            .matches_terminal(id, &terminal)
+        );
         terminal.launch.working_directory = "/explicit-replacement".into();
         let actual = Connection::open(&terminal_window).unwrap();
         actual
