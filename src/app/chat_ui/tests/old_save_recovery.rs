@@ -1,53 +1,433 @@
 // Evidence for the old 582a054bc save-refusal route, not a production repair.
-// Every parent runs only itself in a private exact-ELF child. No returned UI,
-// Skills, probe, first-send or provider task is polled, except the update's
-// settings-save / real session-flush task below. The original constructor's
-// persistable environment projection is deliberately unchanged and never logged.
+// Child execution is qualified only by retained original output, an exact
+// libtest census and the target body's unique entry receipt. No raw child
+// summaries or environment/recipe values are forwarded to outer Cargo output.
 use super::*;
 use cosmic::iced::futures::StreamExt;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::os::unix::fs::DirBuilderExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::{
+    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    process::ExitStatusExt,
+};
 
 const CHILD_ROOT: &str = "CAGENTS_TEST_1995_OLD_RECOVERY_ROOT";
+const CHILD_SELECTOR: &str = "CAGENTS_TEST_1995_OLD_RECOVERY_SELECTOR";
+const EVIDENCE_ROOT: &str = "CAGENTS_TEST_1995_RECOVERY_EVIDENCE_ROOT";
 const WAIT: Duration = Duration::from_secs(10);
+const PROTOCOL_LIMIT: u64 = 8 * 1024;
+const PARSE_LIMIT: u64 = 64 * 1024;
+const SELECTORS: [(&str, &str); 5] = [
+    (
+        "identical_permission_choice_and_retry_leave_old_refusal_unrepaired",
+        "app::chat_ui::tests::old_save_recovery::identical_permission_choice_and_retry_leave_old_refusal_unrepaired",
+    ),
+    (
+        "permission_round_trip_requires_full_checkpoint_and_preserves_captured_window",
+        "app::chat_ui::tests::old_save_recovery::permission_round_trip_requires_full_checkpoint_and_preserves_captured_window",
+    ),
+    (
+        "identical_account_descriptor_does_not_repair_old_refusal",
+        "app::chat_ui::tests::old_save_recovery::identical_account_descriptor_does_not_repair_old_refusal",
+    ),
+    (
+        "account_round_trip_is_not_a_preserve_all_draft_repair",
+        "app::chat_ui::tests::old_save_recovery::account_round_trip_is_not_a_preserve_all_draft_repair",
+    ),
+    (
+        "permission_round_trip_does_not_preserve_a_noncanonical_original_recipe",
+        "app::chat_ui::tests::old_save_recovery::permission_round_trip_does_not_preserve_a_noncanonical_original_recipe",
+    ),
+];
+const PRIVATE_ROOTS: [(&str, &str); 6] = [
+    ("HOME", "home"),
+    ("XDG_CONFIG_HOME", "config"),
+    ("XDG_DATA_HOME", "data"),
+    ("XDG_STATE_HOME", "state"),
+    ("XDG_CACHE_HOME", "cache"),
+    ("XDG_RUNTIME_DIR", "runtime"),
+];
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildLaunch {
+    version: u8,
+    selector: String,
+    nonce: uuid::Uuid,
+    parent_pid: u32,
+    elf: FileIdentity,
+    evidence_device: u64,
+    evidence_inode: u64,
+    case_name: String,
+    case_device: u64,
+    case_inode: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildEntry {
+    version: u8,
+    selector: String,
+    nonce: uuid::Uuid,
+    parent_pid: u32,
+    child_pid: u32,
+    elf: FileIdentity,
+    case_device: u64,
+    case_inode: u64,
+}
+
+fn private_directory(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    // The UID is only a filesystem ownership check, never caller authority.
+    if !path.is_absolute()
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+        || std::fs::canonicalize(path)? != path
+    {
+        return Err(std::io::Error::other(
+            "unqualified private evidence directory",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn private_file(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let held = file.metadata()?;
+    let named = std::fs::symlink_metadata(path)?;
+    if !held.is_file()
+        || named.file_type().is_symlink()
+        || held.uid() != unsafe { libc::geteuid() }
+        || held.mode() & 0o7777 != 0o600
+        || held.nlink() != 1
+        || held.dev() != named.dev()
+        || held.ino() != named.ino()
+    {
+        return Err(std::io::Error::other("unqualified private evidence file"));
+    }
+    Ok(())
+}
+
+fn new_evidence(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    private_file(&file, path)?;
+    Ok(file)
+}
+
+fn write_receipt(path: &Path, receipt: &impl serde::Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(receipt)
+        .map_err(|_| std::io::Error::other("test receipt serialization failed"))?;
+    if bytes.len() as u64 > PROTOCOL_LIMIT {
+        return Err(std::io::Error::other("oversized test receipt"));
+    }
+    let mut file = new_evidence(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    private_file(&file, path)
+}
+
+fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    private_file(&file, path)?;
+    if file.metadata()?.len() > PROTOCOL_LIMIT {
+        return Err(std::io::Error::other("oversized test receipt"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(PROTOCOL_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    private_file(&file, path)?;
+    if bytes.len() as u64 > PROTOCOL_LIMIT {
+        return Err(std::io::Error::other("oversized test receipt"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| std::io::Error::other("invalid test receipt"))
+}
+
+fn own_elf() -> std::io::Result<FileIdentity> {
+    // This is the original executable retained by our own process, even if
+    // another later build legitimately replaces the target pathname.
+    Ok(FileIdentity::of(
+        &std::fs::File::open("/proc/self/exe")?.metadata()?,
+    ))
+}
+
+fn original_log(file: &mut std::fs::File, path: &Path) -> std::io::Result<Vec<u8>> {
+    file.sync_all()?;
+    private_file(file, path)?;
+    if file.metadata()?.len() > PARSE_LIMIT {
+        return Err(std::io::Error::other(
+            "child output exceeds strict parsing bound",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(PARSE_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > PARSE_LIMIT {
+        return Err(std::io::Error::other(
+            "child output exceeds strict parsing bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn one_child_test(stdout: &[u8], selector: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let running = lines
+        .iter()
+        .filter(|line| line.starts_with("running "))
+        .collect::<Vec<_>>();
+    let rows = lines
+        .iter()
+        .filter(|line| line.starts_with("test ") && !line.starts_with("test result:"))
+        .collect::<Vec<_>>();
+    let summaries = lines
+        .iter()
+        .filter(|line| line.starts_with("test result:"))
+        .collect::<Vec<_>>();
+    if running.len() != 1
+        || *running[0] != "running 1 test"
+        || rows.len() != 1
+        || *rows[0] != format!("test {selector} ... ok")
+        || summaries.len() != 1
+    {
+        return false;
+    }
+    let Some(tail) =
+        summaries[0].strip_prefix("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+    else {
+        return false;
+    };
+    let Some((filtered, elapsed)) = tail.split_once(" filtered out; finished in ") else {
+        return false;
+    };
+    !filtered.is_empty()
+        && filtered.bytes().all(|byte| byte.is_ascii_digit())
+        && filtered.parse::<u64>().is_ok()
+        && elapsed
+            .strip_suffix('s')
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|value| value.is_finite() && value >= 0.0)
+}
 
 fn isolated_parent(name: &str) -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os(CHILD_ROOT) {
-        let root = PathBuf::from(root);
-        assert!(root.is_absolute(), "fixture root must be absolute");
+    let selector = SELECTORS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, selector)| *selector)
+        .expect("unknown recovery parent selector");
+    let child_root = std::env::var_os(CHILD_ROOT);
+    let child_selector = std::env::var_os(CHILD_SELECTOR);
+    assert!(
+        child_root.is_some() == child_selector.is_some(),
+        "unexpected ambient recovery child marker",
+    );
+    let evidence = PathBuf::from(
+        std::env::var_os(EVIDENCE_ROOT)
+            .expect("fixed executor must supply the private evidence root"),
+    );
+    let evidence_metadata =
+        private_directory(&evidence).expect("private evidence root qualification");
+    let launch_path = evidence.join(format!("{name}.launch.json"));
+    let entry_path = evidence.join(format!("{name}.entry.json"));
+    let status_path = evidence.join(format!("{name}.status.json"));
+    let elf = own_elf().expect("original own test ELF identity");
+
+    if let Some(child_selector) = child_selector {
+        assert!(
+            child_selector.to_str() == Some(selector),
+            "unexpected recovery child selector"
+        );
+        let launch: ChildLaunch =
+            read_receipt(&launch_path).expect("matching parent launch receipt");
+        assert!(
+            launch.version == 2
+                && launch.selector == selector
+                && !launch.nonce.is_nil()
+                && launch.parent_pid == unsafe { libc::getppid() } as u32
+                && launch.elf == elf
+                && launch.evidence_device == evidence_metadata.dev()
+                && launch.evidence_inode == evidence_metadata.ino()
+                && launch.case_name.starts_with(&format!(".{name}-"))
+                && Path::new(&launch.case_name).components().count() == 1,
+            "recovery child does not match the retained parent launch",
+        );
+        let root = PathBuf::from(child_root.expect("paired child root"));
+        assert!(
+            root == evidence.join(&launch.case_name),
+            "unexpected child root"
+        );
+        let metadata = private_directory(&root).expect("private child root qualification");
+        assert!(
+            metadata.dev() == launch.case_device && metadata.ino() == launch.case_inode,
+            "child root incarnation changed",
+        );
+        for (variable, leaf) in PRIVATE_ROOTS {
+            let expected = root.join(leaf);
+            assert!(
+                std::env::var_os(variable).as_deref() == Some(expected.as_os_str()),
+                "private child directory binding changed",
+            );
+            private_directory(&expected).expect("private child directory qualification");
+        }
+        // Reached only inside this actual named target body; a zero-test
+        // child cannot create the unique entry receipt.
+        write_receipt(
+            &entry_path,
+            &ChildEntry {
+                version: 2,
+                selector: selector.into(),
+                nonce: launch.nonce,
+                parent_pid: launch.parent_pid,
+                child_pid: std::process::id(),
+                elf,
+                case_device: metadata.dev(),
+                case_inode: metadata.ino(),
+            },
+        )
+        .expect("unique actual target entry receipt");
         return Some(root);
     }
-    let root = tempfile::tempdir().expect("private recovery fixture root");
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+
+    let root = tempfile::Builder::new()
+        .prefix(&format!(".{name}-"))
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(&evidence)
+        .expect("explicitly private outer fixture root")
+        .keep();
+    let root_metadata =
+        private_directory(root.as_path()).expect("private outer root qualification");
+    let executable = std::env::current_exe().expect("own executable pathname");
+    assert!(
+        FileIdentity::of(&std::fs::metadata(&executable).expect("test executable metadata")) == elf,
+        "test executable pathname no longer names the original ELF",
+    );
+    let launch = ChildLaunch {
+        version: 2,
+        selector: selector.into(),
+        nonce: uuid::Uuid::new_v4(),
+        parent_pid: std::process::id(),
+        elf,
+        evidence_device: evidence_metadata.dev(),
+        evidence_inode: evidence_metadata.ino(),
+        case_name: root.as_path().file_name().unwrap().to_str().unwrap().into(),
+        case_device: root_metadata.dev(),
+        case_inode: root_metadata.ino(),
+    };
+    write_receipt(&launch_path, &launch).expect("unique parent launch receipt");
+    let stdout_path = evidence.join(format!("{name}.stdout"));
+    let stderr_path = evidence.join(format!("{name}.stderr"));
+    let mut stdout = new_evidence(&stdout_path).expect("unique original child stdout");
+    let mut stderr = new_evidence(&stderr_path).expect("unique original child stderr");
+    let mut command = std::process::Command::new(executable);
     command.args([
         "--exact",
-        &format!("{}::{name}", module_path!()),
+        selector,
+        "--test-threads=1",
+        "--color=never",
         "--nocapture",
     ]);
-    command.env(CHILD_ROOT, root.path());
-    for (name, leaf) in [
-        ("HOME", "home"),
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_STATE_HOME", "state"),
-        ("XDG_CACHE_HOME", "cache"),
-        ("XDG_RUNTIME_DIR", "runtime"),
-    ] {
-        let path = root.path().join(leaf);
+    command
+        .env(CHILD_ROOT, root.as_path())
+        .env(CHILD_SELECTOR, selector);
+    for (variable, leaf) in PRIVATE_ROOTS {
+        let path = root.as_path().join(leaf);
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .unwrap();
-        command.env(name, path);
+        private_directory(&path).expect("private child directory qualification");
+        command.env(variable, path);
     }
-    // Inherit the natural caller context. Never clear/replace authority or
-    // provider variables, choose a profile, or switch the device route.
-    let output = command.output().expect("own exact recovery test child");
+    // Inherit natural Agent/auth/profile/device context. Only test-private
+    // routing and the six explicitly private filesystem roots are changed.
+    command.stdout(std::process::Stdio::from(stdout.try_clone().unwrap()));
+    command.stderr(std::process::Stdio::from(stderr.try_clone().unwrap()));
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            write_receipt(&status_path, &serde_json::json!({
+                "version": 2, "selector": selector, "spawn_error_kind": format!("{:?}", error.kind()),
+                "original_child_status": null, "qualified": false,
+            })).expect("retained spawn failure receipt");
+            panic!("recovery child spawn failed; see private status receipt");
+        }
+    };
+    let child_pid = child.id();
+    let waited = child.wait();
+    let original_stdout = original_log(&mut stdout, &stdout_path);
+    let original_stderr = original_log(&mut stderr, &stderr_path);
+    let entry = read_receipt::<ChildEntry>(&entry_path).ok();
+    let entry_valid = entry.is_some_and(|entry| {
+        entry.version == 2
+            && entry.selector == selector
+            && entry.nonce == launch.nonce
+            && entry.parent_pid == launch.parent_pid
+            && entry.child_pid == child_pid
+            && entry.elf == launch.elf
+            && entry.case_device == launch.case_device
+            && entry.case_inode == launch.case_inode
+    });
+    let census = original_stdout
+        .as_ref()
+        .is_ok_and(|bytes| one_child_test(bytes, selector));
+    let status_ok = waited.as_ref().is_ok_and(|status| status.success());
+    let logs_ok = original_stdout.is_ok() && original_stderr.is_ok();
+    let qualified = status_ok && logs_ok && census && entry_valid;
+    write_receipt(&status_path, &serde_json::json!({
+        "version": 2, "selector": selector, "nonce": launch.nonce, "child_pid": child_pid,
+        "original_exit_code": waited.as_ref().ok().and_then(|status| status.code()),
+        "original_signal": waited.as_ref().ok().and_then(|status| status.signal()),
+        "wait_error_kind": waited.as_ref().err().map(|error| format!("{:?}", error.kind())),
+        "child_wait_completed": waited.is_ok(), "original_status_success": status_ok,
+        "raw_logs_readable_within_bound": logs_ok,
+        "strict_one_test_census": census, "matching_actual_entry": entry_valid,
+        "stdout_sha256": original_stdout.as_ref().ok().map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+        "stderr_sha256": original_stderr.as_ref().ok().map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+        "qualified": qualified,
+    })).expect("retained original child status receipt");
+    // Both successful and failing raw outputs remain private original files.
+    // Oversize/unknown output is unqualified, never truncated into a PASS.
+    // A wait error is a failure; the future c17 executor must settle the whole
+    // family before releasing C, since dropping Child alone is not settlement.
     assert!(
-        output.status.success(),
-        "isolated recovery child failed (only categorical assertions are emitted): {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        qualified,
+        "recovery child unqualified; inspect private per-selector evidence"
     );
     None
 }
