@@ -676,10 +676,19 @@ fn catalog_changes(
         .iter()
         .map(|(record, _)| (record.id, open(record)))
         .collect::<HashMap<_, _>>();
-    removed.extend(listed.iter().filter_map(|(record, _)| {
+    // The writer keeps the last row for an identity. Compare only that row:
+    // an earlier duplicate must not become the sole delta when the final row
+    // already matches the durable baseline.
+    let first_change = removed.len();
+    let mut seen = HashSet::new();
+    removed.extend(listed.iter().rev().filter_map(|(record, _)| {
+        if !seen.insert(record.id) {
+            return None;
+        }
         let current = open(record);
         (previous.get(&record.id) != Some(&current)).then_some(current)
     }));
+    removed[first_change..].reverse();
     removed
 }
 
@@ -1558,6 +1567,85 @@ mod tests {
             &Default::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn catalog_deltas_preserve_the_final_duplicate_identity_through_the_session_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let mut winner = snapshot.worktrees[0].clone();
+        winner.0.branch = Some("refs/heads/winner".into());
+        snapshot.worktrees.push(winner);
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-duplicate-winner"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        writer.save_project(project.clone());
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(catalog_plan(project.id, &snapshot)))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let baseline = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(baseline.branch.as_deref(), Some("winner"));
+        assert!(baseline.existence.is_open());
+
+        for shadow in ["main", "changed-shadow"] {
+            snapshot.worktrees[0].0.branch = Some(format!("refs/heads/{shadow}"));
+            drop(app.update_git(Action::Read {
+                project: project.id,
+                generation: 1,
+                result: Ok((snapshot.clone(), None)),
+            }));
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                store.load_worktree(id).unwrap().unwrap(),
+                baseline,
+                "an unchanged final row must retain its exact durable generation and fields"
+            );
+        }
+        snapshot.worktrees[1].0.branch = Some("refs/heads/new-winner".into());
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let changed = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(changed.branch.as_deref(), Some("new-winner"));
+        assert_eq!(changed.path, baseline.path);
+        assert!(changed.generation > baseline.generation);
+
+        snapshot.worktrees[0].0.branch = Some("refs/heads/another-shadow".into());
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, None)),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.load_worktree(id).unwrap().unwrap(), changed);
     }
 
     #[test]
