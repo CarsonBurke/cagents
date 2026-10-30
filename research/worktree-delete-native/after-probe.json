@@ -3,7 +3,7 @@
   "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
   "never_merge": true,
   "status": "CORRECTIVE_SOURCE_CANDIDATE_FROZEN_HELPER_FRESH_CALLER_REVIEW_REQUIRED_UNGRANTED_UNRUN",
-  "parent_control_head": "e5df18083991feeef58fd054de500afd404ef822",
+  "parent_control_head": "935d94f2ce7b8c228c5f3fe4422a5de031ef3b20",
   "after": {
     "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
     "tree": "7d84da268933045b1add2ad310ce45c84be751db"
@@ -338,6 +338,12 @@
       "review": "/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json",
       "review_sha256": "9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f"
     },
-    "caller_effect_guards": "Private endpoint and original absolute-budget guard immediately before each fresh Xlib/XTest effect/query. Closed AX adapter exposes only existing read APIs with pre/post guard, no fallback or per-read retry; complete read-only query owns existing stale retry. Input key/click/shortcut and XQueryTree buffers release on successful sequential paths only, never in an effect finally after BaseException."
+    "caller_effect_guards": "Private endpoint and original absolute-budget guard immediately before each fresh Xlib/XTest effect/query. Closed AX adapter exposes only existing read APIs with pre/post guard, no fallback or per-read retry; complete read-only query owns existing stale retry. Input key/click/shortcut and XQueryTree buffers release on successful sequential paths only, never in an effect finally after BaseException.",
+    "snapshot_retry_routing": "Caller binds the exact original snapshot body to current bounded complete-query a11y_read. The definition-time old snapshot wrapper is unreachable through the bound controller; no legacy .05s retry sleep after expiry. AX adapter still performs no individual-read retry.",
+    "preserved_R1_successor": {
+      "head": "935d94f2ce7b8c228c5f3fe4422a5de031ef3b20",
+      "tree": "058b081cb009ffb7c71e9c9b2f7d1f3e13822c25",
+      "scope": "Immutable R1 guarded-caller source candidate; exact snapshot successor requires fresh source review."
+    }
   }
 }

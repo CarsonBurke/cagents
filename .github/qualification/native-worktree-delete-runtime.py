@@ -224,6 +224,13 @@ def bind(native, desktop, context):
             return result
         return read_tree()
 
+    @a11y_read
+    def snapshot(pid, name):
+        nodes = tree(pid)
+        assert nodes, 'PID-filtered native accessibility tree disappeared'
+        native.put(native.OUT / (name + '-a11y.json'), dict(pid=pid, monotonic=time.monotonic(),
+            nodes=[native.describe(node) for node in nodes]))
+
     def viewport(window, size):
         desktop.require_private_desktop()
         native.query(['windowactivate', '--sync', window])
@@ -543,6 +550,7 @@ def bind(native, desktop, context):
     native.guard, native.digest, native.processes = guard, digest, processes
     native.private_env, native.spawn, native.cmd = private_env, spawn, cmd
     native.tree, native.a11y_read, native.viewport = tree, a11y_read, viewport
+    native.snapshot = snapshot
     native.wait, native.cancelled = wait, cancelled
     native.check_native_budget, native.begin_probe_cleanup = budget, begin_cleanup
     native.poll_owned, native.reap_owned, native.bounded_sleep = poll, reap, sleep

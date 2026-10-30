@@ -22,7 +22,7 @@ import sys
 import time
 
 CONTROL_BASE = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
-PARENT = 'e5df18083991feeef58fd054de500afd404ef822'
+PARENT = '935d94f2ce7b8c228c5f3fe4422a5de031ef3b20'
 AFTER = '24d0474e250bcc4acc0958cf3abbf53ee1125581'
 AFTER_TREE = '7d84da268933045b1add2ad310ce45c84be751db'
 NATIVE, CONTEXT, INPUTS = None, None, None
@@ -67,7 +67,7 @@ def gates(args):
     assert manifest['mode'] == 'AFTER_ONLY_CANCEL_NO_REMOVE'
     assert set(git(control, 'diff', '--name-only', CONTROL_BASE, 'HEAD').splitlines()) == set(manifest['control_paths_from_base'])
     # Every original base control/product entry, including Before pins, is
-    # retained. The direct predecessor is the separately preserved e5 candidate;
+    # retained. The direct predecessor is the separately preserved 935 candidate;
     # historical source clearance does not establish this exact composition.
     removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', CONTROL_BASE, 'HEAD')
     assert removed_or_modified == ''

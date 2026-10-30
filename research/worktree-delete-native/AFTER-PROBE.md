@@ -1,8 +1,9 @@
 The After-only probe is implemented in
 `.github/qualification/native-worktree-delete-after-probe.py`. It is a direct
-child control of `e5df18083991feeef58fd054de500afd404ef822`, preserving that
-head's private desktop, bus and C1 boundaries while pinning the root-authorized
-shared descendant-exit descriptor policy. Both predecessors remain immutable.
+child control of `935d94f2ce7b8c228c5f3fe4422a5de031ef3b20`, preserving that
+head's private desktop, bus, C1 and R1 guards and root-authorized shared
+descendant-exit policy while routing snapshot's complete-query retry through
+the same bounded caller wrapper. All predecessors remain immutable.
 The e5 R1 source negative remains at
 `/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json`,
 SHA256 `9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f`.
@@ -51,6 +52,9 @@ private-endpoint and absolute-budget guard, including constructor sequences,
 keysym lookup, injection and synchronization. A closed read-only AX adapter
 checks each of the existing node/state/component reads before and after the
 call; it has no protocol fallback and preserves complete-query stale retry.
+The caller also binds the original snapshot body under that same bounded
+wrapper, so the old definition-time snapshot retry wrapper cannot start an
+unfenced sleep after expiry. Individual AX reads are never retried.
 Input releases and XQueryTree buffer release are sequential success-path calls,
 with no later native effect in an exception finally. Original primitive,
 fixture and capture source files remain unchanged. The Cancel-only flow and 39 planned frames are
