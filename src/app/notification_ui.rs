@@ -3245,7 +3245,14 @@ mod tests {
                         app.sidebar_state.card_attention(alias_id),
                         sidebar::AttentionSummary::default()
                     );
-                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    if control == "replaced-proof" {
+                        // The replaced canonical pane is fenced with its alias,
+                        // rather than the alias blocking the whole view.
+                        assert!(app.shared_views.quarantined.contains(&canonical));
+                        assert!(app.shared_views.quarantined.contains(&alias_id));
+                    } else {
+                        assert!(app.shared_views.blocked.contains(&agent.placement));
+                    }
                     assert!(app.card_state(alias_id).unwrap().existence.is_open());
                     assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
                     assert_eq!(
