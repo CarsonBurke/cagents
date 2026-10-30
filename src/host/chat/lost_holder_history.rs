@@ -837,4 +837,67 @@ mod tests {
             .unwrap();
         slots.failed_before_spawn(next).unwrap();
     }
+
+    #[test]
+    fn successor_cleanup_closes_deliveries_before_the_final_reader_barrier() {
+        for ordinary_first in [false, true] {
+            let (_root, mut state, candidate) = fixture();
+            let connection = OriginalConnection::capture(&state, 1).unwrap();
+            let delivery = Arc::clone(state.clients.get(&1).unwrap());
+            let proof = Arc::new(state.proof().clone());
+            // A captured opening has not spawned a worker. It still owns its slot
+            // until its exact no-worker branch settles; a shutdown wait cannot
+            // erase that obligation or skip the caller's existing cleanup.
+            let opening = state
+                .history_readers
+                .reserve(connection, candidate, Instant::now())
+                .unwrap();
+            let host: SharedHost = Arc::new(crate::host::state::HostLock::new(state));
+            let mut runtime_error = None;
+
+            if ordinary_first {
+                assert!(!crate::host::finish_shutdown_owners(
+                    &host,
+                    &mut runtime_error,
+                    false
+                ));
+                assert!(!host.lock().unwrap().shutting_down);
+                assert!(opening.cancelled.load(Ordering::Acquire));
+            }
+
+            // This is the committed-successor caller mode. Its return value is
+            // ignored by the outer loop, so this call must close deliveries even
+            // while the final reader barrier remains outstanding.
+            assert!(crate::host::finish_shutdown_owners(
+                &host,
+                &mut runtime_error,
+                true
+            ));
+            assert!(runtime_error.is_none());
+            assert!(opening.cancelled.load(Ordering::Acquire));
+            assert!(host.lock().unwrap().shutting_down);
+            assert_eq!(
+                delivery.push(crate::host::delivery::Outbound::broadcast(
+                    &proof,
+                    crate::terminal_ipc::ServerMessage::HostShuttingDown,
+                )),
+                Err(crate::host::delivery::DeliveryError::Closed)
+            );
+            assert!(matches!(
+                delivery.pop().unwrap().message,
+                crate::terminal_ipc::ServerMessage::HostShuttingDown
+            ));
+            assert!(delivery.pop().is_none());
+
+            assert!(!finish_shutdown_readers(&host));
+            assert!(!host.lock().unwrap().history_readers.settled());
+            host.lock()
+                .unwrap()
+                .history_readers
+                .failed_before_spawn(opening)
+                .unwrap();
+            assert!(finish_shutdown_readers(&host));
+            assert!(host.lock().unwrap().history_readers.settled());
+        }
+    }
 }

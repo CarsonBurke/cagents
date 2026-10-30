@@ -625,9 +625,15 @@ fn finish_shutdown_owners(
     runtime_error: &mut Option<io::Error>,
     close_deliveries: bool,
 ) -> bool {
-    // Reader handles/cache owners settle off HostState before releasing their
-    // separate credit. A timeout retains the original shutdown barrier.
-    if !chat::lost_holder_history::finish_shutdown_readers(host) {
+    // Close reader admission in both exit modes. Ordinary exit retries this
+    // helper while readers retain their credit. The successor caller does not
+    // retry, so its separate final reader barrier waits after owner cleanup.
+    if close_deliveries {
+        host.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .history_readers
+            .revoke_all();
+    } else if !chat::lost_holder_history::finish_shutdown_readers(host) {
         return false;
     }
     let (handles, deliveries) = {
