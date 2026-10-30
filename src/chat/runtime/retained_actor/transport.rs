@@ -38,6 +38,10 @@ const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
+// The request contains only a fixed-size reader/cursor plus existing issued
+// attachment proof. Refuse oversized proofs rather than widening this read.
+const PEER_REQUEST_BYTES: usize = 4096;
+const PEER_RESPONSE_BYTES: usize = super::super::store::peer_query::PAGE_BYTES;
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -1314,6 +1318,50 @@ impl RemoteActor {
                 Ok((identity, directory))
             }
         }
+    }
+    pub(in crate::chat::runtime) fn peer_page(
+        &self,
+        reader: &mut super::super::PeerReader,
+        after: Option<super::super::PeerCursor>,
+    ) -> Result<super::super::PeerPage, String> {
+        if self.0.close_only {
+            return Err(close_only_refusal());
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        // Use the existing framing with a smaller, allocation-checked bound.
+        // No transcript bytes or server-side reader reservation are retained.
+        crate::descriptor_frame::send_json_with_fds_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "peer_page".into(),
+                args: json!([&*reader, after]),
+            },
+            &[],
+            deadline,
+            PEER_REQUEST_BYTES,
+            0,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )?;
+        let (response, _) = crate::descriptor_frame::receive_json_with_fds_until::<
+            Result<(super::super::PeerReader, super::super::PeerPage), String>,
+        >(
+            &control,
+            deadline,
+            PEER_RESPONSE_BYTES,
+            0,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        let (returned, page) = response?;
+        // In particular, an empty first page must still pin this reader. An
+        // error or a malformed/changed pin cannot silently replace its basis.
+        reader.accept_returned(returned, &page)?;
+        Ok(page)
     }
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
         self.call_until(method, args, Instant::now() + TIMEOUT)
@@ -2688,6 +2736,14 @@ impl Server {
                 }
                 value!(response)
             }
+            "peer_page" => {
+                let (mut reader, after) =
+                    decode!((super::super::PeerReader, Option<super::super::PeerCursor>));
+                let page = self.actor.peer_page(&mut reader, after)?;
+                // The Store has released its checked snapshot before encoding.
+                // Codec sizing reserves space for this fixed reader/envelope.
+                value!((reader, page))
+            }
             "text_copy" => {
                 let (source, offset) = decode!((chat::TextCopySource, u64));
                 value!(self.actor.text_copy(&source, offset)?)
@@ -2994,6 +3050,9 @@ impl Server {
                         );
                         continue;
                     }
+                    let peer_page = request
+                        .as_ref()
+                        .is_ok_and(|request| request.method == "peer_page");
                     let mut finished = false;
                     let response = request.and_then(|request| {
                         let close = request.method == "retire";
@@ -3004,7 +3063,19 @@ impl Server {
                     // Authentication failures use the same result boundary. Only an
                     // explicit retirement after durable semantic ACK exits the
                     // helper; a lost provider-close reply retains its journal.
-                    let _ = send(&control, &response, TIMEOUT);
+                    if peer_page {
+                        let _ = crate::descriptor_frame::send_json_with_fds_until(
+                            &control,
+                            &response,
+                            &[],
+                            Instant::now() + TIMEOUT,
+                            PEER_RESPONSE_BYTES,
+                            0,
+                            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+                        );
+                    } else {
+                        let _ = send(&control, &response, TIMEOUT);
+                    }
                     if finished {
                         break;
                     }
@@ -3288,6 +3359,7 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod peer_page_tests;
 
     #[test]
     fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
