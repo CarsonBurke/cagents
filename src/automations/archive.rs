@@ -5,6 +5,25 @@ use crate::{agent_execution::HostedSession, chat::Session, model::AgentId};
 
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
+#[cfg(feature = "host")]
+fn read_inspection_text(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<String> {
+    // Check borrowed bytes before String decoding or constructing a lookup key.
+    // Keep the original text and ordinary type/UTF-8 conversion errors intact.
+    if let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(column)?
+        && bytes.len() > MAX_SNAPSHOT_BYTES
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Source text exceeds its inspection limit",
+            )),
+        ));
+    }
+    row.get(column)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchivedPaneReadiness {
     agent: AgentId,
@@ -225,7 +244,7 @@ pub fn inspect_completed_automation_pane(
         .map_err(|_| "Cannot inspect the source automation pane")?;
     let row:Option<(String,String,String,Option<String>,String)>=tx.query_row(
         "SELECT c.workspace_id,CASE WHEN length(CAST(c.existence_json AS BLOB))<=4096 THEN c.existence_json ELSE 'null' END,c.kind_tag,CASE WHEN length(CAST(c.content_json AS BLOB))<=4194304 THEN c.content_json ELSE NULL END,CASE WHEN length(CAST(w.existence_json AS BLOB))<=4096 THEN w.existence_json ELSE 'null' END FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id WHERE c.card_id=?1",
-        [card.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_|"The source automation pane is unreadable")?;
+        [card.to_string()],|row|Ok((read_inspection_text(row,0)?,row.get(1)?,read_inspection_text(row,2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_|"The source automation pane is unreadable")?;
     let Some((workspace, existence, tag, content, workspace_existence)) = row else {
         return Ok(None);
     };
@@ -324,7 +343,7 @@ pub fn inspect_archived_pane(
         .map_err(|_| "Cannot read the source archive binding")?;
     let row:Option<(String,String,String,Option<String>,String)>=tx.query_row(
         "SELECT c.workspace_id,CASE WHEN length(CAST(c.existence_json AS BLOB))<=4096 THEN c.existence_json ELSE 'null' END,c.kind_tag,CASE WHEN length(CAST(c.content_json AS BLOB))<=4194304 THEN c.content_json ELSE NULL END,CASE WHEN length(CAST(w.existence_json AS BLOB))<=4096 THEN w.existence_json ELSE 'null' END FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id WHERE c.card_id=?1",
-        [card.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_|"The source archive pane is unreadable")?;
+        [card.to_string()],|row|Ok((read_inspection_text(row,0)?,row.get(1)?,read_inspection_text(row,2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_|"The source archive pane is unreadable")?;
     let Some((workspace, existence, kind, content, workspace_existence)) = row else {
         return Ok(None);
     };
@@ -515,6 +534,169 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "host")]
+    fn inspection_text_source(
+        workspace: &str,
+        tag: &str,
+    ) -> (tempfile::TempDir, crate::model::CardId, Session) {
+        use rusqlite::{Connection, params};
+        let directory = tempfile::tempdir().unwrap();
+        let (id, session, _) = fixture();
+        let card = crate::model::CardId::from_uuid(id.as_uuid());
+        let db = Connection::open(directory.path().join("window.sqlite3")).unwrap();
+        // Deliberately preserve the existing inspectors' raw source shape.
+        // These tests do not claim admission of a production StateStore schema.
+        db.execute_batch("CREATE TABLE workspaces(workspace_id TEXT,existence_json TEXT);CREATE TABLE cards(card_id TEXT,workspace_id TEXT,existence_json TEXT,kind_tag TEXT,content_json TEXT);CREATE TABLE metadata(key TEXT,value TEXT);").unwrap();
+        let open = serde_json::to_string(&crate::model::Existence::Open).unwrap();
+        db.execute(
+            "INSERT INTO workspaces VALUES(?1,?2)",
+            params![workspace, open],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cards VALUES(?1,?2,?3,?4,?5)",
+            params![
+                card.to_string(),
+                workspace,
+                open,
+                tag,
+                serde_json::to_string(&session).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(db);
+        (directory, card, session)
+    }
+
+    #[cfg(feature = "host")]
+    fn inspect_source_text_both(
+        database: &std::path::Path,
+        registry: &std::path::Path,
+        card: crate::model::CardId,
+        session: &Session,
+    ) -> [Result<Option<ArchivedPaneReadiness>, String>; 2] {
+        [
+            inspect_archived_pane(database, registry, card, session),
+            inspect_completed_automation_pane(
+                database,
+                registry,
+                card,
+                &crate::model::CardKind::Chat(session.clone()),
+            ),
+        ]
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn source_inspectors_preserve_bounded_workspace_keys_and_exact_metadata_lookup() {
+        use rusqlite::{Connection, params};
+        let boundary = format!("{}窓", "w".repeat(MAX_SNAPSHOT_BYTES - "窓".len()));
+        assert_eq!(boundary.len(), MAX_SNAPSHOT_BYTES);
+        for workspace in [
+            String::new(),
+            "window".into(),
+            "窓:unchanged/raw-key".into(),
+            boundary,
+        ] {
+            let (directory, card, session) = inspection_text_source(&workspace, "chat");
+            let database = directory.path().join("window.sqlite3");
+            let registry = directory.path().join("missing-registry.sqlite3");
+            let before = std::fs::read(&database).unwrap();
+            for result in inspect_source_text_both(&database, &registry, card, &session) {
+                assert!(
+                    result.unwrap().is_none(),
+                    "bounded raw keys retain no-claim behavior"
+                );
+            }
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            assert!(!registry.exists());
+
+            // The completed inspector permits no archive map. Poison its exact
+            // full key so truncation/normalization cannot silently return None.
+            let wrong = AgentId::new();
+            assert_ne!(wrong.as_uuid(), card.as_uuid());
+            let db = Connection::open(&database).unwrap();
+            db.execute(
+                "INSERT INTO metadata VALUES(?1,?2)",
+                params![
+                    format!("workspace:{workspace}:navigation:automation_archives"),
+                    serde_json::to_string(&std::collections::HashMap::from([(card, wrong)]))
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+            drop(db);
+            let before = std::fs::read(&database).unwrap();
+            for result in inspect_source_text_both(&database, &registry, card, &session) {
+                assert!(
+                    result.is_err(),
+                    "the full original metadata key must be inspected"
+                );
+            }
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            assert!(!registry.exists());
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn source_inspectors_refuse_oversized_text_before_no_claim_fallback() {
+        let byte_boundary = format!("{}窓", "w".repeat(MAX_SNAPSHOT_BYTES - "窓".len() + 1));
+        assert_eq!(byte_boundary.len(), MAX_SNAPSHOT_BYTES + 1);
+        assert!(byte_boundary.chars().count() <= MAX_SNAPSHOT_BYTES);
+        let oversized = "w".repeat(MAX_SNAPSHOT_BYTES + 1);
+        for (workspace, tag) in [
+            (oversized.as_str(), "chat"),
+            (byte_boundary.as_str(), "chat"),
+            ("window", oversized.as_str()),
+        ] {
+            let (directory, card, session) = inspection_text_source(workspace, tag);
+            let database = directory.path().join("window.sqlite3");
+            let registry = directory.path().join("missing-registry.sqlite3");
+            let before = std::fs::read(&database).unwrap();
+            let results = inspect_source_text_both(&database, &registry, card, &session);
+            assert_eq!(
+                results.map(|result| result.unwrap_err()),
+                [
+                    "The source archive pane is unreadable".to_owned(),
+                    "The source automation pane is unreadable".to_owned(),
+                ]
+            );
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            assert!(!registry.exists());
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn source_inspectors_keep_text_type_and_utf8_conversion_errors() {
+        use rusqlite::Connection;
+        for edit in [
+            "UPDATE workspaces SET workspace_id=CAST(workspace_id AS BLOB);UPDATE cards SET workspace_id=CAST(workspace_id AS BLOB);",
+            "UPDATE workspaces SET workspace_id=CAST(x'80' AS TEXT);UPDATE cards SET workspace_id=CAST(x'80' AS TEXT);",
+            "UPDATE cards SET kind_tag=x'63686174';",
+            "UPDATE cards SET kind_tag=CAST(x'80' AS TEXT);",
+        ] {
+            let (directory, card, session) = inspection_text_source("window", "chat");
+            let database = directory.path().join("window.sqlite3");
+            let registry = directory.path().join("missing-registry.sqlite3");
+            let db = Connection::open(&database).unwrap();
+            db.execute_batch(edit).unwrap();
+            drop(db);
+            let before = std::fs::read(&database).unwrap();
+            let results = inspect_source_text_both(&database, &registry, card, &session);
+            assert_eq!(
+                results.map(|result| result.unwrap_err()),
+                [
+                    "The source archive pane is unreadable".to_owned(),
+                    "The source automation pane is unreadable".to_owned(),
+                ]
+            );
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            assert!(!registry.exists());
+        }
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn source_archive_inspection_is_read_only_and_needs_no_service() {
