@@ -68,8 +68,15 @@ enum Stage {
     },
 }
 #[derive(Clone)]
+enum PendingSource {
+    Typed,
+    Panel { thread: String, revision: u64 },
+}
+
+#[derive(Clone)]
 pub(super) struct Pending {
     operation: Operation,
+    source: PendingSource,
     input: Option<Input>,
     start: Option<chat::Session>,
     binding: Option<Binding>,
@@ -83,6 +90,21 @@ pub(super) struct Pending {
 }
 
 impl Pending {
+    fn native_command(&self, current: &chat::goal::Snapshot) -> (Command, u64) {
+        let (thread, revision) = match &self.source {
+            PendingSource::Typed => (&current.thread_id, current.revision),
+            PendingSource::Panel { thread, revision } => (thread, *revision),
+        };
+        (
+            Command::Goal {
+                thread_id: thread.clone(),
+                revision,
+                operation: self.operation.clone(),
+            },
+            revision,
+        )
+    }
+
     fn look_again(&mut self, target: Target, wait: Duration) -> Task<Message> {
         if std::mem::replace(&mut self.model_rechecking, true) {
             return Task::none();
@@ -501,6 +523,7 @@ impl Cagents {
         }
         runtime.goal_pending = Some(Pending {
             operation,
+            source: PendingSource::Typed,
             input: Some(Input {
                 revision: runtime.revision,
                 text: runtime.composer.text(),
@@ -541,21 +564,29 @@ impl Cagents {
     }
 
     pub(super) fn goal_control(&mut self, target: Target, control: Control) -> Task<Message> {
+        if self.admit_goal_control(target, control) {
+            self.dispatch_goal(target)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn admit_goal_control(&mut self, target: Target, control: Control) -> bool {
         if !self.goal_source_current(target) {
-            return Task::none();
+            return false;
         }
         let Some(runtime) = self.chat_runtime_mut(target) else {
-            return Task::none();
+            return false;
         };
         if !runtime.goal_open {
-            return Task::none();
+            return false;
         }
         if let Err(error) = control.intent.operation.validate() {
             runtime.error = Some(error.to_string());
-            return Task::none();
+            return false;
         }
         let Some(handle) = runtime.handle().cloned() else {
-            return Task::none();
+            return false;
         };
         let valid = control.binding.matches(runtime)
             && runtime.goal_pending.is_none()
@@ -569,13 +600,17 @@ impl Cagents {
             });
         if !valid {
             runtime.error = Some("The goal control is stale or its conversation is unavailable. Check the current goal.".into());
-            return Task::none();
+            return false;
         }
         // An old callback must not dismiss a picker opened after it rendered.
         // Presentation changes belong to the same validated native binding.
         runtime.open_goal_panel();
         runtime.goal_pending = Some(Pending {
             operation: control.intent.operation,
+            source: PendingSource::Panel {
+                thread: control.thread,
+                revision: control.intent.observation_revision,
+            },
             input: None,
             start: None,
             binding: Some(control.binding),
@@ -591,7 +626,7 @@ impl Cagents {
             wait_for_ready: false,
             stage: Stage::Waiting,
         });
-        self.dispatch_goal(target)
+        true
     }
 
     pub(super) fn dispatch_goal(&mut self, target: Target) -> Task<Message> {
@@ -695,12 +730,25 @@ impl Cagents {
             runtime.error = Some("The selected model and reasoning were not confirmed in time. The goal was not sent; choose a model and submit again. Your input is kept.".into());
             return Task::none();
         }
+        let handle = runtime.handle().unwrap().clone();
+        let latest = handle.snapshot();
+        let goal = goal_in_snapshot(runtime, &handle, &latest);
+        // The reader can publish between panel admission and dispatch without
+        // a UI wake. That invalidates the control; it cannot upgrade its target
+        // or wait for another goal's physical request and act on its result.
+        if let PendingSource::Panel { thread, revision } = &pending.source {
+            if goal
+                .as_ref()
+                .is_none_or(|goal| &goal.thread_id != thread || goal.revision != *revision)
+            {
+                runtime.error = Some("The goal changed before this control was sent. Check the current goal and try again; your input is kept.".into());
+                return Task::none();
+            }
+        }
         if runtime.pending.is_some() {
             runtime.goal_pending = Some(pending);
             return Task::none();
         }
-        let handle = runtime.handle().unwrap().clone();
-        let latest = handle.snapshot();
         if latest.exited || runtime.disconnected {
             runtime.error = Some(
                 "The original conversation cannot accept a native goal; your input is kept.".into(),
@@ -776,7 +824,7 @@ impl Cagents {
                 runtime.error = Some("The selected model or reasoning changed before the goal was sent. Your input is kept; choose a model and submit again.".into());
                 return Task::none();
             }
-            let Some(goal) = goal_in_snapshot(runtime, &handle, &latest) else {
+            let Some(goal) = goal else {
                 runtime.goal_pending = Some(pending);
                 return Task::none();
             };
@@ -792,14 +840,8 @@ impl Cagents {
                 runtime.error = Some("Check the unconfirmed native goal before requesting another change; your input is kept.".into());
                 return Task::none();
             }
-            (
-                Command::Goal {
-                    thread_id: goal.thread_id,
-                    revision: goal.revision,
-                    operation: pending.operation.clone(),
-                },
-                Some(goal.revision),
-            )
+            let (command, revision) = pending.native_command(&goal);
+            (command, Some(revision))
         };
         runtime.goal_pending = Some(pending);
         let task = self.chat_send(target, command, false);
@@ -990,6 +1032,57 @@ mod tests {
                 observation_revision: goal.revision,
             },
         }
+    }
+
+    fn panel_control_fixture(operation: Operation) -> (Cagents, CardId, Target, Control) {
+        let (mut app, card, target) = live();
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        observed.selected_model = Some("chosen-model".into());
+        observed.reasoning = Some("low".into());
+        observed.goal.as_mut().unwrap().read = ReadState::Known(Some(chat::goal::Goal {
+            thread_id: THREAD.into(),
+            objective: "Original panel goal".into(),
+            status: if operation == Operation::Resume {
+                Status::Paused
+            } else {
+                Status::Active
+            },
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 2,
+            created_at: 1,
+            updated_at: 2,
+        }));
+        publish(&mut app, card, observed);
+        write(
+            &mut app,
+            target,
+            "Unrelated draft, keep its caret and attachment",
+        );
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        rt.attachments
+            .push(Attachment::file("kept-panel-draft.txt"));
+        rt.history.push("An earlier ordinary prompt".into());
+        rt.history_images
+            .push(vec![Attachment::file("kept-history.txt")]);
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready && !rt.disconnected);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
+        let requested = control(rt, operation);
+        (app, card, target, requested)
     }
 
     fn deferred_model_goal(catalog: bool) -> (Cagents, CardId, Target) {
@@ -1417,6 +1510,233 @@ mod tests {
             assert_eq!(rt.composer.text().trim(), input);
             assert!(rt.error.is_none());
         }
+    }
+
+    #[test]
+    fn panel_goal_admission_retains_revision_across_publication_before_ui_wake() {
+        for operation in [
+            Operation::Clear,
+            Operation::Pause,
+            Operation::Resume,
+            Operation::Get,
+        ] {
+            for changed in [true, false] {
+                let (mut app, card, target, requested) = panel_control_fixture(operation.clone());
+                let original = requested.intent.observation_revision;
+                let handle = runtime(&app, card).handle().unwrap().clone();
+                let session = runtime(&app, card).session.clone();
+                let before = {
+                    let rt = runtime(&app, card);
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor,
+                    )
+                };
+                let next_command = runtime(&app, card).next_command;
+                assert!(app.admit_goal_control(target, requested));
+                let rt = runtime(&app, card);
+                let pending = rt.goal_pending.as_ref().unwrap();
+                assert!(matches!(pending.stage, Stage::Waiting));
+                assert!(matches!(&pending.source,
+                    PendingSource::Panel { thread, revision }
+                        if thread == THREAD && *revision == original));
+                assert_eq!(pending.operation, operation);
+                assert!(pending.input.is_none() && pending.model.is_none());
+                assert!(pending.binding.as_ref().unwrap().matches(rt));
+                assert!(rt.pending.is_none());
+                assert_eq!(rt.next_command, next_command);
+
+                let mut next = (*handle.snapshot()).clone();
+                next.generation += 1;
+                if changed {
+                    let goal = next.goal.as_mut().unwrap();
+                    goal.revision += 1;
+                    let ReadState::Known(Some(observed)) = &mut goal.read else {
+                        panic!()
+                    };
+                    observed.objective = "A newer goal from the same conversation".into();
+                    observed.tokens_used += 1;
+                }
+                // The actual reader publishes before emitting Wake::Changed.
+                // Deliberately leave the rendered runtime at the admitted R.
+                handle.publish_snapshot_for_test(next);
+                let rt = runtime(&app, card);
+                assert_eq!(rt.snapshot.goal.as_ref().unwrap().revision, original);
+                assert_eq!(
+                    handle.snapshot().goal.as_ref().unwrap().revision,
+                    original + u64::from(changed)
+                );
+                assert!(rt.snapshot.generation < handle.snapshot().generation);
+                drop(app.dispatch_goal(target));
+                let rt = runtime(&app, card);
+                assert_eq!(rt.session, session);
+                assert_eq!(rt.target, target);
+                assert!(Arc::ptr_eq(rt.handle().unwrap(), &handle));
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor
+                    ),
+                    before
+                );
+                if changed {
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                    assert!(
+                        rt.error
+                            .as_deref()
+                            .unwrap()
+                            .contains("Check the current goal")
+                    );
+                    drop(app.dispatch_goal(target));
+                    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                    let rt = runtime(&app, card);
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                } else {
+                    let pending = rt.goal_pending.as_ref().unwrap();
+                    let native = rt.pending.as_ref().unwrap();
+                    let id = native.id;
+                    assert!(matches!(pending.stage,
+                        Stage::Native { revision, command, accepted: false }
+                            if revision == original && command == id));
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(native.model.is_none() && native.sent.is_none());
+                    assert!(native.draft_revision.is_none() && native.sent_attachments.is_empty());
+                    assert_eq!(
+                        pending.native_command(handle.snapshot().goal.as_ref().unwrap()),
+                        (
+                            Command::Goal {
+                                thread_id: THREAD.into(),
+                                revision: original,
+                                operation: operation.clone()
+                            },
+                            original
+                        )
+                    );
+                    assert!(rt.error.is_none());
+                    // A later observation cannot retire a request already in
+                    // physical custody or replace its original Native revision.
+                    let mut newer = (*handle.snapshot()).clone();
+                    newer.generation += 1;
+                    newer.goal.as_mut().unwrap().revision += 1;
+                    handle.publish_snapshot_for_test(newer);
+                    drop(app.dispatch_goal(target));
+                    let rt = runtime(&app, card);
+                    assert_eq!(rt.pending.as_ref().unwrap().id, id);
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(matches!(rt.goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { revision, command, accepted: false }
+                            if revision == original && command == id));
+                }
+                let rt = runtime(&app, card);
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                        rt.history.clone(),
+                        rt.history_images.clone(),
+                        rt.history_cursor
+                    ),
+                    before
+                );
+                assert!(rt.queued.is_none() && rt.followups.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn panel_goal_lost_observation_retires_before_pending_or_readiness_wait() {
+        for operation in [Operation::Clear, Operation::Pause, Operation::Resume] {
+            for publication in 0..4 {
+                let (mut app, card, target, requested) = panel_control_fixture(operation.clone());
+                assert!(app.admit_goal_control(target, requested));
+                let handle = runtime(&app, card).handle().unwrap().clone();
+                let before = runtime(&app, card).next_command;
+                let mut next = (*handle.snapshot()).clone();
+                next.generation += 1;
+                match publication {
+                    0 => {
+                        let goal = next.goal.as_mut().unwrap();
+                        goal.revision += 1;
+                        goal.pending = true;
+                        next.ready = false;
+                    }
+                    1 => next.goal = None,
+                    2 => next.goal.as_mut().unwrap().thread_id = "another-thread".into(),
+                    _ => next.exited = true,
+                }
+                handle.publish_snapshot_for_test(next);
+                drop(app.dispatch_goal(target));
+                let rt = runtime(&app, card);
+                assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                assert_eq!(rt.next_command, before);
+                assert!(
+                    rt.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("Check the current goal")
+                );
+                // Restoring an eligible publication cannot replay the retired
+                // click, even when the actor subsequently wakes the UI.
+                let mut restored = (*rt.snapshot).clone();
+                restored.generation = handle.snapshot().generation + 1;
+                handle.publish_snapshot_for_test(restored);
+                drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                assert!(runtime(&app, card).goal_pending.is_none());
+                assert!(runtime(&app, card).pending.is_none());
+                assert_eq!(runtime(&app, card).next_command, before);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_panel_goal_retires_without_releasing_an_unrelated_physical_command() {
+        let (mut app, card, target, requested) = panel_control_fixture(Operation::Clear);
+        assert!(app.admit_goal_control(target, requested));
+        drop(app.chat_send(target, Command::Refresh, false));
+        let rt = runtime(&app, card);
+        let id = rt.pending.as_ref().unwrap().id;
+        let next_command = rt.next_command;
+        assert!(matches!(
+            rt.goal_pending.as_ref().unwrap().stage,
+            Stage::Waiting
+        ));
+        let handle = rt.handle().unwrap().clone();
+        let mut next = (*handle.snapshot()).clone();
+        next.generation += 1;
+        next.goal.as_mut().unwrap().revision += 1;
+        handle.publish_snapshot_for_test(next);
+        drop(app.dispatch_goal(target));
+        let rt = runtime(&app, card);
+        assert!(rt.goal_pending.is_none());
+        assert_eq!(rt.pending.as_ref().unwrap().id, id);
+        assert_eq!(rt.next_command, next_command);
+        assert!(
+            rt.error
+                .as_deref()
+                .unwrap()
+                .contains("Check the current goal")
+        );
+        drop(app.dispatch_goal(target));
+        assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, id);
+        acknowledge(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert!(runtime(&app, card).pending.is_none());
+        assert_eq!(runtime(&app, card).next_command, next_command);
     }
 
     #[test]
