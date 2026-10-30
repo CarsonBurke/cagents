@@ -1546,4 +1546,196 @@ mod tests {
             "a helper that never closed this window must not block later attempts"
         );
     }
+
+    fn rendered_update_control(
+        app: &Cagents,
+        renderer: &cosmic::Renderer,
+    ) -> (String, Vec<Message>) {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::{Event, Point, Rectangle, Size, mouse};
+
+        let mut element = app.update_control().expect("update control");
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(640.0, 200.0));
+        let layout = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+        let expected: iced_accessibility::A11yId = widget::Id::new("application-update").into();
+        let button = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| iced_accessibility::IdEq::eq(node.id(), &expected))
+            .expect("the actual update button remains accessible");
+        assert_eq!(
+            button.node().role(),
+            iced_accessibility::accesskit::Role::Button
+        );
+        let label = button
+            .node()
+            .label()
+            .expect("update action name")
+            .to_owned();
+        let bounds = button.node().bounds().expect("update button bounds");
+        let point = Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&layout),
+                mouse::Cursor::Available(point),
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        (label, messages)
+    }
+
+    #[test]
+    fn failed_installed_reopen_keeps_its_cause_and_retries_only_the_installed_build() {
+        let renderer = crate::app::tests::headless_renderer();
+        for polled_failure in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let durable = Arc::clone(&app.durable);
+            let focused = app.workspace.focused();
+            let installed = PathBuf::from("/nonexistent/installed/bin/cagents-ui");
+            app.update_ui.superseded = Some(installed.clone());
+            // Even with a release available, retry must use the installed
+            // build rather than fall through to release discovery/download.
+            app.update_ui.result = Some(UpdateState::Available {
+                release: serde_json::from_value(serde_json::json!({
+                    "version": "9.8.7",
+                    "url": "https://example.invalid/release",
+                    "id": 1,
+                    "archive": {"id": 2, "name": "archive", "size": 1},
+                    "checksums": {"id": 3, "name": "checksums", "size": 1},
+                    "installer": {"id": 4, "name": "installer", "size": 1}
+                }))
+                .unwrap(),
+            });
+            let cause = "Could not save this window: workspace write was refused";
+            if polled_failure {
+                let failed = UpdateJob {
+                    id: "installed-reopen".into(),
+                    version: "9.8.7".into(),
+                    phase: UpdatePhase::Failed,
+                    message: cause.into(),
+                    log_path: "/nonexistent/update.log".into(),
+                    confirmation: None,
+                };
+                app.update_ui.job = Some(failed.clone());
+                drop(
+                    app.update_update_ui(Action::Polled(Some(failed.id.clone()), Ok(Some(failed)))),
+                );
+            } else {
+                app.update_ui.restarting = true;
+                drop(app.update_update_ui(Action::Applied(Err(cause.into()))));
+            }
+            // The toolbar must explain the failure after a transient notice
+            // has gone, without needing another helper or status request.
+            app.status = None;
+            let (label, messages) = rendered_update_control(&app, &renderer);
+            assert!(
+                label.contains(cause),
+                "the failure stays actionable: {label}"
+            );
+            assert!(label.contains("Retry reopening"), "{label}");
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::UpdateUi(Action::Restart)]
+            ));
+            assert_eq!(app.update_ui.superseded, Some(installed));
+            assert!(Arc::ptr_eq(&durable, &app.durable));
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(app.exit.is_none());
+            assert!(!app.update_prepared);
+            assert!(!app.update_ui.restarting);
+
+            // Admit only the existing explicit retry; its future stays
+            // unpolled, so this widget/reducer test runs no updater.
+            drop(app.update_update_ui(Action::Restart));
+            assert!(app.update_ui.restarting);
+            assert!(app.update_ui.error.is_none());
+            let (label, messages) = rendered_update_control(&app, &renderer);
+            assert_eq!(
+                label,
+                "Saving and reopening windows with the installed build"
+            );
+            assert!(
+                messages.is_empty(),
+                "an in-flight retry cannot be pressed again"
+            );
+            assert!(Arc::ptr_eq(&durable, &app.durable));
+            assert!(app.exit.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_installed_reopen_keeps_unsaved_and_modal_blockers_on_the_real_control() {
+        let renderer = crate::app::tests::headless_renderer();
+        for dirty_editor in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let focused = app.workspace.focused().unwrap();
+            if dirty_editor {
+                app.cards.insert(
+                    focused,
+                    CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(focused))),
+                );
+            } else {
+                app.settings_reset_confirm = true;
+            }
+            let durable = Arc::clone(&app.durable);
+            app.update_ui.superseded = Some("/nonexistent/installed/bin/cagents-ui".into());
+            let cause = "Could not save this window: workspace write was refused";
+            drop(app.update_update_ui(Action::Applied(Err(cause.into()))));
+            app.status = None;
+            let blocker = app
+                .window_update_blocker()
+                .expect("existing save/modal guard");
+            let (label, messages) = rendered_update_control(&app, &renderer);
+            assert!(label.contains(cause), "the failure stays visible: {label}");
+            assert!(
+                label.contains(blocker),
+                "the blocking work is named: {label}"
+            );
+            assert!(!label.contains("Retry reopening"), "{label}");
+            assert!(
+                messages.is_empty(),
+                "blocked input must not request a restart"
+            );
+            drop(app.update_update_ui(Action::Restart));
+            assert!(!app.update_ui.restarting);
+            assert_eq!(app.update_ui.error.as_deref(), Some(cause));
+            assert!(Arc::ptr_eq(&durable, &app.durable));
+            assert_eq!(app.workspace.focused(), Some(focused));
+            assert!(app.cards.contains_key(&focused));
+            assert!(app.exit.is_none());
+            assert!(!app.update_prepared);
+
+            if !dirty_editor {
+                app.settings_reset_confirm = false;
+                let (label, messages) = rendered_update_control(&app, &renderer);
+                assert!(label.contains("Retry reopening"));
+                assert!(matches!(
+                    messages.as_slice(),
+                    [Message::UpdateUi(Action::Restart)]
+                ));
+            }
+        }
+    }
 }
