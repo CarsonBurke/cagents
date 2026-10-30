@@ -33,6 +33,7 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
+    #[cfg(target_os = "linux")]
     pub(super) fn observe(stream: &UnixStream, socket: &Path) -> Result<Self, UpdateError> {
         let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
         let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -72,6 +73,11 @@ impl Peer {
         };
         peer.alive()?;
         Ok(peer)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn observe(_stream: &UnixStream, _socket: &Path) -> Result<Self, UpdateError> {
+        Err(unsupported_source_inspection().into())
     }
 
     pub(super) fn verify(&self, proof: &HostSessionProof) -> Result<(), UpdateError> {
@@ -167,6 +173,7 @@ fn process_start(pid: u32) -> Result<String, UpdateError> {
 }
 
 impl Client {
+    #[cfg(target_os = "linux")]
     pub(crate) fn connect(socket: &Path) -> Result<Self, ControlError> {
         if crate::device::is_remote() {
             return Err(ControlError::Configure(io::Error::other(
@@ -179,6 +186,11 @@ impl Client {
         // authorizes nothing: the selected client authenticates its own fresh
         // handshake, exact local peer and kernel-held lease below.
         Self::connect_selected(socket, deadline, v77::discover_protocol(socket, deadline)?)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn connect(_socket: &Path) -> Result<Self, ControlError> {
+        Err(ControlError::Configure(unsupported_source_inspection()))
     }
 
     fn connect_selected(
@@ -338,6 +350,7 @@ impl InstalledIdentity {
 
 /// Installed entry routing, not permission to decode or mutate an unknown
 /// source. Only its exact authenticated old executable may own that workflow.
+#[cfg(target_os = "linux")]
 pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid(
@@ -391,8 +404,14 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateError> {
+    Err(unsupported_source_inspection().into())
+}
+
 /// The inspector must receive the source's actual protocol and ownership, not
 /// infer either from the newly installed coordinator executable.
+#[cfg(target_os = "linux")]
 pub(crate) fn inspect_identity(
     expected: Option<&HostSessionProof>,
 ) -> Result<(u16, Option<HostSessionProof>), UpdateError> {
@@ -417,6 +436,14 @@ pub(crate) fn inspect_identity(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn inspect_identity(
+    _expected: Option<&HostSessionProof>,
+) -> Result<(u16, Option<HostSessionProof>), UpdateError> {
+    Err(unsupported_source_inspection().into())
+}
+
+#[cfg(target_os = "linux")]
 fn absent_source(expected: Option<&HostSessionProof>) -> Result<(), UpdateError> {
     let paths =
         crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
@@ -428,4 +455,42 @@ fn absent_source(expected: Option<&HostSessionProof>) -> Result<(), UpdateError>
         ));
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn absent_source(_expected: Option<&HostSessionProof>) -> Result<(), UpdateError> {
+    Err(unsupported_source_inspection().into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported_source_inspection() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Authenticating an upgrade source requires Linux peer credentials and process identity",
+    )
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_source_cannot_be_classified_as_an_absent_daemon() {
+        assert!(matches!(inspect_identity(None), Err(UpdateError::Io(error))
+            if error.kind() == io::ErrorKind::Unsupported));
+        assert!(
+            matches!(inspect_installed_identity(), Err(UpdateError::Io(error))
+            if error.kind() == io::ErrorKind::Unsupported)
+        );
+        assert!(matches!(absent_source(None), Err(UpdateError::Io(error))
+            if error.kind() == io::ErrorKind::Unsupported));
+        assert!(matches!(Client::connect(Path::new("missing-daemon.sock")),
+            Err(ControlError::Configure(error)) if error.kind() == io::ErrorKind::Unsupported));
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert!(
+            matches!(Peer::observe(&stream, Path::new("untrusted.sock")),
+            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::Unsupported)
+        );
+    }
 }
