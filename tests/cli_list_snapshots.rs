@@ -13,7 +13,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -25,10 +25,15 @@ struct Fixture {
     root: tempfile::TempDir,
     socket: std::path::PathBuf,
     stop: Arc<AtomicBool>,
+    removal_requests: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Fixture {
     fn new(populated: bool) -> Self {
+        Self::with_removal_reply(populated, json!([{"version": 3, "revision": 2}, null]))
+    }
+
+    fn with_removal_reply(populated: bool, removal_reply: serde_json::Value) -> Self {
         let root = tempfile::tempdir().unwrap();
         for path in ["home", "run", "data", "config", "cache"] {
             fs::create_dir(root.path().join(path)).unwrap();
@@ -45,6 +50,8 @@ impl Fixture {
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let end = Arc::clone(&stop);
+        let removal_requests = Arc::new(AtomicUsize::new(0));
+        let observed_removals = Arc::clone(&removal_requests);
         let worker = thread::spawn(move || {
             let proof = HostSessionProof {
                 host_session_id: HostSessionId::new("list-fixture"),
@@ -70,6 +77,20 @@ impl Fixture {
                             proof: proof.clone(),
                             resumed: vec![],
                         }
+                    } else if let ClientRequest::DeviceOperation {
+                        operation:
+                            cagents::device_service::Operation::AccountLifecycle {
+                                operation: cagents::account::remote::Operation::Remove { id },
+                            },
+                    } = &request.request
+                    {
+                        assert_eq!(id.as_str(), format!("claude/{ID}"));
+                        observed_removals.fetch_add(1, Ordering::Relaxed);
+                        ServerResponse::DeviceOperation {
+                            reply: cagents::device_service::Reply::AccountLifecycle(
+                                removal_reply.clone(),
+                            ),
+                        }
                     } else {
                         respond(request.request, populated, &mut registrations)
                     };
@@ -90,6 +111,7 @@ impl Fixture {
             root,
             socket,
             stop,
+            removal_requests,
             worker: Some(worker),
         }
     }
@@ -334,10 +356,6 @@ fn respond(request: ClientRequest, populated: bool, registrations: &mut usize) -
                         json!({"Registered":{"registry":{},"identity":null,"snapshot":null}})
                     }
                 }
-                Operation::Remove { id } => {
-                    assert_eq!(id.as_str(), format!("claude/{ID}"));
-                    json!([{"version":3,"revision":2},null])
-                }
                 other => panic!("Unexpected account lifecycle request: {other:?}"),
             };
             ServerResponse::DeviceOperation {
@@ -493,6 +511,7 @@ fn account_commands_use_the_shared_service_and_keep_login_progress_off_json_stdo
     assert_eq!(removed["data"]["removed"], true);
     assert!(removed["data"]["cleanup_error"].is_null());
     assert!(removed["data"].get("transcript_files_retained").is_none());
+    assert_eq!(fixture.removal_requests.load(Ordering::Relaxed), 1);
     let abandoned = fixture.output(&["account", "sign-in", "codex"], true);
     assert_eq!(abandoned.status.code(), Some(1));
     let error: serde_json::Value = serde_json::from_str(
@@ -507,4 +526,56 @@ fn account_commands_use_the_shared_service_and_keep_login_progress_off_json_stdo
         abandoned.stdout.is_empty(),
         "an unverified login must not emit success"
     );
+}
+
+#[test]
+fn account_removal_errors_preserve_the_disposition_on_stderr_without_repeating_the_mutation() {
+    let cases = [
+        (
+            json!([{"version": 3, "revision": 2}, "fixture: home could not be parked"]),
+            "account_remove_incomplete",
+            json!(true),
+            Some("fixture: home could not be parked"),
+        ),
+        (
+            json!([{"version": 3, "revision": 2}, ""]),
+            "account_remove_incomplete",
+            json!(true),
+            Some(""),
+        ),
+        (
+            json!({"revision": 2}),
+            "account_remove_result_unconfirmed",
+            json!(null),
+            None,
+        ),
+    ];
+    for (reply, expected_kind, removed, cleanup_error) in cases {
+        let fixture = Fixture::with_removal_reply(true, reply);
+        let output = fixture.output(&["account", "remove", &format!("claude/{ID}")], true);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            output.stdout.is_empty(),
+            "a reported error must not emit success"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let error: serde_json::Value =
+            serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+        assert_eq!(error["error"]["kind"], expected_kind);
+        let details = &error["error"]["details"];
+        assert_eq!(details["account"], format!("claude/{ID}"));
+        assert_eq!(details["removed"], removed);
+        if let Some(diagnostic) = cleanup_error {
+            assert_eq!(details["state"], "removed");
+            assert_eq!(details["cleanup_error"], diagnostic);
+        } else {
+            assert_eq!(details["state"], "unconfirmed");
+        }
+        assert!(details.get("transcript_files_retained").is_none());
+        assert_eq!(
+            fixture.removal_requests.load(Ordering::Relaxed),
+            1,
+            "the command must not repeat the mutation after a reported error or malformed result"
+        );
+    }
 }
