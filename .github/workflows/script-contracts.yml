@@ -72,8 +72,43 @@ jobs:
 
       - name: Check validation checkout and process custody contracts
         run: |
-          python3 -I -B tests/prepare_validation_checkout.py -v
-          python3 -I -B tests/qualification/test_process_custody.py -v
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          def present(path):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          for name, source, fixture in (
+              ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
+              ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
+          ):
+              source_present = present(Path(source))
+              fixture_present = present(Path(fixture))
+              if not source_present and not fixture_present:
+                  print(f"Not applicable: {name} (source and fixture both absent at this head)", flush=True)
+                  continue
+              if not source_present or not fixture_present:
+                  print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+                  raise SystemExit(2)
+              print(f"Checking: {name}", flush=True)
+              result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
 
       - name: Check all formatter contracts
         env:
