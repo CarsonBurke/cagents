@@ -6035,6 +6035,17 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    /// Catches draft `card` up, once it can choose again, with launch options
+    /// another window chose while it could not: while its file chooser was
+    /// open or its first message was on the way.
+    fn adopt_stored_draft_session(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| state.kind.clone())
+        else {
+            return Task::none();
+        };
+        self.adopt_shared_draft_session(card, &session)
+    }
+
     pub(super) fn chat_scroll_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -8432,7 +8443,7 @@ impl Cagents {
                     .abandoned
                     .insert(attempt.target, attempt.session);
             }
-            return Task::none();
+            return self.adopt_stored_draft_session(target.card);
         }
         self.revert_chat_draft(target, None)
     }
@@ -11722,14 +11733,22 @@ impl Cagents {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
-                    if !runtime.attachment_bookmarks.contains_key(&id.id) {
-                        return Task::none();
-                    }
-                    match result {
-                        Ok(Some(paths)) => return self.stage_chat_attachments(target, id, paths),
-                        Ok(None) => runtime.cancel_attachment_insert(id.id, None),
-                        Err(error) => runtime.cancel_attachment_insert(id.id, Some(error)),
-                    }
+                    let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
+                        Task::none()
+                    } else {
+                        match result {
+                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(None) => {
+                                runtime.cancel_attachment_insert(id.id, None);
+                                Task::none()
+                            }
+                            Err(error) => {
+                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                Task::none()
+                            }
+                        }
+                    };
+                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
                 }
             }
             Action::Dropped(target, payload) => {
@@ -12357,6 +12376,34 @@ pub(super) fn draft_launch_for_test(
         runtime.snapshot.permission_mode.clone(),
         runtime.session.clone(),
     )
+}
+
+/// The reason draft `card` last failed to start, which it shows.
+#[cfg(test)]
+pub(super) fn draft_error_for_test(app: &mut Cagents, card: CardId) -> &mut Option<String> {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    &mut runtime.error
+}
+
+/// Runs `during` while draft `card`'s file chooser is open, then dismisses the
+/// chooser as its dialog would.
+#[cfg(test)]
+pub(super) fn with_attachment_chooser_open_for_test(
+    app: &mut Cagents,
+    card: CardId,
+    during: impl FnOnce(&mut Cagents),
+) {
+    let _admission = attachment_draft::test_admission();
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    let ticket = runtime.begin_attachment_insert();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    during(app);
+    drop(app.update(Message::ChatUi(Action::Attached(target, ticket, Ok(None)))));
 }
 
 /// Sends draft `card`'s first message, returning the launch it starts.
