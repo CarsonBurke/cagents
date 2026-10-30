@@ -8,6 +8,10 @@ fn runtime(app: &Cagents, card: CardId) -> &Runtime {
 }
 
 fn fixture() -> (Cagents, tempfile::TempDir, CardId, Target) {
+    fixture_for_provider(Provider::Codex)
+}
+
+fn fixture_for_provider(provider: Provider) -> (Cagents, tempfile::TempDir, CardId, Target) {
     let mut app = crate::app::tests::context_inspector_test_app(true);
     let directory = tempfile::tempdir().unwrap();
     let (writer, _) = crate::session::SessionRuntime::open(
@@ -17,10 +21,10 @@ fn fixture() -> (Cagents, tempfile::TempDir, CardId, Target) {
     .unwrap();
     app.session = Some(writer);
     let source = fresh_chat_session(
-        Provider::Codex,
+        provider,
         TerminalId::new(),
         directory.path().to_owned(),
-        &Account::system(Provider::Codex),
+        &Account::system(provider),
         false,
     )
     .unwrap();
@@ -1502,3 +1506,482 @@ fn draft_source_is_fixed_while_its_first_save_is_in_flight() {
     assert_eq!(switched.id, source.id);
     assert_eq!(switched.launch.provider, Provider::Claude);
 }
+
+/// The production reader receives the Prompt Accepted response before the
+/// later ChatRead response. Its command Task and wake subscription are
+/// independent UI producers: a real, successful completion can remain queued
+/// while the UI reduces EOF's Disconnected wake first. Both parents drain the
+/// real wake FIFO; no command completion or wake is fabricated.
+fn accepted_first_prompt_transport_disconnect_case(completion_first: bool) {
+    let budget = Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + budget;
+    let (finished, result) = std::sync::mpsc::channel();
+    // The outer wait also bounds synchronous fixture setup and cleanup. Its
+    // worker owns only temporary SQLite state and the private socket peer.
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(|| {
+            accepted_first_prompt_transport_disconnect_before(completion_first, deadline);
+        });
+        let _ = finished.send(outcome);
+    });
+    match result.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(error) => panic!("accepted-disconnect scenario exceeded its total 20s budget: {error}"),
+    }
+}
+
+fn accepted_first_prompt_transport_disconnect_before(
+    completion_first: bool,
+    deadline: std::time::Instant,
+) {
+    use crate::terminal_ipc::{
+        ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse,
+    };
+    use cosmic::iced::futures::StreamExt;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    const MAX_WAKES: usize = 64;
+    const MAX_TASK_MESSAGES: usize = 64;
+    const MAX_WIRE_MESSAGES: usize = 32;
+    fn remaining(deadline: std::time::Instant) -> Duration {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .expect("accepted-disconnect total scenario deadline expired")
+    }
+
+    let (mut app, _directory, card, draft_target) = fixture_for_provider(Provider::Claude);
+    let _ = remaining(deadline);
+    app.workspace.resize_viewport(1280.0);
+    let original_text = runtime(&app, card).composer.text();
+    let original_images = runtime(&app, card).attachments.clone();
+    let save = app.handle_chat_ui(Action::Submit(draft_target, PromptMode::Send));
+    let (target, attempt, result) = std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async move {
+            let mut stream = cosmic::iced::runtime::task::into_stream(save).expect("save Task");
+            for _ in 0..MAX_TASK_MESSAGES {
+                let action = tokio::time::timeout(remaining(deadline), stream.next())
+                    .await
+                    .expect("checkpoint exceeded total scenario deadline")
+                    .expect("save Task ended without its checkpoint receipt");
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::ChatUi(Action::DraftStartCheckpointed(target, attempt, result)),
+                )) = action
+                {
+                    return (target, attempt, result);
+                }
+            }
+            panic!("checkpoint exceeded {MAX_TASK_MESSAGES} task messages");
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(
+        result.is_ok(),
+        "the actual first-start checkpoint must settle"
+    );
+    // The provider-start Task is intentionally dropped. Only the private wire
+    // peer below supplies the exact pending start's real client handshake.
+    drop(app.handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)));
+    let attempt = app.chat_ui.attempt(card).unwrap();
+    let target = attempt.target;
+    let candidate = attempt.session.clone();
+    let actor = candidate.id;
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let (disconnect, disconnect_now) = mpsc::channel();
+    let peer_text = original_text.clone();
+    let peer_images = original_images.len();
+    let peer = std::thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut codec = FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("accepted-disconnect-host"),
+            boot_id: crate::model::BootId::new("accepted-disconnect-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("accepted-disconnect-instance"),
+        };
+        let mut wire_messages = 0;
+        let mut read = |codec: &mut FrameCodec, server: &mut UnixStream| -> ClientEnvelope {
+            wire_messages += 1;
+            assert!(
+                wire_messages <= MAX_WIRE_MESSAGES,
+                "private peer message count exceeded"
+            );
+            server
+                .set_read_timeout(Some(remaining(deadline).min(Duration::from_secs(5))))
+                .unwrap();
+            codec.read(server).unwrap().unwrap()
+        };
+        let reply = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+            server
+                .set_write_timeout(Some(remaining(deadline).min(Duration::from_secs(5))))
+                .unwrap();
+            codec
+                .write(
+                    server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+        };
+        let connect = read(&mut codec, &mut server);
+        assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+        reply(
+            &mut codec,
+            &mut server,
+            Some(connect.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: Vec::new(),
+                },
+            },
+        );
+        let start = read(&mut codec, &mut server);
+        let ClientRequest::ChatStart { mut session, .. } = start.request else {
+            panic!("the actual private handshake must request ChatStart");
+        };
+        assert_eq!(session.id, actor);
+        assert_eq!(session.launch.provider, Provider::Claude);
+        session.proof = Some(proof.clone());
+        session.launch.session_id = Some("accepted-disconnect-native-thread".into());
+        let initial = Snapshot {
+            generation: 1,
+            ready: true,
+            session_id: session.launch.session_id.clone(),
+            capabilities: chat::Capabilities {
+                attachments: true,
+                ..Default::default()
+            },
+            ..Snapshot::default()
+        };
+        reply(
+            &mut codec,
+            &mut server,
+            Some(start.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached {
+                    session,
+                    snapshot: initial.clone(),
+                },
+            },
+        );
+        let mut prompt = None;
+        let mut visible = false;
+        while prompt.is_none() || !visible {
+            let request = read(&mut codec, &mut server);
+            match request.request {
+                ClientRequest::ChatVisibility {
+                    chat_id,
+                    visible: next,
+                } => {
+                    assert_eq!(chat_id, actor);
+                    visible = next;
+                    reply(
+                        &mut codec,
+                        &mut server,
+                        Some(request.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    );
+                }
+                ClientRequest::ChatCommand {
+                    chat_id,
+                    command:
+                        Command::Prompt {
+                            text, attachments, ..
+                        },
+                } => {
+                    assert_eq!(chat_id, actor);
+                    assert_eq!(text, peer_text);
+                    assert_eq!(attachments.len(), peer_images);
+                    assert!(
+                        prompt.replace(request.request_id).is_none(),
+                        "one first prompt"
+                    );
+                    // The host serves this socket serially. Queue this real
+                    // receipt before answering any later ChatRead; only the
+                    // UI driver may hold the resulting CommandFinished.
+                    reply(
+                        &mut codec,
+                        &mut server,
+                        Some(request.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    );
+                }
+                other => panic!("unexpected request before first acceptance: {other:?}"),
+            }
+        }
+        reply(
+            &mut codec,
+            &mut server,
+            None,
+            ServerMessage::ChatChanged { chat_id: actor },
+        );
+        let read = loop {
+            let request = read(&mut codec, &mut server);
+            match request.request {
+                ClientRequest::ChatRead { chat_id, .. } => {
+                    assert_eq!(chat_id, actor);
+                    break request.request_id;
+                }
+                ClientRequest::ChatVisibility {
+                    chat_id,
+                    visible: true,
+                } => {
+                    assert_eq!(chat_id, actor);
+                    reply(
+                        &mut codec,
+                        &mut server,
+                        Some(request.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    );
+                }
+                other => panic!("expected the reader's real ChatRead, got {other:?}"),
+            }
+        };
+        let accepted = Snapshot {
+            generation: 2,
+            busy: true,
+            items: vec![Arc::new(chat::Item {
+                id: "accepted-disconnect-user-item".into(),
+                role: chat::Role::User,
+                content: chat::ItemContent::Text {
+                    text: peer_text,
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..initial
+        };
+        reply(
+            &mut codec,
+            &mut server,
+            Some(read),
+            ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot {
+                    chat_id: actor,
+                    snapshot: Some(accepted),
+                },
+            },
+        );
+        disconnect_now
+            .recv_timeout(remaining(deadline).min(Duration::from_secs(5)))
+            .unwrap();
+        // Prompt Accepted and ChatSnapshot were already written in socket
+        // order. EOF now runs the actual client's Disconnected producer; the
+        // UI driver still holds the real successful command completion.
+    });
+    // Use the same State sender/receiver as the real wake subscription.
+    let wake_sender = app.chat_ui.sender.clone();
+    let wakes = app.chat_ui.receiver.clone();
+    let mut wake_count = 0;
+    let mut receive_wake = || {
+        wake_count += 1;
+        assert!(
+            wake_count <= MAX_WAKES,
+            "real wake FIFO exceeded {MAX_WAKES} messages"
+        );
+        let wait = remaining(deadline);
+        let wakes = wakes.clone();
+        std::thread::spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async move {
+                tokio::time::timeout(wait, wakes.recv())
+                    .await
+                    .expect("the real wake queue must settle")
+                    .unwrap()
+            })
+        })
+        .join()
+        .unwrap()
+    };
+    let handle = Arc::new(
+        ClientHandle::fixture_start_on(client, candidate, move |wake| {
+            let _ = wake_sender.try_send((target, wake));
+        })
+        .unwrap(),
+    );
+    let send = app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))),
+    ));
+    // Present the foreground fixture through the Runtime's real visibility
+    // policy. This fixture is not evidence of a mounted native window.
+    if let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() {
+        runtime.show(true);
+    }
+    assert!(handle.is_visible_for_test());
+    let command = runtime(&app, card).pending.as_ref().unwrap();
+    assert_eq!(command.queued, Some(QueuedStep::Prompt));
+    let command_id = command.id;
+    let retiring_before = app.chat_ui.retiring.clone();
+    let completion = std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async move {
+            let mut stream = cosmic::iced::runtime::task::into_stream(send).expect("prompt Task");
+            for _ in 0..MAX_TASK_MESSAGES {
+                let action = tokio::time::timeout(remaining(deadline), stream.next())
+                    .await
+                    .expect("command Task exceeded total scenario deadline")
+                    .expect("prompt Task ended without CommandFinished");
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    message @ Message::ChatUi(Action::CommandFinished(..)),
+                )) = action
+                {
+                    return message;
+                }
+            }
+            panic!("command Task exceeded {MAX_TASK_MESSAGES} messages without CommandFinished");
+        })
+    });
+    // set_interest/show can enqueue Changed before the reader publishes the
+    // accepted snapshot. Reduce the actual FIFO until the acceptance latch,
+    // rather than assuming the first wake came from ChatSnapshot.
+    loop {
+        let (wake_target, wake) = receive_wake();
+        assert_eq!(wake_target, target);
+        assert!(
+            matches!(&wake, Wake::Changed),
+            "unexpected pre-acceptance wake: {wake:?}"
+        );
+        drop(app.handle_chat_ui(Action::Wake(wake_target, wake)));
+        if handle.has_observed_user_item() {
+            break;
+        }
+    }
+    assert!(
+        handle.has_observed_user_item(),
+        "production reader latched accepted User item"
+    );
+    // Collect and hold the actual successful callback before allowing EOF.
+    // Delaying UI delivery does not delay a host reply or invent a frame order.
+    let completed = completion.join().unwrap();
+    assert!(
+        matches!(&completed, Message::ChatUi(Action::CommandFinished(t, id, Ok(())))
+        if *t == target && *id == command_id)
+    );
+    disconnect.send(()).unwrap();
+    let disconnected = loop {
+        let (wake_target, wake) = receive_wake();
+        assert_eq!(wake_target, target);
+        match wake {
+            changed @ Wake::Changed => {
+                // The acceptance Changed may still be behind earlier local
+                // wakes. Every Changed ahead of Disconnected is reduced.
+                drop(app.handle_chat_ui(Action::Wake(wake_target, changed)));
+            }
+            disconnected @ Wake::Disconnected(_) => break disconnected,
+            other => panic!("unexpected wake before EOF: {other:?}"),
+        }
+    };
+    peer.join().unwrap();
+    assert_eq!(runtime(&app, card).session.id, actor);
+    assert!(runtime(&app, card).queued.is_some());
+    assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command_id);
+
+    // Only application delivery order changes. Prompt Accepted precedes the
+    // accepted publication on the wire; all real Changed wakes are reduced
+    // before EOF's wake, while CommandFinished(Ok) is held by the driver.
+    let retained_before_late_completion = if completion_first {
+        drop(app.update(completed));
+        drop(app.handle_chat_ui(Action::Wake(target, disconnected)));
+        true
+    } else {
+        // Drop any returned cleanup/skill Tasks: this proposal must never
+        // reach a real daemon or retire a provider during a failing test.
+        drop(app.handle_chat_ui(Action::Wake(target, disconnected)));
+        let retained = runtime(&app, card)
+            .handle()
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            && !runtime(&app, card).is_draft()
+            && runtime(&app, card).composer.text().is_empty()
+            && runtime(&app, card).attachments.is_empty()
+            && app.chat_ui.retiring == retiring_before;
+        drop(app.update(completed));
+        retained
+    };
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(remaining(deadline).min(Duration::from_secs(5)))
+        .unwrap();
+    let saved = app.persistent_workspace();
+    let accepted = runtime(&app, card);
+    assert!(
+        retained_before_late_completion,
+        "accepted execution must survive Disconnected before CommandFinished; do not restore its prompt/images as a sendable duplicate or queue retirement"
+    );
+    assert!(
+        accepted
+            .handle()
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+    );
+    assert!(!accepted.is_draft());
+    assert!(accepted.disconnected);
+    assert_eq!(accepted.session.id, actor);
+    assert_eq!(accepted.session.proof, handle.proof());
+    assert_eq!(
+        accepted.session.launch.session_id.as_deref(),
+        Some("accepted-disconnect-native-thread")
+    );
+    assert!(accepted.composer.text().is_empty());
+    assert!(accepted.attachments.is_empty());
+    assert!(accepted.queued.is_none());
+    assert!(accepted.pending.is_none());
+    assert_eq!(app.chat_ui.retiring, retiring_before);
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(
+        app.chat_retry_intent(card, &accepted.session),
+        chat::Intent::Restore
+    );
+    assert!(!saved.chat_drafts.contains_key(&card));
+    assert!(!saved.chat_draft_attachments.contains_key(&card));
+    let stored = stored(&app, card);
+    assert_eq!(stored.id, actor);
+    assert_eq!(stored.proof, handle.proof());
+    assert_eq!(stored.launch.session_id, accepted.session.launch.session_id);
+    let _ = remaining(deadline);
+}
+
+#[test]
+fn accepted_first_prompt_transport_completion_before_disconnect_is_a_control() {
+    accepted_first_prompt_transport_disconnect_case(true);
+}
+
+#[test]
+fn accepted_first_prompt_transport_disconnect_before_completion_keeps_execution() {
+    accepted_first_prompt_transport_disconnect_case(false);
+}
+
+#[path = "first_start_checkpoint_tests/passive_peer_tests.rs"]
+mod passive_peer_tests;

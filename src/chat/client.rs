@@ -1402,6 +1402,27 @@ impl ClientHandle {
         })
     }
 
+    /// Test-only access to the real start handshake and reader on a private
+    /// socket. It never discovers a daemon or launches a provider.
+    #[cfg(test)]
+    pub(crate) fn fixture_start_on(
+        stream: UnixStream,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
+    }
+
     /// Publishes `snapshot` as the reader thread would on a presentation
     /// frame, so a test can stream a transcript into a surface.
     #[cfg(test)]

@@ -6593,11 +6593,9 @@ impl Cagents {
     /// Opens the conversation card `card` holds: its draft, when nothing has
     /// ever run it, or else a connection to it.
     ///
-    /// A draft restored from an earlier run may have been started without
-    /// that start ever being answered, which leaves an actor with nothing on
-    /// screen able to reach it. Such an actor never took a message, so it is
-    /// given up quietly by identity; the draft's first message starts under
-    /// a new identity, never racing that.
+    /// A shared draft can be observed while another window is starting it.
+    /// Restoring its saved descriptor gives this window no ownership of that
+    /// execution, so opening the draft must not schedule provider retirement.
     pub(super) fn open_chat(
         &mut self,
         card: CardId,
@@ -6610,13 +6608,7 @@ impl Cagents {
         if !session.is_unstarted() {
             return self.start_chat(card, session, intent, None, false);
         }
-        let retire = if intent == chat::Intent::Restore {
-            self.retire_chat(card, None, Some(session.clone()))
-        } else {
-            Task::none()
-        };
-        let skills = self.open_chat_draft(card, session);
-        Task::batch([retire, skills])
+        self.open_chat_draft(card, session)
     }
 
     /// Puts a draft of `session` in card `card`, on the model last chosen for
@@ -9762,9 +9754,10 @@ impl Cagents {
                     // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
-                        // A first message still waiting will not be taken
-                        // now, and a conversation without it holds nothing.
-                        if runtime.queued.is_some() {
+                        // The reader can accept the first message before its
+                        // command callback reaches the UI. Preserve that
+                        // execution across EOF, as the command-error path does.
+                        if runtime.queued.is_some() && !handle.has_observed_user_item() {
                             return self.revert_chat_draft(target, Some(error));
                         }
                         runtime.disconnected = true;
@@ -24183,9 +24176,8 @@ mod tests {
         assert!(!app.chat_start_pending(card));
     }
 
-    /// A saved conversation nothing ever ran reopens as a draft, and any
-    /// actor an unanswered start left for it is given up; one that did run
-    /// reconnects as before.
+    /// An unstarted saved conversation reopens as a draft without retiring
+    /// another window's possible execution; a started one reconnects.
     #[test]
     fn only_a_conversation_that_ran_reconnects_on_restore() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -24196,7 +24188,7 @@ mod tests {
         let _ = app.open_chat(card, session, chat::Intent::Restore);
         assert!(chat_runtime(&app, card).is_draft());
         assert!(!app.chat_start_pending(card));
-        retired(&mut app, card);
+        assert!(app.chat_ui.retiring.is_empty());
 
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let session = chat_runtime(&app, card).session.clone();
