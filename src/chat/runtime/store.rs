@@ -46,7 +46,8 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
-    copy_cache: uuid::Uuid,
+    // None revokes issued reads and new descriptors until Reset fully succeeds.
+    copy_cache: Option<uuid::Uuid>,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
@@ -235,7 +236,7 @@ impl Store {
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
-                copy_cache: uuid::Uuid::new_v4(),
+                copy_cache: Some(uuid::Uuid::new_v4()),
                 copy_revision: 0,
                 copy_projection: Default::default(),
                 file_revision: 0,
@@ -752,6 +753,13 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if matches!(&event, Event::Reset { .. }) {
+            // Revoke before pending-text flush or any fallible cleanup. Old
+            // rows may survive a failed Reset; they must not gain new authority.
+            self.copy_cache = None;
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+            self.copy_projection.clear();
+        }
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -911,9 +919,6 @@ impl Store {
                 self.db
                     .execute("DELETE FROM copy_sources", [])
                     .map_err(|e| e.to_string())?;
-                self.copy_cache = uuid::Uuid::new_v4();
-                self.copy_revision = self.copy_revision.wrapping_add(1);
-                self.copy_projection.clear();
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -927,6 +932,7 @@ impl Store {
                 self.pending_earlier = None;
                 self.latest_boundary = None;
                 self.dirty = true;
+                self.copy_cache = Some(uuid::Uuid::new_v4());
                 out.push(Event::Reset { reason });
                 return Ok(out);
             }
@@ -1886,6 +1892,265 @@ mod tests {
             })
             .unwrap();
         assert!(store.text_copy(&reset, 0).is_err());
+    }
+
+    fn retained_report_record(store: &Store) -> (i64, Vec<u8>, i64, i64, i64, Vec<u8>) {
+        store
+            .db
+            .query_row(
+                "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id='report'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn report_copy_recovers_only_after_successful_reset(
+        store: &mut Store,
+        old: &crate::chat::TextCopySource,
+    ) {
+        assert!(store.copy_parent_source("report").unwrap().is_none());
+        assert!(store.text_copy(old, 0).is_err());
+        store
+            .apply(Event::Item(diagnostic_item(
+                "unrecovered-report",
+                "new body while Reset remains incomplete",
+                "unrecovered preview",
+            )))
+            .unwrap();
+        assert!(
+            store
+                .copy_parent_source("unrecovered-report")
+                .unwrap()
+                .is_none(),
+            "ordinary new publications cannot recover failed-Reset copy authority"
+        );
+        assert!(store.copy_parent_source("report").unwrap().is_none());
+        store
+            .apply(Event::Reset {
+                reason: "fully recovered reset".into(),
+            })
+            .unwrap();
+        assert!(store.copy_parent_source("report").unwrap().is_none());
+        assert!(store.text_copy(old, 0).is_err());
+        let fresh_body = "new-generation report 🦀\ncomplete new bytes";
+        store
+            .apply(Event::Item(diagnostic_item(
+                "report",
+                fresh_body,
+                "fresh preview",
+            )))
+            .unwrap();
+        let fresh = store.copy_parent_source("report").unwrap().unwrap();
+        assert_ne!(fresh.cache, old.cache);
+        assert_eq!(diagnostic_copy(store, &fresh).unwrap(), fresh_body);
+        assert!(store.text_copy(old, 0).is_err());
+    }
+
+    #[test]
+    fn failed_reset_cleanup_revokes_report_reads_without_deleting_retained_report_or_owner() {
+        use std::os::unix::fs::MetadataExt;
+        for table in [
+            "file_edits",
+            "file_totals",
+            "file_paths",
+            "copy_sources",
+            "items",
+        ] {
+            let mut store = Store::new().unwrap();
+            store.file_cwd = Some(store.directory.clone());
+            store
+                .apply(Event::Item(Item {
+                    id: "edit".into(),
+                    role: Role::Assistant,
+                    at: None,
+                    started_at: None,
+                    content: ItemContent::Changes {
+                        changes: vec![crate::chat::FileChange {
+                            path: "owned-fixture.txt".into(),
+                            kind: crate::chat::ChangeKind::Updated,
+                            diff: "@@ -1 +1 @@\n-before\n+after\n".into(),
+                        }],
+                        status: crate::chat::ToolStatus::Succeeded,
+                    },
+                }))
+                .unwrap();
+            let body = format!("Retained stderr\n{}END 🦀", "界".repeat(PART_BYTES));
+            store
+                .apply(Event::Item(diagnostic_item(
+                    "report",
+                    &body,
+                    "retained preview",
+                )))
+                .unwrap();
+            store.window().unwrap();
+            let issued = store.copy_parent_source("report").unwrap().unwrap();
+            assert_eq!(diagnostic_copy(&store, &issued).unwrap(), body);
+            let record = retained_report_record(&store);
+            let directory = store.directory.clone();
+            let owner = store._lease.metadata().unwrap();
+            let source_row: (u64, u64, u64) = store
+                .db
+                .query_row(
+                    "SELECT token,revision,bytes FROM copy_sources WHERE item='report'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let count: i64 = store
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                count > 0,
+                "the {table} DELETE trigger must actually execute"
+            );
+            store.db.execute_batch(&format!(
+                "CREATE TRIGGER reject_reset BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'reset cleanup fixture failure'); END;"
+            )).unwrap();
+            let error = store
+                .apply(Event::Reset {
+                    reason: "injected cleanup failure".into(),
+                })
+                .unwrap_err();
+            assert!(
+                error.contains("reset cleanup fixture failure"),
+                "{table}: {error}"
+            );
+            assert_eq!(
+                retained_report_record(&store),
+                record,
+                "{table}: preserve exact report metadata/identity"
+            );
+            assert_eq!(
+                store.field("report", 0, 0, body.len()).unwrap(),
+                body.as_bytes(),
+                "{table}: preserve report bytes"
+            );
+            assert_eq!(store.directory, directory);
+            let kept = store._lease.metadata().unwrap();
+            assert_eq!(
+                (kept.dev(), kept.ino(), kept.uid(), kept.mode()),
+                (owner.dev(), owner.ino(), owner.uid(), owner.mode())
+            );
+            if table != "items" {
+                let kept: (u64, u64, u64) = store
+                    .db
+                    .query_row(
+                        "SELECT token,revision,bytes FROM copy_sources WHERE item='report'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    kept, source_row,
+                    "old rows remain; revocation cannot rely on deleting them"
+                );
+            }
+            assert!(store.copy_cache.is_none());
+            assert!(
+                store.text_copy(&issued, 0).is_err(),
+                "{table}: old issued read must be revoked"
+            );
+            assert!(store.copy_parent_source("report").unwrap().is_none());
+            store.window().unwrap();
+            assert!(store.copy_projection.iter().all(Option::is_none));
+            store
+                .db
+                .execute_batch("DROP TRIGGER reject_reset;")
+                .unwrap();
+            store.apply(Event::Exited { code: Some(3) }).unwrap();
+            assert_eq!(retained_report_record(&store), record);
+            assert!(
+                store.copy_cache.is_none(),
+                "removing a fault or ordinary events do not recover authority"
+            );
+            report_copy_recovers_only_after_successful_reset(&mut store, &issued);
+        }
+    }
+
+    #[test]
+    fn failed_reset_pending_text_flush_revokes_report_before_entering_reset_cleanup() {
+        let mut store = Store::new().unwrap();
+        let body = "Retained report before pending flush 🦀";
+        store
+            .apply(Event::Item(diagnostic_item(
+                "report",
+                body,
+                "retained preview",
+            )))
+            .unwrap();
+        store
+            .apply(Event::Item(history_item("pending", "head")))
+            .unwrap();
+        store.window().unwrap();
+        let issued = store.copy_parent_source("report").unwrap().unwrap();
+        let record = retained_report_record(&store);
+        assert_eq!(diagnostic_copy(&store, &issued).unwrap(), body);
+        store
+            .apply(Event::TextDelta {
+                id: "pending".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " pending suffix".into(),
+            })
+            .unwrap();
+        assert!(store.pending_text.is_some());
+        store.db.execute_batch(
+            "CREATE TRIGGER reject_flush BEFORE UPDATE ON items WHEN OLD.id='pending' BEGIN SELECT RAISE(ABORT,'reset pending flush fixture failure'); END;"
+        ).unwrap();
+        let error = store
+            .apply(Event::Reset {
+                reason: "injected pre-cleanup failure".into(),
+            })
+            .unwrap_err();
+        assert!(error.contains("reset pending flush fixture failure"));
+        assert_eq!(retained_report_record(&store), record);
+        assert_eq!(
+            store.field("report", 0, 0, body.len()).unwrap(),
+            body.as_bytes()
+        );
+        assert_eq!(store.field("pending", 0, 0, 4).unwrap(), b"head");
+        assert_eq!(store.pending_text.as_ref().unwrap().3, " pending suffix");
+        assert!(store.copy_cache.is_none());
+        assert!(store.copy_projection.is_empty());
+        assert!(store.text_copy(&issued, 0).is_err());
+        assert!(store.copy_parent_source("report").unwrap().is_none());
+        let retained_token: u64 = store
+            .db
+            .query_row(
+                "SELECT token FROM copy_sources WHERE item='report'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_token, issued.token,
+            "cleanup was never entered; the old source row still exists"
+        );
+        store
+            .db
+            .execute_batch("DROP TRIGGER reject_flush;")
+            .unwrap();
+        store.apply(Event::Exited { code: Some(3) }).unwrap();
+        assert!(store.pending_text.is_none());
+        assert_eq!(retained_report_record(&store), record);
+        assert!(
+            store.copy_cache.is_none(),
+            "a later successful flush cannot revive the report cache"
+        );
+        report_copy_recovers_only_after_successful_reset(&mut store, &issued);
     }
 
     #[test]

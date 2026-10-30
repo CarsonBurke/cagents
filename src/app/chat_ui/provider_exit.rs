@@ -23,6 +23,22 @@ pub(super) struct Request {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Header Copy is available before the inspector is opened. Its separate
+/// ticket joins the inspector's hide/collapse/drop revocation without opening
+/// or replacing the currently inspected report.
+#[derive(Clone)]
+pub(super) struct CopyTicket(Arc<AtomicBool>);
+
+impl CopyTicket {
+    pub(super) fn is_current(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn revoke(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
     key: Option<Key>,
@@ -35,6 +51,7 @@ pub(super) struct State {
     // Owned by this inspector, never by a callback. Revoked tickets cannot
     // become live again when the same runtime is shown later.
     visibility: Arc<AtomicBool>,
+    full_copy: Option<(Key, CopyTicket)>,
 }
 
 #[derive(Default)]
@@ -250,6 +267,12 @@ fn page_menu(
 }
 
 impl State {
+    fn revoke_full_copy(&mut self) {
+        if let Some((_, ticket)) = self.full_copy.take() {
+            ticket.revoke();
+        }
+    }
+
     fn admit(&mut self) {
         if !self.visibility.load(Ordering::Relaxed) {
             self.visibility = Arc::new(AtomicBool::new(true));
@@ -263,6 +286,11 @@ impl State {
     }
 
     pub(super) fn hide(&mut self, reloadable: bool) {
+        self.revoke_full_copy();
+        self.hide_inspector(reloadable);
+    }
+
+    fn hide_inspector(&mut self, reloadable: bool) {
         self.visibility.store(false, Ordering::Relaxed);
         self.cancel();
         if reloadable {
@@ -272,19 +300,28 @@ impl State {
     }
 
     pub(super) fn collapse(&mut self, id: &str, child: Option<&str>) {
+        // A header copy need not have opened this inspector at all.
+        if self
+            .full_copy
+            .as_ref()
+            .is_some_and(|(key, _)| key.id == id && scope_matches(&key.source.scope, child))
+        {
+            self.revoke_full_copy();
+        }
         if self
             .key
             .as_ref()
             .is_some_and(|key| key.id == id && scope_matches(&key.source.scope, child))
         {
             self.expanded = false;
-            self.hide(true);
+            self.hide_inspector(true);
         }
     }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
+        self.revoke_full_copy();
         self.visibility.store(false, Ordering::Relaxed);
         self.cancel();
     }
@@ -339,6 +376,60 @@ fn page_bounds(text: &str, page: usize) -> (std::ops::Range<usize>, usize, usize
 }
 
 impl Runtime {
+    pub(super) fn requires_report_copy_ticket(
+        &self,
+        id: &str,
+        source: &chat::TextCopySource,
+    ) -> bool {
+        let report = |item: &chat::Item| {
+            matches!(
+                item.content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                }
+            )
+        };
+        if self.active_item(id).is_some_and(|item| report(item)) {
+            return true;
+        }
+        let items = match self.selected_subagent.as_deref() {
+            Some(child) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| agent.id == child)
+                .map(|agent| agent.items.as_slice()),
+            None => Some(self.snapshot.items.as_slice()),
+        };
+        items.is_some_and(|items| {
+            items.iter().any(|item| {
+                report(item)
+                    && self
+                        .message_copy_source(item)
+                        .is_some_and(|current| compatible(source, &current))
+            })
+        })
+    }
+
+    pub(super) fn report_copy_ticket(
+        &mut self,
+        id: &str,
+        source: &chat::TextCopySource,
+    ) -> Result<Option<CopyTicket>, &'static str> {
+        if !self.requires_report_copy_ticket(id, source) {
+            return Ok(None);
+        }
+        let key = self
+            .report_output_key(id, source)
+            .filter(|key| self.visible.load(Ordering::Relaxed) && self.keeps_report_output(key))
+            .ok_or("This report is no longer visible with its saved output source. Copy its current report again.")?;
+        self.provider_exit.revoke_full_copy();
+        let ticket = CopyTicket(Arc::new(AtomicBool::new(true)));
+        self.provider_exit.full_copy = Some((key, ticket.clone()));
+        Ok(Some(ticket))
+    }
+
     // Keep presentation ownership local to the inspector. The Runtime's own
     // visibility is still the authority; callbacks only retain a revocable
     // admission granted after both current source publications agree.
@@ -532,6 +623,25 @@ impl Cagents {
             return Task::none();
         }
         let mut state = State::default();
+        // Showing this same source is not a revocation. Transfer the original
+        // live permit before replacing State, including a captured prefix of
+        // an appended publication. Never allocate or revive a ticket here.
+        if runtime.visible.load(Ordering::Relaxed)
+            && runtime.keeps_report_output(&key)
+            && runtime
+                .provider_exit
+                .full_copy
+                .as_ref()
+                .is_some_and(|(captured, ticket)| {
+                    ticket.is_current()
+                        && captured.id == key.id
+                        && captured.conversation_revision == key.conversation_revision
+                        && compatible(&captured.source, &key.source)
+                        && runtime.keeps_report_output(captured)
+                })
+        {
+            state.full_copy = runtime.provider_exit.full_copy.take();
+        }
         state.key = Some(key);
         state.expanded = true;
         runtime.provider_exit = state;
@@ -824,7 +934,7 @@ mod tests {
             request,
             Ok(loaded.clone()),
         )));
-        let copy = text_copy::Request::for_test(handle.clone(), source.clone());
+        let copy = full_copy_request(&mut app, target, &source);
         drop(app.handle_chat_ui(Action::MessageCopied(
             target,
             "owned-report".into(),
@@ -1241,6 +1351,554 @@ mod tests {
         })
     }
 
+    fn full_copy_request(
+        app: &mut Cagents,
+        target: Target,
+        source: &chat::TextCopySource,
+    ) -> text_copy::Request {
+        app.message_copy_request(target, "owned-report", Some(source.clone()))
+            .expect("the production header-copy admission grants visible report authority")
+    }
+
+    fn full_copy_writes(task: Task<Message>) -> Vec<String> {
+        use iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::time::timeout(Duration::from_secs(3), async move {
+                    let Some(stream) = iced::runtime::task::into_stream(task) else {
+                        return vec![];
+                    };
+                    stream
+                        .filter_map(|effect| async move {
+                            match effect {
+                                iced::runtime::Action::Clipboard(
+                                    iced::runtime::clipboard::Action::Write {
+                                        target: iced::advanced::clipboard::Kind::Standard,
+                                        contents,
+                                        ..
+                                    },
+                                ) => Some(contents),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                        .await
+                })
+                .await
+                .expect("the actual deferred clipboard effect and acknowledgement timer settle")
+            })
+    }
+
+    #[test]
+    fn full_report_copy_revokes_at_completion_and_deferred_effect_after_hide_or_collapse() {
+        let _context = text_copy::isolated_context();
+        for hide_saved_output in [false, true] {
+            for completed_before_revoke in [false, true] {
+                let (mut app, target, handle, source) = fixture();
+                if hide_saved_output {
+                    let read = begin(&mut app, target, &source);
+                    drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+                        target,
+                        read,
+                        Ok(Arc::new(SAVED.into())),
+                    )));
+                } else {
+                    assert!(
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .provider_exit
+                            .key
+                            .is_none()
+                    );
+                }
+                let request = full_copy_request(&mut app, target, &source);
+                let ticket = app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .provider_exit
+                    .full_copy
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .clone();
+                let snapshot = handle.snapshot();
+                let pending = completed_before_revoke.then(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request.clone(),
+                        Ok(SAVED.into()),
+                    ))
+                });
+                drop(app.handle_chat_ui(if hide_saved_output {
+                    Action::ToggleReportOutput(target, "owned-report".into(), source.clone())
+                } else {
+                    Action::Toggle(target, "owned-report".into())
+                }));
+                assert!(!ticket.is_current());
+                assert!(
+                    Arc::ptr_eq(&handle.snapshot(), &snapshot),
+                    "only presentation authority changed"
+                );
+                assert_eq!(app.workspace.focused(), Some(target.card));
+                assert!(Arc::ptr_eq(
+                    app.chat_runtime_mut(target).unwrap().handle().unwrap(),
+                    &handle
+                ));
+                let task = pending.unwrap_or_else(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request.clone(),
+                        Ok(SAVED.into()),
+                    ))
+                });
+                assert!(
+                    full_copy_writes(task).is_empty(),
+                    "a revoked full Copy cannot emit Standard clipboard bytes"
+                );
+                if !completed_before_revoke {
+                    assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+                }
+                app.chat_runtime_mut(target).unwrap().error = Some("current error".into());
+                let obsolete_error = app.handle_chat_ui(Action::MessageCopied(
+                    target,
+                    "owned-report".into(),
+                    request,
+                    Err("obsolete read error".into()),
+                ));
+                assert!(full_copy_writes(obsolete_error).is_empty());
+                assert_eq!(
+                    app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                    Some("current error")
+                );
+
+                // Header Copy remains available after Hide/outer collapse,
+                // without reopening or loading the saved-output inspector.
+                let fresh = full_copy_request(&mut app, target, &source);
+                assert!(
+                    !ticket.is_current(),
+                    "fresh admission never revives an old ticket"
+                );
+                let copied = app.handle_chat_ui(Action::MessageCopied(
+                    target,
+                    "owned-report".into(),
+                    fresh,
+                    Ok(SAVED.into()),
+                ));
+                assert_eq!(full_copy_writes(copied), [SAVED]);
+            }
+        }
+    }
+
+    #[test]
+    fn full_report_copy_without_opening_inspector_requires_a_real_report_permit() {
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, source) = fixture();
+        let request = full_copy_request(&mut app, target, &source);
+        let state = &app.chat_runtime_mut(target).unwrap().provider_exit;
+        assert!(state.key.is_none() && !state.expanded && state.ready.is_none());
+        let copied = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "owned-report".into(),
+            request,
+            Ok(SAVED.into()),
+        ));
+        assert_eq!(full_copy_writes(copied), [SAVED]);
+
+        app.chat_runtime_mut(target).unwrap().copied = None;
+        let unguarded = text_copy::Request::for_test(handle, source.clone());
+        let missing = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "owned-report".into(),
+            unguarded,
+            Ok(SAVED.into()),
+        ));
+        assert!(full_copy_writes(missing).is_empty());
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        assert!(
+            app.message_copy_request(target, "missing-report", Some(source.clone()))
+                .is_none(),
+            "a report descriptor paired with an absent report must not fall through generic Copy"
+        );
+        assert!(
+            app.message_copy_request(target, "owned-report", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn showing_same_report_preserves_admitted_copy_and_deferred_effect_with_compatible_append() {
+        let _context = text_copy::isolated_context();
+        for completed_before_show in [false, true] {
+            for appended in [false, true] {
+                let (mut app, target, handle, source) = fixture();
+                let request = full_copy_request(&mut app, target, &source);
+                let (captured, ticket) = app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .provider_exit
+                    .full_copy
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                assert!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .provider_exit
+                        .key
+                        .is_none()
+                );
+                let pending = completed_before_show.then(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request.clone(),
+                        Ok(SAVED.into()),
+                    ))
+                });
+                let mut opening = source.clone();
+                if appended {
+                    opening.bytes = format!("{SAVED}\nAppended later 🦀").len() as u64;
+                    let mut snapshot = (*handle.snapshot()).clone();
+                    snapshot.generation += 1;
+                    snapshot.text_copy_sources.conversation[0] = Some(opening.clone());
+                    handle.publish_snapshot_for_test(snapshot);
+                    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                }
+                let before = handle.snapshot();
+                drop(app.handle_chat_ui(Action::ToggleReportOutput(
+                    target,
+                    "owned-report".into(),
+                    opening.clone(),
+                )));
+                let state = &app.chat_runtime_mut(target).unwrap().provider_exit;
+                assert!(state.expanded);
+                assert_eq!(state.key.as_ref().unwrap().source, opening);
+                let (retained, current) = state
+                    .full_copy
+                    .as_ref()
+                    .expect("Show retains the valid same-report permit");
+                assert_eq!(retained.source, captured.source);
+                assert_eq!(retained.source.bytes, SAVED.len() as u64);
+                assert!(
+                    Arc::ptr_eq(&ticket.0, &current.0),
+                    "transfer the original ticket, never mint a replacement"
+                );
+                assert!(ticket.is_current());
+                assert!(Arc::ptr_eq(&handle.snapshot(), &before));
+                assert_eq!(app.workspace.focused(), Some(target.card));
+                assert!(Arc::ptr_eq(
+                    app.chat_runtime_mut(target).unwrap().handle().unwrap(),
+                    &handle
+                ));
+                let copied = pending.unwrap_or_else(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request,
+                        Ok(SAVED.into()),
+                    ))
+                });
+                assert_eq!(
+                    full_copy_writes(copied),
+                    [SAVED],
+                    "Show keeps exactly the originally captured bytes, including after an append"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn showing_report_never_revives_copy_revoked_by_hide_collapse_or_different_report() {
+        let _context = text_copy::isolated_context();
+        for revoke in ["hide", "collapse", "different-report"] {
+            for completed_before_revoke in [false, true] {
+                let (mut app, target, handle, source) = fixture();
+                let mut snapshot = (*handle.snapshot()).clone();
+                let mut other = (*snapshot.items[0]).clone();
+                other.id = "other-report".into();
+                snapshot.items.push(Arc::new(other));
+                let mut other_source = source.clone();
+                other_source.token += 1;
+                snapshot
+                    .text_copy_sources
+                    .conversation
+                    .push(Some(other_source.clone()));
+                handle.publish_snapshot_for_test(snapshot);
+                drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                if revoke == "hide" {
+                    let _unpolled = begin(&mut app, target, &source);
+                }
+                let request = full_copy_request(&mut app, target, &source);
+                let ticket = app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .provider_exit
+                    .full_copy
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .clone();
+                let before = handle.snapshot();
+                let pending = completed_before_revoke.then(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request.clone(),
+                        Ok(SAVED.into()),
+                    ))
+                });
+                drop(app.handle_chat_ui(match revoke {
+                    "hide" => {
+                        Action::ToggleReportOutput(target, "owned-report".into(), source.clone())
+                    }
+                    "collapse" => Action::Toggle(target, "owned-report".into()),
+                    _ => Action::ToggleReportOutput(target, "other-report".into(), other_source),
+                }));
+                assert!(!ticket.is_current());
+                if revoke == "collapse" {
+                    drop(app.handle_chat_ui(Action::Toggle(target, "owned-report".into())));
+                }
+                drop(app.handle_chat_ui(Action::ToggleReportOutput(
+                    target,
+                    "owned-report".into(),
+                    source.clone(),
+                )));
+                let state = &app.chat_runtime_mut(target).unwrap().provider_exit;
+                assert!(state.expanded);
+                assert_eq!(state.key.as_ref().unwrap().id, "owned-report");
+                assert!(
+                    state.full_copy.is_none(),
+                    "Show alone never restores revoked Copy authority"
+                );
+                assert!(!ticket.is_current());
+                assert!(Arc::ptr_eq(&handle.snapshot(), &before));
+                assert_eq!(app.workspace.focused(), Some(target.card));
+                let obsolete = pending.unwrap_or_else(|| {
+                    app.handle_chat_ui(Action::MessageCopied(
+                        target,
+                        "owned-report".into(),
+                        request,
+                        Ok(SAVED.into()),
+                    ))
+                });
+                assert!(full_copy_writes(obsolete).is_empty());
+                let fresh = full_copy_request(&mut app, target, &source);
+                let fresh_ticket = &app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .provider_exit
+                    .full_copy
+                    .as_ref()
+                    .unwrap()
+                    .1;
+                assert!(!Arc::ptr_eq(&ticket.0, &fresh_ticket.0));
+                assert!(!ticket.is_current());
+                let copied = app.handle_chat_ui(Action::MessageCopied(
+                    target,
+                    "owned-report".into(),
+                    fresh,
+                    Ok(SAVED.into()),
+                ));
+                assert_eq!(full_copy_writes(copied), [SAVED]);
+            }
+        }
+    }
+
+    #[test]
+    fn full_report_copy_old_ticket_stays_revoked_after_pane_hide_show_or_report_selection() {
+        let _context = text_copy::isolated_context();
+        for pane_hide in [false, true] {
+            let (mut app, target, handle, source) = fixture();
+            let mut snapshot = (*handle.snapshot()).clone();
+            let mut other = (*snapshot.items[0]).clone();
+            other.id = "other-report".into();
+            snapshot.items.push(Arc::new(other));
+            let mut other_source = source.clone();
+            other_source.token += 1;
+            snapshot
+                .text_copy_sources
+                .conversation
+                .push(Some(other_source.clone()));
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            let request = full_copy_request(&mut app, target, &source);
+            let ticket = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .full_copy
+                .as_ref()
+                .unwrap()
+                .1
+                .clone();
+            if pane_hide {
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .set_visible(false)
+                    .unwrap();
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .set_visible(true)
+                    .unwrap();
+                // Restore every source/publication check; the old ticket alone
+                // still prevents the deferred request from becoming live again.
+                handle.publish_snapshot_for_test(snapshot);
+                drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            } else {
+                let before = handle.snapshot();
+                drop(app.handle_chat_ui(Action::ToggleReportOutput(
+                    target,
+                    "other-report".into(),
+                    other_source.clone(),
+                )));
+                assert!(Arc::ptr_eq(&handle.snapshot(), &before));
+            }
+            assert!(!ticket.is_current());
+            let obsolete = app.handle_chat_ui(Action::MessageCopied(
+                target,
+                "owned-report".into(),
+                request,
+                Ok(SAVED.into()),
+            ));
+            assert!(full_copy_writes(obsolete).is_empty());
+            let fresh = full_copy_request(&mut app, target, &source);
+            if !pane_hide {
+                assert_eq!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .provider_exit
+                        .key
+                        .as_ref()
+                        .unwrap()
+                        .id,
+                    "other-report",
+                    "header Copy must not replace the current inspector"
+                );
+                let fresh_ticket = app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .provider_exit
+                    .full_copy
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .clone();
+                drop(app.handle_chat_ui(Action::ToggleReportOutput(
+                    target,
+                    "other-report".into(),
+                    other_source,
+                )));
+                assert!(
+                    fresh_ticket.is_current(),
+                    "hiding another report must not revoke this report's Copy"
+                );
+            }
+            let copied = app.handle_chat_ui(Action::MessageCopied(
+                target,
+                "owned-report".into(),
+                fresh,
+                Ok(SAVED.into()),
+            ));
+            assert_eq!(full_copy_writes(copied), [SAVED]);
+        }
+    }
+
+    #[test]
+    fn hiding_saved_output_keeps_an_unrelated_normal_transcript_copy_working() {
+        let _context = text_copy::isolated_context();
+        let (mut app, target, handle, source) = fixture();
+        let body = "ordinary transcript body 🦀";
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "ordinary".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        }));
+        let mut ordinary = source.clone();
+        ordinary.token += 10;
+        ordinary.bytes = body.len() as u64;
+        snapshot
+            .text_copy_sources
+            .conversation
+            .push(Some(ordinary.clone()));
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        let read = begin(&mut app, target, &source);
+        drop(app.handle_chat_ui(Action::ReportOutputLoaded(
+            target,
+            read,
+            Ok(Arc::new(SAVED.into())),
+        )));
+        let request = app
+            .message_copy_request(target, "ordinary", Some(ordinary))
+            .unwrap();
+        drop(app.handle_chat_ui(Action::ToggleReportOutput(
+            target,
+            "owned-report".into(),
+            source,
+        )));
+        let copied = app.handle_chat_ui(Action::MessageCopied(
+            target,
+            "ordinary".into(),
+            request,
+            Ok(body.into()),
+        ));
+        assert_eq!(full_copy_writes(copied), [body]);
+    }
+
+    #[test]
+    fn full_report_copy_runtime_drop_revokes_request_and_effect_with_a_still_live_handle() {
+        let _context = text_copy::isolated_context();
+        for completed_before_remove in [false, true] {
+            let (mut app, target, handle, source) = fixture();
+            let request = full_copy_request(&mut app, target, &source);
+            let (key, ticket) = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .provider_exit
+                .full_copy
+                .as_ref()
+                .unwrap()
+                .clone();
+            let pending = completed_before_remove.then(|| {
+                app.handle_chat_ui(Action::MessageCopied(
+                    target,
+                    "owned-report".into(),
+                    request.clone(),
+                    Ok(SAVED.into()),
+                ))
+            });
+            drop(
+                app.remove_chat_card(target.card, None)
+                    .expect("remove the report's actual owning runtime"),
+            );
+            assert!(!app.cards.contains_key(&target.card));
+            assert!(handle.is_connected());
+            assert!(snapshot_keeps(&handle.snapshot(), &key));
+            assert!(!ticket.is_current());
+            let obsolete = pending.unwrap_or_else(|| {
+                app.handle_chat_ui(Action::MessageCopied(
+                    target,
+                    "owned-report".into(),
+                    request,
+                    Ok(SAVED.into()),
+                ))
+            });
+            assert!(full_copy_writes(obsolete).is_empty());
+        }
+    }
+
     #[test]
     fn report_page_visibility_ticket_survives_live_updates_but_not_hide_show_or_runtime_drop() {
         let _context = text_copy::isolated_context();
@@ -1410,7 +2068,7 @@ mod tests {
             .selection
             .borrow_mut()
             .selected = Some(selected.clone());
-        let delayed = text_copy::Request::for_test(handle.clone(), source.clone());
+        let delayed = full_copy_request(&mut app, target, &source);
         let pointer_copy = app.handle_chat_ui(Action::CopyReportSelection(
             target,
             key.clone(),
@@ -1494,7 +2152,7 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         let key = runtime.provider_exit.key.as_ref().unwrap().clone();
         let visible = runtime.provider_exit.visibility.clone();
-        let delayed = text_copy::Request::for_test(handle.clone(), source);
+        let delayed = full_copy_request(&mut app, target, &source);
         #[derive(Default)]
         struct MemoryClipboard(Vec<String>);
         impl Clipboard for MemoryClipboard {
@@ -1726,7 +2384,7 @@ mod tests {
         assert!(texts.iter().all(|text| text.len() <= PAGE_BYTES + 3));
         assert!(height < 400.0);
 
-        let copy = text_copy::Request::for_test(handle, source.clone());
+        let copy = full_copy_request(&mut app, target, &source);
         let task = app.handle_chat_ui(Action::MessageCopied(
             target,
             "owned-report".into(),
