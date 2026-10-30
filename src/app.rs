@@ -2429,6 +2429,7 @@ pub enum SettingsCategory {
     General,
     Appearance,
     Terminal,
+    Agents,
     Editor,
     NativeChat,
     Links,
@@ -2438,13 +2439,14 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
         Self::Editor,
         Self::NativeChat,
         Self::Terminal,
+        Self::Agents,
         Self::Links,
         Self::Keyboard,
         Self::Accounts,
@@ -2457,6 +2459,7 @@ impl SettingsCategory {
             Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
+            Self::Agents => "Agents",
             Self::Editor => "Editor",
             Self::NativeChat => "Native chat",
             Self::Links => "Browser & links",
@@ -2736,6 +2739,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
+        Message::AgentCapacity(agent_ui::CapacityAction::CloseInterrupted) => true,
         Message::TerminalFailure(action) => action.is_user_action(),
         Message::SavedTerminal(action) => action.is_user_action(),
         Message::NewTerminal
@@ -3009,6 +3013,8 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsField {
+    AgentCallerLimit,
+    AgentGlobalLimit,
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
@@ -3160,6 +3166,8 @@ impl SettingsField {
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
             Self::TerminalScrollbackMib => "Scrollback (MiB)",
+            Self::AgentCallerLimit => "Agents per caller",
+            Self::AgentGlobalLimit => "Agents across all callers",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
@@ -3232,6 +3240,7 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
+            Self::AgentCallerLimit | Self::AgentGlobalLimit => SettingsCategory::Agents,
             Self::AppTheme
             | Self::UiScale
             | Self::ShowStatusBar
@@ -3419,6 +3428,8 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    agent_caller_limit: String,
+    agent_global_limit: String,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
@@ -3468,6 +3479,8 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            agent_caller_limit: settings.agent_concurrency.caller.to_string(),
+            agent_global_limit: settings.agent_concurrency.global.to_string(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -3550,6 +3563,8 @@ impl SettingsDraft {
             SettingsField::EditorFontFamily => self.editor_font_family = value,
             SettingsField::EditorFontSize => self.editor_font_size = value,
             SettingsField::TerminalScrollbackMib => self.terminal_scrollback_mib = value,
+            SettingsField::AgentCallerLimit => self.agent_caller_limit = value,
+            SettingsField::AgentGlobalLimit => self.agent_global_limit = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::AutoDeleteMergedWorktrees => {
                 self.auto_delete_merged_worktrees = value == "true"
@@ -3701,6 +3716,14 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::AgentCallerLimit => value
+            .parse::<usize>()
+            .map(|value| next.agent_concurrency.caller = value)
+            .map_err(|_| "Agents per caller must be a whole number.".to_owned()),
+        SettingsField::AgentGlobalLimit => value
+            .parse::<usize>()
+            .map(|value| next.agent_concurrency.global = value)
+            .map_err(|_| "Agents across all callers must be a whole number.".to_owned()),
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -4356,6 +4379,7 @@ pub enum Message {
     },
     /// One shared sidebar model update, from the daemon observer or publisher.
     WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
+    AgentCapacity(agent_ui::CapacityAction),
     Repository(RepositoryAction),
     OperationRecovery(crate::operation_recovery::Action),
     ResolvedDiffBasis {
@@ -5304,6 +5328,7 @@ pub struct Cagents {
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     channel_work: channel_work::State,
+    agent_capacity: agent_ui::CapacityState,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -13872,6 +13897,7 @@ impl Cagents {
         if previous.show_status_bar != self.settings.show_status_bar {
             self.device_ui.menu_open = false;
             tasks.push(self.accounts_surface_changed());
+            tasks.push(self.update_agent_capacity(agent_ui::CapacityAction::Refresh));
         }
         if previous.notifications != self.settings.notifications {
             self.notification_ui
@@ -14232,6 +14258,7 @@ impl Application for Cagents {
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
+            agent_capacity: agent_ui::CapacityState::installation(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -17685,19 +17712,26 @@ impl Application for Cagents {
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
+            Message::AgentCapacity(action) => self.update_agent_capacity(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
+                let was_focused = self.refresh_ui.focused;
                 let refresh = self.update_refresh(action);
                 let shared = if self.shared_views.blocked.is_empty() {
                     Task::none()
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), shared])
+                let capacity = if !was_focused && self.refresh_ui.focused {
+                    self.update_agent_capacity(agent_ui::CapacityAction::Refresh)
+                } else {
+                    Task::none()
+                };
+                Task::batch([refresh, self.flush_document_tone(), shared, capacity])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -18127,6 +18161,7 @@ impl Application for Cagents {
             self.automation_subscription(),
             self.work_subscription(),
             self.channel_work_subscription(),
+            self.agent_capacity_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
@@ -29305,6 +29340,7 @@ mod tests {
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
+            agent_capacity: agent_ui::CapacityState::default(),
             automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
