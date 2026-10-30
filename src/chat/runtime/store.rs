@@ -2,6 +2,7 @@
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
 mod text_copy;
+mod wal_retention;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -227,7 +228,7 @@ impl Store {
                 .open(&path)
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=1048576; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
@@ -272,6 +273,12 @@ impl Store {
         }
         result
     }
+    // The mutator body has returned, so its statements and RAII transactions
+    // have finished, including on errors after a partial/committed write.
+    // Maintenance never changes the result or publication of that write.
+    fn maintain_wal(&self) {
+        let _ = wal_retention::after_write(&self.db, &self.directory);
+    }
     fn exists(&self, id: &str) -> Result<bool, String> {
         self.db
             .query_row(
@@ -289,6 +296,16 @@ impl Store {
         self.put_at(item, older, None)
     }
     fn put_at(
+        &mut self,
+        item: Item,
+        older: bool,
+        assigned: Option<i64>,
+    ) -> Result<Option<String>, String> {
+        let result = self.put_at_inner(item, older, assigned);
+        self.maintain_wal();
+        result
+    }
+    fn put_at_inner(
         &mut self,
         mut item: Item,
         older: bool,
@@ -630,6 +647,11 @@ impl Store {
     /// The temporary range is disjoint from every normally allocated ordinal,
     /// so UNIQUE stays enforced through both phases of the atomic update.
     fn rebalance(&mut self) -> Result<(), String> {
+        let result = self.rebalance_inner();
+        self.maintain_wal();
+        result
+    }
+    fn rebalance_inner(&mut self) -> Result<(), String> {
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         transaction.execute_batch("CREATE TEMP TABLE ordinal_remap(old INTEGER PRIMARY KEY, temporary INTEGER UNIQUE NOT NULL, new INTEGER UNIQUE NOT NULL);").map_err(|e| e.to_string())?;
         let count: i64 = transaction
@@ -751,7 +773,12 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
-    pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+        let result = self.apply_inner(event);
+        self.maintain_wal();
+        result
+    }
+    fn apply_inner(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -975,6 +1002,17 @@ impl Store {
         }
     }
     fn append(
+        &mut self,
+        id: &str,
+        role: Role,
+        thinking: bool,
+        delta: &str,
+    ) -> Result<Option<String>, String> {
+        let result = self.append_inner(id, role, thinking, delta);
+        self.maintain_wal();
+        result
+    }
+    fn append_inner(
         &mut self,
         id: &str,
         role: Role,
