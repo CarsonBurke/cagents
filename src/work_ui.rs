@@ -5,7 +5,7 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use cosmic::{
     Element, Theme,
@@ -463,20 +463,20 @@ impl State {
         .padding([space::XS, space::S])
         .on_press_maybe((!projects.is_empty()).then_some(Action::ScopeMenu(!self.scope_menu)));
         let content = self.scope_menu.then(|| {
-            let count = |scope: Option<&PathBuf>| {
-                self.board.as_ref().map_or(0, |board| {
-                    board
-                        .items
-                        .iter()
-                        .filter(|item| scope.is_none_or(|scope| item.project == *scope))
-                        .count()
-                })
-            };
+            let cards_in_board = self
+                .board
+                .as_ref()
+                .map(|board| board.items.as_slice())
+                .unwrap_or_default();
+            let mut counts: HashMap<&PathBuf, usize> = HashMap::new();
+            for item in cards_in_board {
+                *counts.entry(&item.project).or_default() += 1;
+            }
             let mut items = vec![
                 popover_item(
                     Icon::Grid.handle(),
                     "All projects",
-                    cards(count(None)),
+                    cards(cards_in_board.len()),
                     Action::Scope(None),
                 )
                 .selected(self.scope.is_none())
@@ -486,7 +486,7 @@ impl State {
                 popover_item(
                     Icon::Branch.handle(),
                     project.name.as_str(),
-                    cards(count(Some(&project.repository))),
+                    cards(counts.get(&project.repository).copied().unwrap_or_default()),
                     Action::Scope(Some(project.repository.clone())),
                 )
                 .selected(self.scope.as_ref() == Some(&project.repository))
@@ -1482,6 +1482,131 @@ mod tests {
         );
         watched(&mut state, 2, board(vec![item("fix/login", "redact")]));
         assert_eq!(state.scope, None);
+    }
+
+    fn scope_menu_text(state: &State) -> Option<Vec<String>> {
+        use cosmic::iced::{
+            Rectangle, Size, Vector,
+            advanced::{
+                Layout, layout,
+                widget::{Operation, Tree},
+            },
+        };
+        #[derive(Default)]
+        struct Text(Vec<String>);
+        impl Operation for Text {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.scope_picker();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(800.0, 700.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut overlay = element.as_widget_mut().overlay(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &viewport,
+            Vector::ZERO,
+        )?;
+        let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
+        let mut text = Text::default();
+        overlay
+            .as_overlay_mut()
+            .operate(Layout::new(&popup), &renderer, &mut text);
+        Some(text.0)
+    }
+
+    #[test]
+    fn scope_menu_counts_all_cards_by_exact_project_and_tracks_accepted_boards() {
+        let mut initial = board(vec![
+            item("first", "sample"),
+            item("second", "sample"),
+            item("third", "sample-extra"),
+            item("unlisted", "orphan"),
+        ]);
+        let data = Arc::make_mut(&mut initial);
+        data.projects.retain(|project| project.name != "orphan");
+        for project in &mut data.projects {
+            project.name = "Same name".into();
+        }
+        let mut empty = data.projects[0].clone();
+        empty.repository = "/repos/empty/.git".into();
+        empty.name = "Empty project".into();
+        data.projects.push(empty.clone());
+        let mut state = State::default();
+        connected(&mut state, 2, initial.clone());
+        assert!(
+            scope_menu_text(&state).is_none(),
+            "closed menu has no popup"
+        );
+        state.update(Action::ScopeMenu(true));
+        let expected = [
+            "All projects",
+            "4 cards",
+            "Same name",
+            "2 cards",
+            "Same name",
+            "1 card",
+            "Empty project",
+            "0 cards",
+        ];
+        assert_eq!(scope_menu_text(&state).unwrap(), expected);
+        state.update(Action::Query("no matching cards".into()));
+        state.update(Action::Scope(Some("/repos/sample/.git".into())));
+        assert_eq!(state.visible().count(), 0);
+        state.update(Action::ScopeMenu(true));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            expected,
+            "picker counts ignore current search and scope"
+        );
+
+        let mut updated = board(vec![item("new", "sample-extra")]);
+        let data = Arc::make_mut(&mut updated);
+        data.projects[0].name = "Same name".into();
+        data.projects.push(empty);
+        watched(&mut state, 3, updated);
+        assert!(
+            state.scope.is_none(),
+            "removed selected project leaves scope"
+        );
+        let updated_counts = [
+            "All projects",
+            "1 card",
+            "Same name",
+            "1 card",
+            "Empty project",
+            "0 cards",
+        ];
+        assert_eq!(scope_menu_text(&state).unwrap(), updated_counts);
+        watched(&mut state, 2, initial);
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            updated_counts,
+            "an older board must not restore obsolete counts"
+        );
+
+        state.reset();
+        state.update(Action::ScopeMenu(true));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            ["All projects", "0 cards"]
+        );
+        connected(&mut state, 1, board(Vec::new()));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            ["All projects", "0 cards"]
+        );
     }
 
     #[test]
