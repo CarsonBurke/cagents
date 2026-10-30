@@ -5120,6 +5120,74 @@ mod tests {
     fn pending_terminal_reservation_survives_equal_reads_and_final_save_ack() {
         use super::super::workspace_model_sync::ModelUpdate;
 
+        // Observe without retaining another model/snapshot Arc or calling the
+        // mutating capture helpers: diagnostics must not change close custody.
+        let close_witness = |app: &Cagents| {
+            let Some(pending) = app.pending_window_close.as_ref() else {
+                return format!(
+                    "pending=None, window={:?}, exit={}, settings={}/{}, settings_error={:?}, transient={:?}",
+                    app.core.main_window_id(),
+                    app.exit.is_some(),
+                    app.settings_ack_generation,
+                    app.settings_save_generation,
+                    app.settings_save_error,
+                    app.window_close_transient_blocker(),
+                );
+            };
+            let writer = app.session.as_ref().map(SessionRuntime::operation_store);
+            let same_writer = matches!((&pending.writer, &writer),
+                (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+            let mut worktree_offsets = app.worktree_offsets.clone();
+            if app.durable.active_channel.is_none()
+                && let Some(path) = &app.active_workspace
+            {
+                worktree_offsets.insert(path.clone(), app.workspace.camera().offset());
+            }
+            // Read-only projection of capture_window_view before its title
+            // pruning. Report only changed field names, never draft/env bytes.
+            let view = serde_json::to_value(WindowView {
+                user_titles: app.chrome_ui.user_titles.clone(),
+                projects_sidebar_collapsed: app.chrome_ui.projects_collapsed,
+                sidebar_width: app.settings.sidebar_width,
+                inspector_width: app.settings.inspector_width,
+                context_inspector_open: app.context_inspector_open,
+                context_tab: app.context_tab,
+                sidebar: app.sidebar_state.saved_view(),
+                worktree_offsets,
+            })
+            .map_err(|error| error.to_string());
+            let view_differences = pending
+                .view
+                .as_ref()
+                .ok()
+                .and_then(serde_json::Value::as_object)
+                .zip(view.as_ref().ok().and_then(serde_json::Value::as_object))
+                .map(|(before, current)| {
+                    before
+                        .iter()
+                        .filter(|(key, value)| current.get(*key) != Some(*value))
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>()
+                });
+            format!(
+                "generation={}, window_same={}, writer_same={}, model_ptrs={:p}/{:p}, model_same={}, model_values_same={}, snapshot_same_durable={}, settings_generation_same={}, settings_values_same={}, settings={}/{}, settings_error={:?}, view_before_pruning_same={}, view_differences={view_differences:?}, transient={:?}",
+                pending.generation,
+                app.core.main_window_id() == Some(pending.window),
+                same_writer,
+                Arc::as_ptr(&pending.model),
+                Arc::as_ptr(&app.durable),
+                Arc::ptr_eq(&pending.model, &app.durable),
+                pending.model.as_ref() == app.durable.as_ref(),
+                pending.snapshot.as_ref() == app.durable.as_ref(),
+                pending.settings_generation == app.settings_save_generation,
+                pending.settings == app.settings,
+                app.settings_ack_generation,
+                app.settings_save_generation,
+                app.settings_save_error,
+                pending.view == view,
+                app.window_close_transient_blocker(),
+            )
+        };
         let directory = tempfile::tempdir().unwrap();
         let (mut app, _, _, _) = channel_move_fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
@@ -5149,14 +5217,30 @@ mod tests {
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
         super::super::tests::install_window_close_storage(&mut app, directory.path());
+        eprintln!(
+            "terminal final-close before request: {}",
+            close_witness(&app)
+        );
         let task = app.update(Message::WindowCloseRequested(window));
+        eprintln!(
+            "terminal final-close after request: {}",
+            close_witness(&app)
+        );
         assert!(app.pending_window_close.is_some());
         let snapshot = app.persistent_workspace();
-        for _ in 0..3 {
+        eprintln!(
+            "terminal final-close after snapshot: {}",
+            close_witness(&app)
+        );
+        for read in 0..3 {
             drop(
                 app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
                     model.clone(),
                 ))),
+            );
+            eprintln!(
+                "terminal final-close after equal read {read}: {}",
+                close_witness(&app)
             );
             assert_eq!(app.persistent_workspace(), snapshot);
             assert!(app.durable.pending_terminal_creations.contains(&id));
@@ -5165,6 +5249,27 @@ mod tests {
             assert_eq!(app.core.main_window_id(), Some(window));
         }
         let completed = super::super::tests::window_close_test_message(&mut app, task);
+        if let Message::WindowCloseFlushed {
+            generation,
+            window: completed_window,
+            settings_owner,
+            saved,
+            result,
+        } = &completed
+        {
+            let writer = app.session.as_ref().map(SessionRuntime::operation_store);
+            let same_writer = matches!((&settings_owner.writer, &writer),
+                (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+            eprintln!(
+                "terminal final-close completion: generation={generation}, window_same={}, settings_owner_generation={}, settings_writer_same={same_writer}, saved_generation={:?}, saved_error={:?}, flush_error={:?}; {}",
+                app.core.main_window_id() == Some(*completed_window),
+                settings_owner.generation,
+                saved.as_ref().ok().map(|saved| saved.generation),
+                saved.as_ref().err(),
+                result.as_ref().err(),
+                close_witness(&app),
+            );
+        }
         assert!(matches!(
             &completed,
             Message::WindowCloseFlushed { result: Ok(()), .. }
@@ -5181,7 +5286,19 @@ mod tests {
         assert!(saved.cards.iter().any(|card| card.id == id
             && card.existence.is_open()
             && matches!(&card.kind, CardKind::Terminal(current) if current == &session)));
+        eprintln!("terminal final-close before ACK: {}", close_witness(&app));
         drop(app.update(completed));
+        let close_notices = app
+            .notices
+            .entries
+            .iter()
+            .filter(|entry| entry.notice.key == Some(NoticeKey::WindowClose(window)))
+            .map(|entry| (&entry.notice.message, &entry.notice.details))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "terminal final-close after ACK: {}; close_notices={close_notices:?}",
+            close_witness(&app),
+        );
         assert!(app.exit.is_some());
         assert!(app.pending_window_close.is_none());
         assert_eq!(app.core.main_window_id(), None);
