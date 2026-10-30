@@ -12407,6 +12407,9 @@ pub(super) fn with_attachment_chooser_open_for_test(
 }
 
 /// Sends draft `card`'s first message, returning the launch it starts.
+///
+/// The first message saves its candidate conversation before anything
+/// starts, and that candidate is the launch the confirmed save starts.
 #[cfg(test)]
 pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Session {
     let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
@@ -12414,14 +12417,11 @@ pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Ses
     };
     let target = runtime.target;
     drop(app.start_chat_draft(target));
-    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
-        panic!("a starting draft keeps its chat runtime");
-    };
-    runtime
-        .queued
-        .as_ref()
-        .expect("the first message waits for its conversation")
-        .draft
+    app.chat_ui
+        .draft_checkpoints
+        .get(&card)
+        .expect("the first message saves its conversation before starting")
+        .candidate
         .clone()
 }
 
