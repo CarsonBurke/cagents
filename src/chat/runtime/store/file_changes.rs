@@ -409,6 +409,10 @@ impl Store {
         Ok(())
     }
     pub(crate) fn publish_files(&mut self, state: &mut Snapshot) -> Result<(), String> {
+        if let Err(error) = self.peer_query.guard(&self.db) {
+            state.file_changes = Default::default();
+            return Err(error);
+        }
         if state.file_changes.revision != self.file_revision
             || state.file_changes.coverage.has_unloaded_history != self.provider_earlier
             || state.file_changes.coverage.has_incomplete_delegated_history != self.child_files_seen
@@ -530,6 +534,7 @@ impl Store {
             Command::LoadFileChangePatches { key, .. } => Some(key),
             _ => return Ok(None),
         };
+        self.peer_query.guard(&self.db)?;
         if requested_key.is_some_and(|key| {
             source_key(&key.source).len().saturating_add(key.path.len()) > super::METADATA_LIMIT
         }) {

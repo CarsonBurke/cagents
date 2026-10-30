@@ -20,7 +20,7 @@ pub fn mark_provider_error(provider: Provider, item: &mut super::Item) -> bool {
     let super::ItemContent::Text { text, .. } = &mut item.content else {
         return false;
     };
-    let body = std::mem::take(text);
+    let body = std::mem::take(text).into_owned();
     let (from, sender) = provider_marker(provider);
     item.role = super::Role::System;
     item.content = super::ItemContent::Delivery {

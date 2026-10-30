@@ -453,15 +453,16 @@ impl Omp {
                     "text" => (
                         format!("{key}:{index}"),
                         ItemContent::Text {
-                            text: if index == 0 {
+                            text: (if index == 0 {
                                 mapping
                                     .as_ref()
                                     .map(|(plain, _)| *plain)
                                     .unwrap_or_else(|| text(block, "text"))
-                                    .into()
+                                    .to_owned()
                             } else {
-                                text(block, "text").into()
-                            },
+                                text(block, "text").to_owned()
+                            })
+                            .into(),
                             thinking: false,
                             phase: phase(block),
                         },
@@ -690,13 +691,14 @@ impl Omp {
                     id: format!("widget:{}", text(frame, "widgetKey")),
                     role: Role::System,
                     content: ItemContent::Text {
-                        text: frame["widgetLines"]
+                        text: (frame["widgetLines"]
                             .as_array()
                             .into_iter()
                             .flatten()
                             .filter_map(Value::as_str)
                             .collect::<Vec<_>>()
-                            .join("\n"),
+                            .join("\n"))
+                        .into(),
                         thinking: false,
                         phase: Phase::Final,
                     },

@@ -2955,7 +2955,7 @@ mod tests {
             id: "unrelated".into(),
             role: chat::Role::User,
             content: ItemContent::Text {
-                text: "later absent".repeat(10_000),
+                text: ("later absent".repeat(10_000)).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -3046,7 +3046,7 @@ mod tests {
         let old = snapshot.items[0].clone();
         snapshot.items[0] = Arc::new(chat::Item {
             content: ItemContent::Text {
-                text: "new needle λ ".repeat(10_000),
+                text: ("new needle λ ".repeat(10_000)).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },

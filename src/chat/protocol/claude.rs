@@ -3726,7 +3726,7 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
         // would demote real answers into narration, so every text item is
         // final until the provider itself says otherwise.
         content: ItemContent::Text {
-            text,
+            text: text.into(),
             thinking,
             phase: Phase::Final,
         },

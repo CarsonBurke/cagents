@@ -9,6 +9,8 @@ pub mod failure;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
+mod text_body;
+pub use text_body::TextBody;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1132,7 +1134,9 @@ pub struct Snapshot {
     pub text_copy_sources: TextCopySources,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
-    pub models: Vec<Model>,
+    /// Provider catalogs are immutable between explicit catalog events.
+    /// Snapshot cloning and revision-fenced publications retain their payloads.
+    pub models: std::sync::Arc<Vec<Model>>,
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
     #[serde(default)]
@@ -1143,8 +1147,8 @@ pub struct Snapshot {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub permission_denials: Vec<PermissionDenial>,
-    pub commands: Vec<SlashCommand>,
-    pub skills: Vec<Skill>,
+    pub commands: std::sync::Arc<Vec<SlashCommand>>,
+    pub skills: std::sync::Arc<Vec<Skill>>,
     pub usage: Usage,
     pub busy: bool,
     pub detail: String,
@@ -1764,7 +1768,7 @@ pub struct SearchResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemContent {
     Text {
-        text: String,
+        text: TextBody,
         thinking: bool,
         /// Defaulted so transcripts stored before phases existed still load.
         #[serde(default)]

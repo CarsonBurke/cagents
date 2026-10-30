@@ -151,6 +151,7 @@ mod tests {
         let update = Presentation {
             base_generation: 3,
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             metadata: Snapshot {
                 generation: 4,
                 ..Snapshot::default()
@@ -171,6 +172,7 @@ mod tests {
         let rewrite = Presentation {
             base_generation: 4,
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             metadata: Snapshot {
                 generation: 5,
                 ..Snapshot::default()
