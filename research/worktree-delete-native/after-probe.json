@@ -2,8 +2,8 @@
   "schema": 1,
   "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
   "never_merge": true,
-  "status": "RUNNABLE_SOURCE_PREPARED_UNGRANTED_UNRUN",
-  "parent_control_head": "c7a41814f19a00229cc96ae4c3ab471eb352c018",
+  "status": "CORRECTIVE_SOURCE_CANDIDATE_FROZEN_HELPER_FRESH_CALLER_REVIEW_REQUIRED_UNGRANTED_UNRUN",
+  "parent_control_head": "ab3f335a8910838edc6f03fe83c659bd3476cee0",
   "after": {
     "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
     "tree": "7d84da268933045b1add2ad310ce45c84be751db"
@@ -20,7 +20,9 @@
     ".github/qualification/native-worktree-delete-primitives.py",
     "research/worktree-delete-native/manifest.json",
     "research/worktree-delete-native/primitives-provenance.json",
-    ".github/qualification/native-worktree-delete-cleanup-memory-check.py"
+    ".github/qualification/native-worktree-delete-cleanup-memory-check.py",
+    ".github/qualification/native-worktree-delete-runtime.py",
+    ".github/qualification/native-worktree-delete-private-desktop.py"
   ],
   "product_source_sha256": {
     "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
@@ -149,7 +151,8 @@
       "product_head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
       "product_tree": "7d84da268933045b1add2ad310ce45c84be751db",
       "source_sha256": "exact map for every review_paths entry",
-      "composition_review": "SOURCE_CLEAR"
+      "composition_review": "SOURCE_CLEAR",
+      "private_desktop_custody": "SOURCE_CLEAR"
     },
     "ui_checks": {
       "verdict": "MATCHED_BOUNDARIES_PASS",
@@ -218,12 +221,14 @@
     ".github/qualification/native-worktree-delete-after-probe.py",
     "research/worktree-delete-native/after-probe.json",
     "research/worktree-delete-native/AFTER-PROBE.md",
-    ".github/qualification/native-worktree-delete-cleanup-memory-check.py"
+    ".github/qualification/native-worktree-delete-cleanup-memory-check.py",
+    ".github/qualification/native-worktree-delete-runtime.py",
+    ".github/qualification/native-worktree-delete-private-desktop.py"
   ],
   "cleanup_contract": {
-    "deadline": "Original granted one-shot cleanup alarm; BaseException propagates from every stage to one outer abort handler. After expiry no later input, CLI, wait, forced process cleanup or source inspection.",
+    "deadline": "One absolute work/final deadline from remaining external EC lease and one unrenewed cleanup deadline/epoch. Fresh cancellation or spent budget stops all later process/native effects; no expired timeout floor or Popen disposal inference.",
     "observer_close": "Probe-local sequential exact-held input releases and Xlib close. Original reusable helper bodies unchanged; no swallowing catch/finally.",
-    "custody": "Process status, observer status and physical status are distinct. Interrupted or incomplete physical custody stays UNCONFIRMED. Successful forced disposal never restores qualification.",
+    "custody": "Process/observer/physical status remain distinct. Sticky caller abort/unconfirmed state prevents a physical-disposed claim; earlier ordinary errors still prevent qualification even after observed process disposal.",
     "sticky_errors": "Original collection failure, all earlier ordinary cleanup errors, observer release errors and cancellation retain FAILED_UNQUALIFIED regardless of later empty process observation.",
     "memory_check": ".github/qualification/native-worktree-delete-cleanup-memory-check.py",
     "memory_scope": "AST-extracted actual cleanup functions only; pure memory dependencies; no probe/helper import, signals, process, native or fixture workload. Not native qualification.",
@@ -233,6 +238,89 @@
       "sha256": "ee6e92a9c2ba3a6e8c86645e7da122f97538d0c86a5d1a4700754ec1e50020d0",
       "verdict": "BLOCKED_C1_CLEANUP_DEADLINE_SWALLOWED"
     },
-    "successor_review": "Exact new child head/tree and all review_paths must receive an independent fresh source clearance before any execution."
+    "successor_review": "Exact new child head/tree and all review_paths must receive an independent fresh source clearance before any execution.",
+    "memory_check_scope": "Historical exact-ab3/C1 witness only. No checker or extracted function has run against this new isolation/caller successor; fresh caller review and any separately authorized checks are required."
+  },
+  "admission": null,
+  "private_desktop_correction": {
+    "status": "FROZEN_SHARED_CAPSULE_FRESH_REVIEW_REQUIRED",
+    "author": "/root/editor_recovery",
+    "source": ".github/qualification/native-return-terminal-primitives.py",
+    "helper_head": "2b30c85569a0fc1d0a569359ec765eb60471b1e4",
+    "helper_sha256": "659324372442c46b56fc3a76bb9b995eef2a45cb0abdbefc24b793a504e8309a",
+    "contract": "Refuse all inherited desktop/session/accessibility endpoints unchanged. Prove owned authenticated Xvfb/displayfd/cookie/PID-start/executable/socket/auth inode plus private session and accessibility buses before any desktop client/settings/import/input. No external wrapper, hosted flag or README may substitute for custody.",
+    "user_prohibition": "Never connect to, read, mutate, focus or inject into any live user desktop/input/clipboard/state. Private owned fixture resources only; no endpoint fallback.",
+    "caller_scope": "Minimal bootstrap/isolation/caller absolute deadline and effect guards. Preserve Cancel-only fixture flow,39 planned frames,7 conservation checkpoints,4 synthetic terminal IDs and all product pins.",
+    "prior_source_clearance": {
+      "head": "ab3f335a8910838edc6f03fe83c659bd3476cee0",
+      "tree": "b9efd580895e15338a35e923ad822e65b507a63e",
+      "path": "/tmp/coord-b9-1984-ab3f335a-after-probe-independent-review.json",
+      "sha256": "d3c7e729c3f3f068f1c4eab2a8fbead5d72d6feea2304312dfe8784dfd6e42f9",
+      "scope": "Historical C1 cleanup source-only clearance. Does not clear the new P0 private desktop/bus custody requirement or grant execution."
+    },
+    "review": "Fresh exact successor source review required before any actual EC lease.",
+    "runtime_path": ".github/qualification/native-worktree-delete-runtime.py",
+    "runtime_binding": "Exact shared29def capsule owns scan/live/close_owned and pidfd admission/signals/original-wait release; same original OWNED/CHILDREN/EVENTS and same PIDFDS/PIDFD_FAILURES, no numeric signal/reap fallback. PR1984 binding supplies original absolute work/final/cleanup budget and source/input guards only.",
+    "helper_tree": "49419314e9c18a54e7e221bbc71c07e223f4d47d",
+    "capsule_path": ".github/qualification/native-worktree-delete-private-desktop.py",
+    "capsule_sha256": "e711a1319ec37721f8e9701d198940df9445d378850c0cde680e911094ccd71d",
+    "contract_path": "/tmp/coord-b9-1994-isolation-dl1-evidence/integration-contract.json",
+    "contract_sha256": "c40dafe1bc6b33d1d77cc18313fec632edbc42b2ebd74010a472b76174119ee0",
+    "helper_source_receipt": "/tmp/coord-b9-1994-isolation-dl1-evidence/source-receipt.json",
+    "helper_source_receipt_sha256": "bb3b6d23e2fd42a64b9f0edaa9de4ff30823f0b0102eb3772f69a4ca1f9fc1ae",
+    "definition_sha256": {
+      "refuse_inherited_desktop": "7813ac595b5cee9679cb8088e732bf1ab55522cda8dc985fa484fe26aef3adab",
+      "socket_inodes": "81209cb3ec5f70c3d79e827fc95295883352430319d9393e1f996ff8fa5c529c",
+      "server_record": "e85582356ba9006d89d336f8c0b34096b8f9a918d7976b9369bd50c641c35ac2",
+      "verify_server": "2a95d98b970c07f99d191652fbe7e145ea454ab38909ec1b8e1aa1e4edd09be9",
+      "socket_record": "22d8daf078e9c27f3f57aa753aacf3b9778035ccb6d6593da8074ae630b26def",
+      "verify_socket": "09fb558da67f6c3d227ca02a93405a2eea0d3f0caa01d5e0b53dcffdfe5a7045",
+      "verify_private_desktop": "d8e7919a186930a3879278975a1dfae22d541ca30dbb17443d4bf633893a6892",
+      "require_private_desktop": "42b445ae530e9bb2ee5f3c3a81b77e774657ec4b8314f4ef75879b2ad7d9357b",
+      "child_desktop_environment": "131faa99e6117920e4911ae7eba1c732c7b3c491246d7775581b60126c7f3b6c",
+      "private_desktop": "057bf7cffc1462fc8c19071bcda8d002ae09a4453d7ad0d2aab3d941bda17e03",
+      "private_accessibility": "476f34254300a1e171be4392a10e73af31679d91ddb9061fff8a1eae6769e9d6",
+      "bootstrap": "5c0ac285d2bfc7ee5cfb97dd4c0162d96306e9c61a99a3002a40e4b8d9567dc2",
+      "admit_owned": "c51e348972b766ddd4daaf517bc908d53ec6634452c6fa86abb12ee53f17bc23",
+      "pidfd_exited": "559694601bb06f160fb98fe53bdbed96aed22ac2697415b9132aa64f2a4a0053",
+      "signal_owned": "b33d7f3f8ab8fa4faeb8c328e9d676d6340c6718e75e4250a1528a97a2e48610",
+      "settle_direct": "83b51cbbcf3b0b064f15a7acca45c038d3b9ce23b7c5e23359b6535abb0f3156",
+      "settle_descendant": "00b38b38fc091c29b440ced6c57babe51ca17b3fc3b8b32713668bd57df5cf7f",
+      "release_settled_pidfd": "85fad5d16c047c03740b80ecb97bd5d22380b57ec13ccf8104aa9ec2678dcbea",
+      "scan": "21953692b1e63fd9e0b83c69267e1ae9aee22d768182955a6cf80adfb49f747d",
+      "live": "a582ea8d1470c4b10e3f468a46d76b5911d344bc857a84dcb1d765850c0035b5",
+      "close_owned": "7428f6561e4d00076fe5d08ab74a6df40e82be81dd877dd15a3fdaadddabd440",
+      "prepare_login_path_probe": "9a21f602bf0422375d04c1bc906d0973dea6891f7a0a5ad006a6ba91730e19c7",
+      "private_peer_credentials": "af57c276585d8fc56f39782a98cf5317e1ee4bb3f72d2c815c4a13d39cd8e7b0",
+      "admit_private_wayland": "b36010d498152e6336fb4148eb690ef9626f38c541995491c6e8ed0a25d16943",
+      "verify_wayland_capability": "e9c0c2e2d32cdbeb537d8884cf1ba5219f1b582c6de2f5674bfe30fba4ce02b4",
+      "wayland_environment": "369262e8b0cb45762e1f08890935206d5803c4a82c7d5e95e78200eb4d2c59ea",
+      "private_wayland_query": "81d7911f57ef976d30c46762540f4de3bd6ee553bacdb4aa76c5db8773b7d419",
+      "bind_wayland_surface": "5d752c8f098a4ef9b5d368b628590bd08a7be3f0e8af710fa42b64da2e5d2464",
+      "verify_wayland_surface": "9aeda893a07c5a54994c83eb40e3109cc702042a8b52c074937620fa9d951cbf"
+    },
+    "endpoint_names": [
+      "DISPLAY",
+      "XAUTHORITY",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "DBUS_SESSION_BUS_PID",
+      "DBUS_STARTER_ADDRESS",
+      "DBUS_STARTER_BUS_TYPE",
+      "AT_SPI_BUS_ADDRESS",
+      "SESSION_MANAGER",
+      "ICEAUTHORITY",
+      "WAYLAND_DISPLAY",
+      "WAYLAND_SOCKET",
+      "DBUS_SYSTEM_BUS_ADDRESS",
+      "AT_SPI_DISPLAY",
+      "AT_SPI_IOR",
+      "GDK_DISPLAY",
+      "SWAYSOCK",
+      "I3SOCK",
+      "DBUS_SESSION_BUS_WINDOWID"
+    ],
+    "helper_review": "FRESH_INDEPENDENT_CORE_AND_CALLER_REVIEW_REQUIRED",
+    "pidfd_hold": "Every failed admission/release or unclosed/unsettled original pin forces UNQUALIFIED physical handback. Natural-parent wait not observed by controller remains an explicit retained-FD gap, never inferred clean.",
+    "unused_optional_scope": "No headless PATH or Wayland capability is admitted or invoked by this X11 browserless Cancel-only caller."
   }
 }

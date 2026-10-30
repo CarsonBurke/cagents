@@ -22,7 +22,7 @@ import sys
 import time
 
 CONTROL_BASE = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
-PARENT = 'c7a41814f19a00229cc96ae4c3ab471eb352c018'
+PARENT = 'ab3f335a8910838edc6f03fe83c659bd3476cee0'
 AFTER = '24d0474e250bcc4acc0958cf3abbf53ee1125581'
 AFTER_TREE = '7d84da268933045b1add2ad310ce45c84be751db'
 NATIVE, CONTEXT, INPUTS = None, None, None
@@ -57,11 +57,18 @@ def gates(args):
     manifest = json.loads(manifest_path.read_text())
     assert manifest['parent_control_head'] == PARENT
     assert manifest['control_base_head'] == CONTROL_BASE
+    assert manifest['admission'] is None
+    isolation = manifest['private_desktop_correction']
+    assert isolation['status'] == 'FROZEN_SHARED_CAPSULE_FRESH_REVIEW_REQUIRED'
+    assert digest(control / isolation['capsule_path']) == isolation['capsule_sha256']
+    assert isolation['endpoint_names'] and len(set(isolation['endpoint_names'])) == len(isolation['endpoint_names'])
+    assert not any(name in os.environ for name in isolation['endpoint_names']), 'Inherited desktop/bus endpoints refused unchanged'
     assert manifest['after'] == dict(head=AFTER, tree=AFTER_TREE)
     assert manifest['mode'] == 'AFTER_ONLY_CANCEL_NO_REMOVE'
     assert set(git(control, 'diff', '--name-only', CONTROL_BASE, 'HEAD').splitlines()) == set(manifest['control_paths_from_base'])
     # Every original base control/product entry, including Before pins, is
-    # retained. The exact direct predecessor is the preserved negative c7.
+    # retained. The exact direct predecessor is the separately preserved ab3;
+    # its earlier source clearance does not establish private desktop custody.
     removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', CONTROL_BASE, 'HEAD')
     assert removed_or_modified == ''
     hashes = {path: digest(control / path) for path in manifest['review_paths']}
@@ -76,6 +83,7 @@ def gates(args):
     assert review['control_head'] == head and review['control_tree'] == tree
     assert review['source_sha256'] == hashes
     assert review['composition_review'] == 'SOURCE_CLEAR'
+    assert review['private_desktop_custody'] == 'SOURCE_CLEAR'
     originals = {'source-review.json': review_raw, 'ec-lease.json': lease_raw}
     assert (args.ui_checks is None) == (args.ui_checks_sha256 is None)
     if args.ui_checks is not None:
@@ -117,8 +125,14 @@ def gates(args):
     assert target != out and not out.exists() and not out.is_symlink()
     assert not target.is_relative_to(out) and not out.is_relative_to(target)
     assert not out.is_relative_to(control) and not out.is_relative_to(after)
+    remaining = min(lease['collection_seconds'],
+        (expires - datetime.now(timezone.utc)).total_seconds() - lease['cleanup_seconds'])
+    assert remaining > 0, 'No granted collection budget remains after preflight'
+    work_deadline = time.monotonic() + remaining
     return dict(control=control, after=after, head=head, tree=tree, manifest=manifest,
                 hashes=hashes, out=out, target=target, lease=lease, seconds=remaining,
+                work_deadline=work_deadline,
+                final_deadline=work_deadline + lease['cleanup_seconds'],
                 original_receipts=originals)
 
 
@@ -204,7 +218,12 @@ def button(context, label, enabled=True):
 
 def read_node(context, query):
     # Only a complete read-only lookup is retried for the recognized stale AX error.
-    return NATIVE.a11y_read(query)()
+    def checked():
+        NATIVE.require_private_desktop()
+        value = query()
+        NATIVE.require_private_desktop()
+        return value
+    return NATIVE.a11y_read(checked)()
 
 
 def click(context, target, label):
@@ -264,7 +283,7 @@ def menu_probe(context, branch, primary=False):
     assert not p.SCREEN.state(context['xid'])['occluders']
     INPUTS.move(x + width // 2, y + height // 2)
     INPUTS.click(3)
-    time.sleep(.35)  # One bounded settle; no second click or focus repair.
+    NATIVE.bounded_sleep(.35)  # One bounded settle; no second click or focus repair.
     label = context['view'] + '-' + branch + '-context-menu'
     checkpoint(context, label)
     names = read_node(context, lambda: [n.name for n in p.tree(context['pid']) if p.visible(n)])
@@ -282,7 +301,7 @@ def menu_probe(context, branch, primary=False):
         assert delete_exported or (len(delete_lines) == 1 and
             delete_lines[0]['min_confidence'] >= p.M['ocr']['minimum_word_confidence'])
     INPUTS.key('Escape')
-    time.sleep(.2)
+    NATIVE.bounded_sleep(.2)
     dismissed = label + '-dismissed'
     checkpoint(context, dismissed)
     after_names = read_node(context, lambda: [n.name for n in p.tree(context['pid']) if p.visible(n)])
@@ -435,7 +454,8 @@ def launch(context):
                      stdout=(p.OUT / 'runner.log').open('wb'), stderr=subprocess.STDOUT)
     context['runner'] = runner
     def ready():
-        assert runner.poll() is None, 'Runner exited; original output retained, no retry'
+        context['last_runner_exit'] = p.poll_owned(runner)
+        assert context['last_runner_exit'] is None, 'Runner exited; original output retained, no retry'
         return p.owned_window(context['ui_binary'])
     context['pid'], context['xid'] = p.wait(ready, timeout=context['seconds'], interval=2)
     context['owner'] = owner(context)
@@ -534,15 +554,19 @@ def close_probe_inputs(inputs):
     NATIVE.CRITICAL = False
     for kind, values in [('key', inputs.keys), ('button', inputs.buttons)]:
         for value in list(values):
+            NATIVE.require_private_desktop()
             inputs.event(kind, value, False, 'cleanup')
     assert not inputs.keys and not inputs.buttons, 'Held input cleanup incomplete'
+    NATIVE.require_private_desktop()
     inputs.x.XCloseDisplay(inputs.display)
 
 
 def close_probe_screen(screen):
     """Sequential observer shutdown; no native operation in an abort finally."""
     screen.checked(True)
+    NATIVE.require_private_desktop()
     screen.x.XCloseDisplay(screen.display)
+    NATIVE.require_private_desktop()
     screen.x.XSetErrorHandler(screen.previous)
 
 
@@ -564,11 +588,11 @@ def cleanup(context):
                 errors.append(dict(stage='terminal-' + role, error=str(error)))
                 break
     try:
-        if context.get('pid') and context.get('runner') and context['runner'].poll() is None:
+        if context.get('pid') and context.get('runner') and p.poll_owned(context['runner']) is None:
             owner(context)
             INPUTS.request_close(context['xid'])
-            p.wait(lambda: context['runner'].poll() is not None, timeout=15)
-            assert context['runner'].wait() == 0
+            p.wait(lambda: p.poll_owned(context['runner']) is not None, timeout=15)
+            assert p.reap_owned(context['runner']) == 0
         if context.get('daemon_owner'):
             current = p.identity(context['daemon_owner']['pid'], p.TARGET / 'dev-runtime/cagentsd', context['env'])
             assert current == context['daemon_owner']
@@ -586,8 +610,24 @@ def cleanup(context):
     except Exception as error:
         errors.append(dict(stage='native-observer-close', error=str(error)))
     try:
-        # Only descendant PID/start identities retained by the reviewed helper.
-        # Any remaining app/host/terminal means normal cleanup was incomplete.
+        # Inspect immutable source while owned endpoint servers still exist;
+        # all Git children use the same supervised command/deadline contract.
+        source = {path: p.digest(context['after'] / path)
+                  for path in context['manifest']['product_source_sha256']}
+        assert source == context['manifest']['product_source_sha256']
+        assert p.git(context['after'], 'rev-parse', 'HEAD') == AFTER
+        assert p.git(context['after'], 'status', '--porcelain=v1', '--untracked-files=all') == ''
+        assert p.git(context['control'], 'rev-parse', 'HEAD') == context['head']
+        assert p.git(context['control'], 'status', '--porcelain=v1', '--untracked-files=all') == ''
+        assert {path: p.digest(context['control'] / path) for path in context['hashes']} == context['hashes']
+        p.put(p.OUT / 'final-source-conservation.json', dict(status='UNCHANGED', product=source,
+            control_head=context['head'], source_sha256=context['hashes']))
+    except Exception as error:
+        errors.append(dict(stage='final-source-conservation', error=str(error)))
+    try:
+        # Only descendant PID/start identities retained by the original table.
+        # Close endpoint servers only after input/screen handles and all source
+        # commands. Later custody probes are budget-only, never desktop clients.
         application_residue = [r for r in p.live(p.ACTIVE) if r['pid'] in {
             context.get('pid'), context.get('daemon_owner', {}).get('pid'),
             *[v['pid'] for v in context.get('final_conservation', {}).get('processes', {}).values()]}]
@@ -596,30 +636,25 @@ def cleanup(context):
         p.close_owned()
     except Exception as error:
         errors.append(dict(stage='owned-cleanup', error=str(error)))
-    try:
-        source = {path: digest(context['after'] / path)
-                  for path in context['manifest']['product_source_sha256']}
-        assert source == context['manifest']['product_source_sha256']
-        assert git(context['after'], 'rev-parse', 'HEAD') == AFTER
-        assert git(context['after'], 'status', '--porcelain=v1', '--untracked-files=all') == ''
-        assert git(context['control'], 'rev-parse', 'HEAD') == context['head']
-        assert git(context['control'], 'status', '--porcelain=v1', '--untracked-files=all') == ''
-        assert {path: digest(context['control'] / path) for path in context['hashes']} == context['hashes']
-        p.put(p.OUT / 'final-source-conservation.json', dict(status='UNCHANGED', product=source,
-            control_head=context['head'], source_sha256=context['hashes']))
-    except Exception as error:
-        errors.append(dict(stage='final-source-conservation', error=str(error)))
     remaining = p.live()
     if remaining:
         errors.append(dict(stage='owned-processes-remain', identities=remaining))
+    unsettled_pins = {key: value for key, value in p.PIDFDS.items()
+                     if not value['original_wait_settled'] or not value['closed']}
+    if unsettled_pins or p.PIDFD_FAILURES:
+        errors.append(dict(stage='original-pidfd-custody-retained', pins=unsettled_pins,
+            admission_or_release_failures=list(p.PIDFD_FAILURES)))
     context['cleanup_process_status'] = (
         'OBSERVED_NO_OWNED_PROCESSES' if not remaining else 'OWNED_PROCESSES_REMAIN')
     context['cleanup_physical_status'] = ('OBSERVED_DISPOSED' if not remaining and
-        context.get('cleanup_observer_status') == 'CLOSED' else 'UNCONFIRMED')
+        context.get('cleanup_observer_status') == 'CLOSED' and
+        not p.CALLER_STATE['unconfirmed'] and not unsettled_pins and
+        not p.PIDFD_FAILURES else 'UNCONFIRMED')
     p.put(p.OUT / 'cleanup.json', dict(errors=errors, live_owned=remaining,
         physical_status=context['cleanup_physical_status'],
         process_status=context['cleanup_process_status'],
         observer_status=context.get('cleanup_observer_status', 'UNCONFIRMED'),
+        retained_pidfds=unsettled_pins, pidfd_failures=p.PIDFD_FAILURES,
         retained_fixture=str(context.get('fixture')), directories_removed=False))
     return errors
 
@@ -673,6 +708,11 @@ def main():
     parent_manifest = json.loads((context['control'] / 'research/worktree-delete-native/manifest.json').read_text())
     native.configure(parent_manifest, out, context['target'])
     NATIVE, context['prep'], native.ACTIVE = native, prep, 'after-probe'
+    desktop = load_module('worktree_delete_private_desktop', context['control'] /
+                          context['manifest']['private_desktop_correction']['capsule_path'])
+    runtime = load_module('worktree_delete_runtime', context['control'] /
+                         '.github/qualification/native-worktree-delete-runtime.py')
+    runtime.bind(native, desktop, context)
     native.guard()
     native.put(out / 'gate-bindings.json', dict(control_head=context['head'], control_tree=context['tree'],
         product=dict(head=AFTER, tree=AFTER_TREE), source_sha256=context['hashes'],
@@ -688,11 +728,15 @@ def main():
     try:
         for tool in ['xdotool', 'xdpyinfo', 'import', 'openbox', 'gdbus', 'tesseract']:
             assert shutil.which(tool), 'Required observation tool absent: ' + tool
+        desktop_root = out / 'owned-desktop'
+        desktop_root.mkdir(mode=0o700)
+        native.bootstrap(desktop_root)
+        native.require_private_desktop()
         display = native.cmd(['xdpyinfo'])
         assert re.search(r'dimensions:\s+1600x1000 pixels', display)
         assert re.search(r'resolution:\s+96x96 dots per inch', display)
         context['fixture'] = prep.create_fixture(native)
-        native.bootstrap(context['fixture'])
+        native.require_private_desktop()
         import pyatspi
         from gi.repository import GLib
         from PIL import Image
@@ -714,14 +758,14 @@ def main():
         error_record = dict(type=type(error).__name__, error=str(error),
                             last_command=context.get('last_command'),
                             original_native_command=native.COMMANDS[-1] if native.COMMANDS else None,
-                            runner_exit=context['runner'].poll() if context.get('runner') else None,
+                            runner_exit=context.get('last_runner_exit'),
                             runner_log=str(out / 'runner.log'), ui_log=str(out / 'after-ui.log'),
                             monotonic=time.monotonic())
         native.put(out / 'first-failure.json', error_record)
         last_exit = native.COMMANDS[-1].get('exit') if native.COMMANDS else 0
         if (context.get('pid') and context.get('size') and native.SCREEN and
                 native.CANCEL_SIGNAL is None and last_exit == 0 and
-                context.get('runner') and context['runner'].poll() is None):
+                context.get('runner') and time.monotonic() < context['work_deadline']):
             # One read-only failure frame, within the original still-active
             # budget. No action replay, and no follow-on command after an
             # actual nonzero/unfinished command, cancellation or runner exit.
@@ -734,14 +778,21 @@ def main():
         # Collection never gets more time. Only bounded cleanup uses the
         # separately pre-granted allowance, including after the first failure.
         signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.setitimer(signal.ITIMER_REAL, context['lease']['cleanup_seconds'])
         try:
+            cleanup_remaining = native.begin_probe_cleanup()
+            signal.setitimer(signal.ITIMER_REAL, cleanup_remaining)
             cleanup_errors = cleanup_handback(context)
+        except BaseException as cleanup_error:
+            context['cleanup_physical_status'] = 'UNCONFIRMED'
+            cleanup_errors = context.setdefault('cleanup_errors', [])
+            cleanup_errors.append(dict(stage='cleanup-entry-aborted', type=type(cleanup_error).__name__,
+                error=str(cleanup_error)))
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
         native.put(out / 'inputs.json', native.EVENTS)
         native.put(out / 'commands.json', native.COMMANDS)
         native.put(out / 'owned-processes.json', native.OWNED)
+        native.put(out / 'pidfds.json', dict(pins=native.PIDFDS, failures=native.PIDFD_FAILURES))
         native.put(out / 'result.json', dict(
             status=probe_status(failed, cleanup_errors, context.get('cleanup_physical_status', 'UNCONFIRMED')),
             product_head=AFTER, control_head=context['head'], captures=context['completed_captures'],
@@ -749,6 +800,7 @@ def main():
             cleanup_physical_status=context.get('cleanup_physical_status', 'UNCONFIRMED'),
             cleanup_process_status=context.get('cleanup_process_status', 'UNCONFIRMED'),
             cleanup_observer_status=context.get('cleanup_observer_status', 'UNCONFIRMED'),
+            caller_custody=dict(native.CALLER_STATE),
             G1='UNQUALIFIED_NO_ABSENCE_OR_REPLACEMENT_PROBE',
             G3='Full eight-case Before/After suite remains held; no causal/destructive/buffer/recovery evidence',
             native_scale_factor='UNMEASURED; physical viewport and configured scale retained separately',

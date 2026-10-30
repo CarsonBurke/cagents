@@ -1,7 +1,8 @@
 The After-only probe is implemented in
 `.github/qualification/native-worktree-delete-after-probe.py`. It is a direct
-child control of `c7a41814f19a00229cc96ae4c3ab471eb352c018`, correcting its C1
-cleanup cancellation blocker. The original preserved base is
+child control of `ab3f335a8910838edc6f03fe83c659bd3476cee0`, preserving that
+head's C1 correction while adding the newly required private desktop and bus
+custody boundary. The original preserved base is
 `77647db730fd0d5b6ec7f2fc984d5edc94d42a3c`; all of that base's files,
 matched Before `94c3cef719f5cb27637899dfd13e67baca3cbc34` and product After
 `24d0474e250bcc4acc0958cf3abbf53ee1125581` are unchanged. No Before executable
@@ -14,7 +15,36 @@ original externally issued receipt bytes and independently frozen SHA256s. The
 controller checks the exact head/tree/source bindings, scope, capacity, target,
 expiry and budget before fixture creation, desktop bootstrap, build or launch.
 It does not generate or grant any of those receipts. Preparation supplied no
-review, check or lease. No execution is authorized by this document.
+review, check or lease. Admission is explicitly null. No execution is authorized
+by this document. Historical ab3 source clearance does not clear the new custody
+requirement; a fresh review must bind the corrected successor.
+
+The user prohibits every connection, read, mutation, focus change, input or
+clipboard/state operation on a live user desktop. Inherited desktop, Xauthority,
+session and accessibility endpoints must be refused unchanged. The controller
+must establish and bind its own authenticated Xvfb display and private session
+and accessibility buses before any desktop client, accessibility settings,
+native imports or input. The sole shared isolator is authored by
+`/root/editor_recovery`; its exact 29-definition capsule from
+`2b30c85569a0fc1d0a569359ec765eb60471b1e4` is retained unchanged in
+`.github/qualification/native-worktree-delete-private-desktop.py`, SHA256
+`e711a1319ec37721f8e9701d198940df9445d378850c0cde680e911094ccd71d`.
+The full source/API provenance is in `after-probe.json`. No external `xvfb-run`/`dbus-run-session`
+wrapper, hosted environment flag or documentation substitutes for custody. No
+fallback to another desktop endpoint is permitted. Both the shared core and
+this exact caller composition require fresh independent source review before
+any actual EC grant. Preparation supplied no approval or grant.
+
+`.github/qualification/native-worktree-delete-runtime.py` binds that capsule to
+the original primitive module's same `OWNED`, `CHILDREN` and `EVENTS`, and shares
+`PIDFDS`/`PIDFD_FAILURES`. It creates no isolation endpoint itself. Discovery,
+admission, signals, original waits and pidfd release use the single shared
+lifecycle. No numeric PID signal/reap fallback is reachable through the bound
+controller. The caller supplies budget-only file/process reads, explicit child
+environment checks, one original work/final/cleanup deadline and epoch, and
+guarded input/query connections. Original primitive, fixture and capture source
+files remain unchanged. The Cancel-only flow and 39 planned frames are
+preserved; no scanner-confirm, Before or full-suite mode is admitted.
 
 The exact product development runner first receives its supported forwarded UI
 argument `--version`. It builds the three matched executables in separate graphs,
@@ -110,20 +140,25 @@ errors remain sticky. Successful physical disposal alone cannot qualify a probe.
 The c7 negative review remains immutable at
 `/tmp/coord-b9-1984-c7a41814-after-probe-independent-review.json`, SHA256
 `ee6e92a9c2ba3a6e8c86645e7da122f97538d0c86a5d1a4700754ec1e50020d0`.
-It does not clear this corrected successor. The source-only causal check
-`.github/qualification/native-worktree-delete-cleanup-memory-check.py` extracts
-the actual cleanup functions with AST, excludes imports/main/helpers, and uses
-only memory fakes. It injects a BaseException at every actual successful cleanup
-call, requires the effect trace to end at that call, and checks ordinary-error,
-sticky-error and physical-disposal outcomes. An optional source export of exact
-c7 also reproduces its swallowed cancellation. The check uses no helper, signal,
-process, fixture or native resource and is not native qualification:
+It does not clear this corrected successor. At exact ab3, the source-only causal
+check `.github/qualification/native-worktree-delete-cleanup-memory-check.py`
+extracted the actual cleanup functions with AST and used only memory fakes. It
+injected a BaseException at every successful cleanup call and reproduced c7's
+swallowed cancellation. That historical checker and its receipts remain
+unchanged. They do not test this new capsule/caller composition. This correction
+used source/AST witnesses only: no helper import, extracted function case, test,
+signal, process, fixture or native execution. No old memory result transfers.
 
-```sh
-python3 CONTROL/.github/qualification/native-worktree-delete-cleanup-memory-check.py \
-  --source CONTROL/.github/qualification/native-worktree-delete-after-probe.py \
-  --predecessor-source EXACT_C7_SOURCE_EXPORT.py --receipt NEW_MEMORY_RECEIPT.json
-```
+Source conservation runs after observer handles close while the private endpoint
+servers are still alive, using the same supervised Git child custody. Endpoint
+servers close afterward; subsequent checks are budget-only retained process/fd
+observations. Failed pidfd admission/release or any unclosed/unsettled original
+pin leaves physical custody UNCONFIRMED and the probe FAILED_UNQUALIFIED. A
+natural parent may already have waited a descendant; absent an approved original
+wait receipt, the shared policy retains that fd and reports the gap. The caller
+does not infer clean custody from an empty numeric process list or weaken this
+policy. Actual successful build/terminal handback may need that explicit proof
+before native qualification can be claimed.
 
 G1 remains explicit: this probe observes a valid existing target's real dialog,
 then cancels. It does not establish that a missing/prunable row stays reachable
@@ -136,17 +171,15 @@ whole PR or transfer historical screenshot, renderer or terminal-release results
 
 The future invocation requires a naturally hosted User context, already
 installed Rust1.93.0/Zig/native observation dependencies, and actual EC-selected
-`RUNNER_TEMP`, `CARGO_TARGET_DIR` and budget. Dependencies include Xvfb/xauth,
-dbus-run-session, openbox, AT-SPI/python3-pyatspi/GI, Pillow, X11/XTest, Mesa GL,
+`RUNNER_TEMP`, `CARGO_TARGET_DIR` and budget. Dependencies include Xvfb,
+dbus-daemon, openbox, AT-SPI/python3-pyatspi/GI, Pillow, X11/XTest, Mesa GL,
 xdotool, ImageMagick and Tesseract English. The controller installs nothing.
 Run only after root and EC grant the exact frozen head; no such command ran in
 preparation:
 
 ```sh
 timeout --signal=TERM --kill-after=45s ACTUAL_GRANTED_OUTER_SECONDS \
-  xvfb-run --auto-servernum \
-  --server-args="-screen 0 1600x1000x24 -nolisten tcp -dpi 96" \
-  dbus-run-session -- /usr/bin/python3 \
+  /usr/bin/python3 \
   CONTROL/.github/qualification/native-worktree-delete-after-probe.py \
   --control CONTROL --after AFTER --evidence NEW_GRANTED_EVIDENCE_PATH \
   --review ACTUAL_REVIEW.json --review-sha256 ACTUAL_REVIEW_SHA256 \
