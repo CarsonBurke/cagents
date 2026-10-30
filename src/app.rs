@@ -5061,8 +5061,13 @@ struct PendingLspJump {
 struct LspInspectorState {
     context: inspector::LspInspectorContext,
     /// The document, once opened. `None` while no file is open, or when no
-    /// configured server claims this file's extension.
+    /// configured server claims this file's extension, or another independent
+    /// buffer already owns its language-server attachment.
     document: Option<LspDocumentId>,
+    /// Independent editor buffers cannot share one language-server URI.
+    /// Keep the refused buffer editable and let Restart retry after its owner
+    /// closes, without registering its text over the other pane's snapshot.
+    blocked_by_other_buffer: bool,
     /// Absolute path of the card's open buffer, recorded even when no server
     /// claims it. A jump target arrives absolute while the card's file list is
     /// worktree-relative, so this is the only side both can be compared on.
@@ -6402,13 +6407,30 @@ impl Cagents {
 
     fn duplicate_pane(&mut self, source: CardState) -> Task<Message> {
         let owner = self.card_worktree(&source).map(Path::to_path_buf);
-        self.duplicate_pane_in_scope(source, owner)
+        // A repository browser keeps its current file in window-local
+        // navigation, not in the shared pane recipe. Snapshot the live view
+        // now, before the clone is attached; its cached snapshot can be older.
+        let navigation = match self.cards.get(&source.id) {
+            Some(CardRuntime::Repository(runtime)) => runtime.navigation(),
+            _ => None,
+        };
+        self.duplicate_pane_with_navigation(source, owner, navigation)
     }
 
     fn duplicate_pane_in_scope(
         &mut self,
         source: CardState,
         owner: Option<PathBuf>,
+    ) -> Task<Message> {
+        // Reopening a saved pane has no live clone navigation to inherit.
+        self.duplicate_pane_with_navigation(source, owner, None)
+    }
+
+    fn duplicate_pane_with_navigation(
+        &mut self,
+        source: CardState,
+        owner: Option<PathBuf>,
+        navigation: Option<crate::model::RepositoryNavigation>,
     ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
@@ -6525,7 +6547,14 @@ impl Cagents {
             CardKind::Browser(_) => self.retry_card(id),
             #[cfg(not(feature = "integrated-browser"))]
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
-            CardKind::Repository(view) => self.attach_repository_pane(id, view),
+            CardKind::Repository(view) => {
+                if let Some(navigation) = navigation {
+                    Arc::make_mut(&mut self.durable)
+                        .repository_navigation
+                        .insert(id, navigation);
+                }
+                self.attach_repository_pane(id, view)
+            }
             CardKind::PullRequests(view) => self.attach_pull_request_pane(id, view),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes are refused before cloning")
@@ -11131,6 +11160,29 @@ impl Cagents {
             .map(|card| card.id)
     }
 
+    /// Sidebar file navigation follows an eligible focused browser. Other
+    /// callers of `repository_card_for`, including save completion, retain
+    /// their existing first-browser selection.
+    fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
+        self.workspace
+            .focused()
+            .filter(|focused| {
+                self.durable.cards.iter().any(|card| {
+                    card.id == *focused
+                        && card.existence.is_open()
+                        && self
+                            .durable
+                            .channels
+                            .iter()
+                            .find(|channel| channel.cards.contains(&card.id))
+                            .map(|channel| channel.id)
+                            == self.durable.active_channel
+                        && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
+                })
+            })
+            .or_else(|| self.repository_card_for(worktree))
+    }
+
     /// Routes one panel row to the worktree's repository card.
     ///
     /// The card is opened if the worktree has none. Either way the navigation
@@ -11160,7 +11212,7 @@ impl Cagents {
                     .any(|row| row.path == *path && row.ignored)
             });
         let path = path.as_path().to_path_buf();
-        let task = match self.repository_card_for(&key.canonical_path) {
+        let task = match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
                     card,
@@ -11355,9 +11407,18 @@ impl Cagents {
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
             state.context.status = Some(LspStatus::Disabled);
-            self.lsp_pending_jumps.remove(&card);
-            return Task::none();
+            return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         };
+        if self.lsp_contexts.iter().any(|(other, state)| {
+            *other != card && state.document.is_some() && state.path.as_deref() == Some(path)
+        }) {
+            let state = self.lsp_contexts.entry(card).or_default();
+            state.blocked_by_other_buffer = true;
+            state.context.status = Some(LspStatus::Unavailable {
+                reason: "This file is already open for language tools in another pane. Close that file there, then restart the language server here.".into(),
+            });
+            return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
+        }
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = match text {
@@ -11414,11 +11475,21 @@ impl Cagents {
             state.context = inspector::LspInspectorContext::default();
             state.diagnostics_version = None;
             state.path = None;
+            state.blocked_by_other_buffer = false;
         }
     }
 
     /// Applies a parked jump now that `path` is the card's open buffer.
     fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) -> Task<Message> {
+        self.flush_pending_lsp_jump_with_source(card, path, None)
+    }
+
+    fn flush_pending_lsp_jump_with_source(
+        &mut self,
+        card: CardId,
+        path: &Path,
+        source: Option<&repository_widget::LspChangeText>,
+    ) -> Task<Message> {
         // Taken on *any* open, not only a matching one. A jump is answered by
         // the open it asked for or by nothing: leaving it parked would let the
         // caret be yanked minutes later, when the user opens that file
@@ -11434,12 +11505,20 @@ impl Cagents {
             LspCoordinates::Scalar => jump.at,
             // The column arrived in protocol code units because the file was
             // not open when the server answered. It is open now, so the
-            // manager can place it against the text it actually indexes.
+            // loaded buffer can place it even when another independent pane
+            // owns this path's language tools. Never borrow that pane's text.
             LspCoordinates::Utf16 => {
-                let Some(doc) = self.lsp_document(card) else {
-                    return Task::none();
+                let converted = if let Some(source) = source {
+                    Self::loaded_lsp_scalar_position(source, jump.at)
+                } else {
+                    let Some(doc) = self.lsp_document(card) else {
+                        return Task::none();
+                    };
+                    self.lsp
+                        .scalar_position(doc, jump.at)
+                        .map_err(|error| error.to_string())
                 };
-                match self.lsp.scalar_position(doc, jump.at) {
+                match converted {
                     Ok(at) => at,
                     Err(error) => {
                         self.status = Some(TransientNotice::warning(format!(
@@ -11451,6 +11530,62 @@ impl Cagents {
             }
         };
         self.move_lsp_caret(card, at)
+    }
+
+    /// Convert only the destination buffer's text, without acquiring an LSP
+    /// attachment or serializing a normal native snapshot's other lines.
+    fn loaded_lsp_scalar_position(
+        source: &repository_widget::LspChangeText,
+        at: LspPosition,
+    ) -> Result<LspPosition, String> {
+        let outside = || {
+            format!(
+                "line {} UTF-16 character {} is outside this buffer",
+                at.line, at.character
+            )
+        };
+        let convert = |line: &str| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let mut units = 0;
+            let mut scalars = 0;
+            for character in line.chars() {
+                if units == at.character {
+                    return Ok(LspPosition::new(at.line, scalars));
+                }
+                let width = character.len_utf16() as u32;
+                if at.character > units && at.character < units + width {
+                    return Err(format!(
+                        "UTF-16 offset {} on line {} splits a surrogate pair",
+                        at.character, at.line
+                    ));
+                }
+                units += width;
+                scalars += 1;
+            }
+            if units == at.character {
+                Ok(LspPosition::new(at.line, scalars))
+            } else {
+                Err(outside())
+            }
+        };
+        let from_text = |text: &str| {
+            text.split('\n')
+                .nth(at.line as usize)
+                .ok_or_else(outside)
+                .and_then(convert)
+        };
+        match source {
+            repository_widget::LspChangeText::Text(text) => from_text(text),
+            repository_widget::LspChangeText::Snapshot(source)
+                if source.protocol_compatible_lines() =>
+            {
+                source
+                    .line(at.line as usize)
+                    .ok_or_else(outside)
+                    .and_then(|line| convert(&line.text))
+            }
+            repository_widget::LspChangeText::Snapshot(source) => from_text(&source.text()),
+        }
     }
 
     /// Places the caret and gives the editor the keyboard.
@@ -11667,6 +11802,15 @@ impl Cagents {
             }
             InspectorAction::RestartLanguageServer(card) => {
                 let Some(doc) = self.lsp_document(card) else {
+                    if self
+                        .lsp_contexts
+                        .get(&card)
+                        .is_some_and(|state| state.blocked_by_other_buffer)
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    {
+                        runtime.resync_lsp();
+                        return self.drain_lsp_intents(card);
+                    }
                     return Task::none();
                 };
                 self.lsp.restart(doc);
@@ -26509,6 +26653,401 @@ mod tests {
         assert!(copy.continuity.live_proof().is_none());
         assert!(copy.resume_hint.is_none());
         assert_eq!((copy.recovery_origin, copy.predecessor), (None, None));
+    }
+
+    mod repository_clone_navigation {
+        use super::*;
+        use crate::model::ProjectChannel;
+
+        struct Fixture {
+            _directory: tempfile::TempDir,
+            root: PathBuf,
+            text: String,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path().canonicalize().unwrap();
+                let text = (0..100)
+                    .map(|line| format!("source line {line:03}\n"))
+                    .collect::<String>();
+                std::fs::write(root.join("current.txt"), &text).unwrap();
+                std::fs::write(root.join("other.txt"), "a different file\n").unwrap();
+                for arguments in [
+                    vec!["init", "-q", "--template="],
+                    vec!["add", "current.txt", "other.txt"],
+                    vec![
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                    ],
+                ] {
+                    let mut git = tokio::process::Command::new("/usr/bin/git");
+                    git.env_clear()
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .current_dir(&root)
+                        .args([
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "-c",
+                            "commit.gpgsign=false",
+                        ])
+                        .args(arguments)
+                        .kill_on_drop(true);
+                    let output = tokio::time::timeout(Duration::from_secs(5), git.output())
+                        .await
+                        .expect("private Git fixture command finishes")
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Self {
+                    _directory: directory,
+                    root,
+                    text,
+                }
+            }
+
+            async fn app(&self, selected: bool, fixed_file: bool) -> (Cagents, CardId) {
+                let mut app = context_inspector_test_app(true);
+                app.context_inspector_open = false;
+                app.settings.editor_auto_save = false;
+                let card = app.workspace.focused().unwrap();
+                let view = RepositoryView {
+                    project: ProjectId::new(),
+                    repository: self.root.join(".git"),
+                    worktree: self.root.clone(),
+                    selected_file: fixed_file.then(|| "current.txt".into()),
+                };
+                let state = app.card_state_mut(card).unwrap();
+                state.kind = CardKind::Repository(view.clone());
+                state.residency = Residency::Hot;
+                let mut runtime = RepositoryRuntime::new(view.clone());
+                runtime.set_auto_save(false);
+                if selected {
+                    runtime.restore_navigation(&crate::model::RepositoryNavigation {
+                        project: view.project,
+                        worktree: view.worktree,
+                        selected_file: Some("current.txt".into()),
+                        editor: Some(crate::model::EditorNavigation {
+                            caret: crate::model::EditorPosition {
+                                line: 80,
+                                column: 7,
+                            },
+                            selection: Some(crate::model::EditorPosition {
+                                line: 79,
+                                column: 2,
+                            }),
+                            scroll_line: 70,
+                            scroll_vertical: 2.5,
+                            scroll_horizontal: 7.0,
+                        }),
+                    });
+                }
+                let load = repository_task(runtime.initial_load(card));
+                app.cards
+                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
+                settle(&mut app, load).await;
+                assert_eq!(
+                    self::runtime(&app, card).selected_path().is_some(),
+                    selected
+                );
+                (app, card)
+            }
+        }
+
+        fn runtime(app: &Cagents, card: CardId) -> &RepositoryRuntime {
+            match &app.cards[&card] {
+                CardRuntime::Repository(runtime) => runtime,
+                _ => panic!("actual repository runtime"),
+            }
+        }
+
+        async fn settle(app: &mut Cagents, task: Task<Message>) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut pending = VecDeque::from([task]);
+                let mut tasks = 0;
+                while let Some(task) = pending.pop_front() {
+                    tasks += 1;
+                    assert!(tasks < 64, "repository loads must settle");
+                    let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                        continue;
+                    };
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::Repository(_),
+                        )) = action
+                        {
+                            pending.push_back(app.update(message));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("actual clone file worker and application callbacks finish");
+        }
+
+        #[tokio::test]
+        async fn browser_clone_loads_live_file_and_independent_navigation() {
+            let fixture = Fixture::new().await;
+            let (mut app, source) = fixture.app(true, false).await;
+            let source_runtime = runtime(&app, source) as *const RepositoryRuntime;
+            let expected = runtime(&app, source).navigation().unwrap();
+            let editor = expected.editor.unwrap();
+            assert_eq!(editor.caret.line, 80);
+            assert_eq!(editor.selection.unwrap().line, 79);
+            assert_eq!(editor.scroll_line, 70);
+            assert_eq!(editor.scroll_vertical, 2.5);
+            assert_eq!(editor.scroll_horizontal, 7.0);
+            let mut stale = expected.clone();
+            stale.selected_file = Some("other.txt".into());
+            stale.editor = None;
+            Arc::make_mut(&mut app.durable)
+                .repository_navigation
+                .insert(source, stale);
+            assert_ne!(app.durable.repository_navigation[&source], expected);
+
+            let task = app.clone_focused_pane();
+            let clone = app.workspace.focused().unwrap();
+            assert_ne!(clone, source);
+            settle(&mut app, task).await;
+            assert_eq!(app.workspace.focused(), Some(clone));
+            assert_eq!(
+                runtime(&app, clone).editor_text(),
+                Some(fixture.text.clone())
+            );
+            assert_eq!(runtime(&app, clone).navigation(), Some(expected.clone()));
+            assert_eq!(runtime(&app, source).navigation(), Some(expected.clone()));
+            assert_eq!(
+                runtime(&app, source).editor_text(),
+                Some(fixture.text.clone())
+            );
+            assert_eq!(
+                runtime(&app, source) as *const RepositoryRuntime,
+                source_runtime
+            );
+            for card in [source, clone] {
+                assert!(runtime(&app, card).descriptor.selected_file.is_none());
+                assert!(matches!(&app.card_state(card).unwrap().kind,
+                    CardKind::Repository(view) if view.selected_file.is_none()));
+                assert!(!runtime(&app, card).is_dirty());
+            }
+
+            // Drive the sidebar row, not a card-addressed repository action:
+            // the sidebar must choose the focused clone rather than the first
+            // browser, which is still the source.
+            let project = runtime(&app, clone).descriptor.project;
+            app.sidebar_model = SidebarModel::ready(
+                sidebar::SidebarMode::Expanded,
+                vec![SidebarProject::new(
+                    project,
+                    RepositoryId::new(),
+                    "clone navigation fixture".into(),
+                    fixture.root.join(".git"),
+                    vec![SidebarWorktree::from_durable(
+                        WorktreeId::new(),
+                        fixture.root.clone(),
+                        None,
+                    )],
+                    Vec::new(),
+                )],
+            );
+            assert!(app.sidebar_state.sync_active_worktree(
+                &app.sidebar_model,
+                &sidebar::SidebarFocus::Repository {
+                    worktree: fixture.root.clone(),
+                },
+            ));
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            assert_eq!(app.repository_card_for(&fixture.root), Some(source));
+            assert_eq!(app.repository_panel_destination(&fixture.root), Some(clone));
+            let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
+                key,
+                path: RepoPath::parse("other.txt").unwrap(),
+            }));
+            settle(&mut app, task).await;
+            assert_eq!(
+                runtime(&app, clone).selected_path(),
+                Some(Path::new("other.txt"))
+            );
+            assert_eq!(
+                runtime(&app, clone).editor_text().as_deref(),
+                Some("a different file\n")
+            );
+            assert_eq!(runtime(&app, source).navigation(), Some(expected));
+            assert_eq!(
+                runtime(&app, source).editor_text(),
+                Some(fixture.text.clone())
+            );
+
+            // Ineligible focus must preserve the existing first-browser
+            // fallback. None of these cases may retarget a fixed file or a
+            // pane belonging to another worktree/channel.
+            let eligible = app.card_state(clone).unwrap().clone();
+            for fixed_file in [true, false] {
+                let CardKind::Repository(view) = &mut app.card_state_mut(clone).unwrap().kind
+                else {
+                    panic!("repository clone");
+                };
+                if fixed_file {
+                    view.selected_file = Some("other.txt".into());
+                } else {
+                    view.worktree = fixture.root.join("different-worktree");
+                }
+                assert_eq!(
+                    app.repository_panel_destination(&fixture.root),
+                    Some(source)
+                );
+                *app.card_state_mut(clone).unwrap() = eligible.clone();
+            }
+            app.card_state_mut(clone).unwrap().kind = CardKind::Settings;
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            *app.card_state_mut(clone).unwrap() = eligible.clone();
+            app.card_state_mut(clone).unwrap().existence = crate::model::Existence::Closing {
+                operation_id: crate::model::OperationId::new(),
+            };
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            *app.card_state_mut(clone).unwrap() = eligible.clone();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    id: ChannelId::new(),
+                    project_id: project,
+                    title: "other channel".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![clone],
+                    focused: Some(clone),
+                });
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            Arc::make_mut(&mut app.durable).channels.pop();
+            let position = app
+                .durable
+                .cards
+                .iter()
+                .position(|card| card.id == clone)
+                .unwrap();
+            Arc::make_mut(&mut app.durable).cards.remove(position);
+            assert_eq!(app.workspace.focused(), Some(clone));
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            Arc::make_mut(&mut app.durable)
+                .cards
+                .insert(position, eligible);
+
+            // Cloning location must not move or share the source's unsaved
+            // buffer and navigation fence. It does not clone unsaved bytes.
+            drop(app.update(Message::FocusCard(source)));
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: source,
+                    action: repository_widget::EditorAction::Edit(
+                        repository_widget::EditorEdit::Insert('!'),
+                    ),
+                })),
+            );
+            let dirty_text = runtime(&app, source).editor_text();
+            let dirty_navigation = runtime(&app, source).navigation();
+            assert!(runtime(&app, source).is_dirty());
+            assert!(runtime(&app, source).blocks_navigation());
+            let task = app.clone_focused_pane();
+            let independent = app.workspace.focused().unwrap();
+            settle(&mut app, task).await;
+            assert_ne!(independent, source);
+            assert_eq!(runtime(&app, independent).editor_text(), Some(fixture.text));
+            assert!(!runtime(&app, independent).is_dirty());
+            assert_eq!(runtime(&app, source).editor_text(), dirty_text);
+            assert_eq!(runtime(&app, source).navigation(), dirty_navigation);
+            assert_eq!(
+                runtime(&app, source) as *const RepositoryRuntime,
+                source_runtime
+            );
+            assert!(runtime(&app, source).is_dirty());
+            assert!(runtime(&app, source).blocks_navigation());
+        }
+
+        #[tokio::test]
+        async fn clone_keeps_empty_and_fixed_file_recipes_and_reopen_separate() {
+            let fixture = Fixture::new().await;
+            for (selected, fixed_file) in [(false, false), (true, true)] {
+                let (mut app, source) = fixture.app(selected, fixed_file).await;
+                let expected = runtime(&app, source).navigation();
+                // An empty browser must not acquire an old saved selection.
+                if !selected {
+                    let view = runtime(&app, source).descriptor.clone();
+                    Arc::make_mut(&mut app.durable)
+                        .repository_navigation
+                        .insert(
+                            source,
+                            crate::model::RepositoryNavigation {
+                                project: view.project,
+                                worktree: view.worktree,
+                                selected_file: Some("other.txt".into()),
+                                editor: None,
+                            },
+                        );
+                }
+                let task = app.clone_focused_pane();
+                let clone = app.workspace.focused().unwrap();
+                settle(&mut app, task).await;
+                assert_ne!(clone, source);
+                assert_eq!(runtime(&app, clone).navigation(), expected);
+                assert_eq!(
+                    runtime(&app, clone).descriptor.selected_file.is_some(),
+                    fixed_file
+                );
+                assert_eq!(
+                    runtime(&app, source).descriptor,
+                    runtime(&app, clone).descriptor
+                );
+                assert_eq!(runtime(&app, clone).selected_path().is_some(), selected);
+            }
+
+            let (mut app, source) = fixture.app(true, false).await;
+            let original_navigation = runtime(&app, source).navigation();
+            // Closed entries store the old Open CardState. Deliberately keep
+            // its live runtime here too: neither existence nor an ID match
+            // may turn the separate Reopen route into a live-view clone.
+            app.recently_closed.push((
+                app.card_state(source).unwrap().clone(),
+                app.active_workspace_destination(),
+            ));
+            let task = app.run_workspace_command(
+                workspace_widget::GlobalShortcut::ReopenPane,
+                keyboard::Modifiers::empty(),
+            );
+            let reopened = app.workspace.focused().unwrap();
+            settle(&mut app, task).await;
+            assert_ne!(reopened, source);
+            assert_eq!(runtime(&app, reopened).selected_path(), None);
+            assert_eq!(runtime(&app, reopened).navigation(), None);
+            assert_eq!(runtime(&app, source).navigation(), original_navigation);
+        }
+    }
+
+    mod repository_clone_lsp_ownership {
+        include!("app/repository_clone_lsp_ownership_tests.rs");
     }
 
     #[test]
