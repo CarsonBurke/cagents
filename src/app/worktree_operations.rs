@@ -376,14 +376,29 @@ impl Cagents {
                 None
             }
         };
-        let setup_intent = outcome.as_ref().and_then(|_| operation.setup_intent.take());
+        let cancelled = operation.termination_requested;
+        let setup_intent = outcome.as_ref().and_then(|_| {
+            if cancelled {
+                operation.setup_intent.clone()
+            } else {
+                operation.setup_intent.take()
+            }
+        });
         self.sync_worktree_operation_rows();
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
             let setup = match (&outcome, setup_intent) {
                 (WorktreeCreationOutcome::Created { worktree, .. }, Some(intent)) => {
-                    self.start_worktree_setup(id, worktree.path.clone(), intent)
+                    if cancelled {
+                        // Creation may have committed before Cancel reached Git.
+                        // Keep that result and its reviewable intent without
+                        // authorizing a fresh setup preparation token.
+                        self.recover_worktree_setup(id, worktree.path.clone(), intent);
+                        Task::none()
+                    } else {
+                        self.start_worktree_setup(id, worktree.path.clone(), intent)
+                    }
                 }
                 _ => Task::none(),
             };
@@ -814,6 +829,117 @@ mod tests {
             );
             assert!(!app.setup_ui.active());
             assert_eq!(app.durable.cards.len(), 0);
+        }
+    }
+
+    #[test]
+    fn cancelled_created_completion_retains_setup_for_explicit_review() {
+        for cancelled in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let id = OperationId::new();
+            let project = ProjectId::new();
+            let destination = PathBuf::from("/repo/worktrees/created-after-cancel");
+            let intent = super::super::worktree_setup_ui::SetupIntent {
+                primary: Some("/repo".into()),
+                plan: Some(crate::repository::WorktreeSetupPlan {
+                    copy: vec![".editorconfig".into()],
+                    commands: vec!["printf setup".into()],
+                    fingerprint: "a".repeat(64),
+                }),
+                skip: false,
+                run_id: Some(id),
+                ..Default::default()
+            };
+            let request = CreateWorktreeRequest {
+                base_reference: None,
+                setup_intent: Some(intent.clone()),
+                linear_issue: None,
+                repository: "/repo".into(),
+                managed_root: "/repo/worktrees".into(),
+                destination: destination.clone(),
+                branch: crate::repository::ValidatedBranchName::parse("created-after-cancel")
+                    .unwrap(),
+                base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
+                track: false,
+                operation_id: id,
+            };
+            let token = CancellationToken::new();
+            app.worktree_operations.insert(
+                id,
+                ActiveWorktreeOperation {
+                    project,
+                    generation: 7,
+                    request: Some(request.clone()),
+                    token: Some(token.clone()),
+                    receiver: None,
+                    stage: Some(WorktreeProgressStage::RunningGit),
+                    started: Instant::now(),
+                    completed_elapsed: None,
+                    restored: false,
+                    termination_requested: false,
+                    finished: false,
+                    detail: "Creating".into(),
+                    created_worktree: None,
+                    label: "created-after-cancel".into(),
+                    state: None,
+                    draft: None,
+                    setup_intent: Some(intent.clone()),
+                },
+            );
+            if cancelled {
+                drop(app.cancel_worktree_operation(id));
+                assert!(token.is_cancelled());
+            }
+            let report = WorktreeOperationReport {
+                operation_id: id,
+                generation: 7,
+                request: Some(request),
+                state: WorktreeOperationState::Created,
+                outcome: Some(WorktreeCreationOutcome::Created {
+                    worktree: crate::repository::WorktreeRecord {
+                        id: crate::model::WorktreeId::new(),
+                        path: destination.clone(),
+                        creation_basis: None,
+                        created_at_unix_ms: Some(1),
+                        head_oid: Some("a".repeat(40)),
+                        branch: Some("refs/heads/created-after-cancel".into()),
+                        detached: false,
+                        bare: false,
+                        lock: crate::repository::WorktreeLock::default(),
+                        prunable_reason: None,
+                    },
+                    warnings: Vec::new(),
+                }),
+                detail: "Created".into(),
+                created_at_unix_ms: 1,
+            };
+            // A stale callback cannot consume the saved intent or prepare setup.
+            let stale = app.finish_worktree_operation(id, 6, Ok(report.clone()));
+            assert!(cosmic::iced::runtime::task::into_stream(stale).is_none());
+            assert!(!app.worktree_operations[&id].finished);
+            assert_eq!(
+                app.worktree_operations[&id].setup_intent,
+                Some(intent.clone())
+            );
+            assert!(!app.setup_ui.active());
+
+            let completed = app.finish_worktree_operation(id, 7, Ok(report));
+            assert!(cosmic::iced::runtime::task::into_stream(completed).is_some());
+            let operation = &app.worktree_operations[&id];
+            assert!(operation.finished);
+            assert_eq!(operation.state, Some(WorktreeOperationState::Created));
+            assert_eq!(
+                operation.created_worktree.as_ref().map(|(path, _)| path),
+                Some(&destination)
+            );
+            assert_eq!(operation.detail, "Created");
+            assert_eq!(operation.termination_requested, cancelled);
+            assert_eq!(operation.setup_intent, cancelled.then(|| intent.clone()));
+            assert_eq!(app.setup_ui.recovered_creation(&destination), Some(id));
+            assert_eq!(app.setup_ui.current_run(&destination), Some(id));
+            assert_eq!(app.setup_ui.preparing(&destination), !cancelled);
+            assert_eq!(app.setup_ui.active(), !cancelled);
+            assert!(app.durable.cards.is_empty());
         }
     }
 
