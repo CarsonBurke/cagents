@@ -488,6 +488,10 @@ impl LocalHandle {
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
         });
         let launch_context = spec.execution.clone();
+        let native_transport = matches!(
+            &spec.transport,
+            TransportSpec::UnixWebSocket { .. } | TransportSpec::OwnedUnixWebSocket { .. }
+        );
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);
         let worker = thread::Builder::new()
@@ -598,7 +602,6 @@ impl LocalHandle {
                         "Provider exited before acknowledging the control request".into(),
                     ));
                 }
-                use std::os::unix::process::ExitStatusExt;
                 let had_unfinished_turn = {
                     let state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
                     // Scalar activity can remain stale after a Store failure.
@@ -608,18 +611,7 @@ impl LocalHandle {
                             || state.busy || state.waiting || !state.requests.is_empty())
                 };
                 let native_diagnostic = if result.is_err() || !actor.stop.load(Ordering::Acquire) {
-                    actor.native_holder.as_mut().and_then(|holder| {
-                        // A socket close can precede the kernel publishing the
-                        // provider exit. Give that exact holder a short chance
-                        // to observe status before falling back to connection
-                        // diagnostics; never infer death from EOF alone.
-                        let deadline = Instant::now() + Duration::from_millis(500);
-                        loop {
-                            let diagnostic = holder.diagnostic().ok()?;
-                            if diagnostic.code.is_some() || diagnostic.signal.is_some() || Instant::now() >= deadline { break Some(diagnostic); }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                    })
+                    actor.native_exit_diagnostic_until(Instant::now() + Duration::from_millis(500))
                 } else { None };
                 if result.is_ok() && !actor.stop.load(Ordering::Acquire) {
                     if actor.native_holder.is_some() {
@@ -628,10 +620,7 @@ impl LocalHandle {
                         result = Err("Provider exited before reporting the turn's final result".into());
                     }
                 }
-                let native_status = native_diagnostic.as_ref().and_then(|diagnostic| {
-                    diagnostic.signal.map(std::process::ExitStatus::from_raw)
-                        .or_else(|| diagnostic.code.map(|code| std::process::ExitStatus::from_raw(code << 8)))
-                });
+                let native_status = native_diagnostic.as_ref().and_then(|diagnostic| diagnostic.provider_status);
                 let retained_log = if let Some(descriptor) = native_diagnostic.as_ref().and_then(|diagnostic|diagnostic.log.clone()) {
                     super::stderr_log::Lease::open(descriptor).map_err(|error| {tracing::warn!(%error,"Retained provider output is unavailable");error}).ok()
                 } else { None };
@@ -648,7 +637,7 @@ impl LocalHandle {
                         || (adopted_native && !native_installed.load(Ordering::Acquire)));
                 let mut exit_error = result.as_ref().err().cloned();
                 let mut direct_closed = true;
-                let status = actor.child.as_mut().and_then(|child| {
+                let direct_status = actor.child.as_mut().and_then(|child| {
                     let status = child.observed_exit_status().ok().flatten();
                     if let Err(error) = child.terminate() {
                         direct_closed = false;
@@ -656,7 +645,9 @@ impl LocalHandle {
                             Some(format!("Provider cleanup is unconfirmed: {error}"));
                     }
                     status
-                }).or(native_status);
+                });
+                let direct_subject = provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let status = actor.provider_exit_status(direct_status, direct_subject.as_ref(), native_transport, native_status);
                 if let Some(mut reader)=actor.stderr_reader.take() {
                     let mut bytes=[0u8;8192];
                     for _ in 0..128 {
@@ -2240,6 +2231,12 @@ struct Actor {
     write_started: Option<Instant>,
 }
 
+struct NativeExitObservation {
+    provider_status: Option<std::process::ExitStatus>,
+    stderr: String,
+    log: Option<super::stderr_log::Descriptor>,
+}
+
 struct TurnAttention {
     key: String,
     settled: bool,
@@ -2317,6 +2314,65 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn native_exit_diagnostic_until(&mut self, deadline: Instant) -> Option<NativeExitObservation> {
+        let holder = self.native_holder.as_mut()?;
+        loop {
+            let diagnostic = holder.diagnostic().ok()?;
+            let provider_status = diagnostic.provider_status(
+                self.native_peer.as_ref(),
+                self.expected_native_peer.as_ref(),
+            );
+            if provider_status.is_some() || Instant::now() >= deadline {
+                tracing::debug!(launcher = ?diagnostic.launcher,
+                    launcher_code = ?diagnostic.launcher_code,
+                    launcher_signal = ?diagnostic.launcher_signal,
+                    ?provider_status, "Observed native diagnostic subjects");
+                return Some(NativeExitObservation {
+                    provider_status,
+                    stderr: diagnostic.stderr,
+                    log: diagnostic.log,
+                });
+            }
+            // A distinct launcher's status cannot end observation of the
+            // provider, and identity disappearance is not a wait result.
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn provider_exit_status(
+        &self,
+        direct_status: Option<std::process::ExitStatus>,
+        direct_subject: Option<&crate::daemon::holder_registry::Process>,
+        native_transport: bool,
+        native_status: Option<std::process::ExitStatus>,
+    ) -> Option<std::process::ExitStatus> {
+        if !native_transport
+            && self.native_holder.is_none()
+            && self.native_peer.is_none()
+            && self.expected_native_peer.is_none()
+        {
+            return direct_status.or(native_status);
+        }
+        let provider = match (
+            self.native_peer.as_ref(),
+            self.expected_native_peer.as_ref(),
+        ) {
+            (Some(actual), Some(expected)) if actual != expected => return None,
+            (Some(actual), _) => Some(actual),
+            (_, Some(expected)) => Some(expected),
+            _ => None,
+        }
+        .filter(|process| process.pid > 0 && process.start > 0)?;
+        if self.native_holder.is_some() {
+            // Native custody excludes a direct Child. Keep that separation
+            // fail-closed even if a future caller retains both capabilities.
+            return native_status;
+        }
+        direct_status
+            .filter(|_| direct_subject == Some(provider))
+            .or(native_status)
+    }
+
     fn capture_stderr(&mut self, bytes: &[u8]) {
         if let Some(log) = &mut self.stderr_log {
             log.push(bytes);
@@ -5701,6 +5757,268 @@ mod tests {
                         .contains("Fixture local transport failed")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn native_diagnostic_caller_keeps_launcher_exit_separate_from_provider_status() {
+        use crate::daemon::holder_registry::Process as Identity;
+        use std::os::unix::process::ExitStatusExt;
+        let launcher = Identity {
+            pid: 5101,
+            start: 101,
+        };
+        let provider = Identity {
+            pid: 5102,
+            start: 102,
+        };
+        let old4 = |present| {
+            json!({"Diagnostic":{"code":0,"signal":null,"stderr":"launcher completed",
+            "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":present},
+            "log_path":"/must-not-open"}})
+        };
+        let exact = |code, signal| {
+            json!({"Diagnostic":{"code":code,"signal":signal,"stderr":"same subject",
+            "launcher":launcher,"confirmed_server":{"process":launcher,"identity_current":false}}})
+        };
+        let mut stale = launcher.clone();
+        stale.start += 1;
+        let zero = Identity { pid: 0, start: 101 };
+        let cases = vec![
+            (
+                old4(true),
+                Some(provider.clone()),
+                Some(provider.clone()),
+                None,
+            ),
+            (
+                old4(false),
+                Some(provider.clone()),
+                Some(provider.clone()),
+                None,
+            ),
+            (
+                json!({"Diagnostic":{"code":0,"signal":null,"stderr":"legacy unlabeled"}}),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                None,
+            ),
+            (
+                exact(Some(3), None::<i32>),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                Some(3 << 8),
+            ),
+            (
+                exact(None::<i32>, Some(9)),
+                Some(launcher.clone()),
+                None,
+                Some(9),
+            ),
+            (
+                exact(Some(0), None::<i32>),
+                None,
+                Some(launcher.clone()),
+                Some(0),
+            ),
+            (exact(Some(0), None::<i32>), None, None, None),
+            (
+                exact(Some(0), None::<i32>),
+                Some(launcher.clone()),
+                Some(stale.clone()),
+                None,
+            ),
+            (exact(Some(0), None::<i32>), Some(stale), None, None),
+            (exact(Some(0), None::<i32>), Some(zero), None, None),
+            // Even an exact launcher peer cannot erase contradictory server metadata.
+            (
+                old4(false),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                None,
+            ),
+        ];
+        for (frame, actual, expected, wanted) in cases {
+            let (control, peer) = UnixStream::pair().unwrap();
+            let holder =
+                super::super::native_holder::Holder::diagnostic_fixture(control, launcher.clone());
+            let responder = thread::spawn(move || {
+                let length = read_holder_fixture_json(&peer);
+                assert_eq!(length, json!("Diagnostic"));
+                write_holder_fixture_json(&peer, &frame);
+                peer
+            });
+            let mut actor = native_diagnostic_actor_fixture(holder, actual, expected);
+            actor.state.lock().unwrap().outcome = Some(crate::agent::ActivityOutcome::Succeeded);
+            let observed = actor.native_exit_diagnostic_until(Instant::now()).unwrap();
+            assert_eq!(
+                observed.provider_status.map(|status| status.into_raw()),
+                wanted
+            );
+            assert!(
+                observed.log.is_none(),
+                "log_path must not mint retained-output authority"
+            );
+            let final_status =
+                actor.provider_exit_status(None, None, true, observed.provider_status);
+            assert_eq!(final_status.map(|status| status.into_raw()), wanted);
+            if wanted.is_none() {
+                // The direct-child alternative cannot smuggle launcher0 into a
+                // distinct or unproved native provider's lifecycle either.
+                let direct = actor.provider_exit_status(
+                    Some(std::process::ExitStatus::from_raw(0)),
+                    Some(&launcher),
+                    true,
+                    None,
+                );
+                assert!(
+                    direct.is_none(),
+                    "native holder custody cannot fall back to an unrelated direct-child status"
+                );
+                assert!(
+                    actor
+                        .provider_exit_status(
+                            Some(std::process::ExitStatus::from_raw(0)),
+                            Some(&launcher),
+                            false,
+                            None
+                        )
+                        .is_none(),
+                    "native custody also fences a mismatched transport label"
+                );
+            }
+            assert!(actor.native_holder.is_some());
+            assert!(!actor.stop.load(Ordering::Acquire));
+            let state = actor.state.lock().unwrap();
+            assert!(!state.exited);
+            assert_eq!(
+                state.outcome,
+                Some(crate::agent::ActivityOutcome::Succeeded)
+            );
+            drop(state);
+            let mut peer = responder.join().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let mut byte = [0];
+            assert!(
+                matches!(peer.read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "diagnostic classification must not send a Release/Confirm or recreate a provider"
+            );
+        }
+    }
+
+    #[test]
+    fn native_diagnostic_poll_does_not_stop_at_an_unrelated_launcher_exit() {
+        use crate::daemon::holder_registry::Process as Identity;
+        let launcher = Identity {
+            pid: 5201,
+            start: 201,
+        };
+        let provider = Identity {
+            pid: 5202,
+            start: 202,
+        };
+        let (control, peer) = UnixStream::pair().unwrap();
+        let holder =
+            super::super::native_holder::Holder::diagnostic_fixture(control, launcher.clone());
+        let mut actor =
+            native_diagnostic_actor_fixture(holder, Some(provider.clone()), Some(provider.clone()));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let responder = thread::spawn(move || {
+            assert_eq!(read_holder_fixture_json(&peer), json!("Diagnostic"));
+            write_holder_fixture_json(
+                &peer,
+                &json!({"Diagnostic":{"code":0,"signal":null,"stderr":"first",
+                "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":true}}}),
+            );
+            assert_eq!(read_holder_fixture_json(&peer), json!("Diagnostic"));
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            write_holder_fixture_json(
+                &peer,
+                &json!({"Diagnostic":{"code":0,"signal":null,"stderr":"later",
+                "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":false}}}),
+            );
+        });
+        let observed = actor.native_exit_diagnostic_until(deadline).unwrap();
+        assert!(observed.provider_status.is_none());
+        assert_eq!(observed.stderr, "later");
+        assert!(actor.native_holder.is_some());
+        responder.join().unwrap();
+    }
+
+    fn read_holder_fixture_json(peer: &UnixStream) -> Value {
+        let mut peer = peer;
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut length = [0; 4];
+        peer.read_exact(&mut length).unwrap();
+        let mut payload = vec![0; u32::from_be_bytes(length) as usize];
+        peer.read_exact(&mut payload).unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+    fn write_holder_fixture_json(peer: &UnixStream, frame: &Value) {
+        let mut peer = peer;
+        let payload = serde_json::to_vec(frame).unwrap();
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        peer.write_all(&payload).unwrap();
+    }
+    fn native_diagnostic_actor_fixture(
+        holder: super::super::native_holder::Holder,
+        native_peer: Option<crate::daemon::holder_registry::Process>,
+        expected_native_peer: Option<crate::daemon::holder_registry::Process>,
+    ) -> Actor {
+        let (_, incoming) = crossbeam_channel::bounded(1);
+        let (_, urgent_incoming) = crossbeam_channel::bounded(1);
+        let (wake, _) = UnixStream::pair().unwrap();
+        Actor {
+            launch_context: None,
+            launch_account_scope: None,
+            working_directory: "/var/tmp".into(),
+            child: None,
+            native_holder: Some(holder),
+            reconnect_only_reported: false,
+            native_peer,
+            expected_native_peer,
+            preserve_native: Arc::new(AtomicBool::new(false)),
+            native_installed: Arc::new(AtomicBool::new(true)),
+            adapter: Box::new(Echo),
+            state: Arc::new(Mutex::new(Snapshot::default())),
+            confirmed_session: Arc::new(Mutex::new(None)),
+            store: Arc::new(Mutex::new(Store::new().unwrap())),
+            visible: Arc::new(AtomicBool::new(false)),
+            observe_next: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            incoming,
+            urgent_incoming,
+            wake,
+            notify: Arc::new(|_| {}),
+            output: Vec::new(),
+            scanned: 0,
+            pending: VecDeque::new(),
+            control_replies: BTreeMap::new(),
+            offset: 0,
+            queued: 0,
+            stderr: VecDeque::new(),
+            stderr_reader: None,
+            stderr_log: None,
+            indices: BTreeMap::new(),
+            retained: 0,
+            history_error: None,
+            login_recovery: None,
+            dirty: false,
+            activity: ActivityState::Idle,
+            activity_outcome: None,
+            ready: false,
+            prompt_available: false,
+            attention: TurnAttention::default(),
+            execution: execution::Tracker::default(),
+            attention_baselined: false,
+            waiting_fingerprint: None,
+            last_present: Instant::now(),
+            first_frame: false,
+            started: Instant::now(),
+            write_started: None,
         }
     }
 

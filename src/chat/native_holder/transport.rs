@@ -190,11 +190,87 @@ enum Report {
 /// short reason; keeping this separate prevents transport errors hiding exits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ExitDiagnostic {
-    pub code: Option<i32>,
-    pub signal: Option<i32>,
+    #[serde(rename = "code")]
+    pub launcher_code: Option<i32>,
+    #[serde(rename = "signal")]
+    pub launcher_signal: Option<i32>,
+    #[serde(default)]
+    pub launcher: Option<Process>,
+    #[serde(default)]
+    pub confirmed_server: Option<ServerObservation>,
     pub stderr: String,
     #[serde(default)]
     pub log: Option<crate::chat::stderr_log::Descriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ServerObservation {
+    pub process: Process,
+    /// Identity presence only, including zombies; never a wait result.
+    pub identity_current: bool,
+}
+
+impl ExitDiagnostic {
+    fn validate(&self, original_launcher: &Process) -> Result<(), String> {
+        let positive = |process: &Process| process.pid > 0 && process.start > 0;
+        if self
+            .launcher
+            .as_ref()
+            .is_some_and(|launcher| !positive(launcher) || launcher != original_launcher)
+        {
+            return Err("Native diagnostic names another original launcher".into());
+        }
+        if self
+            .confirmed_server
+            .as_ref()
+            .is_some_and(|server| !positive(&server.process))
+        {
+            return Err("Native diagnostic has an invalid confirmed server identity".into());
+        }
+        if self
+            .launcher_code
+            .is_some_and(|code| !(0..=255).contains(&code))
+            || self
+                .launcher_signal
+                .is_some_and(|signal| !(1..=64).contains(&signal))
+            || (self.launcher_code.is_some() && self.launcher_signal.is_some())
+        {
+            return Err("Native diagnostic has an invalid launcher wait status".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn provider_status(
+        &self,
+        native_peer: Option<&Process>,
+        expected_peer: Option<&Process>,
+    ) -> Option<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        let provider = match (native_peer, expected_peer) {
+            (Some(actual), Some(expected)) if actual != expected => return None,
+            (Some(actual), _) => actual,
+            (_, Some(expected)) => expected,
+            _ => return None,
+        };
+        if provider.pid <= 0
+            || provider.start == 0
+            || self.launcher.as_ref() != Some(provider)
+            || self
+                .confirmed_server
+                .as_ref()
+                .is_some_and(|server| &server.process != provider)
+            || self.validate(provider).is_err()
+        {
+            return None;
+        }
+        // Only the launcher's real wait result is available. Identity presence
+        // cannot supply a status for a distinct confirmed server.
+        match (self.launcher_code, self.launcher_signal) {
+            (Some(code), None) => Some(std::process::ExitStatus::from_raw(code << 8)),
+            (None, Some(signal)) => Some(std::process::ExitStatus::from_raw(signal)),
+            _ => None,
+        }
+    }
 }
 
 /// Dropping an intentionally closed actor releases its server. An unexpected
@@ -239,7 +315,12 @@ impl Holder {
             }
         };
         match response {
-            Some(Report::Diagnostic(diagnostic)) => Ok(diagnostic),
+            Some(Report::Diagnostic(diagnostic)) => {
+                // This entire JSON frame was consumed. A semantic refusal
+                // grants no status and does not leave a partial next reply.
+                diagnostic.validate(&self.identity.record.root)?;
+                Ok(diagnostic)
+            }
             Some(Report::Failed(error)) => Err(error),
             _ => {
                 self.control_poisoned = true;
@@ -351,6 +432,40 @@ impl Holder {
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge provider identity".into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn diagnostic_fixture(control: UnixStream, launcher: Process) -> Self {
+        let recovery = super::tests::recovery();
+        let proof = recovery.source.proof.as_ref().unwrap().clone();
+        let holder = Process {
+            pid: 900_001,
+            start: 900_001,
+        };
+        Self {
+            control: Some(control),
+            release_on_drop: false,
+            durable: true,
+            directory_pin: false,
+            control_peer: holder.clone(),
+            control_poisoned: false,
+            identity: super::Detached {
+                record: Record {
+                    version: PROTOCOL,
+                    build: Some(registry::BuildIdentity::current(Kind::Native)),
+                    kind: Kind::Native,
+                    application: crate::instance::APPLICATION_ID.into(),
+                    boot: proof.boot_id.clone(),
+                    terminal: recovery.source.id,
+                    holder,
+                    root: launcher,
+                },
+                source: recovery.source,
+                proof: proof.clone(),
+                original_role: None,
+                receipt_proof: proof,
+            },
         }
     }
 
@@ -1052,8 +1167,15 @@ impl Residence {
                         });
                     match result {
                         Ok(status) => Report::Diagnostic(ExitDiagnostic {
-                            code: status.and_then(|status| status.code()),
-                            signal: status.and_then(|status| status.signal()),
+                            launcher_code: status.and_then(|status| status.code()),
+                            launcher_signal: status.and_then(|status| status.signal()),
+                            launcher: Some(self.record.root.clone()),
+                            confirmed_server: self.recovery.server_process.as_ref().map(
+                                |process| ServerObservation {
+                                    process: process.clone(),
+                                    identity_current: process.is_current(),
+                                },
+                            ),
                             stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous())
                                 .into_owned(),
                             log: status.and_then(|_| {
@@ -1755,6 +1877,138 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_rpc_validates_subjects_and_status_without_reusing_bad_frames() {
+        use serde_json::json;
+        let launcher = Process {
+            pid: 4101,
+            start: 101,
+        };
+        let server = Process {
+            pid: 4102,
+            start: 102,
+        };
+        let legacy = json!({"Diagnostic":{"code":0,"signal":null,"stderr":"old helper tail","log_path":"/must-not-open"}});
+        let current = json!({"Diagnostic":{"code":3,"signal":null,"stderr":"current tail",
+            "launcher":launcher,"confirmed_server":{"process":server,"identity_current":true}}});
+        let mut frames = vec![(legacy, true, false), (current.clone(), true, false)];
+        for (field, value) in [
+            ("launcher", json!({"pid":4101,"start":999})),
+            ("launcher", json!({"pid":9999,"start":101})),
+            ("launcher", json!({"pid":0,"start":101})),
+            ("launcher", json!({"pid":4101,"start":0})),
+            (
+                "confirmed_server",
+                json!({"process":{"pid":0,"start":102},"identity_current":false}),
+            ),
+            ("code", json!(-1)),
+            ("code", json!(256)),
+            ("signal", json!(0)),
+            ("signal", json!(65)),
+            ("signal", json!(9)),
+        ] {
+            let mut frame = current.clone();
+            frame["Diagnostic"][field] = value;
+            frames.push((frame, false, false));
+        }
+        for (field, value) in [
+            ("stderr", json!([1, 2, 3])),
+            ("code", json!("0")),
+            ("signal", json!(true)),
+            ("code", json!(1.5)),
+        ] {
+            let mut frame = current.clone();
+            frame["Diagnostic"][field] = value;
+            frames.push((frame, false, true));
+        }
+        for (frame, accepted, poisoned) in frames {
+            let (control, peer) = UnixStream::pair().unwrap();
+            let mut holder = Holder::diagnostic_fixture(control, launcher.clone());
+            let producer = std::thread::spawn(move || {
+                assert!(matches!(
+                    receive(&peer, TIMEOUT).unwrap(),
+                    Some(Request::Diagnostic)
+                ));
+                send(&peer, &frame, TIMEOUT).unwrap();
+                peer
+            });
+            let result = holder.diagnostic();
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(holder.control_poisoned, poisoned);
+            if let Ok(diagnostic) = &result {
+                assert!(
+                    diagnostic.log.is_none(),
+                    "old log_path is not an opaque output lease"
+                );
+                let encoded = serde_json::to_value(diagnostic).unwrap();
+                assert!(encoded.get("code").is_some());
+                assert!(encoded.get("signal").is_some());
+                assert!(encoded.get("launcher_code").is_none());
+                assert!(encoded.get("launcher_signal").is_none());
+                if diagnostic.launcher.is_none() {
+                    assert!(diagnostic.provider_status(Some(&launcher), None).is_none());
+                }
+            }
+            let peer = producer.join().unwrap();
+            if poisoned {
+                assert!(
+                    holder
+                        .diagnostic()
+                        .unwrap_err()
+                        .contains("framing is uncertain")
+                );
+            } else {
+                // A fully consumed semantic refusal leaves the next complete
+                // diagnostic exchange available, without retrying old input.
+                let expected = launcher.clone();
+                let next = std::thread::spawn(move || {
+                    assert!(matches!(
+                        receive(&peer, TIMEOUT).unwrap(),
+                        Some(Request::Diagnostic)
+                    ));
+                    send(
+                        &peer,
+                        &json!({"Diagnostic":{"code":null,"signal":9,"stderr":"next",
+                        "launcher":expected}}),
+                        TIMEOUT,
+                    )
+                    .unwrap();
+                });
+                let next_diagnostic = holder.diagnostic().unwrap();
+                assert_eq!(next_diagnostic.launcher_signal, Some(9));
+                next.join().unwrap();
+            }
+            assert!(holder.is_durable());
+            assert!(!holder.release_on_drop);
+        }
+        let (control, peer) = UnixStream::pair().unwrap();
+        let mut holder = Holder::diagnostic_fixture(control, launcher.clone());
+        holder.control.take();
+        assert!(holder.diagnostic().unwrap_err().contains("detached"));
+        drop(peer);
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        let mut holder = Holder::diagnostic_fixture(control, launcher);
+        holder
+            .identity
+            .record
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .clear();
+        assert!(
+            holder
+                .diagnostic()
+                .unwrap_err()
+                .contains("older provider holder")
+        );
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert!(
+            matches!(peer.read(&mut byte), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
     fn legacy_named_json_inspection_messages_remain_decodable() {
         let recovery = super::super::tests::recovery();
         let proof = recovery.source.proof.as_ref().unwrap();
@@ -1834,14 +2088,19 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let diagnostic = loop {
             let diagnostic = holder.diagnostic().unwrap();
-            if diagnostic.code.is_some() || diagnostic.signal.is_some() {
+            if diagnostic.launcher_code.is_some() || diagnostic.launcher_signal.is_some() {
                 break diagnostic;
             }
             assert!(Instant::now() < deadline, "fixture provider did not exit");
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(diagnostic.code, Some(3));
-        assert_eq!(diagnostic.signal, None);
+        assert_eq!(diagnostic.launcher_code, Some(3));
+        assert_eq!(diagnostic.launcher_signal, None);
+        assert_eq!(
+            diagnostic.launcher.as_ref(),
+            Some(&holder.identity.record.root)
+        );
+        assert!(diagnostic.confirmed_server.is_none());
         assert_eq!(diagnostic.stderr, "first diagnostic\nlast failure\n");
         assert_eq!(
             std::fs::read_to_string(&diagnostic.log.as_ref().unwrap().path).unwrap(),
@@ -1851,7 +2110,7 @@ mod tests {
         let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else {
             panic!("missing diagnostic control response")
         };
-        assert_eq!(decoded.code, Some(3));
+        assert_eq!(decoded.launcher_code, Some(3));
         assert!(decoded.stderr.ends_with("last failure\n"));
         let (control, peer) = UnixStream::pair().unwrap();
         holder.replace_control_for_test(control);
