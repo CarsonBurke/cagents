@@ -189,7 +189,15 @@ impl ControlClient {
 }
 
 pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppError> {
-    let authority = crate::agent_execution::Authority::from_environment();
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: AutomationCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
+    let authority = &context.authority;
     let wait = match &command {
         AutomationCommand::Propose {
             wait: true,
@@ -210,9 +218,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = context.connect()?;
     let mut reply = client
         .automation(authority.clone(), request)
         .map_err(protocol_error)?;

@@ -291,6 +291,13 @@ pub enum Action {
     ImageNext(bool),
     ImageFit,
     ImageExternal,
+    /// A context menu, viewer control or shortcut acting on displayed pixels.
+    Image(images::ImageRef, images::ImageCommand),
+    /// PNG encoding finished; `None` when a newer copy superseded it first.
+    ImageCopied(
+        text_copy::Intent,
+        Result<Option<images::clipboard::Png>, String>,
+    ),
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
     CopyQueued(Target, QueueCopy),
@@ -452,6 +459,8 @@ impl Action {
                 | Self::ImageNext(_)
                 | Self::ImageFit
                 | Self::ImageExternal
+                | Self::Image(images::ImageRef::Viewer(_), _)
+                | Self::ImageCopied(..)
         )
     }
 
@@ -2128,7 +2137,11 @@ pub(super) struct Runtime {
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
-    failures: Vec<(Option<String>, String)>,
+    failures: Vec<failure::Note>,
+    /// Notices raised while an earlier page is shown. That page holds
+    /// neither the latest prompt nor the latest work, so they are recorded
+    /// when the latest page next arrives.
+    unplaced_failures: Vec<String>,
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
@@ -3020,6 +3033,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
@@ -3079,35 +3093,85 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
     }
-    /// Records a notice in the transcript, after the exchange it concerns.
+    fn notice_anchor<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+        turns: &'a [turn::Turn],
+    ) -> Option<&'a str> {
+        failure::prompt_anchor(self.session.launch.provider, &snapshot.items)
+            .or_else(|| turns.last().map(|turn| turn.key.as_str()))
+    }
+    /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
-        let anchor = self.turns.last().map(|turn| turn.key.clone());
+        if self.snapshot.has_later {
+            self.defer_note(notice);
+            self.refresh_failure_ui();
+            return;
+        }
+        let anchor = self
+            .notice_anchor(&self.snapshot, &self.turns)
+            .map(str::to_owned);
+        let after = failure::closing_item(&self.snapshot, &self.turns).map(str::to_owned);
+        if self.note_at(anchor, after, notice) {
+            self.refresh_failure_ui();
+        }
+    }
+    fn defer_note(&mut self, notice: String) {
+        if !self.unplaced_failures.contains(&notice) {
+            if self.unplaced_failures.len() == 32 {
+                self.unplaced_failures.remove(0);
+            }
+            self.unplaced_failures.push(notice);
+        }
+    }
+    /// Records `notice` for the prompt message `anchor`, drawn after the
+    /// group containing the item `after`: work a delivery started after that
+    /// prompt still precedes the notice. Returns whether the notes changed;
+    /// the caller refreshes their presentation once its inputs agree.
+    fn note_at(&mut self, anchor: Option<String>, after: Option<String>, notice: String) -> bool {
         let provider = self.session.launch.provider;
+        let mut changed = false;
         if chat::requires_sign_in(provider, &notice) {
             // An updated verification failure replaces this exchange's active
             // auth warning; other exchanges and tool failures remain history.
-            self.failures.retain(|(previous, message)| {
-                previous != &anchor || !chat::requires_sign_in(provider, message)
+            let before = self.failures.len();
+            self.failures.retain(|note| {
+                !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                    || !chat::requires_sign_in(provider, &note.text)
             });
+            changed = self.failures.len() != before;
         }
-        if self
-            .failures
-            .iter()
-            .any(|(previous, message)| previous == &anchor && message == &notice)
-        {
-            return;
+        if let Some(index) = self.failures.iter().position(|note| {
+            failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                && note.text == notice
+        }) {
+            // The same failure recurring later in this exchange is still one
+            // notice, now after the work that produced it again. It becomes
+            // the latest note, which places an incident it shares.
+            if after.is_some() && self.failures[index].after != after {
+                let mut note = self.failures.remove(index);
+                note.after = after;
+                self.failures.push(note);
+                changed = true;
+            }
+            return changed;
         }
         if self.failures.len() == 32 {
             self.failures.remove(0);
         }
-        self.failures.push((anchor, notice));
-        self.refresh_failure_ui();
+        self.failures.push(failure::Note {
+            message: anchor,
+            after,
+            text: notice,
+        });
+        true
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
@@ -4249,7 +4313,8 @@ impl Runtime {
                 &snapshot.items,
             );
         }
-        let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
+        let current_anchor = self.notice_anchor(&self.snapshot, &self.turns);
+        let next_anchor = self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns));
         if self
             .snapshot
             .error
@@ -4262,18 +4327,17 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && current_anchor
-                == turns
-                    .as_deref()
-                    .unwrap_or(&self.turns)
-                    .last()
-                    .map(|turn| turn.key.as_str())
+            && failure::same_prompt(self.session.launch.provider, current_anchor, next_anchor)
         {
             let provider = self.session.launch.provider;
-            self.failures.retain(|(anchor, message)| {
-                anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
+            self.failures.retain(|note| {
+                !failure::same_prompt(provider, note.message.as_deref(), current_anchor)
+                    || !chat::requires_sign_in(provider, &note.text)
             });
         }
+        let next_anchor = next_anchor.map(str::to_owned);
+        let next_after = failure::closing_item(&snapshot, turns.as_deref().unwrap_or(&self.turns))
+            .map(str::to_owned);
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
             self.turns = turns;
@@ -4283,10 +4347,20 @@ impl Runtime {
             self.find_disclosure
                 .retain(&self.expanded, &self.unfolded, &self.opened);
         }
+        // Presentation refreshes below, once the snapshot is installed.
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
-            self.note(error.clone());
+            if snapshot.has_later {
+                self.defer_note(error.clone());
+            } else {
+                self.note_at(next_anchor.clone(), next_after.clone(), error.clone());
+            }
+        }
+        if !snapshot.has_later {
+            for notice in std::mem::take(&mut self.unplaced_failures) {
+                self.note_at(next_anchor.clone(), next_after.clone(), notice);
+            }
         }
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
@@ -10769,17 +10843,30 @@ impl Cagents {
                 }
             }
             Action::ImageExternal => {
-                if let Some(url) = self
+                if let Some(image) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .and_then(|gallery| gallery.url())
+                    .map(images::Gallery::selected_image)
                 {
-                    return cosmic::task::future(async move {
-                        Message::ExternalLinkOpened(images::open_external(url).await)
-                    });
+                    return self.image_command(image, images::ImageCommand::OpenExternally);
                 }
             }
+            Action::Image(image, command) => return self.image_command(image, command),
+            // A superseded copy reports nothing, not even its failure.
+            Action::ImageCopied(intent, _) if !intent.is_current() => {}
+            Action::ImageCopied(intent, result) => match result {
+                Ok(Some(png)) => {
+                    self.status = Some(TransientNotice::success("Copied image"));
+                    return intent.write_data(png);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.status = Some(
+                        TransientNotice::error("Could not copy the image").with_details(error),
+                    );
+                }
+            },
             Action::CopyQueued(target, source) => {
                 if self
                     .card_state(target.card)
@@ -12055,6 +12142,313 @@ mod tests {
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }
+    #[test]
+    fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
+        use iced::clipboard::mime::AsMimeTypes;
+        use iced::futures::StreamExt;
+        type Effect = iced::runtime::Action<cosmic::Action<Message>>;
+        fn run(task: Task<Message>) -> Vec<Effect> {
+            let Some(stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(stream.collect())
+        }
+        fn copied(app: &mut Cagents, effects: Vec<Effect>) -> Vec<String> {
+            let mut offered = Vec::new();
+            for effect in effects {
+                let iced::runtime::Action::Output(cosmic::Action::App(message)) = effect else {
+                    panic!("encoding reports back before touching the clipboard");
+                };
+                for effect in run(app.update(message)) {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::WriteData(data, _),
+                    ) = effect
+                    {
+                        let png = data.as_bytes("image/png").expect("PNG is offered");
+                        let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+                        assert_eq!(decoded.into_raw(), [9, 8, 7, 255]);
+                        offered.extend(data.available().iter().cloned());
+                    }
+                }
+            }
+            offered
+        }
+        // A notice raised directly, or one `update` has already moved to the log.
+        fn notice(app: &Cagents) -> (NoticeSeverity, String) {
+            app.status
+                .as_ref()
+                .or_else(|| app.notices.entries.back().map(|entry| &entry.notice))
+                .map(|notice| (notice.severity, notice.message.clone()))
+                .expect("the action reports its outcome")
+        }
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let content = ItemContent::Image {
+            path: "shots/result.png".into(),
+            description: "Generated image".into(),
+            reference: None,
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        let shown = iced::widget::image::Handle::from_rgba(1, 1, vec![9, 8, 7, 255]);
+        cached.image = Some(shown.clone());
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+        let target = runtime.target;
+        let expected_path = runtime
+            .session
+            .launch
+            .recipe
+            .working_directory
+            .join("shots/result.png");
+        let preview = images::ImageRef::Transcript(target, shown.id());
+
+        // Copy image path: a relative provider path resolves in its own cwd.
+        let effects = run(app.image_command(preview, images::ImageCommand::CopyPath));
+        assert!(matches!(
+            effects.as_slice(),
+            [iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, .. })]
+                if Path::new(contents) == expected_path
+        ));
+        assert_eq!(notice(&app).1, "Copied image path");
+
+        // Copy image: encoded off the UI thread, then offered as image/png.
+        let effects = run(app.image_command(preview, images::ImageCommand::Copy));
+        assert_eq!(copied(&mut app, effects), ["image/png"]);
+        assert_eq!(notice(&app).1, "Copied image");
+
+        // A menu opened on pixels that have since been replaced acts on nothing.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut("image")
+            .unwrap()
+            .image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![1, 1, 1, 255],
+        ));
+        assert!(run(app.image_command(preview, images::ImageCommand::Copy)).is_empty());
+        assert_eq!(notice(&app).0, NoticeSeverity::Warning);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut("image")
+            .unwrap()
+            .image = Some(shown.clone());
+
+        // Open image from the menu opens the viewer on the same pixels.
+        drop(app.image_command(preview, images::ImageCommand::Open));
+        let viewer = app.chat_ui.image_viewer.as_ref().unwrap().selected_image();
+        assert_eq!(viewer, images::ImageRef::Viewer(shown.id()));
+        assert!(Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+        assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
+        assert!(!Action::Image(preview, images::ImageCommand::Copy).allowed_while_modal());
+
+        // Ctrl+C in the viewer copies the image it shows, by physical key on
+        // any layout (here Cyrillic), once per press rather than per repeat.
+        app.status = None;
+        app.notices.entries.clear();
+        let control_c = |repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("с".into()),
+            modified_key: keyboard::Key::Character("с".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat,
+        };
+        let press = app.update(Message::KeyEvent {
+            event: control_c(false),
+            captured: false,
+        });
+        // The chord's repeats, arriving while the press is still encoding,
+        // neither copy again nor cancel the copy the press started.
+        assert!(
+            run(app.update(Message::KeyEvent {
+                event: control_c(true),
+                captured: false,
+            }))
+            .is_empty()
+        );
+        assert_eq!(copied(&mut app, run(press)), ["image/png"]);
+        assert_eq!(notice(&app).1, "Copied image");
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "copying keeps the viewer open"
+        );
+
+        // Escape is the viewer's own rather than the app-wide key handler's,
+        // so nothing focused beneath the viewer can claim it first, while the
+        // Escape that its open context menu claims closes only that menu.
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.update(Message::KeyEvent {
+            event: escape.clone(),
+            captured: true,
+        }));
+        assert!(app.chat_ui.image_viewer.is_some());
+        {
+            use iced::advanced::layout::{Layout, Limits};
+            use iced::advanced::widget::Tree;
+            use iced::advanced::{Shell, clipboard, mouse};
+            let renderer = crate::app::tests::headless_renderer();
+            let window = iced::Size::new(1000.0, 800.0);
+            let viewport = iced::Rectangle::with_size(window);
+            let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+            let mut element = gallery.view();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, window),
+            );
+            let pointer = mouse::Cursor::Available(viewport.center());
+            let mut send =
+                |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        tree,
+                        &event,
+                        Layout::new(&node),
+                        pointer,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
+                        .count()
+                };
+            let mut menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+                element
+                    .as_widget_mut()
+                    .overlay(
+                        tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        iced::Vector::ZERO,
+                    )
+                    .is_some()
+            };
+            send(
+                &mut element,
+                &mut tree,
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            );
+            assert!(
+                menu_open(&mut element, &mut tree),
+                "the image's menu opened"
+            );
+            assert_eq!(
+                send(
+                    &mut element,
+                    &mut tree,
+                    iced::Event::Keyboard(escape.clone())
+                ),
+                0
+            );
+            assert!(
+                !menu_open(&mut element, &mut tree),
+                "Escape closed the menu"
+            );
+            assert_eq!(
+                send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn only_literal_image_paths_are_offered_for_copying() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let image = |path: &str, reference: Option<chat::ImageReference>| ItemContent::Image {
+            path: path.into(),
+            description: String::new(),
+            reference,
+        };
+        let path = |runtime: &Runtime, content: ItemContent| {
+            images::clipboard::copyable_path(runtime, &content)
+        };
+        assert_eq!(
+            path(&*runtime, image("/abs/shot.png", None)).as_deref(),
+            Some("/abs/shot.png")
+        );
+        assert!(path(&*runtime, image("data:image/png;base64,AAAA", None)).is_none());
+        assert!(path(&*runtime, image("https://example.com/a.png", None)).is_none());
+        assert!(path(&*runtime, image("", None)).is_none());
+        let managed = chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 1,
+            device: uuid::Uuid::new_v4(),
+            name: "Pasted image".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        assert!(
+            path(&*runtime, image("/private/asset-digest.png", Some(managed))).is_none(),
+            "a managed asset's snapshot path is not an authority to expose"
+        );
+        let cached = format!(
+            "/run/user/1000/cagents/chat-{}/image-{}.png",
+            uuid::Uuid::new_v4(),
+            "0f".repeat(32)
+        );
+        assert!(
+            path(&*runtime, image(&cached, None)).is_none(),
+            "a provider image decoded into the private transcript cache is ephemeral"
+        );
+        assert!(
+            path(&*runtime, image(&format!("file://{cached}"), None)).is_none(),
+            "nor is its file URL"
+        );
+        assert!(path(&*runtime, image("/abs/image-0f.png", None)).is_some());
+        assert_eq!(
+            path(&*runtime, image("file:///abs/shot%20one.png", None)).as_deref(),
+            Some("/abs/shot one.png"),
+            "a file URL names the same file the viewer offers"
+        );
+        assert!(path(&*runtime, image("relative.png", None)).is_some());
+        runtime.selected_subagent = Some("child".into());
+        assert!(
+            path(&*runtime, image("relative.png", None)).is_none(),
+            "a child's relative path has no known working directory"
+        );
+    }
+
     #[test]
     fn image_loads_ignore_replaced_items_and_retired_runtime_generations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -13527,7 +13921,7 @@ mod tests {
         );
     }
 
-    fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
+    pub(super) fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
         history_fixture_for_provider(app, Provider::Codex)
     }
     fn history_fixture_for_provider(
@@ -14012,13 +14406,35 @@ mod tests {
         let (card, target, handle) = history_fixture(&mut app);
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "failed-prompt".into(),
+            role: chat::Role::User,
+            content: text("Investigate"),
+            started_at: None,
+            at: None,
+        }));
         snapshot.error = Some("Provider failure".into());
         handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
         let recorded = chat_runtime(&app, card).failures.clone();
         assert_eq!(recorded.len(), 1);
+        let drawn = chat_runtime(&app, card).failure_ui.incidents[0]
+            .anchor
+            .clone();
+        assert_eq!(
+            drawn.as_deref(),
+            Some("failed-prompt"),
+            "drawn after the work that failed"
+        );
         snapshot.generation += 1;
         snapshot.error = None;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "recovered-reply".into(),
+            role: chat::Role::Assistant,
+            content: text("Signed in again."),
+            started_at: None,
+            at: None,
+        }));
         snapshot.items.push(Arc::new(chat::Item {
             id: "next-prompt".into(),
             role: chat::Role::User,
@@ -14030,8 +14446,15 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().refresh();
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.failures, recorded);
+        let incident = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.summary.contains("Provider failure"))
+            .unwrap();
+        assert_eq!(incident.anchor, drawn);
         assert_ne!(
-            runtime.failures[0].0.as_ref(),
+            incident.anchor.as_ref(),
             runtime.turns.last().map(|turn| &turn.key)
         );
         assert!(runtime.snapshot.error.is_none());
@@ -22062,7 +22485,7 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|(_, notice)| notice.contains("does not offer gpt-b")),
+                .any(|note| note.text.contains("does not offer gpt-b")),
             "{:?}",
             runtime.failures
         );
@@ -22235,7 +22658,7 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|(_, notice)| notice.contains("acknowledgement timed out")),
+                .any(|note| note.text.contains("acknowledgement timed out")),
             "{:?}",
             runtime.failures
         );
@@ -24875,7 +25298,7 @@ mod tests {
         runtime.note(message.clone());
         assert_eq!(runtime.failures.len(), 1);
         runtime.error = Some(message.clone());
-        assert!(runtime.active_auth_notice(&runtime.failures[0].0, &message));
+        assert!(runtime.active_auth_notice(&runtime.failures[0].message, &message));
         // A later exchange must be able to report the same failure again.
         let next = chat::Item {
             id: "next-auth-exchange".into(),
@@ -24888,13 +25311,16 @@ mod tests {
             at: None,
             started_at: None,
         };
-        runtime.turns = turn::group(&[next], &HashSet::new(), |_| None);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(next)];
+        runtime.install_snapshot(Arc::new(snapshot), None);
         runtime.note(message.clone());
         assert_eq!(runtime.failures.len(), 2);
-        assert!(!runtime.active_auth_notice(&runtime.failures[0].0, &message));
-        assert!(runtime.active_auth_notice(&runtime.failures[1].0, &message));
+        assert!(!runtime.active_auth_notice(&runtime.failures[0].message, &message));
+        assert!(runtime.active_auth_notice(&runtime.failures[1].message, &message));
         runtime.error = None;
-        assert!(!runtime.active_auth_notice(&runtime.failures[1].0, &message));
+        assert!(!runtime.active_auth_notice(&runtime.failures[1].message, &message));
     }
     #[test]
     fn auth_recovery_requires_the_recipe_to_bind_a_known_account_home() {
@@ -25088,10 +25514,15 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot.clone());
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
-        let current = runtime.turns.last().map(|turn| turn.key.clone());
-        runtime
-            .failures
-            .insert(0, (Some("older-exchange".into()), failure.into()));
+        let current = runtime
+            .notice_anchor(&runtime.snapshot, &runtime.turns)
+            .map(str::to_owned);
+        let older = failure::Note {
+            message: Some("older-exchange".into()),
+            after: Some("older-exchange".into()),
+            text: failure.into(),
+        };
+        runtime.failures.insert(0, older.clone());
         runtime.note("Tool deployment failed with HTTP 401".into());
         runtime.note(chat::sign_in_verification_failure(
             failure,
@@ -25105,8 +25536,8 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .filter(|(anchor, message)| anchor == &current
-                    && chat::requires_sign_in(Provider::Codex, message))
+                .filter(|note| note.message == current
+                    && chat::requires_sign_in(Provider::Codex, &note.text))
                 .count(),
             1
         );
@@ -25118,16 +25549,10 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.snapshot.items, transcript);
         assert_eq!(runtime.failures.len(), 2);
-        assert_eq!(
-            runtime.failures[0],
-            (Some("older-exchange".into()), failure.into())
-        );
+        assert_eq!(runtime.failures[0], older);
         assert!(
-            runtime
-                .failures
-                .iter()
-                .any(|(anchor, message)| anchor == &current
-                    && message == "Tool deployment failed with HTTP 401")
+            runtime.failures.iter().any(|note| note.message == current
+                && note.text == "Tool deployment failed with HTTP 401")
         );
     }
 
