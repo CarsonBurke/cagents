@@ -8325,6 +8325,10 @@ mod app_tests {
                 app.account_ui.account_mut(&id).unwrap().account = system.clone();
                 app.account_ui.registry.set_default(&system);
                 app.account_ui.installed.insert(provider, true);
+                assert!(
+                    !table::row_ids_for_test(&app.account_ui, provider).contains(&id),
+                    "an unobserved system account without an error stays hidden"
+                );
                 let now = now_ms();
                 let first = now - schedule::MANUAL_DEBOUNCE - 1;
                 let prior = now - schedule::STALE_AFTER - 1_000;
@@ -8386,7 +8390,28 @@ mod app_tests {
                     } else {
                         serde_json::json!({})
                     };
-                    let (owner, ticket) = admit_actual_ticket(&mut app, &id, admitted_at);
+                    let (owner, ticket) = if phase == 2 {
+                        assert!(table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+                        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                        assert!(
+                            app.account_ui
+                                .account(&id)
+                                .unwrap()
+                                .schedule
+                                .manual_ready(admitted_at)
+                        );
+                        // The row's real Refresh action admits recovery; its
+                        // provider Task stays unpolled, as in the other phases.
+                        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+                        (
+                            app.account_ui.probe_owner(&id).unwrap(),
+                            app.account_ui
+                                .pending_probe_for_test(&id)
+                                .expect("the visible row's Refresh admitted recovery"),
+                        )
+                    } else {
+                        admit_actual_ticket(&mut app, &id, admitted_at)
+                    };
                     let state = app.account_ui.account(&id).unwrap();
                     let retained = (
                         state.snapshot.clone(),
@@ -8438,6 +8463,10 @@ mod app_tests {
                     assert_eq!(state.owner, owner);
                     assert!(app.account_ui.pending_probe_for_test(&id).is_none());
                     assert!(!state.schedule.in_flight(finished));
+                    assert!(
+                        table::row_ids_for_test(&app.account_ui, provider).contains(&id),
+                        "{provider:?} {case} phase {phase} keeps the system row discoverable"
+                    );
                     assert_eq!(app.known_account(&id).as_ref(), Some(&system));
                     assert_eq!(app.default_account(provider), system);
                     assert!(

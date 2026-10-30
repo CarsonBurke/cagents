@@ -271,15 +271,29 @@ fn order(state: &State, sort: Sort, left: &AccountState, right: &AccountState) -
     }
 }
 
+/// Pane visibility is separate from a successful account or quota reading.
+pub(super) fn listed(account: &AccountState) -> bool {
+    account.present || account.failure.is_some() || !account.account.is_system()
+}
+
 /// The accounts the pane lists for `provider`, in `sort` order: every
-/// account cagents added, and the system account where its CLI is set up.
+/// account cagents added, and the system account where its CLI is set up or
+/// its last check failed and the reader needs its retry control.
 fn rows<'a>(state: &'a State, provider: Provider, sort: Sort) -> Vec<&'a AccountState> {
     let mut rows: Vec<&AccountState> = state
         .of(provider)
-        .filter(|account| account.present || !account.account.is_system())
+        .filter(|account| listed(account))
         .collect();
     rows.sort_by(|left, right| order(state, sort, left, right));
     rows
+}
+
+#[cfg(test)]
+pub(super) fn row_ids_for_test(state: &State, provider: Provider) -> Vec<AccountId> {
+    rows(state, provider, state.table.sort)
+        .into_iter()
+        .map(|account| account.id.clone())
+        .collect()
 }
 
 pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
@@ -750,13 +764,23 @@ fn row<'a>(
         .collect::<Vec<_>>();
     if layout.stacked {
         return stacked_row(
-            account_cell(app, account, project),
+            account_cell(
+                app,
+                account,
+                project,
+                layout.columns.contains(&Column::Status),
+            ),
             layout.columns.iter().copied().zip(cells).collect(),
             actions(app, account, now, project),
         );
     }
     line(
-        account_cell(app, account, project),
+        account_cell(
+            app,
+            account,
+            project,
+            layout.columns.contains(&Column::Status),
+        ),
         cells,
         actions(app, account, now, project),
         ROW_HEIGHT,
@@ -796,6 +820,7 @@ fn account_cell<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
     project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
+    status_visible: bool,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let renaming = state
@@ -825,7 +850,8 @@ fn account_cell<'a>(
     let mut title: Vec<Element<'a, Message>> = vec![name];
     let several = state
         .of(account.account.provider)
-        .filter(|other| other.present || !other.account.is_system())
+        .filter(|other| listed(other))
+        .take(2)
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
@@ -884,6 +910,10 @@ fn account_cell<'a>(
         subtitle =
             vec!["Enter to save, Escape to cancel. Leave empty for the default name.".into()];
     }
+    let failure = account.failure.as_ref().filter(|_| !status_visible);
+    if failure.is_some() {
+        subtitle.insert(0, "Check failed".into());
+    }
     let mut lines: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(title)
             .spacing(space::S)
@@ -891,14 +921,17 @@ fn account_cell<'a>(
             .into(),
     ];
     if !subtitle.is_empty() {
-        lines.push(
-            design::caption(subtitle.join(" · "))
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into(),
-        );
+        let caption = design::caption(subtitle.join(" · "))
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ));
+        lines.push(match failure {
+            Some(failure) => {
+                crate::interaction::tooltip(caption, format!("Last check failed: {failure}"))
+            }
+            None => caption.into(),
+        });
     }
     widget::row::with_children(vec![
         widget::icon(crate::ui_controls::provider_icon(account.account.provider))
@@ -1384,6 +1417,144 @@ mod tests {
         let listed = rows(&state, Provider::Codex, Sort::Name);
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].account.is_system());
+    }
+
+    #[test]
+    fn failed_system_rows_keep_error_and_refresh_when_status_columns_drop() {
+        use iced::advanced::{clipboard, mouse};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        for provider in [Provider::Claude, Provider::Codex] {
+            for (width, stacked, status_visible) in [
+                (420.0, true, false),
+                (500.0, false, false),
+                (1_200.0, false, true),
+            ] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.account_ui.now_ms = 1_790_000_000_000;
+                let now = app.account_ui.now_ms;
+                let managed = app.account_ui.add_managed_fixture(provider, 1938006);
+                app.account_ui
+                    .set_fixture_label(&managed, Some("Other account"));
+                app.account_ui
+                    .registry
+                    .set_default(&Account::system(provider));
+                let completed = app.account_ui.account_mut(&managed).unwrap();
+                // Synthetic completed-check timing keeps only the System row's
+                // Refresh enabled; no provider future runs in this widget test.
+                completed.schedule.start(Trigger::Manual, now);
+                completed.schedule.succeed(now);
+                assert!(!completed.schedule.in_flight(now));
+                assert!(!completed.schedule.manual_ready(now));
+                let id = Account::system(provider).id();
+                let account = app.account_ui.account_mut(&id).unwrap();
+                // A first failed check has no quota or reported identity. This
+                // fixture exercises only the actual table's labels and input.
+                account.present = false;
+                account.snapshot = None;
+                account.identity = None;
+                account.failure = Some("The provider returned no usable quota".into());
+
+                let columns = layout(width);
+                assert_eq!(columns.stacked, stacked, "{provider:?} {width}");
+                assert_eq!(
+                    columns.columns.contains(&Column::Status),
+                    status_visible,
+                    "{provider:?} {width}"
+                );
+                let mut ui = UserInterface::build(
+                    table(&app, width),
+                    iced::Size::new(width, 600.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.draw(
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &iced::advanced::renderer::Style::default(),
+                    mouse::Cursor::Unavailable,
+                );
+                let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                let nodes = tree
+                    .root()
+                    .iter()
+                    .chain(tree.children())
+                    .collect::<Vec<_>>();
+                let labels = nodes
+                    .iter()
+                    .filter_map(|node| node.node().label())
+                    .collect::<Vec<_>>();
+                assert!(labels.contains(&"System default"), "{provider:?} {width}");
+                assert!(labels.contains(&"Other account"), "{provider:?} {width}");
+                assert_eq!(
+                    labels
+                        .iter()
+                        .copied()
+                        .filter(|label| *label == "Default")
+                        .count(),
+                    1,
+                    "{provider:?} {width}: both listed rows preserve the selected default"
+                );
+                let login = format!("{}'s own login", probe::cli_name(provider));
+                if status_visible {
+                    assert!(labels.contains(&"Unavailable"), "{provider:?} {width}");
+                    assert!(labels.contains(&login.as_str()), "{provider:?} {width}");
+                    assert!(
+                        !labels.iter().any(|label| label.starts_with("Check failed")),
+                        "the wide status column already explains the failure"
+                    );
+                } else {
+                    assert!(
+                        labels.iter().any(|label| {
+                            label.starts_with("Check failed · ") && label.contains(login.as_str())
+                        }),
+                        "{provider:?} {width}: narrow error retains original login context"
+                    );
+                }
+                let refresh = nodes
+                    .iter()
+                    .filter(|node| node.node().label() == Some("Check now"))
+                    .collect::<Vec<_>>();
+                assert_eq!(refresh.len(), 1, "{provider:?} {width}");
+                assert!(!refresh[0].node().is_disabled());
+                let bounds = refresh[0].node().bounds().expect("refresh geometry");
+                let refresh = iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                };
+                assert_eq!(refresh.width, design::COMPACT_CONTROL_SIZE);
+                assert_eq!(refresh.height, design::COMPACT_CONTROL_SIZE);
+                assert!(
+                    refresh.x.is_finite()
+                        && refresh.y.is_finite()
+                        && refresh.x >= 0.0
+                        && refresh.x + refresh.width <= width
+                        && refresh.y >= 0.0
+                        && refresh.y + refresh.height <= 600.0,
+                    "{provider:?} {width}: full retry target stays inside the pane"
+                );
+                let point = refresh.center();
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(
+                    matches!(messages.as_slice(), [Message::AccountUi(Action::Refresh(actual))] if actual == &id),
+                    "{provider:?} {width}: actual retry click keeps the original account"
+                );
+            }
+        }
     }
 
     #[test]
