@@ -24,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod worktree_safety;
+pub use worktree_safety::{WorktreeSafetySnapshot, default_disposable_ignored_directories};
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
@@ -825,6 +827,24 @@ pub struct RemoteRefRecord {
     /// first component alone gave `te` here against `te/am` there.
     pub remote: String,
     pub branch: String,
+}
+
+/// Configured remote names can contain slashes. Assign a cached ref to its
+/// longest matching remote before interpreting the remaining branch name.
+fn configured_remote_branch<'a>(
+    reference: &'a RemoteRefRecord,
+    remotes: &'a [RemoteRecord],
+) -> Option<(&'a str, &'a str)> {
+    remotes
+        .iter()
+        .filter_map(|remote| {
+            reference
+                .name
+                .as_str()
+                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                .map(|branch| (remote.name.as_str(), branch))
+        })
+        .max_by_key(|(remote, _)| remote.len())
 }
 
 /// A remote's default branch: the target of `refs/remotes/<remote>/HEAD`.
@@ -3071,7 +3091,7 @@ impl ValidatedBranchName {
         let value = value.into();
         let invalid_component = value.split('/').any(|component| {
             component.is_empty()
-                || component == "."
+                || component.starts_with('.')
                 || component == ".."
                 || component.ends_with(".lock")
                 || component.ends_with('.')
@@ -3893,6 +3913,55 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             })
     }
 
+    /// Looks up an exact ref path without Git's revision-name fallbacks.
+    fn resolve_exact_ref_oid(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Oid, RepositoryError> {
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--hash", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run_checked(&command, cancellation)?;
+        Oid::parse_object(parse_utf8_line(&output.stdout, "reference_oid")?).map_err(|error| {
+            RepositoryError::InvalidOutput {
+                field: "reference_oid",
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Resolves an exact ref to a commit, distinguishing absence from a Git
+    /// failure. Peeling the captured object cannot select a similarly named tag
+    /// if the ref disappears between these reads.
+    fn resolve_optional_ref(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        let command = self
+            .git_read(
+                worktree,
+                ["show-ref", "--verify", "--quiet", "--", reference],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run(&command, cancellation)?;
+        if !output.success {
+            return if output.exit_code == Some(1) {
+                Ok(None)
+            } else {
+                Err(git_failure(&command, output).into())
+            };
+        }
+        let oid = self.resolve_exact_ref_oid(worktree, reference, cancellation)?;
+        self.resolve_optional_revision(worktree, oid.as_str(), cancellation)
+    }
+
     /// The `git log` page for one history request.
     pub fn history_command(
         &self,
@@ -3982,7 +4051,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     reason: "an unborn branch has nothing to compare".into(),
                 })?;
         let base = self
-            .resolve_optional_revision(worktree, base_ref.as_str(), cancellation)?
+            .resolve_optional_ref(worktree, base_ref.as_str(), cancellation)?
             .ok_or_else(|| RepositoryError::InvalidOutput {
                 field: "base_ref",
                 reason: format!("{base_ref} does not resolve to a commit"),
@@ -5330,7 +5399,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // what keeps a name this application cannot spell out of a refspec.
         let local_ref = request.branch.full_ref();
         let Some(local_oid) =
-            self.resolve_optional_revision(&request.worktree, &local_ref, cancellation)?
+            self.resolve_optional_ref(&request.worktree, &local_ref, cancellation)?
         else {
             return Ok(PushOutcome::NotPushed {
                 failure: MutationFailure::Rejected {
@@ -5359,15 +5428,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // This observes endpoints of the attempt; it does not prevent
                 // an external change or detect an A -> B -> A transition.
                 let observation = CancellationToken::new();
-                let reason = match self.resolve_optional_revision(
-                    &request.worktree,
-                    &local_ref,
-                    &observation,
-                ) {
-                    Ok(Some(after)) if after == local_oid => return Ok(pushed(local_oid)),
-                    Ok(_) => "The source branch changed during the push",
-                    Err(_) => "The source branch could not be verified after the push",
-                };
+                let reason =
+                    match self.resolve_optional_ref(&request.worktree, &local_ref, &observation) {
+                        Ok(Some(after)) if after == local_oid => return Ok(pushed(local_oid)),
+                        Ok(_) => "The source branch changed during the push",
+                        Err(_) => "The source branch could not be verified after the push",
+                    };
                 return Ok(PushOutcome::OutcomeUnknown {
                     failure: MutationFailure::Reconciliation {
                         reason: reason.into(),
@@ -5649,17 +5715,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
         let _remote = self.checked_remote(worktree, remote, cancellation)?;
-        let command = self.git_read(
-            worktree,
-            [
-                OsString::from("ls-remote"),
-                OsString::from("--refs"),
-                OsString::from("--exit-code"),
-                OsString::from("--"),
-                OsString::from(remote),
-                OsString::from(remote_ref.as_str()),
-            ],
-        );
+        let command = self
+            .git_read(
+                worktree,
+                [
+                    OsString::from("ls-remote"),
+                    OsString::from("--refs"),
+                    OsString::from("--exit-code"),
+                    OsString::from("--"),
+                    OsString::from(remote),
+                    OsString::from(remote_ref.as_str()),
+                ],
+            )
+            .timeout(Duration::from_secs(3));
         let output = self.run(&command, cancellation)?;
         if !output.success {
             // 2 is `--exit-code`'s "no matching ref"; anything else is a
@@ -5732,33 +5800,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .find(|local| local.name.as_str() == branch.full_ref());
         let selected_remote = if let Some((remote, name)) = explicit {
             Some((remote, name))
-        } else if let Some(local) = local {
-            local.upstream.as_ref().and_then(|upstream| {
-                remotes
-                    .iter()
-                    .filter_map(|remote| {
-                        upstream
-                            .as_str()
-                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                            .map(|name| (remote.name.clone(), name.to_owned()))
-                    })
-                    .max_by_key(|(remote, _)| remote.len())
-            })
+        } else if local.is_some() {
+            None
         } else {
-            let mut candidates = Vec::new();
-            for remote in &remotes {
-                if self
-                    .remote_ref_oid(
-                        &repository,
-                        &remote.name,
-                        &RemoteSideRef::parse(branch.full_ref())?,
-                        cancellation,
-                    )?
-                    .is_some()
-                {
-                    candidates.push((remote.name.clone(), branch.as_str().to_owned()));
-                }
-            }
+            // A plain branch name is local intent. Cached remote-tracking refs
+            // can identify an existing remote branch; unknown names create a
+            // local branch without a speculative network lookup.
+            let mut candidates: Vec<_> = refs
+                .remote
+                .iter()
+                .filter_map(|reference| configured_remote_branch(reference, &remotes))
+                .filter(|(_, name)| *name == branch.as_str())
+                .map(|(remote, name)| (remote.to_owned(), name.to_owned()))
+                .collect();
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
@@ -5881,17 +5935,41 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if is_hex_oid(name) {
             return Ok(BaseRevision::object_id(name)?);
         }
+        if name.starts_with("refs/tags/") {
+            ValidatedRefName::parse(name.to_owned())?;
+            return match self.resolve_optional_ref(repository, name, cancellation)? {
+                Some(oid) => Ok(BaseRevision::object_id(oid.to_string())?),
+                None => Err(ValidationError::InvalidBase(format!(
+                    "Tag {name} does not exist; choose another base"
+                ))
+                .into()),
+            };
+        }
         let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
-        if refs
-            .local
-            .iter()
-            .any(|local| local.name.as_str() == format!("refs/heads/{local_name}"))
+        let explicit_remote = name.strip_prefix("refs/remotes/");
+        if explicit_remote.is_none()
+            && refs
+                .local
+                .iter()
+                .any(|local| local.name.as_str() == format!("refs/heads/{local_name}"))
         {
             return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(
                 local_name,
             )?));
         }
-        let remote_name = name.strip_prefix("refs/remotes/").unwrap_or(name);
+        if name.starts_with("refs/heads/") {
+            return Err(ValidationError::InvalidBase(format!(
+                "Local branch {local_name} does not exist; choose another base"
+            ))
+            .into());
+        }
+        let tag = format!("refs/tags/{name}");
+        if explicit_remote.is_none() && ValidatedRefName::parse(tag.clone()).is_ok() {
+            if let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)? {
+                return Ok(BaseRevision::object_id(oid.to_string())?);
+            }
+        }
+        let remote_name = explicit_remote.unwrap_or(name);
         if let Some((remote, branch)) = remotes
             .iter()
             .filter_map(|remote| {
@@ -5906,21 +5984,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "refs/remotes/{remote}/{branch}"
             ))?);
         }
-        let branch = ValidatedBranchName::parse(name)?;
-        let mut candidates = Vec::new();
-        for remote in remotes {
-            if self
-                .remote_ref_oid(
-                    repository,
-                    &remote.name,
-                    &RemoteSideRef::parse(branch.full_ref())?,
-                    cancellation,
-                )?
-                .is_some()
-            {
-                candidates.push(format!("refs/remotes/{}/{name}", remote.name));
-            }
+        if explicit_remote.is_some() {
+            return Err(ValidationError::InvalidBase(format!(
+                "Remote ref {name} has no configured remote; choose another base"
+            ))
+            .into());
         }
+        let branch = ValidatedBranchName::parse(name)?;
+        let mut candidates: Vec<_> = refs
+            .remote
+            .iter()
+            .filter(|reference| {
+                configured_remote_branch(reference, remotes)
+                    .is_some_and(|(_, name)| name == branch.as_str())
+            })
+            .map(|reference| reference.name.as_str().to_owned())
+            .collect();
         if candidates.len() == 1 {
             return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
         }
@@ -5942,23 +6021,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .find(|remote| remote.name == "origin")
             .or_else(|| (remotes.len() == 1).then(|| &remotes[0]));
         if let Some(remote) = remote {
-            let _remote = self.checked_remote(repository, &remote.name, cancellation)?;
-            let output = self.run_checked(
-                &self.git_read(
-                    repository,
-                    ["ls-remote", "--symref", remote.name.as_str(), "HEAD"],
-                ),
-                cancellation,
-            )?;
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(branch) = text.lines().find_map(|line| {
-                line.strip_prefix("ref: refs/heads/")
-                    .and_then(|line| line.strip_suffix("\tHEAD"))
-            }) {
-                return Ok(BaseRevision::remote_ref(format!(
-                    "refs/remotes/{}/{branch}",
-                    remote.name
-                ))?);
+            if let Some(head) = refs
+                .remote_heads
+                .iter()
+                .find(|head| head.remote == remote.name)
+            {
+                if refs
+                    .remote
+                    .iter()
+                    .any(|reference| reference.name == head.target)
+                {
+                    return Ok(BaseRevision::remote_ref(head.target.as_str())?);
+                }
+            }
+            for branch in ["main", "master"] {
+                if let Some(reference) = refs.remote.iter().find(|reference| {
+                    reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)
+                }) {
+                    return Ok(BaseRevision::remote_ref(reference.name.as_str())?);
+                }
             }
         }
         // The checked-out branch is a proven ref. A repository whose default
@@ -6010,15 +6091,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     base.into(),
                 ],
             ),
-            check_branch_absent: self.git_read(
-                &request.repository,
-                [
-                    OsString::from("show-ref"),
-                    OsString::from("--verify"),
-                    OsString::from("--quiet"),
-                    request.branch.full_ref().into(),
-                ],
-            ),
+            check_branch_absent: self
+                .git_read(
+                    &request.repository,
+                    [
+                        OsString::from("show-ref"),
+                        OsString::from("--verify"),
+                        OsString::from("--quiet"),
+                        request.branch.full_ref().into(),
+                    ],
+                )
+                .env("GIT_NO_LAZY_FETCH", "1"),
         })
     }
 
@@ -6076,15 +6159,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<WorktreeResidualState, RepositoryError> {
         let worktrees = self.list_worktrees(&request.repository, cancellation)?;
-        let command = self.git_read(
-            &request.repository,
-            [
-                OsString::from("show-ref"),
-                OsString::from("--verify"),
-                OsString::from("--quiet"),
-                request.branch.full_ref().into(),
-            ],
-        );
+        let command = self
+            .git_read(
+                &request.repository,
+                [
+                    OsString::from("show-ref"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    request.branch.full_ref().into(),
+                ],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let branch_output = self.run(&command, cancellation)?;
         let branch_exists = match branch_output.exit_code {
             _ if branch_output.success => true,
@@ -7579,6 +7664,17 @@ mod tests {
                     command: &CommandSpec,
                     cancellation: &CancellationToken,
                 ) -> Result<ProcessOutput, ProcessFailure> {
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "show-ref")
+                    {
+                        assert_eq!(
+                            command.environment.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+                            Some(&OsString::from("1")),
+                            "selected-base reads must not fetch missing promisor objects"
+                        );
+                    }
                     let output = IsolatedExecutor.execute(command, cancellation)?;
                     if command
                         .arguments
@@ -7683,6 +7779,250 @@ mod tests {
             };
             assert_eq!(old.text(), Some("rename contents\n"));
             assert_eq!(new.text(), Some("rename contents\n"));
+
+            // A base offered by the loaded snapshot can disappear before the
+            // selected comparison runs. Its full spelling must not select a tag.
+            let mut unexpected_comparisons = Vec::new();
+            for reference in ["refs/heads/selected", "refs/remotes/origin/selected"] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                git(root, &["init", "-b", "main"]);
+                if reference.starts_with("refs/remotes/") {
+                    git(root, &["remote", "add", "origin", root.to_str().unwrap()]);
+                }
+                fs::write(root.join("tracked.txt"), b"selected base\n").unwrap();
+                git(root, &["add", "tracked.txt"]);
+                git(root, &["commit", "-m", "selected base"]);
+                let comparison_service = service();
+                let base = comparison_service
+                    .resolve_head(root, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                git(root, &["update-ref", reference, base.as_str()]);
+                fs::write(root.join("tracked.txt"), b"head change\n").unwrap();
+                git(root, &["add", "tracked.txt"]);
+                git(root, &["commit", "-m", "head change"]);
+                let head = comparison_service
+                    .resolve_head(root, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(head, base);
+                let snapshot = comparison_service.snapshot(root, &cancellation).unwrap();
+                let selected = snapshot
+                    .local_refs
+                    .iter()
+                    .map(|record| &record.name)
+                    .chain(snapshot.remote_refs.iter().map(|record| &record.name))
+                    .find(|name| name.as_str() == reference)
+                    .cloned()
+                    .expect("the real snapshot offers this branch comparison base");
+                let original = comparison_service
+                    .branch_comparison(root, &selected, &cancellation)
+                    .unwrap();
+                assert_eq!(original.base_oid, base);
+                assert_eq!(original.merge_base, base);
+                assert!(!original.entries.is_empty());
+
+                // The decoy is HEAD, so falling back to it would silently erase
+                // the branch's changes from the comparison instead of failing.
+                let decoy = format!("refs/tags/{reference}");
+                git(root, &["update-ref", &decoy, head.as_str()]);
+                git(root, &["update-ref", "-d", reference]);
+                let result = comparison_service.branch_comparison(root, &selected, &cancellation);
+                if !matches!(
+                    &result,
+                    Err(RepositoryError::InvalidOutput {
+                        field: "base_ref",
+                        ..
+                    })
+                ) {
+                    unexpected_comparisons.push((reference, result));
+                }
+                assert_eq!(
+                    String::from_utf8(git_output(
+                        root,
+                        &["show-ref", "--verify", "--hash", "--", &decoy]
+                    ))
+                    .unwrap()
+                    .trim(),
+                    head.as_str()
+                );
+                assert_eq!(
+                    comparison_service
+                        .resolve_head(root, &cancellation)
+                        .unwrap(),
+                    Some(head)
+                );
+                assert_eq!(
+                    fs::read(root.join("tracked.txt")).unwrap(),
+                    b"head change\n"
+                );
+            }
+            assert!(
+                unexpected_comparisons.is_empty(),
+                "an absent selected ref must not produce a tag-based comparison: {unexpected_comparisons:?}"
+            );
+        }
+
+        #[test]
+        fn explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote() {
+            if isolated_git_test(concat!(
+                module_path!(),
+                "::explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote"
+            )) {
+                return;
+            }
+
+            let mut unexpected_fallbacks = Vec::new();
+            for decoy in ["tag", "remote"] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path();
+                git(root, &["init", "-b", "main"]);
+                git(root, &["commit", "--allow-empty", "-m", "initial"]);
+                let head = String::from_utf8(git_output(root, &["rev-parse", "HEAD"]))
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(root, &["update-ref", "refs/heads/existing", "HEAD"]);
+                git(root, &["update-ref", "refs/tags/release", "HEAD"]);
+
+                if decoy == "tag" {
+                    git(
+                        root,
+                        &["update-ref", "refs/tags/refs/heads/missing", "HEAD"],
+                    );
+                } else {
+                    let unavailable = root.join("unavailable-local-remote.git");
+                    git(
+                        root,
+                        &["remote", "add", "refs", unavailable.to_str().unwrap()],
+                    );
+                    git(
+                        root,
+                        &["update-ref", "refs/remotes/refs/heads/missing", "HEAD"],
+                    );
+                }
+
+                let service = service();
+                let cancellation = CancellationToken::new();
+                let input = |base: &str| WorktreeInput {
+                    repository: root.into(),
+                    input: "new-from-base".into(),
+                    base: base.into(),
+                    managed_directory: ".worktrees/".into(),
+                    destination: String::new(),
+                    operation_id: OperationId::new(),
+                };
+                let resolve =
+                    |base: &str| service.resolve_worktree_request(&input(base), &cancellation);
+
+                let local = resolve("refs/heads/existing").unwrap();
+                assert_eq!(
+                    local.base,
+                    BaseRevision::LocalBranch(ValidatedBranchName::parse("existing").unwrap()),
+                    "an existing explicitly qualified local branch remains local"
+                );
+                assert!(!local.track);
+                assert_eq!(
+                    resolve("release").unwrap().base,
+                    BaseRevision::object_id(head.clone()).unwrap(),
+                    "unqualified tag bases retain their existing meaning"
+                );
+                if decoy == "tag" {
+                    assert_eq!(
+                        resolve("refs/tags/refs/heads/missing").unwrap().base,
+                        BaseRevision::object_id(head.clone()).unwrap(),
+                        "the decoy tag remains available through its own explicit namespace"
+                    );
+                } else {
+                    for base in ["heads/missing", "refs/remotes/refs/heads/missing"] {
+                        let request = resolve(base).unwrap();
+                        assert_eq!(
+                            request.base,
+                            BaseRevision::remote_ref("refs/remotes/refs/heads/missing").unwrap(),
+                            "cached remote base {base} retains its existing meaning"
+                        );
+                        assert!(!request.track, "a base override creates local history");
+                    }
+                }
+
+                // Neither a tag with this spelling nor a cached branch on the remote
+                // named `refs` can satisfy a request for this absent local branch.
+                let result = resolve("refs/heads/missing");
+                if !matches!(
+                    &result,
+                    Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+                ) {
+                    unexpected_fallbacks.push((decoy, result));
+                }
+                assert!(
+                    !root.join(".worktrees").exists(),
+                    "resolving a base must not create the worktree destination"
+                );
+            }
+            assert!(
+                unexpected_fallbacks.is_empty(),
+                "an explicitly qualified missing local branch must fail instead of selecting a decoy: {unexpected_fallbacks:?}"
+            );
+        }
+
+        #[test]
+        fn worktree_base_uses_the_longest_configured_remote_prefix() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(
+                root,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            );
+            for name in ["team", "team/nested"] {
+                let unavailable = root.join(format!("missing-{}.git", name.replace('/', "-")));
+                git(
+                    root,
+                    &["remote", "add", name, unavailable.to_str().unwrap()],
+                );
+            }
+            // No fetch or symbolic remote HEAD: the configured remote names
+            // must disambiguate this shared remote-tracking namespace.
+            git(
+                root,
+                &["update-ref", "refs/remotes/team/nested/topic", "HEAD"],
+            );
+            let service = service();
+            let cancellation = CancellationToken::new();
+            let input = |base: &str| WorktreeInput {
+                repository: root.into(),
+                input: "from-cached-topic".into(),
+                base: base.into(),
+                managed_directory: ".worktrees/".into(),
+                destination: String::new(),
+                operation_id: OperationId::new(),
+            };
+            let result = service.resolve_worktree_request(&input("nested/topic"), &cancellation);
+            assert!(
+                matches!(
+                    &result,
+                    Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+                ),
+                "topic on team/nested must not masquerade as nested/topic on team: {result:?}"
+            );
+            let expected = BaseRevision::remote_ref("refs/remotes/team/nested/topic").unwrap();
+            for base in ["topic", "team/nested/topic"] {
+                let request = service
+                    .resolve_worktree_request(&input(base), &cancellation)
+                    .unwrap();
+                assert_eq!(request.base, expected, "base {base}");
+                assert!(!request.track, "a base override creates local history");
+            }
         }
 
         #[test]
@@ -7815,7 +8155,16 @@ mod tests {
             ValidatedBranchName::parse("feature/safe").unwrap().as_str(),
             "feature/safe"
         );
-        for invalid in ["-force", "bad name", "a..b", "a.lock", "a@{b", "a//b"] {
+        for invalid in [
+            "-force",
+            "bad name",
+            "a..b",
+            "a.lock",
+            "a@{b",
+            "a//b",
+            ".hidden",
+            "feature/.hidden",
+        ] {
             assert!(ValidatedBranchName::parse(invalid).is_err(), "{invalid}");
         }
     }
@@ -9798,6 +10147,14 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(
+            plan.check_branch_absent
+                .environment
+                .get(OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&OsString::from("1")),
+            "checking a new branch name must not fetch missing promisor objects"
+        );
+
         for command in [
             &plan.validate_branch,
             &plan.resolve_base,
@@ -9824,11 +10181,15 @@ mod tests {
     fn a_successful_push_reports_the_pushed_commit() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
             success(b"/origin\n"),
             success(b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n"),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
         ]);
         let outcome = service
@@ -9849,6 +10210,8 @@ mod tests {
     fn a_rejected_push_is_definitively_not_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9864,13 +10227,15 @@ mod tests {
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
         // No endpoint lookup follows rejection; only private preflight configuration reads run.
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 8);
     }
 
     #[test]
     fn a_push_that_never_started_is_not_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9882,13 +10247,15 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 8);
     }
 
     #[test]
     fn an_uncertain_push_whose_remote_matches_is_reconciled_as_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9912,19 +10279,20 @@ mod tests {
             }
         );
         let commands = service.executor.commands.lock().unwrap();
-        let count: u32 = commands[9].environment[OsStr::new("GIT_CONFIG_COUNT")]
+        let count: u32 = commands[11].environment[OsStr::new("GIT_CONFIG_COUNT")]
             .to_str()
             .unwrap()
             .parse()
             .unwrap();
-        let marker =
-            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))].clone();
+        let marker = commands[11].environment
+            [OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))]
+        .clone();
         assert_eq!(
-            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
+            commands[11].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
             OsString::from("url./origin.insteadOf")
         );
         assert_eq!(
-            commands[9].arguments,
+            commands[11].arguments,
             vec![
                 OsString::from("-C"),
                 OsString::from("/repo"),
@@ -9947,6 +10315,8 @@ mod tests {
     fn an_uncertain_push_whose_remote_differs_stays_unknown() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9965,6 +10335,8 @@ mod tests {
         // An absent remote ref is also not proof that the push landed.
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9983,6 +10355,8 @@ mod tests {
         // Neither is a failed reconciliation lookup.
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -10011,12 +10385,18 @@ mod tests {
             };
             let mut responses = vec![
                 success(b""),
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
                 success(format!("{}\n", oid(4)).as_bytes()),
                 Err(unstarted_failure()),
                 result,
             ];
             if definite_success {
-                responses.push(success(format!("{}\n", oid(4)).as_bytes()));
+                responses.extend([
+                    success(b""),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                ]);
             }
             let service = fake_service(responses);
             let outcome = service
@@ -10028,9 +10408,9 @@ mod tests {
                 matches!(outcome, PushOutcome::OutcomeUnknown { .. })
             });
             let commands = service.executor.commands.lock().unwrap();
-            assert_eq!(commands.len(), if definite_success { 5 } else { 4 });
+            assert_eq!(commands.len(), if definite_success { 9 } else { 6 });
             assert!(
-                commands[3]
+                commands[5]
                     .arguments
                     .iter()
                     .any(|argument| argument == "push")
@@ -10046,13 +10426,33 @@ mod tests {
 
     #[test]
     fn successful_push_requires_a_readable_unchanged_source_observation() {
-        for after in [
-            success(format!("{}\n", oid(5)).as_bytes()),
-            exit(1, b""),
-            Err(unstarted_failure()),
+        for (after, reads, peeled) in [
+            (
+                vec![
+                    success(b""),
+                    success(format!("{}\n", oid(5)).as_bytes()),
+                    success(format!("{}\n", oid(5)).as_bytes()),
+                ],
+                3,
+                Some(oid(5)),
+            ),
+            (vec![exit(1, b"")], 1, None),
+            (vec![Err(unstarted_failure())], 1, None),
+            (vec![success(b""), Err(unstarted_failure())], 2, None),
+            (
+                vec![
+                    success(b""),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                    Err(unstarted_failure()),
+                ],
+                3,
+                Some(oid(4)),
+            ),
         ] {
-            let service = fake_service(vec![
+            let mut responses = vec![
                 success(b""),
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
                 success(format!("{}\n", oid(4)).as_bytes()),
                 success(b"/origin\0"),
                 success(b""),
@@ -10060,8 +10460,9 @@ mod tests {
                 success(
                     b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n",
                 ),
-                after,
-            ]);
+            ];
+            responses.extend(after);
+            let service = fake_service(responses);
             let outcome = service
                 .push(&publish_request(), &CancellationToken::new())
                 .unwrap();
@@ -10072,18 +10473,40 @@ mod tests {
                 }
             ));
             let commands = service.executor.commands.lock().unwrap();
-            assert_eq!(commands.len(), 7);
+            assert_eq!(commands.len(), 8 + reads);
             assert!(
-                commands[6]
-                    .arguments
-                    .iter()
-                    .any(|argument| argument == "rev-parse")
+                commands[8].arguments.ends_with(
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        "--",
+                        "refs/heads/feature"
+                    ]
+                    .map(OsString::from)
+                )
             );
-            assert!(
-                commands[6]
-                    .arguments
-                    .contains(&OsString::from("refs/heads/feature^{commit}"))
-            );
+            if reads >= 2 {
+                assert!(
+                    commands[9].arguments.ends_with(
+                        &["show-ref", "--verify", "--hash", "--", "refs/heads/feature"]
+                            .map(OsString::from)
+                    )
+                );
+            }
+            if let Some(oid) = peeled {
+                assert!(
+                    commands[10]
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "rev-parse")
+                );
+                assert!(
+                    commands[10]
+                        .arguments
+                        .contains(&OsString::from(format!("{oid}^{{commit}}")))
+                );
+            }
         }
     }
 
@@ -11678,6 +12101,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         emit(WorktreeProgressStage::ResolvingBase);
         let mut journal_write_failed = false;
+        let mut remote_refresh_warning = None;
         let attempt = (|| -> Result<(), RepositoryError> {
             if cancellation.is_cancelled() {
                 return Err(process_failure(
@@ -11729,7 +12153,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .into());
             }
             // Fetch is a mutation too: journal its intention before updating any
-            // remote-tracking ref. Never fetch into a local branch or force it.
+            // remote-tracking ref. Force only that cache, never a local branch.
             journal.effects_started = true;
             journal
                 .persist(store, &payload)
@@ -11746,43 +12170,83 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     cancellation,
                 )?;
             } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
-                let remotes = self.remotes(&journal.request.repository, cancellation)?;
-                let (remote, branch) = remotes
-                    .iter()
-                    .filter_map(|remote| {
-                        reference
-                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                            .map(|branch| (&remote.name, branch))
-                    })
-                    .max_by_key(|(remote, _)| remote.len())
-                    .ok_or_else(|| {
-                        ValidationError::InvalidBase(format!(
-                            "No configured remote owns {reference}"
-                        ))
-                    })?;
-                let _remote =
-                    self.checked_remote(&journal.request.repository, remote, cancellation)?;
-                ValidatedBranchName::parse(branch)?;
-                let mut fetch = self.git_mutation(
-                    &journal.request.repository,
-                    [
-                        "fetch",
-                        "--no-tags",
-                        "--no-recurse-submodules",
-                        remote.as_str(),
-                        &format!("refs/heads/{branch}:{reference}"),
-                    ],
-                );
-                fetch.inherited_lease = Some(lease.as_raw_fd());
-                self.run_checked(&fetch, cancellation)?;
+                // A tag with a remote ref's spelling is not a cached branch.
+                let cache_check = self
+                    .git_read(
+                        &journal.request.repository,
+                        ["show-ref", "--verify", "--quiet", "--", reference.as_str()],
+                    )
+                    .env("GIT_NO_LAZY_FETCH", "1");
+                let cache_output = self.run(&cache_check, cancellation)?;
+                let cached = if cache_output.success {
+                    true
+                } else if cache_output.exit_code == Some(1) {
+                    false
+                } else {
+                    return Err(git_failure(&cache_check, cache_output).into());
+                };
+                if journal.request.track || !cached {
+                    let remotes = self.remotes(&journal.request.repository, cancellation)?;
+                    let (remote, branch) = remotes
+                        .iter()
+                        .filter_map(|remote| {
+                            reference
+                                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                                .map(|branch| (&remote.name, branch))
+                        })
+                        .max_by_key(|(remote, _)| remote.len())
+                        .ok_or_else(|| {
+                            ValidationError::InvalidBase(format!(
+                                "No configured remote owns {reference}"
+                            ))
+                        })?;
+                    let _remote =
+                        self.checked_remote(&journal.request.repository, remote, cancellation)?;
+                    ValidatedBranchName::parse(branch)?;
+                    let mut fetch = self.git_mutation(
+                        &journal.request.repository,
+                        [
+                            "fetch",
+                            "--no-tags",
+                            "--no-recurse-submodules",
+                            remote.as_str(),
+                            &format!("+refs/heads/{branch}:{reference}"),
+                        ],
+                    );
+                    fetch.inherited_lease = Some(lease.as_raw_fd());
+                    if let Err(failure) = self.run_checked(&fetch, cancellation) {
+                        if !cached || cancellation.is_cancelled() {
+                            return Err(failure.into());
+                        }
+                        remote_refresh_warning = Some(format!(
+                            "Remote refresh failed; using cached {reference}: {}",
+                            failure.reported_detail()
+                        ));
+                        journal.warnings.push(failure);
+                    }
+                }
             }
+            // Resolve exact typed refs before peeling their objects. A full ref
+            // passed to rev-parse can still fall through to a similarly named
+            // tag or remote if the branch disappeared after input resolution.
+            let exact_ref = match &journal.request.base {
+                BaseRevision::LocalBranch(branch) => Some(branch.full_ref()),
+                BaseRevision::RemoteRef(reference) => Some(reference.clone()),
+                BaseRevision::ObjectId(_) => None,
+            };
+            let base_revision = if let Some(reference) = exact_ref {
+                self.resolve_exact_ref_oid(&journal.request.repository, &reference, cancellation)?
+                    .to_string()
+            } else {
+                journal.request.base.revision_argument()
+            };
             let resolve = self.git_read(
                 &journal.request.repository,
                 [
                     OsString::from("rev-parse"),
                     OsString::from("--verify"),
                     OsString::from("--end-of-options"),
-                    format!("{}^{{commit}}", journal.request.base.revision_argument()).into(),
+                    format!("{base_revision}^{{commit}}").into(),
                 ],
             );
             let output = self.run_checked(&resolve, cancellation)?;
@@ -11791,7 +12255,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(ValidationError::InvalidBase(oid).into());
             }
             if let Some(existing) = &journal.existing_branch_oid {
-                let current = self.resolve_optional_revision(
+                let current = self.resolve_optional_ref(
                     &journal.request.repository,
                     &journal.request.branch.full_ref(),
                     cancellation,
@@ -11948,7 +12412,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Ok(())
         })();
         journal.detail = match attempt {
-            Ok(()) => "Git exited; reconciling durable outcome".into(),
+            Ok(()) => remote_refresh_warning
+                .unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
             Err(error) => {
                 let detail = error.to_string();
                 journal.warnings.push(repository_warning(&self.git, error));
@@ -12017,7 +12482,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let lease_path =
             common_dir.join(format!("cagents-operation-{}.lease", request.operation_id));
         let existing_branch_oid = self
-            .resolve_optional_revision(
+            .resolve_optional_ref(
                 &request.repository,
                 &request.branch.full_ref(),
                 cancellation,
@@ -12183,7 +12648,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
-                self.resolve_optional_revision(
+                self.resolve_optional_ref(
                     &journal.request.repository,
                     &journal.request.branch.full_ref(),
                     &CancellationToken::new(),
@@ -12817,11 +13282,409 @@ mod worktree_journal_tests {
     }
 
     #[test]
-    fn intelligent_creation_uses_live_default_branch_and_keeps_source_changes() {
+    fn offline_creation_uses_last_fetched_remote_default_and_hides_managed_trees() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["commit", "--allow-empty", "-m", "remote advanced"]);
+        let bare = fixture.directory.path().join("bare.git");
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        fixture.git(&["fetch", "origin"]);
+        fixture.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let cached = fixture.git(&["rev-parse", "origin/main"]);
+        // An unreachable remote represents both offline and expired-credential
+        // operation: creating local history must never try authentication.
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
+        let mut input = fixture.input("offline/new");
+        input.managed_directory.clear();
+        fixture.resolve(input);
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/origin/main")
+        );
+        assert_eq!(
+            fixture.request.managed_root,
+            fixture.request.repository.join(".worktrees")
+        );
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(fixture.git(&["rev-parse", "offline/new"]), cached);
+        assert!(fixture.git(&["status", "--porcelain", "-uall"]).is_empty());
+    }
+
+    #[test]
+    fn explicit_remote_creation_follows_force_push_without_overwriting_local_history() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        let base = remote.git(&["rev-parse", "HEAD"]);
+        remote.git(&["switch", "-c", "topic"]);
+        remote.git(&["commit", "--allow-empty", "-m", "old remote tip"]);
+        let bare = fixture.directory.path().join("bare.git");
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        fixture.git(&["fetch", "origin"]);
+        let old = fixture.git(&["rev-parse", "origin/topic"]);
+        remote.git(&["reset", "--hard", &base]);
+        remote.git(&["commit", "--allow-empty", "-m", "rewritten remote tip"]);
+        remote.git(&["push", "--force", bare.to_str().unwrap(), "topic"]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_ne!(fixture.git(&["rev-parse", "topic"]), old);
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+        assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "origin");
+    }
+
+    #[test]
+    fn uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        let bare = fixture.directory.path().join("bare.git");
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        let upload_pack = fixture.directory.path().join("slow-upload-pack");
+        fs::write(
+            &upload_pack,
+            "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&upload_pack, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.git(&[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(upload_pack.with_file_name("slow-upload-pack.ran").exists());
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+    }
+
+    #[test]
+    fn unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
+        let cached = fixture.git(&["rev-parse", "origin/topic"]);
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(
+            report
+                .detail
+                .contains("using cached refs/remotes/origin/topic"),
+            "{report:?}"
+        );
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
+        assert!(
+            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty())
+        );
+    }
+
+    #[test]
+    fn cached_remote_resolution_preserves_configured_remote_names_containing_slashes() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("team/nested", &remote);
+        fixture.git(&["fetch", "team/nested"]);
+        fixture.resolve(fixture.input("topic"));
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")
+        );
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::Created
+        );
+        assert_eq!(
+            fixture.git(&["config", "branch.topic.remote"]),
+            "team/nested"
+        );
+        let mut input = fixture.input("from-cached-topic");
+        input.base = "topic".into();
+        fixture.resolve(input);
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")
+        );
+    }
+
+    #[test]
+    fn explicit_tag_base_resolves_to_its_commit_without_remote_lookup() {
+        let mut fixture = Fixture::new();
+        let original = fixture.git(&["rev-parse", "HEAD"]);
+        fixture.git(&["tag", "-a", "v1", "-m", "release"]);
+        fixture.git(&["commit", "--allow-empty", "-m", "later work"]);
+        let mut input = fixture.input("from-tag");
+        input.base = "v1".into();
+        fixture.resolve(input);
+        assert!(matches!(&fixture.request.base, BaseRevision::ObjectId(oid) if oid == &original));
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::Created
+        );
+        assert_eq!(fixture.git(&["rev-parse", "from-tag"]), original);
+    }
+
+    #[test]
+    fn qualified_remote_bases_keep_their_namespace_and_missing_cache_policy() {
+        struct RecordingFetch(Arc<std::sync::atomic::AtomicUsize>);
+        impl ProcessExecutor for RecordingFetch {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                token: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                if command.arguments.iter().any(|argument| argument == "fetch") {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                SystemProcessExecutor.execute(command, token)
+            }
+        }
+
+        for cached in [true, false] {
+            let mut fixture = Fixture::new();
+            let original = fixture.git(&["rev-parse", "HEAD"]);
+            fixture.git(&["commit", "--allow-empty", "-m", "decoy"]);
+            let decoy = fixture.git(&["rev-parse", "HEAD"]);
+            assert_ne!(original, decoy);
+            let unavailable = fixture.directory.path().join("unavailable.git");
+            fixture.git(&["remote", "add", "origin", unavailable.to_str().unwrap()]);
+            for reference in [
+                "refs/tags/refs/remotes/origin/topic",
+                "refs/heads/refs/remotes/origin/topic",
+                "refs/tags/refs/remotes/unconfigured/topic",
+                "refs/heads/refs/remotes/unconfigured/topic",
+            ] {
+                fixture.git(&["update-ref", reference, &decoy]);
+            }
+            if cached {
+                fixture.git(&["update-ref", "refs/remotes/origin/topic", &original]);
+            }
+            let repository = fixture.request.repository.clone();
+            let index = fs::read(repository.join(".git/index")).unwrap();
+            let tracked = fs::read(repository.join("tracked.txt")).unwrap();
+            let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let service = RepositoryService::new("git", Arc::new(RecordingFetch(fetches.clone())));
+            let cancellation = CancellationToken::new();
+            let mut input = fixture.input("from-qualified-remote");
+            input.base = "refs/remotes/origin/topic".into();
+            fixture.request = service
+                .resolve_worktree_request(&input, &cancellation)
+                .unwrap();
+            assert_eq!(
+                fixture.request.base,
+                BaseRevision::remote_ref("refs/remotes/origin/topic").unwrap(),
+                "qualified remote identity must survive both tag and local-branch decoys"
+            );
+            assert!(!fixture.request.track);
+            let (sender, _) = async_channel::bounded(8);
+            let report = service.create_worktree_journaled(
+                &fixture.store,
+                &fixture.request,
+                7,
+                &cancellation,
+                &sender,
+            );
+            if cached {
+                assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+                assert_eq!(
+                    fixture.git(&["rev-parse", "from-qualified-remote"]),
+                    original
+                );
+                assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(
+                    report.state,
+                    WorktreeOperationState::NotCreated,
+                    "{report:?}"
+                );
+                assert!(matches!(
+                    report.outcome,
+                    Some(WorktreeCreationOutcome::NotCreated { .. })
+                ));
+                assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(!fixture.request.destination.exists());
+                assert_eq!(
+                    fixture.git(&[
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "refs/heads/from-qualified-remote"
+                    ]),
+                    ""
+                );
+                let recovered = service
+                    .rehydrate_worktree_operations(&fixture.store)
+                    .unwrap();
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].state, WorktreeOperationState::NotCreated);
+                assert_eq!(
+                    recovered[0].request.as_ref().unwrap().base,
+                    fixture.request.base
+                );
+            }
+            let mut unknown = fixture.input("from-unconfigured");
+            unknown.base = "refs/remotes/unconfigured/topic".into();
+            assert!(matches!(
+                service.resolve_worktree_request(&unknown, &cancellation),
+                Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+            ));
+            assert_eq!(fixture.git(&["rev-parse", "HEAD"]), decoy);
+            assert_eq!(fs::read(repository.join(".git/index")).unwrap(), index);
+            assert_eq!(fs::read(repository.join("tracked.txt")).unwrap(), tracked);
+            assert_eq!(
+                fixture.git(&[
+                    "show-ref",
+                    "--verify",
+                    "--hash",
+                    "refs/tags/refs/remotes/origin/topic"
+                ]),
+                decoy
+            );
+            assert_eq!(
+                fixture.git(&[
+                    "show-ref",
+                    "--verify",
+                    "--hash",
+                    "refs/heads/refs/remotes/origin/topic"
+                ]),
+                decoy
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_tags_are_exact_and_shorthand_keeps_local_tag_remote_precedence() {
+        for annotated in [false, true] {
+            let mut fixture = Fixture::new();
+            let tagged = fixture.git(&["rev-parse", "HEAD"]);
+            if annotated {
+                fixture.git(&["tag", "-a", "refs/remotes/origin/topic", "-m", "release"]);
+            } else {
+                fixture.git(&["tag", "refs/remotes/origin/topic"]);
+            }
+            fixture.git(&["tag", "origin/topic"]);
+            fixture.git(&["commit", "--allow-empty", "-m", "local branch"]);
+            let local = fixture.git(&["rev-parse", "HEAD"]);
+            assert_ne!(local, tagged);
+            let unavailable = fixture.directory.path().join("unavailable.git");
+            fixture.git(&["remote", "add", "origin", unavailable.to_str().unwrap()]);
+            fixture.git(&["update-ref", "refs/remotes/origin/topic", &local]);
+            fixture.git(&["update-ref", "refs/heads/origin/topic", &local]);
+            fixture.git(&[
+                "update-ref",
+                "refs/heads/refs/tags/refs/remotes/origin/topic",
+                &local,
+            ]);
+            let mut input = fixture.input("from-qualified-tag");
+            input.base = "refs/tags/refs/remotes/origin/topic".into();
+            fixture.resolve(input.clone());
+            assert_eq!(
+                fixture.request.base,
+                BaseRevision::object_id(tagged.clone()).unwrap()
+            );
+            assert!(!fixture.request.track);
+            let report = fixture.run(&CancellationToken::new());
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert_eq!(fixture.git(&["rev-parse", "from-qualified-tag"]), tagged);
+
+            input.input = "shorthand".into();
+            input.base = "origin/topic".into();
+            let resolve = |input: &WorktreeInput| {
+                fixture
+                    .service
+                    .resolve_worktree_request(input, &CancellationToken::new())
+            };
+            assert_eq!(
+                resolve(&input).unwrap().base,
+                BaseRevision::LocalBranch(ValidatedBranchName::parse("origin/topic").unwrap())
+            );
+            fixture.git(&["update-ref", "-d", "refs/heads/origin/topic"]);
+            assert_eq!(
+                resolve(&input).unwrap().base,
+                BaseRevision::object_id(tagged.clone()).unwrap()
+            );
+            fixture.git(&["update-ref", "-d", "refs/tags/origin/topic"]);
+            fixture.git(&["update-ref", "refs/tags/refs/tags/origin/topic", &tagged]);
+            assert_eq!(
+                resolve(&input).unwrap().base,
+                BaseRevision::remote_ref("refs/remotes/origin/topic").unwrap()
+            );
+            input.base = "refs/remotes/origin/topic".into();
+            assert_eq!(
+                resolve(&input).unwrap().base,
+                BaseRevision::remote_ref("refs/remotes/origin/topic").unwrap()
+            );
+
+            input.base = "refs/tags/refs/remotes/origin/topic".into();
+            fixture.git(&["update-ref", "-d", &input.base]);
+            let nested = format!("refs/tags/{}", input.base);
+            fixture.git(&["update-ref", &nested, &local]);
+            assert!(matches!(
+                resolve(&input),
+                Err(RepositoryError::Validation(ValidationError::InvalidBase(_)))
+            ));
+            assert_eq!(
+                fixture.git(&["show-ref", "--verify", "--hash", &nested]),
+                local
+            );
+            assert_eq!(fixture.git(&["rev-parse", "HEAD"]), local);
+            assert!(
+                !fixture
+                    .request
+                    .repository
+                    .join("worktrees/shorthand")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn intelligent_creation_uses_cached_default_branch_and_keeps_source_changes() {
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["commit", "--allow-empty", "-m", "remote default advanced"]);
         fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
         fs::write(
             fixture.request.repository.join("tracked.txt"),
             "local dirty content",
@@ -12856,7 +13719,7 @@ mod worktree_journal_tests {
     }
 
     #[test]
-    fn intelligent_creation_fetches_existing_upstream_and_tracks_without_new_history() {
+    fn intelligent_creation_keeps_local_branch_without_refreshing_upstream() {
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
@@ -12864,18 +13727,13 @@ mod worktree_journal_tests {
         fixture.git(&["fetch", "origin"]);
         fixture.git(&["branch", "--track", "topic", "origin/topic"]);
         remote.git(&["switch", "topic"]);
+        let cached = fixture.git(&["rev-parse", "topic"]);
         remote.git(&["commit", "--allow-empty", "-m", "new upstream work"]);
         fixture.resolve(fixture.input("topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic"]),
-            remote.git(&["rev-parse", "topic"])
-        );
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic@{upstream}"]),
-            remote.git(&["rev-parse", "topic"])
-        );
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
+        assert_eq!(fixture.git(&["rev-parse", "topic@{upstream}"]), cached);
     }
 
     #[test]
@@ -12908,7 +13766,7 @@ mod worktree_journal_tests {
         // Removing a created worktree outside the app does not release its
         // replay-proof identity; only a deletion the user asked the app for does.
         // A distinct destination permits an independent divergence attempt.
-        let mut input = fixture.input("topic");
+        let mut input = fixture.input("origin/topic");
         input.destination = "worktrees/topic-diverged".into();
         fixture.resolve(input);
         let report = fixture.run(&CancellationToken::new());
@@ -12961,6 +13819,8 @@ mod worktree_journal_tests {
         second.git(&["commit", "--allow-empty", "-m", "second remote"]);
         fixture.add_remote("first", &first);
         fixture.add_remote("second", &second);
+        fixture.git(&["fetch", "first"]);
+        fixture.git(&["fetch", "second"]);
         let error = fixture
             .service
             .resolve_worktree_request(&fixture.input("topic"), &CancellationToken::new())

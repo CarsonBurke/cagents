@@ -1309,4 +1309,523 @@ mod tests {
         assert!(dialog.draft.base.is_empty());
         assert_eq!(dialog.draft.destination, "chosen-destination");
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn branch_menu_creation_keeps_ref_looking_and_hex_short_names_through_the_real_journal() {
+        use crate::repository::{
+            BaseRevision, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+        use cosmic::iced::futures::StreamExt;
+        const TEST: &str = "app::worktree_dialog::tests::branch_menu_creation_keeps_ref_looking_and_hex_short_names_through_the_real_journal";
+        if crate::repository::isolated_git_test(TEST) {
+            return;
+        }
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = SystemProcessExecutor
+                .execute(
+                    &CommandSpec::new("git")
+                        .cwd(root)
+                        .args([
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.invalid",
+                        ])
+                        .args(args.iter().copied())
+                        .timeout(Duration::from_secs(20))
+                        .output_limits(1024 * 1024, 64 * 1024),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(
+                output.success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_owned()
+        }
+        // Poll only the actual creation chain. In particular, never poll the
+        // watchers/default-terminal tasks returned by final UI publication.
+        async fn creation_message(task: Task<Message>) -> Message {
+            tokio::time::timeout(Duration::from_secs(30), async move {
+                let mut stream =
+                    iced::runtime::task::into_stream(task).expect("actual creation task");
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        if matches!(
+                            &message,
+                            Message::WorktreeInputResolved { .. }
+                                | Message::WorktreeOperationFinished { .. }
+                                | Message::WorktreeCreated { .. }
+                        ) {
+                            return message;
+                        }
+                    }
+                }
+                panic!("the actual creation worker must publish its next callback");
+            })
+            .await
+            .expect("bounded creation callback")
+        }
+        for mode in [
+            "prefix",
+            "hex",
+            "missing tag",
+            "missing remote",
+            "late missing tag",
+            "late missing remote",
+        ] {
+            let mut fixture = fixture();
+            drop(fixture.app.update(Message::CancelDialog));
+            let files = crate::repository::retained_managed_fixture_directory();
+            let root = files.path().join("repository");
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            git(&root, &["init", "--template=", "-b", "main"]);
+            std::fs::write(root.join("tracked"), b"colliding base\n").unwrap();
+            git(&root, &["add", "tracked"]);
+            git(&root, &["commit", "-m", "Colliding base"]);
+            let first = git(&root, &["rev-parse", "HEAD"]);
+            git(&root, &["branch", "topic", &first]);
+            git(&root, &["tag", "refs/heads/topic", &first]);
+            std::fs::write(root.join("tracked"), b"selected branch source\n").unwrap();
+            git(&root, &["add", "tracked"]);
+            git(&root, &["commit", "-m", "Selected branch"]);
+            let selected = git(&root, &["rev-parse", "HEAD"]);
+            assert_ne!(selected, first);
+            let selected_branch = if mode == "hex" {
+                first.clone()
+            } else {
+                "refs/heads/topic".into()
+            };
+            let full_ref = format!("refs/heads/{selected_branch}");
+            git(&root, &["checkout", "-b", &selected_branch]);
+            // Use Main's actual repository loader and accepted generation. Its
+            // SidebarWorktree already strips the one full-ref prefix Git emits.
+            let loaded = super::super::load_repository(
+                &root,
+                Some(fixture.project),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            fixture.app.repository_load_sequence = 1;
+            fixture
+                .app
+                .repository_generations
+                .insert(fixture.project, 1);
+            drop(fixture.app.update(Message::RepositoryLoaded {
+                open_cards: false,
+                project_id: fixture.project,
+                generation: 1,
+                result: Ok(Box::new(loaded)),
+            }));
+            let row = fixture
+                .app
+                .sidebar_model
+                .project(fixture.project)
+                .unwrap()
+                .worktrees
+                .iter()
+                .find(|row| row.path == root)
+                .unwrap();
+            assert_eq!(row.branch.as_deref(), Some(selected_branch.as_str()));
+            let worktree_id = row.id;
+            fixture.app.settings.managed_worktree_directory = ".worktrees".into();
+            drop(
+                fixture
+                    .app
+                    .update(Message::Sidebar(SidebarAction::ProjectCommand {
+                        project_id: fixture.project,
+                        worktree_id: Some(worktree_id),
+                        command: sidebar::ProjectCommand::NewWorktreeFromBranch,
+                    })),
+            );
+            assert!(dialog(&fixture.app).draft.pr_checkout.is_none());
+            drop(fixture.app.update(Message::WorktreeBranchChanged(
+                "derived-from-selected".into(),
+            )));
+            let unavailable_origin = files.path().join("unavailable-origin");
+            let expected_base = if mode == "late missing remote" {
+                // This is a user-edited explicit base on the actual generic form.
+                // Configure a nonexistent LOCAL origin: fetch can fail safely but
+                // no network access is necessary for this workflow.
+                let reference = "refs/remotes/origin/topic".to_owned();
+                git(
+                    &root,
+                    &[
+                        "remote",
+                        "add",
+                        "origin",
+                        unavailable_origin.to_str().unwrap(),
+                    ],
+                );
+                git(&root, &["update-ref", &reference, &selected]);
+                assert_eq!(git(&root, &["rev-parse", &reference]), selected);
+                drop(
+                    fixture
+                        .app
+                        .update(Message::WorktreeBaseChanged(reference.clone())),
+                );
+                reference
+            } else {
+                full_ref.clone()
+            };
+            if mode.starts_with("late missing ") {
+                drop(
+                    fixture.app.update(Message::WorktreeDestinationChanged(
+                        files
+                            .path()
+                            .join("late-derived-destination")
+                            .to_str()
+                            .unwrap()
+                            .into(),
+                    )),
+                );
+            }
+            if mode.starts_with("missing ") {
+                let destination = files.path().join("keep-this-destination");
+                let typed_destination = destination.to_str().unwrap().to_owned();
+                drop(fixture.app.update(Message::WorktreeDestinationChanged(
+                    typed_destination.clone(),
+                )));
+                let draft = dialog(&fixture.app).draft.clone();
+                // The menu captured this exact local branch. Its disappearance
+                // must not silently select a similarly spelled tag or remote.
+                git(&root, &["checkout", "main"]);
+                git(&root, &["update-ref", "-d", &full_ref]);
+                assert!(git(&root, &["for-each-ref", "--format=%(refname)", &full_ref]).is_empty());
+                if mode == "missing tag" {
+                    git(
+                        &root,
+                        &["update-ref", &format!("refs/tags/{full_ref}"), &first],
+                    );
+                } else {
+                    // Purely local configuration and cached tracking ref: neither
+                    // resolution nor this test needs a network request or fetch.
+                    git(&root, &["remote", "add", "refs", root.to_str().unwrap()]);
+                    git(
+                        &root,
+                        &["update-ref", &format!("refs/remotes/{full_ref}"), &first],
+                    );
+                }
+                let decoy = if mode == "missing tag" {
+                    format!("refs/tags/{full_ref}")
+                } else {
+                    format!("refs/remotes/{full_ref}")
+                };
+                assert_eq!(git(&root, &["rev-parse", &decoy]), first);
+                let input = creation_message(fixture.app.submit_worktree_dialog()).await;
+                let Message::WorktreeInputResolved {
+                    operation_id,
+                    result: Err(error),
+                    ..
+                } = &input
+                else {
+                    panic!("{mode}: a missing explicit local branch must fail, not use the decoy");
+                };
+                let operation = *operation_id;
+                assert_eq!(error.field, Some(WorktreeField::Base));
+                drop(fixture.app.update(input));
+                let form = dialog(&fixture.app);
+                assert!(form.resolving.is_none());
+                assert_eq!(
+                    form.error.as_ref().unwrap().field,
+                    Some(WorktreeField::Base)
+                );
+                assert_eq!(form.draft, draft);
+                assert_eq!(form.draft.branch, "derived-from-selected");
+                assert_eq!(form.draft.destination, typed_destination);
+                assert_eq!(form.draft.base, full_ref);
+                assert!(fixture.app.worktree_operations.is_empty());
+                assert!(
+                    fixture
+                        .app
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .operation_store()
+                        .journaled_worktree_operation(operation)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!destination.exists());
+                assert!(!root.join(".worktrees").exists());
+                assert!(
+                    git(
+                        &root,
+                        &[
+                            "for-each-ref",
+                            "--format=%(refname)",
+                            "refs/heads/derived-from-selected"
+                        ]
+                    )
+                    .is_empty()
+                );
+                assert_eq!(git(&root, &["rev-parse", "HEAD"]), selected);
+                assert_eq!(
+                    std::fs::read(root.join("tracked")).unwrap(),
+                    b"selected branch source\n"
+                );
+                continue;
+            }
+            let input = creation_message(fixture.app.submit_worktree_dialog()).await;
+            let Message::WorktreeInputResolved {
+                project_id,
+                operation_id,
+                result: Ok(request),
+            } = &input
+            else {
+                panic!("actual menu input must resolve successfully");
+            };
+            assert_eq!(*project_id, fixture.project);
+            let operation = *operation_id;
+            if mode == "late missing remote" {
+                assert!(
+                    matches!(&request.base, BaseRevision::RemoteRef(reference) if reference == &expected_base)
+                );
+            } else {
+                let BaseRevision::LocalBranch(branch) = &request.base else {
+                    panic!(
+                        "a selected local branch must not become an object ID: {:?}",
+                        request.base
+                    );
+                };
+                assert_eq!(branch.as_str(), selected_branch);
+            }
+            assert_eq!(request.base.revision_argument(), expected_base);
+            let destination = request.destination.clone();
+            let setup_intent = request.setup_intent.clone();
+            let late_draft = mode
+                .starts_with("late missing ")
+                .then(|| dialog(&fixture.app).draft.clone());
+            if late_draft.is_some() {
+                // Resolution already proved a typed local or remote ref. Remove
+                // that exact ref before the physical journal worker runs; Git's
+                // permissive rev-parse now resolves it through an unrelated tag.
+                if mode == "late missing tag" {
+                    git(&root, &["checkout", "main"]);
+                }
+                git(&root, &["update-ref", "-d", &expected_base]);
+                let tag = format!("refs/tags/{expected_base}");
+                git(&root, &["update-ref", &tag, &first]);
+                assert!(
+                    git(
+                        &root,
+                        &["for-each-ref", "--format=%(refname)", &expected_base]
+                    )
+                    .is_empty()
+                );
+                assert_eq!(
+                    git(
+                        &root,
+                        &[
+                            "rev-parse",
+                            "--verify",
+                            "--end-of-options",
+                            &format!("{expected_base}^{{commit}}")
+                        ]
+                    ),
+                    first
+                );
+            }
+            if matches!(mode, "prefix" | "hex") {
+                git(
+                    &root,
+                    &[
+                        "update-ref",
+                        "refs/tags/refs/heads/derived-from-selected",
+                        &first,
+                    ],
+                );
+            }
+            let creation = fixture.app.update(input);
+            let finished = creation_message(creation).await;
+            let Message::WorktreeOperationFinished {
+                result: Ok(report), ..
+            } = &finished
+            else {
+                panic!("actual journal worker must return its report");
+            };
+            assert_eq!(report.operation_id, operation);
+            if let Some(draft) = late_draft {
+                assert_eq!(
+                    report.state,
+                    WorktreeOperationState::NotCreated,
+                    "{report:?}"
+                );
+                assert!(matches!(
+                    report.outcome,
+                    Some(WorktreeCreationOutcome::NotCreated { .. })
+                ));
+                let recorded = report
+                    .request
+                    .as_ref()
+                    .expect("failed journal retains the request");
+                assert_eq!(recorded.base.revision_argument(), expected_base);
+                assert_eq!(recorded.setup_intent, setup_intent);
+                let settled = fixture.app.update(finished);
+                tokio::time::timeout(Duration::from_secs(30), async move {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(settled) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                                action
+                            {
+                                assert!(
+                                    !matches!(
+                                        message,
+                                        Message::WorktreeCreated { .. }
+                                            | Message::PrWorktreeCreated { .. }
+                                    ),
+                                    "a missing typed base cannot publish a created worktree"
+                                );
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("failed creation reducer settles finitely");
+                assert!(!fixture.app.has_active_worktree_operations());
+                assert_eq!(
+                    fixture.app.worktree_operations[&operation].reopenable_draft(),
+                    Some(&draft)
+                );
+                let journal = fixture
+                    .app
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .journaled_worktree_operation(operation)
+                    .unwrap()
+                    .expect("failed journal remains durable");
+                assert_eq!(
+                    journal.status,
+                    crate::persistence::PendingOperationStatus::RolledBack
+                );
+                if mode == "late missing remote" {
+                    // ProcessFailure retains stderr but not argv. The existing
+                    // typed journal warnings prove that Git tried this unavailable
+                    // local origin, rather than merely rejecting the final ref.
+                    let warnings: Vec<crate::process::ProcessFailure> =
+                        serde_json::from_value(journal.payload["warnings"].clone()).unwrap();
+                    assert!(
+                        warnings.iter().any(|failure| {
+                            String::from_utf8_lossy(&failure.stderr)
+                                .contains(unavailable_origin.to_str().unwrap())
+                        }),
+                        "a vanished remote cache must attempt the configured local origin"
+                    );
+                }
+                assert!(!destination.exists());
+                assert!(!root.join(".worktrees").exists());
+                assert!(
+                    git(
+                        &root,
+                        &[
+                            "for-each-ref",
+                            "--format=%(refname)",
+                            "refs/heads/derived-from-selected"
+                        ]
+                    )
+                    .is_empty()
+                );
+                assert_eq!(git(&root, &["rev-parse", "HEAD"]), selected);
+                assert_eq!(
+                    std::fs::read(root.join("tracked")).unwrap(),
+                    b"selected branch source\n"
+                );
+                drop(fixture.app.reopen_worktree_operation(operation, false));
+                let form = dialog(&fixture.app);
+                assert_eq!(form.draft, draft);
+                assert_eq!(form.draft.branch, "derived-from-selected");
+                assert_eq!(form.draft.base, expected_base);
+                assert!(form.resolving.is_none());
+                assert!(
+                    form.error
+                        .as_ref()
+                        .is_some_and(|error| !error.message.is_empty())
+                );
+                assert_eq!(form.replaces, Some(operation));
+                assert_eq!(fixture.app.worktree_operations.len(), 1);
+                continue;
+            }
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            let recorded = report
+                .request
+                .as_ref()
+                .expect("journal retains the request");
+            assert_eq!(recorded.base.revision_argument(), full_ref);
+            assert_eq!(recorded.setup_intent, setup_intent);
+            let publication = creation_message(fixture.app.update(finished)).await;
+            let Message::WorktreeCreated {
+                result: Ok(WorktreeCreationOutcome::Created { worktree, .. }),
+                ..
+            } = &publication
+            else {
+                panic!("actual generic completion must publish its created worktree");
+            };
+            let created = worktree.id;
+            assert_eq!(worktree.path, destination);
+            drop(fixture.app.update(publication));
+            assert!(
+                fixture
+                    .app
+                    .sidebar_model
+                    .project(fixture.project)
+                    .unwrap()
+                    .worktrees
+                    .iter()
+                    .any(|row| row.id == created && row.path == destination)
+            );
+            let session = fixture.app.session.as_ref().unwrap();
+            session.flush(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                session
+                    .operation_store()
+                    .load_worktree(created)
+                    .unwrap()
+                    .unwrap()
+                    .path,
+                destination
+            );
+            let destination_head = git(&destination, &["rev-parse", "HEAD"]);
+            assert_eq!(destination_head, selected);
+            assert_ne!(destination_head, first);
+            assert_eq!(
+                git(
+                    &root,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--hash",
+                        "refs/heads/derived-from-selected"
+                    ]
+                ),
+                selected
+            );
+            assert_eq!(
+                git(
+                    &root,
+                    &["rev-parse", "refs/tags/refs/heads/derived-from-selected"]
+                ),
+                first
+            );
+            assert_eq!(git(&root, &["symbolic-ref", "HEAD"]), full_ref);
+            assert_eq!(git(&root, &["rev-parse", "HEAD"]), selected);
+            assert_eq!(git(&root, &["rev-parse", "refs/heads/topic"]), first);
+            assert_eq!(
+                git(&root, &["rev-parse", "refs/tags/refs/heads/topic"]),
+                first
+            );
+            assert_eq!(
+                std::fs::read(root.join("tracked")).unwrap(),
+                b"selected branch source\n"
+            );
+            assert!(git(&root, &["status", "--porcelain=v1", "--untracked-files=no"]).is_empty());
+        }
+    }
 }

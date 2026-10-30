@@ -429,3 +429,23 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+### Managed worktree safety
+
+New managed worktrees use `.worktrees/` by default. In-checkout managed directories
+are excluded through the clone's `info/exclude`; tracked `.gitignore` files are
+unchanged. Existing configured locations remain in use. Registered worktrees under
+the previous `worktrees/` directory stay in place and that directory is excluded
+on the next managed creation. Absolute and sibling locations are supported.
+
+Automatic merged-worktree cleanup checks uncommitted changes, untracked files and
+ignored user files. Ignored build directories are disposable by policy: defaults
+are `node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`,
+`.pytest_cache`, `.mypy_cache` and `.ruff_cache`. A directory name matches at any
+depth, including its nested contents; a regular file with the same name remains
+protected. All other ignored content, including `.env`, prevents cleanup.
+
+The per-project list is stored as a JSON array in the clone-local Git configuration
+key `cagents.cleanupDisposableDirectories`, shared by its linked worktrees. An
+empty array permits no ignored directories to be discarded. Values must be simple
+directory names, with no slashes, traversal components or control characters.

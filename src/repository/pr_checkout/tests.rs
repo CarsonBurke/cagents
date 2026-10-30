@@ -2822,6 +2822,48 @@ fn new_pr_creation_reuses_only_an_exact_matching_unmounted_read_only_branch() {
             WorktreeOperationState::Created
         );
     }
+
+    // A tag with the output branch's full spelling is not an existing local
+    // branch, even when it points at precisely the reviewed PR commit.
+    let fixture = Fixture::new(false);
+    let (request, consent, store) = creation_request(&fixture, false);
+    let decoy = "refs/tags/refs/heads/reviewed";
+    run_git(
+        &fixture.root,
+        &["update-ref", decoy, fixture.original.as_str()],
+    );
+    let input = WorktreeInput {
+        repository: fixture.root.clone(),
+        input: "reviewed".into(),
+        base: fixture.original.as_str().into(),
+        managed_directory: request.managed_root.to_str().unwrap().into(),
+        destination: request.destination.to_str().unwrap().into(),
+        operation_id: request.operation_id,
+    };
+    let resolved = fixture
+        .service
+        .resolve_worktree_request_for_pr(&input, &consent, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        resolved.base,
+        BaseRevision::object_id(fixture.original.as_str()).unwrap(),
+        "the absent output branch must remain new reviewed-commit intent"
+    );
+    assert!(!resolved.track);
+    let report = create_reviewed(&fixture, &resolved, &consent, &store);
+    assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+    assert_eq!(
+        git_text(&resolved.destination, &["rev-parse", "HEAD"]),
+        fixture.original.as_str()
+    );
+    assert_eq!(
+        git_text(
+            &fixture.root,
+            &["show-ref", "--verify", "--hash", "--", decoy]
+        ),
+        fixture.original.as_str(),
+        "creating the real output branch must preserve the decoy tag"
+    );
 }
 
 #[test]

@@ -1170,7 +1170,9 @@ impl Cagents {
                             project_id,
                             target.repository,
                             WorktreeDraft {
-                                base: branch.trim_start_matches("refs/heads/").to_owned(),
+                                // Sidebar branches are exact local names, already
+                                // stripped once when their repository row is built.
+                                base: format!("refs/heads/{branch}"),
                                 ..Default::default()
                             },
                             None,
