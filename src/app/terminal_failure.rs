@@ -56,6 +56,38 @@ pub(super) struct Details {
     exit: Option<crate::model::TerminalExit>,
     consequence: &'static str,
 }
+
+/// The rendered diagnostic's source, never a card-only callback authority.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct DiagnosticIntent {
+    card: CardId,
+    session: TerminalSession,
+    code: &'static str,
+    exit: Option<crate::model::TerminalExit>,
+}
+impl std::fmt::Debug for DiagnosticIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The descriptor includes a launch environment and saved evidence.
+        f.debug_struct("DiagnosticIntent")
+            .field("card", &self.card)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TranscriptIntent {
+    diagnostic: DiagnosticIntent,
+    operation: uuid::Uuid,
+    saved_context: Option<(uuid::Uuid, PathBuf)>,
+}
+impl std::fmt::Debug for TranscriptIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranscriptIntent")
+            .field("card", &self.diagnostic.card)
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
         "start_failed" => ("start_failed", "The terminal could not be started."),
@@ -187,6 +219,7 @@ struct Probe {
     operation: uuid::Uuid,
     session: TerminalSession,
     saved_context: Option<(uuid::Uuid, PathBuf)>,
+    activation: Option<DiagnosticIntent>,
     available: bool,
     pending: bool,
     retry_at: Instant,
@@ -241,8 +274,8 @@ impl std::fmt::Debug for Permit {
 }
 #[derive(Debug, Clone)]
 pub(super) enum Action {
-    Copy(CardId),
-    Reveal(CardId),
+    Copy(DiagnosticIntent),
+    Reveal(TranscriptIntent),
     Probed {
         card: CardId,
         operation: uuid::Uuid,
@@ -251,11 +284,13 @@ pub(super) enum Action {
     Prepared {
         card: CardId,
         operation: uuid::Uuid,
+        owner: DiagnosticIntent,
         result: Result<Permit, transcript_location::Unavailable>,
     },
     Revealed {
         card: CardId,
         operation: uuid::Uuid,
+        owner: DiagnosticIntent,
         result: Result<(), transcript_location::Unavailable>,
     },
     RetryFinished {
@@ -307,6 +342,45 @@ fn fresh_transcript(
     transcript_location::open(session.id, &metadata)
 }
 impl Cagents {
+    fn terminal_diagnostic_intent(&self, card: CardId) -> Option<DiagnosticIntent> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        let CardKind::Terminal(session) = &state.kind else {
+            return None;
+        };
+        let details = self.terminal_details(card)?;
+        Some(DiagnosticIntent {
+            card,
+            session: session.clone(),
+            code: details.code,
+            exit: details.exit,
+        })
+    }
+
+    fn diagnostic_intent_is_current(&self, owner: &DiagnosticIntent) -> bool {
+        self.terminal_diagnostic_intent(owner.card).as_ref() == Some(owner)
+    }
+
+    fn terminal_transcript_intent(&self, card: CardId) -> Option<TranscriptIntent> {
+        let probe = self.terminal_failure.probes.get(&card)?;
+        if !probe.available || probe.pending || !self.probe_current(card, probe.operation) {
+            return None;
+        }
+        Some(TranscriptIntent {
+            diagnostic: self.terminal_diagnostic_intent(card)?,
+            operation: probe.operation,
+            saved_context: probe.saved_context.clone(),
+        })
+    }
+
+    pub(super) fn reveal_terminal_transcript(&mut self, card: CardId) -> Task<Message> {
+        let Some(intent) = self.terminal_transcript_intent(card) else {
+            return Task::none();
+        };
+        self.update_terminal_failure(Action::Reveal(intent))
+    }
+
     pub(super) fn terminal_details(&self, card: CardId) -> Option<Details> {
         let state = self
             .card_state(card)
@@ -368,16 +442,12 @@ impl Cagents {
         !crate::device::is_remote()
             && self.terminal_failure.probes.get(&card).is_some_and(|probe| {
                 probe.operation == operation
+                    && probe.activation.as_ref().is_none_or(|owner| self.diagnostic_intent_is_current(owner))
                     && (self.saved_terminal_current(card).is_none() || probe.saved_context.is_some())
                     && probe.saved_context == self.saved_terminal_transcript_context(card)
                     && self.card_state(card).is_some_and(|state| {
                         state.existence.is_open()
-                            && matches!(&state.kind, CardKind::Terminal(session)
-                                if if probe.saved_context.is_some() {
-                                    session == &probe.session
-                                } else {
-                                    session.id == probe.session.id && session.launch == probe.session.launch
-                                })
+                            && matches!(&state.kind, CardKind::Terminal(session) if session == &probe.session)
                     })
             })
     }
@@ -403,19 +473,26 @@ impl Cagents {
             })
             .collect();
         self.terminal_failure.probes.retain(|card, probe| {
-            sessions.get(card).is_some_and(|session| {
-                session.id == probe.session.id && session.launch == probe.session.launch
-            })
+            sessions
+                .get(card)
+                .is_some_and(|session| **session == probe.session)
         });
         let mut tasks = Vec::new();
         for (card, session) in sessions {
             let saved_context = self.saved_terminal_transcript_context(card);
+            let replaced_activation = self
+                .terminal_failure
+                .probes
+                .get(&card)
+                .and_then(|probe| probe.activation.as_ref())
+                .is_some_and(|owner| !self.diagnostic_intent_is_current(owner));
             if self
                 .terminal_failure
                 .probes
                 .get(&card)
                 .is_some_and(|probe| {
-                    probe.saved_context != saved_context
+                    replaced_activation
+                        || probe.saved_context != saved_context
                         || (saved_context.is_some() && &probe.session != session)
                 })
             {
@@ -447,6 +524,7 @@ impl Cagents {
                 operation,
                 session: session.clone(),
                 saved_context: saved_context.clone(),
+                activation: None,
                 available: false,
                 pending: true,
                 retry_at: Instant::now(),
@@ -496,19 +574,24 @@ impl Cagents {
             .into()
     }
     pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'static, Message> {
-        widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Copy details")
-                .id(card_control_id(card, "failure.copy"))
-                .on_press(Message::TerminalFailure(Action::Copy(card)))
-                .into(),
-            self.terminal_transcript_control(
-                card,
-                Some(Message::TerminalFailure(Action::Reveal(card))),
-            ),
-        ])
-        .spacing(space::S)
-        .wrap()
-        .into()
+        let Some(intent) = self.terminal_diagnostic_intent(card) else {
+            return iced::widget::Space::new().into();
+        };
+        crate::ui_controls::owned(
+            intent.clone(),
+            widget::flex_row(vec![
+                crate::ui_controls::button::secondary("Copy details")
+                    .id(card_control_id(card, "failure.copy"))
+                    .on_press(Message::TerminalFailure(Action::Copy(intent)))
+                    .into(),
+                self.terminal_transcript_control(
+                    card,
+                    self.terminal_transcript_intent(card)
+                        .map(|intent| Message::TerminalFailure(Action::Reveal(intent))),
+                ),
+            ])
+            .spacing(space::S as u16),
+        )
     }
     pub(super) fn terminal_transcript_control(
         &self,
@@ -517,7 +600,8 @@ impl Cagents {
     ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
-        let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
+        let owner = self.terminal_transcript_intent(card);
+        let available = owner.is_some();
         let folder = crate::ui_controls::button::secondary(
             if !remote && probe.is_some_and(|probe| probe.pending) {
                 "Checking transcript…"
@@ -533,7 +617,7 @@ impl Cagents {
         } else {
             folder
         };
-        folder.into()
+        crate::ui_controls::owned(owner, folder)
     }
 
     pub(super) fn terminal_runtime_claims(&self, terminal: TerminalId) -> bool {
@@ -605,8 +689,10 @@ impl Cagents {
     }
     pub(super) fn update_terminal_failure(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Copy(card) => self
-                .terminal_details(card)
+            Action::Copy(owner) => self
+                .diagnostic_intent_is_current(&owner)
+                .then(|| self.terminal_details(owner.card))
+                .flatten()
                 .map(|details| {
                     chat_ui::invalidate_copy_intent();
                     iced::clipboard::write(details.copy_text()).map(cosmic::Action::App)
@@ -631,7 +717,11 @@ impl Cagents {
                 Task::none()
             }
             Action::ProbeRetryDue => Task::none(),
-            Action::Reveal(card) => {
+            Action::Reveal(intent) => {
+                let card = intent.diagnostic.card;
+                if self.terminal_transcript_intent(card).as_ref() != Some(&intent) {
+                    return Task::none();
+                }
                 if self
                     .terminal_failure
                     .probes
@@ -653,9 +743,11 @@ impl Cagents {
                 }
                 probe.pending = true;
                 probe.operation = uuid::Uuid::new_v4();
+                probe.activation = Some(intent.diagnostic.clone());
                 let operation = probe.operation;
                 let session = probe.session.clone();
                 let saved_context = probe.saved_context.clone();
+                let owner = intent.diagnostic;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         fresh_transcript(
@@ -669,6 +761,7 @@ impl Cagents {
                     Message::TerminalFailure(Action::Prepared {
                         card,
                         operation,
+                        owner,
                         result,
                     })
                 })
@@ -676,9 +769,13 @@ impl Cagents {
             Action::Prepared {
                 card,
                 operation,
+                owner,
                 result,
             } => {
-                if !self.probe_current(card, operation) {
+                if owner.card != card
+                    || !self.diagnostic_intent_is_current(&owner)
+                    || !self.probe_current(card, operation)
+                {
                     return Task::none();
                 }
                 match result {
@@ -695,6 +792,7 @@ impl Cagents {
                             Message::TerminalFailure(Action::Revealed {
                                 card,
                                 operation,
+                                owner,
                                 result: transcript.reveal().await,
                             })
                         })
@@ -702,6 +800,7 @@ impl Cagents {
                     Err(error) => self.update_terminal_failure(Action::Revealed {
                         card,
                         operation,
+                        owner,
                         result: Err(error),
                     }),
                 }
@@ -709,10 +808,14 @@ impl Cagents {
             Action::Revealed {
                 card,
                 operation,
+                owner,
                 result,
             } => {
                 let mut retry = Task::none();
-                if self.probe_current(card, operation) {
+                if owner.card == card
+                    && self.diagnostic_intent_is_current(&owner)
+                    && self.probe_current(card, operation)
+                {
                     if let Some(probe) = self.terminal_failure.probes.get_mut(&card) {
                         if result.is_err() {
                             if let Some(at) = probe.unavailable(false, Instant::now()) {
@@ -776,6 +879,461 @@ mod tests {
             Instant::now(),
         );
         (app, card, session)
+    }
+
+    fn ready_diagnostic_probe(app: &mut Cagents, card: CardId) {
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+            unreachable!()
+        };
+        let session = session.clone();
+        app.terminal_failure.probes.insert(
+            card,
+            Probe {
+                operation: uuid::Uuid::new_v4(),
+                session,
+                saved_context: None,
+                activation: None,
+                available: true,
+                pending: false,
+                retry_at: Instant::now(),
+                failures: 0,
+            },
+        );
+    }
+
+    fn replace_diagnostic_source(app: &mut Cagents, card: CardId, scenario: u8) {
+        if scenario == 0 {
+            return;
+        }
+        if matches!(scenario, 4 | 5) {
+            let mut details = app.terminal_details(card).unwrap();
+            if scenario == 4 {
+                details.code = "runtime_failed";
+                details.message = "The terminal connection is unavailable.";
+            } else {
+                details.worktree = Some(crate::model::WorktreeId::new());
+            }
+            app.cards.insert(
+                card,
+                CardRuntime::Failed(Failure::Terminal(Box::new(details))),
+            );
+            if scenario == 4 {
+                ready_diagnostic_probe(app, card);
+            }
+            return;
+        }
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        match scenario {
+            1 => session.id = TerminalId::new(),
+            2 => session.launch.arguments.push("different recipe".into()),
+            3 => {
+                session.continuity = TerminalContinuity::Live {
+                    host_session_id: "replacement-session".into(),
+                    boot_id: "replacement-boot".into(),
+                    host_incarnation: "replacement-incarnation".into(),
+                }
+            }
+            _ => unreachable!(),
+        }
+        ready_diagnostic_probe(app, card);
+    }
+
+    fn diagnostic_clipboard_text(task: Task<Message>) -> String {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Clipboard(
+                            iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) = effect
+                        {
+                            return contents;
+                        }
+                    }
+                    panic!("Copy must publish current bounded diagnostics");
+                })
+                .await
+                .unwrap()
+            })
+    }
+
+    #[test]
+    fn diagnostic_native_press_and_fresh_click_keep_their_original_source() {
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+
+        fn bounds(
+            tree: &iced_accessibility::A11yTree,
+            name: &str,
+            size: iced::Size,
+        ) -> iced::Rectangle {
+            let nodes: Vec<_> = tree
+                .root()
+                .iter()
+                .chain(tree.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(name)
+                        && !node.node().is_hidden()
+                        && !node.node().is_disabled()
+                })
+                .filter_map(|node| node.node().bounds())
+                .collect();
+            assert_eq!(nodes.len(), 1, "one actual diagnostic button: {name}");
+            let rect = nodes[0];
+            assert!(
+                rect.x0 >= 0.0
+                    && rect.y0 >= 0.0
+                    && rect.x1 > rect.x0
+                    && rect.y1 > rect.y0
+                    && rect.x1 <= f64::from(size.width)
+                    && rect.y1 <= f64::from(size.height),
+                "diagnostic button must remain inside the viewport: {name}"
+            );
+            iced::Rectangle {
+                x: rect.x0 as f32,
+                y: rect.y0 as f32,
+                width: (rect.x1 - rect.x0) as f32,
+                height: (rect.y1 - rect.y0) as f32,
+            }
+        }
+
+        for (copy, width) in [(false, 320.0), (false, 600.0), (true, 320.0), (true, 600.0)] {
+            for scenario in 0..6 {
+                let (mut app, card, _) = app_and_session();
+                ready_diagnostic_probe(&mut app, card);
+                let mut renderer = super::super::tests::headless_renderer();
+                let size = iced::Size::new(width, 100.0);
+                let name = if copy {
+                    "Copy details"
+                } else {
+                    "Open transcript folder"
+                };
+                let mut ui = UserInterface::build(
+                    app.terminal_diagnostic_controls(card),
+                    size,
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let pointer =
+                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name, size).center();
+                let mut messages = Vec::new();
+                ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    ))],
+                    iced::mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(messages.is_empty());
+                let cache = ui.into_cache();
+                replace_diagnostic_source(&mut app, card, scenario);
+                let mut ui = UserInterface::build(
+                    app.terminal_diagnostic_controls(card),
+                    size,
+                    cache,
+                    &mut renderer,
+                );
+                let pointer =
+                    bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), name, size).center();
+                ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    ))],
+                    iced::mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                if matches!(scenario, 0 | 5) {
+                    assert_eq!(messages.len(), 1, "unchanged owner keeps its native press");
+                } else {
+                    assert!(
+                        messages.is_empty(),
+                        "held diagnostic press retargeted, copy={copy}, scenario={scenario}"
+                    );
+                    let released = ui.into_cache();
+                    let mut ui = UserInterface::build(
+                        app.terminal_diagnostic_controls(card),
+                        size,
+                        released,
+                        &mut renderer,
+                    );
+                    for event in [
+                        iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                        iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                    ] {
+                        ui.update(
+                            &[iced::Event::Mouse(event)],
+                            iced::mouse::Cursor::Available(pointer),
+                            &mut renderer,
+                            &mut clipboard::Null,
+                            &mut messages,
+                        );
+                    }
+                    assert_eq!(messages.len(), 1, "replacement accepts a fresh click");
+                }
+                assert!(match messages.pop().unwrap() {
+                    Message::TerminalFailure(Action::Copy(owner)) if copy => {
+                        assert!(app.diagnostic_intent_is_current(&owner));
+                        let expected = app.terminal_details(card).unwrap().copy_text();
+                        let copied = diagnostic_clipboard_text(
+                            app.update_terminal_failure(Action::Copy(owner)),
+                        );
+                        assert_eq!(
+                            copied, expected,
+                            "same-incident enrichment copies current fields"
+                        );
+                        true
+                    }
+                    Message::TerminalFailure(Action::Reveal(owner)) if !copy =>
+                        app.terminal_transcript_intent(card).as_ref() == Some(&owner),
+                    _ => false,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn queued_diagnostics_and_late_reveal_results_cannot_follow_replaced_evidence() {
+        for scenario in 1..5 {
+            let (mut app, card, _) = app_and_session();
+            ready_diagnostic_probe(&mut app, card);
+            let old_copy = app.terminal_diagnostic_intent(card).unwrap();
+            let old_reveal = app.terminal_transcript_intent(card).unwrap();
+            let mut redacted = old_copy.clone();
+            redacted
+                .session
+                .launch
+                .environment
+                .insert("TOKEN".into(), "PRIVATE_INTENT_EVIDENCE".into());
+            assert!(!format!("{:?}", Action::Copy(redacted)).contains("PRIVATE_INTENT_EVIDENCE"));
+            replace_diagnostic_source(&mut app, card, scenario);
+            let operation = app.terminal_failure.probes[&card].operation;
+            assert!(
+                iced::runtime::task::into_stream(
+                    app.update_terminal_failure(Action::Copy(old_copy.clone()))
+                )
+                .is_none()
+            );
+            assert!(
+                iced::runtime::task::into_stream(
+                    app.update_terminal_failure(Action::Reveal(old_reveal))
+                )
+                .is_none()
+            );
+            assert_eq!(app.terminal_failure.probes[&card].operation, operation);
+            assert!(!app.terminal_failure.probes[&card].pending);
+            let expected = app.terminal_details(card).unwrap().copy_text();
+            let owner = app.terminal_diagnostic_intent(card).unwrap();
+            let copy = app.update_terminal_failure(Action::Copy(owner.clone()));
+            let contents = diagnostic_clipboard_text(copy);
+            assert_eq!(contents, expected);
+            // Construct, then drop the genuine preparation task: no host or
+            // file manager is contacted by this ownership regression.
+            drop(app.reveal_terminal_transcript(card));
+            let operation = app.terminal_failure.probes[&card].operation;
+            assert!(app.terminal_failure.probes[&card].pending);
+            for prepared in [false, true] {
+                let action = if prepared {
+                    Action::Prepared {
+                        card,
+                        operation,
+                        owner: old_copy.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                } else {
+                    Action::Revealed {
+                        card,
+                        operation,
+                        owner: old_copy.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                };
+                assert!(
+                    iced::runtime::task::into_stream(app.update_terminal_failure(action)).is_none()
+                );
+                assert!(app.terminal_failure.probes[&card].pending);
+                assert!(app.status.is_none());
+            }
+            drop(app.update_terminal_failure(Action::Prepared {
+                card,
+                operation,
+                owner,
+                result: Err(transcript_location::Unavailable::Changed),
+            }));
+            assert!(!app.terminal_failure.probes[&card].pending);
+            assert!(
+                app.status.is_some(),
+                "current preparation failure still settles"
+            );
+        }
+        let (mut app, card, _) = app_and_session();
+        app.workspace.resize_viewport(1200.0);
+        ready_diagnostic_probe(&mut app, card);
+        drop(app.reveal_terminal_transcript(card));
+        let operation = app.terminal_failure.probes[&card].operation;
+        app.terminal_failure.probes.get_mut(&card).unwrap().failures = 4;
+        // A changed incident must retire an old in-flight activation even
+        // when the terminal descriptor itself stays the same. Otherwise the
+        // rejected completion would leave this probe pending forever.
+        let mut details = app.terminal_details(card).unwrap();
+        details.code = "runtime_failed";
+        app.cards.insert(
+            card,
+            CardRuntime::Failed(Failure::Terminal(Box::new(details))),
+        );
+        drop(app.terminal_transcript_probes());
+        let probe = &app.terminal_failure.probes[&card];
+        assert_ne!(probe.operation, operation);
+        assert!(probe.activation.is_none());
+        assert_eq!(probe.failures, 0, "a new incident starts a fresh backoff");
+    }
+
+    #[test]
+    fn stale_diagnostic_errors_cannot_change_current_retry_deadline_or_arm_a_timer() {
+        for scenario in 1..5 {
+            let (mut app, card, _) = app_and_session();
+            ready_diagnostic_probe(&mut app, card);
+            let old_owner = app.terminal_diagnostic_intent(card).unwrap();
+            // Admit the original action, without polling any host/file-manager work.
+            drop(app.reveal_terminal_transcript(card));
+            replace_diagnostic_source(&mut app, card, scenario);
+            let current_owner = app.terminal_diagnostic_intent(card).unwrap();
+            drop(app.reveal_terminal_transcript(card));
+            let probe = app.terminal_failure.probes.get_mut(&card).unwrap();
+            probe.failures = 2;
+            probe.retry_at = Instant::now() + Duration::from_secs(80);
+            let expected = (
+                probe.operation,
+                probe.available,
+                probe.pending,
+                probe.retry_at,
+                probe.failures,
+            );
+            armed();
+            for prepared in [false, true] {
+                // Deliberately use the *current* operation. Only the original
+                // diagnostic source can reject this stale completion.
+                let action = if prepared {
+                    Action::Prepared {
+                        card,
+                        operation: expected.0,
+                        owner: old_owner.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                } else {
+                    Action::Revealed {
+                        card,
+                        operation: expected.0,
+                        owner: old_owner.clone(),
+                        result: Err(transcript_location::Unavailable::Changed),
+                    }
+                };
+                assert_eq!(app.update_terminal_failure(action).units(), 0);
+                let probe = &app.terminal_failure.probes[&card];
+                assert_eq!(
+                    (
+                        probe.operation,
+                        probe.available,
+                        probe.pending,
+                        probe.retry_at,
+                        probe.failures,
+                    ),
+                    expected,
+                    "an old incident must not consume the current retry budget"
+                );
+                assert_eq!(probe.activation.as_ref(), Some(&current_owner));
+                assert!(app.status.is_none());
+                assert!(armed().is_empty());
+            }
+            let before = Instant::now();
+            assert_eq!(
+                app.update_terminal_failure(Action::Prepared {
+                    card,
+                    operation: expected.0,
+                    owner: current_owner,
+                    result: Err(transcript_location::Unavailable::Changed),
+                })
+                .units(),
+                1,
+                "a current error still returns its retry task"
+            );
+            let probe = &app.terminal_failure.probes[&card];
+            assert_eq!(probe.failures, 3);
+            assert!(!probe.pending && !probe.available);
+            assert!(probe.retry_at >= before + Duration::from_secs(40));
+            assert_eq!(armed(), vec![probe.retry_at]);
+            assert!(app.status.is_some());
+        }
+    }
+
+    #[test]
+    fn a_retired_incidents_retry_wake_respects_the_current_deadline_and_pending_probe() {
+        let (mut app, card, original) = app_and_session();
+        app.cards.insert(card, CardRuntime::Completed);
+        let _ = app.workspace.resize_viewport(1200.0);
+        let operation = probing(&mut app, card, &original);
+        armed();
+        drop(app.update_terminal_failure(Action::Probed {
+            card,
+            operation,
+            available: false,
+        }));
+        assert_eq!(armed().len(), 1, "the retired owner really armed a wake");
+        replace_diagnostic_source(&mut app, card, 1);
+        let CardKind::Terminal(current) = &app.card_state(card).unwrap().kind else {
+            unreachable!()
+        };
+        let current = current.clone();
+        // Put the replacement at the published policy's last backoff step
+        // through actual reducer replies, without polling transcript I/O.
+        for _ in 0..6 {
+            let operation = probing(&mut app, card, &current);
+            drop(app.update_terminal_failure(Action::Probed {
+                card,
+                operation,
+                available: false,
+            }));
+        }
+        armed();
+        let probe = &app.terminal_failure.probes[&card];
+        let expected = (probe.operation, probe.retry_at, probe.failures);
+        assert_eq!(probe.failures, 6);
+        assert!(Instant::now() < probe.retry_at);
+        // Deliver the real App action an old timer would publish. It has no
+        // authority to advance the replacement's still-future deadline.
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!((probe.operation, probe.retry_at, probe.failures), expected);
+        assert!(!probe.pending && !probe.available);
+        assert_eq!(probe.session, current);
+        assert!(armed().is_empty());
+        app.terminal_failure.probes.get_mut(&card).unwrap().retry_at = Instant::now();
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        let current_operation = probe.operation;
+        assert_ne!(current_operation, expected.0, "a due current probe starts");
+        assert!(probe.pending);
+        assert_eq!(probe.failures, 6);
+        assert_eq!(probe.session, current);
+        assert!(probe.activation.is_none());
+        // A coincident retired wake cannot start a second pending probe.
+        drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
+        let probe = &app.terminal_failure.probes[&card];
+        assert_eq!(probe.operation, current_operation);
+        assert!(probe.pending);
+        assert_eq!(probe.failures, 6);
+        assert!(armed().is_empty());
     }
     #[test]
     fn diagnostics_copy_uses_known_fields_and_never_raw_errors_or_launch_secrets() {
@@ -1077,19 +1635,22 @@ mod tests {
                 operation: old,
                 session,
                 saved_context: None,
+                activation: None,
                 available: true,
                 pending: false,
                 retry_at: Instant::now(),
                 failures: 0,
             },
         );
-        drop(app.update_terminal_failure(Action::Reveal(card)));
+        let owner = app.terminal_diagnostic_intent(card).unwrap();
+        drop(app.reveal_terminal_transcript(card));
         let current = app.terminal_failure.probes[&card].operation;
         assert_ne!(old, current);
         assert!(app.terminal_failure.probes[&card].pending);
         drop(app.update_terminal_failure(Action::Revealed {
             card,
             operation: old,
+            owner,
             result: Err(transcript_location::Unavailable::Changed),
         }));
         assert!(app.terminal_failure.probes[&card].pending);
@@ -1105,6 +1666,7 @@ mod tests {
                 operation,
                 session,
                 saved_context: None,
+                activation: None,
                 available: false,
                 pending: true,
                 retry_at: Instant::now(),
@@ -1150,6 +1712,7 @@ mod tests {
                 operation,
                 session: session.clone(),
                 saved_context: None,
+                activation: None,
                 available: false,
                 pending: true,
                 retry_at: Instant::now(),
@@ -1224,6 +1787,7 @@ mod tests {
             operation: uuid::Uuid::new_v4(),
             session,
             saved_context: None,
+            activation: None,
             available: false,
             pending: true,
             retry_at: now,
@@ -1259,10 +1823,12 @@ mod tests {
         let (mut app, card, session) = app_and_session();
         armed();
         let operation = probing(&mut app, card, &session);
+        let owner = app.terminal_diagnostic_intent(card).unwrap();
         assert_eq!(
             app.update_terminal_failure(Action::Revealed {
                 card,
                 operation,
+                owner,
                 result: Err(transcript_location::Unavailable::Changed),
             })
             .units(),
