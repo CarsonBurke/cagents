@@ -838,6 +838,12 @@ impl Codex {
                 step.events
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
+            if turn["error"].is_object() {
+                step.events.push(Event::Item(turn_error_item(
+                    id,
+                    error_message(&turn["error"]),
+                )));
+            }
             if let Some(message) = turn["error"]["message"].as_str() {
                 step.events.push(Event::Error {
                     message: message.into(),
@@ -1294,6 +1300,9 @@ impl Codex {
                     }
                     items.push(item);
                 }
+            }
+            if turn["error"].is_object() {
+                items.push(turn_error_item(turn_id, error_message(&turn["error"])));
             }
         }
         if !earlier {
@@ -2935,11 +2944,11 @@ impl Adapter for Codex {
                     });
                 }
                 if turn["error"].is_object() {
+                    let message = error_message(&turn["error"]);
+                    step.events
+                        .push(Event::Item(turn_error_item(turn_id, message.clone())));
                     step.events.push(Event::Error {
-                        message: turn["error"]["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| turn["error"].to_string()),
+                        message,
                         fatal: false,
                     });
                 }
@@ -3163,10 +3172,7 @@ impl Adapter for Codex {
                 });
             }
             "error" => {
-                let message = params["error"]["message"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| params["error"].to_string());
+                let message = error_message(&params["error"]);
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
@@ -3176,6 +3182,10 @@ impl Adapter for Codex {
                     }
                     step.events.push(notice);
                 } else {
+                    if let Some(turn) = params["turnId"].as_str().filter(|turn| !turn.is_empty()) {
+                        step.events
+                            .push(Event::Item(turn_error_item(turn, message.clone())));
+                    }
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
@@ -3252,6 +3262,35 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
+}
+
+fn error_message(error: &Value) -> String {
+    error["message"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// A turn has one terminal error field. Live failure, completion and history
+/// must name that same incident without moving it behind later work. Hash the
+/// provider's original turn ID to keep the cache identity bounded; unlike
+/// provider item keys this namespace contains no slash. The text is not an ID.
+fn turn_error_item(turn: &str, message: String) -> Item {
+    use sha2::{Digest, Sha256};
+
+    let mut item = Item {
+        id: format!("codex-turn-error:{:x}", Sha256::digest(turn.as_bytes())),
+        role: Role::System,
+        content: ItemContent::Text {
+            text: message,
+            thinking: false,
+            phase: Phase::Commentary,
+        },
+        started_at: None,
+        at: None,
+    };
+    chat::failure::mark_provider_error(crate::agent::Provider::Codex, &mut item);
+    item
 }
 
 /// Advisory provider messages belong to the transcript, at their arrival
@@ -5941,10 +5980,22 @@ mod tests {
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
-            assert!(matches!(
-                adapter.receive(failed).unwrap().events.as_slice(),
-                [Event::Error { fatal: false, .. }]
-            ));
+            let failed = adapter.receive(failed).unwrap();
+            let [
+                Event::Item(item),
+                Event::Error {
+                    message,
+                    fatal: false,
+                },
+            ] = failed.events.as_slice()
+            else {
+                panic!("a terminal error retains both history and live behavior");
+            };
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, item),
+                Some(message.as_str())
+            );
+            assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
         }
         let mut foreign = frame;
         foreign["params"]["threadId"] = json!("another-thread");
@@ -6989,6 +7040,13 @@ mod tests {
             assert_eq!(final_step.events.iter().filter(|event| matches!(event,
                 Event::Item(Item { content: ItemContent::Text { text, .. }, .. }) if text == "Partial answer"
             )).count(), 1, "{:?}", final_step.events);
+            assert_eq!(
+                final_step.events.iter().filter(|event| matches!(event,
+                    Event::Item(item) if chat::failure::provider_error_text(Provider::Codex, item) == Some("Exact failure")
+                )).count(),
+                1,
+                "{:?}", final_step.events
+            );
             assert_eq!(
                 final_step
                     .events

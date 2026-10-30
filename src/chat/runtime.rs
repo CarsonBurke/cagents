@@ -3761,6 +3761,301 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    fn codex_incident_history(
+        turns: Vec<Value>,
+    ) -> (tempfile::TempDir, Box<dyn Adapter>, Vec<Event>) {
+        let directory = tempfile::tempdir().unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("incident-thread".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().to_owned(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Construct the owned-listener spec only: no socket or process starts.
+        let (_, mut adapter) = super::super::protocol::codex::create_with_listener(
+            &launch,
+            "/tmp/cagents-incident-fixture.sock".into(),
+        )
+        .unwrap();
+        let initialize = adapter.initialize().unwrap();
+        let initialized = adapter
+            .receive(json!({"id":initialize.writes[0]["id"],"result":{
+                "codexHome":directory.path(),"userAgent":"incident-history-fixture"
+            }}))
+            .unwrap();
+        let request = |method| {
+            initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == method)
+                .unwrap()["id"]
+                .clone()
+        };
+        let mut events = adapter
+            .receive(json!({"id":request("thread/resume"),"result":{
+                "thread":{"id":"incident-thread","status":{"type":"idle"},"canAcceptDirectInput":true},
+                "initialTurnsPage":{"data":turns,"nextCursor":null}
+            }}))
+            .unwrap()
+            .events;
+        events.extend(
+            adapter
+                .receive(json!({"id":request("skills/list"),"result":{"data":[]}}))
+                .unwrap()
+                .events,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Ready(true)))
+        );
+        (directory, adapter, events)
+    }
+
+    fn apply_codex_incident_events(
+        store: &mut Store,
+        state: &mut Snapshot,
+        indices: &mut BTreeMap<String, usize>,
+        history_error: &mut Option<String>,
+        events: Vec<Event>,
+    ) {
+        for event in events {
+            for event in store.apply(event).unwrap() {
+                recover_history_error(&mut state.error, history_error, &event);
+                apply_event(state, indices, event);
+            }
+        }
+        state.items = store.window().unwrap().items;
+    }
+
+    #[test]
+    fn codex_turn_failures_survive_new_work_and_fresh_provider_history_without_duplicates() {
+        let (_home, mut adapter, initial) = codex_incident_history(Vec::new());
+        let mut store = Store::new().unwrap();
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut history_error = None;
+        apply_codex_incident_events(
+            &mut store,
+            &mut state,
+            &mut indices,
+            &mut history_error,
+            initial,
+        );
+        let raw = format!(
+            "You've hit your limit · resets 1:30pm\n{}",
+            "original provider diagnostics\n".repeat(3_000)
+        );
+        assert!(
+            raw.len() > 64 * 1024,
+            "diagnostics exceed the identity budget"
+        );
+        assert!(raw.len() < 128 * 1024, "one displayed part per incident");
+        let mut failed_turns = Vec::new();
+        let mut original_ids = Vec::new();
+        for turn in ["first-failure", "second-failure"] {
+            let user =
+                json!({"id":"prompt","type":"userMessage","content":[{"type":"text","text":turn}]});
+            let started = adapter.receive(json!({"method":"turn/started","params":{
+                "threadId":"incident-thread","turn":{"id":turn,"status":"inProgress","items":[user.clone()]}
+            }})).unwrap();
+            apply_codex_incident_events(
+                &mut store,
+                &mut state,
+                &mut indices,
+                &mut history_error,
+                started.events,
+            );
+            let failure = json!({"method":"error","params":{
+                "threadId":"incident-thread","turnId":turn,"willRetry":false,"error":{"message":&raw}
+            }});
+            for _ in 0..2 {
+                let failed = adapter.receive(failure.clone()).unwrap();
+                assert!(failed.events.iter().any(|event| matches!(event,
+                    Event::Error { message, fatal: false } if message == &raw
+                )));
+                apply_codex_incident_events(
+                    &mut store,
+                    &mut state,
+                    &mut indices,
+                    &mut history_error,
+                    failed.events,
+                );
+            }
+            assert_eq!(state.error.as_deref(), Some(raw.as_str()));
+            let failed_turn =
+                json!({"id":turn,"status":"failed","items":[user],"error":{"message":&raw}});
+            let completed = adapter
+                .receive(json!({"method":"turn/completed","params":{
+                    "threadId":"incident-thread","turn":failed_turn.clone()
+                }}))
+                .unwrap();
+            apply_codex_incident_events(
+                &mut store,
+                &mut state,
+                &mut indices,
+                &mut history_error,
+                completed.events,
+            );
+            let failures: Vec<_> = state
+                .items
+                .iter()
+                .filter(|item| {
+                    super::super::failure::provider_error_text(crate::agent::Provider::Codex, item)
+                        == Some(raw.as_str())
+                })
+                .collect();
+            assert_eq!(failures.len(), failed_turns.len() + 1);
+            original_ids.push(failures.last().unwrap().id.clone());
+            failed_turns.push(failed_turn);
+        }
+        assert_ne!(
+            original_ids[0], original_ids[1],
+            "same text on another turn is another incident"
+        );
+
+        let next_user =
+            json!({"id":"prompt","type":"userMessage","content":[{"type":"text","text":"."}]});
+        let next_turn = json!({"id":"follow-up","status":"completed","items":[
+            next_user.clone(),
+            {"id":"answer","type":"agentMessage","text":"Continuing with retained work"},
+            {"id":"tool","type":"commandExecution","command":"printf next","cwd":"/fixture","status":"completed","aggregatedOutput":"next","exitCode":0}
+        ]});
+        for frame in [
+            json!({"method":"turn/started","params":{"threadId":"incident-thread","turn":{"id":"follow-up","status":"inProgress","items":[next_user]}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"incident-thread","turnId":"follow-up","itemId":"answer","delta":"Continuing with retained work"}}),
+            json!({"method":"item/started","params":{"threadId":"incident-thread","turnId":"follow-up","item":{"id":"tool","type":"commandExecution","command":"printf next","cwd":"/fixture","status":"inProgress"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"incident-thread","turn":next_turn.clone()}}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            apply_codex_incident_events(
+                &mut store,
+                &mut state,
+                &mut indices,
+                &mut history_error,
+                step.events,
+            );
+        }
+        assert!(state.error.is_none(), "new work clears only the live error");
+        let live_ids: Vec<_> = state.items.iter().map(|item| item.id.clone()).collect();
+        let dot = state
+            .items
+            .iter()
+            .position(|item| {
+                matches!(&item.content,
+                    ItemContent::Text { text, .. } if item.role == Role::User && text == "."
+                )
+            })
+            .unwrap();
+        for id in &original_ids {
+            let position = state.items.iter().position(|item| &item.id == id).unwrap();
+            assert!(position < dot, "an old incident stays before later work");
+        }
+
+        // A new decoder and Store use only the provider's persisted turns,
+        // never copies of resident error Items or a manufactured snapshot.
+        let mut history = vec![next_turn];
+        history.extend(failed_turns.into_iter().rev());
+        let (_cold_home, _cold_adapter, replay) = codex_incident_history(history);
+        let mut cold = Store::new().unwrap();
+        let mut cold_state = Snapshot::default();
+        let mut cold_indices = BTreeMap::new();
+        let mut cold_history_error = None;
+        apply_codex_incident_events(
+            &mut cold,
+            &mut cold_state,
+            &mut cold_indices,
+            &mut cold_history_error,
+            replay.clone(),
+        );
+        assert!(
+            cold_state.error.is_none(),
+            "history is not a new live failure"
+        );
+        assert_eq!(
+            cold_state
+                .items
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            live_ids.iter().collect::<Vec<_>>()
+        );
+        let failures: Vec<_> = cold_state
+            .items
+            .iter()
+            .filter_map(|item| {
+                super::super::failure::provider_error_text(crate::agent::Provider::Codex, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        assert_eq!(
+            failures,
+            [
+                (original_ids[0].as_str(), raw.as_str()),
+                (original_ids[1].as_str(), raw.as_str())
+            ]
+        );
+        apply_codex_incident_events(
+            &mut store,
+            &mut state,
+            &mut indices,
+            &mut history_error,
+            replay,
+        );
+        assert_eq!(
+            state.items.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            live_ids.iter().collect::<Vec<_>>(),
+            "history cannot append a second carrier or move the original"
+        );
+    }
+
+    #[test]
+    fn codex_retries_stay_advisory_and_unbound_failures_do_not_claim_turn_history() {
+        let (_home, mut adapter, _) = codex_incident_history(Vec::new());
+        for turn in [Value::Null, json!("")] {
+            let step = adapter.receive(json!({"method":"error","params":{
+                "threadId":"incident-thread","turnId":turn,"willRetry":false,"error":{"message":"unbound failure"}
+            }})).unwrap();
+            assert!(
+                matches!(step.events.as_slice(), [Event::Error { message, fatal: false }] if message == "unbound failure")
+            );
+        }
+        let retry = adapter.receive(json!({"method":"error","params":{
+            "threadId":"incident-thread","turnId":"retrying-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}
+        }})).unwrap();
+        assert!(matches!(retry.events.as_slice(), [Event::Item(item)] if
+            super::super::failure::provider_error_text(crate::agent::Provider::Codex, item) == Some("Reconnecting... 1/2")
+        ));
+        let request = adapter
+            .command(Command::Prompt {
+                text: "not accepted yet".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let rejected = adapter
+            .receive(json!({"id":request.writes[0]["id"],"error":{"message":"RPC-only failure"}}))
+            .unwrap();
+        assert!(rejected.events.iter().any(|event| matches!(event,
+            Event::Error { message, fatal: false } if message == "Codex RPC error: RPC-only failure"
+        )));
+        assert!(
+            !rejected
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_))),
+            "no provider turn exists to reconstruct this RPC error"
+        );
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
