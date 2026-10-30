@@ -1692,7 +1692,56 @@ mod tests {
         // Exercise the real row beneath a real scrolling ancestor. Layout
         // children already carry the mounted origin; only the scrollable's
         // inherited translation should adjust the tooltip's screen anchor.
-        fn tooltip_surface(node: &layout::Node, viewport: iced::Size) -> iced::Rectangle {
+        use iced::advanced::widget::{Operation, operation};
+        fn observed_scroll(
+            element: &mut Element<'_, ReviewAction>,
+            node: &layout::Node,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            id: &cosmic::widget::Id,
+            context: &str,
+        ) -> (iced::Rectangle, iced::Rectangle, iced::Vector) {
+            struct Observe {
+                id: cosmic::widget::Id,
+                samples: Vec<(iced::Rectangle, iced::Rectangle, iced::Vector)>,
+            }
+            impl Operation for Observe {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&cosmic::widget::Id>,
+                    bounds: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    _: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.samples.push((bounds, content, translation));
+                    }
+                }
+            }
+            let mut observation = Observe {
+                id: id.clone(),
+                samples: Vec::new(),
+            };
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), renderer, &mut observation);
+            assert_eq!(
+                observation.samples.len(),
+                1,
+                "one matching actual Scrollable; {context}; samples={:?}",
+                observation.samples
+            );
+            observation.samples[0]
+        }
+        fn tooltip_surface(
+            node: &layout::Node,
+            viewport: iced::Size,
+            context: &str,
+        ) -> iced::Rectangle {
             fn collect(
                 layout: Layout<'_>,
                 viewport: iced::Size,
@@ -1710,13 +1759,17 @@ mod tests {
             }
             let mut surfaces = Vec::new();
             collect(Layout::new(node), viewport, &mut surfaces);
-            assert_eq!(surfaces.len(), 1, "one actual discussion tooltip surface");
+            assert_eq!(
+                surfaces.len(),
+                1,
+                "one actual discussion tooltip surface; {context}; surfaces={surfaces:?}"
+            );
             surfaces[0]
         }
-        let close = |actual: f32, expected: f32| {
+        let close = |actual: f32, expected: f32, context: &str| {
             assert!(
                 (actual - expected).abs() < 0.01,
-                "actual {actual} must match expected {expected}"
+                "actual {actual} must match expected {expected}; {context}"
             );
         };
         for (width, size) in [
@@ -1751,7 +1804,12 @@ mod tests {
                     &renderer,
                     &layout::Limits::new(iced::Size::ZERO, size),
                 );
-                let mut previous: Option<(iced::Rectangle, iced::Rectangle)> = None;
+                let mut previous: Option<(
+                    iced::Point,
+                    iced::Vector,
+                    iced::Rectangle,
+                    iced::Rectangle,
+                )> = None;
                 for (index, (origin, scroll_y, movement)) in [
                     (iced::Point::new(40.0, 80.0), 0.0, None),
                     (
@@ -1783,11 +1841,28 @@ mod tests {
                             },
                         ),
                     );
+                    let pose_context = format!(
+                        "width={width} viewport={size:?} modal_open={modal_open} pose={index} origin={origin:?} requested_scroll={scroll_y}"
+                    );
+                    // scroll_to's operation sees the old translation. Observe
+                    // the actual clamped state in a separate public operation.
+                    let scroll = observed_scroll(
+                        &mut element,
+                        &node,
+                        &mut tree,
+                        &renderer,
+                        &scroll_id,
+                        &pose_context,
+                    );
+                    let (scroll_bounds, _, translation) = scroll;
+                    close(translation.x, 0.0, &pose_context);
+                    close(translation.y, scroll_y, &pose_context);
                     let original = record(&element, &node, &tree);
                     for label in ["2 · 1 open", "Review file.rs", "Mark viewed"] {
                         assert_eq!(
                             original.iter().filter(|child| child.label == label).count(),
-                            1
+                            1,
+                            "{pose_context}; actual_scroll={translation:?}"
                         );
                     }
                     let count = original
@@ -1801,24 +1876,53 @@ mod tests {
                         assert!(control.click && control.focus);
                         assert_eq!(control.disabled, modal_open);
                     }
-                    let owner = iced::Rectangle::new(
+                    let raw_owner = iced::Rectangle::new(
                         iced::Point::new(count.bounds.x0 as f32, count.bounds.y0 as f32),
                         iced::Size::new(
                             (count.bounds.x1 - count.bounds.x0) as f32,
                             (count.bounds.y1 - count.bounds.y0) as f32,
                         ),
                     );
-                    assert!(owner.width > 0.0 && owner.height > 0.0);
-                    assert!(owner.x >= 0.0 && owner.y >= 0.0);
+                    // This pinned passive Text adapter reports raw layout
+                    // bounds despite Scrollable forwarding virtual_offset.
+                    // Normalize only the pointer/geometry oracle; keep the
+                    // original raw accessibility records unchanged below.
+                    let owner = raw_owner - translation;
+                    let point = owner.center();
+                    let context = format!(
+                        "{pose_context}; actual_scroll={translation:?} scroll_bounds={scroll_bounds:?} raw_owner={raw_owner:?} screen_owner={owner:?} screen_pointer={point:?}"
+                    );
+                    assert!(owner.width > 0.0 && owner.height > 0.0, "{context}");
+                    assert!(owner.x >= 0.0 && owner.y >= 0.0, "{context}");
                     assert!(
                         owner.x + owner.width <= size.width
-                            && owner.y + owner.height <= size.height
+                            && owner.y + owner.height <= size.height,
+                        "{context}"
                     );
-                    let point = owner.center();
+                    let review = original
+                        .iter()
+                        .find(|child| child.label == "Review file.rs")
+                        .unwrap();
+                    let review_bounds = iced::Rectangle::new(
+                        iced::Point::new(review.bounds.x0 as f32, review.bounds.y0 as f32),
+                        iced::Size::new(
+                            (review.bounds.x1 - review.bounds.x0) as f32,
+                            (review.bounds.y1 - review.bounds.y0) as f32,
+                        ),
+                    );
+                    for bounds in [review_bounds, scroll_bounds] {
+                        assert!(
+                            owner.x >= bounds.x
+                                && owner.y >= bounds.y
+                                && owner.x + owner.width <= bounds.x + bounds.width
+                                && owner.y + owner.height <= bounds.y + bounds.height,
+                            "screen count must be inside its visible row and Scrollable; {context}; containing_bounds={bounds:?}"
+                        );
+                    }
                     let cursor = iced::mouse::Cursor::Available(point);
                     let now = std::time::Instant::now();
                     let mut measured = None;
-                    for (event, open) in [
+                    for (dwell_phase, (event, open)) in [
                         (iced::Event::Window(iced::window::Event::Focused), false),
                         (
                             iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: point }),
@@ -1836,7 +1940,10 @@ mod tests {
                             )),
                             true,
                         ),
-                    ] {
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
                         assert!(
                             dispatch(
                                 &mut element,
@@ -1847,7 +1954,8 @@ mod tests {
                                 event,
                                 cursor
                             )
-                            .is_empty()
+                            .is_empty(),
+                            "tooltip hover must not dispatch actions; {context}; dwell_phase={dwell_phase}"
                         );
                         if open {
                             let mut overlay = element
@@ -1859,49 +1967,68 @@ mod tests {
                                     &viewport,
                                     iced::Vector::ZERO,
                                 )
-                                .expect("actual discussion tooltip after dwell");
+                                .unwrap_or_else(|| {
+                                    panic!("actual discussion tooltip after dwell; {context}; dwell_phase={dwell_phase}")
+                                });
                             let tip = tooltip_surface(
                                 &overlay.as_overlay_mut().layout(&renderer, size),
                                 size,
+                                &context,
                             );
-                            assert!(tip.width > 0.0 && tip.height > 0.0);
-                            assert!(tip.x >= 0.0 && tip.y >= 0.0);
+                            assert!(
+                                tip.width > 0.0 && tip.height > 0.0,
+                                "{context}; dwell_phase={dwell_phase}"
+                            );
+                            assert!(
+                                tip.x >= 0.0 && tip.y >= 0.0,
+                                "{context}; dwell_phase={dwell_phase}"
+                            );
                             assert!(
                                 tip.x + tip.width <= size.width
-                                    && tip.y + tip.height <= size.height
+                                    && tip.y + tip.height <= size.height,
+                                "{context}; dwell_phase={dwell_phase}"
                             );
                             close(
                                 tip.x,
                                 (owner.center_x() - tip.width / 2.0)
                                     .clamp(0.0, (size.width - tip.width).max(0.0)),
+                                &context,
                             );
                             close(
                                 tip.y,
                                 (owner.y - tip.height - crate::design::space::XS)
                                     .clamp(0.0, (size.height - tip.height).max(0.0)),
+                                &context,
                             );
                             if let Some(first) = measured {
-                                assert_eq!(tip, first);
+                                assert_eq!(tip, first, "{context}; dwell_phase={dwell_phase}");
                             }
                             measured = Some(tip);
                         }
-                        assert_eq!(record(&element, &node, &tree), original);
+                        assert_eq!(
+                            record(&element, &node, &tree),
+                            original,
+                            "raw children stay unchanged; {context}; dwell_phase={dwell_phase}"
+                        );
                     }
                     let tip = measured.unwrap();
-                    if let Some(movement) = movement {
-                        let (old_owner, old_tip) = previous.unwrap();
-                        close(owner.x - old_owner.x, movement.x);
-                        close(owner.y - old_owner.y, movement.y);
-                        close(tip.x - old_tip.x, movement.x);
-                        close(tip.y - old_tip.y, movement.y);
+                    if let Some(expected_movement) = movement {
+                        let (old_origin, old_translation, old_owner, old_tip) = previous.unwrap();
+                        let movement = (origin - old_origin) - (translation - old_translation);
+                        close(movement.x, expected_movement.x, &context);
+                        close(movement.y, expected_movement.y, &context);
+                        close(owner.x - old_owner.x, movement.x, &context);
+                        close(owner.y - old_owner.y, movement.y, &context);
+                        close(tip.x - old_tip.x, movement.x, &context);
+                        close(tip.y - old_tip.y, movement.y, &context);
                     }
                     if index == 3 {
-                        close(tip.x + tip.width, size.width);
+                        close(tip.x + tip.width, size.width, &context);
                     }
                     if index == 4 {
-                        close(tip.y, 0.0);
+                        close(tip.y, 0.0, &context);
                     }
-                    previous = Some((owner, tip));
+                    previous = Some((origin, translation, owner, tip));
                     element = view();
                     tree.diff(element.as_widget_mut());
                     node = element
@@ -1912,7 +2039,23 @@ mod tests {
                             &layout::Limits::new(iced::Size::ZERO, size),
                         )
                         .move_to(origin);
-                    assert_eq!(record(&element, &node, &tree), original);
+                    assert_eq!(
+                        observed_scroll(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &scroll_id,
+                            &context
+                        ),
+                        scroll,
+                        "real row rebuild retains actual scroll; {context}"
+                    );
+                    assert_eq!(
+                        record(&element, &node, &tree),
+                        original,
+                        "raw children survive real row rebuild; {context}"
+                    );
                     {
                         let mut overlay = element
                             .as_widget_mut()
@@ -1923,13 +2066,15 @@ mod tests {
                                 &viewport,
                                 iced::Vector::ZERO,
                             )
-                            .expect("retained discussion tooltip survives the real row rebuild");
+                            .unwrap_or_else(|| panic!("retained discussion tooltip survives the real row rebuild; {context}"));
                         assert_eq!(
                             tooltip_surface(
                                 &overlay.as_overlay_mut().layout(&renderer, size),
-                                size
+                                size,
+                                &context,
                             ),
-                            tip
+                            tip,
+                            "{context}"
                         );
                     }
                     for event in [
@@ -1948,7 +2093,8 @@ mod tests {
                                 event,
                                 iced::mouse::Cursor::Unavailable
                             )
-                            .is_empty()
+                            .is_empty(),
+                            "tooltip exit must not dispatch actions; {context}"
                         );
                     }
                     assert!(
@@ -1962,7 +2108,7 @@ mod tests {
                                 iced::Vector::ZERO,
                             )
                             .is_none(),
-                        "scrolling discussion tooltip closes after pointer exit"
+                        "scrolling discussion tooltip closes after pointer exit; {context}"
                     );
                 }
             }
