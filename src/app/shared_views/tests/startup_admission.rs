@@ -118,7 +118,28 @@ impl ScriptedDaemon {
         }))
     }
 
+    fn with_image_owner(session: Session) -> Self {
+        assert_eq!(session.proof, Some(scripted_proof()));
+        Self::with_attachment_capabilities(
+            Some(UpgradeScript {
+                source: session.clone(),
+                canonical: session,
+                refuse_lineage: false,
+            }),
+            false,
+            true,
+        )
+    }
+
     fn with_attachment(upgrade: Option<UpgradeScript>, refuse_attachment: bool) -> Self {
+        Self::with_attachment_capabilities(upgrade, refuse_attachment, false)
+    }
+
+    fn with_attachment_capabilities(
+        upgrade: Option<UpgradeScript>,
+        refuse_attachment: bool,
+        attachments: bool,
+    ) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
@@ -253,6 +274,10 @@ impl ScriptedDaemon {
                                             snapshot: crate::chat::Snapshot {
                                                 session_id: session.launch.session_id.clone(),
                                                 ready: true,
+                                                capabilities: crate::chat::Capabilities {
+                                                    attachments,
+                                                    ..Default::default()
+                                                },
                                                 ..Default::default()
                                             },
                                             session,
@@ -1064,6 +1089,361 @@ fn ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection() {
             "{invalid}"
         );
     }
+}
+
+#[test]
+fn mixed_scope_verified_retirement_preserves_runtime_only_managed_images() {
+    use crate::{
+        app::{
+            chat_ui::managed_image_retention_test_support as custody,
+            workspace_model_sync::ModelUpdate,
+        },
+        chat::{Attachment, attachment_assets},
+        session::SessionRuntime,
+    };
+    if isolated("mixed_scope_verified_retirement_preserves_runtime_only_managed_images") {
+        return;
+    }
+
+    fn assert_saved(
+        saved: &WorkspaceState,
+        healthy: &Pane,
+        rejected: &Pane,
+        image: &Attachment,
+        channel: ChannelId,
+    ) {
+        for pane in [healthy, rejected] {
+            let card = saved.cards.iter().find(|card| card.id == pane.id).unwrap();
+            assert_eq!(card.kind, pane.kind);
+            assert!(card.existence.is_open());
+        }
+        assert_eq!(saved.local_only_cards, HashSet::from([healthy.id]));
+        assert_eq!(
+            saved.quarantined_panes,
+            HashMap::from([(rejected.id, rejected.kind.clone())])
+        );
+        assert!(saved.chat_drafts.is_empty());
+        assert_eq!(
+            saved.chat_draft_attachments,
+            HashMap::from([(healthy.id, vec![image.clone()])])
+        );
+        assert!(!saved.pending_chat_admissions.contains_key(&healthy.id));
+        let CardKind::Chat(rejected_source) = &rejected.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            saved.pending_chat_admissions.get(&rejected.id),
+            Some(rejected_source)
+        );
+        assert_eq!(
+            saved
+                .channels
+                .iter()
+                .find(|entry| entry.id == channel)
+                .unwrap()
+                .cards,
+            vec![healthy.id, rejected.id]
+        );
+        attachment_assets::validate(&saved.chat_draft_attachments[&healthy.id][0]).unwrap();
+    }
+
+    attachment_assets::with_test_image(|image| {
+        for parked in [false, true] {
+            for closed_owner in [false, true] {
+                let (mut app, active, channel, mut healthy, identity) = cached_chat();
+                let healthy_source = current_owner(&mut healthy);
+                app.card_state_mut(healthy.id).unwrap().kind = healthy.kind.clone();
+                let rejected = sibling_chat(&healthy, "Unverified image-draft sibling");
+                install_held_pane(&mut app, channel, &rejected);
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.active_channel = Some(channel);
+                durable.focused = Some(healthy.id);
+                durable
+                    .channels
+                    .iter_mut()
+                    .find(|entry| entry.id == channel)
+                    .unwrap()
+                    .focused = Some(healthy.id);
+                app.workspace = Cagents::rebuild_workspace(&app.durable);
+                app.shared_views = State::for_workspace(&app.durable);
+                let daemon = ScriptedDaemon::with_image_owner(healthy_source.clone());
+                let startup = app.initialize_runtimes();
+                settle(&mut app, startup);
+                assert!(app.chat_awaiting_admission(healthy.id));
+                assert!(app.chat_awaiting_admission(rejected.id));
+                assert!(daemon.requests().is_empty());
+
+                let mut view = View::empty(channel);
+                view.revision = 7;
+                view.panes = vec![healthy.clone(), rejected.clone()];
+                let mut full = model(identity, active, channel, view);
+                full.sequence = 10;
+                let mut issuer = managed_owner(&healthy, channel);
+                let Some(crate::agent_execution::HostedSession::Chat(issued)) = &mut issuer.session
+                else {
+                    unreachable!()
+                };
+                // Canonical learned metadata and the original issued source
+                // remain separately bound throughout this managed retirement.
+                issued.launch.session_id = None;
+                let mut invalid = managed_owner(&rejected, channel);
+                let Some(crate::agent_execution::HostedSession::Chat(source)) =
+                    &mut invalid.session
+                else {
+                    unreachable!()
+                };
+                source.proof.as_mut().unwrap().host_incarnation = "unrelated-sibling-owner".into();
+                full.agents = vec![issuer, invalid];
+                let (tx, rx) = async_channel::unbounded();
+                app.workspace_model_tx = tx;
+                let ranked = app.apply_workspace_model_update(ModelUpdate::Ranked {
+                    channel,
+                    model: full.clone(),
+                });
+                settle(&mut app, ranked);
+                let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                let seeds = edits
+                    .iter()
+                    .filter_map(|edit| match edit {
+                        ModelEdit::SeedView {
+                            scope,
+                            panes,
+                            closed,
+                        } => Some((scope, panes, closed)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let healthy_seeds = seeds
+                    .iter()
+                    .filter(|(scope, _, _)| **scope == Scope::Channel(channel))
+                    .collect::<Vec<_>>();
+                assert_eq!(healthy_seeds.len(), 1, "one actual managed seed: {edits:?}");
+                assert_eq!(healthy_seeds[0].1, &vec![healthy.clone()]);
+                assert!(healthy_seeds[0].2.is_empty());
+                assert!(app.shared_views.seeding.contains(&Scope::Channel(channel)));
+                assert!(
+                    !app.shared_views
+                        .initialized
+                        .contains(&Scope::Channel(channel))
+                );
+                assert!(app.shared_views.pending.is_empty());
+                assert!(
+                    !edits
+                        .iter()
+                        .any(|edit| matches!(edit, ModelEdit::ChangeView { .. }))
+                );
+                assert!(!edits.iter().any(|edit| matches!(edit,
+                    ModelEdit::SeedView { panes, closed, .. }
+                        if panes.iter().any(|pane| pane.id == rejected.id) || closed.contains(&rejected.id)
+                )));
+                assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+                assert!(daemon.requests().is_empty());
+                // Acknowledge only the seeds actually emitted above. In
+                // particular, no early None ACK can manufacture an Insert.
+                for (scope, panes, closed) in seeds {
+                    assert!(closed.is_empty());
+                    if *scope != Scope::Channel(channel) {
+                        assert_eq!(*scope, Scope::Channel(active));
+                        assert!(panes.is_empty());
+                    }
+                    let ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                        scope: scope.clone(),
+                        operation: None,
+                        model: full.clone(),
+                    });
+                    settle(&mut app, ack);
+                }
+                assert!(
+                    app.shared_views
+                        .initialized
+                        .contains(&Scope::Channel(channel))
+                );
+                assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+                assert!(app.shared_views.pending.is_empty());
+                assert_eq!(daemon.requests(), vec![healthy_source.clone()]);
+                assert!(!app.chat_start_pending(healthy.id));
+                assert!(!app.chat_awaiting_admission(healthy.id));
+                let witness = app.shared_views.validated_managed.get(&healthy.id).unwrap();
+                assert_eq!(witness.registry, identity);
+                assert_eq!(witness.scope, Scope::Channel(channel));
+                assert_eq!(witness.source, healthy.kind);
+                assert_eq!(Some(&witness.issuer), full.agents[0].session.as_ref());
+                assert_eq!(witness.snapshot_sequence, 10);
+                assert_eq!(witness.revision, 7);
+                assert!(
+                    !app.shared_views
+                        .validated_managed
+                        .contains_key(&rejected.id)
+                );
+                assert!(matches!(
+                    app.cards.get(&rejected.id),
+                    Some(CardRuntime::Failed(_))
+                ));
+
+                // The synthetic daemon's actual ChatAttached response owns
+                // readiness and image capability; no Ready/snapshot is injected.
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get(&healthy.id) else {
+                    panic!("admitted healthy runtime");
+                };
+                assert_eq!(runtime.restored_pane_ready(), Ok(true));
+                assert_eq!(runtime.session, healthy_source);
+                assert_eq!(runtime.unsent_text(), "");
+                assert_eq!(runtime.transition_blocker(), None);
+                custody::insert_image_only(&mut app, healthy.id, &image);
+                let allocation =
+                    custody::assert_runtime_only_image(&app, healthy.id, &image, false, false);
+                if parked {
+                    custody::park(&mut app, healthy.id);
+                }
+                assert_eq!(
+                    custody::assert_runtime_only_image(&app, healthy.id, &image, parked, false),
+                    allocation
+                );
+                assert!(app.shared_chat_has_local_work(healthy.id));
+                assert_eq!(app.device_switch_chat_blocker(), None);
+                assert!(!app.durable.local_only_cards.contains(&healthy.id));
+                let project = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|entry| entry.id == channel)
+                    .unwrap()
+                    .project_id;
+                let directory = tempfile::tempdir().unwrap();
+                let database = directory.path().join("mixed-image-custody.sqlite3");
+                let boot = crate::model::BootId::new("boot");
+                let (writer, _) = SessionRuntime::open(&database, boot.clone()).unwrap();
+                writer.save_project(ProjectState {
+                    id: project,
+                    generation: 0,
+                    name: "Mixed image custody".into(),
+                    repository: "/fixture-project".into(),
+                    kind: ProjectKind::Folder,
+                    existence: Existence::Open,
+                });
+                app.session = Some(writer);
+                app.persist();
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(
+                    custody::assert_runtime_only_image(&app, healthy.id, &image, parked, false),
+                    allocation
+                );
+                assert!(app.shared_views.pending.is_empty());
+                assert!(
+                    app.shared_views
+                        .initialized
+                        .contains(&Scope::Channel(channel))
+                );
+                assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+                assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+                let witness = app.shared_views.validated_managed.get(&healthy.id).unwrap();
+                assert_eq!(witness.source, healthy.kind);
+                assert_eq!(Some(&witness.issuer), full.agents[0].session.as_ref());
+                assert_eq!(witness.snapshot_sequence, 10);
+                assert_eq!(witness.revision, 7);
+
+                let mut retired = full.clone();
+                retired.sequence = 11;
+                retired.agents[0].closed = closed_owner;
+                assert!(
+                    retired.views[1]
+                        .apply(&Change::Remove { id: healthy.id })
+                        .unwrap()
+                );
+                retired.views[1].revision = 8;
+                assert_eq!(retired.views[1].panes, vec![rejected.clone()]);
+                assert_eq!(retired.views[1].retired, vec![healthy.id]);
+                for update in [
+                    ModelUpdate::Read(retired.clone()),
+                    ModelUpdate::Ranked {
+                        channel,
+                        model: retired.clone(),
+                    },
+                    ModelUpdate::Read(retired.clone()),
+                ] {
+                    let task = app.update(Message::WorkspaceModelObserved(update));
+                    settle(&mut app, task);
+                    assert_eq!(app.workspace_model.views, retired.views);
+                    assert_eq!(app.workspace_model.agents, retired.agents);
+                    assert_eq!(app.shared_views.snapshot_sequence, 11);
+                    assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+                    assert!(
+                        !app.shared_views
+                            .validated_managed
+                            .contains_key(&rejected.id)
+                    );
+                    assert_eq!(
+                        custody::assert_runtime_only_image(&app, healthy.id, &image, parked, true),
+                        allocation
+                    );
+                    assert_saved(
+                        &app.persistent_workspace(),
+                        &healthy,
+                        &rejected,
+                        &image,
+                        channel,
+                    );
+                    assert!(!app.chat_start_pending(healthy.id));
+                    assert!(!app.chat_start_pending(rejected.id));
+                    assert!(app.shared_views.pending.is_empty());
+                    app.persist();
+                    app.session
+                        .as_ref()
+                        .unwrap()
+                        .flush(Duration::from_secs(5))
+                        .unwrap();
+                    assert_eq!(app.session.as_ref().unwrap().last_error(), None);
+                }
+                assert!(
+                    rx.try_recv().is_err(),
+                    "retained work must not republish either source"
+                );
+                assert_eq!(daemon.requests(), vec![healthy_source]);
+                assert!(daemon.resolutions().is_empty());
+                assert!(
+                    !daemon
+                        .controls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|request| matches!(
+                            request,
+                            ClientRequest::ChatStart { .. }
+                                | ClientRequest::ChatPrepareResume { .. }
+                                | ClientRequest::ChatClose { .. }
+                                | ClientRequest::ChatCloseRetained { .. }
+                                | ClientRequest::CloseTerminalChecked { .. }
+                                | ClientRequest::ChatRecoverAccount { .. }
+                                | ClientRequest::ChatStartSelected { .. }
+                                | ClientRequest::ChatReturnTerminal { .. }
+                        ))
+                );
+                let mut writer = app.session.take().unwrap();
+                writer.shutdown();
+                assert_eq!(writer.last_error(), None);
+                drop(writer);
+                // These are real private SQLite writer/load cycles, not a
+                // claim that a cold native UI has reattached the retired chat.
+                for _ in 0..2 {
+                    let (mut reopened, loaded) =
+                        SessionRuntime::open(&database, boot.clone()).unwrap();
+                    let loaded = loaded.expect("saved mixed workspace");
+                    assert_saved(&loaded, &healthy, &rejected, &image, channel);
+                    reopened.snapshot(Arc::new(loaded));
+                    reopened.flush(Duration::from_secs(5)).unwrap();
+                    assert_eq!(reopened.last_error(), None);
+                    reopened.shutdown();
+                }
+                drop(app);
+                drop(daemon);
+                std::fs::remove_file(crate::terminal_ipc::daemon_socket_path().unwrap()).unwrap();
+            }
+        }
+    });
 }
 
 #[test]

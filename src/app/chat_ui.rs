@@ -34,6 +34,8 @@ mod image_only_peer_remove_tests;
 pub(super) mod images;
 mod layout;
 mod literal_content;
+#[cfg(test)]
+pub(super) mod managed_image_retention_test_support;
 mod markdown;
 mod markdown_source;
 mod monospace;
