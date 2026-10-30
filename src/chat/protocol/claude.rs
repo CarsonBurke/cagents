@@ -4167,12 +4167,25 @@ impl Claude {
                 if matches!(delta_type, "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                if !matches!(
-                    delta_type,
-                    "text_delta" | "thinking_delta" | "input_json_delta"
-                ) {
-                    self.warn_unknown("stream delta", delta_type);
-                    return Ok(());
+                let payload_field = match delta_type {
+                    "text_delta" => "text",
+                    "thinking_delta" => "thinking",
+                    "input_json_delta" => "partial_json",
+                    other => {
+                        self.warn_unknown("stream delta", other);
+                        return Ok(());
+                    }
+                };
+                // A discarded known block still requires a well-formed known
+                // delta. Only an explicitly ignored future block bypasses its
+                // payload, above; budget truncation must not hide corruption.
+                if !delta[payload_field].is_string() {
+                    return Err(if delta_type == "input_json_delta" {
+                        "Claude tool input delta has no string payload"
+                    } else {
+                        "Claude text delta has no string payload"
+                    }
+                    .into());
                 }
                 let Some(item) = self
                     .blocks
@@ -5874,6 +5887,162 @@ mod tests {
                     );
                     assert!(adapter.busy && adapter.streams[""].truncated);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn known_stream_delta_payloads_are_validated_before_the_block_budget() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field) in [
+                ("text", "text_delta", "text"),
+                ("thinking", "thinking_delta", "thinking"),
+                ("tool_use", "input_json_delta", "partial_json"),
+                ("server_tool_use", "input_json_delta", "partial_json"),
+            ] {
+                for payload in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!(false)),
+                    Some(json!(7)),
+                    Some(json!({})),
+                    Some(json!([])),
+                ] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":"future_content"}})))
+                            .unwrap();
+                    }
+                    let block = match block_type {
+                        "text" => json!({"type":"text","text":""}),
+                        "thinking" => json!({"type":"thinking","thinking":""}),
+                        _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                    };
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":count,
+                            "content_block":block})))
+                        .unwrap();
+                    assert_eq!(adapter.streams[""].truncated, count == MAX_TOOLS);
+                    let mut delta = json!({"type":delta_type});
+                    if let Some(payload) = &payload {
+                        delta[field] = payload.clone();
+                    }
+                    assert_eq!(
+                        adapter
+                            .receive(stream(json!({"type":"content_block_delta","index":count,
+                                "delta":delta})))
+                            .err(),
+                        Some(
+                            if delta_type == "input_json_delta" {
+                                "Claude tool input delta has no string payload"
+                            } else {
+                                "Claude text delta has no string payload"
+                            }
+                            .into()
+                        ),
+                        "accepted {delta_type} with {field}={payload:?} after {count} future blocks"
+                    );
+                    assert_eq!(
+                        adapter.blocks.len() + adapter.ignored_blocks.len(),
+                        MAX_TOOLS
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_delta_overflow_keeps_unknown_indices_and_next_text_usable() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field, payload) in [
+                ("text", "text_delta", "text", "kept"),
+                ("thinking", "thinking_delta", "thinking", "kept"),
+                ("tool_use", "input_json_delta", "partial_json", "{}"),
+                ("server_tool_use", "input_json_delta", "partial_json", "{}"),
+            ] {
+                let mut adapter = Claude::default();
+                adapter
+                    .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                    .unwrap();
+                for index in 0..count {
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":index,
+                            "content_block":{"type":"future_content"}})))
+                        .unwrap();
+                }
+                let block = match block_type {
+                    "text" => json!({"type":"text","text":""}),
+                    "thinking" => json!({"type":"thinking","thinking":""}),
+                    _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                };
+                let start = adapter
+                    .receive(stream(json!({"type":"content_block_start","index":count,
+                        "content_block":block})))
+                    .unwrap();
+                assert_eq!(errors(&start.events).len(), usize::from(count == MAX_TOOLS));
+                for payload in ["", payload] {
+                    let mut delta = json!({"type":delta_type});
+                    delta[field] = json!(payload);
+                    let step = adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count,
+                            "delta":delta})))
+                        .unwrap();
+                    assert!(errors(&step.events).is_empty());
+                    if count == MAX_TOOLS {
+                        assert!(step.events.is_empty());
+                    } else {
+                        assert!(step.events.iter().any(|event| match event {
+                            Event::TextDelta { delta, .. } => delta == payload,
+                            Event::Item(Item {
+                                content: ItemContent::Tool { input, .. },
+                                ..
+                            }) => input == payload,
+                            _ => false,
+                        }));
+                    }
+                }
+                // Future delta types remain advisory even at an unowned index.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count+1,
+                            "delta":{"type":"future_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // An index explicitly owned by future content keeps its opaque
+                // delta behavior, even when a known-looking payload is absent.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":0,
+                            "delta":{"type":"text_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // Replacing just that ignored index makes room for real text;
+                // truncation must not poison the next retained valid block.
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                        "content_block":{"type":"text","text":""}})))
+                    .unwrap();
+                let resumed = adapter
+                    .receive(stream(json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"text_delta","text":"next valid answer"}})))
+                    .unwrap();
+                assert!(resumed.events.iter().any(|event| matches!(event,
+                    Event::TextDelta { delta, .. } if delta == "next valid answer"
+                )));
+                assert!(errors(&resumed.events).is_empty());
+                assert_eq!(
+                    adapter.blocks.len() + adapter.ignored_blocks.len(),
+                    MAX_TOOLS
+                );
             }
         }
     }
