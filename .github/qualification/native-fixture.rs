@@ -103,13 +103,14 @@ fn snapshot(session: &Session) -> Snapshot {
     if std::env::var("HELD_FIXTURE_IMAGE_ONLY").as_deref() == Ok("1") {
         return Snapshot {
             ready: true, generation: 1, session_id: session.launch.session_id.clone(),
+            finished_at: Some(1_700_000_000_000),
             capabilities: cagents::chat::Capabilities { attachments: true, ..Default::default() },
             items: vec![Arc::new(cagents::chat::Item {
                 id: "image-only-ready".into(), role: cagents::chat::Role::Assistant,
                 content: cagents::chat::ItemContent::Text {
                     text: "Verified conversation ready for image-only retirement.".into(),
                     thinking: false, phase: cagents::chat::Phase::Final,
-                }, at: None, started_at: None,
+                }, at: Some(1_700_000_000_000), started_at: None,
             })],
             ..Default::default()
         };

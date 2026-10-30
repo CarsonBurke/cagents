@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: c7f8e4df263c5e9b0175bb356975d49a89d57f44
-      PRODUCT_TREE: f3d8d4a64d2777ad196aa9c1f45b529c96588d76
+      PRODUCT_SHA: d27cd6c679dba7dfba2e5561ac8440045a9c0292
+      PRODUCT_TREE: f1c6eecb424aeee749b8c81d7a26fc44fd674565
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -58,7 +58,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 9ead6a2019db03485ebe1d608b697e1959ca1e54
+          ref: bb88099d1037a04e5c914a6f2b055e1445cd2a47
           path: before-image
           persist-credentials: false
       - name: Install native evidence tools

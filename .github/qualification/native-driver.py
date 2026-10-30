@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import signal
 import sqlite3
 import stat
@@ -29,6 +30,7 @@ if os.environ.get('WAYLAND_DISPLAY') or os.environ.get('WAYLAND_SOCKET'):
 out.mkdir(parents=True, exist_ok=True)
 target = Path(os.environ['CARGO_TARGET_DIR'])
 source = control / '.github/qualification/native-fixture.rs'
+review_exercise = runpy.run_path(str(control / '.github/qualification/review-native.py'))['exercise']
 base = Path(tempfile.mkdtemp(prefix='hs.', dir='/tmp'))
 os.chmod(base, 0o700)
 receipts = []
@@ -707,6 +709,125 @@ def exercise_image_only(pid, window, root, label, receipt, before_loss):
                     and node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node) and in_column(node)]
         assert len(controls) <= 1
         return len(controls) == 1 and any(node.name == 'Image 1' and visible(node) and in_column(node) for node in nodes)
+    stamp = time.localtime(1_700_000_000)
+    stamp_labels = {
+        'message-time': time.strftime('%Y-%m-%d %H:%M', stamp),
+        'finished-time': 'Finished at ' + time.strftime('%H:%M', stamp),
+    }
+    def tooltip_targets():
+        value = binding()
+        if value is None:
+            return None
+        left, right = value['column']
+        nodes = live_tree(pid)
+        result = {}
+        for kind, name, role in [
+            ('image', 'Image 1', pyatspi.ROLE_PARAGRAPH),
+            ('remove', 'Remove attachment', pyatspi.ROLE_PUSH_BUTTON),
+            ('copy', 'Copy this message', pyatspi.ROLE_PUSH_BUTTON),
+            *[(kind, name, pyatspi.ROLE_PARAGRAPH) for kind, name in stamp_labels.items()],
+        ]:
+            matches = []
+            for node in nodes:
+                if node.name != name or node.getRole() != role or not visible(node):
+                    continue
+                bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                if (left <= bounds.x and bounds.x + bounds.width <= right
+                        and bounds.width > 0 and bounds.height > 0 and bounds.y >= 0
+                        and bounds.y + bounds.height <= viewport[1]):
+                    matches.append((node, bounds))
+            assert len(matches) <= 1, ('Ambiguous native tooltip owner', kind)
+            if len(matches) != 1:
+                return None
+            node, bounds = matches[0]
+            result[kind] = {'name': name, 'role': node.getRoleName(),
+                            'enabled': node.getState().contains(pyatspi.STATE_ENABLED),
+                            'bounds': [bounds.x, bounds.y, bounds.width, bounds.height]}
+        assert result['remove']['enabled'] and result['copy']['enabled']
+        return result
+    def tooltip_evidence(expected, *, timestamps):
+        global viewport
+        # This adds pointer-only diagnostic frames to the original custody
+        # flow. Never refocus, activate a control, repeat paste, or delete the
+        # marker here. Native IDs can legitimately change on a fresh frame;
+        # each target is rebound to A's actual source/column/editor instead.
+        wait(lambda: receipt.read_text().splitlines().count('explicit-read-started')
+             == receipt.read_text().splitlines().count('explicit-read-replied'))
+        def observed_requests():
+            return [line for line in receipt.read_text().splitlines()
+                    if line.startswith(('effect-request-', 'explicit-read-', 'image-read-delivered '))]
+        effects = observed_requests()
+        phase = 'marked' if expected else 'empty'
+        for size, suffix in [((1280, 800), 'wide'), ((900, 700), 'narrow')]:
+            prefix = label + '-tooltip-' + phase
+            run(['xdotool', 'windowsize', '--sync', window, *map(str, size)])
+            run(['xdotool', 'windowmove', '--sync', window, '0', '0'])
+            viewport = size
+            targets = wait(lambda: accessibility_snapshot(tooltip_targets))
+            input_receipt('tooltip-' + phase + '-ready-' + suffix, expected)
+            capture(window, prefix + '-rest-' + suffix, size, neutral_pointer=True)
+            input_receipt('tooltip-' + phase + '-rest-' + suffix, expected)
+            targets = wait(lambda: accessibility_snapshot(tooltip_targets))
+            event({'event': 'native-tooltip-rest', 'phase': phase, 'viewport': list(size),
+                   'targets': targets, 'editor_text': expected, 'capture': prefix + '-rest-' + suffix})
+            kinds = ['image', 'remove', 'message-time', 'finished-time'] if timestamps else []
+            for kind in kinds:
+                targets = wait(lambda: accessibility_snapshot(tooltip_targets))
+                owner = targets[kind]
+                x, y, width, height = owner['bounds']
+                point = (x + width // 2, y + height // 2)
+                if kind == 'image':
+                    rx, ry, rw, rh = targets['remove']['bounds']
+                    assert not (rx <= point[0] < rx + rw and ry <= point[1] < ry + rh)
+                entered = time.monotonic()
+                run(['xdotool', 'mousemove', '--sync', *map(str, point)])
+                location = dict(line.split('=', 1) for line in subprocess.check_output(
+                    ['xdotool', 'getmouselocation', '--shell'], text=True, timeout=5).splitlines())
+                assert (int(location['X']), int(location['Y'])) == point
+                time.sleep(.5)  # Established tooltip: 300ms dwell plus 120ms fade.
+                input_receipt('tooltip-' + phase + '-' + kind + '-dwell-' + suffix, expected)
+                name = prefix + '-' + kind + '-dwell-' + suffix
+                capture(window, name, size)  # Keep the pointer on the owner.
+                input_receipt('tooltip-' + phase + '-' + kind + '-captured-' + suffix, expected)
+                actual_pointer = dict(line.split('=', 1) for line in subprocess.check_output(
+                    ['xdotool', 'getmouselocation', '--shell'], text=True, timeout=5).splitlines())
+                assert (int(actual_pointer['X']), int(actual_pointer['Y'])) == point
+                def captured_owner():
+                    value = binding()
+                    if value is None:
+                        return None
+                    left, right = value['column']
+                    owners = []
+                    for node in live_tree(pid):
+                        if node.name != owner['name'] or node.getRoleName() != owner['role'] or not visible(node):
+                            continue
+                        bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                        rectangle = [bounds.x, bounds.y, bounds.width, bounds.height]
+                        if (rectangle == owner['bounds'] and left <= bounds.x
+                                and bounds.x + bounds.width <= right):
+                            owners.append({'name': node.name, 'role': node.getRoleName(), 'bounds': rectangle,
+                                           'enabled': node.getState().contains(pyatspi.STATE_ENABLED)})
+                    assert len(owners) <= 1, 'The captured tooltip owner became ambiguous'
+                    return owners[0] if owners else None
+                observed_owner = wait(lambda: accessibility_snapshot(captured_owner))
+                assert observed_owner == owner, 'Capture moved or changed the actual tooltip owner'
+                assert chip() and no_pending_paste()
+                event({'event': 'native-tooltip-dwell', 'phase': phase, 'kind': kind,
+                       'viewport': list(size), 'owner': owner, 'pointer': location,
+                       'captured_owner': observed_owner, 'captured_pointer': actual_pointer,
+                       'entered_monotonic': entered, 'dwell_seconds': time.monotonic() - entered,
+                       'editor_text': expected, 'capture': name,
+                       'capture_sha256': digest(out / (name + '.webp')),
+                       'scope': 'Actual pixels; nested attachment/remove tooltip coexistence requires independent UX review.'})
+                exit_name = prefix + '-' + kind + '-exit-' + suffix
+                capture(window, exit_name, size, neutral_pointer=True)
+                input_receipt('tooltip-' + phase + '-' + kind + '-exit-' + suffix, expected)
+                assert wait(lambda: accessibility_snapshot(tooltip_targets))
+            assert observed_requests() == effects, 'Tooltip observation issued or received an extra model/provider request'
+        # Restore the original custody flow's viewport without touching focus.
+        capture(window, label + '-tooltip-' + phase + '-returned-wide', (1280, 800), neutral_pointer=True)
+        input_receipt('tooltip-' + phase + '-returned-wide', expected)
+        assert observed_requests() == effects, 'Returning the tooltip viewport changed model/provider requests'
     wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '')
     bootstrap = image_only_observation(root, label, 'bootstrap')
     sources = {card: value['source'] for card, value in bootstrap['cards'].items()}
@@ -751,6 +872,7 @@ def exercise_image_only(pid, window, root, label, receipt, before_loss):
     wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '[Image 1] ' and chip())
     event({'event': 'image-only-native-paste-settled', 'editor': '[Image 1] ', 'image_label': 'Image 1'})
     assert offered()
+    tooltip_evidence('[Image 1] ', timestamps=True)
     # Delete only the marker, with the exact A editor still focused. A real
     # managed chip remains; neither unsent text nor an invalid path masks 1955.
     wait(no_pending_paste)
@@ -760,6 +882,7 @@ def exercise_image_only(pid, window, root, label, receipt, before_loss):
     wait(no_pending_paste)
     event({'event': 'image-only-paste-settled', 'phase': 'marker-deleted', 'pending_paste_visible': False})
     event({'event': 'image-only-native-marker-deleted', 'editor': '', 'image_label': 'Image 1'})
+    tooltip_evidence('', timestamps=False)
     stop(owner)
     def guarded_check(phase, *, retired, image=None, previous_generation):
         wait(lambda: receipt.read_text().splitlines().count('explicit-read-started')
@@ -1296,13 +1419,14 @@ try:
     run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(control / '.github/qualification/pixel-response.c'),
          '-o', str(pixel_helper), '-lX11', '-lXtst'])
     fixtures = {}
+    review_helpers = {}
     for variant, checkout in [('before', before), ('after', after), ('before-main', before_main), ('before-image', before_image)]:
         revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
         expected_sha, expected_tree = {
             'before': ('c727f886628897c1749290213e9d65037253095a', '6d4f36e2b4dd48fc9744305d34c78469384edcc5'),
             'after': (os.environ['PRODUCT_SHA'], os.environ['PRODUCT_TREE']),
             'before-main': ('c4e75601ae2e8c6f11f810d36af94726477efbb4', '69dacc7a72689e6d24f0a3d4122f9ddfe6ed23c8'),
-            'before-image': ('9ead6a2019db03485ebe1d608b697e1959ca1e54', '55b02f04f3d297bae206c87ca0ef493e769508b7'),
+            'before-image': ('bb88099d1037a04e5c914a6f2b055e1445cd2a47', '0309bedf50697d303396147dd3d728c6eae4a733'),
         }[variant]
         assert revision == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
@@ -1339,6 +1463,19 @@ try:
                     command += ['-L', path]
         run(command, timeout=180)
         fixtures[variant] = (revision, helper, expected_sha, expected_tree)
+        if variant in ('before-image', 'after'):
+            review_helper = base / (variant + '-review-fixture')
+            review_command = ['rustc', '--edition=2024',
+                              str(control / '.github/qualification/review-fixture.rs'),
+                              '--extern', 'cagents=' + libs[0],
+                              '-L', 'dependency=' + str(target / 'dev-runtime/deps'),
+                              '-o', str(review_helper)]
+            for row in rows:
+                if row.get('reason') == 'build-script-executed':
+                    for path in row.get('linked_paths', []):
+                        review_command += ['-L', path]
+            run(review_command, timeout=180)
+            review_helpers[variant] = review_helper
         if variant == 'before-main':
             (out / 'before-main-source.json').write_text(json.dumps({
                 'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
@@ -1351,7 +1488,7 @@ try:
                 'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
                 'helper_cfg': ['held_product_after', 'held_image_before'],
-                'scope': 'Image-only association-loss comparison on frozen 9ead; historical c727 and c4 comparisons remain separate.',
+                'scope': 'Image-only association-loss comparison on 9ead plus shared tooltip accessibility repair bb88099; this is a modified baseline. Historical c727 and c4 comparisons remain separate.',
             }, indent=2) + '\n')
     # Compile each matched helper first. The original c727 reader still checks
     # candidate schema refusal; current main owns only the last comparison arm.
@@ -1560,6 +1697,7 @@ try:
                 assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
                 event({'event': 'arm-completed', 'revision': revision})
                 active_arm = None
+                review_exercise(globals(), checkout, review_helpers[variant], variant, revision, expected_tree)
                 continue
             if mode == 'peer-removal':
                 ready = 'Verified conversation ready for peer removal.'
@@ -2055,6 +2193,7 @@ try:
 finally:
     native_failure = sys.exc_info()[1]
     diagnostic_errors = []
+    retention_errors = []
     if native_failure is not None:
         try:
             (out / 'native-failure-traceback.txt').write_text(''.join(traceback.format_exception(
@@ -2124,12 +2263,29 @@ finally:
             for name in ['receipts.txt', 'expected-draft.txt', 'expected-attachment.txt']:
                 if (root / name).is_file():
                     (out / (root.name + '-' + name)).write_bytes((root / name).read_bytes())
+            if root.name in ('before-image-review-tooltip', 'after-review-tooltip'):
+                # Retain raw synthetic service/transport data even when a
+                # later native observation fails. Incomplete data never
+                # qualifies a diagnostic or the original twenty-arm gate.
+                for relative in ['gh-calls.jsonl', 'git-trace.jsonl', 'gh-data/manifest.json']:
+                    try:
+                        diagnostic_source = root / relative
+                        if diagnostic_source.exists():
+                            info = diagnostic_source.lstat()
+                            assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                            assert info.st_uid == os.getuid() and info.st_nlink == 1
+                            assert diagnostic_source.resolve(strict=True).is_relative_to(root)
+                            assert info.st_size <= 8 * 1024 * 1024
+                            (out / (root.name + '-' + relative.replace('/', '-'))).write_bytes(diagnostic_source.read_bytes())
+                    except Exception as error:
+                        retention_errors.append({'arm': root.name, 'file': relative, 'error': repr(error)})
     (out / 'cleanup.json').write_text(json.dumps({'errors': cleanup_errors, 'subreaper': True}, indent=2) + '\n')
     (out / 'native-outcome.json').write_text(json.dumps({
-        'outcome': 'failed' if native_failure is not None or cleanup_errors else 'complete',
+        'outcome': 'failed' if native_failure is not None or cleanup_errors or retention_errors else 'complete',
         'incomplete_arm': active_arm, 'error_type': type(native_failure).__name__ if native_failure else None,
         'error': str(native_failure)[:2000] if native_failure else None, 'cleanup_errors': cleanup_errors,
         'diagnostic_errors': diagnostic_errors,
+        'retention_errors': retention_errors,
     }, indent=2) + '\n')
     (out / 'accessibility-retries.json').write_text(json.dumps({'unknown_object_retries': stale_accessibility_retries,
         'incomplete_tree_retries': incomplete_accessibility_retries,
@@ -2141,3 +2297,5 @@ finally:
         for path in sorted(out.parent.rglob('*')) if path.is_file() and path.name != 'sha256.txt'))
     if cleanup_errors:
         raise RuntimeError('Native process cleanup is unqualified: ' + '; '.join(cleanup_errors))
+    if retention_errors and native_failure is None:
+        raise RuntimeError('Supplemental native receipt retention is unqualified: ' + repr(retention_errors))
