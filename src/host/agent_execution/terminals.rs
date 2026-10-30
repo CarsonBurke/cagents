@@ -24,6 +24,15 @@ enum Access<'a> {
     Refused,
 }
 
+/// Explicit scope for retained setup and installation observations. Other requests retain
+/// their existing connection policy. A delegation attempt is sticky even if
+/// its capability is refused; retrying without it must not become User.
+#[derive(Clone, Copy)]
+pub(in crate::host) enum AccountPreparationCaller {
+    User,
+    DelegatedAttempt,
+}
+
 /// Classified without a fallback arm, so every new request has to choose.
 fn access(request: &ClientRequest) -> Access<'_> {
     use ClientRequest as R;
@@ -120,7 +129,22 @@ pub(in crate::host) fn authenticate(
     authority: &Authority,
 ) -> Result<(), ProtocolError> {
     if authority.token().is_none() {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.clients.contains_key(&client_id) && !state.agent_clients.contains_key(&client_id) {
+            state
+                .account_preparation_callers
+                .entry(client_id)
+                .or_insert(AccountPreparationCaller::User);
+        }
         return Ok(());
+    }
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.clients.contains_key(&client_id) {
+            state
+                .account_preparation_callers
+                .insert(client_id, AccountPreparationCaller::DelegatedAttempt);
+        }
     }
     let lineage = match super::origin(host, authority).map_err(denied)? {
         Origin::Child { parent } => parent,
@@ -148,6 +172,28 @@ pub(in crate::host) fn admit(
     client_id: ClientId,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
+    if matches!(
+        request,
+        ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::AccountPreparation { .. }
+                | crate::device_service::Operation::AccountInstallationRead { .. }
+                | crate::device_service::Operation::AccountInstallationInitialize { .. }
+        }
+    ) {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        return if state.clients.contains_key(&client_id)
+            && !state.agent_clients.contains_key(&client_id)
+            && matches!(
+                state.account_preparation_callers.get(&client_id),
+                Some(AccountPreparationCaller::User)
+            ) {
+            Ok(())
+        } else {
+            Err(denied(
+                "Account preparation and installation observation require this connection's explicit User scope",
+            ))
+        };
+    }
     let Some(lineage) = acting_for(host, client_id) else {
         return Ok(());
     };

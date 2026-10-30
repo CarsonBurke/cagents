@@ -47,6 +47,7 @@ struct ConnectionContext {
     home: OnceLock<PathBuf>,
     shell: OnceLock<String>,
     bridge: Mutex<Option<Bridge>>,
+    no_start_bridge: Mutex<Option<Bridge>>,
     closed: std::sync::atomic::AtomicBool,
 }
 impl ConnectionContext {
@@ -57,6 +58,7 @@ impl ConnectionContext {
             home: OnceLock::new(),
             shell: OnceLock::new(),
             bridge: Mutex::new(None),
+            no_start_bridge: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -67,6 +69,12 @@ impl ConnectionContext {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         drop(bridge.take());
+        drop(
+            self.no_start_bridge
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
     }
 }
 impl Drop for ConnectionContext {
@@ -471,17 +479,67 @@ pub fn socket_path() -> io::Result<Option<PathBuf>> {
         .map(ConnectionContext::socket_path)
         .transpose()
 }
+
+/// A process-local reference to the originally selected remote context.
+/// This selects transport only: it grants no caller or installation authority.
+#[derive(Clone, Copy)]
+pub struct CapturedRemoteRoute {
+    context: &'static ConnectionContext,
+}
+
+/// Capture selection without reading profiles, opening a proxy or starting a
+/// daemon. A closed or absent selection cannot become a local/default route.
+pub fn capture_remote_route() -> io::Result<CapturedRemoteRoute> {
+    let context = SELECTED.get().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotConnected, "no remote device is selected")
+    })?;
+    if context.closed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "device connection is closed",
+        ));
+    }
+    Ok(CapturedRemoteRoute { context })
+}
+
+impl CapturedRemoteRoute {
+    /// Each new SSH stream explicitly refuses remote daemon startup. It never
+    /// reuses a proxy or master pool whose policy permits startup.
+    pub fn socket_path_no_start(&self) -> io::Result<PathBuf> {
+        self.context
+            .socket_path_with_policy(&self.context.no_start_bridge, true)
+    }
+}
+
 impl ConnectionContext {
     fn socket_path(&self) -> io::Result<PathBuf> {
-        let mut bridge = self.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        self.socket_path_with_policy(&self.bridge, crate::control::daemon_autostart_disabled())
+    }
+
+    fn socket_path_with_policy(
+        &self,
+        slot: &Mutex<Option<Bridge>>,
+        no_start: bool,
+    ) -> io::Result<PathBuf> {
+        self.socket_path_with_runtime(slot, no_start, || {
+            Ok(crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY))
+        })
+    }
+
+    fn socket_path_with_runtime(
+        &self,
+        slot: &Mutex<Option<Bridge>>,
+        no_start: bool,
+        runtime: impl FnOnce() -> io::Result<PathBuf>,
+    ) -> io::Result<PathBuf> {
+        let mut bridge = slot.lock().unwrap_or_else(|p| p.into_inner());
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(io::Error::other("device connection is closed"));
         }
         if let Some(bridge) = bridge.as_ref() {
             return Ok(bridge.transport.directory.join("daemon.sock"));
         }
-        let runtime =
-            crate::instance::runtime_directory()?.join(crate::instance::RUNTIME_SUBDIRECTORY);
+        let runtime = runtime()?;
         crate::secure_file::prepare_private_directory(&runtime)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let directory = runtime.join(format!("device-{}", &token[..12]));
@@ -489,7 +547,7 @@ impl ConnectionContext {
         fs::create_dir(&directory)?;
         let transport = Arc::new(Transport {
             device: self.device.clone(),
-            no_start: crate::control::daemon_autostart_disabled(),
+            no_start,
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
@@ -1142,6 +1200,139 @@ fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_context() -> ConnectionContext {
+        ConnectionContext::new(Device {
+            name: "captured-route-fixture".into(),
+            host: "unused-fixture".into(),
+            executable: "cagents".into(),
+        })
+    }
+
+    #[test]
+    fn captured_no_start_proxy_has_its_own_listener_policy_and_master_pool() {
+        // Match the process-lifetime selection without changing SELECTED or
+        // any caller environment. close() still settles both owned workers.
+        let context = Box::leak(Box::new(fixture_context()));
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = context
+            .socket_path_with_runtime(&context.bridge, false, || {
+                Ok(directory.path().to_path_buf())
+            })
+            .unwrap();
+        let restricted = context
+            .socket_path_with_runtime(&context.no_start_bridge, true, || {
+                Ok(directory.path().to_path_buf())
+            })
+            .unwrap();
+        assert_ne!(legacy, restricted);
+        assert!(legacy.exists() && restricted.exists());
+        let route = CapturedRemoteRoute { context };
+        assert_eq!(route.socket_path_no_start().unwrap(), restricted);
+        {
+            let legacy_slot = context.bridge.lock().unwrap();
+            let restricted_slot = context.no_start_bridge.lock().unwrap();
+            let legacy_transport = &legacy_slot.as_ref().unwrap().transport;
+            let restricted_transport = &restricted_slot.as_ref().unwrap().transport;
+            assert!(!legacy_transport.no_start);
+            assert!(restricted_transport.no_start);
+            assert!(!Arc::ptr_eq(
+                &legacy_transport.pool,
+                &restricted_transport.pool
+            ));
+            assert_eq!(
+                bridge_command(legacy_transport, None)
+                    .get_args()
+                    .last()
+                    .unwrap(),
+                "'cagents' daemon bridge"
+            );
+            assert_eq!(
+                bridge_command(restricted_transport, None)
+                    .get_args()
+                    .last()
+                    .unwrap(),
+                "'cagents' --no-start daemon bridge"
+            );
+        }
+        context.close();
+        assert!(!legacy.exists() && !restricted.exists());
+    }
+
+    #[test]
+    fn captured_no_start_cache_does_not_resolve_another_runtime_or_route() {
+        let context = fixture_context();
+        let directory = tempfile::tempdir().unwrap();
+        let original = context
+            .socket_path_with_runtime(&context.no_start_bridge, true, || {
+                Ok(directory.path().to_path_buf())
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .socket_path_with_runtime(&context.no_start_bridge, true, || {
+                    panic!("cached captured route resolved a replacement runtime")
+                })
+                .unwrap(),
+            original
+        );
+        let replacement = fixture_context();
+        let distinct = replacement
+            .socket_path_with_runtime(&replacement.no_start_bridge, true, || {
+                Ok(directory.path().to_path_buf())
+            })
+            .unwrap();
+        assert_ne!(original, distinct);
+        context.close();
+        assert!(!original.exists());
+        assert!(distinct.exists());
+        replacement.close();
+        assert!(!distinct.exists());
+    }
+
+    #[test]
+    fn captured_no_start_failure_does_not_fall_back_to_a_start_capable_proxy() {
+        let context = fixture_context();
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = context
+            .socket_path_with_runtime(&context.bridge, false, || {
+                Ok(directory.path().to_path_buf())
+            })
+            .unwrap();
+        let error = context
+            .socket_path_with_runtime(&context.no_start_bridge, true, || {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(context.no_start_bridge.lock().unwrap().is_none());
+        assert!(legacy.exists());
+        assert_eq!(context.socket_path().unwrap(), legacy);
+        context.close();
+    }
+
+    #[test]
+    fn closed_captured_context_refuses_both_proxy_slots_before_resolution() {
+        let context = fixture_context();
+        let directory = tempfile::tempdir().unwrap();
+        for (slot, policy) in [(&context.bridge, false), (&context.no_start_bridge, true)] {
+            context
+                .socket_path_with_runtime(slot, policy, || Ok(directory.path().to_path_buf()))
+                .unwrap();
+        }
+        context.close();
+        for (slot, policy) in [(&context.bridge, false), (&context.no_start_bridge, true)] {
+            assert!(
+                context
+                    .socket_path_with_runtime(slot, policy, || {
+                        panic!("closed captured context attempted resolution")
+                    })
+                    .is_err()
+            );
+        }
+        assert!(context.bridge.lock().unwrap().is_none());
+        assert!(context.no_start_bridge.lock().unwrap().is_none());
+    }
 
     fn fixture_transport(device: Device, directory: PathBuf) -> Arc<Transport> {
         Arc::new(Transport {
