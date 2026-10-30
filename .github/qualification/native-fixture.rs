@@ -51,6 +51,47 @@ fn record(root: &std::path::Path, event: &str) {
 const COMPOSITION_USER: &str = "Actual user request: keep my saved work while I open another channel.";
 const COMPOSITION_READY: &str = "Composition transcript is ready.";
 const COMPOSITION_CONTEXT: &str = "<system-reminder>\r\nSYNTHETIC_CONTEXT_BEGIN\nThis is synthetic provider context, not a user instruction.\nKeep literal **Markdown**, <tags>, café and 日本語 unchanged.\nThe saved task and its attachment belong to their original pane.\nSYNTHETIC_CONTEXT_END  \r\n</system-reminder>";
+// Offered by the owned X11 clipboard, then staged by the real ImageSaved path.
+// This is separate from the deliberately unavailable saved attachment below.
+const MANAGED_PNG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 80, 153, 22, 253, 31, 0, 4, 12, 2, 21, 73, 175, 151, 59, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+
+fn managed_image(root: &std::path::Path) -> Result<cagents::chat::Attachment, Box<dyn std::error::Error>> {
+    let path = root.join("image-only-attachment.txt");
+    let directory = fs::symlink_metadata(root)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if fs::canonicalize(root)? != root || !directory.is_dir() || directory.mode() & 0o7777 != 0o700
+        || !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1
+        || metadata.uid() != directory.uid() || metadata.mode() & 0o7777 != 0o600 || metadata.len() > 4096 {
+        return Err("Managed image observation is not a private fresh file".into());
+    }
+    let raw = fs::read_to_string(&path)?;
+    let fields = raw.strip_suffix('\n').ok_or("Image observation must end in one newline")?.split('\n').collect::<Vec<_>>();
+    if fields.len() != 7 || fields.iter().any(|field| field.is_empty() || field.chars().any(char::is_control)) {
+        return Err("Managed image observation fields changed".into());
+    }
+    let reference = cagents::chat::ImageReference {
+        id: fields[1].parse()?, number: fields[2].parse()?, device: fields[3].parse()?,
+        name: fields[4].into(), sha256: fields[5].into(), extension: fields[6].into(),
+    };
+    reference.validate()?;
+    if reference.id.to_string() != fields[1] || reference.number.to_string() != fields[2]
+        || reference.device.to_string() != fields[3] || reference.number != 1
+        || reference.name != "Pasted image" || reference.extension != "png" {
+        return Err("Managed image observation is not the first real PNG paste".into());
+    }
+    let image = cagents::chat::Attachment { path: fields[0].into(), reference: Some(reference) };
+    if !image.path.starts_with(root.join("data"))
+        || fs::canonicalize(&image.path)?.as_os_str() != std::ffi::OsStr::new(fields[0]) {
+        return Err("Managed image observation escaped private asset storage".into());
+    }
+    cagents::chat::attachment_assets::validate(&image)?;
+    let reference = image.reference.as_ref().unwrap();
+    if cagents::chat::attachment_assets::attachment(reference)? != image
+        || cagents::chat::attachment_assets::read(reference, MANAGED_PNG.len())? != MANAGED_PNG {
+        return Err("Managed image registry, exact reference or PNG bytes changed".into());
+    }
+    Ok(image)
+}
 fn composition_copy_source() -> cagents::chat::TextCopySource {
     cagents::chat::TextCopySource {
         cache: "00000000-0000-4000-8000-000000012922".parse().unwrap(),
@@ -59,6 +100,20 @@ fn composition_copy_source() -> cagents::chat::TextCopySource {
     }
 }
 fn snapshot(session: &Session) -> Snapshot {
+    if std::env::var("HELD_FIXTURE_IMAGE_ONLY").as_deref() == Ok("1") {
+        return Snapshot {
+            ready: true, generation: 1, session_id: session.launch.session_id.clone(),
+            capabilities: cagents::chat::Capabilities { attachments: true, ..Default::default() },
+            items: vec![Arc::new(cagents::chat::Item {
+                id: "image-only-ready".into(), role: cagents::chat::Role::Assistant,
+                content: cagents::chat::ItemContent::Text {
+                    text: "Verified conversation ready for image-only retirement.".into(),
+                    thinking: false, phase: cagents::chat::Phase::Final,
+                }, at: None, started_at: None,
+            })],
+            ..Default::default()
+        };
+    }
     if std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1") {
         let text = |id: &str, role, body: &str| Arc::new(cagents::chat::Item {
             id: id.into(), role,
@@ -143,6 +198,7 @@ struct FixtureState {
     ordinary_started: bool,
     peer_removal_started: bool,
     composition_channel: Option<ChannelId>,
+    image_removal_started: bool,
 }
 
 fn composition_edit(root: &std::path::Path, fixture: &mut FixtureState, edit: ModelEdit, healthy: &Session) -> ServerMessage {
@@ -275,6 +331,60 @@ fn peer_edit(root: &std::path::Path, model: &mut WorkspaceModel, edit: ModelEdit
     }
 }
 
+fn image_edit(root: &std::path::Path, model: &mut WorkspaceModel, edit: ModelEdit, healthy: &Session) -> ServerMessage {
+    let id = CardId::from_uuid(model.agents[0].id.as_uuid());
+    let scope = Scope::Channel(model.channels[0].id);
+    let result: Result<(), String> = (|| {
+        match edit {
+            ModelEdit::OpenProject { repository, name, kind }
+                if repository == model.projects[0].repository && kind == ProjectKind::Folder
+                    && (name == "project" || name == model.projects[0].name) => { model.projects[0].name = name; }
+            ModelEdit::SeedView { scope: Scope::Worktree { repository, path }, panes, closed }
+                if repository == model.projects[0].repository && path == repository
+                    && panes.is_empty() && closed.is_empty()
+                    && model.views.iter().filter(|view| view.scope == Scope::Worktree { repository: repository.clone(), path: path.clone() })
+                        .count() == 1
+                    && model.views.iter().any(|view| view.scope == Scope::Worktree { repository: repository.clone(), path: path.clone() }
+                        && view.panes.is_empty() && view.retired.is_empty()) => {}
+            ModelEdit::SeedView { scope: supplied, panes, closed } if supplied == scope && closed.is_empty() => {
+                let view = model.views.iter().find(|view| view.scope == scope).ok_or("Missing image scope")?;
+                for pane in panes {
+                    if pane.id != id || pane.kind != CardKind::Chat(healthy.clone())
+                        || pane.scope.is_some() || pane.pending_terminal_start
+                        || view.retired.contains(&id)
+                        || !view.panes.iter().any(|current| current.id == id && current.kind == pane.kind) {
+                        return Err("Image seed introduced, retired or unverified a source".into());
+                    }
+                    pane.validate()?;
+                }
+                record(root, "image-existing-healthy-seed-checked");
+            }
+            ModelEdit::ChangeView { scope: supplied, expected_revision, change: Change::Update { before, pane }, .. }
+                if supplied == scope && before.id == id && pane.id == id
+                    && before.kind == CardKind::Chat(healthy.clone()) && pane.kind == before.kind
+                    && before.scope.is_none() && pane.scope.is_none()
+                    && !before.pending_terminal_start && !pane.pending_terminal_start => {
+                let view = model.views.iter_mut().find(|view| view.scope == scope).ok_or("Missing image scope")?;
+                if view.retired.contains(&id) || view.revision != expected_revision {
+                    return Err("Image presentation update was stale or republished a retired source".into());
+                }
+                if view.apply(&Change::Update { before, pane })? { view.revision += 1; }
+                record(root, "image-existing-healthy-presentation-checked");
+            }
+            _ => return Err("Mutation outside exact image-only bootstrap".into()),
+        }
+        model.sequence += 1;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ServerMessage::Response { response: ServerResponse::WorkspaceModel { model: model.clone() } },
+        Err(reason) => {
+            record(root, &format!("UNEXPECTED-image-model-mutation {reason:?}"));
+            error("Image-only fixture refused a workspace mutation")
+        }
+    }
+}
+
 fn client(
     mut stream: UnixStream,
     state: Arc<Mutex<FixtureState>>,
@@ -284,6 +394,7 @@ fn client(
 ) {
     let peer_mode = std::env::var("HELD_FIXTURE_PEER").as_deref() == Ok("1");
     let composition_mode = std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1");
+    let image_mode = std::env::var("HELD_FIXTURE_IMAGE_ONLY").as_deref() == Ok("1");
     let writer = Arc::new(Mutex::new(stream.try_clone().expect("private fixture writer")));
     let mut admitted: Option<Session> = None;
     while let Ok(Some(request)) = terminal_ipc::read_frame::<ClientEnvelope>(&mut stream) {
@@ -343,12 +454,33 @@ fn client(
             | ClientRequest::ChatRecoverAccount { .. } | ClientRequest::ChatStartSelected { .. }
             | ClientRequest::ChatReturnTerminal { .. } | ClientRequest::ChatClose { .. }
             | ClientRequest::ChatCloseRetained { .. } | ClientRequest::ChatCommitTerminal { .. }
-                if peer_mode || composition_mode => {
-                record(&root, if peer_mode { "UNEXPECTED-peer-provider-mutation" } else { "UNEXPECTED-composition-provider-mutation" });
+                if peer_mode || composition_mode || image_mode => {
+                record(&root, if peer_mode { "UNEXPECTED-peer-provider-mutation" } else if image_mode { "UNEXPECTED-image-provider-mutation" } else { "UNEXPECTED-composition-provider-mutation" });
                 error(if peer_mode { "Peer removal grants no provider mutation authority" } else { "Composition grants no provider mutation authority" })
             }
             ClientRequest::WatchWorkspaceModel | ClientRequest::ReadWorkspaceModel => {
                 let mut fixture = state.lock().unwrap();
+                if image_mode && root.join("repair-evidence").exists() {
+                    record(&root, "UNEXPECTED-image-repair-authority");
+                    return;
+                }
+                if image_mode && explicit_read {
+                    // Give each real guarded recheck a distinct, observable
+                    // full-model/save barrier without changing pane authority.
+                    fixture.model.sequence += 1;
+                    fixture.model.channels[0].title = format!("Image custody check {}", fixture.model.sequence);
+                    fixture.model.channels[0].title_source = ChannelTitleSource::Manual;
+                    record(&root, &format!("image-full-read-model sequence={} channel={:?} views={:?} issuers={:?}",
+                        fixture.model.sequence, fixture.model.channels[0], fixture.model.views, fixture.model.agents));
+                    let json = match serde_json::to_string(&fixture.model) {
+                        Ok(json) => json,
+                        Err(reason) => {
+                            record(&root, &format!("UNEXPECTED-image-model-json {reason:?}"));
+                            return;
+                        }
+                    };
+                    record(&root, &format!("image-full-read-json sequence={} json={json}", fixture.model.sequence));
+                }
                 if explicit_read && root.join("repair-evidence").exists() && !fixture.repaired {
                     fixture.repaired = true;
                     fixture.model.sequence += 1;
@@ -368,6 +500,9 @@ fn client(
             }
             ClientRequest::EditWorkspaceModel { edit } if composition_mode => {
                 composition_edit(&root, &mut state.lock().unwrap(), edit, &healthy)
+            }
+            ClientRequest::EditWorkspaceModel { edit } if image_mode => {
+                image_edit(&root, &mut state.lock().unwrap().model, edit, &healthy)
             }
             ClientRequest::EditWorkspaceModel { edit } => {
                 let mut fixture = state.lock().unwrap();
@@ -502,7 +637,7 @@ fn client(
             },
             ClientRequest::ChatAttach { session } => {
                 let repaired = state.lock().unwrap().repaired;
-                let retired = if peer_mode {
+                let retired = if peer_mode || image_mode {
                     let fixture = state.lock().unwrap();
                     fixture.model.views[0].retired.contains(&CardId::from_uuid(fixture.model.agents[0].id.as_uuid()))
                 } else { false };
@@ -681,6 +816,15 @@ fn client(
             ServerMessage::Response { response: ServerResponse::WorkspaceModel { model } }
                 if model.channels[0].title == "Peer removal received"
                     && model.views[0].retired.contains(&CardId::from_uuid(model.agents[0].id.as_uuid())));
+        let image_read_delivered = if image_mode && explicit_read {
+            match &response {
+                ServerMessage::Response { response: ServerResponse::WorkspaceModel { model } } => Some(format!(
+                    "image-read-delivered sequence={} revision={} retired={}", model.sequence, model.views[0].revision,
+                    model.views[0].retired.contains(&CardId::from_uuid(model.agents[0].id.as_uuid())),
+                )),
+                _ => None,
+            }
+        } else { None };
         let healthy_long_snapshot = match &response {
             ServerMessage::Response {
                 response: ServerResponse::ChatAttached { session, snapshot },
@@ -719,6 +863,7 @@ fn client(
             record(&root, "composition-context-copy-delivered");
         }
         if peer_model_delivered { record(&root, "peer-removal-model-delivered"); }
+        if let Some(receipt) = image_read_delivered { record(&root, &receipt); }
         if let Some(receipt) = healthy_long_snapshot { record(&root, &receipt); }
         if let Some(chat_id) = visible_chat {
             if terminal_ipc::write_frame(&mut *writer.lock().unwrap(), &ServerEnvelope {
@@ -727,6 +872,74 @@ fn client(
             }).is_err() { break; }
         }
         if explicit_read { record(&root, "explicit-read-replied"); }
+        let start_image = if watching && image_mode {
+            let mut fixture = state.lock().unwrap();
+            let first = !fixture.image_removal_started;
+            fixture.image_removal_started = true;
+            first
+        } else { false };
+        if start_image {
+            let writer = writer.clone();
+            let state = state.clone();
+            let root = root.clone();
+            let healthy = healthy.clone();
+            let held = held.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !root.join("image-remove").exists() {
+                    if std::time::Instant::now() >= deadline { record(&root, "UNEXPECTED-image-trigger-deadline"); return; }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let image = match managed_image(&root) {
+                    Ok(image) => image,
+                    Err(reason) => { record(&root, &format!("UNEXPECTED-image-pre-remove-asset {reason:?}")); return; }
+                };
+                record(&root, &format!("image-pre-remove-asset-validated id={} sha256={}",
+                    image.reference.as_ref().unwrap().id, image.reference.as_ref().unwrap().sha256));
+                let mut writer = writer.lock().unwrap();
+                let mut fixture = state.lock().unwrap();
+                let id = CardId::from_uuid(fixture.model.agents[0].id.as_uuid());
+                let bad_id = CardId::from_uuid(fixture.model.agents[1].id.as_uuid());
+                let mut issuer = healthy.clone();
+                issuer.launch.session_id = None;
+                let mut stale = held.clone();
+                stale.proof.as_mut().unwrap().host_incarnation = "synthetic-stale-incarnation".into();
+                if fixture.model.agents.len() != 2 || fixture.model.agents[0].closed
+                    || fixture.model.agents[0].session != Some(HostedSession::Chat(issuer))
+                    || fixture.model.agents[1].closed
+                    || fixture.model.agents[1].session != Some(HostedSession::Chat(stale)) {
+                    record(&root, "UNEXPECTED-image-issuer-or-held-source-changed"); return;
+                }
+                let view = &mut fixture.model.views[0];
+                if view.panes.len() != 2 || view.retired.contains(&id)
+                    || !view.panes.iter().any(|pane| pane.id == id && pane.kind == CardKind::Chat(healthy.clone())
+                        && pane.scope.is_none() && !pane.pending_terminal_start)
+                    || !view.panes.iter().any(|pane| pane.id == bad_id && pane.kind == CardKind::Chat(held.clone())
+                        && pane.scope.is_none() && !pane.pending_terminal_start) {
+                    record(&root, "UNEXPECTED-image-canonical-source-changed"); return;
+                }
+                let expected_revision = view.revision;
+                let scope = view.scope.clone();
+                record(&root, &format!("image-pre-remove-canonical-witness scope={scope:?} revision={expected_revision} panes={:?}", view.panes));
+                view.apply(&Change::Remove { id }).expect("exact image-only peer removal");
+                view.revision += 1;
+                fixture.model.sequence += 1;
+                fixture.model.channels[0].title = "Image retirement received".into();
+                fixture.model.channels[0].title_source = ChannelTitleSource::Manual;
+                let message = ServerEnvelope {
+                    version: terminal_ipc::PROTOCOL_VERSION, request_id: None, proof: proof(),
+                    message: ServerMessage::WorkspaceModelEdited {
+                        sequence: fixture.model.sequence,
+                        edit: ModelEdit::ChangeView { scope, expected_revision, operation: OperationId::new().as_uuid(), change: Change::Remove { id } },
+                    },
+                };
+                drop(fixture);
+                if terminal_ipc::write_frame(&mut *writer, &message).is_err() {
+                    record(&root, "UNEXPECTED-image-event-write-failed"); return;
+                }
+                record(&root, &format!("image-removal-event-delivered expected_revision={expected_revision}"));
+            });
+        }
         let start_peer = if watching && peer_mode {
             let mut fixture = state.lock().unwrap();
             let first = !fixture.peer_removal_started;
@@ -894,11 +1107,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mode = std::env::args().nth(2).unwrap_or_else(|| "stale".into());
-    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history" | "peer-removal" | "composition") {
+    if !matches!(mode.as_str(), "stale" | "closed" | "closed-history" | "peer-removal" | "composition" | "image-only") {
         return Err("Unknown native fixture mode".into());
     }
     let peer_mode = mode == "peer-removal";
     let composition_mode = mode == "composition";
+    let image_mode = mode == "image-only";
+    if image_mode != (std::env::var("HELD_FIXTURE_IMAGE_ONLY").as_deref() == Ok("1")) {
+        return Err("Image-only mode and private environment disagree".into());
+    }
     if composition_mode != (std::env::var("HELD_FIXTURE_COMPOSITION").as_deref() == Ok("1")) {
         return Err("Composition mode and private environment disagree".into());
     }
@@ -1017,6 +1234,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = StateStore::open(&database, cagents::session::current_boot_id()?)?;
         let workspace_id: WorkspaceId = fs::read_to_string(root.join("workspace-id"))?.trim().parse()?;
         let saved = store.load_workspace(workspace_id, None)?.ok_or("Saved workspace missing")?;
+        #[cfg(held_product_after)]
+        if image_mode {
+            let image = managed_image(&root)?;
+            let owner = saved.channels.iter().find(|owner| owner.id == channel).ok_or("Image channel missing")?;
+            let source = saved.cards.iter().find(|card| card.id == healthy_id).ok_or("Image source history missing")?;
+            let bad = saved.cards.iter().find(|card| card.id == bad_id).ok_or("Image rejected sibling missing")?;
+            if source.kind != CardKind::Chat(healthy.clone()) || bad.kind != CardKind::Chat(held.clone())
+                || !bad.existence.is_open() || saved.active_channel != Some(channel)
+                || saved.cards.len() != 2 || saved.channels.len() != 1
+                || saved.quarantined_panes != HashMap::from([(bad_id, CardKind::Chat(held.clone()))])
+                || saved.pending_chat_admissions.get(&bad_id) != Some(&held)
+                || saved.pending_chat_admissions.len() != 1
+                || saved.pending_chat_admissions.contains_key(&healthy_id)
+                || !saved.chat_drafts.is_empty()
+                || saved.chat_draft_attachments.contains_key(&bad_id)
+                || saved.local_only_cards.contains(&bad_id)
+                || owner.project_id != project || !owner.shared {
+                return Err("Image-only source, proof, empty text, sibling denial, scope or pending custody changed".into());
+            }
+            #[cfg(held_image_before)]
+            {
+                if !matches!(&source.existence, Existence::Closed { .. }) || !saved.local_only_cards.is_empty()
+                    || owner.cards != vec![bad_id] || !saved.chat_draft_attachments.is_empty() {
+                    return Err("BeforeImage must positively show exact retired image association loss".into());
+                }
+                println!("typed-image-before-existing-association-loss: exact-source-closed no-local-custody image-association-absent valid-asset-bytes-retained sibling-only-quarantine");
+            }
+            #[cfg(not(held_image_before))]
+            {
+                if !source.existence.is_open() || !saved.local_only_cards.contains(&healthy_id)
+                    || saved.local_only_cards.len() != 1 || saved.chat_draft_attachments.len() != 1
+                    || owner.cards != vec![healthy_id, bad_id]
+                    || saved.chat_draft_attachments.get(&healthy_id) != Some(&vec![image]) {
+                    return Err("After image-only retirement lost exact open local source or managed image".into());
+                }
+                println!("typed-image-after-open-local-source-exact-managed-image-and-sibling-only-quarantine-preserved");
+            }
+            return Ok(());
+        }
         #[cfg(held_composition_main_before)]
         if composition_mode {
             let created: ChannelId = fs::read_to_string(root.join("composition-channel-id"))?.parse()?;
@@ -1145,6 +1401,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     fs::write(root.join("expected-draft.txt"), &draft)?;
+    if image_mode {
+        if payload != "empty" || terminal_surface || peer_mode || composition_mode
+            || std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1")
+            || std::env::var("HELD_FIXTURE_ORDINARY").as_deref() == Ok("1") {
+            return Err("Image-only requires its separate empty mixed Chat fixture".into());
+        }
+        fs::write(root.join("image-only-offered.png"), MANAGED_PNG)?;
+    }
     if composition_mode {
         if payload != "short" || terminal_surface
             || std::env::var("HELD_FIXTURE_HIDDEN").as_deref() == Ok("1")
@@ -1175,6 +1439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat_draft_attachments: if payload == "empty" { HashMap::new() } else { HashMap::from([(bad_id, vec![attachment.clone()])]) },
         ..Default::default()
     };
+    if image_mode { workspace.chat_drafts.clear(); }
     fs::write(root.join("workspace-id"), workspace.id.to_string())?;
     workspace.channels.push(ProjectChannel {
         id: channel,
@@ -1293,7 +1558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session: Some(HostedSession::Chat(session)),
             console: None,
             created_ms: 0,
-            closed: id == bad_id && mode != "stale" && !composition_mode,
+            closed: id == bad_id && mode != "stale" && !composition_mode && !image_mode,
         });
     if terminal_surface {
         let CardKind::Terminal(terminal) = &cards[1].kind else { unreachable!() };
@@ -1306,6 +1571,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut agents = agents.to_vec();
     if peer_mode {
         agents.truncate(1);
+        let Some(HostedSession::Chat(issued)) = &mut agents[0].session else { unreachable!() };
+        issued.launch.session_id = None;
+    }
+    if image_mode {
         let Some(HostedSession::Chat(issued)) = &mut agents[0].session else { unreachable!() };
         issued.launch.session_id = None;
     }
@@ -1328,6 +1597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ordinary_started: false,
         peer_removal_started: false,
         composition_channel: None,
+        image_removal_started: false,
         model: WorkspaceModel {
             identity: workspace.workspace_model_identity.unwrap(),
             sequence: 1,

@@ -195,6 +195,7 @@ try:
                      'ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection',
                      'ranked_snapshot_retires_verified_pane_behind_newer_metadata',
                      'ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial',
+                     'mixed_scope_verified_retirement_preserves_runtime_only_managed_images',
                      'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner',
                      'ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume',
                      'keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click',
@@ -204,8 +205,15 @@ try:
             output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
             if name not in failures:
-                assert test in text and '1 passed; 0 failed' in text
+                assert text.splitlines().count('test ' + test + ' ... ok') == 1
+                assert 'test result: ok. 1 passed; 0 failed;' in text
         for test in [
+            'app::chat_ui::image_only_peer_remove_tests::peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen',
+            'app::chat_ui::image_only_peer_remove_tests::ready_image_only_alias_blocks_canonical_adoption',
+            'app::chat_ui::image_only_peer_remove_tests::ready_image_only_canonical_destination_refuses_draft_rekey',
+            'app::chat_ui::image_only_peer_remove_tests::history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work',
+            'app::chat_ui::image_only_peer_remove_tests::explicit_image_removal_and_local_close_keep_their_discard_semantics',
+            'app::chat_ui::image_only_peer_remove_tests::pending_images_and_text_remain_local_work_while_an_empty_draft_does_not',
             'app::notification_ui::tests::notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot',
             'app::workspace_model_sync::tests::model_read_publishes_new_managed_chat_before_initialized_view_projection',
             'app::workspace_model_sync::tests::create_publisher_keeps_the_complete_canonical_rank_response',
@@ -226,7 +234,8 @@ try:
             output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
             text = output.read_text()
             if name not in failures:
-                assert test in text and '1 passed; 0 failed' in text
+                assert text.splitlines().count('test ' + test + ' ... ok') == 1
+                assert 'test result: ok. 1 passed; 0 failed;' in text
         if failures:
             raise RuntimeError('User startup qualification failed: ' + ', '.join(failures))
     if '--focused-only' in sys.argv[3:]:

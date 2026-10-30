@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: 9ead6a2019db03485ebe1d608b697e1959ca1e54
-      PRODUCT_TREE: 55b02f04f3d297bae206c87ca0ef493e769508b7
+      PRODUCT_SHA: 8bf7a35b36339c2e5aa9b5511faf035b2171d57e
+      PRODUCT_TREE: a8e3df6de15242f51a7a2cb589d573bf38c0313d
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -56,6 +56,11 @@ jobs:
           ref: c4e75601ae2e8c6f11f810d36af94726477efbb4
           path: before-main
           persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 9ead6a2019db03485ebe1d608b697e1959ca1e54
+          path: before-image
+          persist-credentials: false
       - name: Install native evidence tools
         shell: bash
         run: sudo apt-get update && sudo apt-get install -y xvfb xauth x11-utils openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 adwaita-icon-theme fonts-noto-cjk
@@ -78,7 +83,7 @@ jobs:
         id: native
         shell: bash
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/before-main"
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/before-main" "$GITHUB_WORKSPACE/before-image"
       - name: Upload native interaction evidence
         if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -20,7 +20,7 @@ import pyatspi
 from gi.repository import GLib
 from PIL import Image
 
-control, before, after, before_main = map(Path, sys.argv[1:5])
+control, before, after, before_main, before_image = map(Path, sys.argv[1:6])
 out = Path(os.environ['QUALIFICATION_EVIDENCE']) / 'native'
 if os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted' or 'CAGENTS_AGENT_AUTHORITY' in os.environ:
     raise RuntimeError('A genuine GitHub-hosted User context is required; inherited authority is unchanged')
@@ -526,6 +526,331 @@ def copy_exact(pid, name, expected, keyboard=False, gesture=None):
            'sha256': hashlib.sha256(expected).hexdigest()})
 
 
+def image_only_observation(root, label, phase, *, sources=None, image=None, retired=False,
+                           before_loss=False, read=None, previous_generation=-1):
+    """One actual read-only transaction; no caller supplies a saved image."""
+    healthy = '00000000-0000-4000-8000-000000003922'
+    bad = '00000000-0000-4000-8000-000000004922'
+    channel = '00000000-0000-4000-8000-000000002922'
+    workspace = (root / 'workspace-id').read_text().strip()
+    database = Path((root / 'database-path').read_text())
+    private_inspection_file(root, database)
+    prefix = 'workspace:' + workspace + ':navigation:'
+    def observe():
+        try:
+            with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=.2) as db:
+                db.execute('BEGIN')
+                row = db.execute('SELECT generation FROM workspaces WHERE workspace_id=?', (workspace,)).fetchone()
+                cards = {card: {'workspace': owner, 'kind': kind, 'source': json.loads(content),
+                                'existence': json.loads(existence)}
+                         for card, owner, kind, content, existence in db.execute(
+                             'SELECT card_id,workspace_id,kind_tag,content_json,existence_json FROM cards WHERE card_id IN (?,?)',
+                             (healthy, bad))}
+                values = {key.removeprefix(prefix): json.loads(value) for key, value in db.execute(
+                    'SELECT key,value FROM metadata WHERE key LIKE ?', (prefix + '%',))}
+                required = ('threads', 'active_thread', 'chat_drafts', 'chat_draft_attachments',
+                            'pending_chat_admissions', 'quarantined_panes', 'local_only_cards')
+                if not row or row[0] <= previous_generation or set(cards) != {healthy, bad} or not all(key in values for key in required):
+                    return None
+                owners = [owner for owner in values['threads'] if owner['id'] == channel]
+                if len(owners) != 1:
+                    return None
+                owner = owners[0]
+                current_sources = {card: entry['source'] for card, entry in cards.items()}
+                if sources is not None and current_sources != sources:
+                    raise AssertionError('Image-only exact saved sources changed')
+                if any(entry['workspace'] != workspace or entry['kind'] != 'chat' for entry in cards.values()):
+                    raise AssertionError('Image-only card ownership changed')
+                if cards[bad]['existence'] != 'open' or values['active_thread'] != channel:
+                    return None
+                if values['quarantined_panes'] != {bad: dict(kind='chat', **cards[bad]['source'])}:
+                    return None
+                if values['pending_chat_admissions'] != {bad: cards[bad]['source']} or values['chat_drafts'] != {}:
+                    return None
+                if bad in values['local_only_cards'] or bad in values['chat_draft_attachments']:
+                    raise AssertionError('Rejected sibling gained local or image custody')
+                expected_members = [bad] if retired and before_loss else [healthy, bad]
+                if owner['cards'] != expected_members:
+                    return None
+                if retired and before_loss:
+                    existence = cards[healthy]['existence']
+                    if not isinstance(existence, dict) or set(existence) != {'closed'} or values['local_only_cards'] != [] or values['chat_draft_attachments'] != {}:
+                        return None
+                else:
+                    if cards[healthy]['existence'] != 'open' or set(values['local_only_cards']) != ({healthy} if retired else set()):
+                        return None
+                    images = values['chat_draft_attachments']
+                    if phase != 'bootstrap':
+                        if set(images) != {healthy} or len(images[healthy]) != 1:
+                            return None
+                        if image is not None and images[healthy] != [image]:
+                            raise AssertionError('Exact managed-image association changed')
+                    elif images:
+                        raise AssertionError('Bootstrap unexpectedly contains a draft image')
+                if read is not None and owner['title'] != 'Image custody check ' + str(read['sequence']):
+                    return None
+                offered = (root / 'image-only-offered.png').read_bytes()
+                managed = None
+                if phase != 'bootstrap':
+                    actual_image = image if image is not None else values['chat_draft_attachments'][healthy][0]
+                    path = Path(actual_image['path'])
+                    identity = private_inspection_file(root, path)
+                    data = path.read_bytes()
+                    assert path.is_relative_to(root / 'data') and data == offered, 'Managed PNG bytes changed'
+                    managed = {'attachment': actual_image, 'identity': identity, 'bytes': len(data),
+                               'sha256': hashlib.sha256(data).hexdigest()}
+                dump = out / (label + '-' + phase + '-storage.sql')
+                dump.write_text('\n'.join(db.iterdump()) + '\n')
+                value = {'phase': phase, 'database': str(database), 'workspace': workspace,
+                         'workspace_generation': row[0], 'cards': cards, 'navigation': values,
+                         'read': read, 'dump': dump.name, 'dump_sha256': digest(dump),
+                         'offered_png': {'bytes': len(offered), 'sha256': hashlib.sha256(offered).hexdigest()},
+                         'managed_asset': managed,
+                         'scope': 'Read-only SQLite transaction including committed WAL; storage reload is not a cold native UI restart.'}
+                (out / (label + '-' + phase + '-storage.json')).write_text(json.dumps(value, indent=2) + '\n')
+                event({'event': 'image-only-storage-phase', 'phase': phase, 'workspace_generation': row[0],
+                       'read': read, 'receipt': label + '-' + phase + '-storage.json'})
+                return value
+        except (sqlite3.Error, FileNotFoundError):
+            return None
+    return wait(observe)
+
+
+def exercise_image_only(pid, window, root, label, receipt, before_loss):
+    global viewport
+    ready = 'Verified conversation ready for image-only retirement.'
+    wait(lambda: accessibility_snapshot(lambda: any(ready in node.name and visible(node) for node in live_tree(pid))))
+    wait(lambda: any(node.name == 'Saved pane unavailable' and visible(node) for node in live_tree(pid)))
+    def binding():
+        # CardSurface and IdContainer forward/join their children in the
+        # actual accessibility tree. Bind A's real private-source header and
+        # named resize edge to its column, then the actual Entry and Ready
+        # sentinel inside that column; do not invent an ancestor/widget ID.
+        nodes = live_tree(pid)
+        directory = str(root.parent / 'project')
+        headers = [node for node in nodes if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node)
+                   and node.name.startswith('Chat pane ') and ', ' + directory + ', ' in node.name
+                   and not node.name.startswith('Chat pane Unavailable saved pane, ')]
+        assert len(headers) <= 1, 'Only admitted A may have an available Chat header'
+        if not headers:
+            return None
+        header = headers[0]
+        title, suffix = header.name.removeprefix('Chat pane ').split(', ' + directory + ', ', 1)
+        assert suffix in ('focused', 'not focused')
+        assert title in ('Saved recovery model received', 'Image retirement received') or re.fullmatch(r'Image custody check [0-9]+', title)
+        edges = [node for node in nodes if node.getRole() == pyatspi.ROLE_SEPARATOR and visible(node)
+                 and node.name == 'Resize Chat pane ' + title]
+        sidebars = [node for node in nodes if node.getRole() == pyatspi.ROLE_SEPARATOR and visible(node)
+                    and node.name == 'Resize sidebar']
+        if len(edges) != 1 or len(sidebars) != 1:
+            return None
+        edge = edges[0].queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        sidebar = sidebars[0].queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        left, right = sidebar.x + sidebar.width, edge.x
+        if not 0 <= left < right <= viewport[0]:
+            return None
+        def in_column(node):
+            bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+            return (bounds.width > 0 and bounds.height > 0 and left <= bounds.x
+                    and bounds.x + bounds.width <= right and 0 <= bounds.y
+                    and bounds.y + bounds.height <= viewport[1])
+        fields = [node for node in nodes if node.getRole() == pyatspi.ROLE_ENTRY
+                  and node.name == 'Message' and visible(node) and in_column(node)
+                  and node.getState().contains(pyatspi.STATE_EDITABLE)
+                  and node.getState().contains(pyatspi.STATE_ENABLED)]
+        sentinels = [node for node in nodes if ready in node.name and visible(node) and in_column(node)]
+        assert len(fields) <= 1, 'A column must expose exactly one native Message Entry'
+        assert len(sentinels) <= 1, 'A column must expose one unique Ready sentinel'
+        if len(fields) != 1 or len(sentinels) != 1:
+            return None
+        field = fields[0]
+        bounds = field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        header_bounds = header.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        return {'field': field, 'header': header.name, 'header_role': header.getRoleName(),
+                'header_bounds': [header_bounds.x, header_bounds.y, header_bounds.width, header_bounds.height],
+                'column': [left, right], 'resize_anchor': edges[0].name,
+                'editor_role': field.getRoleName(), 'editor_name': field.name,
+                'editor_bounds': [bounds.x, bounds.y, bounds.width, bounds.height]}
+    def composer():
+        value = binding()
+        return value['field'] if value else None
+    def no_pending_paste():
+        return not any(node.name == 'Pasting…' and visible(node) for node in live_tree(pid))
+    def input_receipt(phase, expected):
+        def read():
+            value = binding()
+            if value is None:
+                return None
+            field = value.pop('field')
+            field.clearCache()
+            assert field.queryText().getText(0, -1) == expected
+            assert field.getState().contains(pyatspi.STATE_FOCUSED)
+            assert no_pending_paste()
+            return value
+        value = wait(lambda: accessibility_snapshot(read))
+        focus = int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
+        focus_pid = int(subprocess.check_output(['xdotool', 'getwindowpid', str(focus)], text=True, timeout=5).strip())
+        assert focus == int(window) and focus_pid == pid, 'Native key input left the owned A window'
+        event({'event': 'image-only-key-target', 'phase': phase, 'window': focus, 'pid': focus_pid,
+               'editor_text': expected, 'pending_paste_visible': False, **value})
+    def chip():
+        value = binding()
+        if value is None:
+            return False
+        left, right = value['column']
+        def in_column(node):
+            bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+            return (left <= bounds.x and bounds.x + bounds.width <= right and bounds.width > 0
+                    and 0 <= bounds.y and bounds.y + bounds.height <= viewport[1] and bounds.height > 0)
+        nodes = live_tree(pid)
+        controls = [node for node in nodes if node.name == 'Remove attachment'
+                    and node.getRole() == pyatspi.ROLE_PUSH_BUTTON and visible(node) and in_column(node)]
+        assert len(controls) <= 1
+        return len(controls) == 1 and any(node.name == 'Image 1' and visible(node) and in_column(node) for node in nodes)
+    wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '')
+    bootstrap = image_only_observation(root, label, 'bootstrap')
+    sources = {card: value['source'] for card, value in bootstrap['cards'].items()}
+    assert sources['00000000-0000-4000-8000-000000003922']['id'] == '00000000-0000-4000-8000-000000005922'
+    assert sources['00000000-0000-4000-8000-000000004922']['id'] == '00000000-0000-4000-8000-000000006922'
+    png = (root / 'image-only-offered.png').read_bytes()
+    assert png.startswith(b'\x89PNG\r\n\x1a\n') and len(png) < 32768
+    (out / (label + '-offered.png')).write_bytes(png)
+    owner = subprocess.Popen(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-in', '-quiet'],
+                             stdin=subprocess.PIPE, start_new_session=True)
+    children.append(owner)
+    owner.stdin.write(png)
+    owner.stdin.close()
+    def offered():
+        assert owner.poll() is None, 'Owned PNG selection exited before paste'
+        result = subprocess.run(['xclip', '-selection', 'clipboard', '-out', '-target', 'image/png'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return result.returncode == 0 and result.stdout == png
+    wait(offered)
+    targets = subprocess.run(['xclip', '-selection', 'clipboard', '-out', '-target', 'TARGETS'],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    assert targets.returncode == 0 and b'image/png' in targets.stdout.splitlines()
+    names = targets.stdout.decode('ascii').splitlines()
+    assert not any(name.upper() in ('UTF8_STRING', 'STRING', 'TEXT') or name.lower().startswith('text/') for name in names), 'PNG owner also offered a text fallback'
+    event({'event': 'image-only-png-offered', 'selection_owner_pid': owner.pid, 'mime': 'image/png',
+           'bytes': len(png), 'sha256': hashlib.sha256(png).hexdigest(), 'targets': targets.stdout.decode()})
+    def image_editor_bounds():
+        field = composer()
+        if field is None:
+            return None
+        bounds = field.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        if (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
+                and bounds.x + bounds.width <= viewport[0] and bounds.y + bounds.height <= viewport[1]):
+            return bounds.x, bounds.y, bounds.width, bounds.height
+        return None
+    x, y, width, height = wait(image_editor_bounds)
+    event({'event': 'image-only-editor-pointer', 'bounds': [x, y, width, height]})
+    run(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1'])
+    wait(lambda: (field := composer()) is not None and field.getState().contains(pyatspi.STATE_FOCUSED))
+    input_receipt('before-paste', '')
+    run(['xdotool', 'key', '--clearmodifiers', 'ctrl+v'])
+    wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '[Image 1] ' and chip())
+    event({'event': 'image-only-native-paste-settled', 'editor': '[Image 1] ', 'image_label': 'Image 1'})
+    assert offered()
+    # Delete only the marker, with the exact A editor still focused. A real
+    # managed chip remains; neither unsent text nor an invalid path masks 1955.
+    wait(no_pending_paste)
+    input_receipt('before-marker-delete', '[Image 1] ')
+    run(['xdotool', 'key', '--clearmodifiers', 'ctrl+a', 'BackSpace'])
+    wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '' and chip())
+    wait(no_pending_paste)
+    event({'event': 'image-only-paste-settled', 'phase': 'marker-deleted', 'pending_paste_visible': False})
+    event({'event': 'image-only-native-marker-deleted', 'editor': '', 'image_label': 'Image 1'})
+    stop(owner)
+    def guarded_check(phase, *, retired, image=None, previous_generation):
+        wait(lambda: receipt.read_text().splitlines().count('explicit-read-started')
+             == receipt.read_text().splitlines().count('explicit-read-replied'))
+        lines = receipt.read_text().splitlines()
+        reads = sum(line.startswith('image-read-delivered ') for line in lines)
+        starts = lines.count('explicit-read-started')
+        click(pid, 'Check session again')
+        def new_read():
+            rows = [line for line in receipt.read_text().splitlines() if line.startswith('image-read-delivered ')]
+            assert len(rows) <= reads + 1, 'One guarded click must cause one exact Read'
+            if len(rows) != reads + 1:
+                return None
+            match = re.fullmatch(r'image-read-delivered sequence=([0-9]+) revision=([0-9]+) retired=(true|false)', rows[-1])
+            assert match is not None
+            value = {'sequence': int(match[1]), 'revision': int(match[2]), 'retired': match[3] == 'true'}
+            assert value['retired'] == retired
+            return value
+        read = wait(new_read)
+        wait(lambda: receipt.read_text().splitlines().count('explicit-read-replied') == starts + 1)
+        title = 'Open channel Image custody check ' + str(read['sequence']) + ', '
+        labels = wait(lambda: accessibility_snapshot(lambda: [node.name for node in live_tree(pid)
+            if node.getRole() == pyatspi.ROLE_PUSH_BUTTON and node.name.startswith(title) and visible(node)]))
+        assert len(labels) == 1
+        wait(lambda: any(node.name == 'Check session again' and visible(node)
+                         and node.getState().contains(pyatspi.STATE_ENABLED) for node in live_tree(pid)))
+        event({'event': 'image-only-read-processed', 'phase': phase, 'read': read, 'sidebar_label': labels[0]})
+        return image_only_observation(root, label, phase, sources=sources, image=image, retired=retired,
+                                      before_loss=before_loss, read=read, previous_generation=previous_generation)
+    pre = guarded_check('pre-remove', retired=False, previous_generation=bootstrap['workspace_generation'])
+    healthy = '00000000-0000-4000-8000-000000003922'
+    image = pre['navigation']['chat_draft_attachments'][healthy][0]
+    reference = image['reference']
+    assert set(image) == {'path', 'reference'}
+    assert set(reference) == {'id', 'number', 'device', 'name', 'sha256', 'extension'}
+    assert reference['number'] == 1 and reference['name'] == 'Pasted image' and reference['extension'] == 'png'
+    assert reference['sha256'] == hashlib.sha256(png).hexdigest()
+    image_path = Path(image['path'])
+    private_inspection_file(root, image_path)
+    assert image_path.is_relative_to(root / 'data') and image_path.read_bytes() == png
+    fields = [image['path'], reference['id'], str(reference['number']), reference['device'], reference['name'],
+              reference['sha256'], reference['extension']]
+    assert all(field and not any(ord(character) < 32 or ord(character) == 127 for character in field) for field in fields)
+    observation = root / 'image-only-attachment.txt'
+    fd = os.open(observation, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write('\n'.join(fields) + '\n')
+    private_inspection_file(root, observation)
+    (out / (label + '-pre-remove-image.json')).write_text(json.dumps({
+        'attachment': image, 'png_bytes': len(png), 'png_sha256': hashlib.sha256(png).hexdigest(),
+        'observed_after_read': pre['read'], 'observation_sha256': digest(observation),
+        'source': sources[healthy], 'scope': 'Actual native paste, then exact saved image observed through read-only SQLite.'}, indent=2) + '\n')
+    wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '' and chip())
+    wait(no_pending_paste)
+    event({'event': 'image-only-paste-settled', 'phase': 'pre-remove', 'pending_paste_visible': False})
+    capture(window, label + '-pre-remove-image-only-wide', (1280, 800), neutral_pointer=True)
+    (root / 'image-remove').touch()
+    event({'event': 'image-only-removal-triggered', 'input': 'External exact-scope watcher; no application input'})
+    wait(lambda: any(line.startswith('image-removal-event-delivered ') for line in receipt.read_text().splitlines()))
+    wait(lambda: any(re.fullmatch(r'image-read-delivered sequence=[0-9]+ revision=[0-9]+ retired=true', line)
+                     for line in receipt.read_text().splitlines()))
+    def post_state():
+        nodes = live_tree(pid)
+        if before_loss:
+            return (not any(visible(node) and (node.name == 'Message' or node.name == 'Remove attachment'
+                            or ready in node.name) for node in nodes)
+                    and len([node for node in nodes if visible(node) and node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                             and node.name.startswith('Chat pane ')]) == 1)
+        return (any(visible(node) and 'Closed in another window.' in node.name for node in nodes)
+                and len([node for node in nodes if visible(node) and node.getRole() == pyatspi.ROLE_PUSH_BUTTON
+                         and node.name.startswith('Chat pane ')]) == 2
+                and (field := composer()) is not None and field.queryText().getText(0, -1) == '' and chip())
+    wait(lambda: accessibility_snapshot(post_state))
+    first = guarded_check('post-remove-check-1', retired=True, image=image, previous_generation=pre['workspace_generation'])
+    second = guarded_check('post-remove-check-2', retired=True, image=image, previous_generation=first['workspace_generation'])
+    assert second['read']['sequence'] > first['read']['sequence'] > pre['read']['sequence']
+    assert second['read']['revision'] == first['read']['revision'] == pre['read']['revision'] + 1
+    assert first['navigation']['threads'][0]['ordinal'] == pre['navigation']['threads'][0]['ordinal']
+    for size, suffix in [((1280, 800), 'wide'), ((900, 700), 'narrow')]:
+        # Assert at the requested viewport before retaining its paired frame.
+        run(['xdotool', 'windowsize', '--sync', window, *map(str, size)])
+        run(['xdotool', 'windowmove', '--sync', window, '0', '0'])
+        viewport = size
+        wait(lambda: accessibility_snapshot(post_state))
+        capture(window, label + '-retired-' + suffix, size, neutral_pointer=True)
+        wait(lambda: accessibility_snapshot(post_state))
+    return {'before_loss': before_loss, 'image': image,
+            'phases': ['bootstrap', 'pre-remove', 'post-remove-check-1', 'post-remove-check-2'],
+            'scope': 'Synthetic provider transport; native clipboard/ImageSaved and repeated storage saves, not a cold UI restart.'}
+
+
 def open_ordinary_history(pid):
     plus_name = wait(lambda: next((node.name for node in live_tree(pid)
                                   if node.getRole() == pyatspi.ROLE_PUSH_BUTTON
@@ -971,12 +1296,13 @@ try:
     run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(control / '.github/qualification/pixel-response.c'),
          '-o', str(pixel_helper), '-lX11', '-lXtst'])
     fixtures = {}
-    for variant, checkout in [('before', before), ('after', after), ('before-main', before_main)]:
+    for variant, checkout in [('before', before), ('after', after), ('before-main', before_main), ('before-image', before_image)]:
         revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
         expected_sha, expected_tree = {
             'before': ('c727f886628897c1749290213e9d65037253095a', '6d4f36e2b4dd48fc9744305d34c78469384edcc5'),
             'after': (os.environ['PRODUCT_SHA'], os.environ['PRODUCT_TREE']),
             'before-main': ('c4e75601ae2e8c6f11f810d36af94726477efbb4', '69dacc7a72689e6d24f0a3d4122f9ddfe6ed23c8'),
+            'before-image': ('9ead6a2019db03485ebe1d608b697e1959ca1e54', '55b02f04f3d297bae206c87ca0ef493e769508b7'),
         }[variant]
         assert revision == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
@@ -992,13 +1318,21 @@ try:
                 and set(row.get('features', [])) == {'development', 'ui'}
                 for name in row.get('filenames', []) if name.endswith('.rlib')]
         assert len(libs) == 1
+        serde_libs = [name for row in rows if row.get('reason') == 'compiler-artifact'
+                      and row.get('target', {}).get('name') == 'serde_json'
+                      and 'lib' in row.get('target', {}).get('kind', [])
+                      for name in row.get('filenames', []) if name.endswith('.rlib')]
+        assert len(serde_libs) == 1, 'Each matched UI graph must supply exactly one existing serde_json library'
         helper = base / (variant + '-fixture')
         command = ['rustc', '--edition=2024', str(source), '--extern', 'cagents=' + libs[0],
+                   '--extern', 'serde_json=' + serde_libs[0],
                    '-L', 'dependency=' + str(target / 'dev-runtime/deps'), '-o', str(helper)]
         if variant == 'after':
             command += ['--cfg', 'held_product_after']
         elif variant == 'before-main':
             command += ['--cfg', 'held_composition_main_before']
+        elif variant == 'before-image':
+            command += ['--cfg', 'held_product_after', '--cfg', 'held_image_before']
         for row in rows:
             if row.get('reason') == 'build-script-executed':
                 for path in row.get('linked_paths', []):
@@ -1012,9 +1346,18 @@ try:
                 'helper_cfg': 'held_composition_main_before',
                 'scope': 'Current-main native composition comparison only; original c727 comparison remains separate.',
             }, indent=2) + '\n')
+        if variant == 'before-image':
+            (out / 'before-image-source.json').write_text(json.dumps({
+                'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
+                'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                'helper_cfg': ['held_product_after', 'held_image_before'],
+                'scope': 'Image-only association-loss comparison on frozen 9ead; historical c727 and c4 comparisons remain separate.',
+            }, indent=2) + '\n')
     # Compile each matched helper first. The original c727 reader still checks
     # candidate schema refusal; current main owns only the last comparison arm.
-    for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True), ('before-main', before_main, True)]:
+    for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True), ('before-main', before_main, True)] + [('before-image', before_image, 'image-only'), ('after', after, 'image-only')]:
+        image_only = composition == 'image-only'
+        composition = composition is True
         revision, helper, expected_sha, expected_tree = fixtures[variant]
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
@@ -1022,6 +1365,8 @@ try:
         arms = [('chat', 'stale', 'short', False, True), ('chat', 'stale', 'short', False, False), ('chat', 'stale', 'long', False, False), ('chat', 'closed', 'short', False, False), ('chat', 'closed', 'empty', False, False), ('terminal', 'closed', 'empty', False, False), ('chat', 'stale', 'short', True, False), ('chat', 'peer-removal', 'empty', False, False)]
         if composition:
             arms = [('chat', 'composition', 'short', False, False)]
+        if image_only:
+            arms = [('chat', 'image-only', 'empty', False, False)]
         for surface, mode, payload, hidden, ordinary in arms:
             label = f'{variant}-' + ('hidden-' if hidden else '') + ('ordinary-' if ordinary else '') + f'{surface}-{mode}-{payload}'
             active_arm = label
@@ -1053,6 +1398,7 @@ try:
             env['HELD_FIXTURE_ORDINARY'] = '1' if ordinary else '0'
             env['HELD_FIXTURE_PEER'] = '1' if mode == 'peer-removal' else '0'
             env['HELD_FIXTURE_COMPOSITION'] = '1' if composition else '0'
+            env['HELD_FIXTURE_IMAGE_ONLY'] = '1' if image_only else '0'
             env['ACCESSIBILITY_ENABLED'] = '1'
             env['NO_AT_BRIDGE'] = '0'
             env['WINIT_UNIX_BACKEND'] = 'x11'
@@ -1184,6 +1530,32 @@ try:
                 receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
                                  'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
                                  'events': events.splitlines(), 'scope': 'After-only synthetic composition supplement; no provider execution or adapter-classification claim.'})
+                assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
+                assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
+                event({'event': 'arm-completed', 'revision': revision})
+                active_arm = None
+                continue
+            if image_only:
+                image_contract = exercise_image_only(pid, window, root, label, receipt, variant == 'before-image')
+                stop(ui)
+                stop(fixture)
+                assert icon_config.read_text() == '"Adwaita"\n'
+                inspect_saved_snapshot(helper, root, mode, 'open', env, label)
+                inspect_saved_snapshot(base / 'before-fixture', root, mode, 'open', env, label, refusal=True)
+                events = receipt.read_text()
+                lines = events.splitlines()
+                assert 'UNEXPECTED-' not in events
+                assert lines.count('healthy-attach-requested') == 1
+                assert lines.count('effect-request-chat-attach') == 1
+                assert sum(line.startswith('image-removal-event-delivered ') for line in lines) == 1
+                assert sum(line.startswith('image-pre-remove-asset-validated ') for line in lines) == 1
+                assert not any(line.startswith(('effect-request-chat-start', 'effect-request-chat-prepare',
+                                               'effect-request-other-provider-mutation', 'effect-request-chat-close',
+                                               'repaired-held-attach-requested')) for line in lines)
+                (out / (label + '-receipts.txt')).write_text(events)
+                receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
+                                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
+                                 'events': lines, 'image_only_contract': image_contract})
                 assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
                 assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
                 event({'event': 'arm-completed', 'revision': revision})
