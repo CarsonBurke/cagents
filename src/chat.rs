@@ -2002,12 +2002,13 @@ pub struct Item {
 impl Item {
     /// Bodies whose complete canonical bytes can be copied through the owned
     /// transcript source. Provider context uses the same field as ordinary
-    /// prose; other deliveries retain their existing presentation copy rules.
+    /// prose. System reports retain their complete readable captured body;
+    /// other deliveries keep their existing presentation copy rules.
     pub(crate) fn logical_copy_body(&self) -> Option<&str> {
         match &self.content {
             ItemContent::Text { text, .. } => Some(text),
             ItemContent::Delivery {
-                kind: DeliveryKind::Notice,
+                kind: DeliveryKind::Notice | DeliveryKind::Report,
                 body,
                 ..
             } if self.role == Role::System => Some(body),

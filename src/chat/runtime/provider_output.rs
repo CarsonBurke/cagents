@@ -41,6 +41,7 @@ pub(super) struct Captured {
 
 #[derive(Clone, Copy)]
 pub(super) enum Origin {
+    ProviderProcess,
     Claude,
     Codex,
     Omp,
@@ -116,6 +117,7 @@ impl Captured {
     /// transcript. Status and EOF must come from the caller's actual observation.
     pub fn report(self, origin: Origin, exit: Exit, end: End) -> Report {
         let provider = match origin {
+            Origin::ProviderProcess => "Provider process",
             Origin::Claude => "Claude",
             Origin::Codex => "Codex",
             Origin::Omp => "Omp",

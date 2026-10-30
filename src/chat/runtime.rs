@@ -25,6 +25,7 @@ mod child_text_copy;
 pub(crate) mod courier_tests;
 mod execution;
 mod handle;
+mod provider_output;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
@@ -497,7 +498,8 @@ impl LocalHandle {
                     pending: VecDeque::new(),
                     offset: 0,
                     queued: 0,
-                    stderr: VecDeque::new(),
+                    stderr: None,
+                    stderr_eof: false,
                     indices: BTreeMap::new(),
                     retained: 0,
                     history_error: None,
@@ -573,6 +575,7 @@ impl LocalHandle {
                         || (unexpected_loss && native_installed.load(Ordering::Acquire)))
                         && !release_native.load(Ordering::Acquire)
                         || (adopted_native && !native_installed.load(Ordering::Acquire)));
+                let diagnostic = actor.retain_stderr_report();
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
@@ -583,13 +586,7 @@ impl LocalHandle {
                         }
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
-                    let stderr =
-                        String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
-                    let message = if stderr.is_empty() {
-                        error
-                    } else {
-                        format!("{error}\nProvider stderr (last 16 KiB): {stderr}")
-                    };
+                    let message = short_provider_error(&error, diagnostic.as_ref());
                     actor.apply(Event::Error {
                         message,
                         fatal: true,
@@ -599,6 +596,14 @@ impl LocalHandle {
                     if let Some(evidence) = attention {
                         actor.publish_current_attention(evidence);
                     }
+                } else if let Some((_, Err(error))) = diagnostic {
+                    actor.apply(Event::Error {
+                        message: short_provider_error(
+                            "Saving captured stderr was not confirmed",
+                            Some(&(String::new(), Err(error))),
+                        ),
+                        fatal: false,
+                    });
                 }
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
@@ -1887,7 +1892,9 @@ struct Actor {
     pending: VecDeque<Vec<u8>>,
     offset: usize,
     queued: usize,
-    stderr: VecDeque<u8>,
+    /// Absent on routes that never supplied an actual stderr pipe.
+    stderr: Option<provider_output::Capture>,
+    stderr_eof: bool,
     indices: BTreeMap<String, usize>,
     retained: usize,
     /// Only the active error published by the most recent history failure.
@@ -1971,7 +1978,129 @@ fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
 }
 
+fn diagnostic_prefix(text: &str, bytes: usize) -> &str {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn short_provider_error(error: &str, diagnostic: Option<&(String, Result<(), String>)>) -> String {
+    if diagnostic.is_none() {
+        let mut text = diagnostic_prefix(error, 1024);
+        if let Some((end, _)) = text.match_indices('\n').nth(4) {
+            text = &text[..end];
+        }
+        return text.to_owned();
+    }
+    let mut lines = vec![diagnostic_prefix(
+        error.lines().next().unwrap_or(error),
+        256,
+    )];
+    if let Some((summary, stored)) = diagnostic {
+        let mut details = summary.lines();
+        if let Some(status) = details.next().filter(|line| !line.is_empty()) {
+            lines.push(diagnostic_prefix(status, 128));
+        }
+        let tail: Vec<_> = details.rev().take(2).collect();
+        for line in tail.into_iter().rev() {
+            let mut start = line.len().saturating_sub(128);
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            lines.push(&line[start..]);
+        }
+        if let Err(error) = stored {
+            let mut message = lines.join("\n");
+            message.push_str("\nSaving stderr was not confirmed: ");
+            message.push_str(diagnostic_prefix(
+                error.lines().next().unwrap_or(error),
+                192,
+            ));
+            return message;
+        }
+    }
+    lines.join("\n")
+}
+
 impl Actor {
+    /// Commit actual observed stderr before the existing teardown/Exited path.
+    /// Capture finalization runs outside Snapshot/Store locks. This neither
+    /// drains a pipe nor extends source lifetime beyond existing ownership.
+    fn retain_stderr_report(&mut self) -> Option<(String, Result<(), String>)> {
+        use provider_output::{End, Exit, Origin};
+        use std::os::unix::process::ExitStatusExt;
+        let captured = self.stderr.take()?.finish();
+        if captured.metadata.raw_total == 0 {
+            return None;
+        }
+        let exit = self
+            .child
+            .as_ref()
+            .and_then(|child| child.observed_exit_status().ok().flatten())
+            .map_or(Exit::Unconfirmed, |status| {
+                status
+                    .code()
+                    .map(Exit::Code)
+                    .unwrap_or_else(|| status.signal().map_or(Exit::Unconfirmed, Exit::Signal))
+            });
+        let origin = self
+            .launch_account_scope
+            .as_ref()
+            .map_or(Origin::ProviderProcess, |scope| match scope.provider {
+                crate::agent::Provider::Claude => Origin::Claude,
+                crate::agent::Provider::Codex => Origin::Codex,
+                crate::agent::Provider::Omp => Origin::Omp,
+            });
+        let report = captured.report(
+            origin,
+            exit,
+            if self.stderr_eof {
+                End::StderrEof
+            } else {
+                End::BeforeStderrEof
+            },
+        );
+        let summary = report.summary;
+        let bytes = report.body.len();
+        if bytes > super::TEXT_COPY_LIMIT_BYTES {
+            return Some((
+                summary,
+                Err("Captured stderr exceeds the saved-output limit".into()),
+            ));
+        }
+        let id = format!("provider-stderr-{}", uuid::Uuid::new_v4());
+        let retained = (|| {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let events = store.apply(Event::Item(Item {
+                id,
+                role: super::Role::System,
+                content: ItemContent::Delivery {
+                    kind: super::DeliveryKind::Report,
+                    from: "Provider stderr".into(),
+                    sender: String::new(),
+                    summary: summary.clone(),
+                    body: report.body,
+                },
+                started_at: observed_at(),
+                at: observed_at(),
+            }))?;
+            Ok(events)
+        })();
+        let result = retained.and_then(|events| {
+            let warning = events.iter().find_map(|event| match event {
+                Event::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            });
+            for event in events {
+                self.apply(event);
+            }
+            self.touch();
+            warning.map_or(Ok(()), Err)
+        });
+        Some((summary, result))
+    }
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2034,6 +2163,7 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
+        self.stderr = Some(provider_output::Capture::default());
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
@@ -2245,14 +2375,15 @@ impl Actor {
             }
             if fds[2].revents != 0 {
                 match stderr.read(&mut buffer) {
-                    Ok(0) => stderr_eof = true,
+                    Ok(0) => {
+                        stderr_eof = true;
+                        self.stderr_eof = true;
+                    }
                     Ok(n) => {
-                        for byte in &buffer[..n] {
-                            if self.stderr.len() == 16384 {
-                                self.stderr.pop_front();
-                            }
-                            self.stderr.push_back(*byte);
-                        }
+                        self.stderr
+                            .as_mut()
+                            .ok_or("Provider stderr capture unavailable")?
+                            .push(&buffer[..n])?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stderr: {e}")),
@@ -6100,6 +6231,193 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn captured_stderr_fixture(read_only: bool, script: Option<&str>) -> LocalHandle {
+        struct StderrFixture;
+        impl Adapter for StderrFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                panic!("saved stderr copy must not reach the provider")
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+        }
+        // Real pipe bytes, not a preseeded report/copy descriptor. Deliberately
+        // exceed one Actor read; stdout EOF still does not prove stderr drain.
+        let script = script.unwrap_or("i=0; while [ \"$i\" -lt 2000 ]; do printf '\\033[31mfixture stderr failure λ\\033[0m\\n' >&2; i=$((i+1)); done; printf '{}\\n'; exit 3");
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), script.into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let mut store = preflight(&spec, &mut initial).unwrap();
+        if read_only {
+            store.read_only_for_test().unwrap();
+        }
+        LocalHandle::start(spec, Box::new(StderrFixture), initial, store, None, |_| {}).unwrap()
+    }
+
+    #[test]
+    fn captured_stderr_commits_one_report_and_reads_full_owned_body_after_actor_exit() {
+        let handle = captured_stderr_fixture(false, None);
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let reports: Vec<_> = snapshot
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.role == Role::System
+                    && matches!(
+                        item.content,
+                        ItemContent::Delivery {
+                            kind: super::super::DeliveryKind::Report,
+                            ..
+                        }
+                    )
+            })
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let (index, report) = reports[0];
+        let source = snapshot.text_copy_sources.conversation[index]
+            .as_ref()
+            .unwrap();
+        let preview = report.logical_copy_body().unwrap();
+        assert!(preview.len() <= 1024 && preview.lines().count() <= 5);
+        assert!(source.bytes > preview.len() as u64);
+        let mut full = String::new();
+        loop {
+            let page = handle.text_copy(source, full.len() as u64).unwrap();
+            assert_eq!(page.source, *source);
+            assert_eq!(page.offset, full.len() as u64);
+            full.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(full.len() as u64, source.bytes);
+        assert!(full.starts_with(
+            "Captured Provider process stderr\nProvider process exited with status 3."
+        ));
+        assert!(full.contains("fixture stderr failure λ"));
+        assert!(!full.contains('\u{1b}'));
+        assert_ne!(
+            full.contains("Capture reached stderr EOF."),
+            full.contains("Capture stopped before stderr EOF")
+        );
+        let error = snapshot.error.as_ref().unwrap();
+        assert!(error.len() <= 1024 && error.lines().count() <= 5);
+        assert!(!error.contains("last 16 KiB"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(handle.text_copy(source, 0).unwrap().offset, 0);
+    }
+
+    #[test]
+    fn failed_stderr_store_retention_keeps_original_error_and_completes_original_cleanup() {
+        let handle = captured_stderr_fixture(true, None);
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.text_copy_sources.conversation.is_empty());
+        let error = snapshot.error.as_ref().unwrap();
+        assert!(error.contains("Saving stderr was not confirmed"));
+        assert!(error.len() <= 1024 && error.lines().count() <= 5);
+        let original = handle.0.failure.lock().unwrap().clone().unwrap();
+        assert!(original.contains("Provider exited"));
+        assert!(!original.contains("Saving stderr"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(
+                Instant::now() < deadline,
+                "diagnostic refusal must not skip cleanup"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn short_provider_error_is_bounded_with_unknown_status_and_storage_refusal() {
+        let diagnostic = (
+            format!(
+                "Provider process exit status is unconfirmed.\n{}\nlast λ",
+                "🦀".repeat(3000)
+            ),
+            Err("disk error".repeat(1000)),
+        );
+        let error = short_provider_error(&"parser error".repeat(1000), Some(&diagnostic));
+        assert!(error.len() <= 1024 && error.lines().count() <= 5);
+        assert!(error.contains("exit status is unconfirmed"));
+        assert!(error.contains("last λ"));
+        assert!(error.contains("Saving stderr was not confirmed"));
+        assert!(short_provider_error(&"界".repeat(1000), None).len() <= 1024);
+        let unavailable = short_provider_error("one\ntwo\nthree\nfour\nfive\nsix", None);
+        assert_eq!(unavailable, "one\ntwo\nthree\nfour\nfive");
+    }
+
+    #[test]
+    fn stdout_eof_capture_keeps_unconfirmed_status_and_unread_stderr_suffix_explicit() {
+        // This child keeps stderr/stdin open after closing stdout. Existing
+        // owner cleanup ends it; the diagnostic must not call that prior EOF.
+        let handle = captured_stderr_fixture(
+            false,
+            Some(
+                "printf 'fixture incomplete diagnostic\\n' >&2; printf '{}\\n'; exec 1>&-; read -r unused",
+            ),
+        );
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let index = snapshot
+            .items
+            .iter()
+            .position(|item| {
+                item.role == Role::System
+                    && matches!(
+                        item.content,
+                        ItemContent::Delivery {
+                            kind: super::super::DeliveryKind::Report,
+                            ..
+                        }
+                    )
+            })
+            .unwrap();
+        let source = snapshot.text_copy_sources.conversation[index]
+            .as_ref()
+            .unwrap();
+        let mut full = String::new();
+        loop {
+            let page = handle.text_copy(source, full.len() as u64).unwrap();
+            full.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert!(full.contains("Provider process exit status is unconfirmed."));
+        assert!(
+            full.contains("Capture stopped before stderr EOF; later output may be unavailable.")
+        );
+        assert!(!full.contains("Capture reached stderr EOF."));
+        assert!(full.ends_with("fixture incomplete diagnostic\n"));
+        assert!(
+            snapshot
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("unobservable writer")
+        );
     }
 
     #[test]

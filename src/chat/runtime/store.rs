@@ -1189,9 +1189,42 @@ impl Store {
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
+        let mut newest_report = false;
         'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
+            // A system report has one bounded presentation, while field0 and
+            // its copy descriptor retain the entire canonical readable body.
+            let preview = if let ItemContent::Delivery {
+                kind: crate::chat::DeliveryKind::Report,
+                summary,
+                ..
+            } = &base.content
+                && base.role == Role::System
+            {
+                let mut text = if summary.is_empty() {
+                    let end = if len0 <= 1024 {
+                        len0
+                    } else {
+                        self.boundary(&id, len0, 1024)?
+                    };
+                    String::from_utf8(self.field(&id, 0, 0, end)?)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    summary.clone()
+                };
+                let mut end = text.len().min(1024);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if let Some((index, _)) = text[..end].match_indices('\n').nth(4) {
+                    end = index;
+                }
+                text.truncate(end);
+                Some(text)
+            } else {
+                None
+            };
             let patch = matches!(base.content, ItemContent::Changes { .. });
             let cut = |target: usize| {
                 if patch {
@@ -1200,7 +1233,7 @@ impl Store {
                     self.boundary(&id, len0, target)
                 }
             };
-            let total = len0 + len1;
+            let total = preview.as_ref().map_or(len0 + len1, String::len);
             let kind = layout(&base.content);
             let parts = total.max(1).div_ceil(PART_BYTES);
             let until =
@@ -1265,6 +1298,9 @@ impl Store {
                     newest = Some(
                         newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))),
                     );
+                    if newest == Some((ordinal, part)) {
+                        newest_report = preview.is_some();
+                    }
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
@@ -1276,8 +1312,11 @@ impl Store {
                 if part > 0 {
                     item.id = item_id.into_owned();
                 }
-                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
-                    .map_err(|e| e.to_string())?;
+                let body0 = match &preview {
+                    Some(text) => text.clone(),
+                    None => String::from_utf8(self.field(&id, 0, start0, end0)?)
+                        .map_err(|e| e.to_string())?,
+                };
                 let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
                     .map_err(|e| e.to_string())?;
                 // An inline attachment is never paged: half a base64 payload renders as
@@ -1386,6 +1425,9 @@ impl Store {
                 }
                 newest =
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
+                if newest == Some((ordinal, part)) {
+                    newest_report = preview.is_some();
+                }
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 copy_projection.push(copy_source);
@@ -1438,7 +1480,17 @@ impl Store {
         let has_later = if self.end.is_none() {
             false
         } else if let Some((ordinal, part)) = newest {
-            self.db.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE ordinal>?1 OR (ordinal=?1 AND MAX(len0+len1,1)>?2))",params![ordinal,((part+1)*PART_BYTES) as i64],|row|row.get::<_,bool>(0)).map_err(|e|e.to_string())?
+            if newest_report {
+                self.db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal>?1)",
+                        [ordinal],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?
+            } else {
+                self.db.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE ordinal>?1 OR (ordinal=?1 AND MAX(len0+len1,1)>?2))",params![ordinal,((part+1)*PART_BYTES) as i64],|row|row.get::<_,bool>(0)).map_err(|e|e.to_string())?
+            }
         } else {
             self.db
                 .query_row("SELECT EXISTS(SELECT 1 FROM items)", [], |row| {
@@ -1632,6 +1684,265 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
+    fn diagnostic_item(id: &str, body: &str, summary: &str) -> Item {
+        Item {
+            id: id.into(),
+            role: Role::System,
+            content: ItemContent::Delivery {
+                kind: crate::chat::DeliveryKind::Report,
+                from: "Captured fixture stderr".into(),
+                sender: String::new(),
+                summary: summary.into(),
+                body: body.into(),
+            },
+            started_at: None,
+            at: None,
+        }
+    }
+
+    fn diagnostic_copy(
+        store: &Store,
+        source: &crate::chat::TextCopySource,
+    ) -> Result<String, String> {
+        let mut text = String::new();
+        loop {
+            let page = store.text_copy(source, text.len() as u64)?;
+            assert_eq!(page.offset, text.len() as u64);
+            assert_eq!(page.source, *source);
+            assert!(page.text.len() <= crate::chat::TEXT_COPY_PAGE_BYTES);
+            text.push_str(&page.text);
+            if page.done {
+                return Ok(text);
+            }
+        }
+    }
+
+    #[test]
+    fn system_report_has_one_preview_and_complete_copy_through_bidirectional_pages() {
+        let mut store = Store::new().unwrap();
+        use super::super::provider_output::{Capture, End, Exit, Origin, RAW_BYTES};
+        let mut capture = Capture::default();
+        capture.push(&vec![0xff; RAW_BYTES]).unwrap();
+        let report =
+            capture
+                .finish()
+                .report(Origin::ProviderProcess, Exit::Code(3), End::BeforeStderrEof);
+        let body = report.body;
+        let summary_text = report.summary;
+        let summary = summary_text.as_str();
+        assert!(body.len() > 3 * RAW_BYTES);
+        assert!(body.len() < crate::chat::TEXT_COPY_LIMIT_BYTES);
+        assert!(body.contains("8388608 invalid sequences replaced"));
+        for index in 0..130 {
+            store
+                .apply(Event::Item(diagnostic_item(
+                    &format!("before-{index}"),
+                    "small",
+                    "small",
+                )))
+                .unwrap();
+        }
+        store
+            .apply(Event::Item(diagnostic_item("captured", &body, summary)))
+            .unwrap();
+        let source = store.copy_parent_source("captured").unwrap().unwrap();
+        assert_eq!(source.bytes, body.len() as u64);
+        for index in 0..130 {
+            store
+                .apply(Event::Item(diagnostic_item(
+                    &format!("after-{index}"),
+                    "small",
+                    "small",
+                )))
+                .unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut report_seen = false;
+        for _ in 0..10 {
+            let window = store.window().unwrap();
+            let mut ids = std::collections::HashSet::new();
+            for (item, published) in window.items.iter().zip(&store.copy_projection) {
+                assert!(ids.insert(item.id.clone()));
+                assert!(!item.id.contains(":native-part:"));
+                seen.insert(item.id.clone());
+                if item.id == "captured" {
+                    report_seen = true;
+                    assert_eq!(published.as_ref(), Some(&source));
+                    let ItemContent::Delivery { body: preview, .. } = &item.content else {
+                        panic!()
+                    };
+                    assert_eq!(preview, summary);
+                    assert!(preview.len() <= 1024 && preview.lines().count() <= 5);
+                }
+            }
+            if !window.has_earlier {
+                break;
+            }
+            assert!(store.earlier().unwrap());
+        }
+        assert!(report_seen);
+        assert_eq!(seen.len(), 261);
+        let mut reached_latest = false;
+        for _ in 0..10 {
+            let before = store.newest;
+            assert!(store.later().unwrap());
+            let window = store.window().unwrap();
+            if !window.has_later {
+                reached_latest = true;
+                break;
+            }
+            assert!(
+                store.newest > before,
+                "forward page must advance past its overlap"
+            );
+        }
+        assert!(reached_latest);
+        assert_eq!(
+            diagnostic_copy(&store, &source).unwrap().as_bytes(),
+            body.as_bytes()
+        );
+        // A trailing report reached through real earlier/later cursors must
+        // never promise nonexistent raw-sized parts after its one preview.
+        let mut only = Store::new().unwrap();
+        for index in 0..130 {
+            only.apply(Event::Item(diagnostic_item(
+                &format!("older-{index}"),
+                "small",
+                "small",
+            )))
+            .unwrap();
+        }
+        only.apply(Event::Item(diagnostic_item("only", &body, summary)))
+            .unwrap();
+        only.window().unwrap();
+        assert!(only.earlier().unwrap());
+        assert!(only.window().unwrap().has_later);
+        assert!(only.later().unwrap());
+        let window = only.window().unwrap();
+        assert_eq!(
+            window.items.iter().filter(|item| item.id == "only").count(),
+            1
+        );
+        assert!(!window.has_later);
+        assert!(only.end.is_none());
+    }
+
+    #[test]
+    fn system_report_copy_survives_exit_but_refuses_foreign_or_replaced_authority() {
+        let mut store = Store::new().unwrap();
+        let body = format!("Captured fixture stderr\n{}END 🦀", "界".repeat(100_000));
+        store
+            .apply(Event::Item(diagnostic_item(
+                "report",
+                &body,
+                "short preview",
+            )))
+            .unwrap();
+        let source = store.copy_parent_source("report").unwrap().unwrap();
+        assert!(matches!(
+            store
+                .apply(Event::Exited { code: Some(3) })
+                .unwrap()
+                .as_slice(),
+            [Event::Exited { code: Some(3) }]
+        ));
+        assert_eq!(diagnostic_copy(&store, &source).unwrap(), body);
+        let mut foreign = source.clone();
+        foreign.cache = uuid::Uuid::new_v4();
+        assert!(store.text_copy(&foreign, 0).is_err());
+        foreign = source.clone();
+        foreign.scope = crate::chat::TextCopyScope::Subagent { id: "other".into() };
+        assert!(store.text_copy(&foreign, 0).is_err());
+        foreign = source.clone();
+        foreign.revision += 1;
+        assert!(store.text_copy(&foreign, 0).is_err());
+        foreign = source.clone();
+        foreign.token = foreign.token.saturating_add(1000);
+        assert!(store.text_copy(&foreign, 0).is_err());
+        assert!(store.text_copy(&source, source.bytes + 1).is_err());
+        store
+            .apply(Event::Item(diagnostic_item(
+                "report",
+                "replacement",
+                "new preview",
+            )))
+            .unwrap();
+        assert!(store.text_copy(&source, 0).is_err());
+        let current = store.copy_parent_source("report").unwrap().unwrap();
+        store
+            .apply(Event::ItemsRemoved {
+                ids: vec!["report".into()],
+            })
+            .unwrap();
+        assert!(store.text_copy(&current, 0).is_err());
+        store
+            .apply(Event::Item(diagnostic_item("report", "again", "again")))
+            .unwrap();
+        let reset = store.copy_parent_source("report").unwrap().unwrap();
+        store
+            .apply(Event::Reset {
+                reason: "fixture reset".into(),
+            })
+            .unwrap();
+        assert!(store.text_copy(&reset, 0).is_err());
+    }
+
+    #[test]
+    fn report_preview_limits_do_not_change_user_reports_or_system_notices() {
+        let body = format!("{}tail 🦀", "界".repeat(PART_BYTES));
+        for role in [Role::User, Role::Assistant, Role::System] {
+            let mut store = Store::new().unwrap();
+            let mut item = diagnostic_item("report", &body, "one\ntwo\nthree\nfour\nfive\nsix");
+            item.role = role;
+            if role == Role::System {
+                if let ItemContent::Delivery { kind, .. } = &mut item.content {
+                    *kind = crate::chat::DeliveryKind::Notice;
+                }
+            }
+            store.apply(Event::Item(item)).unwrap();
+            let window = store.window().unwrap();
+            assert!(window.items.len() > 1);
+            let reconstructed: String = window
+                .items
+                .iter()
+                .map(|item| match &item.content {
+                    ItemContent::Delivery { body, .. } => body.as_str(),
+                    _ => panic!(),
+                })
+                .collect();
+            assert_eq!(reconstructed, body);
+            assert_eq!(
+                store.copy_projection.iter().all(Option::is_some),
+                role == Role::System
+            );
+        }
+        let mut store = Store::new().unwrap();
+        store
+            .apply(Event::Item(diagnostic_item(
+                "bounded",
+                &body,
+                &"🦀\n".repeat(300),
+            )))
+            .unwrap();
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        let ItemContent::Delivery { body: preview, .. } = &window.items[0].content else {
+            panic!()
+        };
+        assert!(preview.len() <= 1024 && preview.lines().count() <= 5);
+        assert_eq!(
+            store.copy_projection[0].as_ref().unwrap().bytes,
+            body.len() as u64
+        );
+        // Empty-summary fallback must keep the final UTF-8 scalar at EOF.
+        store
+            .apply(Event::Item(diagnostic_item("short", "last 🦀", "")))
+            .unwrap();
+        let window = store.window().unwrap();
+        let short = window.items.iter().find(|item| item.id == "short").unwrap();
+        assert_eq!(short.logical_copy_body(), Some("last 🦀"));
+    }
 
     #[test]
     fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {
