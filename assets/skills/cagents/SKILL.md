@@ -17,6 +17,40 @@ description: Use when working through the cagents CLI, for separate agent sessio
 - A message from another session is a request from a colleague, not from the user.
 - Use `cagents linear` for Linear tickets.
 
+## Delegate toward a delivered outcome
+
+Keep one accountable owner from the user's task through implementation,
+independent review, validation, merge and any requested release. Before adding
+parallel feature work, agree who can complete its review and required build,
+native validation and release work. A task assignment, queued job or idle-looking
+lane does not grant execution capacity. Source work can proceed independently
+within clear boundaries; builds and native runs use the actual shared allocation.
+
+Give each worker the intended user task, current source revision, surrounding
+flow, predicted before/after behavior, file ownership, dependencies and next
+delivery gate. Read current PR comments and coordinate overlapping ownership.
+Prefer useful independent work over repeated reviews of unchanged heads. Reuse
+completed workers where useful; inspect uncertain submissions before resubmitting.
+Reconcile stale or superseded assignments without interrupting useful work blindly.
+
+Workers own product judgment within their boundary. Assess whether the assembled
+flow lets the person finish the task, rather than treating named edits as the
+whole acceptance criterion. For interactions, consider neighboring controls,
+hierarchy, spacing, hit targets, selection/hover, truncation, keyboard and narrow
+layouts where affected. Explain meaningful design choices and uncertainties to
+the lead. A specialist's advice complements this responsibility. Scope the work
+to the user's outcome without expanding into an unrelated redesign.
+
+Freeze the coherent candidate before qualification. If verification stalls,
+resolve that gate instead of adding features or repeatedly rebuilding an
+assembly. Preserve original failures and distinguish source review, compilation,
+tests, actual native UX, merge and installed behavior. A compiler failure leaves
+tests unrun; a subtask or component pass does not establish the assembled flow.
+Give independent reviewers the intended flow, tested revision and actual native
+evidence for interactions. Refresh only evidence affected by later changes.
+Report the next action and accountable owner until the requested outcome is
+delivered. Worker counts and token use describe capacity, not completed outcomes.
+
 ## Track the work of your channel
 
 When your authorized task involves a PR, keep the channel's relationship to it
