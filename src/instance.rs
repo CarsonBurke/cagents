@@ -2316,6 +2316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn automatic_cleanup_preserves_older_and_unregistered_independent_editors() {
         use std::os::unix::fs::symlink;
         let runtime = tempfile::tempdir().unwrap();
