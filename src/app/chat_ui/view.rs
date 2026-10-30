@@ -4713,13 +4713,22 @@ impl Runtime {
             ))
             .class(crate::ui_controls::control_style(false, None))
             .on_press(action(Action::Toggle(self.target, item.id.clone())));
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(match self.message_copy_source(item) {
-                    Some(source) => Action::CopyMessage(self.target, item.id.clone(), Some(source)),
-                    None => Action::Copy(self.target, item.id.clone(), CopyPart::Text),
-                }));
+            let source = self.message_copy_source(item);
+            let copy = widget::button::custom(design::caption(if source.is_some() {
+                "Copy report"
+            } else {
+                "Copy report preview"
+            }))
+            .name(if source.is_some() {
+                format!("Copy original report: {heading}")
+            } else {
+                format!("Copy report preview: {heading}")
+            })
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(action(match source {
+                Some(source) => Action::CopyMessage(self.target, item.id.clone(), Some(source)),
+                None => Action::Copy(self.target, item.id.clone(), CopyPart::Text),
+            }));
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Chat),
