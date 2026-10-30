@@ -861,7 +861,8 @@ pub struct AppSettings {
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
-    /// Automatic cleanup is opt-in and never discards changes or stops work.
+    /// Opt-in merged-worktree notices retain files until explicit deletion.
+    /// The legacy storage key remains compatible with existing settings.
     #[serde(default)]
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]

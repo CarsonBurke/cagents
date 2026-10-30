@@ -429,3 +429,25 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+## Merged worktree notices and ignored files
+
+**Notify about merged worktrees** reports eligible GitHub worktrees whose current
+commit is shown as merged in the sidebar. Automatic checks keep the directory,
+Git registration and branch, including when the worktree contains only build
+files: another program could write new user data after any inventory. Review a
+kept worktree, then choose **Delete worktree** and explicitly confirm to discard
+its files. The branch is retained. The saved option keeps its existing
+`auto_delete_merged_worktrees` key for compatibility.
+
+The ignored-file inventory uses the default disposable-directory names `node_modules`,
+`target`, `dist`, `build`, `.venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`
+and `.ruff_cache`. A directory name matches at any depth, including its nested
+contents; a regular file with the same name remains protected. Other ignored
+content, including `.env`, is reported as user data. This policy does not
+authorize automatic deletion or replace explicit deletion confirmation.
+
+The per-project list is stored as a JSON array in the clone-local Git configuration
+key `cagents.cleanupDisposableDirectories`, shared by its linked worktrees. An
+empty array treats every ignored directory as user data. Values must be simple
+directory names, with no slashes, traversal components or control characters.

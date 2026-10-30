@@ -3200,7 +3200,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
-            Self::AutoDeleteMergedWorktrees => "Delete merged worktrees automatically",
+            Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
