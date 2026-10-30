@@ -487,7 +487,7 @@ fn admit(
     model: crate::workspace_model::WorkspaceModel,
 ) {
     use crate::app::workspace_model_sync::ModelUpdate;
-    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(model.clone()));
+    let connected = app.apply_workspace_model_update(ModelUpdate::connected_fixture(model.clone()));
     settle(app, connected);
     for channel in [active, hidden] {
         let applied = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
@@ -943,7 +943,8 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     let authoritative = model(identity, active, hidden, view);
-    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
+    let connected =
+        app.apply_workspace_model_update(ModelUpdate::connected_fixture(authoritative.clone()));
     settle(&mut app, connected);
     assert_eq!(
         app.startup_pane_check(),
@@ -1108,7 +1109,8 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
     let mut view = View::empty(hidden);
     view.panes.push(pane.clone());
     let authoritative = model(identity, active, hidden, view);
-    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
+    let connected =
+        app.apply_workspace_model_update(ModelUpdate::connected_fixture(authoritative.clone()));
     settle(&mut app, connected);
     let first = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
         scope: Scope::Channel(active),

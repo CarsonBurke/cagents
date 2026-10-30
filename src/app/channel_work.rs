@@ -784,7 +784,7 @@ impl Cagents {
                 home: captured,
                 expected_view_revision: view.revision,
             };
-            if self.workspace_model_tx.try_send(edit).is_ok() {
+            if self.workspace_model_tx.try_send(edit.into()).is_ok() {
                 self.channel_work.retire_candidates.remove(&captured);
             }
         }
@@ -939,7 +939,7 @@ mod tests {
             app.retire_settled_empty_channels();
             if current == original {
                 assert_eq!(
-                    received.try_recv().unwrap(),
+                    received.try_recv().unwrap().edit,
                     ModelEdit::RetireEmptyChannel {
                         home: original,
                         expected_view_revision: 7
