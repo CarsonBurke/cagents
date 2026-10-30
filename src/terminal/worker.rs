@@ -1356,23 +1356,56 @@ impl TerminalHandle {
         holder::release::completed(self)
     }
 
-    pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
-        if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
-        let mut retained = self.inner.published.retained_holder.try_lock()
-            .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
-        if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
-        else if !self.inner.published.cleanup_published.load(Ordering::Acquire) {
+    pub(crate) fn release_completed_holder_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "Terminal family cleanup deadline expired; its exact owner remains retained".into(),
+            );
+        }
+        // Completion can precede the OS thread's TLS teardown. Keep the exact
+        // holder and archive untouched until the shared service joins that worker.
+        if !self.join_worker_until(deadline, false) {
+            return Err(
+                "Terminal worker close remains unconfirmed; its exact owner is retained".into(),
+            );
+        }
+        let mut retained = self
+            .inner
+            .published
+            .retained_holder
+            .try_lock()
+            .map_err(|_| {
+                "Another close retains this terminal holder; retry after its deadline".to_owned()
+            })?;
+        if let Some(holder) = retained.as_mut() {
+            holder.close_until(deadline)?;
+        } else if !self
+            .inner
+            .published
+            .cleanup_published
+            .load(Ordering::Acquire)
+        {
             return Err("Terminal has no retained cleanup owner or published family proof; preserved ownership cannot be released".into());
         }
-        let mut archive = self.inner.published.archive.try_lock()
-            .map_err(|_| "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned())?;
+        let mut archive = self.inner.published.archive.try_lock().map_err(|_| {
+            "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned()
+        })?;
         *archive = ArchivePhase::Released;
         let holder = retained.take();
         drop(archive);
         drop(retained);
         drop(holder);
-        self.inner.published.cleanup_published.store(true, Ordering::Release);
-        self.inner.published.completed.store(true, Ordering::Release);
+        self.inner
+            .published
+            .cleanup_published
+            .store(true, Ordering::Release);
+        self.inner
+            .published
+            .completed
+            .store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
     }
@@ -6706,6 +6739,243 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !worker.is_finished() { assert!(Instant::now() < deadline); thread::yield_now(); }
         (worker, release)
+    }
+
+    #[test]
+    fn completed_close_requires_its_original_worker_join_before_family_publication() {
+        const CHILD: &str = "CAGENTS_COMPLETED_ORIGINAL_JOIN_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::tests::completed_close_requires_its_original_worker_join_before_family_publication", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct TlsTeardown {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Drop for TlsTeardown {
+            fn drop(&mut self) {
+                let _ = self.entered.try_send(());
+                // A broken inline join must fail its timing assertion, not
+                // strand the fixture behind its own release guard forever.
+                let _ = self.release.recv_timeout(Duration::from_secs(15));
+            }
+        }
+        thread_local! { static TEARDOWN: RefCell<Option<TlsTeardown>> = const { RefCell::new(None) }; }
+
+        struct Fixture {
+            handle: TerminalHandle,
+            release: Option<Sender<()>>,
+        }
+        impl Fixture {
+            fn release_tls(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.try_send(());
+                }
+            }
+            fn cleanup(&mut self) -> Result<(), String> {
+                self.release_tls();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match self
+                        .handle
+                        .inner
+                        .published
+                        .worker_join
+                        .load(Ordering::Acquire)
+                    {
+                        2 => return self.handle.release_completed_holder_until(deadline),
+                        3 => {
+                            // This anonymous fixture owns this exact holder.
+                            // A failed join remains failed: cleanup here must
+                            // not publish Closed or alter the join receipt.
+                            let mut retained = self
+                                .handle
+                                .inner
+                                .published
+                                .retained_holder
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(holder) = retained.as_mut() {
+                                holder.close_until(deadline)?;
+                            }
+                            drop(retained.take());
+                            return Ok(());
+                        }
+                        _ => {
+                            let _ = self.handle.join_worker_until(deadline, false);
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("fixture original worker join did not settle".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.cleanup();
+            }
+        }
+
+        for panic_after_run in [false, true] {
+            let (commands, receiver) = command_channel(1);
+            let (events, event_receiver) = crossbeam_channel::unbounded();
+            let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+            published
+                .join_reservation
+                .set(joins::reserve().unwrap())
+                .unwrap();
+            let owner = Arc::clone(&published);
+            let (entered, observed) = crossbeam_channel::bounded(1);
+            let (release, blocked) = crossbeam_channel::bounded(1);
+            let worker = thread::spawn(move || {
+                let worker = Worker::start(
+                    shell_session("exit 0"),
+                    TerminalConfig::default(),
+                    receiver,
+                    events,
+                    owner,
+                )
+                .unwrap();
+                assert!(
+                    !worker.holder.registered(),
+                    "fixture must never adopt registered terminal custody"
+                );
+                TEARDOWN.with(|slot| {
+                    *slot.borrow_mut() = Some(TlsTeardown {
+                        entered,
+                        release: blocked,
+                    })
+                });
+                worker.run();
+                assert!(
+                    !panic_after_run,
+                    "deliberate original worker closure panic after normal teardown"
+                );
+            });
+            // Own the original JoinHandle before any readiness assertion can
+            // unwind; the guard unblocks TLS and settles anonymous custody.
+            let mut fixture = Fixture {
+                handle: TerminalHandle {
+                    inner: Arc::new(HandleInner {
+                        commands,
+                        events: event_receiver,
+                        published,
+                        worker: Arc::new(Mutex::new(Some(worker))),
+                    }),
+                },
+                release: Some(release),
+            };
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let handle = &fixture.handle;
+            let published = &handle.inner.published;
+            assert!(handle.is_completed());
+            assert_eq!(published.worker_join.load(Ordering::Acquire), 0);
+            let holder = published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|holder| holder as *const _ as usize)
+                .unwrap();
+            let archive = std::mem::discriminant(&*published.archive.lock().unwrap());
+            assert!(!published.cleanup_published.load(Ordering::Acquire));
+            let started = Instant::now();
+            assert!(
+                handle
+                    .release_completed_holder_until(started + Duration::from_millis(40))
+                    .is_err()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "completed close joined TLS on the caller"
+            );
+            assert_eq!(published.worker_join.load(Ordering::Acquire), 1);
+            let started = Instant::now();
+            assert!(matches!(
+                handle.close_checked(true),
+                super::super::ipc::TerminalCloseResult::Unknown(_)
+            ));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "retry waited behind the retained original join"
+            );
+            assert_eq!(
+                published
+                    .retained_holder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|holder| holder as *const _ as usize),
+                Some(holder)
+            );
+            assert_eq!(
+                std::mem::discriminant(&*published.archive.lock().unwrap()),
+                archive
+            );
+            assert!(!published.cleanup_published.load(Ordering::Acquire));
+
+            fixture.release_tls();
+            let handle = &fixture.handle;
+            let published = &handle.inner.published;
+            let expected = if panic_after_run { 3 } else { 2 };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while published.worker_join.load(Ordering::Acquire) == 1 {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(published.worker_join.load(Ordering::Acquire), expected);
+            if panic_after_run {
+                for _ in 0..2 {
+                    assert!(matches!(
+                        handle.close_checked(true),
+                        super::super::ipc::TerminalCloseResult::Unknown(_)
+                    ));
+                    assert_eq!(published.worker_join.load(Ordering::Acquire), 3);
+                    assert!(!handle.is_completed());
+                    assert_eq!(
+                        published
+                            .retained_holder
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|holder| holder as *const _ as usize),
+                        Some(holder)
+                    );
+                    assert_eq!(
+                        std::mem::discriminant(&*published.archive.lock().unwrap()),
+                        archive
+                    );
+                    assert!(!published.cleanup_published.load(Ordering::Acquire));
+                }
+            } else {
+                assert_eq!(
+                    handle.close_checked(true),
+                    super::super::ipc::TerminalCloseResult::Closed
+                );
+                assert_eq!(
+                    handle.close_checked(true),
+                    super::super::ipc::TerminalCloseResult::Closed
+                );
+                assert!(published.retained_holder.lock().unwrap().is_none());
+                assert!(published.cleanup_published.load(Ordering::Acquire));
+                assert!(matches!(
+                    *published.archive.lock().unwrap(),
+                    ArchivePhase::Released
+                ));
+            }
+            fixture.cleanup().unwrap();
+        }
     }
 
     #[test]
