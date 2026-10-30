@@ -1810,12 +1810,13 @@ pub enum ItemContent {
         #[serde(default)]
         reference: Option<ImageReference>,
     },
-    /// Something another agent, or the harness on its behalf, delivered to
-    /// this conversation: a subagent's report, a teammate's or another
-    /// session's message, or word that background work changed state.
+    /// Something another agent or the provider harness delivered to this
+    /// conversation: a report, a message, a background-work notice, or context
+    /// the provider added without attributing it to the user.
     ///
-    /// It arrives in the user's slot and the agent acts on it as on a
-    /// prompt, but the user did not write it. Typesetting it as their own
+    /// It can arrive in the user's slot and the agent acts on it as on a
+    /// prompt; provider context uses the System role. The user did not write
+    /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
     Delivery {
@@ -1830,8 +1831,8 @@ pub enum ItemContent {
         /// `Agent "Review" finished`, or the one a teammate wrote for its
         /// message. Empty when there is none.
         summary: String,
-        /// A report's or message's Markdown, or the output a notice quotes,
-        /// with the harness's framing removed.
+        /// A report/message with harness framing removed, a notice's quoted
+        /// output, or provider context retained verbatim without interpretation.
         body: String,
     },
 }
@@ -1842,8 +1843,8 @@ pub enum DeliveryKind {
     Report,
     /// A message from a teammate or another session.
     Message,
-    /// The harness reporting that background work - a command, a monitor or
-    /// an agent - finished or produced an event.
+    /// A provider/harness notice, including background-work events and
+    /// provider context. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -1996,6 +1997,23 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
+}
+
+impl Item {
+    /// Bodies whose complete canonical bytes can be copied through the owned
+    /// transcript source. Provider context uses the same field as ordinary
+    /// prose; other deliveries retain their existing presentation copy rules.
+    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+        match &self.content {
+            ItemContent::Text { text, .. } => Some(text),
+            ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                body,
+                ..
+            } if self.role == Role::System => Some(body),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
