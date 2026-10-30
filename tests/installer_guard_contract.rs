@@ -916,9 +916,13 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
                     "{output:?}"
                 );
             } else {
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("(os error 2)"),
-                    "missing matched inspector must expose the actual not-found failure: {output:?}"
+                    diagnostic.contains("The matched source inspector is unavailable")
+                        && diagnostic.contains("source windows remain usable")
+                        && diagnostic.contains("Reinstall the matched CLI and daemon together")
+                        && diagnostic.contains("(os error 2)"),
+                    "missing matched inspector must explain recovery and retain its actual not-found cause: {output:?}"
                 );
             }
             println!(
