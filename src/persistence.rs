@@ -4447,6 +4447,9 @@ fn validate_chat_identity(
         {
             Some("owned listener")
         } else if stored.launch.recipe != session.launch.recipe
+            // Shared launch options may change before either descriptor has
+            // conversation, host, listener, terminal, or retained-actor evidence.
+            && !(stored.is_unstarted() && session.is_unstarted())
             // The daemon gives a new Codex thread its own listener as it
             // starts it, so the started thread comes back naming that
             // endpoint where it had asked for one.
@@ -9395,6 +9398,297 @@ mod tests {
             reopened.load_card(card, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
         );
+    }
+
+    mod unstarted_recipe_persistence {
+        use super::*;
+
+        fn draft_workspace(
+            provider: crate::agent::Provider,
+            home: &Path,
+        ) -> (WorkspaceState, crate::chat::Session) {
+            let (mut workspace, mut session) = agent_workspace(provider);
+            let account = crate::account::Account::managed(
+                provider,
+                uuid::Uuid::new_v4(),
+                home.to_path_buf(),
+            );
+            session.id = TerminalId::new();
+            session.launch.recipe = LaunchRecipe {
+                program: provider.executable().into(),
+                arguments: if provider == crate::agent::Provider::Codex {
+                    vec!["--remote".into(), "unix://".into()]
+                } else {
+                    Vec::new()
+                },
+                working_directory: home.parent().unwrap().to_path_buf(),
+                environment: BTreeMap::from([(
+                    crate::account::home_variable(provider).unwrap().into(),
+                    account
+                        .home_directory(&|_| None)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                )]),
+                unset_environment: Default::default(),
+            };
+            session.launch.session_id = None;
+            session.proof = None;
+            session.terminal = None;
+            assert!(session.is_unstarted());
+            workspace.cards[0].kind = CardKind::Chat(session.clone());
+            (workspace, session)
+        }
+
+        #[test]
+        fn unstarted_launch_options_and_sibling_layout_round_trip_together() {
+            for provider in [
+                crate::agent::Provider::Claude,
+                crate::agent::Provider::Codex,
+            ] {
+                let directory = tempdir().unwrap();
+                let database = directory.path().join("draft.sqlite3");
+                let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+                let (mut workspace, mut draft) =
+                    draft_workspace(provider, &directory.path().join("account-a"));
+                let card = workspace.cards[0].id;
+                let mut sibling = workspace.cards[0].clone();
+                sibling.id = CardId::new();
+                let sibling_id = sibling.id;
+                let CardKind::Chat(session) = &mut sibling.kind else {
+                    unreachable!()
+                };
+                session.id = TerminalId::new();
+                workspace.cards.push(sibling);
+                workspace.chat_drafts.insert(card, "unsent draft λ".into());
+                let mut lane = SaveLane::default();
+                lane.save(&store, &workspace).unwrap();
+
+                for option in ["account", "model", "permissions"] {
+                    match option {
+                        "account" => {
+                            let account = crate::account::Account::managed(
+                                provider,
+                                uuid::Uuid::new_v4(),
+                                directory.path().join("account-b"),
+                            );
+                            draft.launch.recipe.environment.insert(
+                                crate::account::home_variable(provider).unwrap().into(),
+                                account
+                                    .home_directory(&|_| None)
+                                    .unwrap()
+                                    .display()
+                                    .to_string(),
+                            );
+                        }
+                        "model" => draft
+                            .launch
+                            .recipe
+                            .arguments
+                            .extend(["--model".into(), "fixture-model-b".into()]),
+                        "permissions" if provider == crate::agent::Provider::Claude => {
+                            crate::chat::apply_claude_permission_mode(
+                                &mut draft.launch.recipe,
+                                "plan",
+                            );
+                        }
+                        "permissions" => draft.launch.recipe.arguments.extend([
+                            "--ask-for-approval".into(),
+                            "on-request".into(),
+                            "--sandbox".into(),
+                            "read-only".into(),
+                        ]),
+                        _ => unreachable!(),
+                    }
+                    workspace.cards[0].kind = CardKind::Chat(draft.clone());
+                    workspace.cards[1].title = format!("Sibling after {option}");
+                    workspace.cards[1].width_fraction += 0.05;
+                    workspace.focused = Some(sibling_id);
+                    let previous = lane.workspace;
+                    let commit = lane.save(&store, &workspace).unwrap();
+                    assert!(commit.generation > previous, "{provider:?}/{option}");
+                    assert_eq!(
+                        store.load_card(card, None).unwrap().unwrap().kind,
+                        CardKind::Chat(draft.clone()),
+                        "{provider:?}/{option}"
+                    );
+                    let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+                    assert_eq!(saved.focused, Some(sibling_id));
+                    assert_eq!(saved.cards[1].title, workspace.cards[1].title);
+                    assert_eq!(
+                        saved.cards[1].width_fraction,
+                        workspace.cards[1].width_fraction
+                    );
+                    assert_eq!(saved.chat_drafts, workspace.chat_drafts);
+                }
+                let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+                drop(store);
+                let reopened = StateStore::open(database, boot("chat-boot")).unwrap();
+                assert_eq!(
+                    reopened
+                        .load_workspace(workspace.id, None)
+                        .unwrap()
+                        .unwrap(),
+                    saved
+                );
+            }
+        }
+
+        #[test]
+        fn recipe_changes_refuse_either_started_descriptor_and_other_identities() {
+            for evidence in [
+                "conversation",
+                "proof",
+                "terminal",
+                "listener",
+                "retained",
+                "id",
+                "provider",
+            ] {
+                for side in ["stored", "incoming"] {
+                    let directory = tempdir().unwrap();
+                    let store =
+                        StateStore::open(directory.path().join("guard.sqlite3"), boot("chat-boot"))
+                            .unwrap();
+                    let provider = if evidence == "listener" {
+                        crate::agent::Provider::Codex
+                    } else {
+                        crate::agent::Provider::Claude
+                    };
+                    let (mut workspace, plain) =
+                        draft_workspace(provider, &directory.path().join("account-a"));
+                    let card = workspace.cards[0].id;
+                    let mut guarded = plain.clone();
+                    let proof = HostSessionProof {
+                        host_session_id: "fixture-host".into(),
+                        boot_id: boot("chat-boot"),
+                        host_incarnation: "fixture-incarnation".into(),
+                    };
+                    match evidence {
+                        "conversation" => {
+                            guarded.launch.session_id = Some(uuid::Uuid::new_v4().to_string())
+                        }
+                        "proof" => guarded.proof = Some(proof.clone()),
+                        "terminal" => {
+                            let CardKind::Terminal(mut source) =
+                                workspace_with_terminal(&proof.boot_id).cards.remove(0).kind
+                            else {
+                                unreachable!()
+                            };
+                            source.id = guarded.id;
+                            source.launch = guarded.launch.recipe.clone();
+                            guarded.terminal = Some(source);
+                        }
+                        "listener" => {
+                            assert!(guarded.claim_owned_codex_listener(directory.path(), &proof))
+                        }
+                        "retained" => {
+                            guarded.proof = Some(proof);
+                            guarded.native_continuity =
+                                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+                        }
+                        "id" => guarded.id = TerminalId::new(),
+                        "provider" => {
+                            guarded.launch.provider = crate::agent::Provider::Codex;
+                            guarded.launch.recipe.program = "codex".into();
+                            guarded.launch.recipe.arguments =
+                                vec!["--remote".into(), "unix://".into()];
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(guarded.has_valid_native_continuity(), "{evidence}");
+                    let (stored, mut incoming) = if side == "stored" {
+                        (guarded, plain)
+                    } else {
+                        (plain, guarded)
+                    };
+                    workspace.cards[0].kind = CardKind::Chat(stored);
+                    let mut lane = SaveLane::default();
+                    lane.save(&store, &workspace).unwrap();
+                    let baseline = store.load_workspace(workspace.id, None).unwrap().unwrap();
+                    incoming
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("FIXTURE_OPTION".into(), "changed".into());
+                    workspace.cards[0].kind = CardKind::Chat(incoming);
+                    workspace.cards[0].title = "Must roll back with the refused recipe".into();
+                    let field = match evidence {
+                        "id" => "identity",
+                        "provider" => "provider",
+                        "listener" => "owned listener",
+                        "retained" if side == "stored" => "native continuity",
+                        _ => "launch recipe",
+                    };
+                    let error = card_refusal(lane.save(&store, &workspace), card);
+                    assert!(
+                        matches!(&error, StoreError::InvalidState(message) if message.ends_with(&format!("({field})"))),
+                        "{evidence}/{side}: {error}"
+                    );
+                    assert_eq!(
+                        store.load_workspace(workspace.id, None).unwrap().unwrap(),
+                        baseline,
+                        "{evidence}/{side}: refused snapshots remain atomic"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn unstarted_recipe_changes_keep_workspace_and_card_cas() {
+            let directory = tempdir().unwrap();
+            let store =
+                StateStore::open(directory.path().join("cas.sqlite3"), boot("chat-boot")).unwrap();
+            let (mut workspace, mut draft) = draft_workspace(
+                crate::agent::Provider::Claude,
+                &directory.path().join("account-a"),
+            );
+            let card = workspace.cards[0].id;
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            let baseline = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            draft
+                .launch
+                .recipe
+                .arguments
+                .extend(["--model".into(), "fixture-new-model".into()]);
+            workspace.cards[0].kind = CardKind::Chat(draft);
+            workspace.cards[0].title = "Stale layout must not land".into();
+            assert!(matches!(
+                store.save_workspace(
+                    &workspace,
+                    SnapshotBase {
+                        workspace: 0,
+                        cards: &lane.cards
+                    }
+                ),
+                Err(StoreError::StaleGeneration { .. })
+            ));
+            let mut stale_cards = lane.cards.clone();
+            stale_cards.insert(card, 0);
+            assert!(matches!(
+                card_refusal(
+                    store.save_workspace(
+                        &workspace,
+                        SnapshotBase {
+                            workspace: lane.workspace,
+                            cards: &stale_cards
+                        }
+                    ),
+                    card
+                ),
+                StoreError::StaleGeneration { .. }
+            ));
+            assert_eq!(
+                store.load_workspace(workspace.id, None).unwrap().unwrap(),
+                baseline
+            );
+            lane.save(&store, &workspace).unwrap();
+            assert_eq!(
+                store.load_card(card, None).unwrap().unwrap().kind,
+                workspace.cards[0].kind
+            );
+        }
     }
 
     /// A chat card takes a new provider, account, or conversation only through

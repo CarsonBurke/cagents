@@ -5556,3 +5556,197 @@ mod tests {
         drop((first, second));
     }
 }
+
+#[cfg(test)]
+mod unstarted_recipe_persistence_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::model::{ChannelId, ProjectChannel, ProjectId};
+    use crate::persistence::{SnapshotBase, StateStore};
+
+    #[test]
+    fn accepted_unstarted_clone_recipe_and_sibling_layout_reach_the_real_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("projected-window.sqlite3");
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let source_session = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: directory.path().to_path_buf(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        directory.path().join("account-a").display().to_string(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+        };
+        let source = CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: "Claude chat".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Chat(source_session.clone()),
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = Some(source.id);
+        durable.cards.push(source.clone());
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.open_chat(
+            source.id,
+            source_session.clone(),
+            crate::chat::Intent::Start,
+        ));
+        // Drive the actual duplicate producer, without polling any skills or
+        // provider task. A clone of this draft is itself still unstarted.
+        drop(app.duplicate_pane(source.clone()));
+        let cloned = app.workspace.focused().unwrap();
+        assert_ne!(cloned, source.id);
+        let CardKind::Chat(original) = app.card_state(cloned).unwrap().kind.clone() else {
+            panic!("duplicate is a chat")
+        };
+        assert_ne!(original.id, source_session.id);
+        assert!(original.is_unstarted());
+
+        let channel = ChannelId::new();
+        let identity = uuid::Uuid::new_v4();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "Shared fixture".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![source.id, cloned],
+            focused: Some(cloned),
+        });
+        durable.active_channel = Some(channel);
+        durable.workspace_model_identity = Some(identity);
+        app.shared_views.initialized.insert(Scope::Channel(channel));
+        let mut view = View::empty(channel);
+        view.revision = 1;
+        view.panes = [source.id, cloned]
+            .into_iter()
+            .map(|id| {
+                let card = app.card_state(id).unwrap();
+                Pane {
+                    id,
+                    title: card.title.clone(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: card.width_fraction,
+                    scope: None,
+                    kind: card.kind.clone(),
+                }
+            })
+            .collect();
+        app.workspace_model.identity = identity;
+        app.workspace_model.views = vec![view.clone()];
+        let store =
+            StateStore::open(&database, crate::model::BootId::new("projection-boot")).unwrap();
+        let initial = app.persistent_workspace();
+        let initial_commit = store
+            .save_workspace(
+                &initial,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+
+        let before = view.panes[1].clone();
+        let mut changed = before.clone();
+        let CardKind::Chat(replacement) = &mut changed.kind else {
+            unreachable!()
+        };
+        replacement.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            directory.path().join("account-b").display().to_string(),
+        );
+        replacement.launch.recipe.arguments = vec!["--model".into(), "fixture-model-b".into()];
+        crate::chat::apply_claude_permission_mode(&mut replacement.launch.recipe, "plan");
+        assert_eq!(replacement.id, original.id);
+        assert!(replacement.is_unstarted());
+        let expected = replacement.clone();
+        assert!(
+            view.apply(&Change::Update {
+                before,
+                pane: changed
+            })
+            .unwrap()
+        );
+        let before = view.panes[0].clone();
+        let mut sibling = before.clone();
+        sibling.title = "Sibling layout saved beside the changed draft".into();
+        sibling.width_fraction = 0.7;
+        assert!(
+            view.apply(&Change::Update {
+                before,
+                pane: sibling.clone()
+            })
+            .unwrap()
+        );
+        let mut accepted = app.workspace_model.clone();
+        view.revision += 2;
+        accepted.sequence += 2;
+        accepted.views = vec![view];
+        assert!(app.install_workspace_model_snapshot(accepted));
+        // This is the actual canonical projection and snapshot path. It does
+        // not call the local account picker's explicit identity replacement.
+        drop(app.reconcile_shared_views());
+        assert_eq!(
+            app.card_state(cloned).unwrap().kind,
+            CardKind::Chat(expected.clone())
+        );
+        assert!(!app.chat_start_pending(cloned));
+        assert!(!app.chat_start_pending(source.id));
+        assert!(
+            app.session.is_none(),
+            "the fixture uses the real store explicitly"
+        );
+        let projected = app.persistent_workspace();
+        let commit = store
+            .save_workspace(
+                &projected,
+                SnapshotBase {
+                    workspace: initial_commit.generation,
+                    cards: &initial_commit.card_generations,
+                },
+            )
+            .unwrap();
+        assert!(commit.generation > initial_commit.generation);
+        assert_eq!(
+            store.load_card(cloned, None).unwrap().unwrap().kind,
+            CardKind::Chat(expected.clone())
+        );
+        let saved_sibling = store.load_card(source.id, None).unwrap().unwrap();
+        assert_eq!(saved_sibling.title, sibling.title);
+        assert_eq!(saved_sibling.width_fraction, sibling.width_fraction);
+        drop(store);
+        let reopened =
+            StateStore::open(database, crate::model::BootId::new("projection-reopen")).unwrap();
+        assert_eq!(
+            reopened.load_card(cloned, None).unwrap().unwrap().kind,
+            CardKind::Chat(expected)
+        );
+        assert_eq!(
+            reopened.load_card(source.id, None).unwrap().unwrap().title,
+            sibling.title
+        );
+    }
+}
