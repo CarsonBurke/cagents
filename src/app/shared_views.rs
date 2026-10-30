@@ -3174,6 +3174,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 #[cfg(test)]
 mod tests {
     mod history_start;
+    mod published_card_edits;
     mod startup_admission;
 
     use super::*;
