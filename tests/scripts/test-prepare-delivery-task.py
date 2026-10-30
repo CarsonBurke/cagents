@@ -189,6 +189,38 @@ class PrepareDeliveryTask(unittest.TestCase):
         brief["reviewer"] = brief["worker"]
         self.rejected(pr, brief, "worker and independent reviewer must be different")
 
+    def test_explicit_independent_review_can_assign_the_delivery_reviewer(self):
+        pr, brief = case()
+        brief.update(activity="independent-review", worker=brief["reviewer"],
+                     task="Review the assembled channel flow and report concrete findings.")
+        brief["next_gate"]["owner"] = brief["worker"]
+        result = self.run_cli(pr, brief)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected in ("Activity: read-only independent review", "no product/module edits or implementation",
+                         "do not approve your own source or claim delivery readiness", "Read-only source review may proceed",
+                         "Return the exact reviewed head, concrete findings", "NOT SUPPLIED/UNQUALIFIED",
+                         brief["interaction"]["flow"]):
+            self.assertIn(expected, result.stdout)
+        self.assertNotIn("Source work may proceed in the owned boundary", result.stdout)
+
+    def test_review_prose_does_not_implicitly_change_activity_or_grant_writes(self):
+        pr, brief = case()
+        brief.update(worker=brief["reviewer"], task="Review the assembled flow without implementation changes.")
+        self.rejected(pr, brief, "worker and independent reviewer must be different")
+        brief.update(activity="independent-review", task="Implement a change despite this read-only activity.")
+        brief["next_gate"].update(kind="native", action="Inspect the actual native interaction")
+        result = self.run_cli(pr, brief)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Execution BLOCKED", result.stdout)
+        self.assertIn("Continue read-only source review; no product/module edits", result.stdout)
+        self.assertIn("Review only; no product/module edits or implementation", result.stdout)
+        self.assertNotIn("Continue useful source preparation", result.stdout)
+
+    def test_unknown_activity_cannot_bypass_implementation_self_review_guard(self):
+        pr, brief = case()
+        brief.update(activity="review-and-edit", worker=brief["reviewer"])
+        self.rejected(pr, brief, "unknown activity")
+
     def test_1988_superseded_foundation_never_becomes_completed_recovery(self):
         pr, brief = case(1988, NEW1988)
         brief["task"] = "Mount readable saved history with explicit exact-session recovery."
