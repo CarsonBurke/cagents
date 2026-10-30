@@ -1287,6 +1287,13 @@ impl HostState {
                 true,
             ));
         }
+        if self.chat_handoffs.contains_key(&terminal_id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalAlreadyExists,
+                "This source identity retains a terminal-handoff recovery receipt",
+                false,
+            ));
+        }
         if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
@@ -1347,7 +1354,14 @@ impl HostState {
                 .get(id)
                 .is_some_and(|record| !record.handle.is_completed())
             || self.chat_spawning.contains_key(id)
-            || self.chat_handoffs.contains_key(id)
+            || self
+                .chat_handoffs
+                .get(id)
+                .is_some_and(|receipt| receipt.pending())
+    }
+
+    pub(super) fn terminal_is_starting(&self, terminal_id: TerminalId) -> bool {
+        self.spawning.contains(&terminal_id)
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
@@ -1684,7 +1698,7 @@ impl HostState {
             || !self.browser_logins_spawning.is_empty()
             || !self.execution_startups.is_empty()
             || !self.chat_bindings.is_empty()
-            || !self.chat_handoffs.is_empty()
+            || self.chat_handoffs.values().any(|receipt| receipt.pending())
             || !self.native_closing.is_empty()
             || !self.native_adoption_failures.is_empty()
         {
@@ -2257,7 +2271,11 @@ fn prepare_upgrade_with_carry_policy(
                 "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
             ));
         }
-        for (chat, receipt) in &state.chat_handoffs {
+        for (chat, receipt) in state
+            .chat_handoffs
+            .iter()
+            .filter(|(_, receipt)| receipt.pending())
+        {
             tracing::warn!(
                 chat = %chat,
                 terminal = %receipt.replacement().id,

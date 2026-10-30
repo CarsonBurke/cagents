@@ -1005,6 +1005,21 @@ impl TerminalHandle {
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
     }
+
+    /// Metadata from this issued worker, without retaining its process or
+    /// execution environment. The caller still has to fence the worker and
+    /// source under HostState before publishing a retirement capability.
+    pub(crate) fn holder_retirement_identity(
+        &self,
+    ) -> Option<(
+        super::holder::Record,
+        Option<crate::daemon::holder_registry::OriginalRole>,
+    )> {
+        Some((
+            self.holder_identity()?.clone(),
+            self.inner.published.original_holder_role.get().cloned(),
+        ))
+    }
     #[cfg(test)]
     pub(crate) fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
         self.inner

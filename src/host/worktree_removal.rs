@@ -191,7 +191,11 @@ impl Reservation {
                     binding.working_directory().to_owned(),
                 ));
             }
-            for handoff in state.chat_handoffs.values() {
+            for handoff in state
+                .chat_handoffs
+                .values()
+                .filter(|handoff| handoff.pending())
+            {
                 for directory in handoff.working_directories() {
                     hosted.push(("A chat handing off to a terminal", directory.to_owned()));
                 }

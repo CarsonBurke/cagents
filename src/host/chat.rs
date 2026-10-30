@@ -30,6 +30,9 @@ mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
 mod startup_tests;
+mod terminal_handoff;
+#[cfg(test)]
+mod terminal_handoff_tests;
 pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
@@ -113,13 +116,17 @@ pub(super) fn matches_paired_terminal(
 }
 
 // Transition evidence is not an actor: no transcript, socket, store or execution
-// environment survives a successful replacement. Keep it until the GUI confirms
-// durable ownership of the terminal, never merely until a response or attach.
+// environment survives a successful replacement. A durable GUI acknowledgement
+// ends the replay obligation, but preserves exact retirement evidence for the
+// original chat's recovery and a lost close reply in this host epoch.
 pub(super) struct TerminalHandoff {
     source: Session,
     terminal: crate::model::TerminalSession,
     generation: u64,
     subscribers: BTreeMap<ClientId, bool>,
+    retirement: Option<terminal_handoff::IssuedRetirement>,
+    awaiting_ack: bool,
+    terminal_retired: bool,
     /// After this moment no window can still be waiting to save this
     /// replacement, counted from the conversion or from the most recent replay
     /// of its response, whichever happened last.
@@ -155,6 +162,9 @@ impl TerminalHandoff {
             terminal,
             generation,
             subscribers,
+            retirement: None,
+            awaiting_ack: true,
+            terminal_retired: false,
             acknowledgement_deadline,
         }
     }
@@ -165,12 +175,19 @@ impl TerminalHandoff {
     /// connection as part of the conversion and acknowledges over a fresh one,
     /// so every receipt is unattached from the moment it exists.
     pub(super) fn unacknowledgeable(&self, now: Instant) -> bool {
-        now >= self.acknowledgement_deadline
+        !self.pending() || now >= self.acknowledgement_deadline
+    }
+
+    /// Resource protection is distinct from retaining the source identity and
+    /// its bounded, process-free retirement evidence.
+    pub(super) fn pending(&self) -> bool {
+        self.awaiting_ack && !self.terminal_retired
     }
 
     /// A window that just received the replacement's identity again owes its
     /// durable save from that moment, not from the original conversion.
     pub(super) fn reissue(&mut self, now: Instant) {
+        self.awaiting_ack = true;
         self.acknowledgement_deadline = now + ACKNOWLEDGEMENT_GRACE;
     }
 
@@ -2718,7 +2735,12 @@ fn process_inner(
                     "Native chat ownership is changing; retry its normal attach after the transition finishes",
                 ));
             }
-            if let Some(receipt) = state.chat_handoffs.get_mut(&session.id) {
+            if state.chat_handoffs.contains_key(&session.id) {
+                terminal_handoff::require_binding(&state, session.id, None)?;
+                let receipt = state
+                    .chat_handoffs
+                    .get_mut(&session.id)
+                    .expect("checked handoff");
                 receipt.validate_source(&session)?;
                 receipt.subscribers.entry(client).or_insert(false);
                 return Ok(ServerResponse::ChatAttached {
@@ -2886,8 +2908,12 @@ fn process_inner(
                 if state.shutting_down {
                     return Err(unavailable("Daemon is shutting down"));
                 }
-                if let Some(receipt) = state.chat_handoffs.get_mut(&chat_id) {
-                    receipt.require_attached(client)?;
+                if state.chat_handoffs.contains_key(&chat_id) {
+                    terminal_handoff::require_live_replay(&state, chat_id, client)?;
+                    let receipt = state
+                        .chat_handoffs
+                        .get_mut(&chat_id)
+                        .expect("checked handoff");
                     receipt.reissue(Instant::now());
                     return Ok(ServerResponse::ChatTerminal {
                         chat_id,
@@ -2895,9 +2921,14 @@ fn process_inner(
                         snapshot: receipt.snapshot(),
                     });
                 }
-                if state.chat_handoffs.len() >= 1024 {
+                if state
+                    .chat_handoffs
+                    .len()
+                    .saturating_add(state.chat_spawning.len())
+                    >= 1024
+                {
                     return Err(unavailable(
-                        "Too many unacknowledged terminal handoffs; save existing replacements before converting another chat",
+                        "This daemon reached its retained or pending native-transition limit; existing recovery evidence is preserved, and another conversion cannot start",
                     ));
                 }
                 let owners =
@@ -3038,21 +3069,25 @@ fn process_inner(
                         "The replacement terminal changed before handoff publication",
                     ));
                 }
+                let issued = terminal_handoff::IssuedRetirement::capture(
+                    &replacement_worker,
+                    &descriptor.session,
+                    state.proof(),
+                )?;
                 let old_pair = owners.remove_pair(&mut state, &closing)?;
                 let mut record = state
                     .chats
                     .remove(&chat_id)
                     .expect("validated exact attachment");
-                state.chat_handoffs.insert(
-                    chat_id,
-                    TerminalHandoff::new(
-                        session,
-                        descriptor.session.clone(),
-                        snapshot.generation,
-                        std::mem::take(&mut record.subscribers),
-                        Instant::now() + ACKNOWLEDGEMENT_GRACE,
-                    ),
+                let mut handoff = TerminalHandoff::new(
+                    session,
+                    descriptor.session.clone(),
+                    snapshot.generation,
+                    std::mem::take(&mut record.subscribers),
+                    Instant::now() + ACKNOWLEDGEMENT_GRACE,
                 );
+                handoff.retirement = Some(issued);
+                state.chat_handoffs.insert(chat_id, handoff);
                 state.inventory_generation += 1;
                 Ok((record, old_pair))
             })();
@@ -3113,17 +3148,34 @@ fn process_inner(
             // The authenticated envelope pins this receipt to the saved host.
             // Terminal retirement cannot invalidate a durable commit or its retry.
             // The GUI must flush replacement of all of its source references first.
-            let source_id = state
-                .chat_handoffs
-                .iter()
-                .find_map(|(&id, receipt)| (receipt.terminal.id == terminal_id).then_some(id));
+            let source_id = {
+                let mut matches = state.chat_handoffs.iter().filter_map(|(&id, receipt)| {
+                    (receipt.terminal.id == terminal_id).then_some(id)
+                });
+                let source = matches.next();
+                if matches.next().is_some() {
+                    return Err(unavailable(
+                        "Terminal acknowledgement has ambiguous issued ownership",
+                    ));
+                }
+                source
+            };
             if let Some(source_id) = source_id {
-                state.chat_handoffs.remove(&source_id);
-                state.inventory_generation += 1;
+                let receipt = state
+                    .chat_handoffs
+                    .get_mut(&source_id)
+                    .expect("found handoff");
+                if receipt.awaiting_ack {
+                    receipt.awaiting_ack = false;
+                    state.inventory_generation += 1;
+                }
             }
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
+            if let Some(response) = terminal_handoff::close(host, client, chat_id)? {
+                return Ok(response);
+            }
             let target = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 CloseTarget::capture(&state, attached(&state, client, chat_id)?)?
@@ -4864,7 +4916,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn durable_terminal_commit_retires_evidence_after_terminal_retirement() {
+    fn durable_terminal_commit_preserves_retirement_evidence_and_ends_pending_work() {
         let (_directory, host, saved) = upgrade_fixture();
         let source_id = saved.source.id;
         let recipe = saved.launch.terminal_recipe().unwrap();
@@ -4903,18 +4955,139 @@ for line in sys.stdin:
                 ServerResponse::Accepted
             ));
         }
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let receipt = state
+            .chat_handoffs
+            .get(&source_id)
+            .expect("ACK retains exact recovery metadata");
+        assert!(!receipt.pending());
+        assert!(!receipt.terminal_retired, "ACK is not retirement proof");
+        assert!(receipt.unacknowledgeable(Instant::now()));
+        assert!(!state.any_live(&[source_id]));
+    }
+
+    #[test]
+    fn acknowledged_handoff_reserves_only_its_original_source_id() {
+        let (_directory, host, saved) = upgrade_fixture();
+        let mut source = saved.source;
+        source.proof = Some(host.lock().unwrap().proof().clone());
+        let source_id = source.id;
+        let terminal_id = TerminalId::new();
+        let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            terminal_id,
+            source.launch.terminal_recipe().unwrap(),
+            None,
+        )
+        .session;
+        let mut handoff = TerminalHandoff::new(
+            source,
+            terminal,
+            1,
+            BTreeMap::from([(1, false)]),
+            Instant::now(),
+        );
+        handoff.awaiting_ack = false;
+        let mut state = host.lock().unwrap();
+        state.chat_handoffs.insert(source_id, handoff);
+        assert!(!state.any_live(&[source_id]));
+        let generation = state.inventory_generation;
+        assert!(state.reserve_spawn(source_id).is_err());
+        assert_eq!(state.inventory_generation, generation);
+        // T remains available to its separate genuine terminal/native pairing
+        // admission. Retaining A must not reserve T as another source chat.
+        state.reserve_spawn(terminal_id).unwrap();
+        state.cancel_spawn(terminal_id);
+    }
+
+    #[test]
+    fn acknowledged_handoffs_count_toward_the_retained_limit_before_conversion() {
+        let (_directory, host, saved) = upgrade_fixture();
+        {
+            let mut state = host.lock().unwrap();
+            for _ in 0..1024 {
+                let mut source = saved.source.clone();
+                source.id = TerminalId::new();
+                let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                    TerminalId::new(),
+                    source.launch.terminal_recipe().unwrap(),
+                    None,
+                )
+                .session;
+                let mut handoff = TerminalHandoff::new(
+                    source.clone(),
+                    terminal,
+                    1,
+                    BTreeMap::new(),
+                    Instant::now(),
+                );
+                handoff.awaiting_ack = false;
+                state.chat_handoffs.insert(source.id, handoff);
+            }
+        }
+        let generation = host.lock().unwrap().inventory_generation;
+        let refusal = process(
+            &host,
+            1,
+            ClientRequest::ChatReturnTerminal {
+                chat_id: TerminalId::new(),
+            },
+        )
+        .unwrap_err();
         assert!(
-            !host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .chat_handoffs
-                .contains_key(&source_id)
+            refusal
+                .message
+                .contains("retained or pending native-transition limit")
+        );
+        let state = host.lock().unwrap();
+        assert_eq!(state.chat_handoffs.len(), 1024);
+        assert_eq!(state.inventory_generation, generation);
+        assert!(
+            state.chats.is_empty() && state.terminals.is_empty() && state.chat_spawning.is_empty()
         );
     }
 
     #[test]
+    fn terminal_acknowledgement_refuses_ambiguous_replacement_without_consuming_evidence() {
+        let (_directory, host, saved) = upgrade_fixture();
+        let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            saved.source.launch.terminal_recipe().unwrap(),
+            None,
+        )
+        .session;
+        let terminal_id = terminal.id;
+        {
+            let mut state = host.lock().unwrap();
+            for _ in 0..2 {
+                let mut source = saved.source.clone();
+                source.id = TerminalId::new();
+                state.chat_handoffs.insert(
+                    source.id,
+                    TerminalHandoff::new(
+                        source,
+                        terminal.clone(),
+                        1,
+                        BTreeMap::new(),
+                        Instant::now(),
+                    ),
+                );
+            }
+        }
+        let refusal =
+            process(&host, 1, ClientRequest::ChatCommitTerminal { terminal_id }).unwrap_err();
+        assert!(refusal.message.contains("ambiguous issued ownership"));
+        let state = host.lock().unwrap();
+        assert_eq!(state.chat_handoffs.len(), 2);
+        assert!(state.chat_handoffs.values().all(TerminalHandoff::pending));
+    }
+
+    #[test]
     fn standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence() {
-        let (directory, host, saved) = upgrade_fixture();
+        let Some(fixture) = terminal_handoff_tests::isolated() else {
+            return;
+        };
+        let (directory, _old_host, saved) = upgrade_fixture();
+        let host = fixture.host.clone();
         std::fs::write(
             directory.path().join("omp"),
             r#"#!/usr/bin/env python3
@@ -5251,14 +5424,16 @@ for line in sys.stdin:
                 ServerResponse::Accepted
             ));
         }
-        assert!(
-            !host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+        {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let receipt = state
                 .chat_handoffs
-                .contains_key(&session.id)
-        );
-        assert!(
+                .get(&session.id)
+                .expect("ACK retains exact retirement evidence");
+            assert!(!receipt.pending());
+            assert!(!receipt.terminal_retired);
+        }
+        assert!(matches!(
             process(
                 &host,
                 2,
@@ -5266,8 +5441,9 @@ for line in sys.stdin:
                     session: attached.clone()
                 }
             )
-            .is_err()
-        );
+            .unwrap(),
+            ServerResponse::ChatAttached { .. }
+        ));
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -6294,6 +6470,14 @@ done
     }
 
     fn control_client_closes_chat(slow: bool, return_terminal: bool) {
+        let fixture = if return_terminal {
+            match terminal_handoff_tests::isolated() {
+                Some(fixture) => Some(fixture),
+                None => return,
+            }
+        } else {
+            None
+        };
         let directory = tempfile::tempdir().unwrap();
         let cli = directory.path().join("claude");
         std::fs::write(&cli, "#!/bin/sh\nexec cat\n").unwrap();
@@ -6337,9 +6521,18 @@ done
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new("incarnation"),
         };
-        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
-            proof.clone(),
-        )));
+        let (host, proof) = if let Some(fixture) = &fixture {
+            let host = fixture.host.clone();
+            let proof = host.lock().unwrap().proof().clone();
+            (host, proof)
+        } else {
+            (
+                Arc::new(crate::host::state::HostLock::new(HostState::new(
+                    proof.clone(),
+                ))),
+                proof,
+            )
+        };
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
