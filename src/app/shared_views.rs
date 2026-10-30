@@ -14,6 +14,8 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+type PaneAliases = HashMap<(Scope, CardId), CardId>;
+
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
@@ -1195,32 +1197,17 @@ impl Cagents {
         }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
-        let mut views = self.workspace_model.views.clone();
-        for (_, source, change) in &self.shared_views.pending {
-            if let Change::Transfer {
-                id,
-                destination,
-                before,
-            } = change
-            {
-                if !views.iter().any(|view| &view.scope == destination) {
-                    views.push(View::empty(destination.clone()));
-                }
-                let _ = views::transfer(&mut views, source, *id, destination, *before);
-            }
-        }
-        for view in &mut views {
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    let _ = view.apply(change);
-                }
-            }
-        }
+        let (mut views, mut pending_errors) = self.pending_view_projection();
         let owned = views
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
-        self.prepare_shared_aliases(&views, &owned);
+        let aliases = self.prepare_shared_aliases(&views, &owned);
+        if self.rebase_adopted_alias_presentation(&aliases) {
+            // Adoption changes IDs, never membership. Rebuild from the raw
+            // snapshot so the translated intentions still replay just once.
+            (views, pending_errors) = self.pending_view_projection();
+        }
         // Root discovery is immutable during this projection. Keep only owned
         // paths across mutable view updates, and refresh the panes each view
         // changes before visiting the next one.
@@ -1237,7 +1224,7 @@ impl Cagents {
                 .collect::<HashMap<_, _>>()
         };
         let mut projected_scopes = Vec::new();
-        for mut view in views {
+        for view in views {
             if self.shared_views.blocked.contains(&view.scope) {
                 continue;
             }
@@ -1246,12 +1233,10 @@ impl Cagents {
             {
                 continue;
             }
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    if let Err(error) = view.apply(change) {
-                        self.status = Some(TransientNotice::error(error));
-                    }
-                }
+            // Preserve the last error only for scopes that actually project;
+            // blocked or not-yet-seeded scopes previously kept it silent.
+            if let Some(error) = pending_errors.remove(&view.scope) {
+                self.status = Some(TransientNotice::error(error));
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
@@ -1315,7 +1300,260 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
+    fn pending_view_projection(&self) -> (Vec<View>, HashMap<Scope, String>) {
+        self.project_pending_view_changes(
+            self.shared_views
+                .pending
+                .iter()
+                .map(|(_, scope, change)| (scope, change)),
+        )
+    }
+
+    fn project_pending_view_changes<'a>(
+        &self,
+        pending: impl IntoIterator<Item = (&'a Scope, &'a Change)>,
+    ) -> (Vec<View>, HashMap<Scope, String>) {
+        let mut views = self.workspace_model.views.clone();
+        let mut pending_errors = HashMap::new();
+        // Pending moves are ordered intentions, not idempotent state. Replay
+        // each once, including transfers in their original queue position,
+        // before deriving aliases and ownership from the completed overlay.
+        for (source, change) in pending {
+            if let Change::Transfer {
+                id,
+                destination,
+                before,
+            } = change
+            {
+                if !views.iter().any(|view| &view.scope == destination) {
+                    views.push(View::empty(destination.clone()));
+                }
+                let _ = views::transfer(&mut views, source, *id, destination, *before);
+            } else {
+                for view in &mut views {
+                    if *source == view.scope {
+                        if let Err(error) = view.apply(change) {
+                            pending_errors.insert(view.scope.clone(), error);
+                        }
+                    }
+                }
+            }
+        }
+        (views, pending_errors)
+    }
+
+    fn rebase_adopted_alias_presentation(&mut self, aliases: &PaneAliases) -> bool {
+        if aliases.is_empty() {
+            return false;
+        }
+        // The original requests already occupy the publisher's FIFO. Preserve
+        // their receipts and order, including source changes and membership
+        // operations. Translating only one request in place would put its new
+        // wire retry after later intentions while projecting it before them.
+        let mut translated = self.shared_views.pending.clone();
+        let mut update_sources = HashMap::new();
+        let mut translated_any = false;
+        for (operation, scope, change) in &mut translated {
+            match change {
+                Change::Move { id, before } => {
+                    if let Some(canonical) = aliases.get(&(scope.clone(), *id)) {
+                        *id = *canonical;
+                        translated_any = true;
+                    }
+                    if let Some(anchor) = before
+                        && let Some(canonical) = aliases.get(&(scope.clone(), *anchor))
+                    {
+                        *anchor = *canonical;
+                        translated_any = true;
+                    }
+                }
+                Change::Update { before, pane }
+                    if before.id == pane.id
+                        && before.kind == pane.kind
+                        && before.scope == pane.scope
+                        && before.pending_terminal_start == pane.pending_terminal_start =>
+                {
+                    let repository = match &*scope {
+                        Scope::Channel(channel) => self
+                            .workspace_model
+                            .channel(*channel)
+                            .map(|channel| channel.repository.as_path()),
+                        Scope::Worktree { repository, .. } => Some(repository.as_path()),
+                    };
+                    let Some(basis) = self.shared_views.source_bases.get(operation).filter(
+                        |(identity, origin)| {
+                            *identity == self.workspace_model.identity
+                                && repository == Some(origin.as_path())
+                        },
+                    ) else {
+                        continue;
+                    };
+                    if let Some(canonical) = aliases.get(&(scope.clone(), pane.id)) {
+                        before.id = *canonical;
+                        pane.id = *canonical;
+                        update_sources.insert((scope.clone(), *canonical), basis.clone());
+                        translated_any = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !translated_any {
+            return false;
+        }
+        let (original, _) = self.pending_view_projection();
+        let (desired, _) = self.project_pending_view_changes(
+            translated.iter().map(|(_, scope, change)| (scope, change)),
+        );
+        let mut corrections = Vec::new();
+        for target in desired {
+            let Some(previous) = original.iter().find(|view| view.scope == target.scope) else {
+                continue;
+            };
+            let previous_ids = previous
+                .panes
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<HashSet<_>>();
+            let target_ids = target
+                .panes
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<HashSet<_>>();
+            // Alias presentation translation has no membership authority.
+            // Refuse an ambiguous projection instead of filtering away a
+            // membership difference and accidentally changing its meaning.
+            if previous_ids.len() != previous.panes.len()
+                || target_ids.len() != target.panes.len()
+                || previous_ids != target_ids
+            {
+                continue;
+            }
+            let Some(owner) = self
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| view.scope == target.scope)
+            else {
+                continue;
+            };
+            let mut append = |change, source_basis| {
+                corrections.push((
+                    ModelEdit::ChangeView {
+                        scope: target.scope.clone(),
+                        expected_revision: owner.revision,
+                        operation: uuid::Uuid::new_v4(),
+                        change,
+                    },
+                    source_basis,
+                ));
+            };
+            if previous
+                .panes
+                .iter()
+                .map(|pane| pane.id)
+                .ne(target.panes.iter().map(|pane| pane.id))
+            {
+                // A pending Insert can be refused if a peer places that ID in
+                // another view. Never make a surviving reorder depend on such
+                // an optimistic anchor: first order the raw owner's members,
+                // then place pending-only members against those stable anchors.
+                let base = owner
+                    .panes
+                    .iter()
+                    .map(|pane| pane.id)
+                    .filter(|id| target_ids.contains(id))
+                    .collect::<HashSet<_>>();
+                let existing = previous
+                    .panes
+                    .iter()
+                    .filter(|pane| base.contains(&pane.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let desired = target
+                    .panes
+                    .iter()
+                    .filter(|pane| base.contains(&pane.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut ordered = previous.clone();
+                for change in views::changes(&existing, &desired) {
+                    if matches!(change, Change::Move { .. }) {
+                        let _ = ordered.apply(&change);
+                        append(change, None);
+                    }
+                }
+                let mut anchor = None;
+                let mut anchors = HashMap::new();
+                for pane in target.panes.iter().rev() {
+                    if base.contains(&pane.id) {
+                        anchor = Some(pane.id);
+                    } else {
+                        anchors.insert(pane.id, anchor);
+                    }
+                }
+                for pane in &target.panes {
+                    if let Some(before) = anchors.get(&pane.id) {
+                        let change = Change::Move {
+                            id: pane.id,
+                            before: *before,
+                        };
+                        if ordered.apply(&change).unwrap_or(false) {
+                            append(change, None);
+                        }
+                    }
+                }
+            }
+            for change in views::changes(&previous.panes, &target.panes) {
+                let Change::Update { before, pane } = change else {
+                    continue;
+                };
+                let Some(basis) = update_sources.get(&(target.scope.clone(), pane.id)) else {
+                    continue;
+                };
+                // Later queued edits may supersede individual fields. Copy
+                // only the final shadow's presentation delta; no source,
+                // proof or pending-start field is republished.
+                let mut presentation = before.clone();
+                presentation.title = pane.title;
+                presentation.user_title = pane.user_title;
+                presentation.width_fraction = pane.width_fraction;
+                if presentation != before {
+                    append(
+                        Change::Update {
+                            before,
+                            pane: presentation,
+                        },
+                        Some(basis.clone()),
+                    );
+                }
+            }
+        }
+        let changed = !corrections.is_empty();
+        for (edit, source_basis) in corrections {
+            let ModelEdit::ChangeView {
+                scope,
+                operation,
+                change,
+                ..
+            } = &edit
+            else {
+                unreachable!();
+            };
+            if let Some(source_basis) = source_basis {
+                self.shared_views
+                    .source_bases
+                    .insert(*operation, source_basis);
+            }
+            self.shared_views
+                .pending
+                .push((*operation, scope.clone(), change.clone()));
+            self.publish_model_edit(edit);
+        }
+        changed
+    }
+
+    fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) -> PaneAliases {
         self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
@@ -1387,6 +1625,7 @@ impl Cagents {
                 }
             }
         }
+        let mut adopted = HashMap::new();
         for (scope, alias, shared) in adoptions {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -1415,11 +1654,29 @@ impl Cagents {
             {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
+            // Only an accepted adoption backed by one raw canonical resource
+            // can translate a queued presentation intent. Optimistic Inserts
+            // and ambiguous inventories supply no such authority.
+            let mut canonical = self
+                .workspace_model
+                .views
+                .iter()
+                .filter(|view| view.scope == scope)
+                .flat_map(|view| &view.panes)
+                .filter(|pane| views::same_resource(&pane.kind, &shared.kind));
+            if canonical
+                .next()
+                .is_some_and(|pane| pane.id == shared.id && pane.kind == shared.kind)
+                && canonical.next().is_none()
+            {
+                adopted.insert((scope.clone(), alias), shared.id);
+            }
             self.detach_shared_pane(alias);
             for channel in &mut Arc::make_mut(&mut self.durable).channels {
                 channel.cards.retain(|id| *id != alias);
             }
         }
+        adopted
     }
 
     fn prepare_terminal_restoration(&mut self, pane: &Pane) {
@@ -2058,6 +2315,8 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 #[cfg(test)]
 mod tests {
     mod history_start;
+    mod pending_replay;
+    mod seed_alias_order;
     mod startup_admission;
 
     use super::*;
