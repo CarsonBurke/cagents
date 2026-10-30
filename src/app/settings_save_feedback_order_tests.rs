@@ -39,7 +39,7 @@ fn isolated(name: &str, exercise: impl FnOnce(&Path)) {
     }
 
     let executable = std::env::current_exe().unwrap();
-    // Prefer the same filesystem so a hard link avoids copying the Rust ELF.
+    // Give the private alias its own inode without changing the source ELF.
     let directory = tempfile::Builder::new()
         .prefix("settings-save-order-")
         .tempdir_in(executable.parent().unwrap())
@@ -53,9 +53,7 @@ fn isolated(name: &str, exercise: impl FnOnce(&Path)) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let private_executable = root.join("bin/settings-save-order-test");
-    if fs::hard_link(&executable, &private_executable).is_err() {
-        fs::copy(&executable, &private_executable).unwrap();
-    }
+    fs::copy(&executable, &private_executable).unwrap();
     let stdout = root.join("stdout");
     let stderr = root.join("stderr");
     // Inherit the caller's complete authority. Only fixture-owned XDG paths
