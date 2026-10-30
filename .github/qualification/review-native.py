@@ -85,7 +85,7 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
     required = {'discover-repository', 'discover-unauthenticated', 'browser-list', 'review-context',
                 'review-metadata', 'review-files', 'conversation-reviewThreads',
                 'conversation-comments', 'conversation-reviews'}
-    background = {'daemon-authored-open', 'daemon-authored-all'}
+    background = {'daemon-authored-open', 'daemon-authored-all', 'daemon-branch-head'}
     contracts = {case['case']: case for case in data['allowlist']}
     assert len(contracts) == len(data['allowlist']) and set(contracts) == required | background
     cwd_bindings = {'$REPOSITORY': str(repository), '$WORKTREE': str(project), '$CHECKOUT': str(checkout)}
@@ -93,6 +93,9 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
         assert case['required'] is (name in required)
         assert case['consumer'] == ('daemon-background' if name in background else 'native-review')
         case['cwd'] = [cwd_bindings[value] for value in case['cwd']]
+        if 'array_of_response' in case:
+            assert case['response'] not in data['responses']
+            data['responses'][case['response']] = [data['responses'][case['array_of_response']]]
     directory, binary = root / 'gh-data', root / 'bin'
     directory.mkdir(mode=0o700)
     binary.mkdir(mode=0o700)

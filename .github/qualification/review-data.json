@@ -271,6 +271,33 @@
       "exit_code": 0,
       "stderr": "",
       "stdout": "exact synthetic empty JSON array plus newline; no authenticated @me identity"
+    },
+    {
+      "case": "daemon-branch-head",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--state",
+        "all",
+        "--limit",
+        "100",
+        "--json",
+        "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup",
+        "--head",
+        "fixture/native-review"
+      ],
+      "response": "branch-head.json",
+      "array_of_response": "pr.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact one-element JSON array of the same materialized full pr.json DTO plus newline; synthetic branch match only"
     }
   ],
   "responses": {
